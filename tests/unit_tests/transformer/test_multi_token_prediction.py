@@ -38,6 +38,11 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
+from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
+from megatron.core.transformer.forward_sharing import (
+    get_forward_sharing_state,
+    is_mtp_repeated_sharing_source,
+)
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.mtp_sequence_roll import (
@@ -3638,15 +3643,21 @@ class TestMultiTokenPrediction:
                         kwargs["_inputs_pre_aligned"],
                     )
                 )
-                return hidden_states, input_ids, position_ids, padding_mask
+                return hidden_states, input_ids, position_ids, padding_mask, None
 
         config = types.SimpleNamespace(
-            pipeline_model_parallel_size=1, mtp_num_layers=2, mtp_detach_heads=False
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=2,
+            mtp_detach_heads=False,
+            mtp_repeated_layer_shared_components=None,
+            mtp_hsm=False,
         )
         block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
         torch.nn.Module.__init__(block)
         block.config = config
         block.vp_stage = None
+        block.pp_rank = None
+        block.cp_group = None
         block.mtp_use_repeated_layer = False
         block.layers = torch.nn.ModuleList((FakeLayer(), FakeLayer()))
 
@@ -3731,15 +3742,21 @@ class TestMultiTokenPrediction:
                     padding_mask,
                     kwargs.get("_inputs_pre_aligned", False),
                 )
-                return hidden_states, input_ids, position_ids, padding_mask
+                return hidden_states, input_ids, position_ids, padding_mask, None
 
         config = types.SimpleNamespace(
-            pipeline_model_parallel_size=1, mtp_num_layers=1, mtp_detach_heads=False
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=1,
+            mtp_detach_heads=False,
+            mtp_repeated_layer_shared_components=None,
+            mtp_hsm=False,
         )
         block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
         torch.nn.Module.__init__(block)
         block.config = config
         block.vp_stage = None
+        block.pp_rank = None
+        block.cp_group = None
         block.mtp_use_repeated_layer = False
         block.layers = torch.nn.ModuleList((RecordingLayer(),))
 
@@ -3782,6 +3799,108 @@ class TestMultiTokenPrediction:
                 sequence_roll_context=context,
                 embedding=embedding,
             )
+
+    def test_prepared_rows_and_repeated_dsa_sharing_are_composable(self):
+        """Absolute row alignment and iteration-scoped DSA sharing use independent carriers."""
+
+        shared_key = torch.tensor([101.0])
+        shared_topk = torch.tensor([[2]], dtype=torch.int32)
+        shared_topk_length = torch.tensor([1], dtype=torch.int32)
+
+        class SharingLayer(torch.nn.Module):
+            def __init__(self, layer_number):
+                super().__init__()
+                self.layer_number = layer_number
+                self.calls = []
+
+            def forward(
+                self,
+                hidden_states,
+                input_ids,
+                position_ids,
+                padding_mask,
+                attention_mask,
+                packed_seq_params,
+                **kwargs,
+            ):
+                state = get_forward_sharing_state(packed_seq_params, attention_mask, config)
+                is_source = is_mtp_repeated_sharing_source(state, self.layer_number)
+                if is_source:
+                    payload = state.get_or_create(dsa_module._DSAMTPRepeatedSharingPayload)
+                    payload.latent_kv_by_layer[self.layer_number] = shared_key
+                    payload.topk_by_layer[self.layer_number] = shared_topk
+                    payload.topk_length_by_layer[self.layer_number] = shared_topk_length
+                else:
+                    payload = state.get(dsa_module._DSAMTPRepeatedSharingPayload)
+                    assert payload is not None
+                assert payload.latent_kv_by_layer[self.layer_number] is shared_key
+                assert payload.topk_by_layer[self.layer_number] is shared_topk
+                assert payload.topk_length_by_layer[self.layer_number] is shared_topk_length
+                self.calls.append(
+                    (
+                        input_ids.clone(),
+                        position_ids.clone(),
+                        kwargs["_inputs_pre_aligned"],
+                        is_source,
+                        payload,
+                        state,
+                    )
+                )
+                return hidden_states, input_ids, position_ids, padding_mask, None
+
+        config = types.SimpleNamespace(
+            pipeline_model_parallel_size=1,
+            num_layers=2,
+            mtp_num_layers=2,
+            mtp_detach_heads=False,
+            mtp_repeated_layer_shared_components=["latent_kv", "sparse_attention_index"],
+            mtp_hsm=False,
+        )
+        block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
+        torch.nn.Module.__init__(block)
+        block.config = config
+        block.vp_stage = None
+        block.pp_rank = None
+        block.cp_group = None
+        block.mtp_use_repeated_layer = True
+        layer = SharingLayer(config.num_layers + 1)
+        block.layers = torch.nn.ModuleList((layer,))
+
+        input_ids = torch.tensor([[10, 20, 30, 40]], dtype=torch.long)
+        position_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+        sequence_roll_context = prepare_mtp_sequence_roll_context(input_ids, None, None)
+        sequence_roll_context = sequence_roll_context.prepare_fields(
+            (
+                MTPSequenceRollField("input_ids", input_ids, -1, 0, 0),
+                MTPSequenceRollField("position_ids", position_ids, -1, 0, 0),
+            ),
+            max_offset=2,
+        )
+
+        block.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=torch.zeros(4, 1, 2),
+            attention_mask=None,
+            sequence_roll_context=sequence_roll_context,
+            embedding=types.SimpleNamespace(add_position_embedding=True),
+        )
+
+        assert len(layer.calls) == 2
+        assert torch.equal(layer.calls[0][0], torch.tensor([[20, 30, 40, 0]]))
+        assert torch.equal(layer.calls[1][0], torch.tensor([[30, 40, 0, 0]]))
+        assert torch.equal(layer.calls[0][1], torch.tensor([[1, 2, 3, 0]]))
+        assert torch.equal(layer.calls[1][1], torch.tensor([[2, 3, 0, 0]]))
+        assert all(call[2] for call in layer.calls)
+        assert layer.calls[0][3] is True
+        assert layer.calls[1][3] is False
+        assert layer.calls[1][4] is layer.calls[0][4]
+        state = layer.calls[0][5]
+        assert layer.calls[1][5] is state
+        assert not state.active
+        assert state.get(dsa_module._DSAMTPRepeatedSharingPayload) is None
+        with pytest.raises(RuntimeError, match="requires an active layer"):
+            is_mtp_repeated_sharing_source(state, layer.layer_number)
 
     @pytest.mark.parametrize(
         (
