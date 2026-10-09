@@ -62,10 +62,12 @@ class SharedPrefixExecutionPlan:
 
     @property
     def num_units(self) -> int:
+        """Number of physical forwards in this plan."""
         return len(self.units)
 
     @property
     def max_physical_length(self) -> int:
+        """Longest physical forward, which bounds the padded microbatch width."""
         return max(unit.physical_length for unit in self.units)
 
 

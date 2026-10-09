@@ -85,6 +85,12 @@ jobs:
           package-name: megatron.training
           python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
 
+      # megatron.rl ships only its shared-prefix packing modules; NeMo-RL imports them
+      # directly, without the RL runtime's optional dependencies.
+      - name: Check imports for the shipped megatron.rl packing modules
+        run: |
+          ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python -c "import megatron.rl.shared_prefix_execution, megatron.rl.shared_prefix_tensors"
+
   uv-test-pytorch:
     needs: [pre-flight]
     if: |

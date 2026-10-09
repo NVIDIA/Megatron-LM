@@ -106,6 +106,7 @@ class PackedTreeLayout:
 
     @property
     def num_nodes(self) -> int:
+        """Number of tree nodes."""
         return len(self.node_start)
 
     @property
@@ -115,9 +116,11 @@ class PackedTreeLayout:
 
     @property
     def logical_total_len(self) -> int:
+        """Logical token count, excluding node padding tails."""
         return sum(self.logical_node_len)
 
     def roots(self) -> tuple[int, ...]:
+        """Return the nodes without a parent."""
         return tuple(node for node, parent in enumerate(self.node_parent) if parent == -1)
 
     def _check_node(self, node: int) -> None:
@@ -147,6 +150,7 @@ class PackedTreeLayout:
         return max(depths)
 
     def leaf_nodes(self) -> tuple[int, ...]:
+        """Return the nodes without children."""
         parents = set(self.node_parent)
         return tuple(node for node in range(self.num_nodes) if node not in parents)
 
@@ -221,6 +225,7 @@ class PackedTreeLayout:
         )
 
     def padding_positions(self) -> tuple[int, ...]:
+        """Return the physical positions of every node's padding tail."""
         return tuple(
             index
             for start, physical, logical in zip(

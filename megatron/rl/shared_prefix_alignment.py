@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class AlignedUnit:
+    """Rows of one aligned forward and the original unit it reuses, if any."""
+
     row_indices: tuple[int, ...]
     # Reuse this original unit, including its shared layout. None means that
     # splitting changed its rows: construct a conventional dense fallback.

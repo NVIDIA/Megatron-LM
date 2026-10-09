@@ -297,52 +297,64 @@ class SharedPrefixForestLayout:
 
     @cached_property
     def physical_total_length(self) -> int:
+        """Prompt-once length of every root, including branch packing tails."""
         return self.tree_layout.total_len
 
     @cached_property
     def total_length(self) -> int:
+        """Prompt-once length of every root, excluding branch packing tails."""
         return sum(root.total_length for root in self.roots)
 
     @cached_property
     def row_indices(self) -> tuple[int, ...]:
+        """Source rows of every root, in forest order."""
         return tuple(value for root in self.roots for value in root.row_indices)
 
     @cached_property
     def completion_lengths(self) -> tuple[int, ...]:
+        """Logical completion lengths of every root, in forest order."""
         return tuple(value for root in self.roots for value in root.completion_lengths)
 
     @cached_property
     def physical_completion_lengths(self) -> tuple[int, ...]:
+        """Physical completion lengths of every root, in forest order."""
         return tuple(value for root in self.roots for value in root.physical_completion_lengths)
 
     @cached_property
     def position_ids(self) -> tuple[int, ...]:
+        """Prefix-continued position of every physical forest token."""
         return self.tree_layout.position_ids()
 
     @cached_property
     def token_gather_rows(self) -> tuple[int, ...]:
+        """Source row of every physical token, root by root."""
         return tuple(value for root in self.roots for value in root.token_gather_rows)
 
     @cached_property
     def token_gather_columns(self) -> tuple[int, ...]:
+        """Source column of every physical token, including branch padding tails, root by root."""
         return tuple(value for root in self.roots for value in root.token_gather_columns)
 
     @cached_property
     def completion_scatter_rows(self) -> tuple[int, ...]:
+        """Source row of each completion token's logprob, root by root."""
         return tuple(value for root in self.roots for value in root.completion_scatter_rows)
 
     @cached_property
     def completion_scatter_columns(self) -> tuple[int, ...]:
+        """Column of each completion logprob in the ``[row, sequence - 1]`` view, root by root."""
         return tuple(value for root in self.roots for value in root.completion_scatter_columns)
 
     @cached_property
     def branch_starts(self) -> tuple[int, ...]:
+        """Forest-global start of every completion branch."""
         return tuple(
             offset + value for offset, root in self.iter_roots() for value in root.branch_starts
         )
 
     @cached_property
     def completion_positions(self) -> tuple[int, ...]:
+        """Forest-global position of every completion token."""
         return tuple(
             offset + value
             for offset, root in self.iter_roots()
@@ -351,6 +363,7 @@ class SharedPrefixForestLayout:
 
     @cached_property
     def predecessor_positions(self) -> tuple[int, ...]:
+        """Forest-global position that predicts each completion token."""
         return tuple(
             offset + value
             for offset, root in self.iter_roots()
@@ -359,6 +372,7 @@ class SharedPrefixForestLayout:
 
     @cached_property
     def physical_padding_positions(self) -> tuple[int, ...]:
+        """Forest-global positions of branch padding tails."""
         return tuple(
             offset + value
             for offset, root in self.iter_roots()
