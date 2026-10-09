@@ -149,6 +149,14 @@ class DistributedDataParallelConfig:
       | IB                   | True      | 1 / 1               |
     """
 
+    grad_buffer_offload: bool = False
+    """If true, gradient buffers may be released between training phases.
+
+    With ``nccl_ub``, gradient storage is allocated in a separate NCCL memory
+    pool so that it can be deregistered, released, recreated, and registered
+    again without disturbing persistent parameter storage.
+    """
+
     fsdp_double_buffer: bool = False
     """If true, use persistently allocated double buffers for the 
       temporary memory needed in the Megatron FSDP communications.
@@ -330,6 +338,12 @@ class DistributedDataParallelConfig:
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+
+        if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with "
+                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+            )
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
