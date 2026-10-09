@@ -310,7 +310,7 @@ class TestMuonFP8ParamGather:
 
     def _run_steps(self, args, model, optimizer, n):
         """Run ``n`` deterministic steps; return per-step loss, forward output,
-        per-param ``main_grad`` (pre-step), fp32 master and (bf16) param (post-step)."""
+        per-param ``main_grad`` (pre-step), fp32 master (post-step), and forward-time params."""
         # Each trajectory runs under the globals initialized by its own _build.
         assert get_args() is args
         ids, labels, pos, mask, loss_mask = self._batch()
@@ -345,38 +345,17 @@ class TestMuonFP8ParamGather:
                 labels=labels,
                 loss_mask=loss_mask,
             )
+            # Observe the weights consumed by this forward. Do not publish updated
+            # weights between steps: the next forward pre-hook must complete the gather.
+            # Native FP8 storage is compared through outputs, gradients and masters;
+            # dequantized FP8 values need not equal the gather-OFF BF16 parameters.
+            params.append(_snapshot_params(model[0]))
             loss = out.mean()
             loss.backward()
             model[0].finish_grad_sync()
             grad = _snapshot_grads(model[0])
             ok, _, _ = optimizer.step()
             assert ok
-            if args.overlap_param_gather:
-                # Under overlap the param all-gather is deferred to the next forward pre-hook,
-                # so right after ``step()`` the param buffer still holds the values gathered
-                # at THIS iteration's forward, i.e. pre-update -- there is no well-defined
-                # instant at which ON and OFF can be compared. Finalize it here.
-                #
-                # Match the eval/checkpoint order: drain pending gathers and restage
-                # reused DistOpt transport before forcing parameter synchronization.
-                # LayerWise gathers stage directly from each owner's FP32 master.
-                # The shared FP8 policy controls staging independently of layout.
-                optimizer.prepare_model_params_for_param_sync()
-                model[0].disable_forward_pre_hook(param_sync=True)
-                model[0].enable_forward_pre_hook()
-                # The forced sync above takes the synchronous branch and leaves
-                # ``param_gather_dispatched=True``, which is only cleared by finish_grad_sync
-                # (already past) or here. Without this reset the next forward pre-hook is a
-                # strict no-op, so steps 2..n would silently stop exercising the deferred
-                # (async dispatch -> wait -> finalize -> bucket chaining) path that the
-                # ``overlap`` parametrization exists to cover. Re-gathering already-correct
-                # values is idempotent, so the ON-vs-OFF comparison is unaffected.
-                model[0].reset_param_sync_dispatch_state()
-            # NB: include_quantized must stay False here. This snapshot feeds the ON-vs-OFF
-            # comparison, where OFF holds plain bf16 and ON holds Q(bf16(master)); a
-            # dequantized fp32 view of the latter differs from the former by the
-            # quantization step by construction (max_diff == 2**-9 for MXFP8).
-            params.append(_snapshot_params(model[0]))
             masters.append(_snapshot_masters(model[0]))
             grads.append(grad)
             losses.append(loss.detach().clone())
@@ -521,28 +500,35 @@ class TestMuonFP8ParamGather:
             args, model, opt = self._build(True, fp8_recipe, True)
             self._run_steps(args, model, opt, 1)
             ddp = model[0]
+            unpublished_codes = _FP8ParamHarness.quantized_param_state(ddp)
+            opt.prepare_model_params_for_param_sync()
             ddp.start_param_sync()
             groups = ddp.bucket_groups + ddp.expert_parallel_bucket_groups
             assert any(
                 g.param_gather_handle is not None for g in groups
             ), "test precondition: expected a pending async param-gather handle"
-            return model, ddp, groups
+            return model, ddp, groups, unpublished_codes
 
         with deterministic_mode():
             # Reference: finish the pending gather through the forward-pre-hook path.
-            ref_model, ref_ddp, ref_groups = _step_and_dispatch()
+            ref_model, ref_ddp, ref_groups, unpublished_codes = _step_and_dispatch()
             for g in ref_groups:
                 if g.param_gather_handle is not None:
                     g.finish_param_sync(skip_next_bucket_dispatch=True)
             ref_params = _snapshot_params(ref_model[0], include_quantized=True)
             ref_codes = _FP8ParamHarness.quantized_param_state(ref_model[0])
+            assert any(
+                not torch.equal(value, unpublished_codes[name][kind])
+                for name, values in ref_codes.items()
+                for kind, value in values.items()
+            ), "Pending gather must publish updated weights, not gather already-published values"
             ref_grads = _snapshot_layerwise_grad_data(ref_ddp)
             del ref_model, ref_ddp, ref_groups
             gc.collect()
             torch.cuda.empty_cache()
 
             # Under test: force-sync with the handle still pending.
-            model, ddp, groups = _step_and_dispatch()
+            model, ddp, groups, _ = _step_and_dispatch()
             ddp.disable_forward_pre_hook(param_sync=True)
             got_params = _snapshot_params(model[0], include_quantized=True)
             got_codes = _FP8ParamHarness.quantized_param_state(model[0])
