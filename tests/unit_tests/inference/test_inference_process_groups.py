@@ -12,7 +12,9 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+import megatron.core.inference.text_generation_server.run_mcore_engine as run_mcore_engine_module
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -178,3 +180,70 @@ class TestTextGenerationControllerProcessGroups:
         assert controller.dp_group is None
         seed = wrapper.model.config.inference_sampling_seed
         assert controller.sampling_rng.initial_seed() == seed
+
+
+class _StubGroup:
+    """A process-group stand-in that reports a fixed rank and size."""
+
+    def __init__(self, rank, size):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+class _StubTokenizer:
+    def detokenize(self, tokens):
+        return "".join(chr(ord("a") + token) for token in tokens)
+
+
+class TestRunMcoreEngine:
+    """`run_mcore_engine` post-processes on the first stage of the engine's own pipeline."""
+
+    @pytest.mark.parametrize("pp_rank, builds_response", [(0, True), (1, False)])
+    def test_post_processes_on_first_stage_of_engine_pipeline(
+        self, monkeypatch, pp_rank, builds_response
+    ):
+        # The stub group is consulted only when torch.distributed is initialized.
+        Utils.initialize_distributed()
+        prompt_tokens = [1, 2]
+        monkeypatch.setattr(
+            run_mcore_engine_module,
+            "broadcast_float_list",
+            lambda size, float_list, data_parallel: torch.tensor(float_list),
+        )
+        monkeypatch.setattr(
+            run_mcore_engine_module,
+            "tokenize_prompts",
+            lambda **kwargs: (torch.tensor([prompt_tokens]), torch.tensor([len(prompt_tokens)])),
+        )
+        result = SimpleNamespace(
+            generated_text="c",
+            prompt_tokens=prompt_tokens,
+            generated_tokens=torch.tensor([2]),
+            prompt_log_probs=[-0.5],
+            generated_log_probs=[-0.25],
+            segments=["a", "b", "c"],
+        )
+        engine = SimpleNamespace(
+            controller=SimpleNamespace(
+                pp_group=_StubGroup(rank=pp_rank, size=2), tokenizer=_StubTokenizer()
+            ),
+            get_new_request_id=lambda: 0,
+            generate=lambda inference_requests: [result],
+        )
+
+        with forbid_global_process_groups():
+            response = run_mcore_engine_module.run_mcore_engine(
+                engine, prompts=["ab"], tokens_to_generate=1
+            )
+
+        if builds_response:
+            assert response["text"] == ["abc"]
+            assert response["tokens"] == [[1, 2, 2]]
+        else:
+            assert response is None
