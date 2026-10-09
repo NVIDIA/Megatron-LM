@@ -6,9 +6,7 @@ from argparse import Namespace
 
 import pytest
 
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-    vlm_dynamic_inference,
-)
+from examples.inference.advanced import vlm_dynamic_inference
 
 
 @pytest.mark.parametrize("provider", ["nemotron-moe-vlm", "nemotron-moe-mistral-vit"])
