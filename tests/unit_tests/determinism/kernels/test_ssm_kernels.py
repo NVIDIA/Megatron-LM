@@ -290,7 +290,8 @@ def test_chunk_gated_delta_product_varlen_replays():
     )
 
 
-def test_fused_recurrent_gated_delta_rule_update_replays():
+@pytest.mark.parametrize("gate_in_kernel", [False, True])
+def test_fused_recurrent_gated_delta_rule_update_replays(gate_in_kernel):
     from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
@@ -301,6 +302,16 @@ def test_fused_recurrent_gated_delta_rule_update_replays():
     g = -torch.rand(B, 1, H, device="cuda") * 0.1
     beta = torch.rand(B, 1, H, device="cuda", dtype=torch.bfloat16)
     initial_state = torch.randn(B, H, K, V, device="cuda")
+    # The GDN decode form: raw gate and beta logits, with the decay formed in-kernel.
+    gate_kwargs = (
+        dict(
+            A_log=torch.randn(H, device="cuda"),
+            dt_bias=torch.randn(H, device="cuda"),
+            use_beta_sigmoid_in_kernel=True,
+        )
+        if gate_in_kernel
+        else {}
+    )
 
     def fn(q, k, v, g, beta, initial_state):
         return fused_recurrent_gated_delta_rule_update(
@@ -312,6 +323,7 @@ def test_fused_recurrent_gated_delta_rule_update_replays():
             initial_state=initial_state,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
+            **gate_kwargs,
         )
 
     assert_replays_bit_exact(
