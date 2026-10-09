@@ -41,7 +41,7 @@ _LOGGED_TOKEN_POLICIES: set[tuple[str, int, int]] = set()
 
 
 def require_flashinfer_cutlass_mxfp8() -> None:
-    """Raise an actionable error when the CUTLASS MXFP8 APIs are unavailable."""
+    """Raise an error when the CUTLASS MXFP8 APIs are unavailable."""
     if not HAVE_FLASHINFER_CUTLASS_MXFP8:
         raise RuntimeError(
             "FlashInfer CUTLASS MXFP8 MoE requires mxfp8_quantize and "
@@ -91,7 +91,12 @@ def _round_up(value: int, alignment: int) -> int:
 def _pack_cutlass_mxfp8_scale(
     scale: torch.Tensor, experts: int, rows: int, cols: int
 ) -> torch.Tensor:
-    """View cuBLAS-swizzled UE8M0 bytes in CUTLASS's packed-int32 ABI shape."""
+    """Repackage existing MXFP8 scales for FlashInfer's CUTLASS interface.
+
+    Each scale occupies one byte and applies to 32 weights. CUTLASS expects four
+    adjacent scale bytes per int32 entry, with shape [experts, rows, cols // 128].
+    Only the tensor view changes: scale values and byte order are preserved.
+    """
     if rows % 128 or cols % 128:
         raise ValueError(
             "FlashInfer CUTLASS MXFP8 requires weight rows and columns divisible "
@@ -106,8 +111,8 @@ def _pack_cutlass_mxfp8_scale(
             f"got {scale_u8.numel()}, expected {expected} for "
             f"weight shape=({experts}, {rows}, {cols})"
         )
-    # The bytes are already in SWIZZLE_32_4_4 order. CUTLASS's public ABI uses
-    # int32 only to group four adjacent UE8M0 bytes; do not convert or unshuffle them.
+    # The bytes already have the GPU-required SWIZZLE_32_4_4 ordering; keep it intact.
+    # view(int32) groups bytes without changing them; to(int32) would convert values.
     return scale_u8.reshape(experts, rows, scale_cols).view(torch.int32).contiguous()
 
 

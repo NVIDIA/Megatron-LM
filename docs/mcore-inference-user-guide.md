@@ -494,8 +494,7 @@ This requires a FlashInfer build containing
 [FlashInfer #5696](https://github.com/flashinfer-ai/flashinfer/pull/5696)
 (merged as `6dc4f76598340a2ec6aaaaa8f7c925ea1d60f1d3`), exposing
 `ActivationType.ClampedRelu2` and the `clamped_relu2_limit` keyword. Older installations
-remain usable for unclamped activations; requesting the new activation gives an
-upgrade error. A minimum released version will be documented once available.
+remain usable for unclamped activations. TODO(helenn): Document a minimum release version.
 
 The clamped CUTLASS path processes the full dispatched row count; it does not support
 `inference_flashinfer_mxfp8_token_capacity` or `batch_invariant_mode`. Its FP32 clamp

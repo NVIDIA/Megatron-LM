@@ -103,14 +103,6 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
-    KernelEntry(
-        name="counted_combine_prototype",
-        sources=("tools/counted_combine/counted_combine.cu", "tools/counted_combine/layout.h"),
-        tests=(K + "test_counted_combine_prototype.py",),
-        kind="cuda-ext",
-        training_path=False,
-        notes="Standalone research binary; opt-in CFT hardware test checks exact replay oracles.",
-    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
