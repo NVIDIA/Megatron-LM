@@ -9,6 +9,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -28,6 +29,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     CheckpointWithoutOutput,
@@ -2233,6 +2235,154 @@ class TestInlineCaptureManager:
         assert (
             runner.num_warmup_steps == 0
         ), f"Expected 0 warmup steps (manager override), got {runner.num_warmup_steps}"
+
+
+def _forbid_global_process_groups(monkeypatch):
+    """Make the global group, rank and world-size accessors and the collection shim raise."""
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("the global parallel state was read")
+
+    for name in dir(parallel_state):
+        if name.startswith("get_") and name.endswith(
+            ("_rank", "_ranks", "_world_size", "_group", "_groups")
+        ):
+            monkeypatch.setattr(parallel_state, name, forbidden)
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", forbidden)
+
+
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+)
+class TestCudaGraphManagerProcessGroups:
+    """Local CUDA graphs decide graph reuse from the graphed module's own pipeline group."""
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+
+    def teardown_method(self, method):
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.cudagraph_inference_record = []
+        _CudagraphGlobalRecord._disable_saved_tensors_observer()
+        CudaGraphManager.global_mempool = None
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _model_pipeline_group(global_pp):
+        """Initialize a global grid with `global_pp` stages and return the model's PP group.
+
+        The model's pipeline size differs from the global one: under a global PP of 1 the model
+        gets 2-rank pipeline groups, and under a global PP of 2 its pipeline parallelism is off
+        (None). A read of the global grid would flip the reuse decision.
+        """
+        if Utils.world_size < 4 or Utils.world_size % 2:
+            pytest.skip("needs an even world size of at least 4")
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=global_pp)
+        model_parallel_cuda_manual_seed(123)
+        if global_pp == 2:
+            return None
+        pairs = [[rank, rank + 1] for rank in range(0, Utils.world_size, 2)]
+        group, _ = torch.distributed.new_subgroups_by_enumeration(pairs)
+        return group
+
+    @pytest.mark.parametrize("global_pp", [1, 2])
+    def test_function_manager_follows_module_pipeline_group(self, monkeypatch, global_pp):
+        model_pp_group = self._model_pipeline_group(global_pp)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+        )
+        module = _SimpleModule(config).cuda()
+        module.pg_collection = ProcessGroupCollection(pp=model_pp_group)
+        with monkeypatch.context() as patch:
+            _forbid_global_process_groups(patch)
+            manager = CudaGraphManager(
+                config, base_module=module, function_name="my_op", need_backward=False
+            )
+            assert manager.reuse_cudagraphs is None
+            module.my_op(torch.randn(4, config.hidden_size, device="cuda"))
+        assert manager.reuse_cudagraphs is (global_pp == 2)
+
+    def test_function_manager_without_module_pipeline_group_uses_global_grid(self):
+        self._model_pipeline_group(global_pp=2)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+        )
+        module = _SimpleModule(config).cuda()
+        manager = CudaGraphManager(
+            config, base_module=module, function_name="my_op", need_backward=False
+        )
+        module.my_op(torch.randn(4, config.hidden_size, device="cuda"))
+        assert manager.reuse_cudagraphs is False
+
+    @pytest.mark.parametrize("global_pp", [1, 2])
+    def test_transformer_layer_follows_its_pipeline_group(self, monkeypatch, global_pp):
+        model_pp_group = self._model_pipeline_group(global_pp)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.pp = model_pp_group
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+        )
+        hidden_states = torch.ones((32, 2, config.hidden_size), device="cuda")
+        attention_mask = torch.ones((1, 1, 32, 32), dtype=bool, device="cuda")
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                ProcessGroupCollection,
+                "use_mpu_process_groups",
+                lambda *args, **kwargs: pytest.fail("the global parallel state was read"),
+            )
+            layer = TransformerLayer(
+                config,
+                get_gpt_layer_with_transformer_engine_submodules(),
+                pg_collection=pg_collection,
+            ).cuda()
+            assert layer.cudagraph_manager.reuse_cudagraphs is None
+            layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        assert layer.cudagraph_manager.reuse_cudagraphs is (global_pp == 2)
+
+    @pytest.mark.parametrize("global_pp", [1, 2])
+    def test_mamba_layer_follows_its_pipeline_group(self, monkeypatch, global_pp):
+        model_pp_group = self._model_pipeline_group(global_pp)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "cp", "gtp_remat", "expt_gtp_remat"]
+        )
+        pg_collection.pp = model_pp_group
+        config = TransformerConfig(
+            hidden_size=256,  # The Mamba layer places several constraints on this.
+            num_layers=1,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+        )
+        hidden_states = torch.ones((32, 2, config.hidden_size), device="cuda")
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                ProcessGroupCollection,
+                "use_mpu_process_groups",
+                lambda *args, **kwargs: pytest.fail("the global parallel state was read"),
+            )
+            layer = MambaLayer(
+                config,
+                hybrid_stack_spec.submodules.mamba_layer.submodules,
+                pg_collection=pg_collection,
+            ).cuda()
+            assert layer.pg_collection is pg_collection
+            layer(hidden_states=hidden_states)
+        assert layer.cudagraph_manager.reuse_cudagraphs is (global_pp == 2)
 
 
 class TestSkipFp8WeightUpdateTensor:
