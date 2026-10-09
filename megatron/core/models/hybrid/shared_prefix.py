@@ -5,21 +5,19 @@
 This module deliberately does not alter :class:`HybridStack`'s normal ``forward`` path. Call
 ``forward_hybrid_stack_shared_prefix`` with one packed star ``[P, C_1, ..., C_G]`` to opt in.
 Mamba layers scan the prefix once and fork differentiable convolution/SSM state into the
-completion
-branches, including CP>1 through sequence-to-head collectives. An exact uninterrupted-replay path
-is retained as an explicit parity oracle and fallback. Attention uses the exact-backward fused
-forest
-kernel.
+completion branches, including CP>1 through sequence-to-head collectives. Alternative Mamba
+implementations, including an uninterrupted prefix-replay parity oracle, are selected in
+``_forward_mamba_layer_shared_prefix_cp``. Attention uses the exact-backward fused forest kernel.
 Unsupported topology or model features fail before executing a partial forward.
 
 The implementation is the narrow production slice of the shared-prefix work developed in
-Megatron-RL/Megatron-LM commit ``0bf30804f`` plus the fused kernel port ``5b7173f7``. CP1 and CP>1
-are advertised as distinct capabilities so integrations can negotiate against the validated
-topology. CP>1 uses the model's standard zigzag sequence shards and sequence-to-head all-to-alls.
-Validated production capabilities cover TP1 and TP>1 with sequence parallelism, explicit physical
-padding, MoE expert-bias accounting, and full uniform activation recomputation. Topology and
-feature
-tokens remain distinct so integrations can require the exact supported conjunction.
+Megatron-RL/Megatron-LM commit ``0bf30804f`` plus the fused kernel port ``5b7173f7``. CP>1 uses
+the model's standard zigzag sequence shards and sequence-to-head all-to-alls. The implemented
+surface covers TP1 and TP>1 with sequence parallelism, CP1 and CP>1, explicit physical padding,
+MoE expert-bias accounting, and full uniform activation recomputation. The capability tokens at
+the end of this module name these code paths so integrations can require the exact conjunction
+they use; they are contract identifiers, not evidence that a topology has been qualified at
+full-model scale.
 """
 
 import os
@@ -1104,10 +1102,12 @@ def forward_hybrid_stack_shared_prefix(
     )
 
 
-# The legacy scalar remains the validated CP1 negotiation surface. CP-aware integrations must
-# negotiate against the collection so installing the CP track cannot regress existing CP1 runs.
+# Capability tokens are contract identifiers: each names a code path that MCore implements and
+# guards. They are not qualification evidence for a topology or a model.
+# The legacy scalar remains the CP1 negotiation surface. CP-aware integrations must negotiate
+# against the collection so installing the CP track cannot regress existing CP1 runs.
 # ``SHARED_PREFIX_CP_TRAINING_CAPABILITY`` is advertised independently so integrations can retain
-# the CP1 fast path while requiring the validated CP>1 Hybrid forward/backward contract.
+# the CP1 fast path while requiring the CP>1 Hybrid forward/backward contract.
 SHARED_PREFIX_TRAINING_CAPABILITY = "hybrid_star_cp1_tp1_v1"
 SHARED_PREFIX_CP_TRAINING_CAPABILITY = "hybrid_star_cp_v1"
 SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY = "hybrid_star_explicit_physical_padding_v1"
@@ -1115,16 +1115,15 @@ SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY = "hybrid_star_moe_expert_bias_v1"
 SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY = "hybrid_star_full_uniform_recompute_v1"
 SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp1_tp_sp_v1"
 SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp_tp_sp_v1"
-# Validated target-model feature: Nemotron-H attention is positionless while
-# Mamba remains state-positioned by sequence order.
+# Target-model feature: Nemotron-H attention is positionless while Mamba remains
+# state-positioned by sequence order.
 SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY = "hybrid_star_positionless_attention_v1"
-# Validated MTP predictor feature: reconstruct dense attention/MLP or attention/MoE
-# heads from the shared-prefix physical layout on the supported distributed TP/CP
-# topologies.
+# MTP predictor feature: reconstruct dense attention/MLP or attention/MoE heads from
+# the shared-prefix physical layout on the implemented TP/CP topologies.
 SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY = "hybrid_star_mtp_dense_heads_v1"
 SHARED_PREFIX_GROUP_EXECUTION_CAPABILITY = "hybrid_forest_stable_router_v1"
 # Topology and feature capabilities are independent so integrations can negotiate their exact
-# validated conjunction without inferring support from a broader aggregate token.
+# conjunction without inferring support from a broader aggregate token.
 SHARED_PREFIX_TRAINING_CAPABILITIES = frozenset(
     {
         SHARED_PREFIX_TRAINING_CAPABILITY,
