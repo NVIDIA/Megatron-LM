@@ -96,7 +96,7 @@ def test_length_only_callback_stays_independent_and_must_preserve_coverage():
         return ((1, 0),)
 
     units = plan_dense_training_bins(costs=(4, 4), bin_capacity=8, dense_packer=pack)
-    assert seen == [(4, 4)]
+    assert seen == [(4, 4), (4, 4)]  # called twice to enforce determinism
     assert units == (SharedPrefixExecutionUnit((1, 0), None, 8),)
 
 
@@ -189,3 +189,154 @@ def test_historical_generation_request_api_and_pickle_paths_are_preserved():
     assert pickle.loads(pickle.dumps(request)) == request
     assert GenericGenerationArgs.__module__ == Request.__module__ == "megatron.rl"
     assert TypeLookupable.__module__ == "megatron.rl"
+
+
+def _merge_rows():
+    # Two stars of group "a" plus three dense rows: one ungrouped, two of group "b".
+    return [
+        SharedPrefixRow(0, "a", (1, 2), 2),
+        SharedPrefixRow(1, "a", (1, 2), 2),
+        SharedPrefixRow(2, None, (5, 6), 2),
+        SharedPrefixRow(3, "b", (7, 8), 1),
+        SharedPrefixRow(4, "b", (7, 9), 1),
+    ]
+
+
+def _first_fit(capacity):
+    def pack(costs):
+        bins, loads = [], []
+        for index, cost in sorted(enumerate(costs), key=lambda item: (-item[1], item[0])):
+            for bin_index, load in enumerate(loads):
+                if load + cost <= capacity:
+                    bins[bin_index].append(index)
+                    loads[bin_index] += cost
+                    break
+            else:
+                bins.append([index])
+                loads.append(cost)
+        return bins
+
+    return pack
+
+
+def _merge_units(rows, *, bin_capacity, dense_packer):
+    return plan_shared_prefix_execution_units(
+        rows,
+        row_slots=((0, 1), (2,), (3, 4)),
+        bin_capacity=bin_capacity,
+        padding_multiple=1,
+        pack_groups=True,
+        pack_dense_fallbacks=True,
+        merge_dense_fallbacks=True,
+        dense_packer=dense_packer,
+    )
+
+
+def test_merge_dense_fallbacks_keeps_ungrouped_rows_dense_and_mtp_groups():
+    rows = _merge_rows()
+    units = _merge_units(rows, bin_capacity=20, dense_packer=lambda costs: [[0], [1, 2]])
+    assert sorted(index for unit in units for index in unit.row_indices) == [0, 1, 2, 3, 4]
+    # The bin holding the ungrouped row would fit, but stays dense instead of raising.
+    assert SharedPrefixExecutionUnit((2,), None, 4) in units
+    (forest,) = [unit for unit in units if unit.shared_layout is not None]
+    # Star (0, 1) absorbs the dense bin (3, 4) as one MTP normalization group.
+    assert forest.row_indices == (0, 1, 3, 4)
+    assert forest.shared_layout.mtp_loss_group_root_counts == (1, 2)
+    expanded = sum(
+        len(root.row_indices) * root.prompt_length + sum(root.physical_completion_lengths)
+        for _, root in forest.shared_layout.iter_roots()
+    )
+    assert forest.physical_length == 12 and expanded == 14
+
+
+def test_merge_dense_fallbacks_respects_the_expanded_budget():
+    rows = _merge_rows()
+    units = _merge_units(rows, bin_capacity=12, dense_packer=lambda costs: [[0], [1, 2]])
+    # Absorbing (3, 4) would need 14 expanded tokens > 12, so nothing merges.
+    assert all(unit.shared_layout is None or unit.row_indices == (0, 1) for unit in units)
+    assert sorted(index for unit in units for index in unit.row_indices) == [0, 1, 2, 3, 4]
+
+
+def test_dense_packer_bins_must_fit_the_token_budget():
+    rows = [SharedPrefixRow(index, str(index), (1, 2), 6) for index in range(4)]
+    with pytest.raises(ValueError, match="within the token budget"):
+        plan_shared_prefix_execution_units(
+            rows,
+            row_slots=((0,), (1,), (2,), (3,)),
+            bin_capacity=8,
+            padding_multiple=1,
+            pack_groups=True,
+            pack_dense_fallbacks=True,
+            dense_packer=lambda costs: [[0, 1, 2, 3]],
+        )
+
+
+def test_dense_packer_must_be_deterministic():
+    calls = []
+
+    def unstable(costs):
+        calls.append(None)
+        return [[0], [1]] if len(calls) % 2 else [[1], [0]]
+
+    with pytest.raises(ValueError, match="deterministic"):
+        plan_dense_training_bins(costs=(4, 4), bin_capacity=8, dense_packer=unstable)
+
+    def mutating(costs):
+        costs.sort()  # a packer may reorder its own copy without breaking the check
+        return [[0, 1]]
+
+    assert len(plan_dense_training_bins(costs=(4, 3), bin_capacity=8, dense_packer=mutating)) == 1
+
+
+def _large_group(count, completion_length=1):
+    return [SharedPrefixRow(index, "g", (1, 2, 3), completion_length) for index in range(count)]
+
+
+@pytest.mark.parametrize(
+    "count, sizes", [(16, (16,)), (17, (9, 8)), (32, (16, 16)), (33, (11,) * 3)]
+)
+def test_slot_larger_than_branch_limit_splits_evenly_under_group_packing(count, sizes):
+    rows = _large_group(count)
+    units = plan_shared_prefix_execution_units(
+        rows,
+        row_slots=(tuple(range(count)),),
+        bin_capacity=4 * count,
+        padding_multiple=1,
+        pack_groups=True,
+    )
+    roots = [root for unit in units for _, root in unit.shared_layout.iter_roots()]
+    assert tuple(len(root.row_indices) for root in roots) == sizes
+    assert sorted(index for unit in units for index in unit.row_indices) == list(range(count))
+
+
+def test_slot_larger_than_branch_limit_warns_and_stays_one_dense_forward():
+    rows = _large_group(17)
+    with pytest.warns(UserWarning, match="exceeds max_completions_per_bin=16"):
+        units = plan_shared_prefix_execution_units(
+            rows, row_slots=(tuple(range(17)),), bin_capacity=68, padding_multiple=1
+        )
+    assert units == (SharedPrefixExecutionUnit(tuple(range(17)), None, 68),)
+    # Raising the limit keeps the slot as one shared star.
+    (unit,) = plan_shared_prefix_execution_units(
+        rows,
+        row_slots=(tuple(range(17)),),
+        bin_capacity=68,
+        padding_multiple=1,
+        max_completions_per_bin=17,
+    )
+    assert len(unit.shared_layout.row_indices) == 17
+
+
+def test_dense_bin_reconstruction_splits_large_groups_evenly():
+    rows = _large_group(17)
+    (unit,) = share_prefixes_in_dense_training_bins(
+        rows,
+        (SharedPrefixExecutionUnit(tuple(range(17)), None, 68),),
+        costs=(4,) * 17,
+        padding_multiple=1,
+        bin_capacity=68,
+    )
+    roots = unit.shared_layout.roots
+    assert [len(root.row_indices) for root in roots] == [9, 8]
+    assert unit.shared_layout.mtp_loss_group_root_counts == (2,)
+    assert unit.physical_length == 2 * 3 + 17

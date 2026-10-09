@@ -27,6 +27,13 @@ from functools import cached_property
 
 from megatron.rl.tree_layout import PackedTreeLayout
 
+MAX_SHARED_PREFIX_BRANCHES = 16
+"""Default number of completion branches stored behind one prompt copy.
+
+This is a planning policy, not a kernel limit. Planners that accept a branch
+limit default to this value; larger exact-prompt groups are split evenly.
+"""
+
 
 def _round_up(value: int, multiple: int) -> int:
     """Round ``value`` up to a positive alignment without backend imports."""
@@ -35,6 +42,27 @@ def _round_up(value: int, multiple: int) -> int:
 
 def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def split_rows_evenly(
+    rows: Sequence[SharedPrefixRow], *, max_completions_per_bin: int
+) -> tuple[tuple[SharedPrefixRow, ...], ...]:
+    """Split rows into the fewest consecutive chunks of nearly equal size.
+
+    A group of ``max_completions_per_bin + 1`` rows becomes two shared halves
+    instead of a full star plus a singleton that shares nothing.
+    """
+    if not _is_int(max_completions_per_bin) or max_completions_per_bin < 1:
+        raise ValueError("max_completions_per_bin must be a positive integer")
+    count = -(-len(rows) // max_completions_per_bin)
+    base, extra = divmod(len(rows), count) if count else (0, 0)
+    chunks = []
+    start = 0
+    for index in range(count):
+        stop = start + base + (index < extra)
+        chunks.append(tuple(rows[start:stop]))
+        start = stop
+    return tuple(chunks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,7 +503,7 @@ def plan_shared_prefix_bins(
     rows: Sequence[SharedPrefixRow],
     *,
     bin_capacity: int,
-    max_completions_per_bin: int = 16,
+    max_completions_per_bin: int = MAX_SHARED_PREFIX_BRANCHES,
     sequence_length_pad_multiple: int = 1,
 ) -> SharedPrefixPlan:
     """Partition exact-prompt GRPO rows into shared stars and mixed fallbacks.
@@ -493,7 +521,9 @@ def plan_shared_prefix_bins(
         bin_capacity: Maximum number of deduplicated tokens in one shared bin. It
             must be a multiple of ``sequence_length_pad_multiple`` so that a
             planned star still fits after topology padding.
-        max_completions_per_bin: Maximum branches behind one stored prompt.
+        max_completions_per_bin: Maximum branches behind one stored prompt. An
+            exact group above it is first capped to an even share, so 17 rows
+            at limit 16 become stars of 9 and 8 when the token budget allows.
         sequence_length_pad_multiple: Ordinary per-sequence packing alignment.
 
     Returns:
@@ -543,6 +573,9 @@ def plan_shared_prefix_bins(
             continue
 
         prompt_length = exact_rows[0].prompt_length
+        # Spread a group past the branch limit evenly (17 -> 9+8, not a
+        # 16-star plus an unshared singleton), as split_rows_evenly does.
+        branch_limit = -(-len(exact_rows) // -(-len(exact_rows) // max_completions_per_bin))
         physical_bins: list[list[SharedPrefixRow]] = []
         bin_completion_tokens: list[int] = []
         rows_by_size = sorted(
@@ -556,7 +589,7 @@ def plan_shared_prefix_bins(
         for row in rows_by_size:
             destination: int | None = None
             for bin_index, bin_rows in enumerate(physical_bins):
-                has_branch_slot = len(bin_rows) < max_completions_per_bin
+                has_branch_slot = len(bin_rows) < branch_limit
                 has_token_space = (
                     prompt_length
                     + bin_completion_tokens[bin_index]

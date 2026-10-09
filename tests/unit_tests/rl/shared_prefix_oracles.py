@@ -23,6 +23,7 @@ from collections.abc import Sequence
 import torch
 
 from megatron.rl.shared_prefix_packing import (
+    MAX_SHARED_PREFIX_BRANCHES,
     SharedPrefixForestLayout,
     SharedPrefixLayout,
     plan_shared_prefix_bins,
@@ -75,7 +76,7 @@ def plan_and_materialize(
     prompt_lengths: torch.Tensor,
     group_ids: Sequence[str | None],
     bin_capacity: int,
-    max_completions_per_bin: int = 16,
+    max_completions_per_bin: int = MAX_SHARED_PREFIX_BRANCHES,
     sequence_length_pad_multiple: int = 1,
 ) -> tuple[tuple[SharedPrefixTensorBin, ...], tuple[int, ...]]:
     """Plan exact-prompt stars from a padded batch and materialize each one."""

@@ -20,7 +20,7 @@ No batch transport, training configuration, or model runtime is required.
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from megatron.rl.shared_prefix_packing import _round_up
+from megatron.rl.shared_prefix_packing import MAX_SHARED_PREFIX_BRANCHES, _round_up
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +88,7 @@ def plan_fixed_execution_slots(
     bin_capacity: int,
     batch_size: int | None = None,
     sequence_length_pad_multiple: int = 1,
-    max_rows_per_slot: int = 16,
+    max_rows_per_slot: int = MAX_SHARED_PREFIX_BRANCHES,
 ) -> FixedExecutionSlotPlan:
     """Give every complete prompt group the same number of real forwards.
 

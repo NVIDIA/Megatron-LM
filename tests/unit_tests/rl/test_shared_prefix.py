@@ -21,6 +21,7 @@ from megatron.rl.shared_prefix_packing import (
     build_shared_prefix_layout,
     pack_shared_prefix_groups,
     plan_shared_prefix_bins,
+    split_rows_evenly,
 )
 
 
@@ -223,6 +224,27 @@ def test_row_snapshots_list_prompts_as_hashable_tuples() -> None:
     assert row.prompt_token_ids == (10, 11, 12)
     plan = plan_shared_prefix_bins([row, _row(1)], bin_capacity=20)
     assert plan.shared_bins[0].row_indices == (0, 1)
+
+
+@pytest.mark.parametrize(
+    "count, limit, sizes",
+    [(0, 16, ()), (3, 16, (3,)), (16, 16, (16,)), (17, 16, (9, 8)), (33, 16, (11, 11, 11))],
+)
+def test_split_rows_evenly_avoids_singleton_remainders(count, limit, sizes) -> None:
+    rows = [_row(index) for index in range(count)]
+    chunks = split_rows_evenly(rows, max_completions_per_bin=limit)
+    assert tuple(len(chunk) for chunk in chunks) == sizes
+    assert [row for chunk in chunks for row in chunk] == rows
+
+
+@pytest.mark.parametrize("count, sizes", [(16, [16]), (17, [9, 8]), (33, [11, 11, 11])])
+def test_planner_splits_groups_past_the_branch_limit_evenly(count, sizes) -> None:
+    rows = [_row(index) for index in range(count)]
+
+    plan = plan_shared_prefix_bins(rows, bin_capacity=1000)
+
+    assert [len(layout.row_indices) for layout in plan.shared_bins] == sizes
+    assert not plan.fallback_row_indices
 
 
 def _star(group: str, rows: int, completion_length: int, start: int = 0) -> SharedPrefixLayout:

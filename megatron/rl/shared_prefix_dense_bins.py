@@ -14,13 +14,19 @@
 
 """Reconstruct shared prefixes within already aligned conventional training bins."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
-from megatron.rl.shared_prefix_execution import SharedPrefixExecutionUnit
+from megatron.rl.shared_prefix_execution import (
+    DensePacker,
+    SharedPrefixExecutionUnit,
+    pack_dense_rows,
+)
 from megatron.rl.shared_prefix_packing import (
+    MAX_SHARED_PREFIX_BRANCHES,
     SharedPrefixForestLayout,
     SharedPrefixRow,
     build_shared_prefix_layout,
+    split_rows_evenly,
 )
 
 
@@ -41,15 +47,16 @@ def _validate_dense_partition(
 
 
 def plan_dense_training_bins(
-    *,
-    costs: Sequence[int],
-    bin_capacity: int,
-    dense_packer: Callable[[Sequence[int]], Sequence[Sequence[int]]],
+    *, costs: Sequence[int], bin_capacity: int, dense_packer: DensePacker
 ) -> tuple[SharedPrefixExecutionUnit, ...]:
-    """Pack expanded rows before distributed forward-count alignment."""
+    """Pack expanded rows before distributed forward-count alignment.
+
+    ``dense_packer`` must be deterministic; see
+    :func:`~megatron.rl.shared_prefix_execution.pack_dense_rows`.
+    """
     if any(cost <= 0 or cost > bin_capacity for cost in costs):
         raise ValueError("Training rows must fit the expanded token budget")
-    bins = dense_packer(costs)
+    bins = pack_dense_rows(costs, bin_capacity=bin_capacity, dense_packer=dense_packer)
     units = tuple(
         SharedPrefixExecutionUnit(
             row_indices=tuple(indices),
@@ -69,11 +76,14 @@ def share_prefixes_in_dense_training_bins(
     costs: Sequence[int],
     padding_multiple: int,
     bin_capacity: int,
+    max_completions_per_bin: int = MAX_SHARED_PREFIX_BRANCHES,
 ) -> tuple[SharedPrefixExecutionUnit, ...]:
     """Share exact prompts in aligned dense bins without changing MTP groups.
 
     Each output bin retains one auxiliary-loss normalization group, source-row
     coverage, and independent causal boundaries. Ineligible bins stay dense.
+    An exact-prompt group with more than ``max_completions_per_bin`` rows is
+    split evenly into several roots.
     """
     multiple = padding_multiple
     _validate_dense_partition(units, costs, bin_capacity)
@@ -94,12 +104,10 @@ def share_prefixes_in_dense_training_bins(
             continue
         roots = tuple(
             build_shared_prefix_layout(
-                group[start : start + 16],
-                sequence_length_pad_multiple=multiple,
-                allow_singleton=True,
+                chunk, sequence_length_pad_multiple=multiple, allow_singleton=True
             )
             for group in groups.values()
-            for start in range(0, len(group), 16)
+            for chunk in split_rows_evenly(group, max_completions_per_bin=max_completions_per_bin)
         )
         forest = SharedPrefixForestLayout(roots, mtp_loss_group_root_counts=(len(roots),))
         expanded = sum(
