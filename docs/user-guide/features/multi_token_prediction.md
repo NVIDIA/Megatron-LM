@@ -85,7 +85,9 @@ Compatibility:
 - Selective `core_attn` supports index-only sharing, but not KV sharing.
   Set `recompute_modules` explicitly for KV sharing: selective recompute defaults
   to `core_attn`.
-- Attention CUDA graph capture is unsupported; MoE-only scopes remain compatible.
+- Per-layer CUDA graph scopes that capture attention are unsupported. MoE-only
+  scopes and full-iteration graphs (`cuda_graph_impl: full_iteration`) remain
+  compatible.
 
 ## Sequence-Roll Alignment
 
