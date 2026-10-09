@@ -188,9 +188,6 @@
       "get_pp_rank_microbatches:accessor:parallel_state.get_pipeline_model_parallel_rank",
       "get_pp_rank_microbatches:accessor:parallel_state.get_pipeline_model_parallel_world_size"
     ],
-    "megatron/core/resharding/refit.py": [
-      "_unwrap_model_cores:accessor:parallel_state.get_data_parallel_group"
-    ],
     "megatron/core/ssm/mamba_mixer.py": [
       "ExtendedRMSNorm.sharded_state_dict:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
@@ -320,5 +317,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 210
+  "total": 209
 }
