@@ -94,6 +94,23 @@ def test_prepare_cutlass_mxfp8_weights_reuses_existing_swizzled_scale_bytes(monk
         prepare_cutlass_mxfp8_weights(weight)
 
 
+@pytest.mark.parametrize("field", ["data", "scale"])
+def test_prepare_cutlass_mxfp8_weights_rejects_noncontiguous_shared_storage(monkeypatch, field):
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
+    weight = MXFP8Tensor(
+        data=torch.zeros(2, 128, 128, dtype=torch.float8_e4m3fn),
+        scale=torch.zeros(2, 512, dtype=torch.uint8),
+        backend="triton",
+    )
+    tensor = getattr(weight, field)
+    # Preserve shape but change strides, as a future stacking change might do.
+    tensor = tensor.transpose(0, 1).contiguous().transpose(0, 1)
+    assert not tensor.is_contiguous()
+    setattr(weight, field, tensor)
+    with pytest.raises(ValueError, match="require contiguous data and scales"):
+        prepare_cutlass_mxfp8_weights(weight)
+
+
 def test_cutlass_mxfp8_uses_full_rows_and_preserves_output_buffer(monkeypatch):
     monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
     captured = {}

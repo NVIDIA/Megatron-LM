@@ -137,6 +137,11 @@ def prepare_cutlass_mxfp8_weights(
         )
     if weight.data.ndim != 3:
         raise ValueError(f"expected [experts, M, K] MXFP8 data, got {weight.data.shape}")
+    if out is None and (not weight.data.is_contiguous() or not weight.scale.is_contiguous()):
+        raise ValueError(
+            "FlashInfer CUTLASS shared weights require contiguous data and scales; "
+            "copying them would disconnect execution weights from in-place refits."
+        )
 
     experts, rows, cols = weight.data.shape
     packed_scale = _pack_cutlass_mxfp8_scale(weight.scale, experts, rows, cols)
@@ -144,7 +149,7 @@ def prepare_cutlass_mxfp8_weights(
 
     if out is None:
         return FlashInferCutlassMXFP8Weight(
-            data=weight.data.contiguous(),
+            data=weight.data,
             scale=packed_scale,
             input_scale=torch.ones(experts, dtype=torch.float32, device=weight.data.device),
             logical_rows=rows,
