@@ -32,7 +32,7 @@ from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
-from .schedule import SchedulePolicy
+from .schedule import SchedulePolicy, TraceAndReplayScheduler
 
 
 def _is_in_backward() -> bool:
@@ -74,6 +74,7 @@ class FsdpContext:
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         caller_managed_grad_sync: bool = False,
+        use_trace_replay: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -87,11 +88,13 @@ class FsdpContext:
                 ``fully_shard_context``.
             caller_managed_grad_sync: Disable the automatic autograd completion callback.
                 The caller must synchronize gradient reductions with ``finish_grad_sync()``.
+            use_trace_replay: Enable communication replay inside explicit iteration scopes.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
+        self.scheduler = TraceAndReplayScheduler() if use_trace_replay else None
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
@@ -149,6 +152,51 @@ class FsdpContext:
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
+
+    def begin_iteration(self) -> None:
+        """Begin a global batch after construction, before any module execution."""
+        self.ensure_finalized()
+        if self.scheduler is not None:
+            self.scheduler.begin_iteration()
+
+    def end_iteration(self) -> None:
+        """End a global batch after all backward work and before optimizer updates.
+
+        This boundary does not replace ``finish_grad_sync()`` for callers that
+        explicitly manage delayed gradient reductions.
+        """
+        if self.scheduler is not None:
+            self.scheduler.end_iteration()
+
+    @contextmanager
+    def iteration(self) -> Iterator[None]:
+        """Scope all microbatches of one global batch, including backward work.
+
+        Evaluation must use a separate iteration scope so its execution pattern
+        cannot be replayed without validation by the next training iteration.
+        All ranks must follow collective-compatible control flow; replay fallback
+        cannot undo speculative collectives on rank-divergent paths.
+
+        Example:
+            After constructing with ``use_trace_replay=True``, run each batch as::
+
+                optimizer.zero_grad()
+                with context.iteration():
+                    for index, inputs in enumerate(microbatches):
+                        with microbatch(context, is_last=index == len(microbatches) - 1):
+                            (model(inputs).sum() / len(microbatches)).backward()
+                    context.finish_grad_sync()
+                optimizer.step()
+        """
+        self.begin_iteration()
+        try:
+            yield
+        except BaseException:
+            if self.scheduler is not None:
+                self.scheduler.abort_iteration()
+            raise
+        else:
+            self.end_iteration()
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
@@ -453,6 +501,9 @@ class FsdpModule:
         performs that root sync in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
+            scheduler = self.context.scheduler
+            if scheduler is not None:
+                scheduler.record_unshard(self, prefetch)
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
@@ -460,7 +511,9 @@ class FsdpModule:
             self.context.current_stream().wait_event(self._unshard_event)
 
             context = self.context
-            if prefetch == "forward":
+            if scheduler is not None:
+                scheduler.prefetch(self, prefetch)
+            elif prefetch == "forward":
                 self._prefetch_parameter_groups(
                     context.forward_order, self._schedule_policy.forward_prefetch_size
                 )
@@ -517,6 +570,9 @@ class FsdpModule:
     def reshard(self) -> None:
         """Reshard this FsdpModule's parameter groups."""
         with self._nvtx_range("reshard"):
+            if self.context.scheduler is not None:
+                if self.context.scheduler.record_reshard(self):
+                    return
             self._reshard_parameter_groups()
 
     def _reshard_parameter_groups(self) -> None:
