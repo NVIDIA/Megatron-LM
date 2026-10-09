@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 
 import pytest
 import torch
@@ -10,6 +10,7 @@ from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
     CudaRNGStatesTracker,
+    _run_recompute_with_observation_suspended,
     checkpoint,
     convert_cuda_rng_state,
     cudagraph_needs_generator_registration,
@@ -445,3 +446,21 @@ def test_checkpoint_recompute_restores_forward_context(without_output):
         torch.testing.assert_close(x.grad, 3 * x.detach() ** 2)
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_recompute_restores_context_without_duplicate_observations():
+    observed = []
+    shared_scope = ContextVar("test_shared_scope", default=None)
+    token = shared_scope.set("shared-forward")
+    with capture_tensor_observations(lambda *args: observed.append(args), frozenset({"test"})):
+        saved_context = copy_context()
+    shared_scope.reset(token)
+
+    def recompute():
+        observe_tensor(None, "test", "test", torch.ones(1))
+        return shared_scope.get()
+
+    value = saved_context.copy().run(_run_recompute_with_observation_suspended, recompute)
+    assert value == "shared-forward"
+    assert observed == []
+    assert shared_scope.get() is None

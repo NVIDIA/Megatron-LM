@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Router hooks used by shared-prefix execution: routing kwargs, logical expert counts and
-fixed-row router GEMM blocks."""
+"""Router hooks used by shared-prefix execution: routing kwargs, logical expert counts,
+fixed-row router GEMM blocks and the router GEMM backward with frozen inputs."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -126,6 +126,16 @@ def test_expert_bias_counts_accumulate_in_place(dense_indices, padding):
     assert torch.equal(counts, 7 + (bool_routes * weights).sum(dim=0))
 
 
+def test_invalid_expert_count_metadata_rejected():
+    routes = torch.tensor([[0, 1], [1, 2]])
+    with pytest.raises(ValueError, match="one value per routed token"):
+        _expert_bias_token_counts(routes, token_multiplicities=torch.ones(3), num_experts=3)
+    with pytest.raises(ValueError, match="num_experts"):
+        _expert_bias_token_counts(routes, token_multiplicities=torch.ones(2))
+    with pytest.raises(ValueError, match="padding mask"):
+        _expert_bias_token_counts(routes, padding_mask=torch.zeros(3, dtype=torch.bool))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("with_padding", [False, True])
 def test_topk_router_expert_bias_counts_logical_tokens(with_padding):
@@ -170,6 +180,37 @@ def test_topk_router_expert_bias_counts_logical_tokens(with_padding):
         assert torch.equal(router.local_tokens_per_expert, expected)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "requires",
+    [(True, False, False), (False, True, False), (False, False, True), (True, True, True)],
+)
+@pytest.mark.parametrize("block_size", [None, 3])
+def test_router_frozen_parameters_preserve_requested_gradients(requires, block_size):
+    """The router GEMM backward computes only the gradients its inputs require."""
+    generator = torch.Generator().manual_seed(901)
+    values = [
+        torch.randn(shape, generator=generator, dtype=torch.float64)
+        for shape in [(7, 1, 5), (4, 5), (4,)]
+    ]
+    actual_inputs = [value.clone().requires_grad_(need) for value, need in zip(values, requires)]
+    reference_inputs = [value.clone().requires_grad_(need) for value, need in zip(values, requires)]
+    if block_size is None:
+        actual = router_gating_linear(*actual_inputs, torch.float64)
+    else:
+        with router_gating_token_blocks(block_size):
+            actual = router_gating_linear(*actual_inputs, torch.float64)
+    reference = torch.nn.functional.linear(*reference_inputs)
+    cotangent = torch.randn(actual.shape, generator=generator, dtype=torch.float64)
+    actual.backward(cotangent)
+    reference.backward(cotangent)
+    torch.testing.assert_close(actual, reference, rtol=1e-12, atol=1e-12)
+    for value, reference_value, need in zip(actual_inputs, reference_inputs, requires):
+        if need:
+            torch.testing.assert_close(value.grad, reference_value.grad, rtol=1e-12, atol=1e-12)
+        else:
+            assert value.grad is None
 
 
 def _blocked_reference(inp, weight, bias, block_size):
