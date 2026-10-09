@@ -744,8 +744,13 @@ def _validate_shared_prefix_physical_length(
 
 
 def _validate_hybrid_stack(
-    stack, hidden_states: Tensor, layout: SharedPrefixLayout | SharedPrefixForestLayout
+    stack, layout: SharedPrefixLayout | SharedPrefixForestLayout, *, physical_len: int
 ) -> None:
+    """Reject unsupported shared-prefix stack features before any layer executes.
+
+    Only the configuration, process groups, layer types and the global physical star length are
+    inspected, so a caller can run this before the embedding or any other partial forward.
+    """
     # New upstream features must not silently bypass their ordinary execution.
     # These combinations need dedicated shared-layout integrations and GPU tests.
     if getattr(stack.config, "moe_num_hash_layers", 0):
@@ -798,15 +803,6 @@ def _validate_hybrid_stack(
         raise NotImplementedError("shared-prefix Hybrid adapter does not support CUDA graphs")
     if stack.config.fp8 or stack.config.fp4:
         raise NotImplementedError("shared-prefix Hybrid adapter currently supports fp16/bf16 only")
-    if hidden_states.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError("fused shared-prefix attention requires fp16 or bf16 hidden states")
-    if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
-        raise ValueError(
-            "shared-prefix Hybrid input must have shape [sequence/(TP*CP), 1, hidden] "
-            "when sequence parallelism is enabled"
-        )
-    sequence_shards = tp_size if sequence_parallel else 1
-    physical_len = hidden_states.shape[0] * cp_size * sequence_shards
     _validate_shared_prefix_physical_length(
         layout, physical_len, tp_size=tp_size, cp_size=cp_size, sequence_parallel=sequence_parallel
     )
@@ -959,7 +955,19 @@ def forward_hybrid_stack_shared_prefix(
     function installs its scoped private forest descriptor. The descriptor is always removed in a
     ``finally`` block, including when a layer raises.
     """
-    _validate_hybrid_stack(stack, hidden_states, layout)
+    if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("fused shared-prefix attention requires fp16 or bf16 hidden states")
+    if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
+        raise ValueError(
+            "shared-prefix Hybrid input must have shape [sequence/(TP*CP), 1, hidden] "
+            "when sequence parallelism is enabled"
+        )
+    cp_group = stack.pg_collection.cp
+    tp_group = stack.pg_collection.tp
+    tp_size = tp_group.size()
+    sequence_shards = tp_size if stack.config.sequence_parallel else 1
+    physical_len = hidden_states.shape[0] * cp_group.size() * sequence_shards
+    _validate_hybrid_stack(stack, layout, physical_len=physical_len)
     has_attention = any(
         isinstance(layer, TransformerLayer) and isinstance(layer.self_attention, SelfAttention)
         for layer in stack.layers
@@ -973,11 +981,6 @@ def forward_hybrid_stack_shared_prefix(
     if position_embedding_type == "none" and rotary_pos_emb is not None:
         raise ValueError("positionless shared-prefix attention must not receive rotary_pos_emb")
 
-    cp_group = stack.pg_collection.cp
-    tp_group = stack.pg_collection.tp
-    tp_size = tp_group.size()
-    sequence_shards = tp_size if stack.config.sequence_parallel else 1
-    physical_len = hidden_states.shape[0] * cp_group.size() * sequence_shards
     token_multiplicities = None
     expert_bias_enabled = bool(getattr(stack.config, "moe_router_enable_expert_bias", False))
     if expert_bias_enabled:
