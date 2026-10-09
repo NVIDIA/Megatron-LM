@@ -428,7 +428,6 @@ def main():
     set_run_config(pretrain_cfg_container_from_args(args))
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args, training=True)
     initialize_megatron(training=True, skip_dependency_compilation=True)
 
