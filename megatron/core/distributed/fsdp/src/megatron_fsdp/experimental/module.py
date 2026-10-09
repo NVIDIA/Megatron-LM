@@ -287,6 +287,9 @@ class FsdpModule:
         performs that root sync in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
+            scheduler = self.context.scheduler
+            if scheduler is not None:
+                scheduler.record_unshard(self, prefetch)
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
@@ -294,7 +297,9 @@ class FsdpModule:
             self.context.current_stream().wait_event(self._unshard_event)
 
             context = self.context
-            if prefetch == "forward":
+            if scheduler is not None:
+                scheduler.prefetch(self, prefetch)
+            elif prefetch == "forward":
                 self._prefetch_parameter_groups(
                     context.forward_order, self._schedule_policy.forward_prefetch_size
                 )
@@ -352,6 +357,9 @@ class FsdpModule:
     def reshard(self) -> None:
         """Reshard this FsdpModule's parameter groups."""
         with self._nvtx_range("reshard"):
+            if self.context.scheduler is not None:
+                if self.context.scheduler.record_reshard(self):
+                    return
             self._reshard_parameter_groups()
 
     def _reshard_parameter_groups(self) -> None:

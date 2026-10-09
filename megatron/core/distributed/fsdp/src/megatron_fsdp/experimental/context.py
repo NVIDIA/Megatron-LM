@@ -14,6 +14,8 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from weakref import WeakKeyDictionary
 
@@ -21,6 +23,7 @@ import torch
 from torch import nn
 
 from .indexed_order import IndexedOrder
+from .schedule import TraceAndReplayScheduler
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -63,6 +66,7 @@ class FsdpContext:
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         caller_managed_grad_sync: bool = False,
+        use_trace_replay: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -83,6 +87,7 @@ class FsdpContext:
                 allowing delayed weight gradients or custom backward schedules. The caller must
                 call ``finish_grad_sync()`` after all backward work and before reading or
                 modifying gradients.
+            use_trace_replay: Enable communication replay inside explicit iteration scopes.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -95,6 +100,7 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
+        self.scheduler = TraceAndReplayScheduler() if use_trace_replay else None
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
@@ -187,6 +193,51 @@ class FsdpContext:
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
+
+    def begin_iteration(self) -> None:
+        """Begin a global batch after construction, before any module execution."""
+        self.ensure_finalized()
+        if self.scheduler is not None:
+            self.scheduler.begin_iteration()
+
+    def end_iteration(self) -> None:
+        """End a global batch after all backward work and before optimizer updates.
+
+        This boundary does not replace ``finish_grad_sync()`` for callers that
+        explicitly manage delayed gradient reductions.
+        """
+        if self.scheduler is not None:
+            self.scheduler.end_iteration()
+
+    @contextmanager
+    def iteration(self) -> Iterator[None]:
+        """Scope all microbatches of one global batch, including backward work.
+
+        Evaluation must use a separate iteration scope so its execution pattern
+        cannot be replayed without validation by the next training iteration.
+        All ranks must follow collective-compatible control flow; replay fallback
+        cannot undo speculative collectives on rank-divergent paths.
+
+        Example:
+            After constructing with ``use_trace_replay=True``, run each batch as::
+
+                optimizer.zero_grad()
+                with context.iteration():
+                    for index, inputs in enumerate(microbatches):
+                        with microbatch(context, is_last=index == len(microbatches) - 1):
+                            (model(inputs).sum() / len(microbatches)).backward()
+                    context.finish_grad_sync()
+                optimizer.step()
+        """
+        self.begin_iteration()
+        try:
+            yield
+        except BaseException:
+            if self.scheduler is not None:
+                self.scheduler.abort_iteration()
+            raise
+        else:
+            self.end_iteration()
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
