@@ -974,12 +974,18 @@ def forward_hybrid_stack_shared_prefix(
     *,
     rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
     position_embedding_type: str = "rope",
+    exclude_sequence_padding_from_expert_bias: bool = False,
 ) -> Tensor:
     """Explicit exact-prompt star forward for a supported ``HybridStack`` topology.
 
     Normal ``HybridStack.forward`` and ``Attention.forward`` behavior is unchanged unless this
     function installs its scoped private forest descriptor. The descriptor is always removed in a
     ``finally`` block, including when a layer raises.
+
+    ``exclude_sequence_padding_from_expert_bias`` states the caller's dense expert-bias
+    convention for per-branch padding rows. The default counts them, as a dense forward with
+    ``padding_mask=None`` does; ``True`` matches a dense caller that masks packed-sequence padding.
+    Trailing topology padding is never counted.
     """
     if hidden_states.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("fused shared-prefix attention requires fp16 or bf16 hidden states")
@@ -1013,11 +1019,7 @@ def forward_hybrid_stack_shared_prefix(
         token_multiplicities = layout.padded_token_multiplicities(
             physical_len,
             hidden_states.device,
-            # Match NeMo's dense get_packed_seq_padding_mask convention.
-            exclude_sequence_padding=(
-                getattr(stack.config, "moe_token_dispatcher_type", None) == "flex"
-                and getattr(stack.config, "moe_flex_dispatcher_backend", None) == "hybridep"
-            ),
+            exclude_sequence_padding=exclude_sequence_padding_from_expert_bias,
         )
         if cp_group.size() > 1:
             token_multiplicities = token_multiplicities.index_select(

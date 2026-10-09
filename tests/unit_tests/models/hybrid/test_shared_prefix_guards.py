@@ -172,6 +172,27 @@ def _moe_identity_layer(calls):
 _PADDED_LAYOUT = SharedPrefixLayout(3, (5, 1), logical_completion_lens=(3, 1), padding_multiple=4)
 
 
+@pytest.mark.parametrize("exclude", [None, False, True])
+@pytest.mark.parametrize("hybridep", [False, True])
+def test_expert_bias_padding_convention_is_caller_specified(exclude, hybridep):
+    config = _config(moe=True, moe_router_enable_expert_bias=True)
+    if hybridep:
+        config.moe_token_dispatcher_type = "flex"
+        config.moe_flex_dispatcher_backend = "hybridep"
+    calls = []
+    stack = _stack(config, [_moe_identity_layer(calls)])
+    kwargs = {} if exclude is None else {"exclude_sequence_padding_from_expert_bias": exclude}
+    hidden_states = torch.zeros(12, 1, 8, dtype=torch.bfloat16)
+    forward_hybrid_stack_shared_prefix(
+        stack, hidden_states, _PADDED_LAYOUT, position_embedding_type="none", **kwargs
+    )
+    # The dispatcher type no longer selects the convention; only the caller's flag does.
+    padding = 0.0 if exclude else 1.0
+    expected = torch.tensor([2, 2, 2, 1, 1, 1, padding, padding, 1, 0, 0, 0])
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0], expected, rtol=0, atol=0)
+
+
 def test_forward_rejects_unsupported_stack_before_running_layers():
     calls = []
     config = _config(
