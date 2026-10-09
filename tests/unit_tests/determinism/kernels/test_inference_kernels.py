@@ -132,10 +132,6 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
     rtol, atol, relative_l2 = (0.1, 0.03, 0.06) if precision == "mxfp8" else (0.02, 0.01, 0.02)
     difference = expected.float() - reference.float()
     error_l2 = torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(reference.float())
-    print(
-        f"ClampedRelu2 {precision} ep_rank={ep_rank}: "
-        f"max_abs={difference.abs().max().item():.6g} relative_l2={error_l2.item():.6g}"
-    )
     # CUTLASS returns BF16; MCore's unpermute returns FP32. Compare values in
     # FP32 without rounding the reference down or relaxing numerical tolerances.
     assert expected.dtype == torch.bfloat16

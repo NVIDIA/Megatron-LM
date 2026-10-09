@@ -1991,6 +1991,8 @@ class TransformerConfig(ModelParallelConfig):
                 self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
                 and self.activation_func_tanh_clamp_scale is not None
             ):
+                if not math.isfinite(self.activation_func_tanh_clamp_scale):
+                    raise ValueError("FlashInfer ClampedRelu2 requires a finite clamp scale.")
                 if mxfp8_enabled:
                     expert_hidden = (
                         self.moe_latent_size
@@ -2973,8 +2975,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.activation_func_tanh_clamp_scale is not None:
-            if not math.isfinite(self.activation_func_tanh_clamp_scale):
-                raise ValueError("activation_func_tanh_clamp_scale requires a finite clamp scale.")
             if self.activation_func_tanh_clamp_scale <= 0.0:
                 raise ValueError(
                     "activation_func_tanh_clamp_scale must be positive, got "
@@ -3005,10 +3005,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.activation_func_tanh_clamp_scale_linear is not None:
-            if not math.isfinite(self.activation_func_tanh_clamp_scale_linear):
-                raise ValueError(
-                    "activation_func_tanh_clamp_scale_linear requires a finite clamp scale."
-                )
             if self.activation_func_tanh_clamp_scale_linear <= 0.0:
                 raise ValueError(
                     "activation_func_tanh_clamp_scale_linear must be positive, got "

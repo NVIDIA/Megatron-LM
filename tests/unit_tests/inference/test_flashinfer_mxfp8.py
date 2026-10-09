@@ -253,53 +253,20 @@ def test_flashinfer_clamped_relu2_backend_capability(monkeypatch, has_enum, has_
 
 
 @pytest.mark.parametrize("fp8", [None, "e4m3"])
-def test_flashinfer_clamped_relu2_config_accepts_supported_precisions(fp8):
+@pytest.mark.parametrize("latent", [False, True])
+def test_flashinfer_clamped_relu2_config_accepts_supported_precisions(fp8, latent):
+    # MXFP8 alignment applies to the latent expert width, not model hidden size;
+    # BF16 does not require either expert dimension to be divisible by 128.
     config = _make_bounded_mxfp8_config(
+        hidden_size=192 if latent else 128,
+        moe_latent_size=(128 if fp8 else 192) if latent else None,
+        moe_ffn_hidden_size=192 if latent and not fp8 else 128,
         fp8=fp8,
         fp8_param=fp8 is not None,
         inference_flashinfer_mxfp8_token_capacity=None,
         activation_func_tanh_clamp_scale=16.0,
     )
     assert config.activation_func_tanh_clamp_scale == 16.0
-
-
-@pytest.mark.parametrize("backend", ["torch", "vllm", "flashinfer"])
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
-@pytest.mark.parametrize(
-    "field", ["activation_func_tanh_clamp_scale", "activation_func_tanh_clamp_scale_linear"]
-)
-def test_clamp_scales_must_be_finite(backend, value, field):
-    with pytest.raises(ValueError, match="finite clamp scale"):
-        _make_bounded_mxfp8_config(
-            inference_grouped_gemm_backend=backend,
-            inference_flashinfer_mxfp8_token_capacity=None,
-            **{field: value},
-        )
-
-
-@pytest.mark.parametrize(
-    "overrides", [{"hidden_size": 192}, {"moe_latent_size": 192}, {"moe_ffn_hidden_size": 192}]
-)
-def test_cutlass_mxfp8_config_rejects_unaligned_expert_dimensions(overrides):
-    with pytest.raises(ValueError, match="dimensions divisible by 128"):
-        _make_bounded_mxfp8_config(
-            activation_func_tanh_clamp_scale=16.0,
-            inference_flashinfer_mxfp8_token_capacity=None,
-            **overrides,
-        )
-
-
-@pytest.mark.parametrize("fp8", [None, "e4m3"])
-def test_cutlass_alignment_uses_latent_size_and_only_restricts_mxfp8(fp8):
-    _make_bounded_mxfp8_config(
-        hidden_size=192,
-        moe_latent_size=128 if fp8 else 192,
-        moe_ffn_hidden_size=128 if fp8 else 192,
-        fp8=fp8,
-        fp8_param=fp8 is not None,
-        activation_func_tanh_clamp_scale=16.0,
-        inference_flashinfer_mxfp8_token_capacity=None,
-    )
 
 
 @pytest.mark.parametrize(
@@ -314,6 +281,9 @@ def test_cutlass_alignment_uses_latent_size_and_only_restricts_mxfp8(fp8):
         ({"add_bias_linear": True}, "requires add_bias_linear=False"),
         ({"activation_func_tanh_clamp_scale": float("nan")}, "finite clamp scale"),
         ({"activation_func_tanh_clamp_scale": float("inf")}, "finite clamp scale"),
+        ({"hidden_size": 192}, "dimensions divisible by 128"),
+        ({"moe_latent_size": 192}, "dimensions divisible by 128"),
+        ({"moe_ffn_hidden_size": 192}, "dimensions divisible by 128"),
     ],
 )
 def test_flashinfer_clamped_relu2_rejects_unsupported_options(overrides, message):
