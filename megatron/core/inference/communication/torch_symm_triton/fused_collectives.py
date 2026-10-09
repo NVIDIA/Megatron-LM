@@ -144,16 +144,19 @@ def _multimem_reduce_scatter_residual_add_kernel(
     numel_per_rank = tokens_per_rank * numel_per_token
 
     # each program handles 1 token at a time
-    program_offset = pid * numel_per_token
-    thread_mask = tid < numel_per_token
-
     for token_offset in range(pid, tokens_per_rank, tl.num_programs(axis=0)):
         # Step 1: - reduce-scatter + residual add for this token + collect sq sum
         program_offset = token_offset * numel_per_token
         sq_sum_ = 0.0
         for thread_offset in range(0, numel_per_token, BLOCK_SIZE):
             offsets = program_offset + thread_offset + tid
-            mask = (offsets < numel_per_rank) & (thread_mask)
+
+            # BLOCK_SIZE is sized from the whole per-rank shard, capped at 1024.
+            #   if BLOCK_SIZE > numel_per_token -   deactivates the extra threads.
+            #   if BLOCK_SIZE < numel_per_token -   deactivates threads of the last window
+            #                                       [thread_offset, thread_offset + BLOCK_SIZE)
+            #                                       that fall past the end of the row
+            mask = thread_offset + tid < numel_per_token
             multicast_ptrs = (
                 multicast_ptr.to(tl.pointer_type(tl.uint64)) + (RANK * numel_per_rank + offsets) * 2
             )
@@ -180,7 +183,7 @@ def _multimem_reduce_scatter_residual_add_kernel(
             offsets = program_offset + thread_offset + tid
             # first offset is a token offset
             # second offset is a hidden-dim offset (in units of 128-bit)
-            mask = (offsets < numel_per_rank) & (thread_mask)
+            mask = thread_offset + tid < numel_per_token
 
             multicast_ptrs = (
                 multicast_ptr.to(tl.pointer_type(tl.uint64)) + (RANK * numel_per_rank + offsets) * 2
