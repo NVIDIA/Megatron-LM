@@ -8,10 +8,9 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 # Ship only megatron.rl's dependency-free shared-prefix packing API (plus its
 # lazy package __init__) in built wheels. The RL runtime (rl_utils, agent,
-# inference, server) needs undeclared dependencies, and shipping it would turn
-# on megatron.training's guarded RL import for every wheel user. This narrowing
-# applies to wheel installs only: an editable install maps the whole
-# megatron/rl directory, so the full package (and that import) stays visible.
+# inference, server) needs undeclared dependencies. This narrowing applies to
+# wheel installs only: an editable install maps the whole megatron/rl directory.
+# megatron.training imports the RL runtime only for RL runs in either case.
 py-modules = [
     "megatron.rl.generation_api",
     "megatron.rl.shared_prefix_alignment",
@@ -155,6 +154,9 @@ te = [
 ]
 
 ssm = [
+    # The default shared-prefix Mamba backend (ragged_state_fork) calls private mamba_ssm SSD
+    # kernels; it was validated with mamba-ssm 2.3.2.post1. Shared-prefix validation fails early
+    # when they cannot be imported; NRL_SP_MAMBA_IMPL=state_fork uses only the public API.
     "mamba-ssm",
     "causal-conv1d~=1.5",
     "flash-linear-attention==0.5.1",
