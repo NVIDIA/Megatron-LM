@@ -30,9 +30,12 @@ from megatron.core.utils import is_fa_min_version
 # its ``window_size_left``/``window_size_right`` arguments first appear in flash-attn 2.7.0.
 _MIN_FLASH_ATTN_VERSION = "2.7.0"
 
-# Cache pass plans because the same packed layout recurs across model layers.
+# Plans recur across layers and across the logprob, reference and training passes of a step.
+# Entries hold device index tensors, so the cache is bounded by their bytes (least recently used
+# entries are evicted first) as well as by count.
 _PLAN_CACHE: dict = {}
-_PLAN_CACHE_MAX = 128
+_PLAN_CACHE_MAX_ENTRIES = 128
+_PLAN_CACHE_MAX_BYTES = 64 * 2**20
 
 
 def _gather_kv(k, v, k_idx):
@@ -51,9 +54,10 @@ def _forest_key(forest):
 def _star_forest_plan(forest, device):
     """Decompose a normalized star forest into the FlashAttention passes it runs.
 
-    Returns ``(total, passes)``. Each pass is ``(rows, k_idx, cu_q, cu_k, max_q, max_k, causal)``:
-    query rows ``q[rows]`` attend the keys ``k`` (``k_idx is None``) or ``k[k_idx]`` as varlen
-    sequences.
+    Returns ``(total, passes, nbytes)``. Each pass is
+    ``(rows, k_idx, cu_q, cu_k, max_q, max_k, causal)``: query rows ``q[rows]`` attend the keys
+    ``k`` (``k_idx is None``) or ``k[k_idx]`` as varlen sequences. ``nbytes`` counts the device
+    index tensors.
 
     - Self pass (causal, every row): the prompt and its first completion are adjacent, so they
       form one causal sequence; every other completion is its own causal sequence.
@@ -96,30 +100,41 @@ def _star_forest_plan(forest, device):
         max_q = max(max_q, q1 - q0)
         cursor = q1
 
-    cu = torch.tensor(cu_self + cu_q + cu_k, dtype=torch.int32, device=device)
+    # Copy all index data with non-blocking transfers from pinned memory; a pageable copy would
+    # synchronize the host with the device on every cache miss.
+    pin = device.type == "cuda"
+    cu = torch.tensor(cu_self + cu_q + cu_k, dtype=torch.int32, pin_memory=pin)
+    cu = cu.to(device, non_blocking=True)
+    nbytes = cu.numel() * cu.element_size()
     self_cu = cu[: len(cu_self)]
     max_self = max(self_lens)
     passes = [(slice(0, end), None, self_cu, self_cu, max_self, max_self, True)]
     if cross:
-        k_idx = torch.cat([torch.arange(k0, k1, device=device) for _, _, k0, k1 in cross])
+        k_idx = torch.empty(cu_k[-1], dtype=torch.long, pin_memory=pin)
+        torch.cat([torch.arange(k0, k1) for _, _, k0, k1 in cross], out=k_idx)
+        k_idx = k_idx.to(device, non_blocking=True)
+        nbytes += k_idx.numel() * k_idx.element_size()
         cross_cu_q = cu[len(cu_self) : len(cu_self) + len(cu_q)]
         cross_cu_k = cu[len(cu_self) + len(cu_q) :]
         max_k = max(k1 - k0 for _, _, k0, k1 in cross)
         rows = slice(cross[0][0], cross[-1][1])
         passes.append((rows, k_idx, cross_cu_q, cross_cu_k, max_q, max_k, False))
-    return end, passes
+    return end, passes, nbytes
 
 
 def _star_forest_plan_cached(forest, device):
-    """Return ``(total, passes)`` for ``forest``, reusing plans across layers."""
+    """Return ``(total, passes)`` for ``forest``, reusing plans across layers and passes."""
     key = (_forest_key(forest), str(device))
-    plan = _PLAN_CACHE.get(key)
+    plan = _PLAN_CACHE.pop(key, None)
     if plan is None:
         plan = _star_forest_plan(key[0], torch.device(device))
-        if len(_PLAN_CACHE) >= _PLAN_CACHE_MAX:
-            _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
-        _PLAN_CACHE[key] = plan
-    return plan
+    _PLAN_CACHE[key] = plan  # (re)insert as the most recently used entry
+    held = sum(entry[2] for entry in _PLAN_CACHE.values())
+    while len(_PLAN_CACHE) > 1 and (
+        len(_PLAN_CACHE) > _PLAN_CACHE_MAX_ENTRIES or held > _PLAN_CACHE_MAX_BYTES
+    ):
+        held -= _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))[2]
+    return plan[0], plan[1]
 
 
 def _flash_attn_varlen_backward(**kwargs):

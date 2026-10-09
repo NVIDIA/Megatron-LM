@@ -169,6 +169,31 @@ def test_old_flash_attention_is_rejected_before_attention(attention, monkeypatch
         attention.flash_composed_forest_attention(query, query, query, [(0, 4, [4])])
 
 
+def test_plan_cache_evicts_least_recently_used_plans_by_bytes(attention, monkeypatch):
+    """Cached plans stay within the byte and entry budgets; hits refresh recency."""
+    cpu = torch.device("cpu")
+    first, second, third = (_stars((8, lengths)) for lengths in ([4, 5, 6], [5, 4, 6], [6, 5, 4]))
+    size = attention._star_forest_plan(attention._forest_key(first), cpu)[2]
+    monkeypatch.setattr(attention, "_PLAN_CACHE_MAX_BYTES", 2 * size)
+    for forest in (first, second, first, third):  # the hit on `first` refreshes it
+        attention._star_forest_plan_cached(forest, cpu)
+    assert [key for key, _ in attention._PLAN_CACHE] == [
+        attention._forest_key(forest) for forest in (first, third)
+    ]
+
+    monkeypatch.setattr(attention, "_PLAN_CACHE_MAX_BYTES", 0)
+    attention._star_forest_plan_cached(second, cpu)  # a plan above the budget is still kept
+    assert [key for key, _ in attention._PLAN_CACHE] == [attention._forest_key(second)]
+
+    monkeypatch.setattr(attention, "_PLAN_CACHE_MAX_BYTES", 2**30)
+    monkeypatch.setattr(attention, "_PLAN_CACHE_MAX_ENTRIES", 2)
+    for forest in (first, third):
+        attention._star_forest_plan_cached(forest, cpu)
+    assert [key for key, _ in attention._PLAN_CACHE] == [
+        attention._forest_key(forest) for forest in (first, third)
+    ]
+
+
 def _qkv(tokens, dtype, *, heads=8, kv_heads=2, dim=64, strided=True):
     """Use K/V views from an interleaved grouped QKV projection, as the backbone does."""
     width = heads // kv_heads
