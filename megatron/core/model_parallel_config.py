@@ -97,12 +97,6 @@ class ModelParallelConfig:
        (https://arxiv.org/abs/2205.05198) for more details.
     """
 
-    deterministic_tp_reduce_scatter: bool = False
-    """Use fixed-order FP32 accumulation for non-expert TE row-parallel outputs.
-       Requires sequence parallelism, unquantized GEMMs, and no TP communication
-       overlap or weight rematerialization. Changes rounding versus NCCL SUM.
-    """
-
     context_parallel_size: int = 1
     """Splits network input along sequence dimension across GPU ranks."""
 

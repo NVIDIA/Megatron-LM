@@ -1432,13 +1432,6 @@ class TransformerConfig(ModelParallelConfig):
     is_hybrid_model: bool = False
     """ Indicates whether this is a hybrid model. """
 
-    sequence_relative_kernels: bool = False
-    """Experimental common numerical baseline for dense and shared-prefix execution.
-    Use sequence-relative Mamba scan chunks and full-context causal attention.
-    Requires deterministic_tp_reduce_scatter and causal, dropout-free vanilla attention.
-    Changes rounding relative to the native packed Mamba and TE ring kernels.
-    """
-
     mamba_state_dim: int = 128
     """The dimensionality of the state representation in Mamba layers."""
 
@@ -1677,24 +1670,6 @@ class TransformerConfig(ModelParallelConfig):
                     "The fine-grained EP-overlap schedule invokes the pre-MLP norm and MLP BDA "
                     "outside TransformerLayer._forward_mlp, bypassing the wide-residual MLP "
                     "read and write connection."
-                )
-
-        if self.sequence_relative_kernels:
-            if not self.deterministic_tp_reduce_scatter:
-                raise ValueError(
-                    "sequence_relative_kernels requires deterministic_tp_reduce_scatter"
-                )
-            if (
-                self.attention_dropout != 0
-                or self.window_size is not None
-                or self.qk_clip
-                or self.log_max_attention_logit
-                or self.softmax_type != "vanilla"
-                or self.attn_logit_softcapping is not None
-            ):
-                raise ValueError(
-                    "sequence_relative_kernels requires dropout-free vanilla attention without "
-                    "windowing, QK clipping, logit softcapping, or maximum-logit statistics"
                 )
 
         # Resolve deprecated attention variant spellings up front so that every consumer

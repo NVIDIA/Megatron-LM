@@ -1652,16 +1652,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         shared_prefix_forest,
                         cp_group=self.pg_collection.cp,
                         scale=softmax_scale,
-                        full_context=self.config.sequence_relative_kernels,
                     )
                 else:
                     core_attn_out = flash_composed_forest_attention(
-                        query,
-                        key,
-                        value,
-                        shared_prefix_forest,
-                        scale=softmax_scale,
-                        full_context=self.config.sequence_relative_kernels,
+                        query, key, value, shared_prefix_forest, scale=softmax_scale
                     )
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]

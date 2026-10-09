@@ -12,7 +12,6 @@ No CUDA compute or communication implementation is substituted.
 import itertools
 import runpy
 from contextlib import contextmanager
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -328,79 +327,5 @@ def test_shared_prefix_cp_replays_and_matches_reference(
             _collective_check(
                 lambda: _check_reference(
                     result, reference_inputs, reference_output, cotangent, shard=shard
-                )
-            )
-
-
-@_CUDA
-@pytest.mark.launch_on_gb200
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("padded", [False, True])
-@pytest.mark.parametrize("heads,kv_heads", [(8, 2), (8, 8)])
-def test_sequence_relative_dispatch_replays_and_matches_reference(
-    attention, dtype, padded, heads, kv_heads
-):
-    """Exercise the public dispatch, packed-group override and padded-boundary selection."""
-    from megatron.core.models.hybrid import sequence_relative_attention
-    from megatron.core.packed_seq_params import PackedSeqParams
-    from megatron.core.transformer.enums import AttnMaskType
-
-    seeded()
-    inputs = _qkv(320, dtype, heads=heads, kv_heads=kv_heads)
-    reference_inputs = tuple(tensor.detach().float().requires_grad_() for tensor in inputs)
-    lengths, starts, parents = [128, 192], [0, 128], [-1, -1]
-    cotangent = torch.randn(320, 1, heads * 64, device="cuda", dtype=dtype)
-    cu = torch.tensor([0, 128, 320], device="cuda", dtype=torch.int32)
-    logical_cu = torch.tensor([0, 120, 300], device="cuda", dtype=torch.int32) if padded else cu
-    with _cp_groups() as groups, deterministic_algorithms(True):
-        for size in (1, 2, 4):
-            group = groups[size]
-            packed = PackedSeqParams(
-                qkv_format="thd",
-                cu_seqlens_q=logical_cu,
-                cu_seqlens_kv=logical_cu,
-                cu_seqlens_q_padded=cu if padded else None,
-                cu_seqlens_kv_padded=cu if padded else None,
-                max_seqlen_q=192,
-                max_seqlen_kv=192,
-                cp_group=group,
-            )
-            owner = SimpleNamespace(
-                cp_group=groups[1],
-                config=SimpleNamespace(
-                    attention_dropout=0,
-                    window_size=None,
-                    qk_clip=False,
-                    log_max_attention_logit=False,
-                    softmax_type="vanilla",
-                    softmax_scale=64**-0.5,
-                ),
-            )
-
-            def shard(tensor):
-                return _zigzag_shard(tensor, lengths, size, group.rank())
-
-            local = tuple(shard(tensor)[:, 0].detach().requires_grad_() for tensor in inputs)
-
-            def operation(q, k, v):
-                return sequence_relative_attention.sequence_relative_attention_forward(
-                    owner, q, k, v, None, AttnMaskType.causal, packed_seq_params=packed
-                ).unsqueeze(1)
-
-            result = _collective_replays(
-                operation,
-                local,
-                shard(cotangent),
-                what=f"sequence-relative public dispatch CP{size}/{dtype}",
-            )
-            reference_output = _reference(*reference_inputs, starts, lengths, parents)
-            # Native THD inputs have no singleton batch dimension.
-            adjusted_result = (
-                result[0],
-                {key: value.unsqueeze(1) for key, value in result[1].items()},
-            )
-            _collective_check(
-                lambda: _check_reference(
-                    adjusted_result, reference_inputs, reference_output, cotangent, shard=shard
                 )
             )

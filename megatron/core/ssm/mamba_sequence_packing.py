@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Experimental packed Mamba with a sequence-relative scan chunk grid."""
+"""Experimental packed Mamba recurrence with each sequence aligned to a scan chunk."""
 
 from functools import lru_cache
 from itertools import accumulate
@@ -9,7 +9,6 @@ import torch
 from causal_conv1d import causal_conv1d_fn
 from einops import rearrange
 
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_mixer import (
     MAMBA_HAS_STATE_DTYPE,
     MambaMixer,
@@ -36,50 +35,6 @@ def aligned_indices(
         output_size=starts[-1],
     )[None]
     return real, sequence_ids, starts[-1]
-
-
-def mamba_sequence_relative_scan(
-    mixer: MambaMixer,
-    projected: torch.Tensor,
-    packed_seq_params: PackedSeqParams | None = None,
-    *,
-    local_gate: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Pad only the internal recurrence layout, then restore original CP positions.
-
-    Every sequence begins on a scan chunk boundary. The convolution still uses
-    sequence IDs to reset its causal context. Tail padding has no path back to
-    real outputs; attention and the surrounding model retain the original layout.
-    This is a new numerical reference, not an emulation of stock packed Mamba.
-    """
-    if not mixer.rmsnorm or mixer.norm_before_gate:
-        raise ValueError("sequence-relative Mamba requires RMSNorm after gating")
-    if projected.ndim != 3 or projected.shape[1] != 1:
-        raise ValueError("sequence-relative Mamba requires packed [sequence, 1, projection] input")
-    if packed_seq_params is None:
-        lengths = (projected.shape[0],)
-    else:
-        assert packed_seq_params.qkv_format == "thd"
-        cu = packed_seq_params.cu_seqlens_q_padded
-        if cu is None:
-            cu = packed_seq_params.cu_seqlens_q
-        lengths = tuple((cu[1:] - cu[:-1]).tolist())
-    assert sum(lengths) == projected.shape[0] and min(lengths) > 0
-    cp = mixer.cp
-    dim = cp.d_inner_local_tpcp
-    if local_gate is None:
-        gate = projected[..., :dim]
-        recurrent = projected[..., dim:]
-    else:
-        gate = local_gate
-        recurrent = projected
-    y = scan_mamba_packed_recurrence(mixer, recurrent, lengths)
-    y = cp.post_conv_ssm(y, packed_seq_params)
-    if local_gate is None:
-        gate = cp.post_conv_ssm(gate.contiguous(), packed_seq_params)
-    if gate.shape != y.shape:
-        raise ValueError("Mamba gate must match the restored local output layout")
-    return mixer.norm(y, gate)
 
 
 def scan_mamba_packed_recurrence(

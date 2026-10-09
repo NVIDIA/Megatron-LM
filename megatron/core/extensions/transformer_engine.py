@@ -42,9 +42,6 @@ from megatron.core.tensor_parallel.layers import (
     set_tensor_model_parallel_attributes,
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
-from megatron.core.tensor_parallel.ordered_reduce_scatter import (
-    ordered_reduce_scatter_to_sequence_parallel_region,
-)
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -2060,28 +2057,6 @@ class TERowParallelLinear(TELinear):
         self._tp_group = tp_group
         gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
 
-        self._ordered_tp_reduce_scatter = (
-            config.deterministic_tp_reduce_scatter and not is_expert and tp_group.size() > 1
-        )
-        self._ordered_reduce_add_bias = (
-            self._ordered_tp_reduce_scatter and bias and not skip_bias_add
-        )
-        if self._ordered_tp_reduce_scatter:
-            if not config.sequence_parallel:
-                raise ValueError("deterministic TP reduce-scatter requires sequence parallelism")
-            if config.tp_comm_overlap or config.symmetric_ar_type is not None:
-                raise ValueError(
-                    "deterministic TP reduce-scatter does not support TP communication overlap"
-                )
-            if config.fp8 or config.fp4 or config.quant_recipe is not None:
-                raise ValueError(
-                    "deterministic TP reduce-scatter requires unquantized linear layers"
-                )
-            if config.gtp_weight_remat_size != 1:
-                raise ValueError(
-                    "deterministic TP reduce-scatter does not support weight rematerialization"
-                )
-
         super().__init__(
             input_size=input_size,
             output_size=output_size,
@@ -2093,7 +2068,7 @@ class TERowParallelLinear(TELinear):
                 else lambda w: None
             ),
             bias=bias,
-            skip_bias_add=True if self._ordered_tp_reduce_scatter else skip_bias_add,
+            skip_bias_add=skip_bias_add,
             skip_weight_param_allocation=False,
             # We don't currently use this for row parallel layers # pylint: disable=line-too-long
             is_expert=is_expert,
@@ -2104,11 +2079,6 @@ class TERowParallelLinear(TELinear):
             gtp_remat_group=gtp_remat_group,
             gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
         )
-        if self._ordered_tp_reduce_scatter:
-            # Initialize as row-parallel to preserve weight sharding, RNG, and
-            # checkpoint attributes. Disable TE communication once, before any
-            # forward; our autograd reduction owns the matching backward gather.
-            self.parallel_mode = None
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
             rank = get_pg_rank(tp_group)
@@ -2142,18 +2112,6 @@ class TERowParallelLinear(TELinear):
                 or config.expert_gtp_weight_remat_size != config.gtp_weight_remat_size
             )
             _set_expert_parameter_attributes(self, "row", use_expert_pgs)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Apply the local GEMM, then the configured sequence-parallel reduction."""
-        output, bias = super().forward(x)
-        if self._ordered_tp_reduce_scatter:
-            output = ordered_reduce_scatter_to_sequence_parallel_region(
-                output, group=self._tp_group
-            )
-            if self._ordered_reduce_add_bias:
-                output = output + bias
-                bias = None
-        return output, bias
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
@@ -2485,28 +2443,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Run TE attention after the runtime CP binding has been installed."""
-        if self.config.sequence_relative_kernels:
-            if bf16_backward:
-                raise NotImplementedError(
-                    "sequence-relative attention does not support a BF16-backward override"
-                )
-            # This optional backend imports FlashAttention only when explicitly enabled.
-            from megatron.core.models.hybrid.sequence_relative_attention import (
-                sequence_relative_attention_forward,
-            )
-
-            return sequence_relative_attention_forward(
-                self,
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type,
-                attention_bias,
-                packed_seq_params,
-                num_splits,
-            )
-
         if packed_seq_params is not None:
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
