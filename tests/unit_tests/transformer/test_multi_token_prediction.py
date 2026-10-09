@@ -3885,6 +3885,7 @@ class TestMultiTokenPredictionHybrid:
 
         assert prepared.hidden_states is hidden_states
         assert prepared.packed_seq_params is packed_seq_params
+        assert prepared.cp_partition_mode == "contiguous"
 
     @pytest.mark.parametrize("compute_mtp_loss", [True, False])
     def test_compute_mtp_loss_does_not_control_speculative_decoding(

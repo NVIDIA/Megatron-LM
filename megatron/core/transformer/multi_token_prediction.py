@@ -2395,6 +2395,7 @@ class MultiTokenPredictionInputs:
     loss_mask: Optional[Tensor]
     mtp_input_mask: Optional[Tensor]
     packed_seq_params: Optional[PackedSeqParams]
+    cp_partition_mode: Optional[CPLayout] = None
 
 
 def _get_mtp_block_submodules(
@@ -2627,6 +2628,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             loss_mask=loss_mask,
             mtp_input_mask=mtp_input_mask,
             packed_seq_params=packed_seq_params,
+            cp_partition_mode=target_layout,
         )
 
     def _build_layers(self, pg_collection):
