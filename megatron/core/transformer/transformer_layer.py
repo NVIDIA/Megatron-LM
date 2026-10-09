@@ -1820,16 +1820,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 # one full-length sequence (covers the worst case at capture):
                 #   cu_seqlens = [0, max_T, max_T, ..., max_T]
                 # which represents a single packed sequence followed by zero-length
-                # entries. cu_seqlens_q / kv / *_padded all share this layout.
+                # entries. Pipeline prewarm aliases Q/K metadata because fused DSA
+                # scoring recognizes self-attention through tensor identity. CUDA Graph
+                # capture retains independent buffers so replay can update them separately.
                 max_T = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
                 max_num_seqs = self.config.thd_max_packed_sequences or 1
                 cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
                 cu_seqlens[1:] = max_T
 
                 static_inputs["cu_seqlens_q"] = cu_seqlens
-                static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
-                static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
-                static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
+                if for_pipeline_prewarm:
+                    padded_cu_seqlens = cu_seqlens.clone()
+                    static_inputs["cu_seqlens_kv"] = cu_seqlens
+                    static_inputs["cu_seqlens_q_padded"] = padded_cu_seqlens
+                    static_inputs["cu_seqlens_kv_padded"] = padded_cu_seqlens
+                else:
+                    static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
+                    static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
+                    static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
                 if self._uses_graph_dynamic_dsa_route():
                     from megatron.core.transformer.experimental_attention_variant import (
                         cp_balanced_indexer,
