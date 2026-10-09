@@ -10,6 +10,7 @@ replicas by another grid's DP ranks, so several ranks or none wrote each shard.
 from unittest import mock
 
 import pytest
+import torch
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.dict_utils import nested_values
@@ -19,7 +20,14 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import utils as transformer_utils
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_tensors_for_checkpoint,
+)
+from megatron.core.utils import (
+    make_sharded_tensor_for_checkpoint,
+    make_tp_sharded_tensor_for_checkpoint,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -112,3 +120,35 @@ class TestModulesSupplyTheirOwnDpCpGroup:
 
         assert shard_ids(block_sharded_state_dict) == expected_block
         assert shard_ids(mlp_sharded_state_dict) == expected_mlp
+
+
+class TestTensorParallelGroupNeedsADpCpGroup:
+    """A TP group alone is a caller error; a DP x CP group alone means "not tensor-parallel"."""
+
+    def setup_method(self, method):
+        if Utils.world_size % 2 != 0:
+            pytest.skip("needs TP=2")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_tp_group_without_dp_cp_group_raises(self):
+        tensor = torch.zeros(4, 4, device='cuda')
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+
+        with pytest.raises(ValueError, match="dp_cp_group"):
+            make_sharded_tensors_for_checkpoint({'w': tensor}, '', {'w': 0}, tp_group=tp_group)
+        with pytest.raises(ValueError, match="dp_cp_group"):
+            make_tp_sharded_tensor_for_checkpoint(tensor, 'w', 0, tp_group=tp_group)
+        with pytest.raises(ValueError, match="dp_cp_group"):
+            make_sharded_tensor_for_checkpoint(tensor, 'w', tp_group=tp_group)
+
+    def test_dp_cp_group_alone_is_not_tensor_parallel(self):
+        tensor = torch.zeros(4, 4, device='cuda')
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+        sharded = make_tp_sharded_tensor_for_checkpoint(tensor, 'w', 0, dp_cp_group=dp_cp_group)
+
+        assert sharded.global_shape == (4, 4)
+        assert sharded.replica_id == (0, 0, dp_cp_group.rank())

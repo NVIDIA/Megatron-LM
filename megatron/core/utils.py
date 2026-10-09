@@ -1068,9 +1068,14 @@ def make_tp_sharded_tensor_for_checkpoint(
         replica_id: Replica ID for the tensor (default: None)
         prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
         **kwargs: Additional arguments. May include:
-            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
-            - dp_cp_group: Data parallel + context parallel group
-              (default: None, falls back to parallel_state)
+            - tp_group: Tensor parallel group. None with a dp_cp_group means the tensor is
+              not tensor-parallel (default: None, falls back to parallel_state when
+              dp_cp_group is None too)
+            - dp_cp_group: Data parallel + context parallel group, required with a tp_group
+              (default: None, falls back to parallel_state when tp_group is None too)
+
+    Raises:
+        ValueError: If tp_group is given without dp_cp_group.
     """
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
@@ -1084,6 +1089,11 @@ def make_tp_sharded_tensor_for_checkpoint(
     if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    elif dp_cp_group is None:
+        raise ValueError(
+            "A tp_group without a dp_cp_group would make every data-parallel rank the main "
+            f"replica of '{key}'; pass both, or neither to use the global groups"
+        )
 
     # Use local get_pg_rank and get_pg_size functions
     tp_rank = get_pg_rank(tp_group)
@@ -1273,9 +1283,14 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
         replica_id: Replica ID for the tensor (default: None)
         **kwargs: Additional arguments. May include:
-            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
-            - dp_cp_group: Data parallel + context parallel group
-              (default: None, falls back to parallel_state)
+            - tp_group: Tensor parallel group. None with a dp_cp_group means the tensor is
+              not tensor-parallel (default: None, falls back to parallel_state when
+              dp_cp_group is None too)
+            - dp_cp_group: Data parallel + context parallel group, required with a tp_group
+              (default: None, falls back to parallel_state when tp_group is None too)
+
+    Raises:
+        ValueError: If tp_group is given without dp_cp_group.
     """
     # Sanity guard.
     from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
@@ -1301,6 +1316,11 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    elif dp_cp_group is None:
+        raise ValueError(
+            "A tp_group without a dp_cp_group would make every data-parallel rank the main "
+            f"replica of '{key}'; pass both, or neither to use the global groups"
+        )
 
     # Use local get_pg_rank and get_pg_size functions
     dp_rank = get_pg_rank(dp_cp_group)

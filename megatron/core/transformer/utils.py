@@ -175,11 +175,16 @@ def make_sharded_tensors_for_checkpoint(
         extra_state_suffix (str, default = '_extra_state'): layers with this
             suffix will be wrapped with ShardedObject instead of ShardedTensor.
         tp_group (Optional[torch.distributed.ProcessGroup], optional): tensor parallel group.
-            If None, defaults to parallel_state.get_tensor_model_parallel_group()
+            None with a `dp_cp_group` means the tensors are not tensor-parallel. If both groups
+            are None, defaults to parallel_state.get_tensor_model_parallel_group()
         dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): data parallel group
-            with context parallel. If None, defaults to
+            with context parallel that replica ids are computed over. Required with a
+            `tp_group`. If both groups are None, defaults to
             parallel_state.get_data_parallel_group(with_context_parallel=True)
 
+    Raises:
+        ValueError: If `tp_group` is given without `dp_cp_group`. Every data-parallel rank
+            would otherwise claim to be the main replica of each shard.
     """
 
     if tensor_parallel_layers_axis_map is None:
@@ -188,6 +193,11 @@ def make_sharded_tensors_for_checkpoint(
     if tp_group is None and dp_cp_group is None:
         tp_group = get_tensor_model_parallel_group_if_none(tp_group)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    elif dp_cp_group is None:
+        raise ValueError(
+            "make_sharded_tensors_for_checkpoint got a tp_group without a dp_cp_group; pass "
+            "both, or neither to use the global groups"
+        )
 
     # GTP-sharded weights need the GTP axis layered onto the TP/DP offsets. The GTP helper
     # is a no-op for non-GTP state_dicts, but importing it eagerly would be circular, so
