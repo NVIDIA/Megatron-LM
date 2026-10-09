@@ -15,26 +15,14 @@
 import pytest
 
 from megatron.rl.shared_prefix_metadata import (
-    make_repeated_group_ids,
     plan_fixed_execution_slots,
     plan_group_coherent_shards,
 )
 
 
-def test_make_repeated_group_ids_matches_repeat_interleave_order() -> None:
-    assert make_repeated_group_ids(num_rows=6, group_size=3, namespace="step-7") == [
-        "step-7:0",
-        "step-7:0",
-        "step-7:0",
-        "step-7:1",
-        "step-7:1",
-        "step-7:1",
-    ]
-
-
 def test_single_completion_groups_keep_dense_fallback_rows_and_order() -> None:
     """PPO may sample one answer per prompt; no row may disappear."""
-    groups = make_repeated_group_ids(num_rows=4, group_size=1, namespace="ppo")
+    groups = ["ppo:0", "ppo:1", "ppo:2", "ppo:3"]
     lengths = [9, 8, 2, 1]
     slots = plan_fixed_execution_slots(
         group_ids=groups, sequence_lengths=lengths, bin_capacity=12, sequence_length_pad_multiple=4
@@ -66,12 +54,6 @@ def test_slot_planning_rejects_a_non_integer_pad_multiple(pad_multiple) -> None:
             bin_capacity=16,
             sequence_length_pad_multiple=pad_multiple,
         )
-
-
-@pytest.mark.parametrize("num_rows, group_size", [(3, 2), (2, 0), (-2, 2)])
-def test_make_repeated_group_ids_rejects_invalid_shape(num_rows: int, group_size: int) -> None:
-    with pytest.raises(ValueError):
-        make_repeated_group_ids(num_rows=num_rows, group_size=group_size, namespace="batch")
 
 
 def test_group_coherent_shards_balance_work_without_splitting_groups() -> None:

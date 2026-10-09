@@ -82,7 +82,6 @@ NEMO_RL_CONTRACT = {
         "FixedExecutionSlotPlan": None,
         "GroupCoherentShardPlan": None,
         "get_prescribed_shared_prefix_slots": ("group_ids", "slot_ids"),
-        "make_repeated_group_ids": ("num_rows", "group_size", "namespace"),
         "plan_fixed_execution_slots": (
             "group_ids",
             "sequence_lengths",

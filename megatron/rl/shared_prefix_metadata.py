@@ -335,23 +335,6 @@ def plan_group_coherent_shards(
     )
 
 
-def make_repeated_group_ids(*, num_rows: int, group_size: int, namespace: str) -> list[str]:
-    """Return one opaque ID per row for contiguous repeated prompt groups."""
-    if not namespace:
-        raise ValueError("shared-prefix group namespace must be non-empty")
-    if group_size < 1:
-        raise ValueError(f"shared-prefix group_size must be positive, got {group_size}")
-    if num_rows < 0 or num_rows % group_size != 0:
-        raise ValueError(
-            f"num_rows={num_rows} must be nonnegative and divisible by group_size={group_size}"
-        )
-    return [
-        f"{namespace}:{group_index}"
-        for group_index in range(num_rows // group_size)
-        for _ in range(group_size)
-    ]
-
-
 def get_prescribed_shared_prefix_slots(
     *, group_ids: Sequence[str], slot_ids: Sequence[int]
 ) -> tuple[tuple[int, ...], ...]:
