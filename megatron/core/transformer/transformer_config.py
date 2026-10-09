@@ -3597,11 +3597,17 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_shared_expert_overlap
             ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
-            assert self.mtp_num_layers in (
+            assert (
+                self.mtp_num_layers is None or self.mtp_num_layers >= 0
+            ), "mtp_num_layers must be nonnegative."
+            # The overlap schedule expands the ordinary depth chain, bypassing
+            # MultiTokenPredictionBlock.forward's history mixing and repeated calls.
+            assert not self.mtp_hsm, "EP overlap does not support mtp_hsm."
+            assert not self.mtp_use_repeated_layer or self.mtp_num_layers in (
                 None,
                 0,
                 1,
-            ), 'MTP supports at most one layer when enabling overlap_moe_expert_parallel_comm.'
+            ), "EP overlap does not support mtp_use_repeated_layer."
 
             # NCCL EP (ncclep flex backend) mirrors hybridep's comm/compute overlap, but a few
             # configs are not yet safe under the 1F1B split and are gated here.

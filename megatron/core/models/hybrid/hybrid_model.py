@@ -290,12 +290,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "Use hybrid_layer_pattern with '/' separators (e.g., 'M*M*/MM/MM')."
             )
 
-        # Validate the full architecture, including MTP heads on other pipeline stages.
-        if self.mtp_pattern is not None and self.config.overlap_moe_expert_parallel_comm:
-            raise ValueError(
-                "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
-                "overlap scheduler does not expand the nested HybridStack."
-            )
+        # Hybrid patterns can resolve the depth count after TransformerConfig validation.
+        if (
+            self.config.overlap_moe_expert_parallel_comm
+            and self.mtp_num_depths > 1
+            and self.config.mtp_use_repeated_layer
+        ):
+            raise ValueError("EP overlap does not support mtp_use_repeated_layer.")
+
         if self.config.freeze_base_model_for_mtp and self.mtp_num_depths < 1:
             raise ValueError(
                 "freeze_base_model_for_mtp requires the HybridModel architecture "

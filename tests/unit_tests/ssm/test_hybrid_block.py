@@ -827,10 +827,14 @@ class TestHybridBlock:
             required_pgs = ['tp', 'pp', 'cp']
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
 
-    def test_hybrid_mtp_rejects_expert_parallel_overlap_before_build(self, monkeypatch):
-        """Reject overlap before constructing any HybridModel submodule."""
+    def test_hybrid_mtp_rejects_repeated_overlap_before_build(self, monkeypatch):
+        """Validate repeated depths when the hybrid pattern resolves the depth count."""
         config = TransformerConfig(
-            hidden_size=256, num_layers=1, num_attention_heads=4, use_cpu_initialization=True
+            hidden_size=256,
+            num_layers=1,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_use_repeated_layer=True,
         )
         # Mutate after generic config validation to exercise the pattern-specific guard.
         config.overlap_moe_expert_parallel_comm = True
@@ -840,13 +844,13 @@ class TestHybridBlock:
 
         monkeypatch.setattr("megatron.core.models.hybrid.hybrid_model.build_module", fail_build)
 
-        with pytest.raises(ValueError, match="Hybrid MTP does not support"):
+        with pytest.raises(ValueError, match="EP overlap does not support mtp_use_repeated_layer"):
             HybridModel(
                 config=config,
                 hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=128,
                 max_sequence_length=8,
-                hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}",
+                hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}/{Symbols.MAMBA}",
                 pg_collection=self.get_pg_collection(),
             )
 

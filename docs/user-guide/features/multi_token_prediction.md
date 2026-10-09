@@ -53,6 +53,25 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 - For models with MTP layers, the final LayerNorm sits in the stage that contains the last decoder layer, not in the post-process stage. That can change gradient norm reduction slightly in deterministic mode when LayerNorm would otherwise live in another stage. For bitwise alignment, disable gradient norm clipping.
 - MTP loss is computed in the post-processing stage.
 
+### Expert-Parallel Communication Overlap
+
+`overlap_moe_expert_parallel_comm` supports multiple sequential MTP depths.
+The combined 1F1B schedule overlaps one microbatch's forward communication with
+another microbatch's backward computation across both the decoder and MTP layers.
+Prediction heads and losses remain in model postprocessing.
+
+For `HybridModel`, each depth's inner stack is expanded into logical schedule
+units. For example, `[*E]/[*E][*-]/[*E][*-]` has two MTP depths, each containing
+an attention/MoE group followed by an attention/dense-MLP group. The embedding
+projection runs once at each depth's entrance, and its final norm runs once at
+the exit. Intermediate depth outputs retain both their prediction-head and
+downstream-depth gradient contributions.
+
+The ordinary EP-overlap restrictions still apply. Hidden State Mixing
+(`mtp_hsm`) and using a shared layer for multiple depths (`mtp_use_repeated_layer`)
+are not supported with this schedule. Hybrid EP overlap also retains its
+existing CUDA-graph and context-parallel layout restrictions.
+
 ## Unsupported Combinations
 
 Context Parallel (CP), arbitrary `AttnMaskType`, and learned absolute position embeddings are not supported with MTP.

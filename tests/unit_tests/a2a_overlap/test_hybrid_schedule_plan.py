@@ -6,7 +6,10 @@ import pytest
 import torch
 
 from megatron.core.context_parallel.layout import ContextParallelLayoutManager
-from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
+from megatron.core.models.common.model_chunk_schedule_plan import (
+    TransformerLayerSchedulePlan,
+    TransformerModelChunkSchedulePlan,
+)
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -204,5 +207,129 @@ def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern):
             if name in reference_grads:
                 assert param.grad is not None, name
                 torch.testing.assert_close(param.grad, reference_grads[name], rtol=2e-2, atol=2e-2)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("num_depths", [1, 2, 4])
+@pytest.mark.parametrize("mtp_pattern", ["[*E]", "[*E][*-]", "*E"])
+def test_hybrid_mtp_overlap_matches_eager_outputs_and_gradients(num_depths, mtp_pattern):
+    """Expand complete depths, including dense tails, and accumulate shared-head gradients."""
+    if Utils.world_size < 2:
+        pytest.skip("Expert-parallel overlap requires at least two ranks")
+    Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            ffn_hidden_size=256,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            add_bias_linear=False,
+            num_moe_experts=4,
+            moe_grouped_gemm=True,
+            moe_router_topk=2,
+            moe_router_dtype="fp32",
+            expert_model_parallel_size=2,
+            moe_token_dispatcher_type="alltoall",
+            overlap_moe_expert_parallel_comm=True,
+            mtp_num_layers=num_depths,
+            mtp_loss_scaling_factor=0.7,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=16,
+            hybrid_layer_pattern="[*E]" + f"/{mtp_pattern}" * num_depths,
+            share_embeddings_and_output_weights=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        ).cuda()
+        batches = []
+        for _ in range(3):
+            input_ids = torch.randint(1, 128, (2, 16), device="cuda")
+            padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            padding_mask[0, -2:] = True
+            padding_mask[1, -4:] = True
+            input_mask = ~padding_mask
+            input_mask[0, 5] = False
+            batches.append(
+                dict(
+                    input_ids=input_ids,
+                    position_ids=torch.arange(16, device="cuda").expand_as(input_ids),
+                    labels=torch.randint(1, 128, input_ids.shape, device="cuda"),
+                    attention_mask=None,
+                    padding_mask=padding_mask,
+                    loss_mask=(~padding_mask).float(),
+                    mtp_input_mask=input_mask,
+                )
+            )
+
+        set_streams()
+        for _ in range(2):
+            model.zero_grad(set_to_none=True)
+            references = []
+            for batch in batches:
+                output = model(**batch)
+                references.append(output.detach().float().clone())
+                # Keep the main loss and the normalized auxiliary losses on
+                # comparable scales when checking the shared embedding/head.
+                output.mean().backward()
+            reference_grads = {
+                name: None if param.grad is None else param.grad.detach().float().clone()
+                for name, param in model.named_parameters()
+            }
+            model.zero_grad(set_to_none=True)
+
+            previous_plan = None
+            previous_output = None
+            for batch, reference in zip(batches, references):
+                plan = model.build_schedule_plan(**batch)
+                output = TransformerModelChunkSchedulePlan.run(
+                    plan,
+                    previous_plan,
+                    b_grad=(
+                        None
+                        if previous_output is None
+                        else torch.ones_like(previous_output) / previous_output.numel()
+                    ),
+                )
+                torch.testing.assert_close(output, reference, rtol=1e-3, atol=1e-3)
+                previous_plan, previous_output = plan, output
+            TransformerModelChunkSchedulePlan.run(
+                None,
+                previous_plan,
+                b_grad=torch.ones_like(previous_output) / previous_output.numel(),
+            )
+            torch.cuda.synchronize()
+
+            for name, param in model.named_parameters():
+                expected = reference_grads[name]
+                assert (param.grad is None) == (expected is None), name
+                if expected is not None:
+                    actual = param.grad.float()
+                    relative_error = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
+                    assert relative_error < 2e-2, (name, relative_error.item())
+                    atol = 2e-4
+                    if param is model.shared_embedding_or_output_weight():
+                        # This BF16 weight accumulates every head and embedding
+                        # lookup in different autograd calls under the schedule.
+                        # Allow rounding near cancellation, while retaining the
+                        # normwise bound above and an elementwise error bound.
+                        atol = max(
+                            atol, 2 * torch.finfo(param.dtype).eps * expected.abs().max().item()
+                        )
+                    torch.testing.assert_close(
+                        actual,
+                        expected,
+                        rtol=3e-2,
+                        atol=atol,
+                        msg=lambda message: f"{name}: {message}",
+                    )
     finally:
         Utils.destroy_model_parallel()

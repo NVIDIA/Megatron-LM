@@ -26,7 +26,10 @@ from megatron.core.models.hybrid.fine_grained_callables import (
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.pipeline_parallel.utils import NoopScheduleNode
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionLayer,
+)
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
@@ -43,6 +46,7 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
         if extra_args is None:
             extra_args = {}
         self.layer_type = extra_args.get("layer_type", None)
+        self.mtp_layer = extra_args.get("mtp_layer")
         super().__init__(layer, event, chunk_state, comp_stream, comm_stream, extra_args)
 
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
@@ -52,12 +56,22 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
         fwd_callables, bwd_dw_callable_map, is_moe, num_local_experts = (
             build_hybrid_stack_callables(self.layer, layer_type=self.layer_type)
         )
+        if self.mtp_layer is not None:
+            from megatron.core.models.common.fine_grained_callables import wrap_mtp_layer_callables
+
+            fwd_callables, bwd_dw_callable_map = wrap_mtp_layer_callables(
+                self.mtp_layer,
+                fwd_callables,
+                bwd_dw_callable_map,
+                pre_process=extra_args["mtp_pre_process"],
+                post_process=extra_args["mtp_post_process"],
+            )
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
         extra_args["num_local_experts"] = num_local_experts
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
-        extra_args["is_mtp"] = False
+        extra_args["is_mtp"] = self.mtp_layer is not None
 
         def create_node(stream, module, name):
             bwd_dw_callables = bwd_dw_callable_map.get(name, None)
@@ -94,9 +108,11 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
 
-        # HybridStack groups never carry an MTP terminal, so mtp_post_process is
-        # always a no-op here.
-        self.mtp_post_process = NoopScheduleNode()
+        self.mtp_post_process = (
+            create_node(comp_stream, mtp_post_process_module, "mtp_post_process")
+            if mtp_post_process_module is not None
+            else NoopScheduleNode()
+        )
 
     def get_low_precision_context(self):
         """Return the layer-level quantization context for GPTModel-path layers.
@@ -104,6 +120,8 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
         Hybrid callables enter the quantization context of each physical layer
         themselves, so hybrid layer plans use a null context here.
         """
+        if self.mtp_layer is not None:
+            return self.mtp_layer.get_inner_quantization_context()
         if self.layer_type is None and isinstance(
             self.layer, (TransformerLayer, MultiTokenPredictionLayer)
         ):
@@ -116,14 +134,36 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
 
     Threads HybridStack's ``layer_type_list[layer_idx]`` symbol into each
     layer plan's ``extra_args`` so the per-layer plan can dispatch grouped
-    layers correctly. Layers of other modules (e.g. MTP layers) get
-    ``layer_type=None`` and follow the GPTModel path. The pre/post
-    process nodes inherit from the GPTModel base class — they already dispatch
-    on ``model._preprocess`` / ``model._postprocess`` which a HybridModel
-    implements.
+    layers correctly. Each MTP depth's inner stack is expanded into the same
+    logical-layer sequence, with its projection and final norm attached at
+    the depth boundaries. The pre/post-process nodes inherit from the common
+    base class and dispatch on ``model._preprocess`` / ``model._postprocess``.
     """
 
     LAYER_SCHEDULE_PLAN_CLASS = HybridStackSchedulePlan
+
+    def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
+        if not isinstance(module, MultiTokenPredictionBlock):
+            return super()._build_layer_schedule_plan(module, comp_stream, comm_stream)
+
+        for depth_idx, mtp_layer in enumerate(module.layers):
+            stack = mtp_layer.mtp_model_layer
+            for layer_idx, layer in enumerate(stack.layers):
+                first_in_depth = layer_idx == 0
+                last_in_depth = layer_idx == len(stack.layers) - 1
+                extra_args = {
+                    "layer_type": stack.layer_type_list[layer_idx],
+                    "mtp_layer": mtp_layer,
+                    "mtp_pre_process": first_in_depth,
+                    "mtp_post_process": last_in_depth,
+                    "is_first_layer": depth_idx == 0 and first_in_depth,
+                    "is_last_layer": depth_idx == len(module.layers) - 1 and last_in_depth,
+                }
+                self._transformer_layers.append(
+                    self.LAYER_SCHEDULE_PLAN_CLASS(
+                        layer, self.event, self.state, comp_stream, comm_stream, extra_args
+                    )
+                )
 
     def _extra_args_for_layer(self, module, layer_idx, num_layers):
         extra_args = super()._extra_args_for_layer(module, layer_idx, num_layers)

@@ -36,6 +36,7 @@ def test_hybrid_schedule_runs_without_a_transformer_context_hook(layer_type):
     plan = HybridStackSchedulePlan.__new__(HybridStackSchedulePlan)
     plan.layer = SimpleNamespace()
     plan.layer_type = layer_type
+    plan.mtp_layer = None
     visited = []
     for name in (
         "pre_dispatch_computation",
@@ -71,9 +72,24 @@ def test_hybrid_schedule_preserves_plain_layer_quantization_context(layer_cls):
     plan = HybridStackSchedulePlan.__new__(HybridStackSchedulePlan)
     plan.layer = layer
     plan.layer_type = None
+    plan.mtp_layer = None
 
     assert plan.get_low_precision_context() is expected_context
     layer.get_inner_quantization_context.assert_called_once_with()
+
+
+def test_hybrid_mtp_schedule_uses_depth_quantization_context():
+    """The depth's projection must use MTP's global precision policy."""
+    context = nullcontext()
+    plan = HybridStackSchedulePlan.__new__(HybridStackSchedulePlan)
+    plan.layer = Mock(spec=TransformerLayer)
+    plan.layer_type = ("*", "E")
+    plan.mtp_layer = Mock(spec=MultiTokenPredictionLayer)
+    plan.mtp_layer.get_inner_quantization_context.return_value = context
+
+    assert plan.get_low_precision_context() is context
+    plan.mtp_layer.get_inner_quantization_context.assert_called_once_with()
+    plan.layer.get_inner_quantization_context.assert_not_called()
 
 
 def test_transformer_layer_uses_fp4_context():
