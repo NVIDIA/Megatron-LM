@@ -12,6 +12,10 @@ from megatron.core import config
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.tensor_parallel.random import (
+    _mark_checkpoint_without_output_tensor,
+    is_checkpoint_without_output_tensor,
+)
 from megatron.core.transformer.moe.fused_a2a import is_nccl_ep_bootstrapped, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
@@ -22,7 +26,6 @@ from megatron.core.transformer.moe.paged_stash import (
     PagedTensor,
     _stash_buffer_dtype,
     check_paged_stash_overflow,
-    mark_paged_stash_recompute_managed,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
 )
@@ -351,14 +354,17 @@ _MXFP8_SKIP_REASON = (
 )
 
 
-def test_recompute_managed_tensor_bypasses_paged_stash_save_hook():
-    tensor = torch.randn(8, 4)
-    tensor.grouped_tensor_scale_inv = False
-    mark_paged_stash_recompute_managed(tensor)
+def test_checkpoint_without_output_view_bypasses_paged_stash_save_hook():
+    tensor = torch.randn(2, 4, 4)
+    _mark_checkpoint_without_output_tensor(tensor)
+    # Match TE GroupedLinear's reshape + split path: both operations create new tensor objects
+    # that alias the CheckpointWithoutOutput-owned storage.
+    saved_view = tensor.reshape(8, 4).split(2)[0]
 
     # The ownership check happens before the manager needs CUDA streams or capture state.
+    assert is_checkpoint_without_output_tensor(saved_view)
     manager = object.__new__(PagedStashManager)
-    assert manager.on_save_for_backward(tensor) is tensor
+    assert manager.on_save_for_backward(saved_view) is saved_view
 
 
 @pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)

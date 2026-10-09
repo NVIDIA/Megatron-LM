@@ -136,14 +136,14 @@ def test_paged_stash_marking_delegates_to_transformer_engine(monkeypatch):
     marked = []
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     module.config = SimpleNamespace(moe_paged_stash=True)
-    tensors = (torch.zeros(2, 4), torch.ones(2, 1))
+    tensors = (torch.zeros(2, 4), None, torch.ones(2, 1))
 
     monkeypatch.setattr(te_ext, "_te_mark_grouped_tensor", lambda *args: marked.append(args))
     module._mark_paged_stash_tensors(*tensors)
 
     assert len(marked) == 1
     assert marked[0][0] is tensors[0]
-    assert marked[0][1] is tensors[1]
+    assert marked[0][1] is tensors[2]
 
 
 @pytest.mark.parametrize(
@@ -401,9 +401,11 @@ def test_non_fused_forward_wraps_compute_in_paged_stash_scope(monkeypatch):
 
 
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=False)
     intermediate = torch.arange(6, dtype=torch.float32).view(3, 2)
 
-    output = TEGroupedMLP._apply_bias(
+    output = module._apply_bias(
         intermediate, bias_parallel=None, tokens_per_expert=[2, 1], permuted_probs=torch.ones(3)
     )
 
@@ -411,32 +413,54 @@ def test_apply_bias_returns_input_unchanged_when_bias_is_none():
 
 
 def test_apply_bias_combines_per_expert_bias_and_probs():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=False)
     intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
     bias_parallel = [torch.tensor([10.0, 20.0]), torch.tensor([100.0, 200.0])]
     tokens_per_expert = [2, 1]
     permuted_probs = torch.tensor([0.5, 0.5, 1.0])
     expected = torch.tensor([[6.0, 12.0], [8.0, 14.0], [105.0, 206.0]], dtype=torch.float32)
 
-    output = TEGroupedMLP._apply_bias(
-        intermediate, bias_parallel, tokens_per_expert, permuted_probs
-    )
+    output = module._apply_bias(intermediate, bias_parallel, tokens_per_expert, permuted_probs)
 
     torch.testing.assert_close(output, expected)
     assert output.dtype == intermediate.dtype
 
 
 def test_apply_bias_combines_packed_grouped_bias_and_accumulates_gradient():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=False)
     intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     packed_bias = torch.tensor([[10.0, 20.0], [100.0, 200.0]], requires_grad=True)
     tokens_per_expert = torch.tensor([2, 1], dtype=torch.int64)
     permuted_probs = torch.tensor([0.25, 0.5, 1.5])
     expected = torch.tensor([[3.5, 7.0], [8.0, 14.0], [155.0, 306.0]])
 
-    output = TEGroupedMLP._apply_bias(intermediate, packed_bias, tokens_per_expert, permuted_probs)
+    output = module._apply_bias(intermediate, packed_bias, tokens_per_expert, permuted_probs)
     output.sum().backward()
 
     torch.testing.assert_close(output, expected)
     torch.testing.assert_close(packed_bias.grad, torch.tensor([[0.75, 0.75], [1.5, 1.5]]))
+
+
+def test_apply_packed_bias_marks_saved_operands_from_config(monkeypatch):
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=True)
+    marked = []
+    monkeypatch.setattr(experts_module, "mark_grouped_tensor", lambda *args: marked.append(args))
+
+    intermediate = torch.zeros(3, 2)
+    packed_bias = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    tokens_per_expert = torch.tensor([2, 1], dtype=torch.int64)
+    # Deliberately leave this tensor unmarked: paged-stash intent comes from config, not an
+    # attribute that selective recompute may have placed on a detached tensor object.
+    permuted_probs = torch.tensor([0.25, 0.5, 1.0])
+
+    module._apply_bias(intermediate, packed_bias, tokens_per_expert, permuted_probs)
+
+    assert len(marked) == 2
+    assert marked[0][0].shape == (3, 1)
+    assert marked[1][0].shape == (3, 2)
 
 
 def test_make_fused_impl_pre_forward_hook_dispatches_submodule_hooks():

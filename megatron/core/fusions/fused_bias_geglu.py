@@ -2,18 +2,10 @@
 
 import torch
 
+from megatron.core.fusions.fused_utils import (
+    propagate_paged_stash_marker as _propagate_paged_stash_marker,
+)
 from megatron.core.jit import jit_fuser
-
-
-def _propagate_paged_stash_marker(source, target):
-    """Preserve TE's dynamic-activation marker across view/cast operations."""
-    if hasattr(source, "grouped_tensor_scale_inv"):
-        # Lazy import avoids the transformer_engine extension -> MLP -> fusion import cycle.
-        from megatron.core.extensions.transformer_engine import mark_grouped_tensor
-
-        mark_grouped_tensor(target)
-    return target
-
 
 ###### BIAS GELU FUSION/ NO AUTOGRAD ################
 # 1/sqrt(2*pi)-> 0.3989423

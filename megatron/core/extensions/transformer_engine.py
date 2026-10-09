@@ -105,6 +105,11 @@ def mark_grouped_tensor(*tensors: Any) -> None:
     _te_mark_grouped_tensor(*tensors)
 
 
+def is_grouped_tensor_marked(tensor: Any) -> bool:
+    """Return whether a tensor carries Transformer Engine's grouped-tensor marker."""
+    return hasattr(tensor, "grouped_tensor_scale_inv")
+
+
 def _set_expert_parameter_attributes(
     module: torch.nn.Module, parallel_mode: Optional[str], use_expert_pgs: bool
 ) -> None:

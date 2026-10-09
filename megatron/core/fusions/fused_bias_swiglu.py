@@ -8,20 +8,13 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.fusions.fused_utils import (
+    propagate_paged_stash_marker as _propagate_paged_stash_marker,
+)
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
-
-
-def _propagate_paged_stash_marker(source, target):
-    """Preserve TE's dynamic-activation marker across view/cast operations."""
-    if hasattr(source, "grouped_tensor_scale_inv"):
-        # Lazy import avoids the transformer_engine extension -> MLP -> fusion import cycle.
-        from megatron.core.extensions.transformer_engine import mark_grouped_tensor
-
-        mark_grouped_tensor(target)
-    return target
 
 
 @jit_fuser

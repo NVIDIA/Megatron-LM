@@ -44,7 +44,6 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.paged_stash import (
     get_paged_stash_context,
-    mark_paged_stash_recompute_managed,
     paged_stash_group_commit,
     paged_stash_group_start,
 )
@@ -401,8 +400,9 @@ class TEGroupedMLP(MegatronModule):
                 self.num_local_experts, align_size=align_size
             )
 
-    @staticmethod
-    def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
+    def _apply_packed_bias(
+        self, intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs
+    ):
         """Apply a packed expert bias without reading token counts on the host."""
         # TODO: get rid of the .float() by having fused kernel compute in FP32
         shape = intermediate_parallel.shape
@@ -410,13 +410,10 @@ class TEGroupedMLP(MegatronModule):
         output_dtype = intermediate_parallel.dtype
         flat_output = intermediate_parallel.view(-1, hidden_size).float()
         flat_probs = permuted_probs.reshape(-1, 1).float()
-        paged_stash_marked = hasattr(intermediate_parallel, "grouped_tensor_scale_inv") or hasattr(
-            permuted_probs, "grouped_tensor_scale_inv"
-        )
-        if paged_stash_marked:
+        if self.config.moe_paged_stash:
             # The multiply below saves these two token-shaped operands. The additive output
             # operand is not saved by autograd and does not need a marker.
-            mark_grouped_tensor(flat_probs)
+            self._mark_paged_stash_tensors(flat_probs)
 
         if tokens_per_expert.device != packed_bias.device:
             raise ValueError("Packed MoE bias and tokens_per_expert must be on the same device.")
@@ -434,12 +431,11 @@ class TEGroupedMLP(MegatronModule):
         bias_per_token = torch.repeat_interleave(
             packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
         )
-        if paged_stash_marked:
-            mark_grouped_tensor(bias_per_token)
+        if self.config.moe_paged_stash:
+            self._mark_paged_stash_tensors(bias_per_token)
         return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
 
-    @staticmethod
-    def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
+    def _apply_bias(self, intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
             return intermediate_parallel
 
@@ -447,7 +443,7 @@ class TEGroupedMLP(MegatronModule):
         # GroupedTensor [num_experts, hidden_size]. The grouped-tensor backend also provides
         # tokens_per_expert as a tensor on the same device.
         if isinstance(bias_parallel, torch.Tensor) and isinstance(tokens_per_expert, torch.Tensor):
-            return TEGroupedMLP._apply_packed_bias(
+            return self._apply_packed_bias(
                 intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs
             )
 
@@ -802,11 +798,33 @@ class TEGroupedMLP(MegatronModule):
         self._ensure_main_grad(self.linear_fc1)
         self._ensure_main_grad(self.linear_fc2)
 
-    def _mark_paged_stash_tensors(self, *tensors: Optional[torch.Tensor]) -> None:
+    def _mark_paged_stash_tensors(self, *tensors: torch.Tensor | None) -> None:
         """Mark dynamic unfused activations for the paged-stash saved-tensor hook."""
         if not self.config.moe_paged_stash:
             return
-        mark_grouped_tensor(*tensors)
+        tensors_to_mark = tuple(tensor for tensor in tensors if tensor is not None)
+        if tensors_to_mark:
+            mark_grouped_tensor(*tensors_to_mark)
+
+    def _get_paged_stash_scope(self, permuted_local_hidden_states, tokens_per_expert):
+        """Start a paged-stash group and return the input and saved-tensor context."""
+        if not self.config.moe_paged_stash:
+            return permuted_local_hidden_states, nullcontext()
+
+        permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+        max_num_tokens = permuted_local_hidden_states.shape[0]
+        # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+        # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+        cap_factor = self.config.moe_expert_rank_capacity_factor
+        avg_num_tokens = (
+            int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
+        )
+        return permuted_local_hidden_states, get_paged_stash_context(
+            name="grouped_mlp",
+            max_num_tokens=max_num_tokens,
+            num_tokens_tensor=tokens_per_expert.sum(),
+            avg_num_tokens=avg_num_tokens,
+        )
 
     def _fused_forward(
         self,
@@ -873,25 +891,9 @@ class TEGroupedMLP(MegatronModule):
             )
         # if the number of tokens is 0, pad the hidden states to 256
 
-        if self.config.moe_paged_stash:
-            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
-            max_num_tokens = permuted_local_hidden_states.shape[0]
-            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
-            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
-            cap_factor = self.config.moe_expert_rank_capacity_factor
-            avg_num_tokens = (
-                int(max_num_tokens // cap_factor)
-                if cap_factor is not None and cap_factor > 0
-                else None
-            )
-            stash_context = get_paged_stash_context(
-                name="grouped_mlp",
-                max_num_tokens=max_num_tokens,
-                num_tokens_tensor=tokens_per_expert.sum(),
-                avg_num_tokens=avg_num_tokens,
-            )
-        else:
-            stash_context = nullcontext()
+        permuted_local_hidden_states, stash_context = self._get_paged_stash_scope(
+            permuted_local_hidden_states, tokens_per_expert
+        )
         fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
         offload_name = "fused_group_mlp"
         fused_group_mlp_manager = off_interface(
@@ -1090,8 +1092,6 @@ class TEGroupedMLP(MegatronModule):
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
-            if self.config.moe_paged_stash:
-                mark_paged_stash_recompute_managed(bias_act_output)
         else:
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
@@ -1187,25 +1187,9 @@ class TEGroupedMLP(MegatronModule):
         elif isinstance(tokens_per_expert, torch.Tensor):
             tokens_per_expert = tokens_per_expert.tolist()
 
-        if self.config.moe_paged_stash:
-            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
-            max_num_tokens = permuted_local_hidden_states.shape[0]
-            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
-            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
-            cap_factor = self.config.moe_expert_rank_capacity_factor
-            avg_num_tokens = (
-                int(max_num_tokens // cap_factor)
-                if cap_factor is not None and cap_factor > 0
-                else None
-            )
-            stash_context = get_paged_stash_context(
-                name="grouped_mlp",
-                max_num_tokens=max_num_tokens,
-                num_tokens_tensor=tokens_per_expert.sum(),
-                avg_num_tokens=avg_num_tokens,
-            )
-        else:
-            stash_context = nullcontext()
+        permuted_local_hidden_states, stash_context = self._get_paged_stash_scope(
+            permuted_local_hidden_states, tokens_per_expert
+        )
         with stash_context:
             output = self._unfused_forward(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs
