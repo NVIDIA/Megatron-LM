@@ -29,6 +29,7 @@ from megatron.rl.shared_prefix_tensors import (
     build_shared_prefix_rows,
     materialize_shared_prefix_layout,
 )
+from tests.unit_tests.rl.shared_prefix_oracles import build_star_attention_allow_mask
 
 
 def test_evaluation_uses_physical_budget_training_keeps_expanded_mtp_budget():
@@ -120,7 +121,7 @@ def test_dense_bin_reconstruction_retains_one_mtp_group_and_causal_rows():
     tensor_bin = materialize_shared_prefix_layout(
         inputs, input_lengths=torch.tensor([4, 4, 4]), layout=unit.shared_layout
     )
-    mask = tensor_bin.attention_allow_mask
+    mask = build_star_attention_allow_mask(tensor_bin.layout)
     assert not bool(mask[5:, :5].any()) and not bool(mask[:5, 5:].any())
     assert not bool(mask[3, 4]) and not bool(mask[4, 3])
 

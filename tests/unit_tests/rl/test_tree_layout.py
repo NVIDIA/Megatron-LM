@@ -22,8 +22,8 @@ from megatron.rl.shared_prefix_packing import (
     SharedPrefixRow,
     build_shared_prefix_layout,
 )
-from megatron.rl.shared_prefix_tensors import build_tree_attention_allow_mask
 from megatron.rl.tree_layout import PackedTreeLayout
+from tests.unit_tests.rl.shared_prefix_oracles import build_tree_attention_allow_mask
 
 
 def _nested() -> PackedTreeLayout:

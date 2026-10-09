@@ -18,11 +18,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Optional
 
-from megatron.rl.shared_prefix_metadata import _round_up, plan_fixed_execution_slots
+from megatron.rl.shared_prefix_metadata import plan_fixed_execution_slots
 from megatron.rl.shared_prefix_packing import (
     SharedPrefixForestLayout,
     SharedPrefixLayout,
     SharedPrefixRow,
+    _round_up,
     build_shared_prefix_layout,
     pack_shared_prefix_groups,
     plan_shared_prefix_bins,
@@ -144,7 +145,7 @@ def plan_shared_prefix_execution_units(
                     layout.row_indices for layout in evaluation_plan.shared_bins
                 )
                 independent_slots.extend(
-                    (fallback.row.row_index,) for fallback in evaluation_plan.fallbacks
+                    (row_index,) for row_index in evaluation_plan.fallback_row_indices
                 )
                 continue
             plan = plan_fixed_execution_slots(
@@ -173,7 +174,7 @@ def plan_shared_prefix_execution_units(
         )
         if (
             len(candidate.shared_bins) == 1
-            and not candidate.fallbacks
+            and not candidate.fallback_row_indices
             and set(candidate.shared_bins[0].row_indices) == set(row_indices)
         ):
             layout = candidate.shared_bins[0]

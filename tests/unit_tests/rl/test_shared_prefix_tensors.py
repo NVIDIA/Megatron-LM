@@ -16,7 +16,6 @@ import pytest
 import torch
 
 from megatron.rl.shared_prefix_packing import (
-    SharedPrefixFallbackReason,
     SharedPrefixForestLayout,
     SharedPrefixLayout,
     SharedPrefixRow,
@@ -24,8 +23,6 @@ from megatron.rl.shared_prefix_packing import (
 )
 from megatron.rl.shared_prefix_tensors import (
     build_shared_prefix_rows,
-    build_shared_prefix_tensor_plan,
-    build_star_attention_allow_mask,
     get_shared_prefix_context_parallel_indices,
     get_shared_prefix_physical_alignment,
     materialize_shared_prefix_layout,
@@ -33,6 +30,10 @@ from megatron.rl.shared_prefix_tensors import (
     resolve_shared_prefix_parallel_topology,
     resolve_shared_prefix_physical_padding_multiple,
     shard_shared_prefix_tensor_bin_for_context_parallel,
+)
+from tests.unit_tests.rl.shared_prefix_oracles import (
+    build_star_attention_allow_mask,
+    plan_and_materialize,
 )
 
 
@@ -54,10 +55,7 @@ def test_singleton_fallback_roots_preserve_causality_and_materialized_padding():
     )
     torch.testing.assert_close(mask, expected, rtol=0, atol=0)
     materialized = materialize_shared_prefix_layout(
-        inputs,
-        input_lengths=torch.tensor([4, 4, 3]),
-        layout=forest,
-        materialize_attention_mask=False,
+        inputs, input_lengths=torch.tensor([4, 4, 3]), layout=forest
     )
     assert materialized.layout.mtp_loss_group_root_counts == (1, 1)
     torch.testing.assert_close(
@@ -135,7 +133,7 @@ def _batch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
 def test_tensor_plan_materializes_prompt_once_and_preserves_fallbacks() -> None:
     input_ids, input_lengths, prompt_lengths, group_ids = _batch()
 
-    plan = build_shared_prefix_tensor_plan(
+    shared_bins, fallback_row_indices = plan_and_materialize(
         input_ids=input_ids,
         input_lengths=input_lengths,
         prompt_lengths=prompt_lengths,
@@ -143,34 +141,32 @@ def test_tensor_plan_materializes_prompt_once_and_preserves_fallbacks() -> None:
         bin_capacity=16,
     )
 
-    assert len(plan.shared_bins) == 1
-    shared_bin = plan.shared_bins[0]
+    assert len(shared_bins) == 1
+    shared_bin = shared_bins[0]
     assert shared_bin.layout.row_indices == (1, 0)
     torch.testing.assert_close(
         shared_bin.packed_input_ids, torch.tensor([10, 11, 12, 30, 31, 32, 20, 21])
     )
     torch.testing.assert_close(shared_bin.position_ids, torch.tensor([0, 1, 2, 3, 4, 5, 3, 4]))
-    assert plan.fallback_row_indices == (2,)
-    assert plan.fallbacks[0].reason is SharedPrefixFallbackReason.NO_EXACT_PROMPT_PEER
-    assert plan.fallbacks[0].fits_block_diagonal_bin
+    assert fallback_row_indices == (2,)
 
 
 def test_tensor_indices_encode_gather_fanout_and_scatter() -> None:
     input_ids, input_lengths, prompt_lengths, group_ids = _batch()
-    shared_bin = build_shared_prefix_tensor_plan(
+    shared_bin = plan_and_materialize(
         input_ids=input_ids,
         input_lengths=input_lengths,
         prompt_lengths=prompt_lengths,
         group_ids=group_ids,
         bin_capacity=16,
-    ).shared_bins[0]
+    )[0][0]
     indices = shared_bin.indices
 
     torch.testing.assert_close(indices.token_gather_rows, torch.tensor([1, 1, 1, 1, 1, 1, 0, 0]))
     torch.testing.assert_close(indices.token_gather_columns, torch.tensor([0, 1, 2, 3, 4, 5, 3, 4]))
     torch.testing.assert_close(indices.completion_positions, torch.tensor([3, 4, 5, 6, 7]))
     torch.testing.assert_close(indices.predecessor_positions, torch.tensor([2, 3, 4, 2, 6]))
-    torch.testing.assert_close(indices.completion_scatter_rows, torch.tensor([1, 1, 1, 0, 0]))
+    assert shared_bin.layout.completion_scatter_rows == (1, 1, 1, 0, 0)
     torch.testing.assert_close(indices.completion_scatter_columns, torch.tensor([2, 3, 4, 2, 3]))
 
 
@@ -185,14 +181,13 @@ def test_context_parallel_indices_match_standard_two_chunk_zigzag() -> None:
 
 def test_context_parallel_shard_pads_only_after_real_star_tokens() -> None:
     input_ids = torch.tensor([[10, 11, 12, 20, 0], [10, 11, 12, 30, 31]])
-    tensor_bin = build_shared_prefix_tensor_plan(
+    tensor_bin = plan_and_materialize(
         input_ids=input_ids,
         input_lengths=torch.tensor([4, 5]),
         prompt_lengths=torch.tensor([3, 3]),
         group_ids=["g", "g"],
         bin_capacity=8,
-        materialize_attention_mask=False,
-    ).shared_bins[0]
+    )[0][0]
 
     rank0 = shard_shared_prefix_tensor_bin_for_context_parallel(tensor_bin, cp_rank=0, cp_size=2)
     rank1 = shard_shared_prefix_tensor_bin_for_context_parallel(tensor_bin, cp_rank=1, cp_size=2)
@@ -207,14 +202,14 @@ def test_context_parallel_shard_pads_only_after_real_star_tokens() -> None:
 
 def test_physical_branch_tails_match_dense_router_count_semantics() -> None:
     input_ids = torch.tensor([[10, 11, 12, 20, 21, 91, 92], [10, 11, 12, 30, 31, 32, 33]])
-    tensor_bin = build_shared_prefix_tensor_plan(
+    tensor_bin = plan_and_materialize(
         input_ids=input_ids,
         input_lengths=torch.tensor([5, 7]),
         prompt_lengths=torch.tensor([3, 3]),
         group_ids=["g", "g"],
         bin_capacity=16,
         sequence_length_pad_multiple=4,
-    ).shared_bins[0]
+    )[0][0]
     layout = tensor_bin.layout
 
     assert layout.completion_lengths == (4, 2)
@@ -243,8 +238,7 @@ def test_physical_branch_tails_match_dense_router_count_semantics() -> None:
     dense_counts = torch.bincount(((dense_tokens + dense_positions) % 4).flatten(), minlength=4)
     torch.testing.assert_close(star_counts, dense_counts)
 
-    mask = tensor_bin.attention_allow_mask
-    assert mask is not None
+    mask = build_star_attention_allow_mask(tensor_bin.layout)
     assert mask.shape == (13, 13)
     assert not mask[7, 8]
     assert not mask[12, 3]
@@ -259,15 +253,14 @@ def test_physical_branch_tails_match_dense_router_count_semantics() -> None:
 
 def test_token_aligned_mtp_mask_uses_star_order_and_zeros_physical_padding() -> None:
     input_ids = torch.tensor([[10, 11, 12, 20, 21, 91, 92], [10, 11, 12, 30, 31, 32, 33]])
-    tensor_bin = build_shared_prefix_tensor_plan(
+    tensor_bin = plan_and_materialize(
         input_ids=input_ids,
         input_lengths=torch.tensor([5, 7]),
         prompt_lengths=torch.tensor([3, 3]),
         group_ids=["g", "g"],
         bin_capacity=16,
         sequence_length_pad_multiple=4,
-        materialize_attention_mask=False,
-    ).shared_bins[0]
+    )[0][0]
     source_mtp_mask = torch.tensor([[0, 0, 0, 1, 1, 7, 7], [0, 0, 0, 1, 1, 1, 1]])
 
     packed_mtp_mask = materialize_shared_prefix_token_aligned_tensor(
@@ -288,15 +281,14 @@ def test_tp_sp_shard_composes_interior_and_topology_padding() -> None:
             [10, 11, 12, 13, 40, 41, 42, 43, 44],
         ]
     )
-    tensor_bin = build_shared_prefix_tensor_plan(
+    tensor_bin = plan_and_materialize(
         input_ids=input_ids,
         input_lengths=torch.tensor([7, 8, 9]),
         prompt_lengths=torch.tensor([4, 4, 4]),
         group_ids=["g", "g", "g"],
         bin_capacity=64,
         sequence_length_pad_multiple=16,
-        materialize_attention_mask=False,
-    ).shared_bins[0]
+    )[0][0]
 
     assert tensor_bin.layout.completion_lengths == (5, 4, 3)
     assert tensor_bin.layout.physical_completion_lengths == (12, 12, 12)
@@ -340,17 +332,14 @@ def test_context_parallel_indices_reject_invalid_topology(
 
 def test_cp1_star_attention_mask_has_exact_branch_isolation() -> None:
     input_ids, input_lengths, prompt_lengths, group_ids = _batch()
-    mask = (
-        build_shared_prefix_tensor_plan(
-            input_ids=input_ids,
-            input_lengths=input_lengths,
-            prompt_lengths=prompt_lengths,
-            group_ids=group_ids,
-            bin_capacity=16,
-        )
-        .shared_bins[0]
-        .attention_allow_mask
+    (shared_bin,), _ = plan_and_materialize(
+        input_ids=input_ids,
+        input_lengths=input_lengths,
+        prompt_lengths=prompt_lengths,
+        group_ids=group_ids,
+        bin_capacity=16,
     )
+    mask = build_star_attention_allow_mask(shared_bin.layout)
 
     expected = torch.tensor(
         [
@@ -368,27 +357,9 @@ def test_cp1_star_attention_mask_has_exact_branch_isolation() -> None:
     torch.testing.assert_close(mask, expected)
 
 
-def test_fused_consumer_can_skip_dense_attention_oracle() -> None:
-    input_ids, input_lengths, prompt_lengths, group_ids = _batch()
-
-    shared_bin = build_shared_prefix_tensor_plan(
-        input_ids=input_ids,
-        input_lengths=input_lengths,
-        prompt_lengths=prompt_lengths,
-        group_ids=group_ids,
-        bin_capacity=16,
-        materialize_attention_mask=False,
-    ).shared_bins[0]
-
-    assert shared_bin.attention_allow_mask is None
-    torch.testing.assert_close(
-        shared_bin.packed_input_ids, torch.tensor([10, 11, 12, 30, 31, 32, 20, 21])
-    )
-
-
 def test_group_id_and_exact_prompt_are_both_required() -> None:
     input_ids = torch.tensor([[1, 2, 3], [1, 2, 4], [1, 9, 5], [1, 2, 6]])
-    plan = build_shared_prefix_tensor_plan(
+    shared_bins, fallback_row_indices = plan_and_materialize(
         input_ids=input_ids,
         input_lengths=torch.tensor([3, 3, 3, 3]),
         prompt_lengths=torch.tensor([2, 2, 2, 2]),
@@ -396,12 +367,8 @@ def test_group_id_and_exact_prompt_are_both_required() -> None:
         bin_capacity=8,
     )
 
-    assert [shared.layout.row_indices for shared in plan.shared_bins] == [(0, 3)]
-    assert plan.fallback_row_indices == (1, 2)
-    assert [fallback.reason for fallback in plan.fallbacks] == [
-        SharedPrefixFallbackReason.NO_EXACT_PROMPT_PEER,
-        SharedPrefixFallbackReason.PROMPT_MISMATCH,
-    ]
+    assert [shared.layout.row_indices for shared in shared_bins] == [(0, 3)]
+    assert fallback_row_indices == (1, 2)
 
 
 def test_materializer_rejects_stale_prompt_tokens() -> None:
@@ -441,23 +408,50 @@ def test_materializer_rejects_a_row_that_grew_past_its_layout() -> None:
         )
 
 
-def test_layout_rejects_noncontiguous_branch_spans_before_materialization() -> None:
-    with pytest.raises(ValueError, match="positive and contiguous"):
-        SharedPrefixLayout(
-            group_id="g",
-            prompt_token_ids=(1, 2),
-            row_indices=(0, 1),
-            completion_lengths=(1, 1),
-            total_length=4,
-            branch_starts=(2, 2),
-            position_ids=(0, 1, 2, 2),
-            token_gather_rows=(0, 0, 0, 1),
-            token_gather_columns=(0, 1, 2, 2),
-            completion_positions=(2, 3),
-            predecessor_positions=(1, 1),
-            completion_scatter_rows=(0, 1),
-            completion_scatter_columns=(1, 1),
-        )
+def test_layout_derives_every_index_map_from_its_rows() -> None:
+    """A hand-built layout cannot carry maps that disagree with its rows."""
+    layout = SharedPrefixLayout(
+        group_id="g",
+        prompt_token_ids=(1, 2),
+        row_indices=(0, 1),
+        completion_lengths=(1, 1),
+        physical_completion_lengths=[2, 1],
+    )
+    assert layout.physical_completion_lengths == (2, 1)
+    assert layout.total_length == 4
+    assert layout.physical_total_length == 5
+    assert layout.position_ids == (0, 1, 2, 3, 2)
+    assert layout.completion_positions == (2, 4)
+    assert layout.predecessor_positions == (1, 1)
+    assert layout.token_gather_rows == (0, 0, 0, 0, 1)
+    assert layout.token_gather_columns == (0, 1, 2, 3, 2)
+    assert layout.physical_padding_positions == (3,)
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        (
+            dict(completion_lengths=(2, 1), physical_completion_lengths=(1, 1)),
+            "no longer than storage",
+        ),
+        (dict(physical_completion_lengths=(0, 1)), "positive and contiguous"),
+        (dict(physical_completion_lengths=(1,)), "must have equal length"),
+        (dict(row_indices=(0,)), "each completion node must own one source row"),
+        (dict(row_indices=(1, 1)), "unique nonnegative integers"),
+        (dict(row_indices=(0, True)), "unique nonnegative integers"),
+        (dict(completion_lengths=(1, 0)), "positive"),
+        (dict(prompt_token_ids=()), "non-empty prompt"),
+        (dict(group_id=""), "non-empty group_id"),
+    ],
+)
+def test_layout_rejects_inconsistent_rows(kwargs: dict, message: str) -> None:
+    fields = dict(
+        group_id="g", prompt_token_ids=(1, 2), row_indices=(0, 1), completion_lengths=(1, 1)
+    )
+    fields.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        SharedPrefixLayout(**fields)
 
 
 @pytest.mark.parametrize(
@@ -500,7 +494,7 @@ def test_layout_rejects_noncontiguous_branch_spans_before_materialization() -> N
         ),
     ],
 )
-def test_tensor_plan_rejects_invalid_batch_metadata(
+def test_planning_rejects_invalid_batch_metadata(
     input_ids: torch.Tensor,
     input_lengths: torch.Tensor,
     prompt_lengths: torch.Tensor,
@@ -508,7 +502,7 @@ def test_tensor_plan_rejects_invalid_batch_metadata(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        build_shared_prefix_tensor_plan(
+        plan_and_materialize(
             input_ids=input_ids,
             input_lengths=input_lengths,
             prompt_lengths=prompt_lengths,

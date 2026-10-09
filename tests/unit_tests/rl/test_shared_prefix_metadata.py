@@ -45,7 +45,6 @@ def test_single_completion_groups_keep_dense_fallback_rows_and_order() -> None:
     assert slots.units_per_group_by_chunk == (1,)
     assert shards.shard_indices == ((0, 3), (1, 2))
     assert shards.rank_order_permutation == (0, 3, 1, 2)
-    assert shards.inverse_permutation == (0, 2, 3, 1)
 
 
 def test_single_completion_slots_still_enforce_physical_capacity() -> None:
@@ -73,7 +72,6 @@ def test_group_coherent_shards_balance_work_without_splitting_groups() -> None:
 
     assert plan.shard_indices == ((0, 1, 6, 7), (2, 3, 4, 5))
     assert plan.rank_order_permutation == (0, 1, 6, 7, 2, 3, 4, 5)
-    assert plan.inverse_permutation == (0, 1, 4, 5, 6, 7, 2, 3)
     for shard in plan.shard_indices:
         shard_groups = {["a", "a", "b", "b", "c", "c", "d", "d"][index] for index in shard}
         assert len(shard_groups) == 2
@@ -133,7 +131,6 @@ def test_group_coherent_shards_preserve_global_batch_boundaries() -> None:
 
     assert plan.shard_indices == ((0, 1, 4, 5), (2, 3, 6, 7))
     assert plan.rank_order_permutation == (0, 1, 4, 5, 2, 3, 6, 7)
-    assert plan.inverse_permutation == (0, 1, 4, 5, 2, 3, 6, 7)
 
 
 def test_group_coherent_shards_reject_groups_crossing_batch_boundaries() -> None:

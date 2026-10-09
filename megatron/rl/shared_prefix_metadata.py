@@ -19,16 +19,22 @@ No batch transport, training configuration, or model runtime is required.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import cast
+
+from megatron.rl.shared_prefix_packing import _round_up
 
 
 @dataclass(frozen=True, slots=True)
 class GroupCoherentShardPlan:
-    """Stable row-index assignment that never splits a prompt group."""
+    """Stable row-index assignment that never splits a prompt group.
+
+    ``rank_order_permutation`` maps each position of the rank-major
+    concatenation to its source row (output position -> source row), which is
+    the forward permutation ``BatchedDataDict.reorder_data`` expects to restore
+    source order. ``None`` means the concatenation is already in source order.
+    """
 
     shard_indices: tuple[tuple[int, ...], ...]
     rank_order_permutation: tuple[int, ...] | None
-    inverse_permutation: tuple[int, ...] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,11 +49,6 @@ class FixedExecutionSlotPlan:
 
     row_slot_ids: tuple[int, ...]
     units_per_group_by_chunk: tuple[int, ...]
-
-
-def _round_up(value: int, multiple: int) -> int:
-    """Round ``value`` up to a positive alignment without backend imports."""
-    return ((value + multiple - 1) // multiple) * multiple
 
 
 def _pack_full_length_group(
@@ -177,7 +178,7 @@ def plan_fixed_execution_slots(
         units_per_group_by_chunk.append(units_per_group)
 
         for group_id, bins in bins_by_group.items():
-            while len(cast(list[list[int]], bins)) < units_per_group:
+            while len(bins) < units_per_group:
                 candidates = [
                     (bin_index, bin_rows)
                     for bin_index, bin_rows in enumerate(bins)
@@ -327,18 +328,9 @@ def plan_group_coherent_shards(
     if sorted(flat_indices) != expected_indices:
         raise RuntimeError("group-coherent sharding did not cover every input row exactly once")
 
-    rank_order_permutation: tuple[int, ...] | None = None
-    inverse_permutation: tuple[int, ...] | None = None
-    if flat_indices != expected_indices:
-        rank_order_permutation = tuple(flat_indices)
-        inverse = [0] * len(flat_indices)
-        for new_position, old_position in enumerate(flat_indices):
-            inverse[old_position] = new_position
-        inverse_permutation = tuple(inverse)
     return GroupCoherentShardPlan(
         shard_indices=shard_indices,
-        rank_order_permutation=rank_order_permutation,
-        inverse_permutation=inverse_permutation,
+        rank_order_permutation=(None if flat_indices == expected_indices else tuple(flat_indices)),
     )
 
 

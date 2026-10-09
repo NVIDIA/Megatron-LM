@@ -22,13 +22,11 @@ from dataclasses import dataclass
 import torch
 
 from megatron.rl.shared_prefix_packing import (
-    SharedPrefixFallback,
     SharedPrefixForestLayout,
     SharedPrefixLayout,
     SharedPrefixRow,
-    plan_shared_prefix_bins,
+    _round_up,
 )
-from megatron.rl.tree_layout import PackedTreeLayout
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +37,6 @@ class SharedPrefixTensorIndices:
     token_gather_columns: torch.Tensor
     completion_positions: torch.Tensor
     predecessor_positions: torch.Tensor
-    completion_scatter_rows: torch.Tensor
     completion_scatter_columns: torch.Tensor
     physical_padding_positions: torch.Tensor
 
@@ -48,31 +45,14 @@ class SharedPrefixTensorIndices:
 class SharedPrefixTensorBin:
     """One unpadded shared-prefix star or forest ready for a backend adapter.
 
-    When materialized, ``attention_allow_mask`` is a dense boolean
-    ``[tokens, tokens]`` reference mask where ``True`` means attention is
-    allowed. It is intended as the exact global correctness oracle; production
-    long-context paths leave it as ``None`` and lower ``layout`` to fused
-    structured attention instead of constructing this quadratic mask.
+    Backends lower ``layout`` to structured attention directly; no dense
+    ``[tokens, tokens]`` mask is built.
     """
 
     layout: SharedPrefixLayout | SharedPrefixForestLayout
     packed_input_ids: torch.Tensor
     position_ids: torch.Tensor
-    attention_allow_mask: torch.Tensor | None
     indices: SharedPrefixTensorIndices
-
-
-@dataclass(frozen=True, slots=True)
-class SharedPrefixTensorPlan:
-    """Tensorized shared bins plus the planner's untouched fallback records."""
-
-    shared_bins: tuple[SharedPrefixTensorBin, ...]
-    fallbacks: tuple[SharedPrefixFallback, ...]
-
-    @property
-    def fallback_row_indices(self) -> tuple[int, ...]:
-        """Source rows that remain on the conventional packing path."""
-        return tuple(fallback.row.row_index for fallback in self.fallbacks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +109,13 @@ def get_shared_prefix_physical_alignment(*, tp_size: int, cp_size: int) -> int:
     standard two-chunk CP quantum. TP>1 shared-prefix execution requires SP and
     uses the stricter ``2 * TP * CP`` integration quantum so every CP-local
     zigzag sequence can be split evenly across TP sequence-parallel ranks.
+
+    The ``2 * TP`` quantum also applies at CP1, which is stricter than the
+    ``TP`` alignment of conventional sequence packing: a TP-aligned
+    ``make_sequence_length_divisible_by`` is rejected unless it is a multiple
+    of ``2 * TP``. This mirrors the MCore shared-prefix validator
+    (``_validate_shared_prefix_physical_length``); relaxing CP1 to ``TP``
+    requires changing both together.
     """
     if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1:
         raise ValueError(f"tp_size must be a positive integer, got {tp_size!r}")
@@ -233,11 +220,7 @@ def shard_shared_prefix_tensor_bin_for_context_parallel(
     resolved_padding_multiple = resolve_shared_prefix_physical_padding_multiple(
         tp_size=tp_size, cp_size=cp_size, padding_multiple=padding_multiple
     )
-    padded_total_length = (
-        (total_length + resolved_padding_multiple - 1)
-        // resolved_padding_multiple
-        * resolved_padding_multiple
-    )
+    padded_total_length = _round_up(total_length, resolved_padding_multiple)
     pad_length = padded_total_length - total_length
 
     packed_input_ids = tensor_bin.packed_input_ids
@@ -260,59 +243,27 @@ def shard_shared_prefix_tensor_bin_for_context_parallel(
     )
 
 
-def build_tree_attention_allow_mask(
-    layout: PackedTreeLayout, *, device: torch.device | str | None = None
-) -> torch.Tensor:
-    """Reference causal attention for arbitrary-depth token-span trees.
-
-    Queries can see their own causal node history and real tokens in strict
-    ancestor nodes. Ancestor padding, sibling branches, and other roots are
-    invisible. Each physical padding query retains self-attention, avoiding an
-    empty row. This quadratic oracle does not enable deeper fused execution.
-    """
-    node_ids = torch.tensor(layout.segment_ids(), dtype=torch.long, device=device)
-    ancestry = torch.zeros((layout.num_nodes, layout.num_nodes), dtype=torch.bool, device=device)
-    for node in range(layout.num_nodes):
-        ancestry[node, list(layout.ancestors(node))] = True
-    positions = torch.arange(layout.total_len, device=device)
-    real_keys = torch.ones(layout.total_len, dtype=torch.bool, device=device)
-    real_keys[list(layout.padding_positions())] = False
-    same_node = node_ids[:, None] == node_ids[None, :]
-    causal = positions[None, :] <= positions[:, None]
-    ancestor_keys = ancestry[node_ids[:, None], node_ids[None, :]] & real_keys[None, :]
-    return (same_node & causal) | ancestor_keys
-
-
-def build_star_attention_allow_mask(
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
-    *,
-    device: torch.device | str | None = None,
-) -> torch.Tensor:
-    """Compatibility entry point for the star/forest tree reference mask."""
-    return build_tree_attention_allow_mask(layout.tree_layout, device=device)
-
-
 def materialize_shared_prefix_layout(
     input_ids: torch.Tensor,
     *,
     input_lengths: torch.Tensor,
     layout: SharedPrefixLayout | SharedPrefixForestLayout,
-    materialize_attention_mask: bool = True,
 ) -> SharedPrefixTensorBin:
     """Gather a planned star or forest from padded ``input_ids`` rows.
+
+    Host work is proportional to the number of layout nodes, not tokens: one
+    small node table, copied once (pinned and non-blocking on CUDA), drives
+    every token-level index map on ``input_ids.device``. Source-row validation
+    also runs on that device and costs a single synchronization.
 
     Args:
         input_ids: Integer token tensor with shape ``[batch, sequence]``.
         input_lengths: Unpadded source-row lengths with shape ``[batch]``.
         layout: Planner output whose row indices address ``input_ids``.
-        materialize_attention_mask: Whether to build the dense global correctness
-            oracle. Fused backends should disable it and lower ``layout``
-            directly so long-context execution does not allocate ``O(T^2)``
-            storage.
 
     Returns:
-        Unpadded packed tokens, prefix-continued positions, exact global allow-mask,
-        and tensorized gather/fan-out/scatter indices on ``input_ids.device``.
+        Unpadded packed tokens, prefix-continued positions, and tensorized
+        gather/fan-out/scatter indices on ``input_ids.device``.
 
     Raises:
         ValueError: If a source row's unpadded length differs from the planned
@@ -321,76 +272,148 @@ def materialize_shared_prefix_layout(
     """
     _validate_input_ids(input_ids)
     batch_size, sequence_width = input_ids.shape
-    input_lengths_cpu = _validate_length_vector(
-        input_lengths, name="input_lengths", batch_size=batch_size, sequence_width=sequence_width
-    )
-    if not layout.token_gather_rows or not layout.token_gather_columns:
-        raise ValueError("shared-prefix layout has no token gather indices")
-    if (
-        len(layout.token_gather_rows) != layout.physical_total_length
-        or len(layout.token_gather_columns) != layout.physical_total_length
-    ):
-        raise ValueError("token gather indices must have physical_total_length entries")
-    if min(layout.token_gather_rows) < 0 or max(layout.token_gather_rows) >= batch_size:
-        raise ValueError("shared-prefix layout references a row outside input_ids")
-    if min(layout.token_gather_columns) < 0:
-        raise ValueError("shared-prefix layout references a negative token column")
+    _validate_length_vector_metadata(input_lengths, name="input_lengths", batch_size=batch_size)
 
-    for _, root in layout.iter_roots():
-        expected_prompt = torch.tensor(
-            root.prompt_token_ids, dtype=input_ids.dtype, device=input_ids.device
+    # One entry per tree node: packed start, physical length, logical length,
+    # source row, first source column, root packed start, root prompt length,
+    # offset of the root prompt in ``prompt_tokens``, and whether it is a branch.
+    nodes: list[tuple[int, ...]] = []
+    prompt_tokens: list[int] = []
+    num_padding = num_prompt_checks = 0
+    for offset, root in layout.iter_roots():
+        prompt_length = root.prompt_length
+        if prompt_length > sequence_width:
+            raise ValueError(
+                f"shared-prefix prompt of {prompt_length} tokens exceeds the input_ids "
+                f"width {sequence_width}"
+            )
+        prompt_offset = len(prompt_tokens)
+        prompt_tokens.extend(root.prompt_token_ids)
+        root_row = root.row_indices[0]
+        nodes.append(
+            (offset, prompt_length, prompt_length, root_row, 0, offset, prompt_length, 0, 0)
         )
-        for row_index, completion_length in zip(
-            root.row_indices, root.completion_lengths, strict=True
+        for row_index, start, physical, logical in zip(
+            root.row_indices,
+            root.branch_starts,
+            root.physical_completion_lengths,
+            root.completion_lengths,
+            strict=True,
         ):
-            if row_index < 0 or row_index >= batch_size:
+            if row_index >= batch_size:
                 raise ValueError(
                     f"shared-prefix layout references row {row_index} outside input_ids"
                 )
+            nodes.append(
+                (
+                    offset + start,
+                    physical,
+                    logical,
+                    row_index,
+                    prompt_length,
+                    offset,
+                    prompt_length,
+                    prompt_offset,
+                    1,
+                )
+            )
+            num_padding += physical - logical
+            num_prompt_checks += prompt_length
+
+    device = input_ids.device
+    (
+        node_start,
+        node_physical,
+        node_logical,
+        node_row,
+        node_column,
+        root_start,
+        root_prompt,
+        prompt_offset,
+        is_branch,
+    ) = _to_device(torch.tensor(nodes, dtype=torch.long), device).unbind(1)
+    node_ids = torch.arange(len(nodes), device=device)
+
+    def spans(lengths: torch.Tensor, total: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the owning node and local offset of every concatenated span element."""
+        owner = torch.repeat_interleave(node_ids, lengths, output_size=total)
+        first = torch.cumsum(lengths, 0) - lengths
+        return owner, torch.arange(total, device=device) - first[owner]
+
+    # Prompt nodes have position offset 0 and branch nodes continue from the
+    # prompt, so a node's first source column is also its position offset.
+    segment, local = spans(node_physical, layout.physical_total_length)
+    token_gather_columns = node_column[segment] + local
+    completion, completion_offset = spans(node_logical * is_branch, sum(layout.completion_lengths))
+    completion_positions = node_start[completion] + completion_offset
+    padding, padding_offset = spans(node_physical - node_logical, num_padding)
+    indices = SharedPrefixTensorIndices(
+        token_gather_rows=node_row[segment],
+        token_gather_columns=token_gather_columns,
+        completion_positions=completion_positions,
+        predecessor_positions=torch.where(
+            completion_offset == 0,
+            root_start[completion] + root_prompt[completion] - 1,
+            completion_positions - 1,
+        ),
+        completion_scatter_columns=root_prompt[completion] + completion_offset - 1,
+        physical_padding_positions=(node_start[padding] + node_logical[padding] + padding_offset),
+    )
+
+    # Every source row must still hold its planned prompt and exact length.
+    # Gathers stay in bounds even for invalid sources, which then fail below.
+    lengths = input_lengths.to(device=device, dtype=torch.long)
+    checked, column = spans(root_prompt * is_branch, num_prompt_checks)
+    expected_prompts = _to_device(torch.tensor(prompt_tokens, dtype=input_ids.dtype), device)
+    valid = torch.stack(
+        (
+            ((lengths >= 0) & (lengths <= sequence_width)).all(),
+            ((lengths[node_row] == root_prompt + node_logical) | (is_branch == 0)).all(),
+            (
+                input_ids[node_row[checked], column]
+                == expected_prompts[prompt_offset[checked] + column]
+            ).all(),
+        )
+    )
+    if not bool(valid.all()):
+        _raise_source_mismatch(input_ids, input_lengths=input_lengths, layout=layout)
+
+    return SharedPrefixTensorBin(
+        layout=layout,
+        packed_input_ids=_gather_token_aligned_tensor(input_ids, indices=indices, padding_value=0),
+        position_ids=token_gather_columns.clone(),
+        indices=indices,
+    )
+
+
+def _raise_source_mismatch(
+    input_ids: torch.Tensor,
+    *,
+    input_lengths: torch.Tensor,
+    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+) -> None:
+    """Report the first source row that no longer satisfies ``layout`` (slow path)."""
+    batch_size, sequence_width = input_ids.shape
+    lengths_cpu = _validate_length_vector(
+        input_lengths, name="input_lengths", batch_size=batch_size, sequence_width=sequence_width
+    ).tolist()
+    for _, root in layout.iter_roots():
+        expected_prompt = list(root.prompt_token_ids)
+        for row_index, completion_length in zip(
+            root.row_indices, root.completion_lengths, strict=True
+        ):
             required_length = root.prompt_length + completion_length
-            source_length = int(input_lengths_cpu[row_index].item())
-            if required_length != source_length:
+            if required_length != lengths_cpu[row_index]:
                 raise ValueError(
                     f"layout completion length differs from source row {row_index}: "
-                    f"layout requires {required_length} tokens, row has {source_length}"
+                    f"layout requires {required_length} tokens, row has "
+                    f"{lengths_cpu[row_index]}"
                 )
-            source_prompt = input_ids[row_index, : root.prompt_length]
-            if not torch.equal(source_prompt, expected_prompt):
+            if input_ids[row_index, : root.prompt_length].tolist() != expected_prompt:
                 raise ValueError(
                     f"source prompt for row {row_index} differs from the planned exact prompt"
                 )
-
-    device = input_ids.device
-    indices = SharedPrefixTensorIndices(
-        token_gather_rows=_as_long_tensor(layout.token_gather_rows, device=device),
-        token_gather_columns=_as_long_tensor(layout.token_gather_columns, device=device),
-        completion_positions=_as_long_tensor(layout.completion_positions, device=device),
-        predecessor_positions=_as_long_tensor(layout.predecessor_positions, device=device),
-        completion_scatter_rows=_as_long_tensor(layout.completion_scatter_rows, device=device),
-        completion_scatter_columns=_as_long_tensor(
-            layout.completion_scatter_columns, device=device
-        ),
-        physical_padding_positions=_as_long_tensor(
-            layout.physical_padding_positions, device=device
-        ),
-    )
-    packed_input_ids = _gather_token_aligned_tensor(
-        input_ids,
-        indices=indices,
-        required_width=max(layout.token_gather_columns) + 1,
-        padding_value=0,
-    )
-    return SharedPrefixTensorBin(
-        layout=layout,
-        packed_input_ids=packed_input_ids,
-        position_ids=_as_long_tensor(layout.position_ids, device=device),
-        attention_allow_mask=(
-            build_star_attention_allow_mask(layout, device=device)
-            if materialize_attention_mask
-            else None
-        ),
-        indices=indices,
-    )
+    raise AssertionError("shared-prefix source validation failed without a mismatching row")
 
 
 def materialize_shared_prefix_token_aligned_tensor(
@@ -405,97 +428,35 @@ def materialize_shared_prefix_token_aligned_tensor(
     """
     if source.ndim != 2:
         raise ValueError("shared-prefix token-aligned source must have shape [batch, sequence]")
-    indices = tensor_bin.indices
-    if indices.token_gather_rows.numel() != tensor_bin.layout.physical_total_length:
-        raise ValueError("shared-prefix token gather rows do not match physical length")
-    if source.shape[0] <= int(indices.token_gather_rows.max().item()):
+    if source.shape[0] <= max(tensor_bin.layout.row_indices):
         raise ValueError("shared-prefix token-aligned source is missing a referenced row")
-
     return _gather_token_aligned_tensor(
-        source,
-        indices=indices,
-        required_width=int(indices.token_gather_columns.max().item()) + 1,
-        padding_value=padding_value,
+        source, indices=tensor_bin.indices, padding_value=padding_value
     )
 
 
 def _gather_token_aligned_tensor(
-    source: torch.Tensor,
-    *,
-    indices: SharedPrefixTensorIndices,
-    required_width: int,
-    padding_value: int | float,
+    source: torch.Tensor, *, indices: SharedPrefixTensorIndices, padding_value: int | float
 ) -> torch.Tensor:
-    """Apply the same physical gather and tail-padding rule to tokens and metadata."""
-    if required_width > source.shape[1]:
-        source = torch.nn.functional.pad(
-            source, (0, required_width - source.shape[1]), value=padding_value
-        )
-    packed = source[indices.token_gather_rows, indices.token_gather_columns].clone()
-    if indices.physical_padding_positions.numel():
-        packed[indices.physical_padding_positions] = padding_value
+    """Apply the same physical gather and tail-padding rule to tokens and metadata.
+
+    Columns past the source width (only branch padding tails reach them) are
+    clamped for the gather and then overwritten, so no padded copy of the
+    source is made.
+    """
+    columns = indices.token_gather_columns
+    width = source.shape[1]
+    packed = source[indices.token_gather_rows, columns.clamp_max(width - 1)]
+    packed.masked_fill_(columns >= width, padding_value)
+    packed[indices.physical_padding_positions] = padding_value
     return packed
 
 
-def build_shared_prefix_tensor_plan(
-    *,
-    input_ids: torch.Tensor,
-    input_lengths: torch.Tensor,
-    prompt_lengths: torch.Tensor,
-    group_ids: Sequence[str | None],
-    bin_capacity: int,
-    max_completions_per_bin: int = 16,
-    materialize_attention_mask: bool = True,
-    sequence_length_pad_multiple: int = 1,
-) -> SharedPrefixTensorPlan:
-    """Plan and materialize exact-prompt stars from a conventional padded batch.
-
-    Args:
-        input_ids: Integer token IDs with shape ``[batch, sequence]``.
-        input_lengths: Unpadded total length of each source row.
-        prompt_lengths: Prompt length of each source row. Completion tokens are
-            the contiguous range ``[prompt_length, input_length)``.
-        group_ids: Opaque rollout-group ID per source row.
-        bin_capacity: Maximum deduplicated token count per shared bin.
-        max_completions_per_bin: Maximum branches per shared bin.
-        sequence_length_pad_multiple: Ordinary per-sequence packing alignment.
-        materialize_attention_mask: Whether each tensor bin should include the
-            dense global reference mask. Set to ``False`` for fused model adapters
-            that consume the structured layout directly.
-
-    Returns:
-        Tensorized shared bins on ``input_ids.device`` and explicit fallback
-        records for every row not selected for sharing.
-
-    Raises:
-        TypeError: If a group ID is neither ``str`` nor ``None``.
-        ValueError: If tensor shapes, lengths, or planner limits are invalid.
-    """
-    rows = build_shared_prefix_rows(
-        input_ids=input_ids,
-        input_lengths=input_lengths,
-        prompt_lengths=prompt_lengths,
-        group_ids=group_ids,
-    )
-
-    plan = plan_shared_prefix_bins(
-        rows,
-        bin_capacity=bin_capacity,
-        max_completions_per_bin=max_completions_per_bin,
-        sequence_length_pad_multiple=sequence_length_pad_multiple,
-    )
-    return SharedPrefixTensorPlan(
-        shared_bins=tuple(
-            materialize_shared_prefix_layout(
-                input_ids,
-                input_lengths=input_lengths,
-                layout=layout,
-                materialize_attention_mask=materialize_attention_mask,
-            )
-            for layout in plan.shared_bins
-        ),
-        fallbacks=plan.fallbacks,
-    )
+def _to_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Copy a small host tensor without waiting for queued device work."""
+    if device.type == "cuda":
+        return values.pin_memory().to(device, non_blocking=True)
+    return values.to(device)
 
 
 def _validate_input_ids(input_ids: torch.Tensor) -> None:
@@ -534,27 +495,27 @@ def _validate_batch_inputs(
     return lengths_cpu, prompt_lengths_cpu
 
 
-def _validate_length_vector(
-    lengths: torch.Tensor, *, name: str, batch_size: int, sequence_width: int
-) -> torch.Tensor:
-    """Validate and copy one source-length vector to CPU long."""
+def _validate_length_vector_metadata(lengths: torch.Tensor, *, name: str, batch_size: int) -> None:
+    """Validate one source-length vector's shape and dtype without a device sync."""
     if not isinstance(lengths, torch.Tensor) or lengths.ndim != 1 or lengths.numel() != batch_size:
         raise ValueError(
             f"{name} must have shape [{batch_size}], got {getattr(lengths, "shape", None)}"
         )
     if lengths.is_floating_point() or lengths.is_complex() or lengths.dtype == torch.bool:
         raise ValueError(f"{name} must have an integer dtype, got {lengths.dtype}")
+
+
+def _validate_length_vector(
+    lengths: torch.Tensor, *, name: str, batch_size: int, sequence_width: int
+) -> torch.Tensor:
+    """Validate and copy one source-length vector to CPU long."""
+    _validate_length_vector_metadata(lengths, name=name, batch_size=batch_size)
     lengths_cpu = lengths.detach().cpu().to(torch.long)
     if bool(torch.any(lengths_cpu < 0).item()) or bool(
         torch.any(lengths_cpu > sequence_width).item()
     ):
         raise ValueError(f"{name} must be within input_ids width [0, {sequence_width}]")
     return lengths_cpu
-
-
-def _as_long_tensor(values: tuple[int, ...], *, device: torch.device) -> torch.Tensor:
-    """Convert immutable planner indices to a device-local long tensor."""
-    return torch.tensor(values, dtype=torch.long, device=device)
 
 
 def build_shared_prefix_rows(
@@ -571,9 +532,10 @@ def build_shared_prefix_rows(
         prompt_lengths=prompt_lengths,
         group_ids=group_ids,
     )
-    input_ids_cpu = input_ids.detach().cpu()
     input_length_values = lengths_cpu.tolist()
     prompt_length_values = prompt_lengths_cpu.tolist()
+    # Only prompt columns are read, so copy just those to the host.
+    prompt_tokens = input_ids[:, : max(prompt_length_values, default=0)].detach().cpu().tolist()
     rows: list[SharedPrefixRow] = []
     for row_index, (input_length, prompt_length) in enumerate(
         zip(input_length_values, prompt_length_values, strict=True)
@@ -585,9 +547,7 @@ def build_shared_prefix_rows(
             SharedPrefixRow(
                 row_index=row_index,
                 group_id=group_id,
-                prompt_token_ids=tuple(
-                    int(token) for token in input_ids_cpu[row_index, :prompt_length].tolist()
-                ),
+                prompt_token_ids=tuple(prompt_tokens[row_index][:prompt_length]),
                 completion_length=input_length - prompt_length,
             )
         )

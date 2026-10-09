@@ -21,12 +21,20 @@ use the same plan for Megatron, DTensor, or an observational dry run.
 
 from __future__ import annotations
 
-import enum
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
 
 from megatron.rl.tree_layout import PackedTreeLayout
+
+
+def _round_up(value: int, multiple: int) -> int:
+    """Round ``value`` up to a positive alignment without backend imports."""
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,10 +57,16 @@ class SharedPrefixRow:
     completion_length: int
 
     def __post_init__(self) -> None:
-        if self.row_index < 0:
-            raise ValueError("row_index must be nonnegative")
-        if self.completion_length < 0:
-            raise ValueError("completion_length must be nonnegative")
+        if not _is_int(self.row_index) or self.row_index < 0:
+            raise ValueError("row_index must be a nonnegative integer")
+        if not _is_int(self.completion_length) or self.completion_length < 0:
+            raise ValueError("completion_length must be a nonnegative integer")
+        if self.group_id is not None and (not isinstance(self.group_id, str) or not self.group_id):
+            raise ValueError("group_id must be None or a non-empty string")
+        if not isinstance(self.prompt_token_ids, tuple):
+            object.__setattr__(self, "prompt_token_ids", tuple(self.prompt_token_ids))
+        if not set(map(type, self.prompt_token_ids)) <= {int}:
+            raise ValueError("prompt_token_ids must contain integers, excluding booleans")
 
     @property
     def prompt_length(self) -> int:
@@ -65,13 +79,15 @@ class SharedPrefixRow:
         return self.prompt_length + self.completion_length
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SharedPrefixLayout:
     """CPU representation of one exact-prompt GRPO star.
 
-    Parallel index tuples deliberately remain ordinary Python values. A model
-    adapter can tensorize them on its own device without making the data-plane
-    planner depend on PyTorch or a specific training backend.
+    Only the source rows and their logical and physical completion lengths are
+    stored; every token index is derived from them, so a layout cannot carry
+    inconsistent maps. Derived tuples are ordinary Python values computed on
+    first access. A model adapter can tensorize them on its own device without
+    making the data-plane planner depend on PyTorch.
 
     ``token_gather_rows`` and ``token_gather_columns`` map every packed token to
     its source-batch coordinate. ``completion_positions`` identify target tokens
@@ -84,40 +100,37 @@ class SharedPrefixLayout:
     prompt_token_ids: tuple[int, ...]
     row_indices: tuple[int, ...]
     completion_lengths: tuple[int, ...]
-    total_length: int
-    branch_starts: tuple[int, ...]
-    position_ids: tuple[int, ...]
-    token_gather_rows: tuple[int, ...]
-    token_gather_columns: tuple[int, ...]
-    completion_positions: tuple[int, ...]
-    predecessor_positions: tuple[int, ...]
-    completion_scatter_rows: tuple[int, ...]
-    completion_scatter_columns: tuple[int, ...]
     physical_completion_lengths: tuple[int, ...] = ()
-    physical_padding_positions: tuple[int, ...] = ()
-    tree_layout: PackedTreeLayout = field(init=False, repr=False)
+    tree_layout: PackedTreeLayout = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        for name in (
+            "prompt_token_ids",
+            "row_indices",
+            "completion_lengths",
+            "physical_completion_lengths",
+        ):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+        if not isinstance(self.group_id, str) or not self.group_id:
+            raise ValueError("shared-prefix layouts require a non-empty group_id")
+        if not self.prompt_token_ids:
+            raise ValueError("a shared-prefix layout requires a non-empty prompt")
+        if not self.row_indices or len(self.row_indices) != len(self.completion_lengths):
+            raise ValueError("each completion node must own one source row")
+        if len(set(self.row_indices)) != len(self.row_indices) or any(
+            not _is_int(row) or row < 0 for row in self.row_indices
+        ):
+            raise ValueError("shared-prefix row indices must be unique nonnegative integers")
         physical_lengths = self.physical_completion_lengths or self.completion_lengths
         if len(physical_lengths) != len(self.completion_lengths):
             raise ValueError(
                 "physical_completion_lengths and completion_lengths must have equal length"
             )
-        if any(
-            physical < logical
-            for physical, logical in zip(physical_lengths, self.completion_lengths, strict=True)
-        ):
-            raise ValueError(
-                "physical completion lengths cannot be shorter than logical completions"
-            )
         object.__setattr__(self, "physical_completion_lengths", physical_lengths)
+        # The tree validates integral, positive and physically bounded spans.
         tree = PackedTreeLayout.from_shared_prefix(
             self.prompt_length, physical_lengths, logical_completion_lens=self.completion_lengths
         )
-        if len(self.row_indices) != len(physical_lengths):
-            raise ValueError("each completion node must own one source row")
-        if self.branch_starts != tree.node_start[1:]:
-            raise ValueError("shared-prefix branches must be positive and contiguous")
         object.__setattr__(self, "tree_layout", tree)
 
     def iter_roots(self) -> Iterator[tuple[int, SharedPrefixLayout]]:
@@ -130,9 +143,9 @@ class SharedPrefixLayout:
         return len(self.prompt_token_ids)
 
     @property
-    def baseline_length(self) -> int:
-        """Token count if every completion duplicated the prompt."""
-        return len(self.row_indices) * self.prompt_length + sum(self.completion_lengths)
+    def total_length(self) -> int:
+        """Logical prompt-once token count, excluding branch padding tails."""
+        return self.prompt_length + sum(self.completion_lengths)
 
     @property
     def physical_total_length(self) -> int:
@@ -140,9 +153,76 @@ class SharedPrefixLayout:
         return self.tree_layout.total_len
 
     @property
-    def tokens_saved(self) -> int:
-        """Prompt tokens removed relative to ordinary duplicated rows."""
-        return self.baseline_length - self.total_length
+    def branch_starts(self) -> tuple[int, ...]:
+        """Packed start of each completion branch."""
+        return self.tree_layout.node_start[1:]
+
+    @cached_property
+    def position_ids(self) -> tuple[int, ...]:
+        """Prefix-continued position of every packed token."""
+        return self.tree_layout.position_ids()
+
+    @cached_property
+    def token_gather_rows(self) -> tuple[int, ...]:
+        """Source row of every packed token."""
+        return (self.row_indices[0],) * self.prompt_length + tuple(
+            row
+            for row, length in zip(self.row_indices, self.physical_completion_lengths, strict=True)
+            for _ in range(length)
+        )
+
+    @cached_property
+    def token_gather_columns(self) -> tuple[int, ...]:
+        """Source column of every packed token, including branch padding tails."""
+        prompt_length = self.prompt_length
+        return tuple(range(prompt_length)) + tuple(
+            column
+            for length in self.physical_completion_lengths
+            for column in range(prompt_length, prompt_length + length)
+        )
+
+    @cached_property
+    def completion_positions(self) -> tuple[int, ...]:
+        """Packed position of every real completion token."""
+        return tuple(
+            position
+            for start, length in zip(self.branch_starts, self.completion_lengths, strict=True)
+            for position in range(start, start + length)
+        )
+
+    @cached_property
+    def predecessor_positions(self) -> tuple[int, ...]:
+        """Packed position whose logits predict each completion token."""
+        # The first token of every branch is predicted by the last prompt token.
+        return tuple(
+            position
+            for start, length in zip(self.branch_starts, self.completion_lengths, strict=True)
+            for position in (self.prompt_length - 1, *range(start, start + length - 1))
+        )
+
+    @cached_property
+    def completion_scatter_rows(self) -> tuple[int, ...]:
+        """Source row of each completion token's logprob."""
+        return tuple(
+            row
+            for row, length in zip(self.row_indices, self.completion_lengths, strict=True)
+            for _ in range(length)
+        )
+
+    @cached_property
+    def completion_scatter_columns(self) -> tuple[int, ...]:
+        """Column of each completion logprob in the ``[row, sequence - 1]`` view."""
+        first_column = self.prompt_length - 1
+        return tuple(
+            column
+            for length in self.completion_lengths
+            for column in range(first_column, first_column + length)
+        )
+
+    @cached_property
+    def physical_padding_positions(self) -> tuple[int, ...]:
+        """Packed positions of branch padding tails."""
+        return self.tree_layout.padding_positions()
 
 
 @dataclass(frozen=True)
@@ -194,14 +274,6 @@ class SharedPrefixForestLayout:
     @cached_property
     def total_length(self) -> int:
         return sum(root.total_length for root in self.roots)
-
-    @cached_property
-    def baseline_length(self) -> int:
-        return sum(root.baseline_length for root in self.roots)
-
-    @property
-    def tokens_saved(self) -> int:
-        return self.baseline_length - self.total_length
 
     @cached_property
     def row_indices(self) -> tuple[int, ...]:
@@ -304,13 +376,11 @@ def pack_shared_prefix_groups(
     ):
         trunk = root.physical_total_length
         dense = dense_length(root)
-        if ((trunk + padding_multiple - 1) // padding_multiple) * padding_multiple > bin_capacity:
+        if _round_up(trunk, padding_multiple) > bin_capacity:
             raise ValueError("shared-prefix root exceeds the aligned backbone budget")
         for index in range(len(bins)):
             combined = trunk_lengths[index] + trunk
-            if (
-                (combined + padding_multiple - 1) // padding_multiple
-            ) * padding_multiple <= bin_capacity and (
+            if _round_up(combined, padding_multiple) <= bin_capacity and (
                 dense_capacity is None or dense_lengths[index] + dense <= dense_capacity
             ):
                 bins[index].append(root)
@@ -326,47 +396,16 @@ def pack_shared_prefix_groups(
     )
 
 
-class SharedPrefixFallbackReason(enum.Enum):
-    """Reason a row was not placed in a shared-prefix star."""
-
-    MISSING_GROUP_ID = "missing_group_id"
-    EMPTY_PROMPT = "empty_prompt"
-    EMPTY_COMPLETION = "empty_completion"
-    SEQUENCE_EXCEEDS_BIN = "sequence_exceeds_bin"
-    NO_EXACT_PROMPT_PEER = "no_exact_prompt_peer"
-    PROMPT_MISMATCH = "prompt_mismatch"
-    NO_CAPACITY_COMPATIBLE_PEER = "no_capacity_compatible_peer"
-
-
-@dataclass(frozen=True, slots=True)
-class SharedPrefixFallback:
-    """One row routed away from shared-prefix packing.
-
-    ``fits_block_diagonal_bin`` distinguishes a normal mixed fallback from an
-    oversized row that the existing packer must reject or handle separately.
-    """
-
-    row: SharedPrefixRow
-    reason: SharedPrefixFallbackReason
-    fits_block_diagonal_bin: bool
-
-
 @dataclass(frozen=True, slots=True)
 class SharedPrefixPlan:
-    """Deterministic partition of input rows into shared stars and fallbacks."""
+    """Deterministic partition of input rows into shared stars and fallbacks.
+
+    ``fallback_row_indices`` lists, in ascending order, every row that keeps
+    ordinary causal packing because it has no exact-prompt peer that fits.
+    """
 
     shared_bins: tuple[SharedPrefixLayout, ...]
-    fallbacks: tuple[SharedPrefixFallback, ...]
-
-    @property
-    def shared_row_indices(self) -> tuple[int, ...]:
-        """Input row indices covered by shared-prefix bins."""
-        return tuple(row_index for layout in self.shared_bins for row_index in layout.row_indices)
-
-    @property
-    def fallback_row_indices(self) -> tuple[int, ...]:
-        """Input row indices routed to the fallback path."""
-        return tuple(fallback.row.row_index for fallback in self.fallbacks)
+    fallback_row_indices: tuple[int, ...]
 
 
 def build_shared_prefix_layout(
@@ -397,11 +436,7 @@ def build_shared_prefix_layout(
     """
     if not rows or (len(rows) < 2 and not allow_singleton):
         raise ValueError("a shared-prefix layout requires at least two rows")
-    if (
-        isinstance(sequence_length_pad_multiple, bool)
-        or not isinstance(sequence_length_pad_multiple, int)
-        or sequence_length_pad_multiple < 1
-    ):
+    if not _is_int(sequence_length_pad_multiple) or sequence_length_pad_multiple < 1:
         raise ValueError("sequence_length_pad_multiple must be a positive integer")
 
     first = rows[0]
@@ -424,59 +459,15 @@ def build_shared_prefix_layout(
             raise ValueError("all shared-prefix rows must have a non-empty completion")
 
     prompt_length = first.prompt_length
-    token_gather_rows = [first.row_index] * prompt_length
-    token_gather_columns = list(range(prompt_length))
-    completion_positions: list[int] = []
-    predecessor_positions: list[int] = []
-    completion_scatter_rows: list[int] = []
-    completion_scatter_columns: list[int] = []
-    physical_completion_lengths = tuple(
-        (
-            (row.total_length + sequence_length_pad_multiple - 1)
-            // sequence_length_pad_multiple
-            * sequence_length_pad_multiple
-        )
-        - prompt_length
-        for row in rows
-    )
-    tree = PackedTreeLayout.from_shared_prefix(
-        prompt_length,
-        physical_completion_lengths,
-        logical_completion_lens=tuple(row.completion_length for row in rows),
-    )
-    for row, packed_offset, physical_completion_length, first_predecessor in zip(
-        rows, tree.node_start[1:], tree.node_len[1:], tree.first_predecessors()[1:], strict=True
-    ):
-        token_gather_rows.extend([row.row_index] * physical_completion_length)
-        token_gather_columns.extend(
-            range(prompt_length, prompt_length + physical_completion_length)
-        )
-        for completion_offset in range(row.completion_length):
-            packed_position = packed_offset + completion_offset
-            predecessor_position = (
-                first_predecessor if completion_offset == 0 else packed_position - 1
-            )
-            completion_positions.append(packed_position)
-            predecessor_positions.append(predecessor_position)
-            completion_scatter_rows.append(row.row_index)
-            completion_scatter_columns.append(prompt_length + completion_offset - 1)
-
     return SharedPrefixLayout(
         group_id=group_id,
         prompt_token_ids=first.prompt_token_ids,
         row_indices=tuple(row.row_index for row in rows),
         completion_lengths=tuple(row.completion_length for row in rows),
-        total_length=prompt_length + sum(row.completion_length for row in rows),
-        branch_starts=tree.node_start[1:],
-        position_ids=tree.position_ids(),
-        token_gather_rows=tuple(token_gather_rows),
-        token_gather_columns=tuple(token_gather_columns),
-        completion_positions=tuple(completion_positions),
-        predecessor_positions=tuple(predecessor_positions),
-        completion_scatter_rows=tuple(completion_scatter_rows),
-        completion_scatter_columns=tuple(completion_scatter_columns),
-        physical_completion_lengths=physical_completion_lengths,
-        physical_padding_positions=tree.padding_positions(),
+        physical_completion_lengths=tuple(
+            _round_up(row.total_length, sequence_length_pad_multiple) - prompt_length
+            for row in rows
+        ),
     )
 
 
@@ -499,8 +490,11 @@ def plan_shared_prefix_bins(
 
     Args:
         rows: Candidate prompt-completion rows.
-        bin_capacity: Maximum number of deduplicated tokens in one shared bin.
+        bin_capacity: Maximum number of deduplicated tokens in one shared bin. It
+            must be a multiple of ``sequence_length_pad_multiple`` so that a
+            planned star still fits after topology padding.
         max_completions_per_bin: Maximum branches behind one stored prompt.
+        sequence_length_pad_multiple: Ordinary per-sequence packing alignment.
 
     Returns:
         A complete, deterministic partition of the input row indices.
@@ -508,23 +502,18 @@ def plan_shared_prefix_bins(
     Raises:
         ValueError: If planner limits are invalid or row indices are duplicated.
     """
-    if bin_capacity < 1:
-        raise ValueError("bin_capacity must be positive")
-    if max_completions_per_bin < 2:
-        raise ValueError("max_completions_per_bin must be at least 2")
-    if (
-        isinstance(sequence_length_pad_multiple, bool)
-        or not isinstance(sequence_length_pad_multiple, int)
-        or sequence_length_pad_multiple < 1
-    ):
+    if not _is_int(sequence_length_pad_multiple) or sequence_length_pad_multiple < 1:
         raise ValueError("sequence_length_pad_multiple must be a positive integer")
+    if not _is_int(bin_capacity) or bin_capacity < 1 or bin_capacity % sequence_length_pad_multiple:
+        raise ValueError(
+            "bin_capacity must be a positive integer multiple of sequence_length_pad_multiple, "
+            f"got {bin_capacity!r}"
+        )
+    if not _is_int(max_completions_per_bin) or max_completions_per_bin < 2:
+        raise ValueError("max_completions_per_bin must be an integer of at least 2")
 
     def padded_row_length(row: SharedPrefixRow) -> int:
-        return (
-            (row.total_length + sequence_length_pad_multiple - 1)
-            // sequence_length_pad_multiple
-            * sequence_length_pad_multiple
-        )
+        return _round_up(row.total_length, sequence_length_pad_multiple)
 
     def physical_completion_length(row: SharedPrefixRow) -> int:
         return padded_row_length(row) - row.prompt_length
@@ -534,48 +523,23 @@ def plan_shared_prefix_bins(
     if len(set(row_indices)) != len(row_indices):
         raise ValueError("row_index values must be unique")
 
-    fallbacks: list[SharedPrefixFallback] = []
-    eligible_rows: list[SharedPrefixRow] = []
-    for row in ordered_rows:
-        reason: SharedPrefixFallbackReason | None = None
-        if row.group_id is None:
-            reason = SharedPrefixFallbackReason.MISSING_GROUP_ID
-        elif row.prompt_length == 0:
-            reason = SharedPrefixFallbackReason.EMPTY_PROMPT
-        elif row.completion_length == 0:
-            reason = SharedPrefixFallbackReason.EMPTY_COMPLETION
-        elif padded_row_length(row) > bin_capacity:
-            reason = SharedPrefixFallbackReason.SEQUENCE_EXCEEDS_BIN
-
-        if reason is None:
-            eligible_rows.append(row)
-        else:
-            fallbacks.append(
-                SharedPrefixFallback(
-                    row=row,
-                    reason=reason,
-                    fits_block_diagonal_bin=padded_row_length(row) <= bin_capacity,
-                )
-            )
-
+    fallbacks: list[int] = []
     exact_groups: dict[tuple[str, tuple[int, ...]], list[SharedPrefixRow]] = {}
-    eligible_group_sizes: dict[str, int] = {}
-    for row in eligible_rows:
-        assert row.group_id is not None
-        exact_groups.setdefault((row.group_id, row.prompt_token_ids), []).append(row)
-        eligible_group_sizes[row.group_id] = eligible_group_sizes.get(row.group_id, 0) + 1
+    for row in ordered_rows:
+        if (
+            row.group_id is None
+            or row.prompt_length == 0
+            or row.completion_length == 0
+            or padded_row_length(row) > bin_capacity
+        ):
+            fallbacks.append(row.row_index)
+        else:
+            exact_groups.setdefault((row.group_id, row.prompt_token_ids), []).append(row)
 
     shared_bins: list[SharedPrefixLayout] = []
-    for (group_id, _prompt_token_ids), exact_rows in exact_groups.items():
+    for exact_rows in exact_groups.values():
         if len(exact_rows) < 2:
-            reason = (
-                SharedPrefixFallbackReason.PROMPT_MISMATCH
-                if eligible_group_sizes[group_id] > 1
-                else SharedPrefixFallbackReason.NO_EXACT_PROMPT_PEER
-            )
-            fallbacks.append(
-                SharedPrefixFallback(row=exact_rows[0], reason=reason, fits_block_diagonal_bin=True)
-            )
+            fallbacks.append(exact_rows[0].row_index)
             continue
 
         prompt_length = exact_rows[0].prompt_length
@@ -617,13 +581,8 @@ def plan_shared_prefix_bins(
                     )
                 )
             else:
-                fallbacks.append(
-                    SharedPrefixFallback(
-                        row=bin_rows[0],
-                        reason=SharedPrefixFallbackReason.NO_CAPACITY_COMPATIBLE_PEER,
-                        fits_block_diagonal_bin=True,
-                    )
-                )
+                fallbacks.append(bin_rows[0].row_index)
 
-    fallbacks.sort(key=lambda fallback: fallback.row.row_index)
-    return SharedPrefixPlan(shared_bins=tuple(shared_bins), fallbacks=tuple(fallbacks))
+    return SharedPrefixPlan(
+        shared_bins=tuple(shared_bins), fallback_row_indices=tuple(sorted(fallbacks))
+    )
