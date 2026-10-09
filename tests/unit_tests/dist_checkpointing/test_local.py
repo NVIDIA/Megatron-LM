@@ -90,7 +90,6 @@ class TestLocalCheckpointing:
             TempNamedDir(tmp_path_dist_ckpt / "owned_rng_local", sync=True) as checkpoint_dir,
             mock.patch("megatron.training.checkpointing.get_args", return_value=args),
             mock.patch("megatron.training.async_utils.get_args", return_value=args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             context = {"local_checkpoint_manager": LocalCheckpointManager(checkpoint_dir)}
             expected_rng = torch.get_rng_state().clone()
@@ -109,7 +108,9 @@ class TestLocalCheckpointing:
             assert saved_config == run_config.to_dict()
             run_config.logger.log_interval += 1
             torch.manual_seed(999)
-            iteration, _ = load_checkpoint(model, optimizer, None, checkpointing_context=context)
+            iteration, _ = load_checkpoint(
+                model, optimizer, None, checkpointing_context=context, restore_training_state=True
+            )
             assert iteration == 1
             assert torch.equal(torch.get_rng_state(), expected_rng)
             assert args.data_parallel_random_init is not owned_dp_random_init

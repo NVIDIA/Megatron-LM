@@ -281,9 +281,7 @@ def test_distributed_training_services_require_explicit_opt_in(monkeypatch, run_
 
 @pytest.mark.parametrize("is_vlm,is_mimo", [(False, False), (True, False), (True, True)])
 def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, is_vlm, is_mimo):
-    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-        vlm_dynamic_inference,
-    )
+    from examples.inference.advanced import vlm_dynamic_inference
 
     args = Namespace(load="checkpoint", inference_ckpt_non_strict=False)
     if is_mimo:
