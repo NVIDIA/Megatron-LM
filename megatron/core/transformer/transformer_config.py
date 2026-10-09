@@ -89,6 +89,14 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_loss_type: str = "cross_entropy"
+    """Training objective for Multi-Token Prediction (MTP) heads.
+
+    Supported values are ``cross_entropy`` and ``e2e_tv``. The end-to-end total
+    variation objective directly optimizes the normalized expected acceptance
+    length under rejection-sampling verification.
+    """
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
@@ -1639,6 +1647,23 @@ class TransformerConfig(ModelParallelConfig):
             is_gated_delta_net_variant,
             normalize_experimental_attention_variant,
         )
+
+        if self.mtp_loss_type not in ("cross_entropy", "e2e_tv"):
+            raise ValueError(
+                "mtp_loss_type must be one of 'cross_entropy' or 'e2e_tv', "
+                f"got {self.mtp_loss_type!r}."
+            )
+        if self.mtp_loss_type == "e2e_tv":
+            if not self.mtp_detach_heads:
+                warnings.warn(
+                    "mtp_loss_type='e2e_tv' requires detached MTP inputs "
+                    "and shared output weights; "
+                    "setting mtp_detach_heads=True automatically to prevent MTP loss "
+                    "gradients from flowing into the main model.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.mtp_detach_heads = True
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
