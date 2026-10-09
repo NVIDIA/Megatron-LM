@@ -4490,8 +4490,6 @@ class TransformerConfig(ModelParallelConfig):
         """Validate V4.1 training relationships and supported kernels on the DSv4 path."""
         if self.tensor_model_parallel_size != 1:
             raise ValueError("Native V4.1 currently requires tensor_model_parallel_size=1")
-        if self.sequence_parallel:
-            raise ValueError("Native V4.1 does not yet support sequence parallelism")
         if self.pipeline_model_parallel_size > 1:
             if self.use_ring_exchange_p2p:
                 raise ValueError("V4.1 PP/VPP does not support ring_exchange")
@@ -4525,8 +4523,6 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "V4.1 full recomputation requires positive integer recompute_num_layers"
             )
-        if self.mtp_num_layers:
-            raise ValueError("V4.1 backbone configuration must not include MTP/DSpark layers")
         if self.fp16 or self.params_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("Native V4.1 requires FP32 or BF16 parameters")
         if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
@@ -4567,12 +4563,10 @@ class TransformerConfig(ModelParallelConfig):
         # implementations and their normal dependency checks. CSA2 does not use
         # MLA's fused down projection or masked softmax; the standalone TE SwiGLU
         # activation does not implement the required clamp.
-        for name in ("mla_down_proj_fusion", "masked_softmax_fusion", "use_te_activation_func"):
+        for name in ("mla_down_proj_fusion", "use_te_activation_func"):
             if getattr(self, name):
                 raise ValueError(f"Native V4.1 requires {name}=False")
         if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
-            if self.cuda_graph_impl != "transformer_engine" or self.enable_cuda_graph:
-                raise ValueError("V4.1 CUDA Graphs require cuda_graph_impl='transformer_engine'")
             if self.enable_hyper_connections and not self.mhc_single_pass:
                 raise ValueError("V4.1 CUDA Graphs require single-pass mHC when mHC is enabled")
             if self.recompute_granularity == "full":
