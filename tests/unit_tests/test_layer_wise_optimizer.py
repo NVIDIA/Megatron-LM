@@ -72,6 +72,7 @@ class _FakeLayerwiseBucket:
 class _FakeBucketGroup:
     def __init__(self, buckets):
         self.buckets = buckets
+        self.param_sync_via_bucket_group = True
 
 
 class _FakeModelChunk:
@@ -93,6 +94,7 @@ def test_set_bucket_layerwise_params_list_single_dp_rank():
     bucket = _FakeLayerwiseBucket(params)
 
     optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.use_layer_wise_param_layout = False
     optimizer.pg_collection = ProcessGroupCollection(dp_cp=None, expt_dp=None)
     optimizer.dp_cp_params_list = None
     optimizer.expt_dp_params_list = None
