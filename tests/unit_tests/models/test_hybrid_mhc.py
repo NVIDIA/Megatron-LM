@@ -440,6 +440,55 @@ class TestHybridStackMHC:
         assert wrapped_layer.hyper_connection.mapping_proj.weight.grad is not None
         assert any(param.grad is not None for param in wrapped_layer.inner_layer.mlp.parameters())
 
+    @pytest.mark.parametrize("recompute_method", ["uniform", "block"])
+    def test_full_recompute_real_moe_matches_forward_backward(self, recompute_method):
+        config_kwargs = dict(
+            num_layers=2,
+            num_moe_experts=2,
+            moe_ffn_hidden_size=64,
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="alltoall",
+            add_bias_linear=False,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'pp', 'cp', 'ep', 'expt_tp', 'tp_ep', 'expt_dp']
+        )
+
+        def build_stack(config):
+            return HybridStack(
+                config=config,
+                submodules=hybrid_stack_spec.submodules,
+                post_layer_norm=False,
+                layer_type_list=[Symbols.MOE] * 2,
+                pg_collection=pg_collection,
+            ).cuda()
+
+        reference = build_stack(_get_config(**config_kwargs))
+        checkpointed = build_stack(
+            _get_config(
+                **config_kwargs,
+                recompute_granularity="full",
+                recompute_method=recompute_method,
+                recompute_num_layers=1,
+            )
+        )
+        checkpointed.load_state_dict(reference.state_dict())
+        hidden = torch.randn(8, 2, 32, device="cuda")
+        reference_input = hidden.clone().requires_grad_()
+        checkpointed_input = hidden.clone().requires_grad_()
+
+        expected = reference(reference_input, attention_mask=None)
+        actual = checkpointed(checkpointed_input, attention_mask=None)
+        torch.testing.assert_close(actual, expected)
+        expected.square().mean().backward()
+        actual.square().mean().backward()
+        torch.testing.assert_close(checkpointed_input.grad, reference_input.grad)
+        for name, param in checkpointed.named_parameters():
+            torch.testing.assert_close(param.grad, reference.get_parameter(name).grad, msg=name)
+        for stack in (reference, checkpointed):
+            for layer in stack.layers:
+                assert layer.inner_layer.mlp.token_dispatcher.probs is None
+
     def test_hybrid_model_forward_backward(self):
         config = _get_config(num_layers=3)
         model = HybridModel(

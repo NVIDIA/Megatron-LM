@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
@@ -122,19 +123,30 @@ def native_h_post_bda(
     return (x_expanded + mixed).to(original_residual.dtype)
 
 
-@torch.compile
-def native_proj_rms(
+def _proj_rms_impl(
     x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
 ) -> Tuple[Tensor, Tensor]:
-    """Native fused projection + RMS normalization."""
+    """FP32 projection + RMS normalization from an activation-dtype input."""
+    x = x.to(torch.float32)
+    weight = weight.to(torch.float32)
     proj = torch.matmul(x, weight.t())
     if eps_inside_sqrt:
         return proj, torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
     norm = x.norm(dim=-1, keepdim=True)
     K = x.shape[-1]
-    v = norm / math.sqrt(K) + eps
-    r = 1.0 / v
-    return proj, r
+    return proj, 1.0 / (norm / math.sqrt(K) + eps)
+
+
+@torch.compile
+def native_proj_rms(
+    x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
+) -> Tuple[Tensor, Tensor]:
+    """Compiled FP32 projection + RMS normalization.
+
+    ``x`` may retain the activation dtype so callers can checkpoint this function without
+    saving an FP32 upcast of the residual stream.
+    """
+    return _proj_rms_impl(x, weight, eps, eps_inside_sqrt)
 
 
 @torch.compile
@@ -311,10 +323,17 @@ class HyperConnectionModule(MegatronModule):
             x: [s, b, n*C] - n-stream hidden states
         """
         s, b, nC = x.shape
-        # Mapping projections use FP32 regardless of the activation dtype.
-        x_2d = x.reshape(s * b, nC).to(torch.float32)
-        weight = self.mapping_proj.weight.to(torch.float32)
-        proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
+        # Keep the activation-dtype input in autograd and upcast inside the recomputed
+        # projection. This avoids retaining a full FP32 copy of the residual stream.
+        x_2d = x.reshape(s * b, nC)
+        weight = self.mapping_proj.weight
+        if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
+            proj_rms = partial(_proj_rms_impl, eps_inside_sqrt=self.config.mhc_norm_eps_inside_sqrt)
+            proj, r = checkpoint(
+                proj_rms, x_2d, weight, self.norm_eps, use_reentrant=False, preserve_rng_state=False
+            )
+        else:
+            proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, -1), r.view(s, b, 1)
 
     @torch.compile
