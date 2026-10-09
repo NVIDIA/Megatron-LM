@@ -390,7 +390,7 @@ def _forward_mamba_layer_shared_prefix_cp_state_fork(
 def _forward_mamba_layer_shared_prefix_cp_replay(
     layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout
 ) -> Tensor:
-    """Exact CP Mamba fallback: replay each prefix without an explicit state boundary."""
+    """Parity baseline: rescan each prefix per branch without an explicit state boundary."""
     return _forward_mamba_layer_shared_prefix_cp_impl(
         layer, hidden_states, layout, replay_prefix=True
     )
@@ -409,9 +409,9 @@ def _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
     decomposed causal-convolution/chunk-scan implementation used by the optimized
     state-fork path.
 
-    The helper is a correctness fallback and an isolation oracle.  It is selected
-    explicitly with ``NRL_SP_MAMBA_IMPL=packed_fused``; ``ragged_state_fork`` is the
-    default.
+    The helper is a diagnostic isolation oracle, not a fallback for the default path.
+    It is selected explicitly with ``NRL_SP_MAMBA_IMPL=packed_fused``;
+    ``ragged_state_fork`` is the default.
     """
     mixer = layer.mixer
     if not isinstance(mixer, MambaMixer):
@@ -590,7 +590,28 @@ def _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
 def _forward_mamba_layer_shared_prefix_cp(
     layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout | SharedPrefixForestLayout
 ) -> Tensor:
-    """Run one Mamba layer with the implementation selected by ``NRL_SP_MAMBA_IMPL``."""
+    """Run one Mamba layer with the implementation selected by ``NRL_SP_MAMBA_IMPL``.
+
+    ``ragged_state_fork`` is the default for every topology and root count, including TP1/CP1
+    single stars. It scans each chunk-aligned prefix once, forks the state into every branch and
+    pads each branch only to its own chunk boundary. Evidence:
+
+    - it matches per-row dense Mamba to about 1e-7 in FP32 with IEEE GEMMs and, on the tested
+      shapes, stays within 1.5x of the dense BF16 error
+      (``tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py``);
+    - its Triton kernels replay bit-exactly under deterministic mode
+      (``tests/unit_tests/determinism/kernels/test_shared_prefix_mamba_kernels.py``);
+    - its layer forward+backward was 1.5-6x faster than ``state_fork`` on GB200 BF16 G=16 stars
+      and forests.
+
+    It calls private mamba_ssm SSD kernels, so stack validation fails early when they cannot be
+    imported and names ``state_fork`` as the workaround.
+
+    The other values are explicit opt-ins: ``state_fork`` uses only the public mamba_ssm API and
+    pads every branch to its longest sibling; ``replay_prefix`` rescans the prefix per branch as
+    a parity baseline; ``packed_recurrence`` and ``packed_fused`` are diagnostic oracles. The
+    ``*_training`` variants use ``state_fork`` in evaluation mode.
+    """
     implementation = _shared_prefix_mamba_impl()
     if implementation == "state_fork":
         return _forward_mamba_layer_shared_prefix_cp_state_fork(layer, hidden_states, layout)
