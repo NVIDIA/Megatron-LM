@@ -16,6 +16,7 @@ from megatron.core.models.hybrid.shared_prefix import (
 from megatron.core.models.hybrid.shared_prefix_layout import SharedPrefixLayout
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import TopKRouter
@@ -114,6 +115,9 @@ def test_moe_token_dropping_and_routing_replay_rejected(overrides, message):
         ("seq_aux_loss", 0.0),
         ("global_aux_loss", 0.0),
         (["aux_loss", "seq_aux_loss"], [0.0, 0.0]),
+        # A coefficient paired with "none" adds no loss (TopKRouter.get_aux_loss_coeff).
+        ("none", 1e-4),
+        (["none", "aux_loss"], [1e-3, 0.0]),
     ],
 )
 def test_inactive_aux_loss_load_balancing_accepted(load_balancing, coeff):
@@ -136,6 +140,7 @@ def test_inactive_aux_loss_load_balancing_accepted(load_balancing, coeff):
         (["aux_loss", "sinkhorn"], [0.0, 0.0], "load balancing type"),
         ("aux_loss", 1e-3, "auxiliary router loss"),
         (["aux_loss", "seq_aux_loss"], [0.0, 1e-3], "auxiliary router loss"),
+        (["none", "global_aux_loss"], [0.0, 1e-3], "auxiliary router loss"),
     ],
 )
 def test_routing_load_balancing_and_active_aux_loss_rejected(load_balancing, coeff, message):
@@ -144,6 +149,121 @@ def test_routing_load_balancing_and_active_aux_loss_rejected(load_balancing, coe
     )
     with pytest.raises(NotImplementedError, match=message):
         _validate_hybrid_stack(_stack(config), _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+
+
+@pytest.mark.parametrize("window_size", [None, (-1, -1), [-1, -1]])
+def test_full_attention_window_accepted(window_size):
+    """A YAML/CLI list [-1, -1] is the same full window as the tuple default."""
+    stack = _stack(_config(window_size=window_size))
+    _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+
+
+def _attention_layer():
+    layer = Mock(spec=TransformerLayer)
+    layer.self_attention = Mock(spec=SelfAttention)
+    layer.self_attention.checkpoint_core_attention = False
+    layer.self_attention.pg_collection = SimpleNamespace(tp=_group(1), cp=_group(1))
+    layer.is_moe_layer = False
+    return layer
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_old_or_missing_flash_attn_rejected_before_any_layer(monkeypatch, installed):
+    def is_fa_min_version(version):
+        if not installed:
+            raise ImportError("No module named 'flash_attn'")
+        return False
+
+    monkeypatch.setattr(shared_prefix, "is_fa_min_version", is_fa_min_version)
+    stack = _stack(_config(), [_attention_layer()])
+    with pytest.raises(RuntimeError, match="flash-attn >= 2.7.0"):
+        _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+    # Attention-free stacks never reach the fused attention kernel.
+    _validate_hybrid_stack(_stack(_config()), _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+
+
+# Every configuration guard of _validate_hybrid_stack that the other tests do not cover.
+_REJECTED_CONFIGS = [
+    ({"moe_num_hash_layers": 1}, NotImplementedError, "hash MoE routing"),
+    ({"quant_recipe": object()}, NotImplementedError, "quantization recipes"),
+    ({"wide_residual": object()}, NotImplementedError, "wide residual streams"),
+    ({"enable_mhc_connections": True}, NotImplementedError, "mHC connections"),
+    ({"attn_logit_softcapping": 30.0}, NotImplementedError, "logit softcapping"),
+    ({"sequence_parallel": True}, NotImplementedError, "sequence parallelism requires TP>1"),
+    ({"tensor_model_parallel_size": 2}, RuntimeError, "tensor-parallel config"),
+    ({"context_parallel_size": 2}, RuntimeError, "context-parallel config"),
+    (
+        {"recompute_granularity": "full", "recompute_method": "block", "recompute_num_layers": 1},
+        NotImplementedError,
+        "uniform method",
+    ),
+    (
+        {"recompute_granularity": "full", "recompute_method": "uniform", "recompute_num_layers": 0},
+        ValueError,
+        "recompute_num_layers >= 1",
+    ),
+    ({"fine_grained_activation_offloading": True}, NotImplementedError, "activation offloading"),
+    ({"cuda_graph_impl": "local"}, NotImplementedError, "CUDA graphs"),
+    ({"fp8": "hybrid"}, NotImplementedError, "fp16/bf16 only"),
+    ({"fp4": "e2m1"}, NotImplementedError, "fp16/bf16 only"),
+    ({"hidden_dropout": 0.1}, NotImplementedError, "zero dropout"),
+    ({"attention_dropout": 0.1}, NotImplementedError, "zero dropout"),
+    ({"window_size": (128, 0)}, NotImplementedError, "sliding-window attention"),
+    ({"softmax_type": "off-by-one"}, NotImplementedError, "vanilla softmax"),
+]
+_REJECTED_MOE_CONFIGS = [
+    ({"moe_router_force_load_balancing": True}, "forced MoE routing"),
+    ({"moe_router_force_biased": 1.0}, "forced MoE router bias"),
+    ({"moe_z_loss_coeff": 1e-3}, "router z-loss"),
+    ({"moe_input_jitter_eps": 0.1}, "input jitter"),
+    ({"mlp_chunks_for_training": 2}, "MLP chunking"),
+    # Expert-bias accounting needs logical completion lengths; _LAYOUT has none.
+    ({"moe_router_enable_expert_bias": True}, "explicit physical branch padding"),
+]
+
+
+@pytest.mark.parametrize(
+    "overrides, error, message",
+    _REJECTED_CONFIGS,
+    ids=lambda case: "-".join(case) if isinstance(case, dict) else None,
+)
+def test_unsupported_stack_config_rejected(overrides, error, message):
+    stack = _stack(_config(**overrides))
+    with pytest.raises(error, match=message):
+        _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    _REJECTED_MOE_CONFIGS,
+    ids=lambda case: "-".join(case) if isinstance(case, dict) else None,
+)
+def test_unsupported_moe_config_rejected(overrides, message):
+    stack = _stack(_config(moe=True, **overrides))
+    with pytest.raises(NotImplementedError, match=message):
+        _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+
+
+def test_unsupported_stack_topology_and_layers_rejected():
+    stack = _stack(_config())
+    stack.pp_group = _group(2)
+    with pytest.raises(NotImplementedError, match="PP1 only"):
+        _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+    stack = _stack(_config(), [Mock(spec=torch.nn.Linear)])
+    with pytest.raises(NotImplementedError, match="not implemented for"):
+        _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+    checkpointed = _attention_layer()
+    checkpointed.self_attention.checkpoint_core_attention = True
+    with pytest.raises(NotImplementedError, match="selective core-attention recomputation"):
+        _validate_hybrid_stack(
+            _stack(_config(), [checkpointed]), _LAYOUT, physical_len=_PHYSICAL_LEN[1]
+        )
+    with pytest.raises(NotImplementedError, match="QK-clipping"):
+        _validate_hybrid_stack(
+            _stack(_config(qk_clip=True), [_attention_layer()]),
+            _LAYOUT,
+            physical_len=_PHYSICAL_LEN[1],
+        )
 
 
 def test_stack_validation_needs_only_the_physical_length():

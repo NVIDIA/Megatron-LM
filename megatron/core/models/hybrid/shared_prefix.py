@@ -46,7 +46,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.moe.moe_utils import router_gating_token_blocks
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import make_viewless_tensor
+from megatron.core.utils import is_fa_min_version, make_viewless_tensor
 
 
 def _mamba_state_dtype_kwargs(mixer: MambaMixer) -> dict:
@@ -804,7 +804,8 @@ def _validate_hybrid_stack(
     )
     if stack.config.attention_dropout != 0.0 or stack.config.hidden_dropout != 0.0:
         raise NotImplementedError("shared-prefix Hybrid adapter currently requires zero dropout")
-    if stack.config.window_size not in (None, (-1, -1)):
+    window_size = stack.config.window_size
+    if window_size is not None and tuple(window_size) != (-1, -1):
         raise NotImplementedError(
             "shared-prefix Hybrid adapter does not support sliding-window attention"
         )
@@ -833,7 +834,14 @@ def _validate_hybrid_stack(
                 "shared-prefix Hybrid adapter does not support MoE router load balancing type "
                 f"{load_balancing!r}"
             )
-        if _has_nonzero_config_value(stack.config.moe_aux_loss_coeff):
+        aux_loss_coeffs = stack.config.moe_aux_loss_coeff
+        if isinstance(load_balancing, str):
+            aux_loss_coeffs = [aux_loss_coeffs]
+        # As in TopKRouter.get_aux_loss_coeff, a coefficient paired with "none" adds no loss.
+        if any(
+            load_balancing_type != "none" and _has_nonzero_config_value(coeff)
+            for load_balancing_type, coeff in zip(load_balancing_types, aux_loss_coeffs)
+        ):
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support MoE auxiliary router loss"
             )
@@ -874,6 +882,7 @@ def _validate_hybrid_stack(
                 "shared-prefix Hybrid MoE adapter does not support training MLP chunking"
             )
 
+    has_attention = False
     for layer in stack.layers:
         if isinstance(layer, MambaLayer):
             if not isinstance(layer.mixer, MambaMixer):
@@ -917,6 +926,7 @@ def _validate_hybrid_stack(
                     'statistics'
                 )
             if isinstance(layer.self_attention, SelfAttention):
+                has_attention = True
                 if layer.self_attention.pg_collection.tp.size() != tp_size:
                     raise RuntimeError(
                         'shared-prefix attention TP helper does not match the Hybrid stack TP '
@@ -955,6 +965,19 @@ def _validate_hybrid_stack(
         else:
             raise NotImplementedError(
                 f"shared-prefix state forking is not implemented for {type(layer).__name__}"
+            )
+    if has_attention:
+        # The attention entry repeats this check; failing here precedes the first Mamba layer.
+        from megatron.core.models.hybrid.shared_prefix_fused import _MIN_FLASH_ATTN_VERSION
+
+        try:
+            flash_attn_supported = is_fa_min_version(_MIN_FLASH_ATTN_VERSION)
+        except ImportError:
+            flash_attn_supported = False
+        if not flash_attn_supported:
+            raise RuntimeError(
+                f"shared-prefix attention requires flash-attn >= {_MIN_FLASH_ATTN_VERSION} for its "
+                "exact backward"
             )
 
 
