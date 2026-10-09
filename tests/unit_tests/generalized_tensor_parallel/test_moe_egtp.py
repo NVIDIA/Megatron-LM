@@ -6,9 +6,9 @@ Test groups
 -----------
 TestMoEEGTPCorrectness  - EGTP_remat MoE loss trajectory matches baseline (no-EGTP_remat) over 10
                           training steps using MXFP8 and Nemotron3-Super MoE hyperparameters.
-TestMoEEGTPPrecisionOverride
-                        - EGTP_remat grouped experts that a te-precision-config override keeps
-                          off the op-fuser path must still complete backward.
+TestMoEEGTPModuleGroupedTensor
+                        - BF16 grouped experts with the op-fuser disabled must select the
+                          module grouped-tensor path or its old-TE fallback and finish backward.
 """
 
 import pytest
@@ -333,7 +333,7 @@ def _worker_expert_bias_gtp_inclusive(rank, world_size, port):
 
 
 # ---------------------------------------------------------------------------
-# EGTP_remat grouped experts kept unfused by a te-precision-config override
+# EGTP_remat module grouped-tensor compatibility with a BF16 precision override
 # ---------------------------------------------------------------------------
 
 
@@ -356,15 +356,12 @@ def _bf16_override_recipe(pattern):
     )
 
 
-def _worker_egtp_precision_override_backward(
-    rank, world_size, port, egtp_remat_size, force_te_unsupported=False
-):
-    """Grouped experts that a precision override keeps unfused must still complete backward.
+def _worker_egtp_module_grouped_tensor_backward(rank, world_size, port, egtp_remat_size):
+    """Exercise the module backend selection independently of the op-fuser precision path.
 
-    The override drives ``_with_fused_impl`` to False, but ``use_transformer_engine_op_fuser``
-    has already force-enabled ``moe_use_grouped_tensor`` for every layer -- and TE's
-    grouped-tensor path cannot accumulate wgrad into a GTP-sharded weight. Both ingredients
-    are required, so ``egtp_remat_size=1`` is the control and 2 is the repro.
+    Request grouped tensors explicitly with the op-fuser disabled. A TE build with #3517
+    supports GTP-sharded weights on this path; older builds must fall back to split-quantize.
+    EGTP_remat=1 is the unsharded control, and 2 exercises the compatibility guard.
     """
     from megatron.core import parallel_state as ps
     from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
@@ -373,11 +370,6 @@ def _worker_egtp_precision_override_backward(
     from megatron.core.transformer.moe import experts as experts_mod
     from megatron.core.transformer.moe.experts import TEGroupedMLP
     from megatron.core.transformer.transformer_config import TransformerConfig
-
-    if force_te_unsupported:
-        # Pin the fallback: with a TE that supports sharded weights, nothing else in this file
-        # would exercise the split-quantize branch of the guard.
-        experts_mod._te_grouped_tensor_supports_sharded_weights = lambda: False
 
     HIDDEN, FFN, NUM_EXPERTS, SEQ = 512, 256, 4, 16
     dtype = torch.bfloat16
@@ -415,7 +407,8 @@ def _worker_egtp_precision_override_backward(
         bias_dropout_fusion=False,
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
-        use_transformer_engine_op_fuser=True,  # force-enables moe_use_grouped_tensor
+        use_transformer_engine_op_fuser=False,
+        moe_use_grouped_tensor=True,
         gradient_accumulation_fusion=True,  # so TE builds main_grad_funcs at all
         quant_recipe=_bf16_override_recipe("*mtp.layers.*"),
     )
@@ -433,10 +426,13 @@ def _worker_egtp_precision_override_backward(
     try:
         experts = layer.experts
         assert isinstance(experts, TEGroupedMLP)
-        # Ingredient 1: the override took these experts off the op-fuser path (#7212), while the
-        # config-level force-enable still asks for the grouped-tensor path.
+        # The module path is explicitly selected, rather than relying on a BF16 override to
+        # disable the op-fuser. Both linears must still resolve the MTP precision override.
+        assert not config.use_transformer_engine_op_fuser
         assert not experts._with_fused_impl
         assert config.moe_use_grouped_tensor
+        assert not experts.linear_fc1.will_execute_quantized(True)
+        assert not experts.linear_fc2.will_execute_quantized(True)
 
         # Ingredient 2: EGTP_remat > 1 shards the expert weights. Only then may the guard fire;
         # leaving an unsharded grouped-tensor run alone is what keeps the flag usable at large.
@@ -482,24 +478,25 @@ class TestMoEEGTPCorrectness:
         _run_distributed(_worker_expert_bias_gtp_inclusive, 4)
 
 
-class TestMoEEGTPPrecisionOverride:
+class TestMoEEGTPModuleGroupedTensor:
     @pytest.mark.parametrize("egtp_remat_size", (1, 2))
-    def test_egtp_precision_override_backward(self, monkeypatch, egtp_remat_size):
-        """bf16 override on grouped experts must survive backward; 1 is the control, 2 the repro."""
+    def test_egtp_module_grouped_tensor_backward(self, egtp_remat_size):
+        """Select the supported module backend and complete BF16 backward with EGTP=1 or 2."""
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
-        # _is_fused_impl_supported() needs this for the GLU fused kernel; without it the experts
-        # would be unfused for the wrong reason and the override would prove nothing.
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-        _run_distributed(_worker_egtp_precision_override_backward, 4, egtp_remat_size)
+        _run_distributed(_worker_egtp_module_grouped_tensor_backward, 4, egtp_remat_size)
 
-    def test_egtp_precision_override_backward_te_fallback(self, monkeypatch):
-        """Same repro with TE reporting no sharded-weight support: must fall back and still work.
+    def test_egtp_module_grouped_tensor_backward_te_fallback(self, monkeypatch):
+        """An old TE must disable grouped tensors on both linears and still finish backward.
 
         Without this the split-quantize branch of the guard goes uncovered on a TE that does
         support sharded weights.
         """
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-        _run_distributed(_worker_egtp_precision_override_backward, 4, 2, True)
+        from megatron.core.transformer.moe import experts as experts_mod
+
+        monkeypatch.setattr(
+            experts_mod, "_te_grouped_tensor_supports_sharded_weights", lambda: False
+        )
+        _run_distributed(_worker_egtp_module_grouped_tensor_backward, 4, 2)

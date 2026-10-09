@@ -3,12 +3,14 @@
 import argparse
 import os
 import sys
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+import megatron.core.extensions.transformer_engine as te_extension
 import megatron.core.transformer.moe.experts as experts_module
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
@@ -228,7 +230,8 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
     module.quantization_padding = lambda tensor, token_counts: (tensor, token_counts)
     module.quantization_unpadding = lambda tensor, token_counts: tensor
     module._fused_ops = None
-    module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias)
+    module.linear_fc1 = SimpleNamespace(te_quant_params=None, training=True)
+    module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias, te_quant_params=None, training=True)
     fused_ops = FakeFusedOps()
     module._make_fused_ops = lambda: fused_ops
     hidden_states = torch.zeros(2, 4)
@@ -247,6 +250,169 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
         torch.testing.assert_close(fused_ops.args[4], probs)
     else:
         assert len(fused_ops.args) == 4
+
+
+def _make_precision_fused_forward_module(monkeypatch, *, fc2_bias=False):
+    """Record the TE call while retaining MCore's actual precision and hook handling."""
+    state = SimpleNamespace(enabled=True, calls=[], hooks=[], builds=0)
+
+    @contextmanager
+    def autocast(*, enabled, **kwargs):
+        previous = state.enabled
+        state.enabled = enabled
+        try:
+            yield
+        finally:
+            state.enabled = previous
+
+    monkeypatch.setattr(
+        te_extension,
+        "FP8GlobalStateManager",
+        SimpleNamespace(is_fp8_enabled=lambda: state.enabled),
+        raising=False,
+    )
+    monkeypatch.setattr(te_extension, "fp8_autocast", autocast, raising=False)
+    monkeypatch.setattr(experts_module, "GRAD_INPUT_BUFFER_KEY", "grad_input")
+    monkeypatch.setattr(experts_module, "OUTPUT_BUFFER_KEY", "output")
+
+    class RecordingFusedOps(torch.nn.Module):
+        def forward(self, hidden_states, *extra_inputs, op_kwargs=None):
+            state.calls.append(
+                SimpleNamespace(
+                    enabled=state.enabled,
+                    grad_enabled=torch.is_grad_enabled(),
+                    extra_inputs=extra_inputs,
+                    kwargs=op_kwargs or {},
+                )
+            )
+            output = hidden_states + 1
+            output_buffer = (op_kwargs or {}).get(-1, {}).get("output")
+            if output_buffer is not None:
+                output_buffer.copy_(output)
+                return output_buffer
+            return output
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        fp8="e4m3",
+        fp4=False,
+        moe_router_padding_for_quantization=True,
+        moe_use_grouped_tensor=True,
+        moe_paged_stash=False,
+    )
+    module._with_fused_impl = True
+    module._use_grouped_tensor = True
+    module._fused_ops = None
+    for name in ("fc1", "fc2"):
+        linear = torch.nn.Linear(4, 4, bias=False)
+        linear.use_bias = fc2_bias and name == "fc2"
+        linear.te_quant_params = None
+        linear.register_forward_pre_hook(lambda original, args, name=name: state.hooks.append(name))
+        setattr(module, f"linear_{name}", linear)
+
+    def make_ops():
+        state.builds += 1
+        ops = RecordingFusedOps()
+        ops.register_forward_pre_hook(module._make_fused_impl_pre_forward_hook())
+        return ops
+
+    module._make_fused_ops = make_ops
+    return module, state
+
+
+@pytest.mark.parametrize("fc2_bias", [False, True])
+@pytest.mark.parametrize("use_buffers", [False, True])
+def test_fused_forward_honors_late_bf16_overrides(monkeypatch, fc2_bias, use_buffers):
+    module, state = _make_precision_fused_forward_module(monkeypatch, fc2_bias=fc2_bias)
+    hidden_states = torch.zeros(2, 4)
+    token_splits = torch.tensor([1, 1])
+    probs = torch.tensor([0.25, 0.75])
+    original_params = tuple(module.parameters())
+    module._fused_forward(hidden_states, token_splits, probs)
+    ops = module._fused_ops[0]
+    state.calls.clear()
+    state.hooks.clear()
+    # Full-model finish_init may install these overrides after the expert is constructed.
+    for linear in (module.linear_fc1, module.linear_fc2):
+        linear.te_quant_params = te_extension.TEQuantizationParams(
+            training_recipe=te_extension.TEQuantizationRecipe(), evaluation_recipe=None
+        )
+    output_buffer = torch.empty_like(hidden_states) if use_buffers else None
+    grad_buffer = torch.empty_like(hidden_states) if use_buffers else None
+    output = module._fused_forward(hidden_states, token_splits, probs, output_buffer, grad_buffer)
+    torch.testing.assert_close(output, torch.ones_like(hidden_states))
+    assert state.enabled is True, "The outer MXFP8 context must be restored"
+    assert module._with_fused_impl is True
+    assert module._fused_ops[0] is ops and state.builds == 1
+    assert tuple(map(id, module.parameters())) == tuple(map(id, original_params))
+    assert state.hooks == ["fc1", "fc2"]
+    assert len(state.calls) == 1 and state.calls[0].enabled is False
+    call = state.calls[0]
+    assert call.extra_inputs[0] is token_splits
+    assert call.extra_inputs[1] is probs
+    assert call.extra_inputs[2] is token_splits
+    assert len(call.extra_inputs) == (4 if fc2_bias else 3)
+    if fc2_bias:
+        assert call.extra_inputs[3] is probs
+    assert call.kwargs == (
+        {0: {"grad_input": grad_buffer}, -1: {"output": output_buffer}} if use_buffers else {}
+    )
+    if use_buffers:
+        assert output is output_buffer
+
+
+@pytest.mark.parametrize("bf16_fc", [1, 2])
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_fused_forward_rejects_different_precision_before_te_calls(
+    monkeypatch, bf16_fc, warm_cache
+):
+    module, state = _make_precision_fused_forward_module(monkeypatch)
+    args = (torch.zeros(2, 4), torch.tensor([1, 1]), torch.ones(2))
+    if warm_cache:
+        module._fused_forward(*args)
+    previous_builds = state.builds
+    state.calls.clear()
+    state.hooks.clear()
+    getattr(module, f"linear_fc{bf16_fc}").te_quant_params = te_extension.TEQuantizationParams(
+        training_recipe=te_extension.TEQuantizationRecipe(), evaluation_recipe=None
+    )
+    with pytest.raises(ValueError, match="same precision override"):
+        module._fused_forward(*args)
+    assert state.builds == previous_builds
+    assert state.calls == [] and state.hooks == []
+    assert state.enabled is True and module._with_fused_impl is True
+
+
+def test_fused_forward_rereads_precision_for_train_eval_and_recompute(monkeypatch):
+    module, state = _make_precision_fused_forward_module(monkeypatch)
+    args = (torch.zeros(2, 4), torch.tensor([1, 1]), torch.ones(2))
+    for linear in (module.linear_fc1, module.linear_fc2):
+        linear.te_quant_params = te_extension.TEQuantizationParams(
+            training_recipe=te_extension.TEQuantizationRecipe(),
+            evaluation_recipe=te_extension.TEQuantizationRecipe(override_quantized_autocast=False),
+        )
+    for training, grad_enabled, expected in (
+        (True, True, False),
+        (False, False, True),
+        (True, False, False),
+        (True, True, False),
+    ):
+        module.train(training)
+        state.calls.clear()
+        with torch.set_grad_enabled(grad_enabled):
+            module._fused_forward(*args)
+        assert state.calls[0].enabled is expected
+        assert state.calls[0].grad_enabled == grad_enabled
+        assert state.enabled is True
+    for linear in (module.linear_fc1, module.linear_fc2):
+        linear.te_quant_params = None
+    for enabled in (True, False):
+        state.enabled = enabled
+        state.calls.clear()
+        module._fused_forward(*args)
+        assert state.calls[0].enabled is enabled and state.enabled is enabled
+    assert state.builds == 1 and module._with_fused_impl is True
 
 
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
@@ -1305,17 +1471,11 @@ class TestTEGroupedMLP:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("override_pattern", (None, "*experts*", "*linear_fc1", "*linear_fc2"))
-    def test_gpu_precision_override_keeps_experts_unfused(self, override_pattern):
-        """A per-module precision override must keep these experts off the op-fuser path.
+    def test_gpu_precision_override_is_resolved_without_disabling_ops(self, override_pattern):
+        """Resolve per-linear overrides while leaving execution precision to forward.
 
-        The fused grouped-MLP kernels are FP8/NVFP4-only and select their recipe from the
-        global autocast state, not from the module's own quantization config. So a module the
-        precision config forces to high precision has to run unfused: otherwise it is silently
-        quantized anyway, and with GTP weight sharding its backward pass is handed an
-        unquantized weight the kernel cannot consume (AttributeError on `_columnwise_data`).
-
-        The fused op covers fc1 and fc2 jointly, so an override matching either one alone must
-        still disable it -- matching only fc2 is what the original GTP crash hit.
+        Matching BF16 overrides can use TE basic operations. Different FC1/FC2 overrides
+        are rejected at execution, as covered by the fused-forward precision tests.
         """
         try:
             from transformer_engine.pytorch.ops import GroupedLinear
@@ -1377,10 +1537,13 @@ class TestTEGroupedMLP:
         experts = layer.experts
         assert isinstance(experts, TEGroupedMLP)
 
-        if override_pattern is None:
-            assert experts._with_fused_impl
-        else:
-            assert not experts._with_fused_impl
+        assert experts._with_fused_impl
+        for name, linear in (
+            ("linear_fc1", experts.linear_fc1),
+            ("linear_fc2", experts.linear_fc2),
+        ):
+            overridden = override_pattern in ("*experts*", f"*{name}")
+            assert linear.will_execute_quantized(True) is not overridden
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

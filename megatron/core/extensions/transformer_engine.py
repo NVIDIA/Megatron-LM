@@ -412,13 +412,28 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
-def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+def _get_fp8_autocast_recipe_for_quant_params(
+    qparams: TEQuantizationParams | None, training: bool
+) -> TEQuantizationRecipe | None:
+    """Return the active module override, or None when it inherits the surrounding context.
+
+    Resolve this before entering any module-specific context. In particular, op-fuser callers
+    need to compare both linears' overrides against the same surrounding autocast state.
+    """
     if qparams is None:
-        return nullcontext()
+        return None
     elif not training and qparams.evaluation_recipe is not None:
-        return _get_fp8_autocast_for_quant_recipe(qparams.evaluation_recipe)
+        recipe = qparams.evaluation_recipe
     else:
-        return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
+        recipe = qparams.training_recipe
+    if FP8GlobalStateManager.is_fp8_enabled():
+        return recipe if recipe.override_quantized_autocast else None
+    return recipe if recipe.override_nonquantized_autocast else None
+
+
+def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+    recipe = _get_fp8_autocast_recipe_for_quant_params(qparams, training)
+    return nullcontext() if recipe is None else _get_fp8_autocast_for_quant_recipe(recipe)
 
 
 def _get_should_context_be_quantized_recipe(

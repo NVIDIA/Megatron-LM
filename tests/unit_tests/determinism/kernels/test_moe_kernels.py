@@ -510,6 +510,82 @@ class TestMoEModules:
             what="TEGroupedMLP",
         )
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    def test_te_op_fuser_bf16_override_replays_under_mxfp8(self, monkeypatch):
+        """Replay the real BF16 TE ops selected inside an outer MXFP8 context."""
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        from megatron.core.enums import Fp8Recipe
+        from megatron.core.extensions.transformer_engine import (
+            TEQuantizationParams,
+            TEQuantizationRecipe,
+        )
+
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear
+            from transformer_engine.pytorch.ops.basic.grouped_linear import (
+                is_op_fuser_grouped_tensor_path_supported,
+            )
+        except ImportError:
+            pytest.skip("TE grouped-tensor operation fuser support is required")
+        available, reason = FP8GlobalStateManager.is_mxfp8_available()
+        if not available:
+            pytest.skip(reason)
+        if not is_op_fuser_grouped_tensor_path_supported(None, torch.bfloat16):
+            pytest.skip("Native BF16 grouped GEMM needs supported hardware and cuBLASLt")
+        self._init()
+        seeded()
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        config = _moe_config(
+            hidden_size=256,
+            ffn_hidden_size=512,
+            num_moe_experts=4,
+            use_cpu_initialization=False,
+            gradient_accumulation_fusion=False,
+            bias_activation_fusion=False,
+            fp8="e4m3",
+            fp8_recipe=Fp8Recipe.mxfp8,
+            use_transformer_engine_op_fuser=True,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_padding_for_quantization=True,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=4, moe_grouped_gemm=True)
+        experts = (
+            get_submodules(spec.submodules.mlp)
+            .experts(
+                num_local_experts=4,
+                config=config,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+            .cuda()
+        )
+        for linear in (experts.linear_fc1, experts.linear_fc2):
+            linear.te_quant_params = TEQuantizationParams(
+                training_recipe=TEQuantizationRecipe(), evaluation_recipe=None
+            )
+        assert experts._with_fused_impl
+        contexts = []
+        original_forward = GroupedLinear.fuser_forward
+
+        def record_context(op, *args, **kwargs):
+            contexts.append(FP8GlobalStateManager.is_fp8_enabled())
+            return original_forward(op, *args, **kwargs)
+
+        monkeypatch.setattr(GroupedLinear, "fuser_forward", record_context)
+        splits = torch.tensor([256, 768, 0, 3072], device="cuda", dtype=torch.int64)
+        hidden = torch.randn(4096, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs = torch.rand(4096, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        assert_module_replays_bit_exact(
+            _InQuantizationContext(experts, config),
+            (hidden, splits, probs),
+            replays=3,
+            contention=True,
+            what="TE op fuser[BF16 override under MXFP8]",
+        )
+        assert experts._fused_ops is not None
+        assert contexts == [False, False] * 3
+
     @pytest.mark.skipif(
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
         reason="MXFP8 parameter storage needs Blackwell",

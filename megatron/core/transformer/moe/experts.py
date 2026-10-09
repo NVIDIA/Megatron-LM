@@ -20,7 +20,11 @@ from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    _get_fp8_autocast_for_quant_recipe,
+    _get_fp8_autocast_recipe_for_quant_params,
+)
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -339,15 +343,9 @@ class TEGroupedMLP(MegatronModule):
             assert (
                 self._is_fused_impl_supported()
             ), "Fused GroupedMLP is not supported for this configuration."
-        # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
-        # autocast state, so they would ignore a --te-precision-config-file override and quantize
-        # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
-        # kernel an unquantized weight. Fusion spans fc1 and fc2, so either one opting out ends it.
-        self._with_fused_impl: bool = (
-            self.config.use_transformer_engine_op_fuser
-            and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
-            and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
-        )
+        # Keep BF16 overrides on the TE ops path. _fused_forward applies the resolved
+        # precision context, and TE selects either a joint fusion or its basic operations.
+        self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
             self.config.gated_linear_unit
@@ -799,6 +797,23 @@ class TEGroupedMLP(MegatronModule):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
+        # Resolve after GPTModel's finish_init sweep, using the original modules' current
+        # train/eval mode. The whole TE sequence must execute under one precision override.
+        fc1_recipe = _get_fp8_autocast_recipe_for_quant_params(
+            self.linear_fc1.te_quant_params, self.linear_fc1.training
+        )
+        fc2_recipe = _get_fp8_autocast_recipe_for_quant_params(
+            self.linear_fc2.te_quant_params, self.linear_fc2.training
+        )
+        if fc1_recipe != fc2_recipe:
+            raise ValueError(
+                "TE grouped-MLP op-fuser requires the same precision override for linear_fc1 "
+                "and linear_fc2. Apply the override to both linears."
+            )
+        quant_context = (
+            nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
+        )
+
         # Construct fused impl if needed
         # Note: We initialize during the first forward pass in case
         # the params are modified after the constructor.
@@ -887,7 +902,7 @@ class TEGroupedMLP(MegatronModule):
                 if fine_grained_activation_offloading and output_buffer is None
                 else []
             )
-            with stash_context:
+            with stash_context, quant_context:
                 # NCCL-EP zero-copy: route the fc2 output (fwd combine reads it one-sided) and the
                 # fc1 dgrad (bwd dispatch scatters it one-sided) into caller-provided symm buffers.
                 # op_kwargs keys are basic-op indices into [fc1, activation, fc2]: 0=fc1, -1=fc2.
