@@ -57,6 +57,33 @@ def _mamba_state_dtype_kwargs(mixer: MambaMixer) -> dict:
     return {"state_dtype": mixer.mamba_training_ssm_states_dtype}
 
 
+# NRL_SP_MAMBA_IMPL values. ``*_training`` variants use state_fork in evaluation mode.
+_MAMBA_IMPLS = (
+    "ragged_state_fork",
+    "ragged_state_fork_training",
+    "state_fork",
+    "replay_prefix",
+    "replay_prefix_training",
+    "packed_recurrence",
+    "packed_recurrence_training",
+    "packed_fused",
+)
+
+
+def _shared_prefix_mamba_impl() -> str:
+    """Return the Mamba implementation selected by ``NRL_SP_MAMBA_IMPL``.
+
+    ``ragged_state_fork`` is the default for every topology and root count.
+    """
+    implementation = os.environ.get("NRL_SP_MAMBA_IMPL", "ragged_state_fork")
+    if implementation not in _MAMBA_IMPLS:
+        raise ValueError(
+            f"NRL_SP_MAMBA_IMPL must be one of {', '.join(map(repr, _MAMBA_IMPLS))}, "
+            f"got {implementation!r}"
+        )
+    return implementation
+
+
 def _validate_mamba_fork(mixer: MambaMixer) -> None:
     tp_size = mixer.pg_collection.tp.size()
     if tp_size > 1 and not mixer.config.sequence_parallel:
@@ -67,6 +94,29 @@ def _validate_mamba_fork(mixer: MambaMixer) -> None:
         raise NotImplementedError("shared-prefix Mamba state forking requires gated RMSNorm")
     if causal_conv1d_fn is None or mamba_chunk_scan_combined is None:
         raise RuntimeError("shared-prefix Mamba state forking requires causal-conv1d and mamba-ssm")
+    if _shared_prefix_mamba_impl().startswith("ragged_state_fork"):
+        chunk_size = mixer.chunk_size
+        if (
+            isinstance(chunk_size, bool)
+            or not isinstance(chunk_size, int)
+            or chunk_size < 1
+            or chunk_size & (chunk_size - 1)
+        ):
+            raise NotImplementedError(
+                f"shared-prefix ragged Mamba requires a power-of-two chunk_size, got "
+                f"{chunk_size!r}; set NRL_SP_MAMBA_IMPL=state_fork to use the padded backend"
+            )
+        # The forest scan keeps upstream's default state dtype (the activation dtype).
+        if MAMBA_HAS_STATE_DTYPE and mixer.mamba_training_ssm_states_dtype not in (
+            None,
+            mixer.config.params_dtype,
+        ):
+            raise NotImplementedError(
+                "shared-prefix ragged Mamba does not support mamba_training_ssm_states_dtype="
+                f"{mixer.mamba_training_ssm_states_dtype} with params_dtype="
+                f"{mixer.config.params_dtype}; unset mamba_training_ssm_states_dtype or set "
+                "NRL_SP_MAMBA_IMPL=state_fork"
+            )
 
 
 def _prefix_conv_context(xbc: Tensor, width: int) -> Tensor:
@@ -195,250 +245,6 @@ def _scan_mamba_projected_segment(
     if z is not None:
         z = rearrange(z, "b l d -> l b d").contiguous()
     return y, z, next_conv_context, final_state
-
-
-def _fork_mamba_segment(
-    mixer: MambaMixer,
-    hidden_states: Tensor,
-    *,
-    conv_context: Tensor | None = None,
-    ssm_initial_state: Tensor | None = None,
-    capture_state: bool = False,
-) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
-    """Scan one segment, optionally capturing a differentiable Mamba end state."""
-    _validate_mamba_fork(mixer)
-    if mixer.pg_collection.tp.size() != 1:
-        raise RuntimeError(
-            "TP sequence-sharded Mamba segments require the collective parallel adapter path"
-        )
-    if mixer.cp.cp_size != 1:
-        raise RuntimeError("CP-sharded Mamba segments require the collective CP adapter path")
-    if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
-        raise ValueError("shared-prefix Mamba segments must have shape [sequence, 1, hidden]")
-
-    cp = mixer.cp
-    num_groups = cp.ngroups_local_tpcp
-    num_heads = cp.nheads_local_tpcp
-    d_inner = cp.d_inner_local_tpcp
-
-    projected, _ = mixer.in_proj(hidden_states)
-    projected = cp.pre_conv_ssm(projected)
-    projected = rearrange(projected, "l b d -> b l d").contiguous()
-    z, xbc, dt = torch.split(
-        projected, [d_inner, d_inner + 2 * num_groups * mixer.d_state, num_heads], dim=-1
-    )
-    A = -torch.exp(cp.get_A_log().float())
-
-    # Channel-last convolution input, as in _scan_mamba_projected_segment.
-    xbc = xbc.contiguous()
-    next_conv_context = _prefix_conv_context(xbc, mixer.d_conv - 1) if capture_state else None
-    if conv_context is not None:
-        if conv_context.shape[0] != xbc.shape[0] or conv_context.shape[2] != xbc.shape[2]:
-            raise ValueError("prefix convolution state is incompatible with the branch")
-        conv_input = torch.cat([conv_context.to(xbc.dtype), xbc], dim=1)
-        conv_output = causal_conv1d_fn(
-            conv_input.transpose(1, 2),
-            rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
-            cp.get_conv1d_bias(),
-            activation=mixer.activation,
-        )[:, :, conv_context.shape[1] :]
-    else:
-        conv_output = causal_conv1d_fn(
-            xbc.transpose(1, 2),
-            rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
-            cp.get_conv1d_bias(),
-            activation=mixer.activation,
-        )
-    xbc = rearrange(conv_output, "b d l -> b l d").contiguous()
-
-    x, B, C = torch.split(
-        xbc, [d_inner, num_groups * mixer.d_state, num_groups * mixer.d_state], dim=-1
-    )
-    x = rearrange(x, "b l (h p) -> b l h p", p=mixer.headdim).contiguous()
-    B = rearrange(B, "b l (g n) -> b l g n", n=mixer.d_state).contiguous()
-    C = rearrange(C, "b l (g n) -> b l g n", n=mixer.d_state).contiguous()
-    z = rearrange(z, "b l (h p) -> b l h p", p=mixer.headdim).contiguous()
-
-    scan = mamba_chunk_scan_combined(
-        x,
-        dt.contiguous(),
-        A,
-        B,
-        C,
-        mixer.chunk_size,
-        D=(
-            rearrange(cp.get_D().float(), "(h p) -> h p", p=mixer.headdim)
-            if mixer.D_has_hdim
-            else cp.get_D()
-        ),
-        z=None,
-        dt_bias=cp.get_dt_bias().float(),
-        dt_softplus=True,
-        initial_states=ssm_initial_state,
-        return_final_states=capture_state,
-        **_mamba_state_dtype_kwargs(mixer),
-    )
-    if capture_state:
-        y, final_state = scan
-    else:
-        y, final_state = scan, None
-
-    y = rearrange(y, "b l h p -> l b (h p)").contiguous()
-    y = cp.post_conv_ssm(y)
-    z = rearrange(z, "b l h p -> l b (h p)").contiguous()
-    z = cp.post_conv_ssm(z)
-    y = mixer.norm(y, z)
-    output, output_bias = mixer.out_proj(y)
-    return output, output_bias, next_conv_context, final_state
-
-
-def _fork_mamba_branches(
-    mixer: MambaMixer,
-    branches: Tensor,
-    *,
-    conv_context: Tensor | None,
-    ssm_initial_state: Tensor | None,
-) -> tuple[Tensor, Tensor | None]:
-    """Scan right-padded prompt-tail/completion branches from an aligned state."""
-    _validate_mamba_fork(mixer)
-    if mixer.pg_collection.tp.size() != 1:
-        raise RuntimeError(
-            "TP sequence-sharded Mamba branches require the collective parallel adapter path"
-        )
-    if mixer.cp.cp_size != 1:
-        raise RuntimeError("CP-sharded Mamba branches require the collective CP adapter path")
-    if branches.ndim != 3:
-        raise ValueError(
-            "shared-prefix Mamba branches must have shape [sequence, branches, hidden]"
-        )
-
-    cp = mixer.cp
-    num_groups = cp.ngroups_local_tpcp
-    num_heads = cp.nheads_local_tpcp
-    d_inner = cp.d_inner_local_tpcp
-    branch_count = branches.shape[1]
-
-    projected, _ = mixer.in_proj(branches)
-    projected = cp.pre_conv_ssm(projected)
-    projected = rearrange(projected, "l b d -> b l d").contiguous()
-    z, xbc, dt = torch.split(
-        projected, [d_inner, d_inner + 2 * num_groups * mixer.d_state, num_heads], dim=-1
-    )
-    A = -torch.exp(cp.get_A_log().float())
-
-    # Channel-last convolution input, as in _scan_mamba_projected_segment.
-    xbc = xbc.contiguous()
-    if conv_context is None:
-        conv_output = causal_conv1d_fn(
-            xbc.transpose(1, 2),
-            rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
-            cp.get_conv1d_bias(),
-            activation=mixer.activation,
-        )
-    else:
-        repeated_context = conv_context.to(xbc.dtype).expand(branch_count, -1, -1)
-        conv_input = torch.cat([repeated_context, xbc], dim=1)
-        conv_output = causal_conv1d_fn(
-            conv_input.transpose(1, 2),
-            rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
-            cp.get_conv1d_bias(),
-            activation=mixer.activation,
-        )[:, :, repeated_context.shape[1] :]
-    xbc = rearrange(conv_output, "b d l -> b l d").contiguous()
-
-    x, B, C = torch.split(
-        xbc, [d_inner, num_groups * mixer.d_state, num_groups * mixer.d_state], dim=-1
-    )
-    x = rearrange(x, "b l (h p) -> b l h p", p=mixer.headdim).contiguous()
-    B = rearrange(B, "b l (g n) -> b l g n", n=mixer.d_state).contiguous()
-    C = rearrange(C, "b l (g n) -> b l g n", n=mixer.d_state).contiguous()
-    z = rearrange(z, "b l (h p) -> b l h p", p=mixer.headdim).contiguous()
-    initial_states = (
-        None
-        if ssm_initial_state is None
-        else ssm_initial_state.expand(branch_count, *ssm_initial_state.shape[1:]).contiguous()
-    )
-
-    y = mamba_chunk_scan_combined(
-        x,
-        dt.contiguous(),
-        A,
-        B,
-        C,
-        mixer.chunk_size,
-        D=(
-            rearrange(cp.get_D().float(), "(h p) -> h p", p=mixer.headdim)
-            if mixer.D_has_hdim
-            else cp.get_D()
-        ),
-        z=None,
-        dt_bias=cp.get_dt_bias().float(),
-        dt_softplus=True,
-        initial_states=initial_states,
-        return_final_states=False,
-        **_mamba_state_dtype_kwargs(mixer),
-    )
-    y = rearrange(y, "b l h p -> l b (h p)").contiguous()
-    y = cp.post_conv_ssm(y)
-    z = rearrange(z, "b l h p -> l b (h p)").contiguous()
-    z = cp.post_conv_ssm(z)
-    y = mixer.norm(y, z)
-    return mixer.out_proj(y)
-
-
-def _forward_mamba_layer_shared_prefix(
-    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout
-) -> Tensor:
-    residual = hidden_states.float() if layer.config.fp32_residual_connection else hidden_states
-    normalized = apply_module(layer.norm)(hidden_states.to(dtype=layer.config.params_dtype))
-
-    fork_boundary = _mamba_prefix_fork_boundary(layer.mixer, layout.prefix_len)
-    replayed_prefix_len = layout.prefix_len - fork_boundary
-    prefix_output = normalized.new_empty((0, 1, normalized.shape[-1]))
-    output_bias = None
-    conv_context = None
-    final_state = None
-    if fork_boundary:
-        prefix_output, output_bias, conv_context, final_state = _fork_mamba_segment(
-            layer.mixer, normalized[:fork_boundary], capture_state=True
-        )
-    physical_completion_lens = list(layout.completion_lens)
-    physical_completion_lens[-1] += hidden_states.shape[0] - layout.total_len
-    max_completion_len = replayed_prefix_len + max(physical_completion_lens)
-    branches = normalized.new_zeros(
-        max_completion_len, len(physical_completion_lens), normalized.shape[-1]
-    )
-    start = layout.prefix_len
-    for branch_index, completion_len in enumerate(physical_completion_lens):
-        if replayed_prefix_len:
-            branches[:replayed_prefix_len, branch_index] = normalized[
-                fork_boundary : layout.prefix_len, 0
-            ]
-        branches[replayed_prefix_len : replayed_prefix_len + completion_len, branch_index] = (
-            normalized[start : start + completion_len, 0]
-        )
-        start += completion_len
-    if start != hidden_states.shape[0]:
-        raise RuntimeError("shared-prefix branch spans do not cover physical sequence")
-    branch_output, branch_bias = _fork_mamba_branches(
-        layer.mixer, branches, conv_context=conv_context, ssm_initial_state=final_state
-    )
-    if output_bias is None:
-        output_bias = branch_bias
-    prefix_output = torch.cat([prefix_output, branch_output[:replayed_prefix_len, :1]], dim=0)
-    packed_output = torch.cat(
-        [prefix_output]
-        + [
-            branch_output[replayed_prefix_len : replayed_prefix_len + length, index : index + 1]
-            for index, length in enumerate(physical_completion_lens)
-        ],
-        dim=0,
-    )
-
-    with layer.bias_dropout_add_exec_handler():
-        return layer.mamba_bda(training=layer.training, fused=layer.config.bias_dropout_fusion)(
-            (packed_output, output_bias), residual, layer.hidden_dropout
-        )
 
 
 def _scan_mamba_shared_prefix_root(
@@ -596,9 +402,8 @@ def _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
     state-fork path.
 
     The helper is a correctness fallback and an isolation oracle.  It is selected
-    explicitly with ``NRL_SP_MAMBA_IMPL=packed_fused``; the optimized state-fork
-    implementation remains the default until end-to-end GPU parity validates a
-    safer default.
+    explicitly with ``NRL_SP_MAMBA_IMPL=packed_fused``; ``ragged_state_fork`` is the
+    default.
     """
     mixer = layer.mixer
     if not isinstance(mixer, MambaMixer):
@@ -783,8 +588,8 @@ def _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
 def _forward_mamba_layer_shared_prefix_cp(
     layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout | SharedPrefixForestLayout
 ) -> Tensor:
-    """Select the optimized Mamba path or correctness-first packed fallback."""
-    implementation = os.environ.get("NRL_SP_MAMBA_IMPL", "state_fork")
+    """Run one Mamba layer with the implementation selected by ``NRL_SP_MAMBA_IMPL``."""
+    implementation = _shared_prefix_mamba_impl()
     if implementation == "state_fork":
         return _forward_mamba_layer_shared_prefix_cp_state_fork(layer, hidden_states, layout)
     if implementation in ("replay_prefix_training", "replay_prefix"):
@@ -816,19 +621,13 @@ def _forward_mamba_layer_shared_prefix_cp(
         return _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
             layer, hidden_states, layout
         )
-    if implementation in ("ragged_state_fork_training", "ragged_state_fork"):
-        return _forward_mamba_layer_shared_prefix_cp_impl(
-            layer,
-            hidden_states,
-            layout,
-            replay_prefix=False,
-            ragged_state_fork=implementation == "ragged_state_fork" or layer.training,
-        )
-    raise ValueError(
-        "NRL_SP_MAMBA_IMPL must be 'state_fork', 'replay_prefix_training', "
-        "'replay_prefix', 'packed_recurrence_training', 'packed_recurrence', 'packed_fused', "
-        "'ragged_state_fork_training' or 'ragged_state_fork', "
-        f"got {implementation!r}"
+    # ragged_state_fork (the default) or ragged_state_fork_training.
+    return _forward_mamba_layer_shared_prefix_cp_impl(
+        layer,
+        hidden_states,
+        layout,
+        replay_prefix=False,
+        ragged_state_fork=implementation == "ragged_state_fork" or layer.training,
     )
 
 
@@ -1212,18 +1011,10 @@ def forward_hybrid_stack_shared_prefix(
                 moe_layer._shared_prefix_token_multiplicities = token_multiplicities
             try:
                 if isinstance(layer, MambaLayer):
-                    if (
-                        cp_group.size() > 1
-                        or tp_size > 1
-                        or isinstance(layout, SharedPrefixForestLayout)
-                    ):
-                        hidden_states = _forward_mamba_layer_shared_prefix_cp(
-                            layer, hidden_states, layout
-                        )
-                    else:
-                        hidden_states = _forward_mamba_layer_shared_prefix(
-                            layer, hidden_states, layout
-                        )
+                    # Every topology and root count honors NRL_SP_MAMBA_IMPL.
+                    hidden_states = _forward_mamba_layer_shared_prefix_cp(
+                        layer, hidden_states, layout
+                    )
                 elif isinstance(layer.self_attention, IdentityOp):
                     hidden_states = layer(hidden_states=hidden_states, attention_mask=None)
                 else:
