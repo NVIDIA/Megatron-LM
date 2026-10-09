@@ -1825,7 +1825,11 @@ class TestMLAUpProjectionInput:
         submodules.linear_q_up_proj = ColumnParallelLinear
         submodules.linear_kv_up_proj = ColumnParallelLinear
         attention = MLASelfAttention(
-            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+            config,
+            submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         seq_len, batch = 32, 2
         hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
