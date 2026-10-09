@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import inspect
 import os
 from argparse import Namespace
 from datetime import timedelta
@@ -101,11 +102,17 @@ def _restore_torch_settings(settings):
     mode, warn_only = settings["deterministic"]
     torch.use_deterministic_algorithms(mode, warn_only=warn_only)
     torch.utils.deterministic.fill_uninitialized_memory = settings["fill_uninitialized_memory"]
-    (
-        torch.backends.cudnn.deterministic,
-        torch.backends.cudnn.benchmark,
-        torch.backends.cudnn.allow_tf32,
-    ) = settings["cudnn"]
+    deterministic, benchmark, allow_tf32 = settings["cudnn"]
+    cudnn_flags = {
+        "_deterministic": deterministic,
+        "_benchmark": benchmark,
+        "_allow_tf32": allow_tf32,
+    }
+    # PyTorch's test helpers freeze direct flag assignments. Use the same
+    # setter as cudnn.flags() without changing that policy or uncaptured flags.
+    if "_fp32_precision" in inspect.signature(torch.backends.cudnn.set_flags).parameters:
+        cudnn_flags["_fp32_precision"] = None
+    torch.backends.cudnn.set_flags(**cudnn_flags)
     (
         torch.backends.cuda.matmul.allow_tf32,
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
