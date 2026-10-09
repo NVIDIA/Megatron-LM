@@ -330,7 +330,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
         ),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(K + "test_moe_kernels.py", K + "test_inference_precision.py"),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available.",
     ),
@@ -545,11 +545,28 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_inference_precision.py"),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
         "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
+    ),
+    KernelEntry(
+        name="inference_precision_boundaries",
+        sources=(
+            "megatron/core/fusions/fused_inference_rms_norm.py",
+            "megatron/core/inference/moe/vllm_fused_moe.py",
+            "megatron/core/tensor_parallel/inference_layers.py",
+            "megatron/core/extensions/transformer_engine.py",
+            "megatron/core/ssm/mamba_layer.py",
+            "megatron/core/transformer/moe/moe_layer.py",
+            "megatron/core/transformer/moe/token_dispatcher_inference.py",
+        ),
+        tests=(K + "test_inference_precision.py", K + "test_te_wrappers.py"),
+        kind="dispatch",
+        training_path=False,
+        notes="FP32 FC2 weighting/reduction and residual RMSNorm replay, changing-input CUDA "
+        "graphs, and EP=1 shared-expert cast boundaries. Collective algorithms are unchanged.",
     ),
     KernelEntry(
         name="batch_invariant_kernels",

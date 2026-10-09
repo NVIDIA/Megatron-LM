@@ -1151,6 +1151,27 @@ else:
     TEFusedResidualRMSNorm = None  # type: ignore[assignment, misc]
 
 
+class TEInferenceRMSNorm(te.pytorch.RMSNorm):
+    """Preserve an opted-in FP32 residual until inference normalization finishes."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Use model-dtype normalized output while retaining FP32 input arithmetic."""
+        if not self.training and (
+            hidden_states.dtype == torch.float32
+            or self.weight.dtype != self._inference_output_dtype
+        ):
+            from megatron.core.fusions.fused_inference_rms_norm import fp32_residual_rms_norm
+
+            return fp32_residual_rms_norm(
+                hidden_states,
+                self.weight,
+                self.eps,
+                self.zero_centered_gamma,
+                output_dtype=self._inference_output_dtype,
+            )
+        return super().forward(hidden_states)
+
+
 class TENorm:
     """A conditional wrapper to initialize an instance of
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input.
@@ -1194,6 +1215,8 @@ class TENorm:
                     TEFusedResidualRMSNorm is not None
                 ), "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
                 norm_module = TEFusedResidualRMSNorm
+            elif config.fp32_residual_connection:
+                norm_module = TEInferenceRMSNorm
             else:
                 norm_module = te.pytorch.RMSNorm
         else:
@@ -1208,6 +1231,8 @@ class TENorm:
         )
 
         instance.returns_residual = use_fused_residual
+        if isinstance(instance, TEInferenceRMSNorm):
+            instance._inference_output_dtype = config.params_dtype
         return cast(LayerNormInterface, instance)
 
 

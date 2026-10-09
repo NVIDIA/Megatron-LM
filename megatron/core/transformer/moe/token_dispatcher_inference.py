@@ -76,6 +76,15 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
         super().__init__(*args, **kwargs)
         self._runs_metadata_sync = runs_metadata_sync
 
+    @staticmethod
+    def _finish_combine(hidden_states):
+        """Keep the expert sum in FP32 until shared experts have been added.
+
+        Batch-invariant inference retains its training-compatible cast boundary.
+        Ordinary inference casts at the MoE layer's output instead.
+        """
+        return hidden_states.to(torch.bfloat16) if batch_invariant.enabled() else hidden_states
+
     @classmethod
     def _valid_tokens(cls) -> torch.Tensor:
         return cls._valid_tokens_tensor
@@ -270,17 +279,18 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             hidden_states: [total_tokens, hidden_dim] expert outputs.
 
         Returns:
-            [local_tokens, hidden_dim] bf16 local token outputs.
+            [local_tokens, hidden_dim] local token outputs, retaining the input
+            precision until shared-expert addition in ordinary inference.
         """
         if self.ep_size == 1:
-            return hidden_states.to(torch.bfloat16)
+            return self._finish_combine(hidden_states)
 
         if not self.__class__._use_allgather_v:
             # CG path: equal token counts, standard reduce-scatter.
             hidden_states = reduce_scatter_to_sequence_parallel_region(
                 hidden_states, group=self.tp_ep_group
             )
-            return hidden_states.to(torch.bfloat16)
+            return self._finish_combine(hidden_states)
 
         # Non-CG path: expand compact → padded, ReduceScatter, truncate.
         tokens_per_rank = self.__class__._local_tokens_per_rank
@@ -300,8 +310,8 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         scattered = padded_output.new_empty(max_tokens, hidden_states.shape[1])
         dist.reduce_scatter_tensor(scattered, padded_output, group=self.ep_group)
 
-        # Truncate padding and cast.
-        return scattered[: tokens_per_rank[ep_rank]].to(torch.bfloat16)
+        # Truncate padding; preserve FP32 through the shared-expert addition.
+        return self._finish_combine(scattered[: tokens_per_rank[ep_rank]])
 
 
 class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
@@ -648,10 +658,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 when written directly to the RSV buffer, bf16 otherwise).
 
         Returns:
-            [local_tokens, hidden_size] bf16 local token outputs.
+            [local_tokens, hidden_size] FP32 local token outputs (BF16 for the
+            batch-invariant training-parity path).
         """
         if self.ep_size == 1:
-            return hidden_states.to(torch.bfloat16)
+            return self._finish_combine(hidden_states)
 
         rsv = self.__class__._symm_rsv
 
@@ -680,7 +691,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             ep_max_tokens=self._ep_max_tokens(),
             per_rank_max_tokens=self._per_rank_worst_case_token_count,
         )
-        return output.to(torch.bfloat16)
+        return self._finish_combine(output)
 
     def combine_postprocess(self, hidden_states):
         """Restore original input shape (e.g. [S/TP, B, H] from [S*B/TP, H]).
