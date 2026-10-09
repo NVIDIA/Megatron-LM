@@ -229,6 +229,94 @@ def _shared_prefix_mtp_branch_indices(
     return tuple(star_indices), tuple(dense_positions)
 
 
+def _fixed_order_copy_contributors(indices: Tensor, num_rows: int, copies: int) -> Tensor:
+    """Return a ``[copies, num_rows]`` map from each source row to the positions copying it.
+
+    Entry ``[k, row]`` is the position in ``indices`` of the ``k``-th copy of ``row`` (in
+    ``indices`` order), or ``indices.numel()`` when ``row`` has fewer than ``k + 1`` copies.
+    Built on device without a host sync.
+    """
+    order = torch.argsort(indices, stable=True)
+    sorted_rows = indices.index_select(0, order)
+    copy = torch.arange(indices.numel(), device=indices.device) - torch.searchsorted(
+        sorted_rows, sorted_rows
+    )
+    contributors = torch.full(
+        (copies, num_rows), indices.numel(), device=indices.device, dtype=torch.long
+    )
+    contributors[copy, sorted_rows] = order
+    return contributors
+
+
+class _FixedOrderRowGather(torch.autograd.Function):
+    """``index_select`` over rows whose backward sums repeated rows in a fixed FP32 order.
+
+    The backward of ``index_select`` scatters with atomic adds in the input dtype, so
+    the prompt rows that every dense MTP branch copies would get run-to-run different
+    BF16 gradients. Only ``multi_rows`` can have more than one copy: each adds its
+    copies in copy order in FP32 and rounds once. Every other row has at most one
+    copy, which is its exact gradient, gathered in the input dtype.
+    """
+
+    @staticmethod
+    def forward(ctx, value, indices, first_copies, multi_rows, multi_copies):
+        """Gather ``value[indices]``."""
+        ctx.save_for_backward(first_copies, multi_rows, multi_copies)
+        return value.index_select(0, indices)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        """Gather single-copy rows, then overwrite ``multi_rows`` with their ordered sum."""
+        first_copies, multi_rows, multi_copies = ctx.saved_tensors
+        sentinel = gradient.shape[0]
+        if sentinel == 0:
+            empty = gradient.new_zeros((first_copies.numel(), *gradient.shape[1:]))
+            return empty, None, None, None, None
+        missing_shape = (-1, *(1,) * (gradient.dim() - 1))
+
+        def gather(positions):
+            # The sentinel position marks a missing copy and contributes an exact zero.
+            rows = gradient.index_select(0, positions.clamp(max=sentinel - 1))
+            return rows.masked_fill_((positions == sentinel).view(missing_shape), 0)
+
+        result = gather(first_copies)
+        if multi_rows.numel() > 0:
+            accumulation_dtype = torch.float64 if gradient.dtype == torch.float64 else torch.float32
+            accumulation = gather(multi_copies[0]).to(accumulation_dtype)
+            for positions in multi_copies[1:].unbind(0):
+                # In-place type promotion upcasts each copy exactly before adding.
+                accumulation.add_(gather(positions))
+            result.index_copy_(0, multi_rows, accumulation.to(gradient.dtype))
+        return result, None, None, None, None
+
+
+def _gather_shared_prefix_mtp_rows(
+    global_hidden_states: Tensor,
+    packed_indices: Tensor,
+    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+) -> Tensor:
+    """Gather dense MTP branch rows of one canonical star with a reproducible backward."""
+    # A prompt row is copied at most once per dense branch of its root; every other
+    # row belongs to at most one branch.
+    copies = max(len(root.completion_lens) for _, root in layout.iter_roots())
+    contributors = _fixed_order_copy_contributors(
+        packed_indices, global_hidden_states.shape[0], copies
+    )
+    multi_rows = torch.cat(
+        [
+            torch.arange(offset, offset + root.prefix_len, device=packed_indices.device)
+            for offset, root in layout.iter_roots()
+        ]
+    )
+    return _FixedOrderRowGather.apply(
+        global_hidden_states,
+        packed_indices,
+        contributors[0].clone(),
+        multi_rows,
+        contributors.index_select(1, multi_rows),
+    )
+
+
 def _pack_shared_prefix_mtp_branches(
     global_hidden_states: Tensor,
     global_input_ids: Tensor,
@@ -244,7 +332,8 @@ def _pack_shared_prefix_mtp_branches(
     branch-major concatenation ``[prompt + completion_1 | ... | prompt +
     completion_G]`` in this rank's CP-local order, gathered with exactly one
     ``index_select`` per tensor. Positions restart at zero for every branch,
-    exactly as in a conventional dense batch.
+    exactly as in a conventional dense batch. The hidden-state gradient sums each
+    prompt row's branch copies in a fixed FP32 order, so it is reproducible.
     """
     _validate_shared_prefix_mtp_star(
         global_hidden_states,
@@ -259,7 +348,7 @@ def _pack_shared_prefix_mtp_branches(
     )
     packed_indices = torch.cat(star_indices)
     return (
-        global_hidden_states.index_select(0, packed_indices),
+        _gather_shared_prefix_mtp_rows(global_hidden_states, packed_indices, layout),
         global_input_ids.index_select(1, packed_indices),
         global_loss_mask.index_select(1, packed_indices),
         torch.cat(dense_positions).unsqueeze(0),
