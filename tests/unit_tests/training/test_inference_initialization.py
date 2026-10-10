@@ -68,7 +68,9 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
 
 
 @pytest.mark.parametrize("restored_samples", [0, 8, 32])
-def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restored_samples):
+def test_resume_updates_microbatches_before_setup_validation(
+    monkeypatch, restored_samples, run_config
+):
     from megatron.training import training
 
     parser = ArgumentParser()
@@ -118,11 +120,10 @@ def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restor
 @pytest.mark.parametrize("enable_runtime_flags", [False, True])
 @pytest.mark.parametrize("training_kwargs", [{}, {"training": False}, {"training": True}])
 def test_runtime_services_initialize_training_only_when_requested(
-    monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs
+    monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs, run_config
 ):
-    args = Namespace(
-        enable_experimental=enable_runtime_flags, disable_jit_fuser=enable_runtime_flags
-    )
+    args = Namespace(enable_experimental=enable_runtime_flags)
+    run_config.dist.disable_jit_fuser = enable_runtime_flags
     experimental = Mock()
     jit = Mock()
     monkeypatch.setattr(global_vars, "set_experimental_flag", experimental)
@@ -164,13 +165,10 @@ def test_runtime_services_initialize_training_only_when_requested(
     else:
         experimental.assert_not_called()
         jit.assert_not_called()
-    assert vars(args) == {
-        "enable_experimental": enable_runtime_flags,
-        "disable_jit_fuser": enable_runtime_flags,
-    }
+    assert vars(args) == {"enable_experimental": enable_runtime_flags}
 
 
-def test_inference_telemetry_does_not_read_training_fields(monkeypatch):
+def test_inference_telemetry_does_not_read_training_fields(monkeypatch, run_config):
     class InferenceArgs(Namespace):
         def __getattribute__(self, name):
             if name in {"micro_batch_size", "global_batch_size", "train_iters"}:

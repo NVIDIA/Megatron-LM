@@ -146,7 +146,7 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(
     monkeypatch, lazy, skip, te_tracker, inference_tracker, run_config
 ):
     args = _args_without_rng()
-    args.lazy_mpu_init = lazy
+    run_config.dist.lazy_mpu_init = lazy
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     for name in (
         "setup_logging",

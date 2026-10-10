@@ -179,6 +179,7 @@ def initialize_runtime_services(
     args: Namespace, *, build_tokenizer: bool = True, training: bool = False
 ) -> None:
     """Initialize shared services, plus training-only services when requested."""
+    cfg = get_run_config()
     if build_tokenizer:
         _build_tokenizer(args)
     _set_wandb_writer(args)
@@ -187,7 +188,7 @@ def initialize_runtime_services(
     if args.enable_experimental:
         set_experimental_flag(True)
 
-    if args.disable_jit_fuser:
+    if cfg.dist.disable_jit_fuser:
         disable_jit_fuser()
 
     if training:
@@ -429,7 +430,7 @@ def _detect_gpu_identity(local_rank):
 
     Uses ``local_rank`` directly (not ``torch.cuda.current_device()``) because
     this runs from ``set_global_variables`` during arg parsing, before
-    ``torch.cuda.set_device(args.local_rank)`` happens in
+    ``torch.cuda.set_device(cfg.dist.local_rank)`` happens in
     ``_initialize_distributed`` -- ``current_device()`` would still read back
     the default (always 0) at this point. ``local_rank`` is resolved against
     ``CUDA_VISIBLE_DEVICES`` the same way ``set_device`` will later resolve it,
@@ -487,9 +488,9 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     """
     # Attach training config as resource attributes so they appear as
     # Process tags in Jaeger, making it easy to identify and compare runs.
-    resource_attrs = {}
+    cfg = get_run_config()
+    resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
     fields = [
-        ('dl.local_rank', 'local_rank'),
         ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
         ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
         ('dl.data_parallel.size', 'data_parallel_size'),
@@ -518,7 +519,7 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     else:
         resource_attrs['megatron.precision'] = 'fp32'
 
-    resource_attrs.update(_detect_gpu_identity(getattr(args, 'local_rank', None) or 0))
+    resource_attrs.update(_detect_gpu_identity(cfg.dist.local_rank))
 
     # SLURM identity, so EVERY span can be correlated with the out-of-band reckoner (which keys
     # on SLUID). SLUID is not in the job env, so the launch script fetches it from sacct (it's

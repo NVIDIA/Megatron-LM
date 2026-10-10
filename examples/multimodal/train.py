@@ -26,7 +26,7 @@ from megatron.core.parallel_state import (
     is_pipeline_last_stage,
 )
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
-from megatron.training import get_args, get_timers, get_tokenizer, pretrain
+from megatron.training import get_args, get_run_config, get_timers, get_tokenizer, pretrain
 from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
@@ -54,6 +54,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
 
     Note: attn_mask_type in layer_specs.py sets the attention mask. Attention mask is None here.
     """
+    cfg = get_run_config()
     imgs = None
     tokens = None
     labels = None
@@ -164,7 +165,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     if imgs.shape == torch.Size([1, 1]):
         # FSDP can hang with text-only samples. A workaround is to run a valid dummy image through the vision
         # model and then add image embeddings with a zero multiplier.
-        if args.use_torch_fsdp2:
+        if cfg.dist.use_torch_fsdp2:
             imgs = torch.zeros((1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device)
         else:
             # Similar workaround is not needed without FSDP and we can use an empty image.

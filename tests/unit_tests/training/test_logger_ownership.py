@@ -71,7 +71,9 @@ def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
         training, 'get_megatron_optimizer_config', lambda args: (OptimizerConfig(), None)
     )
     monkeypatch.setattr(
-        training, 'get_megatron_ddp_config', lambda args: DistributedDataParallelConfig()
+        training,
+        'get_megatron_ddp_config',
+        lambda args, *, use_torch_fsdp2: DistributedDataParallelConfig(),
     )
     if inference:
         cfg = argument_utils.inference_cfg_container_from_args(args, build_model_config=False)
