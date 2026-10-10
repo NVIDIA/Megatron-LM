@@ -29,7 +29,7 @@ class IndexedOrder(Generic[T]):
 
         Without ``items``, append unique items and look up successors by identity.
         With ``items``, preserve duplicates and consume one occurrence per
-        ``next_items`` call, restarting after the complete sequence is consumed.
+        ``advance`` call, restarting after the complete sequence is consumed.
         """
         self._items: list[ref[T]] = []
         self._index_by_item: WeakKeyDictionary[T, int] = WeakKeyDictionary()
@@ -56,25 +56,31 @@ class IndexedOrder(Generic[T]):
 
     def __iter__(self) -> Iterator[T]:
         """Iterate over live items in order, including repeated occurrences."""
-        return self._live_items(0)
-
-    def _live_items(self, start: int) -> Iterator[T]:
-        for index in range(start, len(self._items)):
-            item = self._items[index]()
+        for item_ref in self._items:
+            item = item_ref()
             if item is not None:
                 yield item
 
-    def next_items(self, item: T) -> Iterator[T]:
-        """Consume ``item`` and return its successors within this execution.
-
-        A recorded sequence validates each call before advancing its position.
-        Static orders retain identity-based lookup independent of call order.
-        """
+    def advance(self, item: T) -> None:
+        """Consume a recorded demand call; static orders need no cursor."""
         if self._position is None:
-            index = self._index_by_item[item]
-        else:
-            index = self._position
-            if not self._items or self._items[index]() is not item:
-                raise RuntimeError("FSDP module calls diverged from the recorded prefetch order.")
-            self._position = (index + 1) % len(self._items)
-        return self._live_items(index + 1)
+            return
+        if not self._items or self._items[self._position]() is not item:
+            raise RuntimeError("FSDP module calls diverged from the recorded prefetch order.")
+        self._position = (self._position + 1) % len(self._items)
+
+    def next_item(self, item: T, offset: int = 1) -> T | None:
+        """Return the live successor ``offset`` positions after ``item``, if any.
+
+        Recorded orders use the occurrence consumed by ``advance``. Looking
+        ahead for prefetch does not advance the demand-call cursor.
+        """
+        index = (
+            self._index_by_item[item]
+            if self._position is None
+            else (self._position - 1) % len(self._items)
+        )
+        next_index = index + offset
+        if next_index >= len(self._items):
+            return None
+        return self._items[next_index]()
