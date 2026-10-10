@@ -966,6 +966,54 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
 
 
 @pytest.mark.parametrize(
+    ("cp", "dynamic_cp", "local_cp_size"),
+    [
+        (2, False, None),  # static CP
+        (4, True, 2),  # DCP: partial CP group
+    ],
+)
+def test_get_batch_on_this_rank_for_sequence_packing_pad_between_seqs_tracks_padding(
+    cp, dynamic_cp, local_cp_size
+):
+    """pad_between_seqs must be False when no sequence carries alignment padding.
+
+    TE's FlashAttention and unfused backends reject THD inputs flagged as padded, so a
+    hardcoded True leaves models without a cuDNN-eligible head size (e.g. head_dim 256)
+    with no attention backend even when cu_seqlens == cu_seqlens_padded.
+    """
+    init_kwargs = dict(context_parallel_size=cp)
+    if dynamic_cp:
+        init_kwargs['dynamic_context_parallel'] = True
+        init_kwargs['min_dynamic_context_parallel_size'] = 1
+    Utils.initialize_model_parallel(1, 1, None, **init_kwargs)
+
+    try:
+        dp_rank = parallel_state.get_data_parallel_rank()
+        lengths = [1024, 2048, 512, 1536, 3072]  # already aligned: no padding anywhere
+        data_iterator = iter(
+            MockVariableLengthSequencePackingDataIterator(
+                total_seq_length=sum(lengths),
+                sequence_lengths=lengths,
+                padded_sequence_lengths=lengths,
+                local_cp_size=local_cp_size,
+                seed=42 + dp_rank,
+            )
+        )
+
+        *_, packed_seq_params, _ = get_batch_on_this_rank_for_sequence_packing(
+            data_iterator=data_iterator,
+            mtp_on_this_rank=False,
+            vp_stage=None,
+            dynamic_cp=dynamic_cp,
+        )
+
+        assert torch.equal(packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_q_padded)
+        assert packed_seq_params.pad_between_seqs is False
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
     ("tp", "pp", "cp", "vpp", "scheduler_type"),
     [
         (1, 1, 8, None, "dp_balanced"),
