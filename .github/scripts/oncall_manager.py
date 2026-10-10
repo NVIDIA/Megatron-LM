@@ -192,7 +192,10 @@ def validate_schedule_users_in_rotation_team(schedule, rotation_order):
         print(f"Error: No members found in {ROTATION_TEAM_SLUG}.")
         sys.exit(1)
 
-    missing_users = sorted(schedule_users - rotation_team_members, key=str.casefold)
+    canonical_members = {member.casefold() for member in rotation_team_members}
+    missing_users = sorted(
+        (user for user in schedule_users if user.casefold() not in canonical_members), key=str.casefold
+    )
     if missing_users:
         print(
             f"Error: Scheduled oncall user(s) are not members of "
