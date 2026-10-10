@@ -78,17 +78,27 @@ def copy_tensors_in_struct(src):
 
 def clone_tensors_in_struct(tgt, src):
     """Copy src to pre-existing tensors in tgt."""
+    if isinstance(tgt, torch.Tensor) != isinstance(src, torch.Tensor):
+        raise ValueError(
+            "Full-iteration CUDA graph tensor inputs must keep the same structure across "
+            "iterations. A tensor cannot replace a non-tensor input or vice versa; "
+            "use a fixed input structure or disable full-iteration CUDA graphs."
+        )
     if isinstance(src, tuple):
         raise Exception(f"Unsupported copy for tuple yet: {type(src)}")
     elif isinstance(src, list):
         for i in range(len(src)):
-            if isinstance(src[i], (tuple, list, dict, torch.Tensor)):
+            if isinstance(src[i], (tuple, list, dict, torch.Tensor)) or isinstance(
+                tgt[i], torch.Tensor
+            ):
                 clone_tensors_in_struct(tgt[i], src[i])
             else:
                 tgt[i] = src[i]
     elif isinstance(src, dict):
         for k in src:
-            if isinstance(src[k], (tuple, list, dict, torch.Tensor)):
+            if isinstance(src[k], (tuple, list, dict, torch.Tensor)) or isinstance(
+                tgt[k], torch.Tensor
+            ):
                 clone_tensors_in_struct(tgt[k], src[k])
             else:
                 tgt[k] = src[k]

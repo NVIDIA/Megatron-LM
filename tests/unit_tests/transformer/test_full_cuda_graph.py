@@ -12,8 +12,10 @@ from megatron.core import ModelParallelConfig
 from megatron.core.full_cuda_graph import (
     FullCudaGraphWrapper,
     StaticBufferLoader,
+    clone_tensors_in_struct,
     get_shared_capture_stream,
 )
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     model_parallel_cuda_manual_seed,
@@ -102,6 +104,62 @@ def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
     ]
     assert not stream_mismatch_warnings
     assert all(param.grad is not None for param in wrapped_model.parameters())
+
+
+@pytest.mark.parametrize("container", [lambda value: {"mask": value}, lambda value: [value]])
+@pytest.mark.parametrize("tensor_first", [False, True])
+def test_clone_tensors_in_struct_rejects_optional_tensor_changes(container, tensor_first):
+    """Replay cannot add or remove a tensor input recorded by the captured graph."""
+    value = torch.arange(4, dtype=torch.float32)
+    original = value if tensor_first else None
+    target = container(original)
+    source = container(None if tensor_first else value)
+
+    with pytest.raises(ValueError, match="tensor inputs must keep the same structure"):
+        clone_tensors_in_struct(target, source)
+
+    assert (target["mask"] if isinstance(target, dict) else target[0]) is original
+
+
+def test_clone_tensors_in_struct_preserves_static_tensor_storage():
+    """Valid updates retain captured addresses and leave absent optional fields absent."""
+    value = torch.arange(4, dtype=torch.float32)
+    buffer = torch.zeros(4)
+    target = {"nested": [buffer, None]}
+
+    clone_tensors_in_struct(target, {"nested": [value, None]})
+
+    assert target["nested"][0] is buffer
+    assert torch.equal(buffer, value)
+    assert target["nested"][1] is None
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+@pytest.mark.parametrize("batch_p2p_sync", [False, True])
+def test_batched_p2p_sync_respects_cuda_graph_capture(mocker, capturing, batch_p2p_sync):
+    """Capture skips device synchronization but still waits for communication work."""
+    communicator = P2PCommunicator.__new__(P2PCommunicator)
+    communicator.config = ModelParallelConfig(batch_p2p_comm=True, batch_p2p_sync=batch_p2p_sync)
+    communicator.pp_group = Mock()
+    communicator.next_rank = 1
+    communicator.prev_rank = 1
+    request = Mock()
+    mocker.patch(
+        "megatron.core.pipeline_parallel.p2p_communication._batched_p2p_ops", return_value=[request]
+    )
+    mocker.patch("torch.cuda.is_current_stream_capturing", return_value=capturing)
+    synchronize = mocker.patch("torch.cuda.synchronize")
+
+    communicator._communicate(
+        tensor_send_next=torch.ones(4),
+        tensor_send_prev=None,
+        recv_prev=False,
+        recv_next=False,
+        tensor_shape=None,
+    )
+
+    request.wait.assert_called_once_with()
+    assert synchronize.call_count == int(batch_p2p_sync and not capturing)
 
 
 @pytest.mark.skipif(
