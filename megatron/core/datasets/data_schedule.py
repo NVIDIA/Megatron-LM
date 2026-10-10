@@ -802,6 +802,15 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['padding_mask'] = _build_thd_padding_mask(
             batch['cu_seqlens'], batch['cu_seqlens_padded']
         )
+        positions = torch.arange(
+            batch['cu_seqlens_padded'][-1],
+            device=batch['cu_seqlens_padded'].device,
+            dtype=batch['cu_seqlens_padded'].dtype,
+        )
+        batch['moe_seq_idx'] = torch.searchsorted(
+            batch['cu_seqlens_padded'][1:], positions, right=True
+        ).to(torch.int32)
+        batch['moe_seq_idx'].masked_fill_(batch['padding_mask'], batch['cu_seqlens'].numel() - 1)
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
 
     # Partition padding_mask for context parallel on every PP stage. Partition
@@ -820,7 +829,7 @@ def get_batch_on_this_rank_for_sequence_packing(
                 tex is not None
             ), "Transformer Engine is required to use Context Parallel with THD format data."
             index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
-            cp_slice_keys = ['padding_mask']
+            cp_slice_keys = ['padding_mask', 'moe_seq_idx']
             if is_first_or_last_stage:
                 cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
             for key in cp_slice_keys:
@@ -872,6 +881,13 @@ def get_batch_on_this_rank_for_sequence_packing(
     else:
         batch['padding_mask'] = torch.empty([1, total_tokens], dtype=torch.bool, device=dev)
 
+    # Step3b: Prepare logical sequence ownership for sequence-level MoE aux loss.
+    if is_tp_rank_0:
+        assert batch['moe_seq_idx'].dtype == torch.int32
+        batch['moe_seq_idx'] = batch['moe_seq_idx'].view(1, total_tokens)
+    else:
+        batch['moe_seq_idx'] = torch.empty([1, total_tokens], dtype=torch.int32, device=dev)
+
     # Step4: Prepare "cu_seqlens", "cu_seqlens_padded", "max_seqlen" on all ranks.
     if is_tp_rank_0:
         assert batch['cu_seqlens'].dtype == torch.int32
@@ -894,6 +910,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     broadcast_tensor(batch['labels'], tp_src_rank, tp_group)
     broadcast_tensor(batch['loss_mask'], tp_src_rank, tp_group)
     broadcast_tensor(batch['padding_mask'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['moe_seq_idx'], tp_src_rank, tp_group)
     broadcast_tensor(batch['cu_seqlens'], tp_src_rank, tp_group)
     broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
     broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
@@ -904,6 +921,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     labels = batch['labels']
     loss_mask = batch['loss_mask']
     padding_mask = batch['padding_mask']
+    moe_seq_idx = batch['moe_seq_idx']
     cu_seqlens = batch['cu_seqlens']
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
@@ -919,6 +937,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
+        moe_seq_idx=moe_seq_idx,
     )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.

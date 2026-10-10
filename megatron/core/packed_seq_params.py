@@ -31,6 +31,10 @@ class PackedSeqParams:
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
     cp_scatter_cache: object = None
+    # Logical sequence IDs in the local pre-sequence-parallel token order. Unlike seq_idx,
+    # which may describe the global packed stream for SSM kernels, this tensor follows the
+    # context-parallel token ordering consumed by an MoE router.
+    moe_seq_idx: Tensor = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

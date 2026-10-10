@@ -2330,10 +2330,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
         # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
-        # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
+        # tokens_per_sample and moe_seq_idx are only for MoE sequence-level aux loss.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
+        self.kept_packed_seq_params.discard("moe_seq_idx")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
 
         if get_te_version() < PkgVersion("2.2.0"):

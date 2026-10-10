@@ -756,11 +756,12 @@ class TestRouterAuxLoss:
 
         def _get_seq_aux_loss(hidden_states, packed_seq_params=None):
             clear_aux_losses_tracker()
-            layer._forward_mlp(hidden_states, packed_seq_params=packed_seq_params)
-            return get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"]["values"][0]
+            output = layer._forward_mlp(hidden_states, packed_seq_params=packed_seq_params)
+            loss = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"]["values"][0]
+            return output, loss
 
         # Baseline: forward with the original [seq_len, mbs, H] shape.
-        loss_baseline = _get_seq_aux_loss(hidden_states)
+        _, loss_baseline = _get_seq_aux_loss(hidden_states)
 
         # Flatten to [mbs*seq_len, 1, H] the same way the dataloader does.
         flattened = hidden_states.transpose(0, 1).reshape(batch_size * seq_len, 1, -1)
@@ -768,11 +769,386 @@ class TestRouterAuxLoss:
         # With packed_seq_params, _maybe_reshape_for_moe restores [S, mbs, H]
         # before the router, recovering the correct per-sample loss.
         packed_seq_params = PackedSeqParams(tokens_per_sample=seq_len)
-        loss_with_implicit_reshape = _get_seq_aux_loss(
+        flattened_output, loss_with_implicit_reshape = _get_seq_aux_loss(
             flattened, packed_seq_params=packed_seq_params
         )
 
+        assert flattened_output.shape == flattened.shape
         torch.testing.assert_close(loss_with_implicit_reshape, loss_baseline)
+
+        # Variable-length packs cannot be unflattened into a dense [S, mbs, H] tensor. Verify
+        # the segmented router path through a real MoE layer while retaining the THD layout.
+        logical_lengths = (3, 5)
+        physical_lengths = (4, 8)
+        sequences = [hidden_states[:length, idx] for idx, length in enumerate(logical_lengths)]
+        padded_hidden = torch.zeros(
+            (max(logical_lengths), len(logical_lengths), hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        padded_mask = torch.ones(
+            (len(logical_lengths), max(logical_lengths)), device="cuda", dtype=torch.bool
+        )
+        for sequence_idx, sequence in enumerate(sequences):
+            padded_hidden[: sequence.shape[0], sequence_idx] = sequence
+            padded_mask[sequence_idx, : sequence.shape[0]] = False
+
+        clear_aux_losses_tracker()
+        layer._forward_mlp(padded_hidden, padding_mask=padded_mask)
+        variable_loss_baseline = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"][
+            "values"
+        ][0]
+
+        total_physical_tokens = sum(physical_lengths)
+        variable_packed = torch.zeros(
+            (total_physical_tokens, 1, hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        variable_mask = torch.ones((1, total_physical_tokens), device="cuda", dtype=torch.bool)
+        cursor = 0
+        for sequence, physical_length in zip(sequences, physical_lengths):
+            variable_packed[cursor : cursor + sequence.shape[0], 0] = sequence
+            variable_mask[0, cursor : cursor + sequence.shape[0]] = False
+            cursor += physical_length
+
+        variable_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=torch.tensor([0, 3, 8], device="cuda", dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor([0, 4, 12], device="cuda", dtype=torch.int32),
+        )
+        clear_aux_losses_tracker()
+        variable_output = layer._forward_mlp(
+            variable_packed, padding_mask=variable_mask, packed_seq_params=variable_params
+        )
+        variable_packed_loss = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"][
+            "values"
+        ][0]
+
+        assert variable_output.shape == variable_packed.shape
+        torch.testing.assert_close(variable_packed_loss, variable_loss_baseline)
+
+        # Chunking the variable THD stream would split logical sequences and apply
+        # seq_aux_loss once per chunk. The layer should keep this case unchunked.
+        layer.config.mlp_chunks_for_training = 2
+        clear_aux_losses_tracker()
+        chunk_config_output = layer._forward_mlp(
+            variable_packed, padding_mask=variable_mask, packed_seq_params=variable_params
+        )
+        chunk_config_loss = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"][
+            "values"
+        ][0]
+
+        torch.testing.assert_close(chunk_config_output, variable_output)
+        torch.testing.assert_close(chunk_config_loss, variable_packed_loss)
+
+        with pytest.raises(ValueError, match="not supported with Transformer Engine CUDA graphs"):
+            layer._te_cuda_graph_capture(variable_packed, packed_seq_params=variable_params)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("with_alignment_padding", [False, True])
+    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+    @pytest.mark.parametrize("with_unused_boundary_slots", [False, True])
+    def test_seq_aux_loss_variable_length_packed_sequences(
+        self, with_alignment_padding, calculate_per_token_loss, with_unused_boundary_slots
+    ):
+        """Variable-length THD packs must match an equivalent padded batch.
+
+        The packed representation keeps the logical sequences flattened and may
+        include physical alignment gaps. Sequence-level routing statistics must
+        still be computed independently for each logical sequence.
+        """
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        router = self.new_router(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            calculate_per_token_loss=calculate_per_token_loss,
+        ).cuda()
+
+        logical_lengths = (3, 5)
+        physical_lengths = (4, 8) if with_alignment_padding else logical_lengths
+        max_logical_length = max(logical_lengths)
+        hidden_size = router.config.hidden_size
+
+        with get_cuda_rng_tracker().fork():
+            sequences = [
+                torch.randn(
+                    (length, hidden_size), device=torch.device("cuda"), dtype=torch.bfloat16
+                )
+                for length in logical_lengths
+            ]
+
+        padded_hidden = torch.zeros(
+            (max_logical_length, len(sequences), hidden_size),
+            device=torch.device("cuda"),
+            dtype=torch.bfloat16,
+        )
+        padded_mask = torch.ones(
+            (max_logical_length, len(sequences)), device=torch.device("cuda"), dtype=torch.bool
+        )
+        for sequence_idx, sequence in enumerate(sequences):
+            padded_hidden[: sequence.shape[0], sequence_idx] = sequence
+            padded_mask[: sequence.shape[0], sequence_idx] = False
+
+        total_physical_tokens = sum(physical_lengths)
+        packed_hidden = torch.zeros(
+            (total_physical_tokens, 1, hidden_size),
+            device=torch.device("cuda"),
+            dtype=torch.bfloat16,
+        )
+        packed_mask = torch.ones(
+            (total_physical_tokens, 1), device=torch.device("cuda"), dtype=torch.bool
+        )
+        physical_cursor = 0
+        for sequence, physical_length in zip(sequences, physical_lengths):
+            logical_length = sequence.shape[0]
+            packed_hidden[physical_cursor : physical_cursor + logical_length, 0] = sequence
+            packed_mask[physical_cursor : physical_cursor + logical_length, 0] = False
+            physical_cursor += physical_length
+
+        logical_cu_seqlens = torch.tensor([0, 3, 8], device="cuda", dtype=torch.int32)
+        physical_cu_seqlens = torch.tensor(
+            [0, physical_lengths[0], total_physical_tokens], device="cuda", dtype=torch.int32
+        )
+        if with_unused_boundary_slots:
+            logical_cu_seqlens = torch.nn.functional.pad(logical_cu_seqlens, (0, 2), value=8)
+            physical_cu_seqlens = torch.nn.functional.pad(
+                physical_cu_seqlens, (0, 2), value=total_physical_tokens
+            )
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=logical_cu_seqlens,
+            cu_seqlens_q_padded=(physical_cu_seqlens if with_alignment_padding else None),
+        )
+
+        def run(hidden_states, padding_mask, packed_params=None):
+            clear_aux_losses_tracker()
+            router.weight.grad = None
+            hidden_states.requires_grad_(True)
+            probs, _ = router(
+                hidden_states, padding_mask=padding_mask, packed_seq_params=packed_params
+            )
+            probs.backward(torch.zeros_like(probs))
+            loss = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"]["values"][0]
+            return (
+                loss.detach().clone(),
+                router.weight.grad.detach().clone(),
+                hidden_states.grad.detach().clone(),
+            )
+
+        padded_loss, padded_weight_grad, padded_input_grad = run(padded_hidden, padded_mask)
+        packed_loss, packed_weight_grad, packed_input_grad = run(
+            packed_hidden, packed_mask, packed_seq_params
+        )
+
+        torch.testing.assert_close(packed_loss, padded_loss)
+        torch.testing.assert_close(packed_weight_grad, padded_weight_grad)
+
+        physical_cursor = 0
+        for sequence_idx, (logical_length, physical_length) in enumerate(
+            zip(logical_lengths, physical_lengths)
+        ):
+            torch.testing.assert_close(
+                packed_input_grad[physical_cursor : physical_cursor + logical_length, 0],
+                padded_input_grad[:logical_length, sequence_idx],
+            )
+            alignment_grad = packed_input_grad[
+                physical_cursor + logical_length : physical_cursor + physical_length
+            ]
+            assert torch.count_nonzero(alignment_grad) == 0
+            physical_cursor += physical_length
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
+        reason="CUDA or TE fused router ops not available",
+    )
+    def test_seq_aux_loss_variable_length_packed_sequences_fusion(self):
+        """Fused and unfused aux-loss kernels must agree for variable THD packs."""
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        router_ref = self.new_router(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp32",
+            moe_router_aux_loss_fusion=False,
+        ).cuda()
+        router_fused = self.new_router(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp32",
+            moe_router_aux_loss_fusion=True,
+        ).cuda()
+        with torch.no_grad():
+            router_fused.weight.copy_(router_ref.weight)
+
+        hidden_states = torch.randn(
+            (12, 1, router_ref.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        padding_mask = torch.tensor(
+            [[False, False, False, True, False, False, False, False, False, True, True, True]],
+            device="cuda",
+        ).T
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=torch.tensor([0, 3, 8], device="cuda", dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor([0, 4, 12], device="cuda", dtype=torch.int32),
+        )
+
+        def run(router):
+            clear_aux_losses_tracker()
+            router.weight.grad = None
+            local_hidden = hidden_states.clone().requires_grad_(True)
+            scores, routing_map = router(
+                local_hidden, padding_mask=padding_mask, packed_seq_params=packed_seq_params
+            )
+            scores.backward(torch.zeros_like(scores))
+            loss = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"]["values"][0]
+            return scores, routing_map, loss, router.weight.grad, local_hidden.grad
+
+        ref = run(router_ref)
+        fused = run(router_fused)
+        assert torch.equal(ref[1], fused[1])
+        torch.testing.assert_close(ref[0], fused[0], rtol=2.0e-2, atol=1.0e-3)
+        torch.testing.assert_close(ref[2], fused[2])
+        torch.testing.assert_close(ref[3], fused[3])
+        torch.testing.assert_close(ref[4], fused[4])
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("tp_size,cp_size", [(1, 1), (1, 2), (2, 1), (1, 8), (4, 2)])
+    def test_seq_aux_loss_variable_length_packed_sequences_parallel(self, tp_size, cp_size):
+        """Packed seq_aux_loss must preserve sequence ownership across CP and SP."""
+        from megatron.core.context_parallel import get_batches_on_this_cp_rank
+
+        world_size = torch.distributed.get_world_size()
+        if world_size % (tp_size * cp_size) != 0:
+            pytest.skip(f"requires a world size divisible by TP={tp_size} * CP={cp_size}")
+
+        baseline_router = self.new_router(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            params_dtype=torch.float32,
+            bf16=False,
+        ).cuda()
+        hidden_size = baseline_router.config.hidden_size
+        logical_lengths = (3, 5)
+        with get_cuda_rng_tracker().fork():
+            flat_hidden = torch.randn(
+                (sum(logical_lengths), hidden_size), device="cuda", dtype=torch.float32
+            )
+
+        padded_hidden = torch.zeros(
+            (max(logical_lengths), len(logical_lengths), hidden_size),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        padded_mask = torch.ones(
+            (max(logical_lengths), len(logical_lengths)), device="cuda", dtype=torch.bool
+        )
+        cursor = 0
+        for sequence_idx, length in enumerate(logical_lengths):
+            padded_hidden[:length, sequence_idx] = flat_hidden[cursor : cursor + length]
+            padded_mask[:length, sequence_idx] = False
+            cursor += length
+
+        clear_aux_losses_tracker()
+        padded_hidden.requires_grad_(True)
+        baseline_probs, _ = baseline_router(padded_hidden, padding_mask=padded_mask)
+        baseline_probs.backward(torch.zeros_like(baseline_probs))
+        baseline_loss = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"]["values"][
+            0
+        ].detach()
+        baseline_weight_grad = baseline_router.weight.grad.detach()
+        baseline_input_grad = torch.cat(
+            [
+                padded_hidden.grad[: logical_lengths[0], 0],
+                padded_hidden.grad[: logical_lengths[1], 1],
+            ]
+        )
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+        )
+        router = self.new_router(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            params_dtype=torch.float32,
+            bf16=False,
+            tensor_model_parallel_size=tp_size,
+            context_parallel_size=cp_size,
+            sequence_parallel=tp_size > 1,
+        ).cuda()
+        with torch.no_grad():
+            router.weight.copy_(baseline_router.weight)
+
+        pg_collection = get_default_pg_collection()
+        token_ids = torch.arange(1, sum(logical_lengths) + 1, device="cuda").view(1, -1)
+        cp_batch = get_batches_on_this_cp_rank(
+            {
+                "tokens": token_ids,
+                "labels": None,
+                "loss_mask": torch.ones_like(token_ids),
+                "position_ids": token_ids - 1,
+                "attention_mask": None,
+                "cu_seqlens": torch.tensor([[0, 3, 8]], device="cuda", dtype=torch.int32),
+                "cu_seqlens_padded": None,
+                "max_seqlen": torch.tensor([5], device="cuda", dtype=torch.int32),
+                "local_cp_size": None,
+                "hybrid_cp_group": None,
+            },
+            boundary_layout="zigzag",
+            is_hybrid_cp=False,
+            cp_group=pg_collection.cp,
+            use_per_sequence_balancing=True,
+            sequence_parallel=tp_size > 1,
+            tp_group=pg_collection.tp,
+            tp_cp_group=pg_collection.tp_cp,
+            tokens_per_sample=None,
+        )
+        local_token_ids = cp_batch.get_batch()["tokens"].reshape(-1)
+        if tp_size > 1:
+            local_token_ids = local_token_ids.chunk(tp_size)[pg_collection.tp.rank()]
+
+        valid_tokens = local_token_ids > 0
+        local_hidden = torch.zeros(
+            (local_token_ids.numel(), 1, hidden_size), device="cuda", dtype=torch.float32
+        )
+        local_hidden[valid_tokens, 0] = flat_hidden[local_token_ids[valid_tokens] - 1]
+        local_hidden.requires_grad_(True)
+        local_padding_mask = (~valid_tokens).view(-1, 1)
+
+        clear_aux_losses_tracker()
+        packed_probs, _ = router(
+            local_hidden,
+            padding_mask=local_padding_mask,
+            packed_seq_params=cp_batch.get_packed_seq_params(),
+        )
+        assert packed_probs.shape == (local_hidden.shape[0], router.config.num_moe_experts)
+        packed_probs.backward(torch.zeros_like(packed_probs))
+
+        expected_input_grad = torch.zeros_like(local_hidden.grad)
+        expected_input_grad[valid_tokens, 0] = baseline_input_grad[
+            local_token_ids[valid_tokens] - 1
+        ]
+        torch.testing.assert_close(local_hidden.grad, expected_input_grad)
+
+        packed_loss = (
+            get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"]["values"][0]
+            .detach()
+            .clone()
+        )
+        reduce_from_tensor_model_parallel_region(packed_loss, router.tp_cp_group)
+        torch.testing.assert_close(packed_loss, baseline_loss)
+
+        packed_weight_grad = router.weight.grad.detach().clone()
+        torch.distributed.all_reduce(packed_weight_grad, group=router.tp_cp_group)
+        torch.testing.assert_close(packed_weight_grad, baseline_weight_grad)
 
 
 class TestPaddingMaskAuxLoss:

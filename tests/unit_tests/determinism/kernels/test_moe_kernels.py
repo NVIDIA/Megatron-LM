@@ -450,6 +450,45 @@ class TestMoEModules:
             what=f"TopKRouter[{balancing}, hash={hash_routing}]",
         )
 
+    def test_variable_packed_seq_aux_router_replays(self):
+        """Replay the segmented probability and expert-count accumulations bit-exactly."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=0.01,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+
+        hidden = torch.randn(8192, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        hidden.requires_grad_(True)
+        padding_mask = torch.zeros((8192, 1), device="cuda", dtype=torch.bool)
+        padding_mask[3072:4096] = True
+        padding_mask[7168:8192] = True
+        sequence_ids = torch.full((1, 8192), 2, device="cuda", dtype=torch.int32)
+        sequence_ids[:, :3072] = 0
+        sequence_ids[:, 4096:7168] = 1
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=torch.tensor([0, 3072, 6144], device="cuda", dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor([0, 4096, 8192], device="cuda", dtype=torch.int32),
+            moe_seq_idx=sequence_ids,
+        )
+
+        with deterministic_algorithms(True):
+            assert_module_replays_bit_exact(
+                router,
+                {"input": hidden, "padding_mask": padding_mask, "packed_seq_params": packed},
+                replays=3,
+                contention=True,
+                what="TopKRouter[variable-packed-seq-aux]",
+            )
+
     @pytest.mark.skipif(
         not (HAVE_TE_ROUTER and moe_utils.fused_topk_with_score_function_supports_topk_indices),
         reason="TE dense fused router output is not available",

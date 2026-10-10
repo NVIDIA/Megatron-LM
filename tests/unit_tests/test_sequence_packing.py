@@ -275,6 +275,16 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
         # =====================================================================
         assert packed_seq_params is not None
         assert packed_seq_params.qkv_format == "thd"
+        assert packed_seq_params.moe_seq_idx is not None
+        assert packed_seq_params.moe_seq_idx.shape == padding_mask.shape
+        assert torch.all(packed_seq_params.moe_seq_idx >= 0)
+        assert torch.all(packed_seq_params.moe_seq_idx < packed_seq_params.cu_seqlens_q.numel() - 1)
+        if cp == 1:
+            expected_moe_seq_idx = torch.repeat_interleave(
+                torch.arange(5, device="cuda", dtype=torch.int32),
+                torch.tensor([1024, 2048, 512, 1536, 3072], device="cuda"),
+            ).unsqueeze(0)
+            torch.testing.assert_close(packed_seq_params.moe_seq_idx, expected_moe_seq_idx)
 
         test_keys = [
             "cu_seqlens_q",
@@ -309,6 +319,10 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
                     assert torch.equal(
                         gathered_tensors[0], gathered_tensors[i]
                     ), f"TP rank 0 and rank {i} have different data"
+
+            gathered_seq_idx = _gather_tensor_from_tp_group(packed_seq_params.moe_seq_idx)
+            for tensor in gathered_seq_idx[1:]:
+                torch.testing.assert_close(tensor, gathered_seq_idx[0])
 
         # =====================================================================
         # TEST 4: Verify CP partitioning
