@@ -7,7 +7,6 @@ import os
 import pickle
 from collections import defaultdict
 from functools import reduce
-from itertools import zip_longest
 from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, cast
 
 import numpy as np
@@ -479,128 +478,6 @@ def determine_main_replica_uniform_distribution(
     return _build_shard_distribution(all_shards, ignore_groups)
 
 
-@torch.no_grad()
-@debug_time(f"exchange_loaded_tensors_gather_rounds", logger)
-def exchange_loaded_tensors_gather_rounds(
-    loaded_tensors: Dict[_ShardId, torch.Tensor],
-    unloaded_shards: Dict[_ShardId, ShardedTensor],
-    shard_distribution: ShardDistribution = None,
-    parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Dict[_ShardId, torch.Tensor]:
-    """Exchange the tensors loaded by different ranks with several all_gather calls.
-
-    Groups tensors by dtype, divide tensors that will be exchanged into rounds
-    and execute all_gather for tensors from each round.
-
-    Note: the loading is distributed across ranks based on total loaded size
-    in bytes, so there is no guarantee that number of rounds needed for each
-    rank will be similar, which might result in a lot of almost empty
-    all_gathers. The solution would be to group all tensors into a one
-    bytes tensor and do a single all_gather (with similarly sized messages).
-
-    Args:
-        loaded_tensors (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
-            shard ids to tensors already loaded by this rank.
-        unloaded_shards (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
-            shard ids to ShardedTensors that aren't loaded yet.
-        shard_distribution (ShardDistribution): distribution of all shards
-        parallelization_group (ProcessGroup, optional): process group used for load
-            distribution. Tensors will be exchanged within this group
-
-    Returns:
-        Dict[_ShardId, torch.Tensor]: dictionary mapping shard ids to tensors
-            needed by this rank to load a given state dict. Includes
-            previously loaded tensors (from `loaded_tensors` input)
-    """
-    from ..utils import get_pg_rank, get_pg_size
-
-    if parallelization_group is None:
-        parallelization_group = torch.distributed.group.WORLD
-    main_rank_for_shard, _, shard_to_metadata, all_ranks_for_shard = shard_distribution
-    local_rank = get_pg_rank(group=parallelization_group)
-
-    all_loaded_tensors = dict(loaded_tensors)
-
-    # Group by dtype so that we all_gather tensors of the same dtype
-    for dtype in sorted(set(map(lambda sh_ten: sh_ten.dtype, shard_to_metadata.values())), key=str):
-        with debug_time(f"dtype_{dtype}"):
-            # shards_by_rank maps rank to tensors loaded by this rank
-            shards_by_rank: List[List[torch.Tensor]] = [
-                [] for _ in range(get_pg_size(group=parallelization_group))
-            ]
-            for shard_id, rank in main_rank_for_shard.items():
-                if len(all_ranks_for_shard[shard_id]) == 1:
-                    assert all_ranks_for_shard[shard_id][0] == main_rank_for_shard[shard_id], (
-                        f"When there is only 1 ranks that needs a given shard,"
-                        f" it should be the loading rank."
-                        f" Got: needs [{all_ranks_for_shard[shard_id][0]}]"
-                        f" vs loads [{main_rank_for_shard[shard_id]}]"
-                    )
-                    # Skipping the exchange since only the loading rank needs this tensor
-                    # TODO: we can employ some optimizations even for `len(shard_to_ranks) > 1`
-                    #  case, e.g. P2P exchange. Currently handling this case saves most of the
-                    #  work though.
-                    continue
-                if shard_to_metadata[shard_id].dtype == dtype:
-                    shards_by_rank[rank].append(shard_id)
-
-            # Transpose `shards_by_rank` to form exchange rounds
-            shards_by_round = zip_longest(*shards_by_rank, fillvalue=None)
-            for round_idx, round_shard_ids in enumerate(shards_by_round):
-                round_tensors = []
-                orig_devices = {}
-                for rank, shard_id in enumerate(round_shard_ids):
-                    if shard_id is None:
-                        # if no more useful data, the given rank will exchange empty tensor
-                        local_ten = torch.empty(0, dtype=dtype, device="cuda")
-                        orig_device = None
-                    else:
-                        assert isinstance(shard_id, tuple), type(shard_id)
-                        if rank == local_rank:
-                            assert shard_id in all_loaded_tensors, (
-                                shard_id,
-                                all_loaded_tensors.keys(),
-                            )
-                            orig_device = all_loaded_tensors[shard_id]
-                            all_loaded_tensors[shard_id] = all_loaded_tensors[shard_id].cuda()
-                            local_ten = all_loaded_tensors[shard_id]
-                        else:
-                            local_ten, orig_device = _get_empty_tensor_for_exchange(
-                                shard_id, unloaded_shards, shard_to_metadata, all_loaded_tensors
-                            )
-                        # Because of a TE bug, we have to exchange a nominal dtype instead of FP8
-                        # It's ok to keep the nominal dtype after exchange, because TE will handle
-                        # this during state dict load.
-                        # TODO: remove it once the bug is fixed
-                        from ..fp8_utils import is_float8tensor  # Avoid circular import
-
-                        if is_float8tensor(local_ten):
-                            try:
-                                local_ten = local_ten.from_float8()
-                            except Exception as e:
-                                local_ten = local_ten.dequantize()
-                            all_loaded_tensors[shard_id] = local_ten
-
-                    round_tensors.append(local_ten)
-                    if orig_device is not None:
-                        orig_devices[shard_id] = orig_device
-
-                torch.distributed.all_gather(
-                    list(round_tensors),
-                    round_tensors[local_rank],
-                    group=parallelization_group,
-                    async_op=False,
-                )
-
-                # Move tensors back to CPU if originally was on CPU
-                for shard_id, orig_device in orig_devices.items():
-                    all_loaded_tensors[shard_id] = all_loaded_tensors[shard_id].to(orig_device)
-
-                del round_tensors  # remove tensor references
-
-    return all_loaded_tensors
-
-
 def exchange_loaded_tensors_gather_object(
     loaded_tensors: Dict[_ShardId, torch.Tensor],
     unloaded_shards: Dict[_ShardId, ShardedTensor],
@@ -793,8 +670,6 @@ def exchange_by_distribution(
     assert shard_distribution is not None, "Expecting distribution to perform exchange"
     if exchange_algo == "gather_object":
         exchange_fn = exchange_loaded_tensors_gather_object
-    elif exchange_algo == "gather_rounds":
-        exchange_fn = exchange_loaded_tensors_gather_rounds
     elif exchange_algo == "broadcast":
         exchange_fn = exchange_loaded_tensors_broadcast
     else:
