@@ -214,7 +214,7 @@ def main():
         cov_vals = [r[f"top{n}"] for r in per_layer_results]
         mean_cov = sum(cov_vals) / len(cov_vals)
         if global_topk is not None:
-            uniform_bl = n / args.num_experts
+            uniform_bl = min(n, args.num_experts) / args.num_experts
             ratio = mean_cov / uniform_bl
             print(f"  Mean top-{n} coverage: {mean_cov:.3f}  (uniform baseline: {uniform_bl:.3f}, ratio: {ratio:.2f}×)")
         else:
