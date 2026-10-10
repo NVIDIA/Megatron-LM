@@ -1169,7 +1169,7 @@ class LLaVAModel(MegatronModule):
 
         if self.sequence_parallel_lm and self.pre_process:
             combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
-                combined_embeddings
+                combined_embeddings, group=self.pg_collection.tp
             )  # [S/(CP*TP),B,H]
 
         return combined_embeddings, expanded_labels, expanded_loss_mask, packed_seq_params
