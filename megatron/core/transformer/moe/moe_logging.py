@@ -27,7 +27,10 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 
 
 @dataclass
@@ -175,7 +178,10 @@ class MoEMetricsTracker:
                 the returned console log string.
             percentiles: Per-metric percentiles to compute, e.g.
                 ``{"load_imbalance": [0.5, 0.95]}``.
-            pg_collection: Custom process-group collection for reduction.
+            pg_collection: Process groups of the model, used for the PP and DP reductions
+                (``pp`` and ``dp_cp_gtp_remat``). If None, both groups come from the global grid
+                in ``parallel_state``; if ``dp_cp_gtp_remat`` is None, the DP group does. Both
+                fallbacks are deprecated.
             num_hash_layers: Main-stack MoE layers using hash routing. These do not
                 contribute load-balancing losses; MTP layers remain learned routers.
 
@@ -274,11 +280,21 @@ class MoEMetricsTracker:
         Reduction order: PP collect → reduce_group sum → avg_group avg → DP avg.
         """
         if pg_collection is None:
+            warn_global_process_group_fallback(
+                "MoEMetricsTracker.report", deprecated_in="0.21", removed_in="0.23"
+            )
             pp_group = parallel_state.get_pipeline_model_parallel_group()
             dp_group = None
         else:
             pp_group = pg_collection.pp
-            dp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None)
+            dp_group = pg_collection.dp_cp_gtp_remat
+            if dp_group is None:
+                warn_global_process_group_fallback(
+                    "MoEMetricsTracker.report",
+                    "pg_collection.dp_cp_gtp_remat",
+                    deprecated_in="0.21",
+                    removed_in="0.23",
+                )
         # The metric DP-average must span gtp_remat peers (they hold distinct tokens), else the
         # displayed value is a 1/gtp_remat subsample and looks noisy. Use the gtp_remat-inclusive
         # group; CP ranks (already summed in reduce_group) average as a no-op.

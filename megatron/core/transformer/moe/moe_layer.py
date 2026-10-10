@@ -14,9 +14,14 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    require_process_groups,
+    resolve_gtp_remat_group,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
+    MOE_LAYER_PROCESS_GROUPS,
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
     get_default_pg_collection,
@@ -246,13 +251,15 @@ class MoELayer(BaseMoELayer):
     ):
         """
         Args:
+            pg_collection (ProcessGroupCollection | None): process groups of the owning model.
+                It must set every field in ``MOE_LAYER_PROCESS_GROUPS``. If None, the groups are
+                built from the global grid in ``parallel_state``; this fallback is deprecated.
             name (str | None): module instance name passed top-down from its paranet module
         """
         self.submodules = not_none(submodules)
-        # TODO(Hepteract): delete the usage of the global parallel_state.
-        # Initialize process groups with the global parallel_state.
         if pg_collection is None:
-            pg_collection = get_default_pg_collection()
+            pg_collection = get_default_pg_collection(owner=type(self).__name__)
+        require_process_groups(pg_collection, MOE_LAYER_PROCESS_GROUPS, owner=type(self).__name__)
         super(MoELayer, self).__init__(
             config=config,
             layer_number=layer_number,

@@ -20,18 +20,13 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb_with_cos_sin,
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
-from megatron.core.parallel_state import (
-    get_data_parallel_group,
-    get_data_parallel_rank,
-    get_data_parallel_world_size,
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
@@ -335,14 +330,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        else:
-            assert hasattr(
-                pg_collection, 'tp'
-            ), "Attention pg_collection must have tp process group"
-            assert hasattr(
-                pg_collection, 'cp'
-            ), "Attention pg_collection must have cp process group"
+            warn_global_process_group_fallback(type(self).__name__)
+            # hcp feeds TEDotProductAttention's a2a+p2p path; dp is only read by
+            # run_realtime_tests, so it is resolved only when test_mode needs it.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'hcp'] + (['dp'] if self.config.test_mode else [])
+            )
+        for group_name in ('tp', 'cp'):
+            if group_name not in vars(pg_collection):
+                raise ValueError(f"Attention pg_collection must have {group_name} process group")
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
@@ -1846,7 +1842,14 @@ class SelfAttention(Attention):
 
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
-        rank = get_data_parallel_rank()
+        # Only this consistency check needs the DP group, so it is required here rather than in
+        # __init__, which requires tp/cp only.
+        if vars(self.pg_collection).get('dp') is None:
+            raise ValueError(
+                "run_realtime_tests requires a dp process group; pass one via pg_collection.dp"
+            )
+        dp_group = self.pg_collection.dp
+        rank = dp_group.rank()
         inputs = torch.stack(
             [
                 self.q_layernorm.weight.data,
@@ -1855,9 +1858,9 @@ class SelfAttention(Attention):
                 self.k_layernorm.bias.data,
             ]
         )
-        dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+        dp_list = [torch.empty_like(inputs) for _ in range(dp_group.size())]
         dp_list[rank] = inputs
-        torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+        torch.distributed.all_gather(dp_list, inputs, group=dp_group)
 
         def _compare(srcs, tgts, names, parallelism):
             assert len(srcs) == len(tgts) == len(names)
@@ -1881,10 +1884,10 @@ class SelfAttention(Attention):
                 "DP",
             )
 
-        rank = get_tensor_model_parallel_rank()
-        tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
+        rank = self.tp_group.rank()
+        tp_list = [torch.empty_like(inputs) for _ in range(self.tp_group.size())]
         tp_list[rank] = inputs
-        torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+        torch.distributed.all_gather(tp_list, inputs, group=self.tp_group)
 
         for i, tp in enumerate(tp_list):
             q_w, q_b, k_w, k_b = torch.unbind(tp)
@@ -2021,9 +2024,7 @@ class SelfAttention(Attention):
             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
             if self.config.num_query_groups < self.world_size:
-                idx = get_tensor_model_parallel_rank() % (
-                    self.world_size // self.config.num_query_groups
-                )
+                idx = self.tp_group.rank() % (self.world_size // self.config.num_query_groups)
                 size = self.num_attention_heads_per_partition // (
                     self.world_size // self.config.num_query_groups
                 )

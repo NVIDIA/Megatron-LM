@@ -311,7 +311,17 @@ class TestHybridStackMHC:
             add_bias_linear=False,
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'pp', 'cp', 'ep', 'expt_tp', 'tp_ep', 'expt_dp']
+            required_pgs=[
+                'tp',
+                'pp',
+                'cp',
+                'ep',
+                'expt_tp',
+                'tp_ep',
+                'tp_cp',
+                'tp_dp_cp',
+                'expt_dp',
+            ]
         )
         stack = HybridStack(
             config=config,
