@@ -248,6 +248,42 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
             assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
             assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
 
+    def test_out_norm_params_marked_for_tp_grad_sum(self):
+        # out_norm's parameters are shared by every value head, but TP splits the heads,
+        # so each rank's gradient for them is only a partial sum. They must be tagged so
+        # the finalizer sums their gradients across TP ranks, whether or not SP is on.
+        norm_params = list(self.gdn.out_norm.parameters())
+        assert norm_params, "out_norm should have at least one parameter"
+        for param in norm_params:
+            assert getattr(param, "sum_gradients_across_tp_domain", False)
+
+        # The fixture always builds RMSNorm (weight only). LayerNorm also has a bias,
+        # whose gradient is partial across TP ranks in exactly the same way.
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        ln_config = copy.deepcopy(self.transformer_config)
+        ln_config.normalization = "LayerNorm"
+        gdn_spec = get_experimental_attention_variant_module_spec(config=ln_config)
+        gdn = gdn_spec.module(
+            ln_config,
+            submodules=gdn_spec.submodules,
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            conv_init=1.0,
+            use_qk_l2norm=True,
+            A_init_range=(1, 16),
+            pg_collection=pg_collection,
+        )
+
+        # Guard against this check silently covering nothing if norm construction changes.
+        norm_param_names = {name for name, _ in gdn.out_norm.named_parameters()}
+        assert "bias" in norm_param_names, "LayerNorm out_norm should have a bias"
+        for param in gdn.out_norm.parameters():
+            assert getattr(param, "sum_gradients_across_tp_domain", False)
+
     def test_inference_state_shapes(self):
         if self.use_gdn2:
             pytest.skip("GDN2 inference is not supported.")
