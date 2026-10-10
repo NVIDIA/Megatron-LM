@@ -10,6 +10,7 @@ replayed standalone under side-stream contention; the bare TE modules are what t
 level suite composes, so a regression here localises to one kernel family.
 """
 
+import inspect
 import os
 
 import pytest
@@ -37,11 +38,13 @@ if HAVE_TE:
         TEDotProductAttention,
         TEGroupedLinear,
         TELayerNormColumnParallelLinear,
+        TELMHeadColumnParallelLinear,
         TENorm,
         TERowParallelLinear,
     )
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
+_IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
 
 def _config(**overrides):
@@ -89,6 +92,49 @@ class TestTEWrappers:
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what="TEColumnParallelLinear"
         )
+
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell")
+    def test_te_lm_head_two_uses_replays(self):
+        """The MXFP8 LM head used twice in one backward pass, as by the main and MTP heads, with
+        its weight gradient accumulated into main_grad. TE versions that read
+        ``zero_tensor_dummy_wgrad`` hand autograd ZeroTensor dummies, whose sum is free."""
+        seeded()
+        config = _config(
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_output_proj=True,
+            gradient_accumulation_fusion=True,
+        )
+        head = TELMHeadColumnParallelLinear(
+            HIDDEN, 4096, config=config, init_method=init_method_normal(0.02), bias=False
+        ).cuda()
+        assert head.weight.zero_tensor_dummy_wgrad
+        # Called twice per microbatch: as for MTP's repeated layers, TE gets no
+        # is_first_microbatch, so neither call overwrites main_grad.
+        head.is_repeated_layer = True
+        head.weight.main_grad = torch.zeros_like(head.weight, dtype=torch.float32)
+        head.weight.grad_added_to_main_grad = False
+
+        class TwoUses(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = head
+
+            def forward(self, x, y):
+                return self.head(x)[0] + self.head(y)[0]
+
+        x, y = (
+            torch.randn(1024, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            for _ in range(2)
+        )
+        module = TwoUses()
+        assert_module_replays_bit_exact(
+            module, (x, y), replays=3, contention=True, what="TELMHeadColumnParallelLinear x2"
+        )
+        from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
+        if "zero_tensor" in inspect.signature(get_dummy_wgrad).parameters:
+            assert head.weight.grad._is_zerotensor()
 
     def test_te_row_parallel_linear_replays(self):
         seeded()
