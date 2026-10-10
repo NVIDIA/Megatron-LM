@@ -213,6 +213,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Copy with unique stores; bit-identical to Tensor.contiguous.",
     ),
     KernelEntry(
+        name="fused_embedding_wgrad",
+        sources=("megatron/core/fusions/fused_embedding_wgrad.py",),
+        tests=(K + "test_tensor_parallel_kernels.py",),
+        kind="triton",
+        notes="Embedding weight gradient added into main_grad from sorted per-token partial sums "
+        "in a fixed order; bit-identical to PyTorch's embedding backward followed by main_grad.add_.",
+    ),
+    KernelEntry(
         name="fused_mla_yarn_rope",
         sources=("megatron/core/fusions/fused_mla_yarn_rope_apply.py",),
         tests=(K + "test_fused_triton_kernels.py",),
@@ -263,7 +271,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
         ),
         kind="torch-op",
-        notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding) and local Column/RowParallelLinear "
+        notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding, and the main_grad "
+        "accumulation of gradient_accumulation_fusion) and local Column/RowParallelLinear "
         "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion.",
     ),
     KernelEntry(
