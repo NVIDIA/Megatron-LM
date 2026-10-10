@@ -725,7 +725,11 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
+            # the re-run builds the graph for a backward whose cotangent is already known: a MoE
+            # layer may skip its dead tail under it (moe_skip_dead_recompute, dead_recompute.py)
+            from megatron.core.transformer.moe.dead_recompute import recompute_phase
+
+            with torch.enable_grad(), recompute_phase():
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
