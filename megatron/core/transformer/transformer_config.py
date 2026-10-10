@@ -987,11 +987,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep'] = "deepep"
+    moe_flex_dispatcher_backend: Literal['deepep', 'deepepv2', 'hybridep', 'ncclep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep", "hybridep", and "ncclep". Currently only "hybridep" backend supports
-    the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
-    transformer_engine.pytorch.ep API."""
+    Options are "deepep", "deepepv2", "hybridep", and "ncclep". Currently only "hybridep"
+    backend supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via
+    TransformerEngine's transformer_engine.pytorch.ep API."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -1065,8 +1065,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
-    backends (deepep, hybridep, ncclep). None lets each backend use its own default. Unifies the
-    deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in __post_init__)."""
+    backends (deepep, deepepv2, hybridep, ncclep). None lets each backend use its own default.
+    Unifies the deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in
+    __post_init__)."""
 
     moe_deepep_num_sms: Optional[int] = None
     """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for DeepEP (historical
@@ -1589,7 +1590,11 @@ class TransformerConfig(ModelParallelConfig):
         """Validate context-parallel layout settings."""
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
-        if self.context_parallel_size > 1 and self.attention_cp_layout == "contiguous":
+        if (
+            self.context_parallel_size > 1
+            and self.attention_cp_layout == "contiguous"
+            and self.experimental_attention_variant != "dsv4_hybrid"
+        ):
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
             )
@@ -1825,9 +1830,12 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
-            assert (
-                self.context_parallel_size == 1
-            ), "DSv4 Hybrid Attention does not support context parallelism yet."
+            if self.context_parallel_size > 1 and self.attention_cp_layout != "contiguous":
+                raise ValueError(
+                    "DSv4 context parallelism requires attention_cp_layout='contiguous'."
+                )
+            if self.hybrid_context_parallel:
+                raise ValueError("DSv4 dynamic context parallelism is not supported yet.")
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             if self.dsa_kernel_backend == "tilelang":
                 raise ValueError(
@@ -2108,7 +2116,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
-            if self.moe_flex_dispatcher_backend == "hybridep":
+            if self.moe_flex_dispatcher_backend != "deepep":
                 raise ValueError("Only one backend is supported for flex token dispatcher.")
             self.moe_flex_dispatcher_backend = "deepep"
             warnings.warn(
@@ -2118,7 +2126,7 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_token_dispatcher_type == "flex":
             if self.moe_pad_expert_input_to_capacity and (
-                self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "deepep"
+                self.moe_enable_deepep or self.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
             ):
                 raise ValueError(
                     "Flex token dispatcher with deepep backend does not support "
@@ -3783,6 +3791,18 @@ class TransformerConfig(ModelParallelConfig):
                 "training and inference attention paths run the same batch-invariant "
                 f"FlashAttention kernel (got {self.flash_attention_version})."
             )
+            if self.is_hybrid_model:
+                from megatron.core.ssm.ops.common.determinism import use_deterministic_mode
+
+                # Checked rather than set: the autotune config lists are fixed at
+                # import, so setting the flag here would change nothing.
+                assert use_deterministic_mode(), (
+                    "Batch invariant mode on a hybrid model requires MAMBA_DETERMINISTIC=1 "
+                    "in the environment before Megatron is imported, so the SSM Triton "
+                    "kernels pin their autotune configs instead of choosing per call "
+                    "shape. Setting it after import has no effect; relaunch with it set."
+                )
+
             # Context parallelism routes through TE's FA2 fwd/bwd kernels directly, which
             # cannot be pinned to another version; dropout is not batch-invariant.
             assert (
@@ -3899,10 +3919,21 @@ class TransformerConfig(ModelParallelConfig):
             # allgather specifically, the general variable_seq_lengths check
             # above raises first (packing derives variable_seq_lengths=True).
             if self.num_moe_experts is not None:
-                assert self.moe_token_dispatcher_type == "alltoall", (
-                    f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
+                assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
+                    "sequence_packing only supports moe_token_dispatcher_type in "
+                    "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+                if (
+                    self.moe_token_dispatcher_type == "flex"
+                    and self.moe_flex_dispatcher_backend == "hybridep"
+                    and not self.moe_hybridep_pad_uneven_dispatch_inputs
+                ):
+                    raise ValueError(
+                        "sequence_packing with HybridEP requires "
+                        "moe_hybridep_pad_uneven_dispatch_inputs=True because packed token "
+                        "counts can differ across dispatcher ranks"
+                    )
 
 
 @dataclass

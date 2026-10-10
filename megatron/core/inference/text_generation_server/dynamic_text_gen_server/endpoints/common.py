@@ -213,6 +213,7 @@ def parse_sampling_params(req, app_config, tokenizer, *, completions_mode, retur
         skip_prompt_log_probs=skip_prompt_log_probs,
         num_tokens_to_generate=num_tokens_to_generate,
         stop_words=stop,
+        detokenize_stop_sequence=bool(_get_non_none(req, "include_stop_str_in_output", False)),
         add_BOS=add_BOS,
         termination_id=-1 if bool(req.get("ignore_eos", False)) else None,
         return_prompt_tokens=return_prompt_tokens,

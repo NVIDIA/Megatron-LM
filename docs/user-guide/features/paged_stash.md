@@ -46,6 +46,15 @@ HybridEP + TE fused grouped experts are required whenever `moe_expert_rank_capac
 --moe-paged-stash-buffer-size-factor-cpu 0.0
 ```
 
+The copy/pop kernels use fixed launch sizes based on the current CUDA device:
+4096 elements per program per iteration and at most 8192 programs on Rubin (SM107),
+and 1024 elements and at most 2048 programs on other GPUs. There are no configuration
+options for these launch sizes.
+
+The stash copy/pop kernels are memory-bound; with 1024/2048, wide activations (thousands of
+elements per token) do not saturate DRAM bandwidth. For example, on VR200 with DeepSeek-V3
+(hidden size 7168), using 4096/8192 makes the stash kernels ~2.3x faster.
+
 ## What `moe_expert_rank_capacity_factor` and `moe_paged_stash_buffer_size_factor_cuda` mean
 
 Both are **multipliers on buffer size relative to the perfectly balanced case**—the space you would need if routed tokens were evenly distributed across expert ranks. A larger factor adds headroom for real-world **skew**.
