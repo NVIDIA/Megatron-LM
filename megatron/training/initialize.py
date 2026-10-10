@@ -18,6 +18,7 @@ from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
 from megatron.core.parallel_state import create_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
     RerunErrorInjector,
@@ -62,6 +63,8 @@ def initialize_megatron(
     seed_etp_group=None,
     skip_random_seed=False,
     skip_dependency_compilation=False,
+    *,
+    seed_pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -70,6 +73,8 @@ def initialize_megatron(
     what you are doing.
     `skip_dependency_compilation` should only be set by workloads that do not
     use the C++ dataset helpers.
+    `seed_pg_collection` seeds the random number generators from the process
+    groups of the model being trained instead of the mpu globals.
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
@@ -151,6 +156,7 @@ def initialize_megatron(
                 tp_group=seed_tp_group,
                 ep_group=seed_ep_group,
                 etp_group=seed_etp_group,
+                pg_collection=seed_pg_collection,
             )
 
         # Setup MoE aux loss scale value.
@@ -458,14 +464,31 @@ def _set_random_seed(
     etp_group: Optional[torch.distributed.ProcessGroup] = None,
     gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     egtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Set random seed for reproducability.
 
     The optional parallel groups let a caller without an initialized mpu
     (e.g. a disjoint-grid run) supply the parallel ranks explicitly; each falls
     back to the mpu group when None.
+
+    `pg_collection`, the process groups of the model being seeded, supplies
+    every group that is not passed explicitly, and the mpu globals are not
+    read. Its data-parallel group is `dp_gtp_remat`, the full data-distribution
+    group (DP x GTP-remat) that `mpu.get_data_parallel_rank()` uses by default.
     """
     if seed_ is not None and seed_ > 0:
+        if pg_collection is not None:
+            if pp_group is None:
+                pp_group = pg_collection.pp
+            if dp_group is None:
+                dp_group = pg_collection.dp_gtp_remat
+            if pp_group is None or (data_parallel_random_init and dp_group is None):
+                raise ValueError(
+                    "pg_collection must set pp, and dp_gtp_remat when "
+                    "data_parallel_random_init is set, to seed the random number generators"
+                )
         # Ensure that different pipeline MP stages get different seeds.
         pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
         seed = seed_ + (100 * pp_rank)
@@ -502,6 +525,7 @@ def _set_random_seed(
                 egtp_remat_rank=egtp_remat_rank,
                 gtp_remat_world_size=gtp_remat_world_size,
                 egtp_remat_world_size=egtp_remat_world_size,
+                pg_collection=pg_collection,
             )
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))

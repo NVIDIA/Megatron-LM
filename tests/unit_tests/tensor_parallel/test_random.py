@@ -3,6 +3,9 @@
 import pytest
 import torch
 
+from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import random as random_module
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
@@ -11,6 +14,8 @@ from megatron.core.tensor_parallel.random import (
     convert_cuda_rng_state,
     cudagraph_needs_generator_registration,
     get_cuda_rng_tracker,
+    get_expert_parallel_rng_tracker_name,
+    get_gtp_remat_rng_tracker_name,
     model_parallel_cuda_manual_seed,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -209,6 +214,124 @@ def test_model_parallel_cuda_manual_seed():
     rng_tracker = get_cuda_rng_tracker()
     assert rng_tracker.get_states()['model-parallel-rng'] is not None
     Utils.destroy_model_parallel()
+
+
+def _forbid_global_process_groups(monkeypatch):
+    """Make every global group, rank and world-size accessor raise, including by-name imports."""
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("the global parallel state was read")
+
+    for name in dir(parallel_state):
+        if name.startswith("get_") and name.endswith(
+            ("_rank", "_ranks", "_world_size", "_group", "_groups")
+        ):
+            monkeypatch.setattr(parallel_state, name, forbidden)
+            if hasattr(random_module, name):
+                monkeypatch.setattr(random_module, name, forbidden)
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", forbidden)
+
+
+def _tracker_states():
+    return {name: state.clone() for name, state in get_cuda_rng_tracker().get_states().items()}
+
+
+@pytest.mark.parametrize(
+    "tp, ep, etp, gtp, egtp",
+    [(2, 1, 2, 1, 1), (2, 2, 1, 1, 1), (1, 2, 2, 2, 1), (1, 1, 1, 2, 2), (2, 1, 1, 2, 2)],
+)
+def test_model_parallel_cuda_manual_seed_from_pg_collection(monkeypatch, tp, ep, etp, gtp, egtp):
+    """Seeding from the global grid's collection gives the same states as the global path."""
+    if (
+        Utils.world_size < 4
+        or Utils.world_size % (tp * gtp)
+        or Utils.world_size % (etp * ep * egtp)
+    ):
+        pytest.skip("needs a world size of at least 4 that the grid divides")
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp,
+        expert_model_parallel_size=ep,
+        expert_tensor_parallel_size=etp,
+        gtp_remat_size=gtp,
+        expert_gtp_remat_size=egtp,
+    )
+    try:
+        model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
+        expected = _tracker_states()
+        assert (get_gtp_remat_rng_tracker_name() in expected) == (gtp > 1)
+        assert (get_gtp_remat_rng_tracker_name(is_expert=True) in expected) == (egtp > 1)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "ep", "expt_tp", "gtp_remat", "expt_gtp_remat"]
+        )
+        with monkeypatch.context() as patch:
+            _forbid_global_process_groups(patch)
+            model_parallel_cuda_manual_seed(1234, force_reset_rng=True, pg_collection=pg_collection)
+        actual = _tracker_states()
+
+        assert actual.keys() == expected.keys()
+        for name, state in expected.items():
+            assert torch.equal(actual[name], state), name
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_model_parallel_cuda_manual_seed_uses_pg_collection_groups(monkeypatch):
+    """The collection's groups give the ranks, explicit ranks win, and None turns an axis off."""
+    if Utils.world_size < 4:
+        pytest.skip("needs at least 4 ranks")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        # A layout that differs from the global one: the global DP group, {0, 2} and {1, 3} on
+        # 4 ranks, serves as tp, ep, expt_tp and gtp_remat, while the global TP groups are
+        # {0, 1} and {2, 3}. A read of the global TP rank would change the states on ranks 1 and 2.
+        dp_group = parallel_state.get_data_parallel_group()
+        dp_rank, dp_size = dp_group.rank(), dp_group.size()
+        pg_collection = ProcessGroupCollection(
+            tp=dp_group, ep=dp_group, expt_tp=dp_group, gtp_remat=dp_group, expt_gtp_remat=None
+        )
+        with monkeypatch.context() as patch:
+            _forbid_global_process_groups(patch)
+            model_parallel_cuda_manual_seed(1234, force_reset_rng=True, pg_collection=pg_collection)
+            from_collection = _tracker_states()
+            model_parallel_cuda_manual_seed(
+                1234, force_reset_rng=True, ep_rank=3, pg_collection=pg_collection
+            )
+            explicit_rank_wins = _tracker_states()
+        assert get_gtp_remat_rng_tracker_name() in from_collection
+        assert get_gtp_remat_rng_tracker_name(is_expert=True) not in from_collection
+
+        model_parallel_cuda_manual_seed(
+            1234,
+            force_reset_rng=True,
+            tp_rank=dp_rank,
+            ep_rank=dp_rank,
+            etp_rank=dp_rank,
+            gtp_remat_rank=dp_rank,
+            egtp_remat_rank=0,
+            gtp_remat_world_size=dp_size,
+            egtp_remat_world_size=1,
+        )
+        expected = _tracker_states()
+        assert from_collection.keys() == expected.keys()
+        for name, state in expected.items():
+            assert torch.equal(from_collection[name], state), name
+
+        expert_tracker = get_expert_parallel_rng_tracker_name()
+        torch.cuda.manual_seed(1234 + 1024 + 100 * 3 + dp_rank)
+        assert torch.equal(explicit_rank_wins[expert_tracker], torch.cuda.get_rng_state())
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_model_parallel_cuda_manual_seed_requires_pg_collection_groups(monkeypatch):
+    """A collection that leaves a seeding group unset is an error, not a global fallback."""
+    group = object()
+    pg_collection = ProcessGroupCollection(tp=group, ep=group, expt_tp=group)
+    with monkeypatch.context() as patch:
+        _forbid_global_process_groups(patch)
+        with pytest.raises(ValueError, match=r"\['gtp_remat', 'expt_gtp_remat'\]"):
+            model_parallel_cuda_manual_seed(1234, force_reset_rng=True, pg_collection=pg_collection)
 
 
 def test_checkpoint():
