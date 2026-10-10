@@ -30,7 +30,7 @@ def ci_is_busy(pipeline, target_branch: str):
         get_gitlab_handle()
         .projects.get(PROJECT_ID)
         .pipelines.list(
-            source="merge_request_event", per_page=100, page=1, order_by="id", sort="desc"
+            source="merge_request_event", per_page=100, get_all=True, order_by="id", sort="desc"
         )
     )
 
