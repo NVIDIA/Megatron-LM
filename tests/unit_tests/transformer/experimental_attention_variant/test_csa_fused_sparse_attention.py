@@ -4610,7 +4610,10 @@ class TestThdWrapperDispatchAndValidation:
 
         assert indices.shape == (q.shape[0], topk)
         assert torch.all(lengths == topk)
-        assert torch.equal(softmax, torch.full((q.shape[0], topk), 0.25, device=q.device))
+        # deterministic=True canonicalizes the compact output: the softmax is recomputed from the
+        # returned logits in sorted-id order (all-zero logits over 2 valid slots -> 0.5 each), so
+        # the kernel's stubbed 0.25 values are not passed through.
+        assert torch.equal(softmax, torch.full((q.shape[0], topk), 0.5, device=q.device))
         fake_dsa.indexer_forward_wrapper.assert_not_called()
         fake_dsa.indexer_top_k_wrapper.assert_not_called()
         compact_call = fake_dsa.indexer_forward_top_k_wrapper.call_args
