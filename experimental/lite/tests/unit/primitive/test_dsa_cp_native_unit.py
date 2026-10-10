@@ -152,6 +152,7 @@ def test_dense_cp_native_collective_only_receives_projected_kv_and_indexer_k():
     fake = SimpleNamespace(
         cp_size=2,
         cp_rank=0,
+        skip_topk=False,
         _project_cp_inputs=project_inputs,
         _gather_projected_cp=gather_projected,
         _run_cp_sparse_segment=run_sparse,
@@ -203,6 +204,7 @@ def test_packed_cp_native_explicitly_selects_contiguous_projected_gather():
     fake = SimpleNamespace(
         cp_size=2,
         cp_rank=0,
+        skip_topk=False,
         _packed_cu_seqlens=lambda params, device: params.cu_seqlens_q.to(device),
         _project_cp_inputs=project_inputs,
         _gather_projected_cp=gather_projected,
@@ -225,6 +227,190 @@ def test_packed_cp_native_explicitly_selects_contiguous_projected_gather():
 
     assert result is sentinel
     assert gather_modes == [True, True]
+
+
+def _fake_cp_attention(skip_topk, seen_masks, **extra):
+    def project_inputs(x, cos, sin, position_ids):
+        del x, cos, sin, position_ids
+        return (
+            torch.randn(4, 1, 2, 8),
+            torch.randn(4, 1, 8),
+            torch.randn(2, 2, 4),
+            torch.randn(4, 1, 2, 4),
+            torch.randn(4, 1, 4),
+            torch.randn(4, 1, 2),
+        )
+
+    def gather_projected(tensor, reorder, *, contiguous=False):
+        del contiguous
+        return torch.cat([tensor, tensor], dim=0).index_select(0, reorder)
+
+    def run_sparse(query, kv, q_idx, k_idx, weights, mask, **kwargs):
+        del query, kv, q_idx, k_idx, weights, kwargs
+        seen_masks.append(mask)
+        return torch.randn(4, 1, 8)
+
+    return SimpleNamespace(
+        cp_size=2,
+        cp_rank=0,
+        skip_topk=skip_topk,
+        _project_cp_inputs=project_inputs,
+        _gather_projected_cp=gather_projected,
+        _run_cp_sparse_segment=run_sparse,
+        _project_cp_output=lambda out, weight: out,
+        **extra,
+    )
+
+
+@pytest.mark.parametrize("skip_topk", [False, True])
+def test_dense_cp_native_builds_causal_mask_only_for_topk_layers(monkeypatch, skip_topk):
+    from megatron.lite.primitive.modules.attention import dsa as dsa_module
+
+    mask = torch.zeros(4, 8)
+    build_mask = Mock(return_value=mask)
+    monkeypatch.setattr(dsa_module, "_build_cp_causal_mask", build_mask)
+    seen_masks = []
+    fake = _fake_cp_attention(skip_topk, seen_masks)
+
+    dsa_module.DynamicSparseAttention._forward_dense_cp_native(
+        fake,
+        torch.randn(1, 4, 64),
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
+        index_share_state=None,
+    )
+
+    if skip_topk:
+        build_mask.assert_not_called()
+        assert seen_masks == [None]
+    else:
+        build_mask.assert_called_once()
+        query_pos, key_pos = build_mask.call_args.args
+        assert query_pos.tolist() == [0, 1, 2, 3]
+        assert key_pos.tolist() == list(range(8))
+        assert seen_masks[0] is mask
+
+
+@pytest.mark.parametrize("skip_topk", [False, True])
+def test_packed_cp_native_builds_causal_mask_only_for_topk_layers(monkeypatch, skip_topk):
+    from megatron.lite.primitive.modules.attention import dsa as dsa_module
+
+    mask = torch.zeros(4, 8)
+    build_mask = Mock(return_value=mask)
+    monkeypatch.setattr(dsa_module, "_build_cp_causal_mask", build_mask)
+    seen_masks = []
+    fake = _fake_cp_attention(
+        skip_topk,
+        seen_masks,
+        _packed_cu_seqlens=lambda params, device: params.cu_seqlens_q.to(device),
+    )
+    params = SimpleNamespace(
+        cp_layout="contiguous",
+        cu_seqlens_q=torch.tensor([0, 3, 8], dtype=torch.int32),
+    )
+
+    dsa_module.DynamicSparseAttention._forward_packed_cp_native(
+        fake,
+        torch.randn(1, 4, 64),
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
+        params,
+        index_share_state=None,
+    )
+
+    if skip_topk:
+        build_mask.assert_not_called()
+        assert seen_masks == [None]
+    else:
+        build_mask.assert_called_once()
+        query_pos, key_pos = build_mask.call_args.args
+        assert query_pos.tolist() == [0, 1, 2, 3]
+        assert key_pos.tolist() == list(range(8))
+        assert build_mask.call_args.kwargs["cu_seqlens"].tolist() == [0, 3, 8]
+        assert seen_masks[0] is mask
+
+
+def _fake_cp_sparse_segment_layer(*, skip_topk, training):
+    return SimpleNamespace(
+        skip_topk=skip_topk,
+        training=training,
+        layer_number=4,
+        index_share_source_layer=3,
+        index_share_enabled=True,
+        index_topk=3,
+        indexer_softmax_scale=0.5,
+        attn_sink=torch.zeros(2),
+        softmax_scale=0.25,
+        kv_lora_rank=6,
+    )
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_cp_sparse_segment_shared_layer_reuses_source_topk_without_mask(monkeypatch, training):
+    from megatron.lite.primitive.modules.attention import dsa as dsa_module
+
+    index_scores_and_topk = Mock()
+    indexer_loss = Mock()
+    monkeypatch.setattr(dsa_module, "_index_scores_and_topk", index_scores_and_topk)
+    monkeypatch.setattr(dsa_module, "_cp_indexer_loss", indexer_loss)
+    out = torch.randn(4, 1, 2, 6)
+    sparse_attn = Mock(return_value=out)
+    monkeypatch.setattr(dsa_module._dsa_kernels, "dsa_sparse_attn", sparse_attn)
+    source_topk = torch.tensor([[[0, -1, -1], [1, 0, -1], [2, 1, 0], [3, 2, 1]]]).int()
+    state = dsa_module.DSAIndexShareState()
+    state.save_topk(3, source_topk)
+    layer = _fake_cp_sparse_segment_layer(skip_topk=True, training=training)
+
+    # Shared layers get no indexer inputs and, from their callers, no mask.
+    result = dsa_module.DynamicSparseAttention._run_cp_sparse_segment(
+        layer,
+        torch.randn(4, 1, 2, 8),
+        torch.randn(8, 1, 8),
+        None,
+        None,
+        None,
+        None,
+        index_share_state=state,
+        index_share_cache_key=None,
+    )
+
+    assert result is out
+    index_scores_and_topk.assert_not_called()
+    indexer_loss.assert_not_called()
+    sparse_attn.assert_called_once()
+    flat_idxs = sparse_attn.call_args.args[3]
+    assert flat_idxs.tolist() == source_topk[0].tolist()
+    assert sparse_attn.call_args.kwargs["topk_length"].tolist() == [1, 2, 3, 3]
+
+
+def test_cp_sparse_segment_topk_layer_requires_mask(monkeypatch):
+    from megatron.lite.primitive.modules.attention import dsa as dsa_module
+
+    index_scores_and_topk = Mock(
+        return_value=(torch.zeros(1, 4, 3), torch.zeros(1, 4, 3, dtype=torch.int32))
+    )
+    sparse_attn = Mock(return_value=torch.randn(4, 1, 2, 6))
+    monkeypatch.setattr(dsa_module, "_index_scores_and_topk", index_scores_and_topk)
+    monkeypatch.setattr(dsa_module._dsa_kernels, "dsa_sparse_attn", sparse_attn)
+    layer = _fake_cp_sparse_segment_layer(skip_topk=False, training=False)
+
+    with pytest.raises(AssertionError):
+        dsa_module.DynamicSparseAttention._run_cp_sparse_segment(
+            layer,
+            torch.randn(4, 1, 2, 8),
+            torch.randn(8, 1, 8),
+            torch.randn(4, 1, 2, 4),
+            torch.randn(8, 1, 4),
+            torch.randn(4, 1, 2),
+            None,
+            index_share_state=None,
+            index_share_cache_key=None,
+        )
+
+    index_scores_and_topk.assert_not_called()
+    sparse_attn.assert_not_called()
 
 
 def test_cp_indexer_topk_respects_explicit_global_position_mask():
