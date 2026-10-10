@@ -1139,7 +1139,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             for s in state_dict_state.values():
                 # Native PyTorch state dict requires step (i.e., iteration).
-                s["step"] = step
+                s["step"] = step.detach().clone()
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
             # has an extra optimizer state "step".
@@ -1334,6 +1334,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
             for key in dst_tensors:
+                if not HAVE_APEX_OR_TE and key == "step":
+                    # Native Adam restores this scalar from param_groups. DP-reshardable
+                    # templates carry a local, nonpersistent step that must not overwrite it.
+                    continue
                 if not isinstance(tensors[key], torch.Tensor):
                     continue
                 dst_tensors[key].copy_(tensors[key])
