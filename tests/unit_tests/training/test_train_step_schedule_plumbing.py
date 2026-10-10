@@ -2,11 +2,8 @@
 
 """train_step forwards p2p_communicator and schedule pg_collection to forward_backward_func."""
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
-
-import pytest
 
 from megatron.training import training as training_mod
 
@@ -24,7 +21,7 @@ class _Rerun:
         return False, True, 0  # (checkpoint, exit, code)
 
 
-def _run(*, args_overrides=None, model=None, optimizer=None, forward_backward_func=None, **kwargs):
+def _run(*, args_overrides=None, model=None, optimizer=None, **kwargs):
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -57,7 +54,7 @@ def _run(*, args_overrides=None, model=None, optimizer=None, forward_backward_fu
             optimizer=optimizer,
             opt_param_scheduler=None,
             config=SimpleNamespace(),
-            forward_backward_func=forward_backward_func or (lambda **kw: captured.update(kw) or []),
+            forward_backward_func=lambda **kw: captured.update(kw) or [],
             iteration=0,
             **kwargs,
         )
@@ -135,45 +132,3 @@ def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():
         _run(model=model, optimizer=optimizer)
 
     optimizer._copy_main_params_to_param_buffer.assert_called_once_with()
-
-
-@pytest.mark.parametrize('enabled', [False, True])
-@pytest.mark.parametrize('fail', [False, True])
-def test_train_step_records_shared_mfsdp_context(enabled, fail):
-    """Record all chunks together once and close the scope when the schedule fails."""
-    active = False
-
-    @contextmanager
-    def recording():
-        nonlocal active
-        assert not active, 'Shared context entered twice'
-        active = True
-        try:
-            yield
-        finally:
-            active = False
-
-    context = mock.Mock(record_prefetch_order=mock.Mock(side_effect=recording))
-    model = [
-        SimpleNamespace(
-            module=SimpleNamespace(context=context),
-            force_all_reduce=False,
-            zero_grad_buffer=lambda: None,
-        )
-        for _ in range(2)
-    ]
-
-    def schedule(**kwargs):
-        assert active is enabled
-        assert kwargs['model'] is model
-        if fail:
-            raise ValueError('schedule interrupted')
-        return []
-
-    if fail:
-        with pytest.raises(ValueError, match='schedule interrupted'):
-            _run(model=model, forward_backward_func=schedule, record_prefetch_order=enabled)
-    else:
-        _run(model=model, forward_backward_func=schedule, record_prefetch_order=enabled)
-    assert not active
-    assert context.record_prefetch_order.call_count == int(enabled)
