@@ -2,6 +2,7 @@
 
 """Megatron distributed optimizer."""
 
+import copy
 import gc
 import itertools
 import logging
@@ -1081,6 +1082,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
 
         # Allocate or retrieve optimizer state (i.e., tensors).
+        reuse_allocated_state = False
         if len(self.optimizer.state) == 0:
             # Allocate empty optimizer state if not previously initialized.
             # - If len(self.optimizer.state) == 0, this means that the optimizer
@@ -1130,6 +1132,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             # Retrieve existing optimizer state.
             state_dict_state = inner_state_dict["state"]
+            reuse_allocated_state = True
 
         # Extract 'step', for non-Apex/TE support.
         if not HAVE_APEX_OR_TE:
@@ -1153,9 +1156,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     v["step"] = step.detach().clone()
 
         # Optimizer.
-        self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
-        )
+        if (
+            reuse_allocated_state
+            and HAVE_APEX_OR_TE
+            and not isinstance(self.optimizer, HybridDeviceOptimizer)
+        ):
+            # `state_dict_state` is this optimizer's own allocated state, which
+            # distributed checkpoint loading has already filled in place, so only
+            # the param-group hyperparameters need loading. Passing the state back
+            # through `self.optimizer.load_state_dict` would only copy it onto
+            # itself: torch casts every state to the param dtype and TE FusedAdam
+            # then reallocates it while the old tensors are still referenced,
+            # roughly doubling optimizer memory and causing OOM on large models.
+            self._load_inner_optimizer_param_groups(state_dict_param_groups)
+        else:
+            self.optimizer.load_state_dict(
+                {"state": state_dict_state, "param_groups": state_dict_param_groups}
+            )
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
@@ -1200,6 +1217,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.load_parameter_state_from_fs_model_space(param_state)
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
+
+    def _load_inner_optimizer_param_groups(self, param_groups: List[Dict]):
+        """Load param-group hyperparameters into the inner optimizer, keeping its state.
+
+        Applies the same group validation as `torch.optim.Optimizer.load_state_dict`.
+        """
+        groups = self.optimizer.param_groups
+        if len(param_groups) != len(groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        for group, saved_group in zip(groups, param_groups):
+            if len(saved_group["params"]) != len(group["params"]):
+                raise ValueError(
+                    "loaded state dict contains a parameter group "
+                    "that doesn't match the size of optimizer's group"
+                )
+            group.update(
+                copy.deepcopy({key: value for key, value in saved_group.items() if key != "params"})
+            )
 
     def _get_main_param_and_optimizer_states(self, model_param):
         """Return a dict containing the main param and optimizer states corresponding to the input
