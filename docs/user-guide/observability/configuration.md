@@ -21,7 +21,7 @@ These flags are processed in `megatron/training/global_vars.py:_set_telemetry()`
 
 ## Megatron-specific environment variables
 
-Each `MEGATRON_OTEL_*` variable is an **alias** for the corresponding [`NemoLensConfig` field](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/configuration.md) with `NEMO_LENS_*` as fallback — they are not independent settings. Setting `MEGATRON_OTEL_ENABLED=1` is equivalent to setting `NEMO_LENS_ENABLED=1`; they refer to the same underlying config. The prefix/fallback model lets Megatron scope its own env vars while still inheriting lens defaults from a shared environment.
+Each `MEGATRON_OTEL_*` variable is an **alias** for the corresponding [`NemoLensConfig` field](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/configuration.mdx) with `NEMO_LENS_*` as fallback — they are not independent settings. Setting `MEGATRON_OTEL_ENABLED=1` is equivalent to setting `NEMO_LENS_ENABLED=1`; they refer to the same underlying config. The prefix/fallback model lets Megatron scope its own env vars while still inheriting lens defaults from a shared environment.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -39,13 +39,13 @@ Each `MEGATRON_OTEL_*` variable is an **alias** for the corresponding [`NemoLens
 | `NEMO_LENS_USER_ID` | (empty) | Optional user/team label |
 
 For the full config model, field semantics, and validation rules, see
-[lens: configuration](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/configuration.md).
+[lens: configuration](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/configuration.mdx).
 
 ## Rank strategy
 
 Controls which ranks actually send telemetry. Four strategies are available: `single_rank` (default), `all_ranks`, `sampled`, and `first_rank_per_node`, configured via `MEGATRON_OTEL_RANK_STRATEGY` above.
 
-See [lens: sampling](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/sampling.md) for detailed semantics, when to use each, and how they compose with OTel SDK samplers.
+See [lens: sampling](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/fern/versions/0.1.0/pages/user-guide/sampling.mdx) for detailed semantics, when to use each, and how they compose with OTel SDK samplers.
 
 ## Standard OTel SDK variables
 
@@ -94,7 +94,7 @@ Megatron's `_set_telemetry()` sets training-config attributes on the OTel `Resou
 | `megatron.ckpt_format` | `args.ckpt_format` |
 | `megatron.precision` | `fp16` / `bf16` / `fp32` |
 
-Plus auto-detected attributes from lens's [resource detection](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/resources.md): hostname, PID, GPU count, SLURM metadata, Kubernetes metadata.
+Plus auto-detected attributes from lens's [resource detection](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/resources.mdx): hostname, PID, GPU count, SLURM metadata, Kubernetes metadata.
 
 ## Typical configurations
 
@@ -120,7 +120,7 @@ torchrun --nproc_per_node=8 pretrain_gpt.py ...
 ```
 
 For a local stack to send this to, see
-[lens: sending telemetry to a backend](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/observability/backends.md).
+[lens: sending telemetry to a backend](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/observability/backends.mdx).
 
 ### Production with remote collector
 
