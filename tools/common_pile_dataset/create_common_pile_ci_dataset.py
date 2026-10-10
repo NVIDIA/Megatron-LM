@@ -134,7 +134,7 @@ def download_common_pile_bulk(output_jsonl, num_documents, dataset_name):
     log_interval = max(1000, num_documents // 100)
 
     with open(output_jsonl, 'w', encoding='utf-8') as f:
-        for i in range(min(total_available, num_documents + num_documents // 10)):
+        for i in range(total_available):
             text = ds[i].get("text", "")
             if text and len(text.strip()) > 100:
                 f.write(json.dumps({"text": text}) + "\n")
