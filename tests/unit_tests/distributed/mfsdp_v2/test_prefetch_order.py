@@ -3,6 +3,7 @@
 """Coverage for recording MFSDP demand-unshard order."""
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -19,6 +20,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
     microbatch,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.indexed_order import IndexedOrder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
     FsdpContext,
     FsdpModule,
@@ -43,30 +45,74 @@ def test_recording_scope():
     module._prefetch_parameter_groups = Mock()
     context.current_stream = Mock(return_value=Mock())
 
-    module.unshard(prefetch='forward')
-    with context.record_prefetch_order() as order:
+    original_forward, original_backward = context.forward_order, context.backward_order
+    with context.record_prefetch_order():
         with pytest.raises(RuntimeError, match='already active'):
             with context.record_prefetch_order():
                 pass
         for phase in ('forward', 'forward', 'none', 'backward'):
             module.unshard(prefetch=phase)
-    assert order.forward == [module, module]
-    assert order.backward == [module]
-    # Recording leaves the existing demand gathers, waits, and static prefetch intact.
-    assert module._unshard_parameter_groups.call_count == 5
-    assert context.current_stream().wait_event.call_count == 5
-    assert module._prefetch_parameter_groups.call_count == 4
-    module.unshard(prefetch='backward')
-    assert order.backward == [module]
+    assert list(context.forward_order) == [module, module]
+    assert list(context.backward_order) == [module]
+    assert context.forward_order is not original_forward
+    assert context.backward_order is not original_backward
+    assert module._unshard_parameter_groups.call_count == 4
+    assert context.current_stream().wait_event.call_count == 4
+    module._prefetch_parameter_groups.assert_not_called()
 
+    forward, backward = context.forward_order, context.backward_order
     with pytest.raises(ValueError, match='interrupted'):
-        with context.record_prefetch_order() as interrupted:
+        with context.record_prefetch_order():
             module.unshard(prefetch='forward')
             raise ValueError('interrupted')
-    with context.record_prefetch_order() as fresh:
-        assert fresh.forward == fresh.backward == []
-    assert interrupted.forward == [module]
-    assert context._recorded_prefetch_order is None
+    with context.record_prefetch_order():
+        pass
+    assert context.forward_order is forward
+    assert context.backward_order is backward
+    assert context._recorded_orders is None
+
+
+@pytest.mark.parametrize('budget', [None, 0, 2])
+def test_prefetch_replays_occurrences(budget):
+    """A reused module prefetches different successors at each recorded position."""
+    modules = []
+    for _ in range(3):
+        module = object.__new__(FsdpModule)
+        parameter = SimpleNamespace(unsharded=torch.empty(1))
+        module._parameter_groups = (SimpleNamespace(fsdp_parameters=[parameter]),)
+        module._unshard_parameter_groups = Mock()
+        modules.append(module)
+    first, second, third = modules
+    sequence = [first, second, first, third]
+    order = IndexedOrder(sequence)
+    expected = [[second], [first], [third], []]
+    if budget == 0:
+        expected = [[], [], [], []]
+    elif budget == 2:
+        expected = [[second, first], [first, third], [third], []]
+    for _ in range(2):
+        for module, targets in zip(sequence, expected):
+            for target in modules:
+                target._unshard_parameter_groups.reset_mock()
+            module._prefetch_parameter_groups(order, budget)
+            for target in modules:
+                assert target._unshard_parameter_groups.call_count == targets.count(target)
+    assert list(order) == sequence
+    with pytest.raises(RuntimeError, match='diverged'):
+        order.next_items(third)
+    assert list(order.next_items(first)) == [second, first, third]
+
+
+def test_static_order_lookup():
+    """Construction order still permits demand calls outside the static order."""
+    first, second, third = Mock(), Mock(), Mock()
+    order = IndexedOrder()
+    for module in (first, second, third):
+        order.append(module)
+    assert list(order.next_items(second)) == [third]
+    assert list(order.next_items(first)) == [second, third]
+    with pytest.raises(ValueError, match='duplicate'):
+        order.append(first)
 
 
 def test_recording_matches_dense_training(distributed_setup):
@@ -96,10 +142,11 @@ def test_recording_matches_dense_training(distributed_setup):
     fully_shard_optimizer(optimizer)
     num_microbatches = 3
     base_inputs = torch.arange(16, dtype=torch.float32, device=device).reshape(2, 8) / 16
-    for iteration in range(2):
+    for iteration in range(3):
         dense_optimizer.zero_grad(set_to_none=True)
         optimizer.zero_grad(set_to_none=True)
-        with context.record_prefetch_order() as order:
+        recording = context.record_prefetch_order() if iteration == 0 else nullcontext()
+        with recording:
             for index in range(num_microbatches):
                 inputs = base_inputs + 0.1 * distributed_setup.rank + 0.02 * (iteration + index)
                 expected = dense(inputs)
@@ -109,9 +156,8 @@ def test_recording_matches_dense_training(distributed_setup):
                     (actual.square().mean() / num_microbatches).backward()
                 torch.testing.assert_close(actual, expected)
             context.finish_grad_sync()
-        assert order.forward == [model, model.second, model.first] * num_microbatches
-        assert order.backward == [model, model.first, model.second] * num_microbatches
-        assert list(context.forward_order) == [model, model.first, model.second]
+        assert list(context.forward_order) == [model, model.second, model.first] * num_microbatches
+        assert list(context.backward_order) == [model, model.first, model.second] * num_microbatches
         for reference in dense.parameters():
             dist.all_reduce(reference.grad, group=mesh.get_group())
             reference.grad.div_(distributed_setup.world_size)

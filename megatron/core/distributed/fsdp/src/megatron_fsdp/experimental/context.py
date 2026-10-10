@@ -23,7 +23,6 @@ import torch
 from torch import nn
 
 from .indexed_order import IndexedOrder
-from .schedule import PrefetchOrder
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -45,7 +44,7 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Static orders used to drive all-gather prefetch. Each FsdpModule tracks
+    # Construction orders, replaced by runtime order after recording. Each FsdpModule tracks
     # its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder[nn.Module]
     backward_order: IndexedOrder[nn.Module]
@@ -99,7 +98,7 @@ class FsdpContext:
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
-        self._recorded_prefetch_order: PrefetchOrder | None = None
+        self._recorded_orders: tuple[list[nn.Module], list[nn.Module]] | None = None
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
@@ -192,32 +191,41 @@ class FsdpContext:
         return torch.cuda.current_stream(self.allgather_stream.device)
 
     @contextmanager
-    def record_prefetch_order(self) -> Iterator[PrefetchOrder]:
-        """Record demand-unshard occurrences without changing communication.
+    def record_prefetch_order(self) -> Iterator[None]:
+        """Replace prefetch orders with the module calls observed in this scope.
 
-        Enter after construction and include all forwards and backwards whose
-        order is needed, for example all microbatches in a global batch. Each
-        scope yields a fresh order; modules executed outside it are not recorded.
-        The returned order remains available after the scope exits and holds
-        references to its modules. Nested recording scopes are not supported.
+        Include one complete, repeatable execution pattern, such as all forward
+        and backward calls of a global batch. Demand unshards are recorded;
+        recomputation with ``prefetch="none"`` is excluded. Prefetch is disabled
+        while recording, and successful exit installs the observed orders for
+        subsequent runs. Repeated module calls retain distinct successors.
+
+        All ranks must record and replay collective-compatible module orders.
+        Replay requires the same call sequence in each phase; record again when
+        that pattern changes. An empty phase keeps its existing order, and an
+        interrupted scope leaves both orders unchanged. Nested scopes are rejected.
 
         Example:
-            Record one training batch after exiting ``fully_shard_context``::
+            After exiting ``fully_shard_context``, record a training batch::
 
-                with context.record_prefetch_order() as order:
+                with context.record_prefetch_order():
                     model(inputs).sum().backward()
-                forward_names = [module.name for module in order.forward]
-                backward_names = [module.name for module in order.backward]
+                # Subsequent batches prefetch in the observed execution order.
         """
         self.ensure_finalized()
-        if self._recorded_prefetch_order is not None:
+        if self._recorded_orders is not None:
             raise RuntimeError("An FSDP prefetch-order recording is already active.")
-        order = PrefetchOrder()
-        self._recorded_prefetch_order = order
+        forward: list[nn.Module] = []
+        backward: list[nn.Module] = []
+        self._recorded_orders = (forward, backward)
         try:
-            yield order
+            yield
+            if forward:
+                self.forward_order = IndexedOrder(forward)
+            if backward:
+                self.backward_order = IndexedOrder(backward)
         finally:
-            self._recorded_prefetch_order = None
+            self._recorded_orders = None
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""

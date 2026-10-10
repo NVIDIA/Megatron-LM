@@ -287,18 +287,20 @@ class FsdpModule:
         performs that root sync in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
-            order = self.context._recorded_prefetch_order
-            if order is not None:
+            recorded_orders = self.context._recorded_orders
+            if recorded_orders is not None:
                 if prefetch == "forward":
-                    order.forward.append(self)
+                    recorded_orders[0].append(cast(nn.Module, self))
                 elif prefetch == "backward":
-                    order.backward.append(self)
+                    recorded_orders[1].append(cast(nn.Module, self))
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
             self.context.current_stream().wait_event(self._unshard_event)
 
+            if recorded_orders is not None:
+                return
             context = self.context
             if prefetch == "forward":
                 self._prefetch_parameter_groups(
@@ -313,18 +315,16 @@ class FsdpModule:
         self, order: IndexedOrder[nn.Module], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
-        next_module = order.next_item(cast(nn.Module, self))
-        if prefetch_size is None:
-            if next_module is not None:
-                cast(FsdpModule, next_module)._unshard_parameter_groups()
-            return
-
+        successors = order.next_items(cast(nn.Module, self))
         prefetched_size = 0
-        while next_module is not None and prefetched_size < prefetch_size:
+        for next_module in successors:
+            if prefetch_size is not None and prefetched_size >= prefetch_size:
+                break
             fsdp_module = cast(FsdpModule, next_module)
             fsdp_module._unshard_parameter_groups()
+            if prefetch_size is None:
+                break
             prefetched_size += fsdp_module.num_parameter_elements
-            next_module = order.next_item(next_module)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
