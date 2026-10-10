@@ -6,6 +6,8 @@
   unique stores -- replay and agree with the torch reference.
 * ``fused_row_copy``: copy with unique stores -- replays and agrees bit for bit with
   ``Tensor.contiguous`` on row-strided views.
+* ``fused_moe_residual_add``: elementwise with unique stores -- forward and backward replay and
+  agree bit for bit with the two unfused adds it replaces.
 * MLA YaRN RoPE (``fused_mla_yarn_rope_apply``): elementwise rotations under a timing-based
   ``triton.autotune``; forward and backward replay in sbhd and thd layouts, at a head count the
   autotuned ``BLOCK_H`` divides and at one it does not, plus a check that the result does not
@@ -24,6 +26,7 @@ import torch
 from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
+from megatron.core.fusions.fused_moe_residual_add import fused_moe_residual_add
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
@@ -192,6 +195,33 @@ def test_contiguous_rows_replays_and_matches_torch(width, start, stop, dtype):
     )
     assert outputs["out"].is_contiguous()
     assert bytes_equal(outputs["out"], view.detach().contiguous())
+
+
+# --- MoE output residual add ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_fused_moe_residual_add_replays_and_matches_unfused_adds(dtype):
+    seeded()
+    # 4097 x 1024 elements: the last program covers a partial block.
+    shape = (4097, 1, 1024)
+    inputs = tuple(
+        torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True) for _ in range(3)
+    )
+    grad_output = torch.randn(shape, device="cuda", dtype=dtype)
+    outputs, grads = assert_replays_bit_exact(
+        fused_moe_residual_add,
+        inputs,
+        grad_outputs={"out": grad_output},
+        contention=True,
+        what="fused_moe_residual_add",
+    )
+    expert_output, shared_expert_output, residual = inputs
+    with torch.no_grad():
+        reference = residual + (expert_output + shared_expert_output)
+    assert bytes_equal(outputs["out"], reference)
+    assert len(grads) == 3
+    assert all(bytes_equal(grad, grad_output) for grad in grads.values())
 
 
 # --- MLA YaRN RoPE --------------------------------------------------------------------------
