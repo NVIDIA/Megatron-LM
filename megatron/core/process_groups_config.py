@@ -739,6 +739,36 @@ def resolve_gtp_remat_group(
     return getattr(mpu_pgs, attr)
 
 
+def amax_reduction_group(
+    pg_collection: ProcessGroupCollection, tp_only_amax_red: bool
+) -> torch.distributed.ProcessGroup:
+    """Return the FP8/FP4 amax reduction group from a model's process-group collection.
+
+    This is the collection counterpart of
+    ``parallel_state.get_amax_reduction_group(with_context_parallel=True, ...)``: amaxes are
+    reduced over ``tp_cp`` (TP x CP) when ``tp_only_amax_red`` is set, and over ``tp_dp_cp``
+    (TP x DP x CP, which also spans the gtp_remat axis like the data-parallel group) otherwise.
+
+    Args:
+        pg_collection: Process groups of the model that owns the quantized modules.
+        tp_only_amax_red: Reduce amaxes only across the tensor- and context-parallel ranks.
+
+    Returns:
+        The group to pass to Transformer Engine as the amax reduction group.
+
+    Raises:
+        ValueError: If the selected group is not set in ``pg_collection`` or is None.
+    """
+    group = pg_collection.tp_cp if tp_only_amax_red else pg_collection.tp_dp_cp
+    if group is None:
+        field_name = 'tp_cp' if tp_only_amax_red else 'tp_dp_cp'
+        raise ValueError(
+            f"FP8/FP4 amax reduction with tp_only_amax_red={tp_only_amax_red} needs "
+            f"pg_collection.{field_name}, but it is not set or is None."
+        )
+    return group
+
+
 @dataclass
 class MultiModuleProcessGroupCollection:
     """Process group collection for multi-module pipelines.
