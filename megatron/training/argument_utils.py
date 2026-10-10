@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.models.engram import EngramConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training.config import (
@@ -590,6 +591,9 @@ def gpt_config_from_args(
     else:
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
+    # Built here so the CLI/YAML validation runs once; the padded vocabulary is checked later
+    # by the model builder, which is the first place that knows it.
+    kwargs["engram_config"] = EngramConfig.from_args(args, transformer_cfg)
 
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = import_module(args.spec)
@@ -653,6 +657,10 @@ def hybrid_config_from_args(
         if callable(hybrid_stack_spec) and not isinstance(hybrid_stack_spec, ModuleSpec):
             hybrid_stack_spec = hybrid_stack_spec(transformer_cfg)
         kwargs["hybrid_stack_spec"] = hybrid_stack_spec
+
+    # Built here so the CLI/YAML validation runs once; the padded vocabulary is checked later
+    # by the model builder, which is the first place that knows it.
+    kwargs["engram_config"] = EngramConfig.from_args(args, transformer_cfg)
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
