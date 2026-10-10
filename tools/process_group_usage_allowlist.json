@@ -184,8 +184,6 @@
       "gtp_replica_rank:accessor:parallel_state.get_expert_data_parallel_rank"
     ],
     "megatron/core/tensor_parallel/layers.py": [
-      "_initialize_affine_weight_cpu:accessor:parallel_state.get_tensor_model_parallel_rank",
-      "_initialize_affine_weight_cpu:accessor:parallel_state.get_tensor_model_parallel_world_size",
       "param_is_not_gtp_duplicate:accessor:parallel_state.get_expert_gtp_weight_remat_rank",
       "param_is_not_gtp_duplicate:accessor:parallel_state.get_gtp_weight_remat_rank",
       "param_is_not_tensor_parallel_duplicate:accessor:parallel_state.get_tensor_model_parallel_rank"
@@ -289,5 +287,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 183
+  "total": 181
 }
