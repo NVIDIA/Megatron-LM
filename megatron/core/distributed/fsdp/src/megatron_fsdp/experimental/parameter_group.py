@@ -187,7 +187,7 @@ class FsdpParameterGroup:
         # _build_fsdp_parameters() creates views into this storage, which requires a valid
         # storage size. Release it only after construction; a later unshard reallocates it.
         self._unsharded_model_weight.release_storage()
-        self._switch_to_sharded_parameters()
+        self.bind_sharded_parameters()
 
     @staticmethod
     def _collect_parameter_metadata(
@@ -422,11 +422,13 @@ class FsdpParameterGroup:
             module, parameter_name = get_parameter_owner(owning_module, fqn)
             module._parameters[parameter_name] = parameter
 
-    def _switch_to_sharded_parameters(self) -> None:
+    def bind_sharded_parameters(self) -> None:
+        """Install sharded parameter references without changing storage."""
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.sharded)
 
-    def _switch_to_unsharded_parameters(self) -> None:
+    def bind_unsharded_parameters(self) -> None:
+        """Install full parameter references without changing storage."""
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
@@ -442,8 +444,8 @@ class FsdpParameterGroup:
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
 
-    def unshard_parameters(self) -> None:
-        """Install full parameters for local compute."""
+    def unshard(self) -> None:
+        """Materialize full parameter storage and bind full parameters for compute."""
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight
@@ -480,14 +482,10 @@ class FsdpParameterGroup:
                 if isinstance(unsharded_model_weight, DBuffer)
                 else unsharded_model_weight.get_tensor(index)
             )
-        self._switch_to_unsharded_parameters()
-
-    def reshard_parameters(self) -> None:
-        """Install sharded DTensor parameters on the owning modules."""
-        self._switch_to_sharded_parameters()
+        self.bind_unsharded_parameters()
 
     def release_unsharded_storage(self) -> None:
-        """Release this group's full-parameter storage."""
+        """Free full parameter storage without changing parameter bindings."""
         # This method is shared by the post-forward and post-backward release
         # paths. Post-forward must release storage because autograd may have
         # saved forward views into the unsharded parameters. Post-backward could
@@ -535,7 +533,7 @@ class FsdpParameterGroup:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
         return has_any_grad
 
-    def reduce_partial_gradients(self, partial_grad: DBuffer, *, is_last_microbatch: bool) -> None:
+    def reduce_gradients(self, partial_grad: DBuffer, *, is_last_microbatch: bool) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
 
         For HSDP/HFSDP main_grad rests DP-outer-Partial between microbatches,

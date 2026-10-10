@@ -207,8 +207,7 @@ class FsdpContext:
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
         for module in self.forward_order:
-            for group in module.parameter_groups:
-                group.reshard_parameters()
+            module.bind_sharded_parameters()
         self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def post_backward(self) -> None:
@@ -501,7 +500,7 @@ class FsdpModule:
         self.unshard(prefetch="forward" if not is_recomputing else "none")
 
     def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
-        """Unshard this FsdpModule's parameter groups immediately.
+        """Materialize full parameter storage and bind full parameters for compute.
 
         External schedulers invoking this directly (rather than through the
         automatic ``pre_forward`` hook) must first synchronize the all-gather
@@ -557,7 +556,7 @@ class FsdpModule:
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters()
+                group.unshard()
             self._unshard_event = allgather_stream.record_event()
 
     def post_forward(self) -> None:
@@ -573,23 +572,21 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def reshard(self) -> None:
-        """Reshard this FsdpModule's parameter groups."""
+        """Bind sharded parameters and release full parameter storage."""
         with self._nvtx_range("reshard"):
-            self._reshard_parameter_groups()
+            self.bind_sharded_parameters()
+            self.release_unsharded_storage()
 
-    def _reshard_parameter_groups(self) -> None:
-        """Reshard parameter groups and release unsharded storage after compute.
-
-        This method clears ``_unshard_event`` after queuing the release, so
-        future users enqueue a fresh all-gather.
-        """
+    def bind_sharded_parameters(self) -> None:
+        """Install sharded parameter references without changing storage."""
         for group in self._parameter_groups:
-            group.reshard_parameters()
+            group.bind_sharded_parameters()
 
-        self._release_unsharded_storage()
+    def release_unsharded_storage(self) -> None:
+        """Free full parameter storage after compute without changing bindings.
 
-    def _release_unsharded_storage(self) -> None:
-        """Free full weights after compute without changing parameter bindings."""
+        Clear the materialization event so the next unshard gathers fresh weights.
+        """
         allgather_stream = self.context.allgather_stream
         allgather_stream.wait_stream(self.context.current_stream())
         # Release on the all-gather stream where unsharded storage was allocated,
@@ -625,7 +622,7 @@ class FsdpModule:
         """Finish this module's backward and release weights when safe."""
         if self.phase is not FsdpModule.Phase.BACKWARD:
             return
-        self._release_unsharded_storage()
+        self.release_unsharded_storage()
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
@@ -649,7 +646,7 @@ class FsdpModule:
 
                 reduce_scatter_stream.wait_stream(current_stream)
                 with torch.cuda.stream(reduce_scatter_stream):
-                    group.reduce_partial_gradients(
+                    group.reduce_gradients(
                         partial_grad, is_last_microbatch=self.context.is_last_microbatch
                     )
 
