@@ -384,10 +384,10 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
 
-    dsa_indexer_qk_proj_disable_quantization: bool = False
-    """Disable FP8/FP4 for indexer query/key parameter initialization and GEMMs.
-    These projections use the configured unquantized dtype (e.g. BF16); this does not
-    control ``linear_weights_proj`` or index-score quantization.
+    dsa_indexer_qk_proj_use_quantization: bool = True
+    """Whether indexer query/key projections use the enclosing FP8/FP4 context.
+    When disabled, these projections use the configured unquantized dtype (e.g. BF16).
+    This does not control ``linear_weights_proj`` or index-score quantization.
     """
 
     dsa_indexer_k_norm_epsilon: Optional[float] = None
