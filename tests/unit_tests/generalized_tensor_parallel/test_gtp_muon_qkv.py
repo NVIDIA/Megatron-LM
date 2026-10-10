@@ -318,6 +318,55 @@ def _worker_partial_pg_collection(rank, world_size, port):
         )
 
 
+def _worker_dev_qkv_layout_after_gtp_gather(rank, world_size, port, tp_size, per_head, mode):
+    """GTP reconstruction precedes dev's per-head/fragmented-TP QKV handling."""
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=1,
+        gtp_remat_size=world_size // tp_size,
+    )
+    try:
+        pgc = ProcessGroupCollection.use_mpu_process_groups()
+        opt = _make_muon(pgc, tp_mode=mode)
+        opt.split_qkv = True
+        opt.split_qkv_per_head = per_head
+        opt.is_qkv_fn = lambda p: getattr(p, "is_qkv", False)
+        splits = [12, 12, 12] if per_head else [24, 6, 6]
+        w = _full_weight(sum(splits))
+        # Independent TP1 reference: orthogonalize each logical projection/head.
+        reference = torch.cat(
+            [opt.scaled_orthogonalize_fn(x, None, None) for x in torch.split(w, splits)]
+        )
+        tp_rank = torch.distributed.get_rank(pgc.tp)
+        tp_rows = w.size(0) // tp_size
+        tp_w = w[tp_rank * tp_rows : (tp_rank + 1) * tp_rows]
+        local, pad_length = _padded_local_shard(tp_w, pgc.gtp_remat)
+        local.partition_dim = 0
+        local.is_qkv = True
+        local.qkv_split_shapes_global = splits
+        local.qkv_split_shapes = (
+            _eo_module._localize_qkv_split_shapes(
+                splits, local_start=tp_rank * tp_rows, local_rows=tp_rows
+            )[0]
+            if per_head
+            else splits
+        )
+        local.qkv_split_heads_are_complete = tp_size == 1
+        local.qkv_split_groups_are_complete = tp_size == 1
+        opt.qkv_split_shapes = splits
+        actual = opt.orthogonalize(local, local.clone())
+        tp_reference = reference[tp_rank * tp_rows : (tp_rank + 1) * tp_rows]
+        padded_reference = torch.nn.functional.pad(tp_reference, (0, 0, 0, pad_length))
+        gtp_rank = torch.distributed.get_rank(pgc.gtp_remat)
+        expected = padded_reference[gtp_rank * local.size(0) : (gtp_rank + 1) * local.size(0)]
+        torch.testing.assert_close(actual, expected, atol=_ATOL, rtol=_RTOL)
+        assert not opt._warned_qkv_split_disabled
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 class TestGTPMuonQKVSplit:
     """The [q|k|v] split happens after the all-gather, so GTP == TP1 per shard."""
 
@@ -363,3 +412,10 @@ class TestGTPMuonQKVSplit:
     def test_partial_pg_collection_matches_full(self, world_size):
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_partial_pg_collection, world_size)
+
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.parametrize("per_head", [False, True])
+    @pytest.mark.parametrize("mode", ["duplicated", "auto"])
+    def test_dev_qkv_layout_after_gtp_gather(self, tp_size, per_head, mode):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_dev_qkv_layout_after_gtp_gather, 4, tp_size, per_head, mode)

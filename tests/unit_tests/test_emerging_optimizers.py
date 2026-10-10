@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import json
 import logging
@@ -1478,8 +1478,8 @@ def test_muon_optimizer_qkv_split_per_head_is_opt_in():
     head_param.qkv_split_shapes = [2] * 8
     orthogonalize_call_shapes = []
 
-    def center_rows(x, tp_group=None, partition_dim=None):
-        del tp_group, partition_dim
+    def center_rows(x, tp_group=None, partition_dim=None, tp_mode_this_group=None):
+        del tp_group, partition_dim, tp_mode_this_group
         orthogonalize_call_shapes.append(tuple(x.shape))
         return x - x.mean(dim=-2, keepdim=True)
 
@@ -1654,7 +1654,8 @@ def test_muon_qkv_distributed_mode_routing_warns_once(monkeypatch, layout, expec
     monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.log_single_rank", capture_log)
     orthogonalize_args = []
 
-    def capture_orthogonalize(x, tp_group=None, partition_dim=None):
+    def capture_orthogonalize(x, tp_group=None, partition_dim=None, tp_mode_this_group=None):
+        del tp_mode_this_group
         orthogonalize_args.append((tp_group, partition_dim))
         return x
 

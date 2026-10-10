@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import logging
 import warnings
@@ -849,13 +849,17 @@ def _get_megatron_emerging_optimizer(
                 if config.muon_split_qkv_per_head:
                     param.qkv_split_shapes, param.qkv_split_heads_are_complete = (
                         _localize_qkv_split_shapes(
-                            qkv_split_shapes, local_start=local_start, local_rows=rows_before_gtp_sharding
+                            qkv_split_shapes,
+                            local_start=local_start,
+                            local_rows=rows_before_gtp_sharding,
                         )
                     )
                 else:
                     param.qkv_split_shapes = qkv_split_shapes
                     param.qkv_split_groups_are_complete = _qkv_split_groups_are_complete(
-                        qkv_split_shapes, local_start=local_start, local_rows=rows_before_gtp_sharding
+                        qkv_split_shapes,
+                        local_start=local_start,
+                        local_rows=rows_before_gtp_sharding,
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
