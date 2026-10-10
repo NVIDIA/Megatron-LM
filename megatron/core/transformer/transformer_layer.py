@@ -82,7 +82,7 @@ def get_transformer_layer_offset(
 
         if config.pipeline_model_parallel_layout:
             offset = config.pipeline_model_parallel_layout.get_layer_offset(
-                layer_type=LayerType.decoder, vp_stage=vp_stage
+                layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
             )
         elif (
             config.num_layers_in_first_pipeline_stage is not None

@@ -352,6 +352,7 @@ class MegatronCheckpointSaverBase:
 
         for pp_rank in range(self.args.target_pipeline_parallel_size):
             mpu.set_pipeline_model_parallel_rank(pp_rank)
+            mpu.get_pipeline_model_parallel_group().set_rank(pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
             for ep_rank in range(self.args.target_expert_parallel_size):
@@ -434,6 +435,7 @@ class MegatronCheckpointSaverBase:
         total_layer_num = 0
         for pp_rank in range(self.args.target_pipeline_parallel_size):
             mpu.set_pipeline_model_parallel_rank(pp_rank)
+            mpu.get_pipeline_model_parallel_group().set_rank(pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
             for layer_id in range(schema.get_num_layers(self.models[pp_rank][0][0])):
