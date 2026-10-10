@@ -257,6 +257,8 @@ jobs:
               docker/.ngc_version.dev
               docker/common/install_nccl.sh
               docker/common/install_nccl_m2n.sh
+              docker/common/install_mok.sh
+              docker/patches/mok.patch
               docker/patches/deepep.patch
               docker/patches/deepep-nvshmem.patch
               megatron/core/__init__.py

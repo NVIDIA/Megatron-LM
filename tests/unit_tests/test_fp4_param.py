@@ -24,8 +24,8 @@ from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    initialize_runtime_services,
     set_args,
-    set_global_variables,
     set_run_config,
 )
 from megatron.training.training import force_param_sync, get_model, setup_model_and_optimizer
@@ -153,10 +153,11 @@ class TestFP4Param:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         set_run_config(pretrain_cfg_container_from_args(args))
+        initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):
@@ -534,7 +535,9 @@ class TestFP4Param:
             args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
                 tp_size, str(ckpt_dir), **kwargs
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, strict=True, restore_training_state=True
+            )
             assert iteration == 3
             loaded_state = self.quantized_param_state(model[0])
 

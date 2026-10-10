@@ -39,6 +39,7 @@ from tests.unit_tests.inference.engines.ssm_test_helpers import (
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig,
     DynamicInferenceEngineTestBase,
+    reset_rounder,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -55,6 +56,9 @@ class PrefixCachingTestBase:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        reset_rounder()
 
     @staticmethod
     def _mamba_config(mamba_chunk_size=128):
@@ -1143,41 +1147,30 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert not msa5.has_state(bid5) and bh5 not in msa5.hash_to_block_id
 
     @pytest.mark.internal
-    def test_mamba_prefill_skip_clamp_lands_on_cached_block(self):
-        # The clamp that keeps effective_prefill_chunk_length >= 2 rounds the skip
-        # down to a block boundary, which can land on a block that has no cached
-        # Mamba state. The skip must walk back to the nearest block that does,
-        # otherwise add_request() zeroes the SSM state and resumes mid-prompt.
-        # One token past 3 full blocks: skipping all 3 leaves a 1-token chunk, so
-        # the clamp always fires and moves the boundary from block 3 to block 2.
+    def test_mamba_prefill_skip_allows_single_token_chunk(self):
+        # A prompt one token past 3 full blocks: skipping all 3 leaves a 1-token chunk, which
+        # must be allowed so the skip can land on the block whose Mamba state is cached.
         ctx = self._mctx()
         bs = ctx.block_size_tokens
         prompt = self._prompt(bs * 3 + 1)
         ctx.add_request(self._req(ctx, prompt.clone()))
 
-        # Only the last block has Mamba state, so the clamped boundary has none
-        # and there is no earlier cached block to fall back to: skip nothing.
+        # Only block 2 carries Mamba state: all 3 blocks are skipped and restore targets block 2.
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[2:])
         req = self._req(ctx, prompt.clone(), request_id=2)
         _m = ctx._compute_prefix_match(req, len(prompt))
-        matched = _m.matched_block_ids
-        prefix_skip = _m.prefix_skip_tokens
-        eff_chunk = _m.effective_prefill_chunk_length
-        assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
+        assert len(_m.matched_block_ids) == 3
+        assert _m.prefix_skip_tokens == bs * 3
+        assert _m.effective_prefill_chunk_length == 1
 
-        # Same clamp, but the first block is also cached: back off to it rather
-        # than all the way to zero.
+        # No Mamba state cached anywhere: nothing to restore from, so skip nothing.
         ctx2 = self._mctx()
         p2 = self._prompt(bs * 3 + 1)
         ctx2.add_request(self._req(ctx2, p2.clone()))
-        blocks2 = self._block_ids(ctx2, 0, 3)
-        self._mamba_allocate_and_register(ctx2, [blocks2[0], blocks2[2]])
         req2 = self._req(ctx2, p2.clone(), request_id=2)
-        _m = ctx2._compute_prefix_match(req2, len(p2))
-        m2 = _m.matched_block_ids
-        ps2 = _m.prefix_skip_tokens
-        ec2 = _m.effective_prefill_chunk_length
-        assert len(m2) == 3 and ps2 == bs and ec2 == len(p2) - bs
+        _m2 = ctx2._compute_prefix_match(req2, len(p2))
+        assert _m2.prefix_skip_tokens == 0
+        assert _m2.effective_prefill_chunk_length == len(p2)
 
     @pytest.mark.internal
     def test_batch_invariant_mamba_chunked_prefill_scheduler_alignment(self):
@@ -1601,7 +1594,7 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_fully_cached_repeat_redirects_recomputed_block(self):
-        """The `>= 2 computed tokens` clamp forces a matched block to be recomputed."""
+        """A fully cached repeat recomputes only its last token, whose write is redirected."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         dummy = ctx.kv_block_allocator.dummy_block_idx
@@ -1610,17 +1603,15 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone()))
         cached_blocks = self._block_ids(ctx, 0, 3)
 
-        # Re-sending the prompt verbatim matches all 3 blocks, but skipping all 96
-        # tokens would leave a 0-token chunk, so the skip is clamped down to 2 blocks
-        # and the third block's 32 tokens are recomputed.
+        # Re-sending the prompt verbatim matches all 3 blocks. The last token is always
+        # computed (it produces the logits), so the skip stops one token short.
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         start, end = self._add_chunk(ctx, req2)
-        assert end - start == bs
-        assert ctx.request_kv_length_offsets[1].item() == bs * 2
+        assert end - start == 1
+        assert ctx.request_kv_length_offsets[1].item() == bs * 3 - 1
 
-        # Every recomputed token lands in the matched third block, so all of the
-        # chunk's writes are redirected.
-        assert self._write_targets(ctx, start, end) == [dummy] * bs
+        # That token lands in the matched third block, so its write is redirected.
+        assert self._write_targets(ctx, start, end) == [dummy]
         # The block table is untouched: attention still reads the cached KV.
         assert self._block_ids(ctx, 1, 3) == cached_blocks
 
@@ -1723,14 +1714,14 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
 
         # Chunk 1 stops at token 40, i.e. 8 tokens into block 1, leaving
         # `finished_chunk_token_count` unaligned for chunk 2. Both blocks it spans
-        # are matched, so its 8 computed tokens redirect.
+        # are matched, so the skip stops one token short and that token redirects.
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         chunk1_length = bs + 8
         start1, end1 = self._add_chunk(ctx, req2, chunk_length=chunk1_length)
-        assert end1 - start1 == 8
+        assert end1 - start1 == 1
         assert req2.finished_chunk_token_count == chunk1_length
         assert req2.num_matched_prefix_blocks == 2
-        assert self._write_targets(ctx, start1, end1) == [dummy] * 8
+        assert self._write_targets(ctx, start1, end1) == [dummy]
 
         # Chunk 2 covers tokens [40, 128). The first 24 complete block 1 -- which
         # chunk 1 obtained by match and still shares with the first request -- so
@@ -1745,6 +1736,79 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
         # Every block this request holds is shared with the first request.
         for block_id in self._block_ids(ctx, 1, 4):
             assert ctx.kv_block_allocator.block_ref_counts[block_id].item() == 2
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("record_mamba_match", [False, True])
+@pytest.mark.parametrize(
+    "mamba_boundaries",
+    [None, [], [2], [2, 6, 9]],
+    ids=["memory_only", "snapshots_evicted", "earlier_snapshot", "later_snapshots"],
+)
+def test_hybrid_cached_continuation_preserves_recurrent_position(
+    mamba_boundaries, record_mamba_match
+):
+    """KV reuse must not skip transitions in a continuation's live Mamba state."""
+    ctx = object.__new__(DynamicInferenceContext)
+    ctx.block_size_tokens = 256
+    ctx.enable_prefix_caching = True
+    ctx.enable_mtp_kv_cache = False
+    ctx.is_hybrid_model = True
+    hashes = list(range(1, 11))
+    ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
+    ctx.mamba_slot_allocator = (
+        None
+        if mamba_boundaries is None
+        else SimpleNamespace(hash_to_block_id={h: h for h in mamba_boundaries})
+    )
+    req = SimpleNamespace(finished_chunk_token_count=0, precomputed_block_hashes=hashes)
+    bs = ctx.block_size_tokens
+    recurrent_position = 0
+
+    for chunk_length in (4 * bs, 4 * bs, 2 * bs + 2):
+        finished = req.finished_chunk_token_count
+        match = ctx._compute_prefix_match(req, chunk_length, record_mamba_match=record_mamba_match)
+        allocated = match.already_allocated_blocks
+        required = match.overall_required_blocks
+        assert match.matched_block_ids == hashes[allocated:required]
+        assert match.num_blocks_from_pool == required - allocated - len(match.matched_block_ids)
+        if finished == 0:
+            # A valid first-chunk snapshot still permits its matching prefix skip.
+            assert match.prefix_skip_tokens == (2 * bs if mamba_boundaries else 0)
+            recurrent_position = match.prefix_skip_tokens
+        else:
+            # No Mamba restore occurs on continuation admission. Sharing KV must
+            # not advance the logical position past uncomputed recurrent state.
+            assert match.prefix_skip_tokens == 0
+            assert match.effective_prefill_chunk_length == chunk_length
+        recurrent_position += match.effective_prefill_chunk_length
+        req.finished_chunk_token_count += chunk_length
+        assert recurrent_position == req.finished_chunk_token_count
+
+
+@pytest.mark.internal
+def test_attention_only_cached_continuation_still_skips():
+    """Attention-only continuations can still skip matching KV blocks."""
+    ctx = object.__new__(DynamicInferenceContext)
+    ctx.block_size_tokens = 256
+    ctx.enable_prefix_caching = True
+    ctx.enable_mtp_kv_cache = False
+    ctx.is_hybrid_model = False
+    ctx.mamba_slot_allocator = None
+    hashes = list(range(1, 11))
+    ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
+    req = SimpleNamespace(
+        finished_chunk_token_count=4 * ctx.block_size_tokens, precomputed_block_hashes=hashes
+    )
+
+    match = ctx._compute_prefix_match(req, 6 * ctx.block_size_tokens + 2)
+
+    assert match.matched_block_ids == hashes[4:]
+    assert match.num_blocks_from_pool == 1
+    assert match.already_allocated_blocks == 4
+    assert match.overall_required_blocks == 11
+    assert match.prefix_skip_tokens == 6 * ctx.block_size_tokens
+    assert match.effective_prefill_chunk_length == 2
 
 
 def _make_cpu_mamba_slot_allocator(
@@ -2029,7 +2093,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
             ),
         )
         ctx.add_request(request)
-        assert request.num_cached_tokens == bs
+        assert request.num_cached_tokens == 2 * bs - 1
         engine = _StubEngine(ctx)
         future = engine._add_request(request)
         engine.waiting_request_ids.clear()
@@ -2632,7 +2696,7 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
             skipped = _m.prefix_skip_tokens
             effective = _m.effective_prefill_chunk_length
             assert matched == producer_blocks
-            assert skipped == 2 * block_size and effective == block_size
+            assert skipped == 3 * block_size - 1 and effective == 1
             ctx.add_request(probe)
             assert probe.num_cached_tokens == skipped
 
@@ -2672,9 +2736,9 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
             fresh = self._req(ctx, self._prompt(3 * block_size, offset=50_000), request_id=3)
             ctx.add_request(cached)
             ctx.add_request(fresh)
-            assert ctx.request_query_lengths[1].item() == block_size
+            assert ctx.request_query_lengths[1].item() == 1
             assert ctx.request_query_lengths[2].item() == 3 * block_size
-            assert cached.num_cached_tokens == 2 * block_size
+            assert cached.num_cached_tokens == 3 * block_size - 1
             assert fresh.num_cached_tokens == 0
 
         self._apply_local_churn(ctx, producer, producer_blocks)
@@ -3322,9 +3386,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         try:
             self._run_engine_case(case)
         finally:
-            DynamicInferenceContext.ROUNDER = 64
-            DynamicInferenceContext.TOKEN_ROUNDER = 64
-            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            reset_rounder()
             Utils.destroy_model_parallel()
 
 

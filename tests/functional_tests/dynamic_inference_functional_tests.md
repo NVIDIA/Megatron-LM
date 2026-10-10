@@ -91,8 +91,8 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 | Feature | Surface | Notes |
 |---|---|---|
 | Suspend/resume | `engine.suspend()` / `engine.resume()`; tests use `--suspend-timeout`, `--suspend-resume-interval` | Offloads GPU state to CPU/disk |
-| KV cache management on suspend | `--rl-kv-cache-management-mode {persist, offload, recompute}` | What to do with KV when suspending |
-| Static KV pointers | `InferenceConfig.static_kv_memory_pointers` | Keep KV buffer addrs across suspend/resume |
+| KV cache management on suspend | `--inference-kv-cache-management-mode {persist, offload, recompute}` | What to do with KV when suspending |
+| Static KV pointers | `--inference-static-kv-memory-pointers` (`InferenceConfig.static_kv_memory_pointers`) | Keep KV buffer addrs across suspend/resume |
 | Track paused events | `--inference-dynamic-batching-track-paused-request-events` | Telemetry only |
 | Track per-token events | `--inference-dynamic-batching-track-generated-token-events` | Telemetry only |
 

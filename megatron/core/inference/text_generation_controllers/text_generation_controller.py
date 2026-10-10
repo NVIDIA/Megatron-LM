@@ -36,11 +36,11 @@ from megatron.core.inference.utils import (
     InferenceMode,
     detokenize_tokens,
     get_attention_mask,
+    get_language_model,
     model_eos_token_ids,
     set_decode_expert_padding,
     set_moe_metadata_sync,
 )
-from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -245,20 +245,14 @@ class TextGenerationController(MTPControllerMixin):
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
+        # The language model holds the vocab, the MTP block and the embedding; a multimodal
+        # wrapper keeps it under `language_model`.
+        self._language_model = get_language_model(unwrap_model(self.inference_wrapped_model.model))
         # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
-        # TODO(ksanthanam): Consider deprecating this check if LLaVAModel is no longer used
-        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-        if isinstance(unwrapped_model, LLaVAModel):
-            self.vocab_size = unwrapped_model.language_model.vocab_size
-        else:
-            self.vocab_size = unwrapped_model.vocab_size
+        self.vocab_size = self._language_model.vocab_size
 
         if getattr(self.inference_wrapped_model.inference_context, "enable_mtp_kv_cache", False):
-            language_model = (
-                unwrapped_model.language_model
-                if isinstance(unwrapped_model, LLaVAModel)
-                else unwrapped_model
-            )
+            language_model = self._language_model
             if language_model.position_embedding_type != "none":
                 raise ValueError(
                     "MTP KV caching requires position_embedding_type='none'; positional "
