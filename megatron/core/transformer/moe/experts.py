@@ -19,7 +19,7 @@ from megatron.core.activations import situlu, squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, mark_grouped_tensor
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -303,8 +303,9 @@ class TEGroupedMLP(MegatronModule):
                 self.num_local_experts, align_size=align_size
             )
 
-    @staticmethod
-    def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
+    def _apply_packed_bias(
+        self, intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs
+    ):
         """Apply a packed expert bias without reading token counts on the host."""
         # TODO: get rid of the .float() by having fused kernel compute in FP32
         shape = intermediate_parallel.shape
@@ -312,6 +313,10 @@ class TEGroupedMLP(MegatronModule):
         output_dtype = intermediate_parallel.dtype
         flat_output = intermediate_parallel.view(-1, hidden_size).float()
         flat_probs = permuted_probs.reshape(-1, 1).float()
+        if self.config.moe_paged_stash:
+            # The multiply below saves these two token-shaped operands. The additive output
+            # operand is not saved by autograd and does not need a marker.
+            self._mark_paged_stash_tensors(flat_probs)
 
         if tokens_per_expert.device != packed_bias.device:
             raise ValueError("Packed MoE bias and tokens_per_expert must be on the same device.")
@@ -329,10 +334,11 @@ class TEGroupedMLP(MegatronModule):
         bias_per_token = torch.repeat_interleave(
             packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
         )
+        if self.config.moe_paged_stash:
+            self._mark_paged_stash_tensors(bias_per_token)
         return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
 
-    @staticmethod
-    def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
+    def _apply_bias(self, intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
             return intermediate_parallel
 
@@ -340,7 +346,7 @@ class TEGroupedMLP(MegatronModule):
         # GroupedTensor [num_experts, hidden_size]. The grouped-tensor backend also provides
         # tokens_per_expert as a tensor on the same device.
         if isinstance(bias_parallel, torch.Tensor) and isinstance(tokens_per_expert, torch.Tensor):
-            return TEGroupedMLP._apply_packed_bias(
+            return self._apply_packed_bias(
                 intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs
             )
 
@@ -704,6 +710,34 @@ class TEGroupedMLP(MegatronModule):
 
         return forward_post_hook
 
+    def _mark_paged_stash_tensors(self, *tensors: torch.Tensor | None) -> None:
+        """Mark dynamic unfused activations for the paged-stash saved-tensor hook."""
+        if not self.config.moe_paged_stash:
+            return
+        tensors_to_mark = tuple(tensor for tensor in tensors if tensor is not None)
+        if tensors_to_mark:
+            mark_grouped_tensor(*tensors_to_mark)
+
+    def _get_paged_stash_scope(self, permuted_local_hidden_states, tokens_per_expert):
+        """Start a paged-stash group and return the input and saved-tensor context."""
+        if not self.config.moe_paged_stash:
+            return permuted_local_hidden_states, nullcontext()
+
+        permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+        max_num_tokens = permuted_local_hidden_states.shape[0]
+        # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+        # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+        cap_factor = self.config.moe_expert_rank_capacity_factor
+        avg_num_tokens = (
+            int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
+        )
+        return permuted_local_hidden_states, get_paged_stash_context(
+            name="grouped_mlp",
+            max_num_tokens=max_num_tokens,
+            num_tokens_tensor=tokens_per_expert.sum(),
+            avg_num_tokens=avg_num_tokens,
+        )
+
     def _fused_forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -767,25 +801,9 @@ class TEGroupedMLP(MegatronModule):
             )
         # if the number of tokens is 0, pad the hidden states to 256
 
-        if self.config.moe_paged_stash:
-            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
-            max_num_tokens = permuted_local_hidden_states.shape[0]
-            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
-            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
-            cap_factor = self.config.moe_expert_rank_capacity_factor
-            avg_num_tokens = (
-                int(max_num_tokens // cap_factor)
-                if cap_factor is not None and cap_factor > 0
-                else None
-            )
-            stash_context = get_paged_stash_context(
-                name="grouped_mlp",
-                max_num_tokens=max_num_tokens,
-                num_tokens_tensor=tokens_per_expert.sum(),
-                avg_num_tokens=avg_num_tokens,
-            )
-        else:
-            stash_context = nullcontext()
+        permuted_local_hidden_states, stash_context = self._get_paged_stash_scope(
+            permuted_local_hidden_states, tokens_per_expert
+        )
         fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
         offload_name = "fused_group_mlp"
         fused_group_mlp_manager = off_interface(
@@ -824,75 +842,19 @@ class TEGroupedMLP(MegatronModule):
         x = x.view(shape)
         return x
 
-    def forward(
+    def _unfused_forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
+        tokens_per_expert: torch.Tensor | list[int],
         permuted_probs: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward of TEGroupedMLP
-
-        Args:
-            permuted_local_hidden_states (torch.Tensor): The permuted input hidden states of the
-            local experts.
-            tokens_per_expert (torch.Tensor): The number of tokens per expert.
-            permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
-
-        Return:
-            output (torch.Tensor): The output of the local experts.
-        """
-
-        # Call fused impl if enabled
-        if self._with_fused_impl:
-            output = self._fused_forward(
-                permuted_local_hidden_states, tokens_per_expert, permuted_probs
-            )
-            output_bias = None
-            return output, output_bias
-
-        # Apply padding if needed
-        unpadded_tokens_per_expert = None
-        permuted_probs = permuted_probs.unsqueeze(-1)
-        # The token buffer may already contain per-expert padding when padding was performed
-        # before expert compute:
-        #   * router padding modified the routing map before dispatch;
-        #   * HybridEP/NCCL-EP fused padding into dispatch/permute;
-        #   * DeepEP fused padding into its post-communication local permutation.
-        # In those cases tokens_per_expert already describes the padded expert segments. Running
-        # Fp8Padding again would change the segment lengths without matching the existing token
-        # layout, so this module must leave both tensors unchanged.
-        if skip_routed_expert_padding(self.config):
-            pass
-        # Regular AllToAll normally supplies unpadded expert segments and therefore uses this
-        # explicit fallback. FP8/FP4 need their recipe-specific alignment. MCore currently also
-        # applies its common aligned-segment contract to the GroupedTensor backend so quantized
-        # grouped execution receives supported shapes
-        elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
-            tokens_per_expert = tokens_per_expert.tolist()
-            unpadded_tokens_per_expert = tokens_per_expert
-            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
-                permuted_local_hidden_states, tokens_per_expert
-            )
-            permuted_probs, _ = self.quantization_padding(
-                permuted_probs, unpadded_tokens_per_expert
-            )
-
-        if self._use_grouped_tensor:
-            if not isinstance(tokens_per_expert, torch.Tensor):
-                tokens_per_expert = torch.tensor(
-                    tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
-                )
-            else:
-                tokens_per_expert = tokens_per_expert.to(
-                    device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
-                )
-        elif isinstance(tokens_per_expert, torch.Tensor):
-            tokens_per_expert = tokens_per_expert.tolist()
-
+    ) -> torch.Tensor:
+        """Run FC1, activation, and FC2 without the TE operation fuser."""
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1
             ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            # MulBackward saves both operands before GroupedLinear sees the scaled input.
+            self._mark_paged_stash_tensors(permuted_local_hidden_states, permuted_probs)
             original_dtype = permuted_local_hidden_states.dtype
             permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
@@ -915,6 +877,7 @@ class TEGroupedMLP(MegatronModule):
         moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
+            self._mark_paged_stash_tensors(intermediate_parallel, permuted_probs)
 
             # Whether activation function is interleaved GLU
             with_glu_interleaving = (
@@ -999,7 +962,6 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with moe_act_manager as fc1_output:
@@ -1009,7 +971,6 @@ class TEGroupedMLP(MegatronModule):
         else:
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
-
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
@@ -1021,12 +982,86 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors=[fc1_output],
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+        return self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
+    def forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward of TEGroupedMLP
+
+        Args:
+            permuted_local_hidden_states (torch.Tensor): The permuted input hidden states of the
+            local experts.
+            tokens_per_expert (torch.Tensor): The number of tokens per expert.
+            permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
+
+        Return:
+            output (torch.Tensor): The output of the local experts.
+        """
+
+        # Call fused impl if enabled
+        if self._with_fused_impl:
+            output = self._fused_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            )
+            output_bias = None
+            return output, output_bias
+
+        # Apply padding if needed
+        unpadded_tokens_per_expert = None
+        permuted_probs = permuted_probs.unsqueeze(-1)
+        # The token buffer may already contain per-expert padding when padding was performed
+        # before expert compute:
+        #   * router padding modified the routing map before dispatch;
+        #   * HybridEP/NCCL-EP fused padding into dispatch/permute;
+        #   * DeepEP fused padding into its post-communication local permutation.
+        # In those cases tokens_per_expert already describes the padded expert segments. Running
+        # Fp8Padding again would change the segment lengths without matching the existing token
+        # layout, so this module must leave both tensors unchanged.
+        if skip_routed_expert_padding(self.config):
+            pass
+        # Regular AllToAll normally supplies unpadded expert segments and therefore uses this
+        # explicit fallback. FP8/FP4 need their recipe-specific alignment. MCore currently also
+        # applies its common aligned-segment contract to the GroupedTensor backend so quantized
+        # grouped execution receives supported shapes
+        elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
+            tokens_per_expert = tokens_per_expert.tolist()
+            unpadded_tokens_per_expert = tokens_per_expert
+            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+            permuted_probs, _ = self.quantization_padding(
+                permuted_probs, unpadded_tokens_per_expert
+            )
+
+        if self._use_grouped_tensor:
+            if not isinstance(tokens_per_expert, torch.Tensor):
+                tokens_per_expert = torch.tensor(
+                    tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
+                )
+            else:
+                tokens_per_expert = tokens_per_expert.to(
+                    device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
+                )
+        elif isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = tokens_per_expert.tolist()
+
+        permuted_local_hidden_states, stash_context = self._get_paged_stash_scope(
+            permuted_local_hidden_states, tokens_per_expert
+        )
+        with stash_context:
+            output = self._unfused_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            )
         # upad and concat the output
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
 
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="grouped_mlp")
         output_bias = None
 
         return output, output_bias
