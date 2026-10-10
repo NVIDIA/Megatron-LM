@@ -27,11 +27,12 @@ def main(pipeline_id: int):
 
     project = gl.projects.get(PROJECT_ID)
     pipeline = project.pipelines.get(pipeline_id)
-    print(pipeline.bridges.list())
+    bridges = pipeline.bridges.list(get_all=True)
+    print(bridges)
 
     pipeline_bridges = [
         pipeline_bridge
-        for pipeline_bridge in pipeline.bridges.list()
+        for pipeline_bridge in bridges
         if pipeline_bridge.name.startswith("test:unit_tests")
         and pipeline_bridge.downstream_pipeline is not None
     ]
