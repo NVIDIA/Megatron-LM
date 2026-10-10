@@ -99,8 +99,12 @@ def test_prefetch_replays_occurrences(budget):
                 assert target._unshard_parameter_groups.call_count == targets.count(target)
     assert list(order) == sequence
     with pytest.raises(RuntimeError, match='diverged'):
-        order.next_items(third)
-    assert list(order.next_items(first)) == [second, first, third]
+        order.advance(third)
+    order.advance(first)
+    assert order.next_item(first) is second
+    assert order.next_item(first, 2) is first
+    assert order.next_item(first, 3) is third
+    assert order.next_item(first, 4) is None
 
 
 def test_static_order_lookup():
@@ -109,8 +113,12 @@ def test_static_order_lookup():
     order = IndexedOrder()
     for module in (first, second, third):
         order.append(module)
-    assert list(order.next_items(second)) == [third]
-    assert list(order.next_items(first)) == [second, third]
+    order.advance(second)
+    assert order.next_item(second) is third
+    assert order.next_item(third) is None
+    order.advance(first)
+    assert order.next_item(first) is second
+    assert order.next_item(first, 2) is third
     with pytest.raises(ValueError, match='duplicate'):
         order.append(first)
 
