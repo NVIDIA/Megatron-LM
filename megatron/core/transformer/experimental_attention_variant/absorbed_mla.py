@@ -1058,10 +1058,6 @@ class AbsorbedMLASelfAttention(Attention):
             set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_down_proj)
 
-    def clip_qk(self):
-        """
-        QK Clipping is a technique to clip the query and key attention logits to prevent the
-        attention logits from exploding. Per MuonClip usage, we update the weight by calling this
-        function after Muon optimizer step.
-        """
-        raise NotImplementedError("clip_qk is not implemented for AbsorbedMLA")
+    def get_qk_clip_factors(self):
+        """QK-Clip is unsupported after MLA absorption."""
+        raise NotImplementedError("QK-Clip is not implemented for AbsorbedMLA")

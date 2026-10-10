@@ -53,6 +53,7 @@ from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad
 from .cpu_offloading.chunked_optimizer_state_offload import ChunkedOptimizerStateOffloader
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
+from .qk_clip import apply_qk_clip
 
 logger = getLogger(__name__)
 
@@ -870,6 +871,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 self.optimizer.step()
             else:
                 self._optimizer_state_offloader.step()
+            apply_qk_clip(self)
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
@@ -1361,6 +1363,7 @@ class FP32Optimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         self.optimizer.step()
+        apply_qk_clip(self)
         if timers is not None:
             timers('optimizer-inner-step').stop()
 

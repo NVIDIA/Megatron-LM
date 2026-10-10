@@ -2,6 +2,7 @@
 
 import os
 from inspect import signature
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -17,6 +18,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.optimizer.qk_clip import apply_qk_clip, clear_qk_clip
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
@@ -1363,6 +1365,36 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestMLAClipQK:
 
+    @staticmethod
+    @torch.no_grad()
+    def _apply_qk_clip_and_copy_back(attention):
+        """Exercise master clipping, model copy-back, and statistics cleanup."""
+        params = list(attention.parameters())
+        originals = [param.detach().clone() for param in params]
+        logits = attention.core_attention.current_max_attn_logits
+        factors = attention.get_qk_clip_factors()
+        assert attention.core_attention.current_max_attn_logits is logits
+        for param, original in zip(params, originals):
+            torch.testing.assert_close(param, original, rtol=0, atol=0)
+        masters = []
+        for param in params:
+            param.main_param = param.detach().float().clone()
+            masters.append(param.main_param)
+        optimizer = SimpleNamespace(
+            optimizer=SimpleNamespace(param_groups=[{"params": masters}]),
+            _qk_clip_layers=[attention],
+        )
+        expected = {id(param): param.detach().float() * factor for param, factor in factors}
+        apply_qk_clip(optimizer)
+        for param, original in zip(params, originals):
+            torch.testing.assert_close(param, original, rtol=0, atol=0)
+            torch.testing.assert_close(param.main_param, expected.get(id(param), original.float()))
+            param.copy_(param.main_param)
+        assert attention.core_attention.current_max_attn_logits is logits
+        clear_qk_clip(optimizer)
+        assert attention.core_attention.current_max_attn_logits is None
+        assert optimizer._qk_clip_shards == {}
+
     @pytest.fixture(scope='function', autouse=True)
     def setup_and_teardown(self, rope_type):
         Utils.initialize_model_parallel(1, 1)
@@ -1414,7 +1446,7 @@ class TestMLAClipQK:
             )
 
             with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
-                attention.clip_qk()
+                attention.get_qk_clip_factors()
 
     def test_clip_qk_none_logits_raises_error(self):
         """Test that clip_qk raises ValueError when current_max_attn_logits is None."""
@@ -1427,7 +1459,7 @@ class TestMLAClipQK:
             )
 
             with pytest.raises(ValueError, match="current_max_attn_logits is None"):
-                attention.clip_qk()
+                attention.get_qk_clip_factors()
 
     def test_clip_qk_below_threshold_no_update(self):
         """Test that weights are not updated when max logits are below threshold."""
@@ -1454,8 +1486,8 @@ class TestMLAClipQK:
             [50.0, 60.0, 70.0, 80.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should not be updated
         if self.transformer_config.q_lora_rank is None:
@@ -1491,8 +1523,8 @@ class TestMLAClipQK:
             [150.0, 160.0, 170.0, 180.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should be updated
         if self.transformer_config.q_lora_rank is None:
@@ -1528,8 +1560,8 @@ class TestMLAClipQK:
             [80.0, 150.0, 90.0, 200.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should be updated since at least one head exceeds threshold
         if self.transformer_config.q_lora_rank is None:
@@ -1584,7 +1616,7 @@ class TestMLAClipQK:
             ValueError,
             match="qk_clip is not supported when cache_mla_latents is enabled and absorption is active",
         ):
-            attention.clip_qk()
+            attention.get_qk_clip_factors()
 
 
 @pytest.mark.experimental

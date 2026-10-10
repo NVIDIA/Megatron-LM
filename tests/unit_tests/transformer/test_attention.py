@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+from types import SimpleNamespace
 from unittest import mock
 
 import einops
@@ -217,6 +218,36 @@ class TestParallelAttention:
 @pytest.mark.skipif(not is_te_min_version("2.9.0"), reason="QK clipping requires TE >= 2.9.0")
 class TestClipQK:
 
+    @staticmethod
+    @torch.no_grad()
+    def _apply_qk_clip_and_copy_back(attention):
+        """Exercise master clipping, model copy-back, and statistics cleanup."""
+        params = list(attention.parameters())
+        originals = [param.detach().clone() for param in params]
+        logits = attention.core_attention.current_max_attn_logits
+        factors = attention.get_qk_clip_factors()
+        assert attention.core_attention.current_max_attn_logits is logits
+        for param, original in zip(params, originals):
+            torch.testing.assert_close(param, original, rtol=0, atol=0)
+        masters = []
+        for param in params:
+            param.main_param = param.detach().float().clone()
+            masters.append(param.main_param)
+        optimizer = SimpleNamespace(
+            optimizer=SimpleNamespace(param_groups=[{"params": masters}]),
+            _qk_clip_layers=[attention],
+        )
+        expected = {id(param): param.detach().float() * factor for param, factor in factors}
+        apply_qk_clip(optimizer)
+        for param, original in zip(params, originals):
+            torch.testing.assert_close(param, original, rtol=0, atol=0)
+            torch.testing.assert_close(param.main_param, expected.get(id(param), original.float()))
+            param.copy_(param.main_param)
+        assert attention.core_attention.current_max_attn_logits is logits
+        clear_qk_clip(optimizer)
+        assert attention.core_attention.current_max_attn_logits is None
+        assert optimizer._qk_clip_shards == {}
+
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -240,7 +271,7 @@ class TestClipQK:
         )
 
         with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
-            attention.clip_qk()
+            attention.get_qk_clip_factors()
 
     def test_clip_qk_none_logits_raises_error(self):
         """Test that clip_qk raises ValueError when current_max_attn_logits is None."""
@@ -260,7 +291,7 @@ class TestClipQK:
         )
 
         with pytest.raises(ValueError, match="current_max_attn_logits is None"):
-            attention.clip_qk()
+            attention.get_qk_clip_factors()
 
     def test_clip_qk_below_threshold_no_update(self):
         """Test that weights are not updated when max logits are below threshold."""
@@ -288,8 +319,8 @@ class TestClipQK:
             [50.0, 60.0, 70.0, 80.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should not be updated
         assert torch.equal(attention.linear_qkv.weight.data, original_weight)
@@ -322,8 +353,8 @@ class TestClipQK:
             [150.0, 160.0, 170.0, 180.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should be updated
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
@@ -357,8 +388,8 @@ class TestClipQK:
             [150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should be updated
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
@@ -391,8 +422,8 @@ class TestClipQK:
             [80.0, 150.0, 90.0, 200.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should be updated since at least one head exceeds threshold
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
@@ -402,6 +433,36 @@ class TestClipQK:
 
 @pytest.mark.parametrize("output_gate", [False, True])
 class TestSelfAttention:
+
+    @staticmethod
+    @torch.no_grad()
+    def _apply_qk_clip_and_copy_back(attention):
+        """Exercise master clipping, model copy-back, and statistics cleanup."""
+        params = list(attention.parameters())
+        originals = [param.detach().clone() for param in params]
+        logits = attention.core_attention.current_max_attn_logits
+        factors = attention.get_qk_clip_factors()
+        assert attention.core_attention.current_max_attn_logits is logits
+        for param, original in zip(params, originals):
+            torch.testing.assert_close(param, original, rtol=0, atol=0)
+        masters = []
+        for param in params:
+            param.main_param = param.detach().float().clone()
+            masters.append(param.main_param)
+        optimizer = SimpleNamespace(
+            optimizer=SimpleNamespace(param_groups=[{"params": masters}]),
+            _qk_clip_layers=[attention],
+        )
+        expected = {id(param): param.detach().float() * factor for param, factor in factors}
+        apply_qk_clip(optimizer)
+        for param, original in zip(params, originals):
+            torch.testing.assert_close(param, original, rtol=0, atol=0)
+            torch.testing.assert_close(param.main_param, expected.get(id(param), original.float()))
+            param.copy_(param.main_param)
+        assert attention.core_attention.current_max_attn_logits is logits
+        clear_qk_clip(optimizer)
+        assert attention.core_attention.current_max_attn_logits is None
+        assert optimizer._qk_clip_shards == {}
 
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self, output_gate):
@@ -428,7 +489,7 @@ class TestSelfAttention:
         )
 
         with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
-            attention.clip_qk()
+            attention.get_qk_clip_factors()
 
     def test_clip_qk_none_logits_raises_error(self):
         """Test that clip_qk raises ValueError when current_max_attn_logits is None."""
@@ -448,7 +509,7 @@ class TestSelfAttention:
         )
 
         with pytest.raises(ValueError, match="current_max_attn_logits is None"):
-            attention.clip_qk()
+            attention.get_qk_clip_factors()
 
     def test_clip_qk_below_threshold_no_update(self):
         """Test that weights are not updated when max logits are below threshold."""
@@ -476,8 +537,8 @@ class TestSelfAttention:
             [50.0, 60.0, 70.0, 80.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should not be updated
         assert torch.equal(attention.linear_qkv.weight.data, original_weight)
@@ -510,8 +571,8 @@ class TestSelfAttention:
             [150.0, 160.0, 170.0, 180.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should be updated
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
@@ -545,8 +606,8 @@ class TestSelfAttention:
             [150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should be updated
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
@@ -579,8 +640,8 @@ class TestSelfAttention:
             [80.0, 150.0, 90.0, 200.0], device='cuda'
         )
 
-        # Call clip_qk
-        attention.clip_qk()
+        # Clip masters and copy back to model weights
+        self._apply_qk_clip_and_copy_back(attention)
 
         # Weights should be updated since at least one head exceeds threshold
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)

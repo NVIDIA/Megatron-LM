@@ -2046,7 +2046,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 # autograd graph, otherwise accumulating it into
                 # current_max_attn_logits keeps every batch's attention forward
                 # graph alive and leaks memory (most visibly when only
-                # log_max_attention_logit is set and clip_qk() never resets it).
+                # log_max_attention_logit is set and clipping never resets it).
                 batch_max_attention_logits = batch_max_attention_logits.detach()
 
                 # Update QK_Clip balancing eta
