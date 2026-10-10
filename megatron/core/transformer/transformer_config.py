@@ -1067,6 +1067,11 @@ class TransformerConfig(ModelParallelConfig):
     Generally unnecessary with latent fan-in-aware initialization. Requires a positive
     ``moe_latent_size`` and MoE experts. Disabled by default."""
 
+    moe_latent_sigmoid_input_scale: float = 1.0
+    """Scale only the sigmoid argument of routed latent experts' SwiGLU or SiTU gates.
+    Independent of both latent projection gains; leaves linear factors and tanh inputs unchanged.
+    A non-unit value requires latent MoE with gated SiLU. Must be finite. Defaults to 1.0."""
+
     moe_use_norm_before_up_proj: bool = False
     """Apply normalization before the latent-to-hidden MoE projection. Requires
     ``moe_latent_size`` to be set."""
@@ -2202,6 +2207,25 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
+
+        if not math.isfinite(self.moe_latent_sigmoid_input_scale):
+            raise ValueError("moe_latent_sigmoid_input_scale must be finite.")
+        if self.moe_latent_sigmoid_input_scale != 1.0:
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "Non-unit moe_latent_sigmoid_input_scale is not supported by the TE op fuser; "
+                    "disable use_transformer_engine_op_fuser and use bias_activation_fusion."
+                )
+            if self.moe_latent_size is None or self.moe_latent_size <= 0:
+                raise ValueError(
+                    "moe_latent_sigmoid_input_scale requires a positive moe_latent_size."
+                )
+            if self.num_moe_experts is None:
+                raise ValueError("moe_latent_sigmoid_input_scale requires num_moe_experts.")
+            if not self.gated_linear_unit or self.activation_func != F.silu:
+                raise ValueError(
+                    "moe_latent_sigmoid_input_scale requires gated SiLU (SwiGLU/SiTU)."
+                )
 
         if self.moe_latent_projection_scaling or self.moe_latent_up_projection_scaling:
             if self.moe_latent_size is None or self.moe_latent_size <= 0:

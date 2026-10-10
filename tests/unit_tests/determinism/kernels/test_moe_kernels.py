@@ -639,6 +639,25 @@ class TestMoEModules:
             pytest.param(
                 "allgather",
                 1,
+                {"moe_latent_size": 512, "moe_latent_sigmoid_input_scale": 1.7},
+                id="allgather-latent-sigmoid-scale",
+            ),
+            pytest.param(
+                "alltoall",
+                1,
+                {
+                    "moe_latent_size": 512,
+                    "moe_latent_sigmoid_input_scale": 1.7,
+                    "activation_func_tanh_clamp_scale": 5.0,
+                    "activation_func_tanh_clamp_scale_linear": 3.0,
+                    "moe_latent_projection_scaling": True,
+                    "moe_latent_up_projection_scaling": True,
+                },
+                id="alltoall-latent-situ-sigmoid-scale-both-gains",
+            ),
+            pytest.param(
+                "allgather",
+                1,
                 {"moe_latent_size": 512, "moe_latent_projection_scaling": True},
                 id="allgather-latent-down-gain",
             ),

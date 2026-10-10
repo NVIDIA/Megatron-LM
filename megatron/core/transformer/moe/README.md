@@ -275,7 +275,7 @@ After establishing a working parallel configuration, profile your training to id
 
 ## Feature Documentation
 
-### Latent MoE Projection Scaling
+### Latent MoE Projection and Sigmoid Scaling
 
 Latent MoE projects routed tokens from `hidden_size` to `moe_latent_size` before expert
 dispatch and projects the combined expert output back to `hidden_size`. Shared experts
@@ -321,6 +321,34 @@ compensate for a smaller latent dimension. Neither end-to-end variance preservat
 nor a training-quality improvement is assumed. Compare down/up scaling independently
 with the same initialization, both with and without `--moe-use-norm-before-up-proj`,
 and measure activation RMS, gradients, loss, and throughput.
+
+The independent `--moe-latent-sigmoid-input-scale KAPPA` option defaults to `1.0`.
+It changes only routed latent experts' sigmoid argument:
+
+```text
+SwiGLU(gate, linear) = gate * sigmoid(kappa * gate) * linear
+SiTU(gate, linear) = s * tanh(gate / s) * sigmoid(kappa * gate) * linear
+```
+
+Both projection gains can remain disabled, or be enabled independently of `kappa`.
+The gate's multiplicative factor and the linear branch retain their original inputs;
+SiTU tanh arguments and any linear-branch tanh clamp stay unchanged. Dense/shared
+experts and routing are unaffected.
+For example, `--moe-latent-size 3584 --moe-latent-sigmoid-input-scale 1.41421356237`
+adjusts sigmoid sensitivity without enabling either projection gain. The scale must
+be finite; non-unit values require latent MoE with gated SiLU. Reuse the same scale
+when loading a checkpoint to reproduce its computation.
+
+The fused custom backward includes the `kappa` chain-rule factor and uses the same
+sigmoid scale for the router-probability gradient in weighted fusions. TE native
+activations fall back to the standard activation path for non-unit scales. The TE op fuser cannot express this
+option; disable `--use-transformer-engine-op-fuser` and use `--bias-activation-fusion`
+for the custom fused activation instead.
+Inference-optimized MoE kernels reject non-unit scales; use standard grouped or
+sequential experts instead. CPU reference comparisons verify the activation math;
+GPU compiler replay, distributed training, and quality ablations remain separate
+validation. Compare sigmoid scaling and projection gains independently, and record
+both activation saturation and routed-branch RMS alongside loss.
 
 ### Router and Load Balancing
 

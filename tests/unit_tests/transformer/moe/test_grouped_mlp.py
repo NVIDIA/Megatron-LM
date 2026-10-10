@@ -768,6 +768,7 @@ def _make_fused_impl_support_module(
         use_fused_weighted_squared_relu=use_fused_weighted_squared_relu,
         moe_apply_probs_on_input=False,
     )
+    module.sigmoid_input_scale = 1.0
     module.activation_func = object()
     module.tp_group = SimpleNamespace(size=lambda: 1)
     module.offload_expert_fc1 = False
@@ -2061,3 +2062,16 @@ def test_moe_act_recompute_paths_are_numerically_equivalent(monkeypatch):
         nograd_output, _, _ = _run_moe_act_forward(monkeypatch)
 
     torch.testing.assert_close(grad_output.detach(), nograd_output)
+
+
+def test_te_op_fuser_rejects_nonunit_sigmoid_scale(monkeypatch):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
+    )
+    module.sigmoid_input_scale = 1.7
+    assert module._is_fused_impl_supported() is False
