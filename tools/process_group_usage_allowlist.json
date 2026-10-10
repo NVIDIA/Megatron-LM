@@ -152,23 +152,9 @@
       "hybrid_context_parallel_forward_backward:shim:use_mpu_process_groups"
     ],
     "megatron/core/pipeline_parallel/schedules.py": [
-      "_build_default_pg_collection:accessor:parallel_state.get_context_parallel_group",
-      "_build_default_pg_collection:accessor:parallel_state.get_data_parallel_group",
-      "_build_default_pg_collection:accessor:parallel_state.get_data_parallel_group",
-      "_build_default_pg_collection:accessor:parallel_state.get_data_parallel_group",
-      "_build_default_pg_collection:accessor:parallel_state.get_embedding_group",
-      "_build_default_pg_collection:accessor:parallel_state.get_expert_gtp_weight_remat_group",
-      "_build_default_pg_collection:accessor:parallel_state.get_gtp_weight_remat_group",
-      "_build_default_pg_collection:accessor:parallel_state.get_pipeline_model_parallel_group",
-      "_build_default_pg_collection:accessor:parallel_state.get_position_embedding_group",
-      "_build_default_pg_collection:accessor:parallel_state.get_tensor_and_data_parallel_group",
-      "_build_default_pg_collection:accessor:parallel_state.get_tensor_model_parallel_group",
-      "forward_backward_pipelining_with_interleaving:accessor:parallel_state.get_pipeline_model_parallel_group",
-      "forward_backward_pipelining_without_interleaving:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "_build_default_pg_collection:guarded:resolve_process_groups",
       "forward_step_calc_loss:accessor:parallel_state.get_context_parallel_world_size",
-      "get_forward_backward_func:accessor:parallel_state.get_pipeline_model_parallel_world_size",
-      "get_pp_rank_microbatches:accessor:parallel_state.get_pipeline_model_parallel_rank",
-      "get_pp_rank_microbatches:accessor:parallel_state.get_pipeline_model_parallel_world_size"
+      "get_forward_backward_func:accessor:parallel_state.get_pipeline_model_parallel_world_size"
     ],
     "megatron/core/resharding/refit.py": [
       "_unwrap_model_cores:accessor:parallel_state.get_data_parallel_group"
@@ -289,5 +275,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 183
+  "total": 169
 }
