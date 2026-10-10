@@ -462,6 +462,18 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
+        # Expert tensor-and-model-parallel (tp_ep) group: the group the inference MoE
+        # dispatchers gather/scatter tokens over. Equals the EP group when ETP == 1.
+        if pg_collection is not None:
+            # getattr: non-MoE callers may build a pg_collection without tp_ep.
+            self.expert_tensor_and_model_parallel_group = getattr(pg_collection, "tp_ep", None)
+        else:
+            # Migration fallback for callers that do not pass a pg_collection; mirrors
+            # the EP fallback above. None (size 1) when MPU is not initialized.
+            self.expert_tensor_and_model_parallel_group = (
+                parallel_state.get_expert_tensor_and_model_parallel_group(check_initialized=False)
+            )
+
         # Optional CPU-side collective for EP batch-dimension sync. Populated by
         # the engine via set_ep_zmq_communicator() when available. When set,
         # match_graph_config() uses this to perform the MAX reduction on the
@@ -798,8 +810,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         # are we using the inference_optimized nvls ep dispatcher for MoEs?
+        # The NVLS dispatcher gathers over the tp_ep group, so it is also active
+        # for EP == 1 with expert tensor parallelism (ETP > 1).
         self._nvls_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
+            get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
         )
 
@@ -866,7 +880,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
-                ep_group=self.expert_model_parallel_group,
+                tp_ep_group=self.expert_tensor_and_model_parallel_group,
             )
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
@@ -878,16 +892,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
         ):
             ep_size = get_pg_size(self.expert_model_parallel_group)
+            tp_ep_size = get_pg_size(self.expert_tensor_and_model_parallel_group)
+            etp_size = max(1, tp_ep_size // ep_size)
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             # Worst-case rows entering the MoE: the fixed NVLS AGV buffer height
-            # (per-rank worst case * ep_size); max_tokens covers the EP=1 / NCCL paths.
+            # (per-rank worst case * tp_ep_size); max_tokens covers the EP=1 / NCCL paths.
             moe_max_rows = max(
-                self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * ep_size
+                self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * tp_ep_size
             )
             VllmFusedMoeBuffers.allocate_buffers(
                 max_tokens=moe_max_rows,
                 topk=model_config.moe_router_topk,
+                # Expert weights are sharded along the FFN dim across expert-TP ranks.
                 fc1_output_size=model_config.moe_ffn_hidden_size
+                // etp_size
                 * (2 if model_config.gated_linear_unit else 1),
                 hidden_size=moe_hidden_size,
                 num_local_experts=model_config.num_moe_experts // ep_size,

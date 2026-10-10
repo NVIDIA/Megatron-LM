@@ -240,7 +240,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.resume_request_ids = None
         self.use_coordinator = False
 
-        self.ep_world_size = 1
+        self.tp_ep_world_size = 1
         self.disable_ep_consensus = False
         self.ep_consensus_interval = 1  # TODO: add tests for interval > 1 (e.g. verify pausing is delayed by at most N steps)
 
