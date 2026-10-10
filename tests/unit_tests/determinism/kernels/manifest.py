@@ -750,6 +750,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "TensorParallelMuon duplicated mode. The CI container's emerging-optimizers runs the "
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
     ),
+    KernelEntry(
+        name="csa_deterministic_attention_and_indexer",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_fused_sparse_attention.py",
+        ),
+        kind="dispatch",
+        notes="Stable TopK and fixed-order sparse indexer dK/dW, with batch-local reference/replay; "
+        "real non-CP attention replay exercises deterministic cuDNN backward independently. "
+        "Deterministic learned-indexer SBHD forwards preserve key order and output bits across "
+        "no-grad and training dispatch, including zero and positive sparse indexer loss.",
+    ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
         name="csa_teacher_lse",
