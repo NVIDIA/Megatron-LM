@@ -30,6 +30,11 @@ on:
         required: false
         default: nvidia-ci-aws-gpu-x8
         type: string
+      selected-runner-gcp-h100:
+        description: Runner label for an additional Singapore GCP H100 build
+        required: false
+        default: nvidia-ci-gcp-cpu-h100
+        type: string
       selected-runner-gb200:
         description: Runner label for the GB200 build
         required: false
@@ -41,6 +46,22 @@ on:
         # Keep registry defaults aligned with the image registries in cicd-main.yml.
         default: 766267172432.dkr.ecr.us-east-1.amazonaws.com
         type: string
+      registry-gcp-h100:
+        description: Registry for H100 images and caches built on Singapore GCP runners
+        required: false
+        # GAR paths include the repository unlike ECR registry roots.
+        default: asia-southeast1-docker.pkg.dev/nv-nemoautomati-20260505210812/megatron-lm
+        type: string
+      use-gcp-h100:
+        description: Build and publish the H100 image on the Singapore GCP CPU runner
+        required: false
+        default: false
+        type: boolean
+      include-gcp-h100:
+        description: Also build and publish the Singapore GCP H100 image alongside the selected H100 build
+        required: false
+        default: false
+        type: boolean
       registry-gb200:
         description: Registry for GB200 images and caches
         required: false
@@ -83,19 +104,35 @@ jobs:
           IS_MAINTAINER: ${{ inputs.is-maintainer }}
           ENABLE_GB_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           SELECTED_RUNNER: ${{ inputs.selected-runner }}
+          SELECTED_RUNNER_GCP_H100: ${{ inputs.selected-runner-gcp-h100 }}
           SELECTED_RUNNER_GB_GPU: ${{ inputs.selected-runner-gb200 }}
           REGISTRY_AWS: ${{ inputs.registry-aws }}
+          REGISTRY_GCP_H100: ${{ inputs.registry-gcp-h100 }}
+          USE_GCP_H100: ${{ inputs.use-gcp-h100 }}
+          INCLUDE_GCP_H100: ${{ inputs.include-gcp-h100 }}
           REGISTRY_GB_GPU: ${{ inputs.registry-gb200 }}
         run: |
-          AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
-            '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
+          if [ "$IS_MAINTAINER" = "true" ] && [ "$USE_GCP_H100" = "true" ]; then
+            GCP_H100=$(jq -nc --arg registry "$REGISTRY_GCP_H100" --arg runner "$SELECTED_RUNNER" \
+              '{"cloud": "gcp-h100", "registry": $registry, "runner": $runner}')
+            H100_MATRIX=$(jq -nc --argjson gcp "$GCP_H100" '[$gcp]')
+          else
+            AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
+              '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
+            H100_MATRIX=$(jq -nc --argjson aws "$AWS_H100" '[$aws]')
+            if [ "$IS_MAINTAINER" = "true" ] && [ "$INCLUDE_GCP_H100" = "true" ]; then
+              GCP_H100=$(jq -nc --arg registry "$REGISTRY_GCP_H100" --arg runner "$SELECTED_RUNNER_GCP_H100" \
+                '{"cloud": "gcp-h100", "registry": $registry, "runner": $runner}')
+              H100_MATRIX=$(jq -nc --argjson h100 "$H100_MATRIX" --argjson gcp "$GCP_H100" '($h100 + [$gcp])')
+            fi
+          fi
           if [ "$IS_MAINTAINER" = "true" ] && [ "$ENABLE_GB_TESTING" = "true" ]; then
             GB_GPU=$(jq -nc --arg registry "$REGISTRY_GB_GPU" --arg runner "$SELECTED_RUNNER_GB_GPU" \
               '{"cloud": "gb-gpu", "registry": $registry, "runner": $runner}')
-            MATRIX=$(jq -nc --argjson aws "$AWS_H100" --argjson gb_gpu "$GB_GPU" \
-              '{"include": [$aws, $gb_gpu]}')
+            MATRIX=$(jq -nc --argjson h100 "$H100_MATRIX" --argjson gb_gpu "$GB_GPU" \
+              '{"include": ($h100 + [$gb_gpu])}')
           else
-            MATRIX=$(jq -nc --argjson aws "$AWS_H100" '{"include": [$aws]}')
+            MATRIX=$(jq -nc --argjson h100 "$H100_MATRIX" '{"include": $h100}')
           fi
           echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
 
@@ -106,8 +143,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
     runs-on: >-
-      ${{ inputs.is-maintainer && matrix.cloud == 'aws-h100' && 'nvidia-ci-aws-cpu'
-          || inputs.is-maintainer && matrix.cloud == 'gb-gpu' && 'nvidia-ci-aws-cpu-arm64'
+      ${{ inputs.is-maintainer && matrix.cloud == 'gb-gpu' && 'nvidia-ci-aws-cpu-arm64'
           || matrix.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     env:
@@ -314,8 +350,19 @@ jobs:
           echo "target-build-hash=$TARGET_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
           echo "pr-build-hash=$PR_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Configure GAR Docker authentication
+        if: inputs.is-maintainer && matrix.cloud == 'gcp-h100' && startsWith(matrix.registry, 'asia-southeast1-docker.pkg.dev/')
+        shell: bash
+        env:
+          REGISTRY: ${{ matrix.registry }}
+        run: |
+          GAR_HOST="${REGISTRY%%/*}"
+          command -v docker-credential-gcr
+          docker-credential-gcr configure-docker --registries="$GAR_HOST"
+          docker-credential-gcr get <<< "https://$GAR_HOST" >/dev/null
+
       - name: Login to ECR
-        if: inputs.is-maintainer && (matrix.cloud == 'aws-h100' || matrix.cloud == 'gb-gpu')
+        if: inputs.is-maintainer && (matrix.cloud == 'gb-gpu' || (matrix.cloud == 'aws-h100' && !startsWith(matrix.registry, 'asia-southeast1-docker.pkg.dev/')))
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
         env:
           AWS_REGION: ${{ matrix.cloud == 'gb-gpu' && 'us-east-2' || 'us-east-1' }}
