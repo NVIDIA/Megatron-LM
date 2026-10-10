@@ -5,7 +5,10 @@ from megatron.core.extensions.transformer_engine import TEDotProductAttention, T
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_stack_spec,
+    hybrid_stack_spec_no_moe_grouped_gemm,
+)
 from megatron.core.post_training.modelopt.layers import Linear, Norm
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -37,29 +40,6 @@ from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
-)
-
-# Identical to `hybrid_stack_spec` except the MoE layer uses SequentialMLP (per-expert
-# linears) instead of TEGroupedMLP, so ModelOpt flows that need to operate on individual
-# experts (e.g. pruning) can dispatch on each linear.
-hybrid_stack_spec_no_moe_grouped_gemm = ModuleSpec(
-    module=hybrid_stack_spec.module,
-    submodules=HybridStackSubmodules(
-        mamba_layer=hybrid_stack_spec.submodules.mamba_layer,
-        gdn_layer=hybrid_stack_spec.submodules.gdn_layer,
-        attention_layer=hybrid_stack_spec.submodules.attention_layer,
-        dsa_layer=hybrid_stack_spec.submodules.dsa_layer,
-        mlp_layer=hybrid_stack_spec.submodules.mlp_layer,
-        moe_layer=ModuleSpec(
-            module=MoETransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm,
-                mlp=get_moe_module_spec(use_te=True, num_experts=8, moe_grouped_gemm=False),
-                mlp_bda=get_bias_dropout_add,
-            ),
-        ),
-        mtp_block_spec=hybrid_stack_spec.submodules.mtp_block_spec,
-    ),
 )
 
 
