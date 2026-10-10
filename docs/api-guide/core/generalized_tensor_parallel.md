@@ -363,8 +363,8 @@ GTP backward reduce-scatter overlap across local CUDA-graph boundaries is enable
 |---|---|
 | **Use when** | wgrads are BF16 (the default) **and** the gtp_remat axis is ≥ 4 |
 | **Skip when** | `--accumulate-allreduce-grads-in-fp32` is set, which already makes the wire and the accumulation FP32; or the axis is ≤ 2, where it is auto-bypassed |
-| **Gain** | the `N-1` intermediate roundings disappear, leaving only the final downcast — so the error stops growing with the axis, and the benefit grows with it |
-| **Cost** | one unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter, plus a local FP32 sum and downcast at `wait()` time |
+| **Gain** | the `N-1` intermediate roundings disappear; the output stays FP32 until accumulation into `main_grad`, which rounds once when `main_grad` is BF16 |
+| **Cost** | one unsharded-wgrad-sized scratch buffer and one FP32 output shard per in-flight reduce-scatter, plus a local FP32 sum at `wait()` time |
 
 Implemented in `megatron/core/distributed/reduce_scatter_with_fp32_accumulation.py`. This is the
 gtp_remat-axis analogue of `--ddp-reduce-scatter-with-fp32-accumulation` and **independent of
