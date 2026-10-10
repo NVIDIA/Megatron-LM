@@ -1273,8 +1273,11 @@ class MLASelfAttention(MultiLatentAttention):
         if not self.config.qk_clip:
             raise ValueError("qk_clip option needs to be enabled")
 
-        if self.core_attention.current_max_attn_logits is None:
-            raise ValueError("current_max_attn_logits is None")
+        if (
+            self.core_attention.current_max_attn_logits is None
+            or torch.isneginf(self.core_attention.current_max_attn_logits).all()
+        ):
+            raise ValueError("No attention logits have been accumulated")
 
         # Check if we're in absorption mode
         if self.cache_mla_latents and not hasattr(self, 'linear_kv_up_proj'):
@@ -1327,8 +1330,7 @@ class MLASelfAttention(MultiLatentAttention):
                 )
             kv_proj_weight.data.copy_(self._clip_kv_proj_weight(kv_proj_weight.data))
 
-        # reset current_max_attn_logits
-        self.core_attention.current_max_attn_logits = None
+        self.core_attention.current_max_attn_logits.fill_(float("-inf"))
 
     def _clip_q_proj_weight(self, weight):
         """Clip q_proj_weight"""
