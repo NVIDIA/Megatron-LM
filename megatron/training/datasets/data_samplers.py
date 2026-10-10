@@ -45,6 +45,9 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     is_eval = split in (Split.valid, Split.test)
     micro_batch_size = getattr(args, 'eval_micro_batch_size', args.micro_batch_size) if is_eval else args.micro_batch_size
     global_batch_size = getattr(args, 'eval_global_batch_size', args.global_batch_size) if is_eval else args.global_batch_size
+    if args.dataloader_type == 'cyclic' and not is_eval and not args.data_sharding:
+        from megatron.core.num_microbatches_calculator import get_current_running_global_batch_size
+        global_batch_size = get_current_running_global_batch_size()
 
     if split == Split.valid and args.full_validation:
         batch_sampler = MegatronFullValidationSampler(
@@ -75,6 +78,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=micro_batch_size,
+            global_batch_size=global_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
             data_sharding=args.data_sharding,
@@ -349,6 +353,7 @@ class MegatronPretrainingRandomSampler:
         data_parallel_rank,
         data_parallel_size,
         data_sharding,
+        global_batch_size=None,
     ):
         # Keep a copy of input params for later use.
         self.dataset = dataset
@@ -359,6 +364,7 @@ class MegatronPretrainingRandomSampler:
         self.data_parallel_size = data_parallel_size
         self.data_sharding = data_sharding
         self.micro_batch_times_data_parallel_size = self.micro_batch_size * data_parallel_size
+        self.global_batch_size = global_batch_size or self.micro_batch_times_data_parallel_size
         self.last_batch_size = self.total_samples % self.micro_batch_times_data_parallel_size
 
         # Sanity checks.
@@ -375,6 +381,10 @@ class MegatronPretrainingRandomSampler:
         return self.total_samples
 
     def __iter__(self):
+        if not self.data_sharding:
+            yield from self._iter_without_data_sharding()
+            return
+
         active_total_samples = self.total_samples - self.last_batch_size
         self.epoch = self.consumed_samples // active_total_samples
         current_epoch_samples = self.consumed_samples % active_total_samples
@@ -395,15 +405,6 @@ class MegatronPretrainingRandomSampler:
             g.manual_seed(self.epoch)
             random_idx = torch.randperm(bucket_size, generator=g).tolist()
             idx_range = [start_idx + x for x in random_idx[bucket_offset:]]
-        else:
-            full_bucket_size = (self.total_samples // self.micro_batch_size) * self.micro_batch_size
-            full_bucket_offset = current_epoch_samples
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            idx_range_total = torch.randperm(full_bucket_size, generator=g).tolist()
-            idx_range_active = idx_range_total[full_bucket_offset:]
-            idx_range = idx_range_active[self.data_parallel_rank :: self.data_parallel_size]
-
         batch = []
         # Last batch if not complete will be dropped.
         for idx in idx_range:
@@ -412,3 +413,44 @@ class MegatronPretrainingRandomSampler:
                 self.consumed_samples += self.micro_batch_times_data_parallel_size
                 yield batch
                 batch = []
+
+    def _iter_without_data_sharding(self):
+        """Yield a DP-independent permutation, including samples across epoch tails."""
+        epoch_size = (self.total_samples // self.micro_batch_size) * self.micro_batch_size
+        self.epoch = self.consumed_samples // epoch_size
+        if isinstance(self.dataset, RandomSeedDataset):
+            self.dataset.set_epoch(self.epoch)
+        current_epoch_samples = self.consumed_samples % epoch_size
+        remaining = epoch_size - current_epoch_samples
+        num_micro_batches = self.global_batch_size // self.micro_batch_times_data_parallel_size
+        num_global_batches = (remaining + self.global_batch_size - 1) // self.global_batch_size
+
+        def samples():
+            position = self.consumed_samples
+            while True:
+                epoch = position // epoch_size
+                offset = position % epoch_size
+                generator = torch.Generator()
+                generator.manual_seed(epoch)
+                permutation = torch.randperm(epoch_size, generator=generator).tolist()
+                for index in permutation[offset:]:
+                    yield epoch, index
+                position = (epoch + 1) * epoch_size
+
+        sample_iterator = samples()
+        for _ in range(num_global_batches):
+            global_batch = [next(sample_iterator) for _ in range(self.global_batch_size)]
+            for micro_batch_idx in range(num_micro_batches):
+                start = self.data_parallel_rank * self.micro_batch_size
+                start += micro_batch_idx * self.micro_batch_size * self.data_parallel_size
+                micro_batch = global_batch[start : start + self.micro_batch_size]
+                batch_epochs = {epoch for epoch, _ in micro_batch}
+                if isinstance(self.dataset, RandomSeedDataset):
+                    # A global batch can straddle an epoch boundary, but each
+                    # micro-batch remains within one epoch because epoch_size
+                    # is a multiple of micro_batch_size.
+                    assert len(batch_epochs) == 1
+                    self.epoch = batch_epochs.pop()
+                    self.dataset.set_epoch(self.epoch)
+                self.consumed_samples += self.micro_batch_times_data_parallel_size
+                yield [index for _, index in micro_batch]
