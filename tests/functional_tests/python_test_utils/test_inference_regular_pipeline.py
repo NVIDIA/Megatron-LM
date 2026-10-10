@@ -35,8 +35,11 @@ def _median_as_float(value):
         values = [float(v) for v in value]
         if len(values) > 1:
             values = values[1:]
+        assert all(math.isfinite(v) for v in values), "Metric contains non-finite values."
         return float(median(values))
-    return float(value)
+    value = float(value)
+    assert math.isfinite(value), "Metric contains non-finite values."
+    return value
 
 
 def _bytes_to_gib(num_bytes: float) -> float:
