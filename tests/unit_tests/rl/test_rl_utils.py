@@ -20,7 +20,10 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.enums import ModelType
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
@@ -42,6 +45,7 @@ from megatron.core.transformer.cuda_graphs import (
 )
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_pg_size
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
@@ -824,6 +828,85 @@ class TestRLUtils:
             # Non-last stages return the model output as is: vocab-sharded unless gathered.
             vocab = VOCAB if batch_invariant else VOCAB // get_pg_size(model.pg_collection.tp)
             assert logprobs.shape == (BATCH, SEQ, vocab)
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((tp, 1), id=f"tp{tp}-pp1") for tp in [1, 2, 4] if tp <= Utils.world_size],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_get_logprobs_mtp(self, initialize_model_parallel, monkeypatch):
+        """An MTP model trained through get_logprobs must give the same MTP loss, acceptance
+        counts and MTP-layer gradients whether the main logits stay vocab-parallel (the default
+        path) or are gathered (the --batch-invariant-mode fallback): process_mtp_loss keeps its
+        own logits vocab-sharded either way, so the vocab-parallel cross-entropy never sees a
+        TP-times larger vocabulary (loss +ln(TP), wrong gradients). RL derives the MTP labels
+        from the tokens, so the metrics must cover every position but the two rolled off the
+        end of the sequence."""
+        _, _, tp, _ = initialize_model_parallel
+        self.create_test_args(tensor_model_parallel_size=tp, bf16=True)
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            tensor_model_parallel_size=tp,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+            # Both passes run in training mode (process_mtp_loss records its metrics and
+            # attaches the loss only then), so they must see identical activations.
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        torch.manual_seed(0)  # Identical CPU-initialized weights (and tokens) on every rank.
+        gpt_model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            mtp_block_spec=get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=True),
+            vocab_size=VOCAB,
+            max_sequence_length=32,
+        ).cuda()
+        # Float16Module takes get_logprobs' fp32_output argument, as in RL training.
+        model = Float16Module(config, gpt_model)
+        mtp_params = {name: p for name, p in model.named_parameters() if "mtp.layers." in name}
+        assert mtp_params
+
+        # batch 1: get_logprobs' default PackedSeqParams describe a single thd sequence.
+        batch_size, seq_length = 1, 32
+        tokens = torch.randint(0, VOCAB, (batch_size, seq_length), dtype=torch.long).cuda()
+        position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
+
+        results = {}
+        for batch_invariant in (False, True):
+            monkeypatch.setattr(
+                rl_utils, "is_batch_invariant_mode_enabled", lambda flag=batch_invariant: flag
+            )
+            model.zero_grad(set_to_none=True)
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            logprobs = rl_utils.get_logprobs(model, tokens, position_ids=position_ids)
+            logprobs.sum().backward()
+            tracker = MTPLossLoggingHelper.tracker
+            assert all(p.grad is not None for p in mtp_params.values())
+            results[batch_invariant] = (
+                logprobs.detach().float(),
+                {k: tracker[k].clone() for k in ("loss_values", "correct_values", "total_values")},
+                {name: p.grad.clone() for name, p in mtp_params.items()},
+            )
+
+        vp_logprobs, vp_metrics, vp_grads = results[False]
+        gathered_logprobs, gathered_metrics, gathered_grads = results[True]
+        assert vp_logprobs.shape == (batch_size, seq_length - 1)
+        # bf16 logits: the same tolerance as test_vocab_parallel_selective_log_softmax.
+        torch.testing.assert_close(vp_logprobs, gathered_logprobs, atol=5e-2, rtol=5e-2)
+        # One MTP layer: the labels roll once (derived from the tokens), the layer rolls again.
+        expected_total = torch.full_like(vp_metrics["total_values"], batch_size * (seq_length - 2))
+        torch.testing.assert_close(vp_metrics["total_values"], expected_total)
+        for key in ("loss_values", "correct_values", "total_values"):
+            torch.testing.assert_close(vp_metrics[key], gathered_metrics[key], atol=1e-3, rtol=1e-3)
+        # MTP-layer parameters get their gradient from the MTP loss alone.
+        for name, grad in vp_grads.items():
+            torch.testing.assert_close(grad, gathered_grads[name], atol=1e-5, rtol=2e-2)
 
     @pytest.mark.parametrize("dtype, chunk_tokens, sliced", _VP_CASES)
     @pytest.mark.parametrize("tp_world", [1, 2])
