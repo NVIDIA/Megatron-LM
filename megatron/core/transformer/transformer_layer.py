@@ -27,12 +27,20 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    require_process_groups,
+    resolve_process_groups,
+)
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.module import (
+    GraphableMegatronModule,
+    TwoStageAttentionLayer,
+    _require_pipeline_group,
+)
 from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     checkpoint_residual_read,
@@ -57,6 +65,34 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
+
+# The fields of a ProcessGroupCollection that TransformerLayer and the modules built from its
+# submodule specs read. TransformerBlock hands its collection to its layers, so it reads the same
+# fields. When the caller omits the collection, both build only these from the global groups.
+_LAYER_PROCESS_GROUPS = (
+    # TransformerLayer and TransformerBlock: tensor parallelism and the pipeline stage.
+    'tp',
+    'pp',
+    # Attention: context parallelism, hierarchical CP for a2a+p2p, and dp for config.test_mode.
+    'cp',
+    'hcp',
+    'dp',
+    # MoE router, token dispatcher and experts.
+    'tp_cp',
+    'tp_dp_cp',
+    'ep',
+    'expt_tp',
+    'tp_ep',
+    'expt_dp',
+    'expt_dp_gtp_remat',
+    # Linear layers: the GTP weight-rematerialization groups, and dp_cp, over which checkpointing
+    # elects the writer of a GTP shard. dp_cp_gtp_remat accompanies dp_cp: code that prefers the
+    # GTP-inclusive group uses dp_cp only when dp_cp_gtp_remat is unset.
+    'gtp_remat',
+    'expt_gtp_remat',
+    'dp_cp',
+    'dp_cp_gtp_remat',
+)
 
 
 def _get_offloading_interface():
@@ -349,6 +385,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     ):
         """
         Args:
+            pg_collection (ProcessGroupCollection | None): process groups of the model that this
+                layer belongs to, passed on to its attention and MLP. It must set ``tp``. With
+                ``config.pipeline_model_parallel_size > 1`` it must also set ``pp`` to the
+                pipeline-parallel group of this rank; without pipeline parallelism ``pp`` may
+                be unset or None. Omitting the collection falls back to the global groups in
+                ``parallel_state`` with a ``ProcessGroupFallbackWarning``; the fallback is
+                deprecated.
             name (str | None): module instance name passed top-down from its paranet module
         """
         self.submodules_config = submodules
@@ -369,9 +412,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            # Build every field that this layer's modules read, not only the ones checked below.
+            pg_collection = resolve_process_groups(
+                None,
+                owner=type(self).__name__,
+                required=_LAYER_PROCESS_GROUPS,
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
+        (self.tp_group,) = require_process_groups(pg_collection, ('tp',), owner=type(self).__name__)
+        pp_group = _require_pipeline_group(pg_collection, config, type(self).__name__)
         self.pg_collection = pg_collection
-        self.tp_group = pg_collection.tp
 
         # MTP inner layers use their own layer numbering (starting from 1 within each MTP depth),
         # so they should NOT add the decoder layer offset. The router.py handles MTP layer
@@ -384,7 +435,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             self.layer_number = layer_number
         else:
             self.layer_number = layer_number + get_transformer_layer_offset(
-                self.config, vp_stage, get_pg_rank(pg_collection.pp)
+                self.config, vp_stage, get_pg_rank(pp_group)
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
