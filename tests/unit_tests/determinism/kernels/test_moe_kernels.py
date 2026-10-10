@@ -635,6 +635,33 @@ class TestMoEModules:
         [
             ("allgather", 1, {}),
             ("alltoall", 1, {}),
+            pytest.param("allgather", 1, {"moe_latent_size": 512}, id="allgather-latent-no-gain"),
+            pytest.param(
+                "allgather",
+                1,
+                {"moe_latent_size": 512, "moe_latent_projection_scaling": True},
+                id="allgather-latent-down-gain",
+            ),
+            pytest.param(
+                "alltoall",
+                1,
+                {
+                    "moe_latent_size": 512,
+                    "moe_latent_up_projection_scaling": True,
+                    "moe_use_norm_before_up_proj": True,
+                },
+                id="alltoall-latent-up-gain-norm",
+            ),
+            pytest.param(
+                "alltoall",
+                2,
+                {
+                    "moe_latent_size": 512,
+                    "moe_latent_projection_scaling": True,
+                    "moe_latent_up_projection_scaling": True,
+                },
+                id="alltoall-latent-both-gains-ep2",
+            ),
             pytest.param(
                 "alltoall",
                 1,
@@ -672,6 +699,8 @@ class TestMoEModules:
     def test_moe_layer_replays(self, dispatcher, ep, extra):
         if Utils.world_size % ep != 0 or (ep > 1 and Utils.world_size < ep):
             pytest.skip(f"needs a world size divisible by EP={ep}")
+        if extra.get("moe_latent_size") is not None and not HAVE_TE:
+            pytest.skip("Latent MoE projections require Transformer Engine")
         self._init(ep=ep)
         seeded()
         config = _moe_config(

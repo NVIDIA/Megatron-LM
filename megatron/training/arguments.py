@@ -1967,6 +1967,12 @@ def validate_args(args, defaults={}):
     ), "--moe-use-norm-before-up-proj requires --moe-latent-size to be set."
 
     # MoE latent projections
+    assert (
+        not args.moe_latent_projection_scaling or args.moe_latent_size is not None
+    ), "--moe-latent-projection-scaling requires --moe-latent-size to be set."
+    assert (
+        not args.moe_latent_up_projection_scaling or args.moe_latent_size is not None
+    ), "--moe-latent-up-projection-scaling requires --moe-latent-size to be set."
     if args.moe_latent_size is not None:
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."

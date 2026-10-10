@@ -1055,6 +1055,18 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
+    moe_latent_projection_scaling: bool = False
+    """Scale the hidden-to-latent projection output by sqrt(hidden_size / moe_latent_size).
+    Applies before routed expert dispatch; does not scale the latent-to-hidden projection.
+    Requires a positive ``moe_latent_size`` and MoE experts.
+    Disabled by default to preserve existing checkpoint behavior."""
+
+    moe_latent_up_projection_scaling: bool = False
+    """Independently scale the up-projection output by sqrt(hidden_size / moe_latent_size).
+    Applies after the latent-to-hidden projection and before adding shared experts.
+    Generally unnecessary with latent fan-in-aware initialization. Requires a positive
+    ``moe_latent_size`` and MoE experts. Disabled by default."""
+
     moe_use_norm_before_up_proj: bool = False
     """Apply normalization before the latent-to-hidden MoE projection. Requires
     ``moe_latent_size`` to be set."""
@@ -2190,6 +2202,14 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
+
+        if self.moe_latent_projection_scaling or self.moe_latent_up_projection_scaling:
+            if self.moe_latent_size is None or self.moe_latent_size <= 0:
+                raise ValueError(
+                    "MoE latent projection scaling requires a positive moe_latent_size."
+                )
+            if self.num_moe_experts is None:
+                raise ValueError("MoE latent projection scaling requires num_moe_experts.")
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
