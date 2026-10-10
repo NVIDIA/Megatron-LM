@@ -8,6 +8,7 @@ This script will generate scripts into `$(pwd)/test_cases`.
 """
 
 import pathlib
+import shlex
 from typing import Optional
 
 import click
@@ -102,7 +103,7 @@ def main(
             fh.write(f"export ENABLE_LIGHTWEIGHT_MODE={str(enable_lightweight_mode).lower()}\n")
             fh.write(f"export RECORD_CHECKPOINTS={str(record_checkpoints).lower()}\n")
             fh.write(
-                f'export OUTPUT_PATH={output_path}/runs/$(python3 -c "import uuid; print(uuid.uuid4())")\n'
+                f'export OUTPUT_PATH={shlex.quote(output_path + "/runs")}/$(python3 -c "import uuid; print(uuid.uuid4())")\n'
             )
             fh.write(workload.spec["script"].format(**magic_values))
             fh.write("\n\necho This test wrote results into $OUTPUT_PATH\n")
