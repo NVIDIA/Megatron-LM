@@ -3,6 +3,7 @@
 import inspect
 import logging
 import os
+from contextlib import nullcontext
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
@@ -720,3 +721,75 @@ def test_gpt_builder_forwards_rope_scaling_factor():
         assert (
             call_kwargs.get('rope_scaling_factor') == 32.0
         ), "rope_scaling_factor must be forwarded from args"
+
+
+@pytest.mark.parametrize(
+    ("init_model_with_meta_device", "use_cpu_initialization", "fp8_output_proj"),
+    [
+        pytest.param(False, False, False, id="eager"),
+        pytest.param(True, False, False, id="meta"),
+        pytest.param(True, True, False, id="meta_cpu_init"),
+        pytest.param(
+            True,
+            False,
+            True,
+            id="meta_te_lm_head",
+            marks=pytest.mark.skipif(
+                not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+                reason="MXFP8 output projection requires Blackwell (SM >= 10)",
+            ),
+        ),
+    ],
+)
+def test_tied_embedding_copies_match_across_pipeline_stages(
+    init_model_with_meta_device, use_cpu_initialization, fp8_output_proj
+):
+    """The last-stage copy of a tied embedding equals the first-stage embedding at construction,
+    also when the model is built on the meta device (the TE LM head is a tied copy that is meta)."""
+    Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+    model_parallel_cuda_manual_seed(123)
+    params_dtype = torch.bfloat16 if fp8_output_proj else torch.float32
+    fp8_kwargs = (
+        dict(bf16=True, fp8="hybrid", fp8_recipe="mxfp8", fp8_output_proj=True)
+        if fp8_output_proj
+        else {}
+    )
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=params_dtype,
+        params_dtype=params_dtype,
+        # Distinct init distributions, so the copies cannot already match before the sync.
+        embedding_init_method_std=1.0,
+        init_model_with_meta_device=init_model_with_meta_device,
+        use_cpu_initialization=use_cpu_initialization,
+        **fp8_kwargs,
+    )
+    with torch.device("meta") if init_model_with_meta_device else nullcontext():
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=8,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
+            share_embeddings_and_output_weights=True,
+        )
+
+    # TE layers follow the meta context unless CPU initialization pins them to the host, so the
+    # cases above exercise the production device placement rather than a stand-in.
+    assert any(p.is_meta for p in model.decoder.parameters()) == (
+        init_model_with_meta_device and not use_cpu_initialization
+    )
+    weight = model.shared_embedding_or_output_weight()
+    assert not weight.is_meta
+    embd_group = parallel_state.get_embedding_group()
+    reference = weight.detach().clone()
+    torch.distributed.broadcast(
+        reference, src=torch.distributed.get_process_group_ranks(embd_group)[0], group=embd_group
+    )
+    assert torch.equal(weight, reference)
+
+    Utils.destroy_model_parallel()
