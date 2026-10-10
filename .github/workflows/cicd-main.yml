@@ -1122,8 +1122,8 @@ jobs:
   #   (B) Unit-test gate — unit tests must have succeeded on PR push and
   #       merge_group; scheduled / force-run workflows bypass this for
   #       full nightly coverage.
-  # Downstream integration jobs consume `outputs.should_run` instead of
-  # duplicating this logic four times.
+  # H100 applies its PR-specific functional-test selection after the original
+  # approval + unit gate. GB200 keeps the original approval + unit behavior.
   cicd-integration-gate:
     runs-on: ubuntu-latest
     needs:
@@ -1175,13 +1175,15 @@ jobs:
             should_run=false
           fi
           echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
-          if [ "$approval" = "true" ] && [ "$unit" = "true" ] && [ "$RUN_FUNCTIONAL" = "true" ]; then
+          # Preserve the pre-traffic-split GB200 gate: after approval and
+          # successful unit tests, GB200 functional tests run whenever enabled.
+          if [ "$approval" = "true" ] && [ "$unit" = "true" ]; then
             should_run_gb200=true
           else
             should_run_gb200=false
           fi
           echo "should_run_gb200=$should_run_gb200" >> "$GITHUB_OUTPUT"
-          echo "approval=$approval unit=$unit run_h100_functional=$RUN_H100_FUNCTIONAL run_gb200_functional=$RUN_FUNCTIONAL -> H100=$should_run GB200=$should_run_gb200"
+          echo "approval=$approval unit=$unit run_h100_functional=$RUN_H100_FUNCTIONAL -> H100=$should_run GB200=$should_run_gb200"
           echo "  (wait-in-queue=$WAIT_RESULT, unit-tests=$UNIT_RESULT,"
           echo "   is_merge_group=$IS_MERGE_GROUP, is_ci_workload=$IS_CI_WORKLOAD,"
           echo "   force_run_all=$FORCE_RUN_ALL)"
@@ -1388,6 +1390,7 @@ jobs:
       - is-not-external-contributor
       - cicd-unit-tests-latest
       - cicd-unit-tests-latest-gb200
+      - cicd-integration-gate
       - cicd-integration-tests-latest-h100
       - cicd-integration-tests-latest-gb200
     if: |
@@ -1417,8 +1420,8 @@ jobs:
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
-          RUN_FUNCTIONAL: ${{ needs.configure.outputs.run_functional }}
           RUN_H100_FUNCTIONAL: ${{ needs.configure.outputs.run_h100_functional }}
+          GB200_SHOULD_RUN: ${{ needs.cicd-integration-gate.outputs.should_run_gb200 }}
           ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
           UNIT_GB200_RESULT: ${{ needs.cicd-unit-tests-latest-gb200.result }}
@@ -1459,11 +1462,12 @@ jobs:
             FAILED=true
           fi
 
-          # GB200 tests are required only when explicitly enabled.
+          # GB200 tests are required after the original approval + unit gate
+          # whenever the GB200 lane is enabled for maintainers.
           if [ "$ENABLE_GB200_TESTING" == "true" ]; then
             # GB200 tests may be skipped only for non-maintainer PRs
             # (no GB200 runners available); maintainer runs must always succeed.
-            if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ] && [ "$RUN_FUNCTIONAL" == "true" ]; then
+            if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ] && [ "$GB200_SHOULD_RUN" == "true" ]; then
               echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
               FAILED=true
             fi
