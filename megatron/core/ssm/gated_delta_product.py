@@ -843,7 +843,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         zVKQba, _ = self.in_proj(hidden_states)
 
         # The fused convolution reads weights directly, bypassing Conv1d's DDP
-        # pre-hook. Publish them before CP can slice them in pre_conv_ssm.
+        # pre-hook. Ensure they are ready before direct reads or CP weight slicing.
         ensure_params_ready(self.conv1d.parameters())
 
         if not self.chunkwise_context_parallel:
