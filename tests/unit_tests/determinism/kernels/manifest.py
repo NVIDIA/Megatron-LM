@@ -570,8 +570,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
-        "test_fused_triton_kernels.py) and TE fused RoPE (test_te_wrappers.py). The TE "
-        "FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not replayed.",
+        "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
+        "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
+        "test_te_wrappers.py. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not "
+        "replayed.",
     ),
     KernelEntry(
         name="fp8_fp4_master_weight_casts",
