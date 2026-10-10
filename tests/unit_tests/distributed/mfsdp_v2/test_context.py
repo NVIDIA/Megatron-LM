@@ -307,3 +307,23 @@ def test_combined_scheduler_uses_post_accumulate_grad(distributed_setup):
     # The root has no input gradients; its weights are released by the final callback.
     frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
     assert frozen_weight.untyped_storage().nbytes() == 0
+
+
+def test_finish_grad_sync_restores_parameter_bindings(distributed_setup):
+    """Storage is freed before synchronization restores trainable and frozen bindings."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    trainable = nn.Linear(4, 4, bias=False)
+    frozen = nn.Linear(4, 4, bias=False).requires_grad_(False)
+    model = nn.Sequential(trainable, frozen).to(device)
+    with fully_shard_context(device=device, caller_managed_grad_sync=True) as context:
+        fully_shard(model, mesh, _default_placements())
+    model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
+    for group in model.parameter_groups:
+        for parameter in group.fsdp_parameters:
+            assert model.get_parameter(parameter.fqns[0]) is parameter.unsharded
+            assert parameter.unsharded.untyped_storage().nbytes() == 0
+    context.finish_grad_sync()
+    for group in model.parameter_groups:
+        for parameter in group.fsdp_parameters:
+            assert model.get_parameter(parameter.fqns[0]) is parameter.sharded

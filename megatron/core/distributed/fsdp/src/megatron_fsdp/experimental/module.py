@@ -200,12 +200,15 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Order current-stream consumers after all gradient reductions submitted so far.
+        """Restore sharded parameter bindings and wait on submitted gradient reductions.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
+        for module in self.forward_order:
+            for group in module.parameter_groups:
+                group.reshard_parameters()
         self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def post_backward(self) -> None:
@@ -443,6 +446,10 @@ class FsdpModule:
                         "Transformer Engine does not accumulate their gradients. See "
                         "https://github.com/NVIDIA/TransformerEngine/issues/3437"
                     )
+                if not self.context.caller_managed_grad_sync:
+                    raise ValueError(
+                        "Delayed weight gradients require caller_managed_grad_sync=True."
+                    )
                 parameter_module, _ = get_parameter_owner(module, fsdp_parameter.fqns[0])
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
                     lambda parameter=parameter: post_accumulate_grad_hook_per_parameter(parameter)
@@ -618,26 +625,13 @@ class FsdpModule:
         """Finish this module's backward and release weights when safe."""
         if self.phase is not FsdpModule.Phase.BACKWARD:
             return
-        # TE backward_dw() needs the full parameter binding for .grad, but not its data.
-        if any(
-            getattr(parameter.unsharded, "skip_backward_post_hook", False)
-            for group in self._parameter_groups
-            if group.requires_grad
-            for parameter in group.fsdp_parameters
-        ):
-            self._release_unsharded_storage()
-        else:
-            self.reshard()
+        self._release_unsharded_storage()
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
     def post_accumulate_grad(self) -> None:
         """Pack completed gradients and immediately launch their reductions."""
         self.context.validate_grad_sync()
-        # Restore any full parameter bindings retained for TE backward_dw().
-        if self.phase is FsdpModule.Phase.RESTING:
-            for group in self._parameter_groups:
-                group.reshard_parameters()
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             reduce_scatter_stream = context.reduce_scatter_stream

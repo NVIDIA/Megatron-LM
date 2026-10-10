@@ -299,6 +299,10 @@ def test_delayed_te_weight_gradient(distributed_setup, caller_managed_grad_sync)
     with fully_shard_context(
         device=device, caller_managed_grad_sync=caller_managed_grad_sync
     ) as context:
+        if not caller_managed_grad_sync:
+            with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
+                fully_shard(model, mesh=mesh, placements=_default_placements())
+            return
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     torch.manual_seed(5678 + distributed_setup.rank)
@@ -308,11 +312,6 @@ def test_delayed_te_weight_gradient(distributed_setup, caller_managed_grad_sync)
     assert model.phase is FsdpModule.Phase.RESTING
     assert model.weight.shape == (16, 16)
     assert model.weight.untyped_storage().nbytes() == 0
-
-    if not caller_managed_grad_sync:
-        with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
-            model.backward_dw()
-        return
 
     model.backward_dw()
     context.finish_grad_sync()
