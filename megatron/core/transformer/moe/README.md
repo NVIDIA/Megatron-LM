@@ -288,6 +288,7 @@ Routers determine which expert(s) handle each token. A lightweight MLP scores ev
 | **Top-K Router** | Standard routing with configurable K, uses softmax for probability computation | --moe-router-topk 8 |
 | **Group Top-K Router** | Selects top-K expert groups, then routes experts in selected groups | --moe-router-num-groups 8 --moe-router-group-topk 4 |
 | **Router score function** | Score function to calculate the probs from output logits of router | --moe-router-score-function softmax/sigmoid |
+| **Hash Router** | Selects experts for the leading MoE layers from a token-ID lookup table instead of learned top-K, see [Hash Routing](#hash-routing) | --moe-num-hash-layers 2 |
 
 #### Load Balancing Strategies
 
@@ -299,6 +300,26 @@ Routers determine which expert(s) handle each token. A lightweight MLP scores ev
 | **sinkhorn** | Optimal transport formulation for balancing expert usage | `--moe-router-load-balancing-type sinkhorn` |
 | **aux loss free** | Dynamic bias-based load balancing strategy without auxiliary loss | `--moe-router-enable-expert-bias --moe-router-bias-update-rate 1e-3`|
 | **none** | No load balancing | `--moe-router-load-balancing-type none` |
+
+#### Hash Routing
+
+Hash routing selects experts from a fixed token-ID-to-expert lookup table instead of learned top-K selection. It applies to the first `--moe-num-hash-layers` MoE layers of a `HybridModel`; the remaining MoE layers and all MTP layers keep learned routing.
+
+**Key Features:**
+- **Table-driven selection**: Each hash layer holds a `tid2eid` buffer of shape `[hash_moe_vocab_size, moe_router_topk]` that maps a token ID to its experts. The router still computes gating scores, which weight the outputs of the selected experts.
+- **Layer counting**: `--moe-num-hash-layers` counts MoE positions in `--hybrid-layer-pattern`, not every layer in the pattern.
+- **Vocabulary size**: `hash_moe_vocab_size` has no command-line flag. The training scripts set it from the tokenizer vocabulary size; set it explicitly when constructing `TransformerConfig` directly.
+- **Checkpointing**: `tid2eid` is saved and loaded with distributed checkpoints, including across different TP sizes.
+- **Load balancing**: Auxiliary load-balancing losses and the dynamic expert bias are not applied to hash layers.
+
+**Usage**
+```bash
+--moe-num-hash-layers 2
+```
+
+> **Note**: If no table is loaded from a checkpoint, `tid2eid` is initialized with a placeholder round-robin assignment and a warning is logged. Load a trained table or provide a workload-aware initialization before training.
+
+> **Requirements**: `HybridModel` only; `GPTModel` raises an error because it does not forward token IDs to transformer layers. All hash layers must be in the pipeline or virtual pipeline stage that owns the embedding. Not supported with `--moe-shortcut-connection` or `--overlap-moe-expert-parallel-comm`.
 
 ### Token Dispatching
 
@@ -538,6 +559,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-fusion | Enable router fusion | False |
 | --moe-router-dtype | Router precision: fp32, fp64 | None |
 | --moe-router-padding-for-fp8 | Pad for FP8 alignment | False |
+| --moe-num-hash-layers | Leading MoE layers that use hash routing (`HybridModel` only) | 0 |
 
 ### Loss and Regularization
 | Argument | Description | Default |

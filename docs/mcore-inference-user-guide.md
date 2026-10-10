@@ -606,6 +606,13 @@ coordinator mode* and raises `ValueError` otherwise. The routes are:
 Each route is also served without the `/v1` prefix. Chat completions report
 prefix-cache hits as `usage.prompt_tokens_details.cached_tokens`.
 
+If a client disconnects before a `/v1/completions` or `/v1/chat/completions`
+response finishes, the frontend aborts that call's in-flight requests through
+`InferenceClient.abort_request`, so the engine stops generating for them and
+their batch slots are released. This applies to both streaming and non-streaming
+responses. Requests already submitted are also aborted when a later submission
+in the same non-streaming call fails.
+
 The runnable script is
 [`examples/inference/launch_inference_server.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/launch_inference_server.py),
 with the shell wrapper
