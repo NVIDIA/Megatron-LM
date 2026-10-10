@@ -367,6 +367,15 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
     """Precision used only by the fused compact DSA indexer forward and Top-K."""
 
+    dsa_compact_indexer_workspace_sharing: bool = True
+    """Under CUDA graphs the fused compact DSA indexer keeps a persistent workspace per static
+    geometry (MXFP8 q/k quantization destinations, packed scales, candidate offsets) that has to be
+    prepared outside capture. When True, every CSA layer built from this config shares one such
+    workspace per geometry and balanced-indexer slot instead of owning its own copy: the layers of
+    a graph run serially on one stream and nothing in the workspace outlives the indexer dispatch
+    that fills it, so sharing only removes duplicates (one workspace per layer costs ~7 GiB per
+    rank on DSv4 at 16K tokens). False restores per-layer workspaces."""
+
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
     """Optional fused ordinary-DSA kernel backend. Unsupported layouts use PyTorch fallback."""
 
