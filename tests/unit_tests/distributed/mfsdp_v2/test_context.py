@@ -16,6 +16,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContext
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 
 
 class NestedModel(nn.Module):
@@ -284,3 +285,45 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
             fully_shard(model, mesh=mesh, placements=_default_placements())
 
     assert model.inner.context is first_context
+
+
+def test_combined_scheduler_uses_post_accumulate_grad(distributed_setup):
+    """The manual scheduler reduces gradients and completes deferred frozen units."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    trainable = nn.Linear(4, 4, bias=False)
+    frozen = nn.Linear(4, 4, bias=False).requires_grad_(False)
+    model = nn.Sequential(trainable, frozen).to(device)
+    nn.init.ones_(frozen.weight)
+    with fully_shard_context(device=device, caller_managed_grad_sync=True) as context:
+        fully_shard(trainable, mesh, _default_placements(), register_hooks=False)
+        fully_shard(model, mesh, _default_placements(), register_hooks=False)
+    register_combined_1f1b_hooks(model)
+    model(torch.ones(2, 4, device=device)).sum().backward()
+    context.finish_grad_sync()
+    torch.testing.assert_close(
+        trainable.weight.grad.full_tensor(), torch.full((4, 4), 8.0, device=device)
+    )
+    # The root has no input gradients; its weights are released by the final callback.
+    frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
+    assert frozen_weight.untyped_storage().nbytes() == 0
+
+
+def test_finish_grad_sync_restores_parameter_bindings(distributed_setup):
+    """Storage is freed before synchronization restores trainable and frozen bindings."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    trainable = nn.Linear(4, 4, bias=False)
+    frozen = nn.Linear(4, 4, bias=False).requires_grad_(False)
+    model = nn.Sequential(trainable, frozen).to(device)
+    with fully_shard_context(device=device, caller_managed_grad_sync=True) as context:
+        fully_shard(model, mesh, _default_placements())
+    model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
+    for group in model.parameter_groups:
+        for parameter in group.fsdp_parameters:
+            assert model.get_parameter(parameter.fqns[0]) is parameter.unsharded
+            assert parameter.unsharded.untyped_storage().nbytes() == 0
+    context.finish_grad_sync()
+    for group in model.parameter_groups:
+        for parameter in group.fsdp_parameters:
+            assert model.get_parameter(parameter.fqns[0]) is parameter.sharded

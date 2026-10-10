@@ -2,6 +2,7 @@
 
 """Unit tests for the minimal Megatron-FSDP path."""
 
+import copy
 import logging
 from typing import NamedTuple
 
@@ -274,31 +275,54 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-def test_rejects_delayed_te_weight_gradient(distributed_setup):
-    """Default automatic synchronization rejects weight gradients produced after autograd."""
+@pytest.mark.parametrize("caller_managed_grad_sync", [False, True])
+def test_delayed_te_weight_gradient(distributed_setup, caller_managed_grad_sync):
+    """Delayed wgrad needs the full parameter binding, but not its weight storage."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (world_size,))
-    model = te.Linear(
-        16,
-        16,
-        bias=False,
-        params_dtype=torch.bfloat16,
-        device=device,
-        delay_wgrad_compute=True,
-        fuse_wgrad_accumulation=False,
-    )
-    with fully_shard_context(device=device):
+    torch.manual_seed(1234)
+    model, reference = [
+        te.Linear(
+            16,
+            16,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            device=device,
+            delay_wgrad_compute=True,
+            fuse_wgrad_accumulation=False,
+        )
+        for _ in range(2)
+    ]
+    reference.load_state_dict(model.state_dict())
+    with fully_shard_context(
+        device=device, caller_managed_grad_sync=caller_managed_grad_sync
+    ) as context:
+        if not caller_managed_grad_sync:
+            with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
+                fully_shard(model, mesh=mesh, placements=_default_placements())
+            return
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
+    torch.manual_seed(5678 + distributed_setup.rank)
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
     model(x).float().square().mean().backward()
     assert model.weight.grad is None
-    assert model.phase is FsdpModule.Phase.BACKWARD
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.weight.shape == (16, 16)
+    assert model.weight.untyped_storage().nbytes() == 0
 
-    with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
-        model.backward_dw()
+    model.backward_dw()
+    context.finish_grad_sync()
+    assert isinstance(model.weight, DTensor)
+
+    reference(x.detach()).float().square().mean().backward()
+    reference.backward_dw()
+    dist.all_reduce(reference.weight.grad, op=dist.ReduceOp.AVG)
+    torch.testing.assert_close(
+        model.weight.grad.full_tensor().to(reference.weight.grad.dtype), reference.weight.grad
+    )
 
 
 def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
@@ -1234,3 +1258,78 @@ def test_fully_shard_tensor_atomic_losses_match_baseline(
         torch.stack(baseline_losses),
         msg="TensorAtomic sharded losses did not match baseline losses.",
     )
+
+
+def test_no_input_gradients_preserve_saved_weights(distributed_setup):
+    """The output-time module hook must not release weights needed inside backward."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(1234)
+    trainable = nn.Linear(4, 4, bias=False)
+    frozen = nn.Linear(4, 4, bias=False).requires_grad_(False)
+    model = nn.Sequential(trainable, frozen).to(device)
+    reference = copy.deepcopy(model)
+    # The root owns only frozen weights and receives inputs without gradients.
+    # Its trainable child provides a backward graph; a frozen linear alone would not.
+    with fully_shard_context(device=device):
+        fully_shard(model[0], mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+
+    def unpack(tensor):
+        if tensor.untyped_storage().nbytes() == 0:
+            pytest.fail("Backward read released weights", pytrace=False)
+        return tensor
+
+    x = torch.ones(2, 4, device=device)
+    reference(x).sum().backward()
+    # pack_hook saves the original tensor without copying its storage; unpack_hook
+    # checks that storage before returning the saved tensor for backward to read.
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook=lambda t: t, unpack_hook=unpack):
+        model(x).sum().backward()
+    for actual, expected in zip(model.parameters(), reference.parameters()):
+        if expected.requires_grad:
+            torch.testing.assert_close(actual.grad.full_tensor(), expected.grad)
+    assert model.phase is FsdpModule.Phase.RESTING
+
+
+def test_shared_units_reshard_before_post_accumulate_grad(distributed_setup):
+    """Repeated invocations release weights independently of shared gradient accumulation."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(1234)
+    reference = nn.Sequential(*(nn.Linear(4, 4, bias=False) for _ in range(3))).to(device)
+    model = copy.deepcopy(reference)
+    with fully_shard_context(device=device):
+        for layer in model:
+            fully_shard(layer, mesh, _default_placements())
+
+    def forward(layers, x):
+        x = layers[0](x)
+        for _ in range(2):
+            x = layers[2](layers[1](x).tanh()).tanh()
+        return x.square().sum()
+
+    completions = []
+
+    def check_released(unit):
+        full_weight = unit.parameter_groups[0].fsdp_parameters[0].unsharded
+        assert full_weight.untyped_storage().nbytes() == 0
+        if not completions:
+            assert unit.weight.grad is None
+        completions.append(unit)
+
+    for layer in model:
+        layer.register_post_backward_hook(check_released)
+    torch.manual_seed(4321 + distributed_setup.rank)
+    x = torch.randn(2, 4, device=device, requires_grad=True)
+    actual_x = x.detach().clone().requires_grad_()
+    expected = forward(reference, x)
+    actual = forward(model, actual_x)
+    expected.backward()
+    actual.backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_x.grad, x.grad)
+    assert completions == [model[2], model[1], model[2], model[1], model[0]]
+    for layer, ref_layer in zip(model, reference):
+        dist.all_reduce(ref_layer.weight.grad, op=dist.ReduceOp.AVG)
+        torch.testing.assert_close(layer.weight.grad.full_tensor(), ref_layer.weight.grad)
