@@ -1014,7 +1014,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         compute_mtp_loss: bool = True,
         cp_batch: ContextParallelBatch | None = None,
         shared_prefix_layout: Optional[SharedPrefixLayout | SharedPrefixForestLayout] = None,
-        shared_prefix_exclude_sequence_padding_from_expert_bias: bool = False,
+        shared_prefix_exclude_sequence_padding_from_expert_bias: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -1047,10 +1047,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 path is unchanged when the argument is ``None``. Defaults to None.
             shared_prefix_exclude_sequence_padding_from_expert_bias (bool, optional): The
                 caller's dense expert-bias convention for per-branch padding rows of a
-                ``shared_prefix_layout``. ``False`` counts them, as a dense forward with
-                ``padding_mask=None`` does; ``True`` excludes them, as a dense forward with the
-                packed-sequence padding mask does. Trailing topology padding is never counted.
-                ``True`` requires ``shared_prefix_layout``. Defaults to False.
+                ``shared_prefix_layout``. ``True`` excludes them, as a dense forward with the
+                packed-sequence padding mask does; ``False`` counts them, as a dense forward with
+                ``padding_mask=None`` does. ``None`` excludes them when
+                ``moe_token_dispatcher_type`` is ``"flex"`` and ``moe_flex_dispatcher_backend``
+                is ``"hybridep"``, and counts them otherwise. Trailing topology padding is never
+                counted. A value other than ``None`` requires ``shared_prefix_layout``.
+                Defaults to None.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -1148,7 +1151,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 raise NotImplementedError(
                     "shared-prefix HybridModel TP/SP requires TP-sharded parallel output logits"
                 )
-        elif shared_prefix_exclude_sequence_padding_from_expert_bias:
+        elif shared_prefix_exclude_sequence_padding_from_expert_bias is not None:
             raise ValueError(
                 "shared_prefix_exclude_sequence_padding_from_expert_bias requires "
                 "shared_prefix_layout"

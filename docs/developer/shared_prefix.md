@@ -95,11 +95,15 @@ exactly in the int64 expert-bias buffer. Ordinary routing counts follow the
 upstream path when multiplicity metadata is absent. Hash MoE remains supported by
 the ordinary path and is explicitly rejected for shared execution.
 
-Per-branch padding rows count toward expert bias by default, as in a dense forward
-with `padding_mask=None`. A caller whose dense path masks packed-sequence padding
-passes `shared_prefix_exclude_sequence_padding_from_expert_bias=True` to
-`HybridModel.forward` (`exclude_sequence_padding_from_expert_bias` on
-`forward_hybrid_stack_shared_prefix`). Trailing topology padding never counts.
+The caller states whether per-branch padding rows count toward expert bias with
+`shared_prefix_exclude_sequence_padding_from_expert_bias` on `HybridModel.forward`
+(`exclude_sequence_padding_from_expert_bias` on `forward_hybrid_stack_shared_prefix`).
+`True` excludes them, as a dense forward with the packed-sequence padding mask does.
+`False` counts them, as a dense forward with `padding_mask=None` does. When the
+argument is unset, padding rows are excluded if `moe_token_dispatcher_type` is
+`flex` and `moe_flex_dispatcher_backend` is `hybridep`, and counted otherwise.
+Passing the argument without `shared_prefix_layout` raises `ValueError`. Trailing
+topology padding never counts.
 
 The router runs fixed row blocks inside a scoped shared forward, so its GEMM does
 not depend on how stars are packed. Activation recomputation restores that scope

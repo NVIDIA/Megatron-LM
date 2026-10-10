@@ -1011,7 +1011,7 @@ def forward_hybrid_stack_shared_prefix(
     *,
     rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
     position_embedding_type: str = "rope",
-    exclude_sequence_padding_from_expert_bias: bool = False,
+    exclude_sequence_padding_from_expert_bias: bool | None = None,
     validated_physical_len: int | None = None,
 ) -> Tensor:
     """Explicit exact-prompt star forward for a supported ``HybridStack`` topology.
@@ -1021,9 +1021,10 @@ def forward_hybrid_stack_shared_prefix(
     ``finally`` block, including when a layer raises.
 
     ``exclude_sequence_padding_from_expert_bias`` states the caller's dense expert-bias
-    convention for per-branch padding rows. The default counts them, as a dense forward with
-    ``padding_mask=None`` does; ``True`` matches a dense caller that masks packed-sequence padding.
-    Trailing topology padding is never counted.
+    convention for per-branch padding rows. ``True`` excludes them, as a dense forward with the
+    packed-sequence padding mask does; ``False`` counts them, as a dense forward with
+    ``padding_mask=None`` does. ``None`` (the default) excludes them with the flex dispatcher's
+    HybridEP backend and counts them otherwise. Trailing topology padding is never counted.
 
     ``validated_physical_len`` is the global physical length for which the caller has already
     validated this stack and layout, as ``HybridModel.forward`` does before its embedding. The
@@ -1064,6 +1065,11 @@ def forward_hybrid_stack_shared_prefix(
     token_multiplicities = None
     expert_bias_enabled = bool(getattr(stack.config, "moe_router_enable_expert_bias", False))
     if expert_bias_enabled:
+        if exclude_sequence_padding_from_expert_bias is None:
+            exclude_sequence_padding_from_expert_bias = (
+                getattr(stack.config, "moe_token_dispatcher_type", None) == "flex"
+                and getattr(stack.config, "moe_flex_dispatcher_backend", None) == "hybridep"
+            )
         token_multiplicities = layout.padded_token_multiplicities(
             physical_len,
             hidden_states.device,

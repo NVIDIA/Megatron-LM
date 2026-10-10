@@ -323,14 +323,16 @@ class TestSharedPrefixHybridModelParity:
             routing.close()
         # The problem has per-branch padding, so the two dense conventions differ.
         assert sum(map(torch.sum, masked.counts)) < sum(map(torch.sum, counted.counts))
-        # Unset, the flag counts padding rows, as a dense forward with padding_mask=None does.
+        # Unset on this non-HybridEP dispatcher, padding rows count, as with padding_mask=None.
+        assert model.config.moe_token_dispatcher_type != "flex"
         expected = masked if exclude else counted
         assert len(shared.counts) == PATTERN.count("E")
         for shared_count, expected_count in zip(shared.counts, expected.counts):
             torch.testing.assert_close(shared_count, expected_count, rtol=0, atol=0)
 
-    def test_expert_bias_padding_flag_requires_layout(self, monkeypatch):
-        """Excluding padding rows has no meaning without a shared-prefix layout."""
+    @pytest.mark.parametrize("exclude", [False, True], ids=["counted", "excluded"])
+    def test_expert_bias_padding_flag_requires_layout(self, exclude, monkeypatch):
+        """Stating the padding convention has no meaning without a shared-prefix layout."""
         clear_attention_env(monkeypatch)
         torch.manual_seed(0)
         model = build_hybrid_model(PATTERN, torch.bfloat16)
@@ -340,8 +342,35 @@ class TestSharedPrefixHybridModelParity:
                 input_ids=tokens.row_ids[0][None].cuda(),
                 position_ids=torch.arange(tokens.row_ids[0].numel())[None].cuda(),
                 attention_mask=None,
-                shared_prefix_exclude_sequence_padding_from_expert_bias=True,
+                shared_prefix_exclude_sequence_padding_from_expert_bias=exclude,
             )
+
+    @pytest.mark.parametrize("exclude", [None, False, True], ids=["unset", "counted", "excluded"])
+    def test_expert_bias_padding_flag_reaches_the_stack(self, exclude, monkeypatch):
+        """Unset, the model leaves the convention to the stack's dispatcher-based inference."""
+        from megatron.core.models.hybrid import shared_prefix
+
+        clear_attention_env(monkeypatch)
+        torch.manual_seed(0)
+        model = build_hybrid_model(PATTERN, torch.bfloat16)
+        tokens = TokenProblem(_problem(STAR), vocab_size=2048, seed=1)
+        forward = shared_prefix.forward_hybrid_stack_shared_prefix
+        received = []
+
+        def recording_forward(*args, exclude_sequence_padding_from_expert_bias, **kwargs):
+            received.append(exclude_sequence_padding_from_expert_bias)
+            return forward(
+                *args,
+                exclude_sequence_padding_from_expert_bias=exclude_sequence_padding_from_expert_bias,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(shared_prefix, "forward_hybrid_stack_shared_prefix", recording_forward)
+        flag = {}
+        if exclude is not None:
+            flag["shared_prefix_exclude_sequence_padding_from_expert_bias"] = exclude
+        run_shared(model, tokens, tokens.problem.layout(forest=False), **flag)
+        assert received == [exclude]
 
     def test_forward_validates_the_stack_once(self, monkeypatch):
         """HybridModel validates before its embedding; the stack forward does not repeat it."""
