@@ -7,6 +7,22 @@ import check_process_group_usage as checker
 
 
 class TestAnnotations(unittest.TestCase):
+    def test_postponed_annotations_do_not_execute_accessors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'sample.py'
+            path.write_text(
+                'from __future__ import annotations\nfrom megatron.core import parallel_state\ndef model(value: parallel_state.get_tensor_model_parallel_group()) -> parallel_state.get_data_parallel_group(): pass\n'
+            )
+            self.assertEqual(checker._violations_in(path), [])
+
+    def test_postponed_annotations_still_check_defaults_and_decorators(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'sample.py'
+            path.write_text(
+                'from __future__ import annotations\nfrom megatron.core import parallel_state\n@parallel_state.get_tensor_model_parallel_group()\ndef model(value: parallel_state.get_tensor_model_parallel_group() = parallel_state.get_data_parallel_group()): pass\n'
+            )
+            self.assertEqual(len(checker._violations_in(path)), 2)
+
     def test_calls_in_function_annotations_are_detected(self):
         for signature in [
             'def model(value: parallel_state.get_tensor_model_parallel_group()): pass',
