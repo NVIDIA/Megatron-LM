@@ -15,6 +15,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
@@ -486,10 +487,26 @@ class TestMoEModules:
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
-    def test_te_grouped_mlp_replays_on_uneven_experts(self):
+    @pytest.mark.parametrize(
+        "use_grouped_tensor",
+        [
+            False,
+            pytest.param(
+                True,
+                marks=pytest.mark.skipif(
+                    not te_ext._TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+                    reason="Installed TE GroupedLinear does not expose use_grouped_tensor",
+                ),
+            ),
+        ],
+        ids=["multi-stream", "device-initiated"],
+    )
+    def test_te_grouped_mlp_replays_on_uneven_experts(self, use_grouped_tensor):
         self._init()
         seeded()
-        config = _moe_config(hidden_size=2048, ffn_hidden_size=4096)
+        config = _moe_config(
+            hidden_size=2048, ffn_hidden_size=4096, moe_use_grouped_tensor=use_grouped_tensor
+        )
         spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
         experts = get_submodules(spec.submodules.mlp).experts(
             num_local_experts=8,
@@ -507,7 +524,7 @@ class TestMoEModules:
             (hidden, tokens_per_expert, probs),
             replays=3,
             contention=True,
-            what="TEGroupedMLP",
+            what=f"TEGroupedMLP[grouped_tensor={use_grouped_tensor}]",
         )
 
     @pytest.mark.skipif(

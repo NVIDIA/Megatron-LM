@@ -7,8 +7,10 @@ from typing import Any
 import torch
 
 from megatron.core._rank_utils import log_single_rank
+from megatron.core.extensions.transformer_engine import is_grouped_tensor_marked
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     GLOBAL_MAX_BLOCKS,
@@ -741,12 +743,16 @@ class PagedStashManager:
         Hook called when autograd saves a tensor for backward pass.
         Returns a tag to identify the tensor later.
         """
+        # CheckpointWithoutOutput intentionally releases the storage of its output after the
+        # following module has saved it, then restores that same StorageImpl during backward
+        # recomputation. Paged stashing must not take ownership of such a tensor in between.
+        # This check is storage-level because TE GroupedLinear saves reshape/split views of
+        # activation inputs, and Python tensor attributes do not survive those view operations.
+        if is_checkpoint_without_output_tensor(tensor):
+            return tensor
+
         # Handle 0-dim tensors (torch.Size([])) - they have no size(0)
-        if (
-            self.max_num_tokens is None
-            or tensor.dim() == 0
-            or not hasattr(tensor, 'grouped_tensor_scale_inv')
-        ):
+        if self.max_num_tokens is None or tensor.dim() == 0 or not is_grouped_tensor_marked(tensor):
             return tensor
 
         assert isinstance(tensor, torch.Tensor), f"tensor is not a torch.Tensor {type(tensor)}"
