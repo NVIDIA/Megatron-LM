@@ -108,7 +108,7 @@ jobs:
         run: |
           if [ "$IS_MAINTAINER" = "true" ] && [ "$USE_GCP_H100" = "true" ]; then
             GCP_H100=$(jq -nc --arg registry "$REGISTRY_GCP_H100" --arg runner "$SELECTED_RUNNER" \
-              '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
+              '{"cloud": "gcp-h100", "registry": $registry, "runner": $runner}')
             if [ "$ALSO_BUILD_AWS_H100" = "true" ]; then
               AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" \
                 '{"cloud": "aws-h100", "registry": $registry, "runner": "nvidia-ci-aws-cpu"}')
@@ -347,7 +347,7 @@ jobs:
           echo "pr-build-hash=$PR_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Configure GAR Docker authentication
-        if: inputs.is-maintainer && inputs.use-gcp-h100 && matrix.cloud == 'aws-h100' && startsWith(matrix.registry, 'asia-southeast1-docker.pkg.dev/')
+        if: inputs.is-maintainer && inputs.use-gcp-h100 && matrix.cloud == 'gcp-h100' && startsWith(matrix.registry, 'asia-southeast1-docker.pkg.dev/')
         shell: bash
         env:
           REGISTRY: ${{ matrix.registry }}

@@ -929,7 +929,7 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
-          container-image: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && format('{0}/megatron-lm:{1}-aws-h100', env.container-registry-gcp-h100, needs.configure.outputs.sha) || format('{0}/megatron-lm:{1}-aws-h100', env.container-registry, needs.configure.outputs.sha) }}
+          container-image: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && format('{0}/megatron-lm:{1}-gcp-h100', env.container-registry-gcp-h100, needs.configure.outputs.sha) || format('{0}/megatron-lm:{1}-aws-h100', env.container-registry, needs.configure.outputs.sha) }}
           sha: ${{ needs.configure.outputs.sha }}
           unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
