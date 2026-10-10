@@ -466,6 +466,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
             else:
