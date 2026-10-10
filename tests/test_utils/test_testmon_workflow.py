@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -522,3 +523,202 @@ def test_full_test_guards_override_selective_requests(
     summary = (tmp_path / "summary").read_text()
     assert f"| `unit_testmon_requested` | `{str(requested).lower()}` |" in summary
     assert "| `unit_testmon_eligible` | `false` |" in summary
+
+
+@pytest.mark.parametrize(
+    "mode,has_tests,plan_outcome,upload_outcome,artifact,expected",
+    [
+        ("selected", "false", "success", "success", "plan", ("selected", "false", "plan")),
+        ("selected", "true", "success", "success", "plan", ("selected", "true", "plan")),
+        ("full", "true", "success", "skipped", "plan", ("full", "true", "")),
+        ("selected", "false", "failure", "success", "plan", ("full", "true", "")),
+        ("selected", "false", "success", "failure", "plan", ("full", "true", "")),
+        ("selected", "false", "success", "skipped", "plan", ("full", "true", "")),
+        ("selected", "", "success", "success", "plan", ("full", "true", "")),
+        ("selected", "false", "success", "success", "", ("full", "true", "")),
+        ("", "", "skipped", "skipped", "", ("full", "true", "")),
+    ],
+)
+def test_cpu_selection_requires_a_complete_artifact_handoff(
+    tmp_path, mode, has_tests, plan_outcome, upload_outcome, artifact, expected
+):
+    result, outputs = _run(
+        _step("_unit-tests.yml", "select", "result")["run"],
+        tmp_path,
+        {
+            "PLAN_MODE": mode,
+            "HAS_TESTS": has_tests,
+            "PLAN_OUTCOME": plan_outcome,
+            "UPLOAD_OUTCOME": upload_outcome,
+            "PLAN_ARTIFACT": artifact,
+            "BUCKET": "tests/unit_tests/test_example.py",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert (outputs["mode"], outputs["has_tests"], outputs["plan_artifact"]) == expected
+
+
+@pytest.mark.parametrize(
+    "result,mode,has_tests,cancelled,expected",
+    [
+        ("success", "selected", "false", False, False),
+        ("success", "selected", "true", False, True),
+        ("success", "full", "true", False, True),
+        ("skipped", "", "", False, True),
+        ("failure", "selected", "false", False, True),
+        ("success", "", "false", False, True),
+        ("success", "selected", "", False, True),
+        ("success", "selected", "true", True, False),
+    ],
+)
+def test_gpu_job_runs_unless_cpu_selection_proves_the_bucket_empty(
+    result, mode, has_tests, cancelled, expected
+):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
+    assert workflow["jobs"]["run"]["needs"] == "select"
+    expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
+    expression = (
+        expression.replace("!cancelled()", "not cancelled").replace("&&", "and").replace("||", "or")
+    )
+    needs = SimpleNamespace(
+        select=SimpleNamespace(
+            result=result, outputs=SimpleNamespace(mode=mode, has_tests=has_tests)
+        )
+    )
+    assert (
+        eval(expression, {"__builtins__": {}}, {"needs": needs, "cancelled": cancelled}) == expected
+    )
+
+
+@pytest.mark.parametrize("platform", ["h100", "gb200"])
+def test_unit_buckets_use_cpu_selection_before_the_gpu_runner(platform):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
+    suffix = "" if platform == "h100" else "-gb200"
+    job = workflow["jobs"][f"cicd-unit-tests-latest{suffix}"]
+    assert job["uses"] == "./.github/workflows/_unit-tests.yml"
+    assert "steps" not in job and "runs-on" not in job
+    assert job["with"]["cloud"] == ("aws-h100" if platform == "h100" else "gb-gpu")
+    assert "unit_testmon_eligible" in job["with"]["unit_testmon_mode"]
+    assert "selected_runner" in job["with"]["runner"]
+    assert job["with"]["unit_test_pr_files_artifact_id"] == (
+        "${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}"
+    )
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "skipped"])
+def test_cpu_plan_requires_the_configured_pr_files_download(outcome):
+    download = _step("_unit-tests.yml", "select", "pr-files")
+    assert download["with"]["artifact-ids"] == "${{ inputs.unit_test_pr_files_artifact_id }}"
+    assert download["with"]["merge-multiple"] is True
+    expression = _step("_unit-tests.yml", "select", "plan")["if"]
+    for step in ("dependencies", "identity", "baseline", "image"):
+        expression = expression.replace(f"steps.{step}.outcome", repr("success"))
+    expression = expression.replace("steps.pr-files.outcome", repr(outcome))
+    assert eval(expression.replace("&&", "and"), {"__builtins__": {}}) == (outcome == "success")
+
+
+def test_cpu_plan_passes_the_downloaded_pr_files_to_the_selector(tmp_path):
+    image = tmp_path / "assets_dir/testmon-image"
+    image.mkdir(parents=True)
+    (image / "image-id.txt").write_text("sha256:" + "b" * 64 + "\n")
+    pr_files = tmp_path / "downloaded PR files"
+    script = (
+        'python() { printf "%s\\n" "$@" > arguments; '
+        'printf "mode=selected\\nhas_tests=true\\n"; }\n'
+        + _step("_unit-tests.yml", "select", "plan")["run"]
+    )
+    result, outputs = _run(
+        script,
+        tmp_path,
+        {
+            "BUCKET": "tests/unit_tests/**/*.py",
+            "RECIPE_PLATFORM": "dgx_h100",
+            "SOURCE_SHA": "a" * 40,
+            "MATCHED_KEY": "baseline-123",
+            "PR_FILES_DIR": str(pr_files),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    arguments = (tmp_path / "arguments").read_text().splitlines()
+    assert arguments[arguments.index("--pr-files-dir") + 1] == str(pr_files)
+    assert outputs == {"mode": "selected", "has_tests": "true"}
+
+
+@pytest.mark.parametrize(
+    "evidence,allowed",
+    [
+        ("complete", True),
+        ("repeated-empty", True),
+        ("missing", False),
+        ("nonempty-prod", False),
+        ("nonempty-experimental", False),
+        ("full", False),
+        ("wrong-sha", False),
+        ("wrong-schema", False),
+        ("unexpected-bucket", False),
+        ("no-expected-buckets", False),
+        ("not-selective", False),
+    ],
+)
+def test_no_coverage_requires_empty_plans_for_every_expected_bucket(tmp_path, evidence, allowed):
+    bucket = "tests/unit_tests/test_example.py"
+    plans = []
+    for platform in ("dgx_h100", "dgx_gb200"):
+        plans.append(
+            {
+                "schema": 1,
+                "source_sha": "a" * 40,
+                "bucket": bucket,
+                "platform": platform,
+                "mode": "selected",
+                "phases": {"prod": [], "experimental": []},
+            }
+        )
+    if evidence == "missing":
+        plans.pop()
+    elif evidence == "repeated-empty":
+        plans.append(plans[0])
+    elif evidence.startswith("nonempty-"):
+        plans[0]["phases"][evidence.removeprefix("nonempty-")] = [bucket + "::test_example"]
+    elif evidence == "full":
+        plans[0]["mode"] = "full"
+    elif evidence == "wrong-sha":
+        plans[0]["source_sha"] = "b" * 40
+    elif evidence == "wrong-schema":
+        plans[0]["schema"] = 2
+    elif evidence == "unexpected-bucket":
+        plans[0]["bucket"] = "tests/unit_tests/test_unexpected.py"
+    for index, plan in enumerate(plans):
+        directory = tmp_path / f"unit-test-plan-{index}"
+        directory.mkdir()
+        (directory / "plan.json").write_text(json.dumps(plan))
+    result, outputs = _run(
+        _step("cicd-main.yml", "Coverage", "coverage")["run"],
+        tmp_path,
+        {
+            "SELECTIVE": "false" if evidence == "not-selective" else "true",
+            "H100_BUCKETS": json.dumps(
+                [] if evidence == "no-expected-buckets" else [{"bucket": bucket}]
+            ),
+            "GB200_BUCKETS": json.dumps(
+                [] if evidence == "no-expected-buckets" else [{"bucket": bucket}]
+            ),
+            "SOURCE_SHA": "a" * 40,
+        },
+    )
+    assert (result.returncode == 0) == allowed, result.stdout + result.stderr
+    assert outputs == ({"has_coverage": "false"} if allowed else {})
+
+
+def test_actual_coverage_does_not_require_selective_plans(tmp_path):
+    directory = tmp_path / "coverage-unit-test-example"
+    directory.mkdir()
+    (directory / ".coverage").touch()
+    result, outputs = _run(
+        _step("cicd-main.yml", "Coverage", "coverage")["run"],
+        tmp_path,
+        {"SELECTIVE": "false", "H100_BUCKETS": "[]", "GB200_BUCKETS": "[]", "SOURCE_SHA": "a" * 40},
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs == {"has_coverage": "true"}

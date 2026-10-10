@@ -834,6 +834,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
+      container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
     needs:
       - pre-flight
       - configure
@@ -874,8 +875,6 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
-    runs-on: ${{ startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner }}
-    timeout-minutes: 60
     name: "${{ matrix.bucket }} - latest"
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
@@ -891,34 +890,23 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
-    env:
-      PIP_DISABLE_PIP_VERSION_CHECK: 1
-      PIP_NO_PYTHON_VERSION_WARNING: 1
-      PIP_ROOT_USER_ACTION: ignore
-      PIP_DEFAULT_TIMEOUT: 120
-      PIP_RETRIES: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.configure.outputs.sha }}
-      - name: main
-        uses: ./.github/actions
-        with:
-          test_case: ${{ matrix.bucket }}
-          tag: latest
-          timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: "true"
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
-          sha: ${{ needs.configure.outputs.sha }}
-          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-          unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
-          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+    uses: ./.github/workflows/_unit-tests.yml
+    with:
+      bucket: ${{ matrix.bucket }}
+      timeout: ${{ matrix.timeout || 30 }}
+      runner: ${{ startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner }}
+      container-image: ${{ needs.cicd-parse-unit-tests.outputs.container-image }}
+      cloud: aws-h100
+      sha: ${{ needs.configure.outputs.sha }}
+      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+      unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
     outputs:
       unit-tests-gb200: ${{ steps.parse-unit-tests.outputs.unit-tests-gb200 }}
+      container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
     needs:
       - is-not-external-contributor
       - pre-flight
@@ -962,8 +950,6 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests-gb200
-    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
-    timeout-minutes: 60
     name: "${{ matrix.bucket }} - gb200 latest"
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
@@ -981,30 +967,18 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
-    env:
-      PIP_DISABLE_PIP_VERSION_CHECK: 1
-      PIP_NO_PYTHON_VERSION_WARNING: 1
-      PIP_ROOT_USER_ACTION: ignore
-      PIP_DEFAULT_TIMEOUT: 120
-      PIP_RETRIES: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.configure.outputs.sha }}
-      - name: main
-        uses: ./.github/actions
-        with:
-          test_case: ${{ matrix.bucket }}
-          tag: latest
-          timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: "true"
-          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
-          platform: dgx_gb200
-          sha: ${{ needs.configure.outputs.sha }}
-          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-          unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
-          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+    uses: ./.github/workflows/_unit-tests.yml
+    with:
+      bucket: ${{ matrix.bucket }}
+      timeout: ${{ matrix.timeout || 30 }}
+      runner: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+      container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
+      cloud: gb-gpu
+      platform: dgx_gb200
+      sha: ${{ needs.configure.outputs.sha }}
+      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+      unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:
@@ -1423,14 +1397,12 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test]
+    needs: [Nemo_CICD_Test, pre-flight, configure, cicd-parse-unit-tests, cicd-parse-unit-tests-gb200]
     if: |
-      (
-        (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
-        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
-        || success()
-      )
-      && !cancelled()
+      !cancelled()
+      && needs.Nemo_CICD_Test.result == 'success'
+      && needs.pre-flight.outputs.docs_only != 'true'
+      && needs.pre-flight.outputs.is_deployment_workflow != 'true'
       && github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
@@ -1449,12 +1421,63 @@ jobs:
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
+      - name: Download CPU selection evidence
+        if: needs.configure.outputs.unit_testmon_eligible == 'true'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: unit-test-plan-*
+
+      - name: Require coverage or verified empty selections
+        id: coverage
+        env:
+          SELECTIVE: ${{ needs.configure.outputs.unit_testmon_eligible }}
+          H100_BUCKETS: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests || '[]' }}
+          GB200_BUCKETS: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 || '[]' }}
+          SOURCE_SHA: ${{ needs.configure.outputs.sha }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          has_coverage = any(Path.cwd().glob("coverage-unit-test-*/.coverage"))
+          if not has_coverage:
+              if os.environ["SELECTIVE"] != "true":
+                  raise SystemExit("Missing unit-test coverage artifacts")
+              expected = {
+                  (platform, entry["bucket"])
+                  for platform, variable in (
+                      ("dgx_h100", "H100_BUCKETS"), ("dgx_gb200", "GB200_BUCKETS")
+                  )
+                  for entry in json.loads(os.environ[variable])
+              }
+              observed = set()
+              for path in Path.cwd().glob("unit-test-plan-*/plan.json"):
+                  plan = json.loads(path.read_text())
+                  identity = (plan["platform"], plan["bucket"])
+                  if (
+                      identity not in expected
+                      or plan.get("schema") != 1
+                      or plan.get("source_sha") != os.environ["SOURCE_SHA"]
+                      or plan.get("mode") != "selected"
+                      or plan.get("phases") != {"prod": [], "experimental": []}
+                  ):
+                      raise SystemExit(f"Invalid empty-selection evidence: {path}")
+                  observed.add(identity)
+              if not expected or observed != expected:
+                  raise SystemExit("Missing CPU selection evidence for unit-test buckets")
+              print("Every unit-test bucket has a verified empty selection; no coverage expected.")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"has_coverage={str(has_coverage).lower()}\n")
+          PY
+
       - name: List coverage files
+        if: steps.coverage.outputs.has_coverage == 'true'
         run: find . -type f -name "*.xml" -o -name "*.lcov"
 
       - name: Get total coverage of current branch
         shell: bash -x -e -u -o pipefail {0}
-        if: always()
+        if: steps.coverage.outputs.has_coverage == 'true'
         run: |
           pip install coverage
 
@@ -1466,6 +1489,7 @@ jobs:
           ls -al
 
       - name: Upload coverage reports to Codecov
+        if: steps.coverage.outputs.has_coverage == 'true'
         uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -1474,12 +1498,37 @@ jobs:
           base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
+        if: steps.coverage.outputs.has_coverage == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |
             .coverage
           include-hidden-files: true
+
+      - name: Generate token for the no-tests coverage status
+        id: app-token
+        if: steps.coverage.outputs.has_coverage == 'false'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.COMMUNITY_BOT_ID }}
+          private-key: ${{ secrets.COMMUNITY_BOT_KEY }}
+          permission-statuses: write
+
+      - name: Report verified empty unit-test selection
+        if: steps.coverage.outputs.has_coverage == 'false'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'success',
+              description: 'No affected unit tests - coverage check skipped',
+              context: 'codecov/patch'
+            });
 
   merge-queue-notification:
     runs-on: ubuntu-latest
