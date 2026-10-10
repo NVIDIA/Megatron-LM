@@ -264,6 +264,12 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_qkv_per_head: bool = False
+    """Whether to orthogonalize each Q, gate, K, and V head independently. Requires
+    ``muon_split_qkv``. Uniform head sizes use the batched Newton-Schulz implementation
+    from the Emerging-Optimizers revision pinned in ``pyproject.toml``. By default, Muon
+    orthogonalizes the Q, gate, K, and V projection matrices separately."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
@@ -285,7 +291,9 @@ class OptimizerConfig:
     each shard independently, which makes the update rule depend on the parallelism config;
     "duplicated" and "distributed" both orthogonalize the whole matrix, so results do not
     change as TP changes. "auto" select between duplicated and distributed mode per-weight for
-    dense weights. "layer_sharded" uses LayerShardedMuon instead of TensorParallelMuon:
+    dense weights. For QKV weights, ``distributed`` applies only to projection splits with
+    complete local query groups and no GTP; other QKV layouts fall back to non-TP NS with a
+    warning. "layer_sharded" uses LayerShardedMuon instead of TensorParallelMuon:
     each 2D weight is assigned one NS home rank in the (GTP_remat x TP) domain — i.e. the
     GTP domain — all_to_all stages over the gtp_remat and tp groups assemble the complete
     (P, Q) momentum on the home, the exact same full-matrix Newton-Schulz as duplicated
