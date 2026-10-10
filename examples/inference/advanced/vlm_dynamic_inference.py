@@ -167,15 +167,23 @@ _ENCODER_REGISTRY_ATTRS = {
 }
 
 
-def _checkpoint_tensor_keys(args):
-    """Return the tensor keys of the checkpoint iteration that --load resolves to."""
+def _loaded_checkpoint_dir(args):
+    """Return the checkpoint iteration directory that --load resolves to.
+
+    Without --ckpt-step this reads the tracker file, which all-reduces across ranks, so every
+    rank must call it.
+    """
     if args.ckpt_step is not None:
         release = False
     else:
         _, release = read_metadata(get_checkpoint_tracker_filename(args.load))
-    checkpoint_dir = get_checkpoint_name(
-        args.load, get_loaded_iteration(), release, return_base_dir=True
-    )
+    return get_checkpoint_name(args.load, get_loaded_iteration(), release, return_base_dir=True)
+
+
+def _checkpoint_tensor_keys(args, checkpoint_dir=None):
+    """Return the tensor keys of the checkpoint iteration that --load resolves to."""
+    if checkpoint_dir is None:
+        checkpoint_dir = _loaded_checkpoint_dir(args)
     return dist_checkpointing.load_tensors_metadata(checkpoint_dir).keys()
 
 
@@ -317,6 +325,7 @@ def _check_mimo_checkpoint_fully_loaded(args, model):
     assert requested is not None, "the model has not built a sharded state dict for the load"
     gathered = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(gathered, sorted(requested))
+    checkpoint_dir = _loaded_checkpoint_dir(args)
 
     unloaded = []
     if torch.distributed.get_rank() == 0:
@@ -324,7 +333,7 @@ def _check_mimo_checkpoint_fully_loaded(args, model):
         checkpoint_prefixes = tuple(args.mimo_checkpoint_prefix_map.values())
         unloaded = sorted(
             key
-            for key in _checkpoint_tensor_keys(args)
+            for key in _checkpoint_tensor_keys(args, checkpoint_dir)
             if key.startswith(checkpoint_prefixes)
             and not key.endswith(_TRAINING_ONLY_CHECKPOINT_SUFFIXES)
             # Factories (e.g. fused in_proj) expand into sub-keys of the requested key.
