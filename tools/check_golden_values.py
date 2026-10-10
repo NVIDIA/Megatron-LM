@@ -56,7 +56,7 @@ NOT_ACCEPTED_VALUES = [
 # SKIP_PYTEST is 1. Explicit MODE: rl uses the GRPO tolerance validator instead.
 # Matched on the raw YAML text so this script does not depend on PyYAML.
 _NONDETERMINISTIC_ENV_VAR = re.compile(
-    r"^\s*(NON_DETERMINSTIC_RESULTS|NVTE_ALLOW_NONDETERMINISTIC_ALGO|SKIP_PYTEST)"
+    r"^\s*(['\"]?)(NON_DETERMINSTIC_RESULTS|NVTE_ALLOW_NONDETERMINISTIC_ALGO|SKIP_PYTEST)\1"
     r"\s*:\s*['\"]?1['\"]?\s*(#.*)?$",
     re.MULTILINE,
 )
