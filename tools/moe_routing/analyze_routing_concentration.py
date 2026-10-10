@@ -142,7 +142,7 @@ def main():
                     per_layer_freq[layer_key][e] += 1
             per_layer_tokens[layer_key] += len(top_indices)
 
-    layer_keys = sorted(per_layer_freq.keys())
+    layer_keys = sorted(per_layer_freq.keys(), key=lambda lk: (lk[0], -1 if lk[1] is None else lk[1], lk[2]))
     if not layer_keys:
         print("No data found. Exiting.")
         return
