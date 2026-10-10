@@ -48,7 +48,7 @@ def get_args():
     ), f"ERROR: {args.input} is not a directory or does not exist"
 
     assert os.path.isdir(
-        os.path.dirname(args.output_prefix)
+        os.path.dirname(args.output_prefix) or "."
     ), f"ERROR: {os.path.dirname(args.output_prefix)} is not a directory or does not exist"
 
     return args
