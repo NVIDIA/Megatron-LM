@@ -33,6 +33,8 @@ permissions:
 env:
   container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
   container-registry-gb200: 766267172432.dkr.ecr.us-east-2.amazonaws.com
+  # GAR path includes the repository; the reusable workflow appends the image name.
+  container-registry-gcp-h100: asia-southeast1-docker.pkg.dev/nv-nemoautomati-20260505210812/megatron-lm
 
 jobs:
   ephemeral-runner-routing:
@@ -840,8 +842,10 @@ jobs:
     uses: ./.github/workflows/_build_ci_container.yml
     with:
       is-maintainer: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
-      selected-runner: ${{ startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner }}
+      selected-runner: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-cpu' || (startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner) }}
       selected-runner-gb200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+      registry-gcp-h100: asia-southeast1-docker.pkg.dev/nv-nemoautomati-20260505210812/megatron-lm
+      use-gcp-h100: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
       source-sha: ${{ needs.configure.outputs.sha }}
       lts: ${{ needs.configure.outputs.lts == 'true' }}
 
@@ -924,7 +928,7 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
+          container-image: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && format('{0}/megatron-lm:{1}-aws-h100', env.container-registry-gcp-h100, needs.configure.outputs.sha) || format('{0}/megatron-lm:{1}-aws-h100', env.container-registry, needs.configure.outputs.sha) }}
           sha: ${{ needs.configure.outputs.sha }}
           unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
