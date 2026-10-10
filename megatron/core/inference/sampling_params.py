@@ -46,6 +46,8 @@ class SamplingParams:
     num_tokens_to_generate: int = None
     num_tokens_total: Optional[int] = None  # Cannot set both this and num_tokens_to_generate
     termination_id: Optional[int] = None
+    # Explicit token stops remain active even when model EOS stopping is disabled.
+    stop_token_ids: Optional[List[int]] = None
     top_n_logprobs: int = 0
     return_prompt_top_n_logprobs: bool = False  # Deprecated field for backwards compatibility
     add_BOS: bool = False
@@ -72,6 +74,13 @@ class SamplingParams:
         Sets return_prompt_top_n_logprobs based on skip_prompt_log_probs and top_n_logprobs:
         - return_prompt_top_n_logprobs = not skip_prompt_log_probs and top_n_logprobs > 0
         """
+        if self.stop_token_ids is not None:
+            if not isinstance(self.stop_token_ids, list) or any(
+                isinstance(token, bool) or not isinstance(token, int) or token < 0
+                for token in self.stop_token_ids
+            ):
+                raise ValueError("stop_token_ids must be a list of nonnegative integers")
+            self.stop_token_ids = sorted(set(self.stop_token_ids))
         self._normalize_filters()
         self._sync_prompt_logprobs_fields()
         self._validate_streaming_interval()

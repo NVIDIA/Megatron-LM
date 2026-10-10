@@ -28,6 +28,7 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
     PendingKvImport,
     PendingSSMImport,
 )
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -181,13 +182,16 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
 
     def _terminating_token_ids(self, request):
         termination_id = request.sampling_params.termination_id
+        explicit = frozenset(request.sampling_params.stop_token_ids or ())
         if termination_id is None or termination_id < 0:
-            return frozenset()
-        return self._extra_eos_token_id_set | {termination_id}
+            return explicit
+        return self._extra_eos_token_id_set | {termination_id} | explicit
 
     def _check_stop_words_for_request_post_append(self, request):
         for stop_word_ids in request.stop_word_ids or []:
             if request.generated_tokens[-len(stop_word_ids) :] == stop_word_ids:
+                if not request.sampling_params.detokenize_stop_sequence:
+                    request.generated_tokens = request.generated_tokens[: -len(stop_word_ids)]
                 return True, 0, 0
         return False, 0, 0
 
@@ -707,18 +711,27 @@ def test_transfer_polling_defers_batch_mutation_to_scheduling(handoff_loop):
 
 
 @pytest.mark.parametrize(
-    "num_tokens_to_generate, termination_id, stop_word_ids, extra_eos_token_id_set, expected_tokens",
+    "num_tokens_to_generate, termination_id, stop_word_ids, extra_eos_token_id_set, "
+    "stop_token_ids, expected_tokens, expected_reason",
     [
-        (0, -1, None, (), []),
-        (1, -1, None, (), [55]),
-        (3, 55, None, (), [55]),
-        (3, -1, [[55]], (), [55]),
+        (0, -1, None, (), None, [], "length"),
+        (1, -1, None, (), None, [55], "length"),
+        (3, 55, None, (), None, [55], "stop"),
+        (3, -1, [[55]], (), None, [], "stop"),
         # Declared by the model's generation_config but not the request's
         # termination_id: the imported prefill's token 55 must still stop here
         # rather than resuming decode past it.
-        (3, 2, None, (2, 55), [55]),
+        (3, 2, None, (2, 55), None, [55], "stop"),
+        (1, -1, None, (), [55], [55], "stop"),
     ],
-    ids=["sequence-limit", "generation-limit", "termination-token", "stop-word", "declared-eos"],
+    ids=[
+        "sequence-limit",
+        "generation-limit",
+        "termination-token",
+        "stripped-stop-word",
+        "declared-eos",
+        "stop-at-budget",
+    ],
 )
 def test_handoff_finishes_without_an_extra_decode_step(
     handoff_loop,
@@ -726,7 +739,9 @@ def test_handoff_finishes_without_an_extra_decode_step(
     termination_id,
     stop_word_ids,
     extra_eos_token_id_set,
+    stop_token_ids,
     expected_tokens,
+    expected_reason,
 ):
     engine = _HandoffHarness(handoff_loop, extra_eos_token_id_set=extra_eos_token_id_set)
     blocks = engine.context.kv_block_allocator.allocate_memory_blocks(2).tolist()
@@ -735,11 +750,23 @@ def test_handoff_finishes_without_an_extra_decode_step(
         request_id=7,
         prompt_tokens=torch.arange(4),
         sampling_params=SamplingParams(
-            num_tokens_to_generate=num_tokens_to_generate, termination_id=termination_id
+            num_tokens_to_generate=num_tokens_to_generate,
+            termination_id=termination_id,
+            stop_token_ids=stop_token_ids,
         ),
     )
     request.add_event_add_engine()
     request.stop_word_ids = stop_word_ids
+    engine.stop_word_being_finished_ids = set()
+    engine.finished_request_count = 0
+    engine._set_finish_reason = DynamicInferenceEngine._set_finish_reason.__get__(engine)
+    engine._complete_request = DynamicInferenceEngine._complete_request
+
+    def complete_request(request_id):
+        engine.requests[request_id] = RequestEntry(
+            record=DynamicInferenceRequestRecord.from_request(request), future=request_future
+        )
+        InferenceStateHandoffMixin._complete_handoff_request_without_forward(engine, request_id)
 
     def add_request(request_id, _prompt, _sampling_params, precomputed_block_hashes=None):
         engine.requests[request_id] = request
@@ -765,20 +792,28 @@ def test_handoff_finishes_without_an_extra_decode_step(
             "megatron.core.inference.disaggregation.inference_state_handoff."
             "admit_prefilled_decode"
         ) as admit,
-        mock.patch.object(engine, "_complete_handoff_request_without_forward") as complete,
+        mock.patch.object(
+            engine, "_complete_handoff_request_without_forward", side_effect=complete_request
+        ) as complete,
     ):
         engine._finalize_kv_handoff_import(pending)
 
     admit.assert_not_called()
     complete.assert_called_once_with(7)
     assert request.generated_tokens == expected_tokens
+    assert request_future.result().finish_reason == expected_reason
+    assert request.sampling_params.num_tokens_to_generate == num_tokens_to_generate
     assert engine.context.kv_block_allocator.block_ref_counts[blocks].tolist() == [0, 0]
     assert pending.local_blocks == []
     assert pending.continuation_blocks == []
 
 
 def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
-    engine = object.__new__(InferenceStateHandoffMixin)
+    engine = object.__new__(DynamicInferenceEngine)
+    engine.stop_word_being_finished_ids = set()
+    engine.controller = SimpleNamespace(
+        terminating_token_ids=lambda _, stop_token_ids=None: frozenset(stop_token_ids or ())
+    )
     request = DynamicInferenceRequest(
         request_id=7,
         prompt_tokens=torch.arange(4),
@@ -801,13 +836,14 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
 
     engine._complete_request = complete_request
 
-    engine._complete_handoff_request_without_forward(7)
+    InferenceStateHandoffMixin._complete_handoff_request_without_forward(engine, 7)
 
     assert request.status == Status.COMPLETED
     assert request.generated_length == 1
     finished_request = request_future.result()
     assert isinstance(finished_request, DynamicInferenceRequest)
     assert finished_request.generated_text is None
+    assert finished_request.finish_reason == "length"
     assert finished_request.finalize_text(tokenizer).generated_text == "answer"
     assert engine.finished_request_count == 1
     assert 7 not in engine.requests

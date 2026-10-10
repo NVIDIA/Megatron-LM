@@ -2631,6 +2631,10 @@ class DynamicInferenceEngine(AbstractEngine):
                             request_log_probs = request_log_probs[:-num_dropped]
                         if top_n_logprobs is not None and req_idx in top_n_logprobs:
                             top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_dropped]
+                if eos_mid_block_hit:
+                    eos_mid_block_hit = bool(tokens) and tokens[-1] in self._terminating_token_ids(
+                        request
+                    )
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -2735,7 +2739,13 @@ class DynamicInferenceEngine(AbstractEngine):
                         accepted_t != -1
                     ).long()
 
+                if (
+                    stop_word_hit or eos_mid_block_hit
+                ) and not request.sampling_params.do_kv_handoff:
+                    request.finish_reason = "stop"
+
                 if request_id in finished_request_ids:
+                    self._set_finish_reason(request)
                     # Reconstruct routing from per-block storage before popping.
                     if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
@@ -2924,26 +2934,41 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Find which stop word finished IDs are in the current active requests
         result = self.stop_word_finished_request_ids & set(active_request_ids)
+        # Partial prefill cannot finish; preserve its stop until the final chunk.
+        result.discard(self.context.chunked_prefill_request_id)
         # Move to "being finished" set so post_process_requests can skip the extra token
         self.stop_word_being_finished_ids = result
         # Clear the IDs that we're returning (they'll be marked as finished)
         self.stop_word_finished_request_ids -= result
         return result
 
+    def _set_finish_reason(self, request: DynamicInferenceRequest) -> None:
+        """Record final termination semantics without re-inferring them in clients."""
+        if request.finish_reason is not None or request.sampling_params.do_kv_handoff:
+            return
+        is_stop = request.request_id in self.stop_word_being_finished_ids or (
+            bool(request.generated_tokens)
+            and request.generated_tokens[-1] in self._terminating_token_ids(request)
+        )
+        request.finish_reason = "stop" if is_stop else "length"
+
     def _terminating_token_ids(self, request: DynamicInferenceRequest) -> frozenset:
         """Token ids that end generation for this request.
 
         The CPU-side counterpart of the controller's per-step tensor check, resolved
-        through the controller so every termination site shares one rule. Empty when
-        termination is disabled (`ignore_eos`).
+        through the controller, including explicit request stop ids.
+        Disabling model EOS (`ignore_eos`) does not disable explicit stops.
 
         Args:
             request (DynamicInferenceRequest): Request to resolve ids for.
 
         Returns:
-            frozenset: Terminating token ids, empty when termination is disabled.
+            frozenset: Model EOS ids (unless disabled) and explicit request stop ids.
         """
-        return self.controller.terminating_token_ids(request.sampling_params.termination_id)
+        return self.controller.terminating_token_ids(
+            request.sampling_params.termination_id,
+            stop_token_ids=request.sampling_params.stop_token_ids,
+        )
 
     def _truncate_at_mid_block_eos(
         self,
@@ -2992,10 +3017,12 @@ class DynamicInferenceEngine(AbstractEngine):
     def _find_mid_block_eos(
         self, request: DynamicInferenceRequest, tokens: list[int]
     ) -> Optional[int]:
-        """Locate an EOS token inside a multi-token speculative step.
+        """Locate an explicit stop token or a speculative-block model EOS.
 
-        Only meaningful when a step emits more than one token, i.e. under speculative
-        decoding: the controller's termination check inspects just the step's last token,
+        Model EOS is scanned when a step emits more than one token. Explicit
+        request stop tokens are also checked for single-token steps, since the
+        controller does not hold their variable-length sets. Its EOS check inspects
+        just the step's last token,
         so an EOS on an accepted draft position is otherwise missed and generation runs
         past it. A single-token step was already checked by the controller, and a request
         the controller has already finished does not reach here as unfinished.
@@ -3007,8 +3034,12 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             Optional[int]: Index of the first EOS in `tokens`, or None if there is none.
         """
-        if len(tokens) <= 1 or request.request_id in self.stop_word_being_finished_ids:
+        if not tokens or request.request_id in self.stop_word_being_finished_ids:
             return None
+        if len(tokens) == 1:
+            # Model EOS was checked by the controller. Explicit request stops
+            # are handled here, including the non-speculative single-token path.
+            return 0 if tokens[0] in (request.sampling_params.stop_token_ids or ()) else None
         terminating_ids = self._terminating_token_ids(request)
         if not terminating_ids:
             return None

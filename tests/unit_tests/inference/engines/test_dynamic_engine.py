@@ -1603,7 +1603,8 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     engine.controller = types.SimpleNamespace(
         tokenizer=types.SimpleNamespace(
             detokenize=lambda tokens: f"<{','.join(str(token) for token in tokens)}>"
-        )
+        ),
+        terminating_token_ids=mock.Mock(return_value=frozenset()),
     )
     engine.finished_request_count = 0
     engine.evicted_request_count = 0
@@ -1630,6 +1631,8 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     assert active_ids == []
     assert merge.call_count == 1
     assert future.result() is finished
+    assert finished.finish_reason == "length"
+    engine.controller.terminating_token_ids.assert_called_with(-1, stop_token_ids=None)
     assert finished.generated_log_probs == [-0.25]
     assert finished.generated_top_n_logprobs == [{"<12>": -0.25, "<13>": -1.0}]
     assert finished.tpot == [0.25]

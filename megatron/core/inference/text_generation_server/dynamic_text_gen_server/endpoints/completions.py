@@ -19,6 +19,7 @@ from .common import (
     attach_stage_metadata,
     collect_stage_metadata,
     generation_config_sampling_defaults,
+    generation_finish_reason,
     log_sampling_defaults_once,
     resolve_sampling_default,
     validate_offload_params,
@@ -187,6 +188,7 @@ try:
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
                 stop_words=stop,
+                stop_token_ids=req.get("stop_token_ids"),
                 detokenize_stop_sequence=bool(req.get("include_stop_str_in_output", False)),
                 termination_id=-1 if ignore_eos else None,
                 streaming_interval=int(req.get("streaming_interval", 1)),
@@ -235,6 +237,7 @@ try:
                     skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
                     num_tokens_to_generate=sampling_params.num_tokens_to_generate,
                     stop_words=sampling_params.stop_words,
+                    stop_token_ids=sampling_params.stop_token_ids,
                     detokenize_stop_sequence=sampling_params.detokenize_stop_sequence,
                     termination_id=sampling_params.termination_id,
                     # This endpoint always echoes prompt_token_ids in its response, so
@@ -362,11 +365,7 @@ try:
                 prompt_token_count = len(prompt_tokens_list)
             prompt_tokens_counts.append(prompt_token_count)
 
-            finish_reason = "length"
-            sampling_params_result = result.get("sampling_params") or {}
-            num_tokens_requested = sampling_params_result.get("num_tokens_to_generate")
-            if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
-                finish_reason = "stop"
+            finish_reason = generation_finish_reason(result)
 
             # Under payload offload the engine dropped the per-token log probs from the reply,
             # so the OpenAI logprobs block is absent.

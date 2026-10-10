@@ -443,3 +443,56 @@ async def test_completions_streaming_echoes_each_prompt_first(monkeypatch):
         for choice in payload["choices"]:
             texts[choice["index"]].append(choice["text"])
     assert texts == {0: ["a", "<12><13>", ""], 1: ["b", "<12><13>", ""]}
+
+
+@pytest.mark.asyncio
+@PATHS
+@pytest.mark.parametrize("payload_offloaded", [False, True])
+@pytest.mark.parametrize("reason", ["stop", "length"])
+async def test_engine_finish_reason_wins_at_token_budget(path, payload_offloaded, reason):
+    result = completed_reply(
+        "boundary",
+        [10, 11],
+        [12, 2],
+        finish_reason=reason,
+        sampling_params={"num_tokens_to_generate": 2},
+        payload_offloaded=payload_offloaded,
+    )
+    response = (
+        await build_app(path, ReplyingClient([result]))
+        .test_client()
+        .post(path, json={**BODIES[path], "max_tokens": 2})
+    )
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    payload = await response.get_json()
+    assert payload["choices"][0]["finish_reason"] == reason
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_stop_token_ids_reach_each_request(path):
+    client = ReplyingClient([completed_reply("a", [10], [12]), completed_reply("b", [10], [12])])
+    payload = {**BODIES[path], "stop_token_ids": [0, 7, 7], "ignore_eos": True}
+    if path == CHAT_PATH:
+        payload["n"] = 2
+    else:
+        payload["prompt"] = ["hello", "hello"]
+    response = await build_app(path, client).test_client().post(path, json=payload)
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    assert len(client.sampling_params) == 2
+    for params in client.sampling_params:
+        assert params.stop_token_ids == [0, 7]
+        assert params.termination_id == -1
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_invalid_stop_token_ids_rejected_before_submission(path):
+    client = ReplyingClient([])
+    response = (
+        await build_app(path, client)
+        .test_client()
+        .post(path, json={**BODIES[path], "stop_token_ids": [-1]})
+    )
+    assert response.status_code == 400
+    assert client.sampling_params == []

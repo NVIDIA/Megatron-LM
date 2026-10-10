@@ -5,6 +5,7 @@ import gc
 from collections import deque
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -191,6 +192,7 @@ class _StubEngine(DynamicInferenceEngine):
 
     def __init__(self, context: DynamicInferenceContext, *, enable_chunked_prefill=False):
         self.context = context
+        self.controller = SimpleNamespace(terminating_token_ids=Mock(return_value=frozenset()))
         self.enable_chunked_prefill = enable_chunked_prefill
         self.cuda_graph_all_prefills = False
         self._prefix_coordination_waits = 0
@@ -2138,6 +2140,8 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         assert future.result() is merged
         assert merged.generated_tokens == generated
         assert merged.generated_log_probs == [-0.1, -0.2, -0.3, -0.4]
+        assert merged.finish_reason == "length"
+        engine.controller.terminating_token_ids.assert_called_with(-1, stop_token_ids=None)
         np.testing.assert_array_equal(current.routing_indices, expected)
         np.testing.assert_array_equal(merged.routing_indices, expected)
         assert merged.routing_indices.shape[0] == (
