@@ -3,6 +3,7 @@
 """Unit tests for experimental Megatron-FSDP runtime contexts."""
 
 from unittest.mock import Mock
+from weakref import ref
 
 import pytest
 import torch
@@ -110,6 +111,26 @@ def test_child_then_parent_share_one_context(distributed_setup):
     assert model.inner.context is model.context
     assert model.is_root()
     assert not model.inner.is_root()
+
+
+def test_context_does_not_keep_modules_alive(distributed_setup):
+    """Keeping a finalized context alive must not retain its roots or descendants."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel().to(device)
+
+    with fully_shard_context(device=device) as context:
+        fully_shard(model.inner, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    model_ref = ref(model)
+    child_ref = ref(model.inner)
+    del model
+
+    assert model_ref() is None
+    assert child_ref() is None
+    assert list(context.forward_order) == []
+    assert list(context.backward_order) == []
 
 
 def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
