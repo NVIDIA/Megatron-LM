@@ -32,7 +32,7 @@ from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
-from .schedule import PrefetchOrder, SchedulePolicy
+from .schedule import SchedulePolicy
 
 
 def _is_in_backward() -> bool:
@@ -57,7 +57,7 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Static orders used to drive all-gather prefetch. Each FsdpModule tracks
+    # Construction orders, replaced by runtime order after recording. Each FsdpModule tracks
     # its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
@@ -93,7 +93,7 @@ class FsdpContext:
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
-        self._recorded_prefetch_order: PrefetchOrder | None = None
+        self._recorded_orders: tuple[list[FsdpModule], list[FsdpModule]] | None = None
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
@@ -151,32 +151,41 @@ class FsdpContext:
         return torch.cuda.current_stream(self.allgather_stream.device)
 
     @contextmanager
-    def record_prefetch_order(self) -> Iterator[PrefetchOrder]:
-        """Record demand-unshard occurrences without changing communication.
+    def record_prefetch_order(self) -> Iterator[None]:
+        """Replace prefetch orders with the module calls observed in this scope.
 
-        Enter after construction and include all forwards and backwards whose
-        order is needed, for example all microbatches in a global batch. Each
-        scope yields a fresh order; modules executed outside it are not recorded.
-        The returned order remains available after the scope exits and holds
-        references to its modules. Nested recording scopes are not supported.
+        Include one complete, repeatable execution pattern, such as all forward
+        and backward calls of a global batch. Demand unshards are recorded;
+        recomputation with ``prefetch="none"`` is excluded. Prefetch is disabled
+        while recording, and successful exit installs the observed orders for
+        subsequent runs. Repeated module calls retain distinct successors.
+
+        All ranks must record and replay collective-compatible module orders.
+        Replay requires the same call sequence in each phase; record again when
+        that pattern changes. An empty phase keeps its existing order, and an
+        interrupted scope leaves both orders unchanged. Nested scopes are rejected.
 
         Example:
-            Record one training batch after exiting ``fully_shard_context``::
+            After exiting ``fully_shard_context``, record a training batch::
 
-                with context.record_prefetch_order() as order:
+                with context.record_prefetch_order():
                     model(inputs).sum().backward()
-                forward_names = [module.name for module in order.forward]
-                backward_names = [module.name for module in order.backward]
+                # Subsequent batches prefetch in the observed execution order.
         """
         self.ensure_finalized()
-        if self._recorded_prefetch_order is not None:
+        if self._recorded_orders is not None:
             raise RuntimeError("An FSDP prefetch-order recording is already active.")
-        order = PrefetchOrder()
-        self._recorded_prefetch_order = order
+        forward: list[FsdpModule] = []
+        backward: list[FsdpModule] = []
+        self._recorded_orders = (forward, backward)
         try:
-            yield order
+            yield
+            if forward:
+                self.forward_order = IndexedOrder(forward)
+            if backward:
+                self.backward_order = IndexedOrder(backward)
         finally:
-            self._recorded_prefetch_order = None
+            self._recorded_orders = None
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
@@ -481,18 +490,20 @@ class FsdpModule:
         performs that root sync in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
-            order = self.context._recorded_prefetch_order
-            if order is not None:
+            recorded_orders = self.context._recorded_orders
+            if recorded_orders is not None:
                 if prefetch == "forward":
-                    order.forward.append(self)
+                    recorded_orders[0].append(self)
                 elif prefetch == "backward":
-                    order.backward.append(self)
+                    recorded_orders[1].append(self)
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
             self.context.current_stream().wait_event(self._unshard_event)
 
+            if recorded_orders is not None:
+                return
             context = self.context
             if prefetch == "forward":
                 self._prefetch_parameter_groups(
@@ -507,17 +518,15 @@ class FsdpModule:
         self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
-        next_module = order.next_item(self)
-        if prefetch_size is None:
-            if next_module is not None:
-                next_module._unshard_parameter_groups()
-            return
-
+        successors = order.next_items(self)
         prefetched_size = 0
-        while next_module is not None and prefetched_size < prefetch_size:
+        for next_module in successors:
+            if prefetch_size is not None and prefetched_size >= prefetch_size:
+                break
             next_module._unshard_parameter_groups()
+            if prefetch_size is None:
+                break
             prefetched_size += next_module.num_parameter_elements
-            next_module = order.next_item(next_module)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.

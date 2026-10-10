@@ -14,11 +14,7 @@
 
 """Scheduling configuration for the minimal Megatron-FSDP path."""
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .module import FsdpModule
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -43,16 +39,3 @@ class SchedulePolicy:
                 "backward_prefetch_size must be non-negative, "
                 f"got {self.backward_prefetch_size}."
             )
-
-
-@dataclass
-class PrefetchOrder:
-    """Observed demand-unshard order, separated by forward and backward phase.
-
-    Each list preserves repeated module occurrences and microbatch boundaries
-    are not inferred. Recompute and explicit unshards with ``prefetch="none"``
-    are excluded. Recording does not change the static prefetch schedule.
-    """
-
-    forward: list["FsdpModule"] = field(default_factory=list)
-    backward: list["FsdpModule"] = field(default_factory=list)

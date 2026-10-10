@@ -14,7 +14,7 @@
 
 """Ordered sequence with indexed item lookup."""
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import Generic, TypeVar
 from weakref import WeakKeyDictionary, ref
 
@@ -24,10 +24,19 @@ T = TypeVar("T")
 class IndexedOrder(Generic[T]):
     """Insertion order with weakly held items and successor lookup."""
 
-    def __init__(self) -> None:
-        """Create an empty indexed order."""
+    def __init__(self, items: Iterable[T] | None = None) -> None:
+        """Create a static order or replay a recorded sequence of occurrences.
+
+        Without ``items``, append unique items and look up successors by identity.
+        With ``items``, preserve duplicates and consume one occurrence per
+        ``next_items`` call, restarting after the complete sequence is consumed.
+        """
         self._items: list[ref[T]] = []
         self._index_by_item: WeakKeyDictionary[T, int] = WeakKeyDictionary()
+        self._position: int | None = None
+        if items is not None:
+            self._items = [ref(item) for item in items]
+            self._position = 0
 
     def append(self, item: T) -> None:
         """Append ``item`` to the order.
@@ -38,22 +47,34 @@ class IndexedOrder(Generic[T]):
         Raises:
             ValueError: If ``item`` is already present in the order.
         """
+        if self._position is not None:
+            raise ValueError("Cannot append to a recorded order.")
         if item in self._index_by_item:
             raise ValueError("IndexedOrder does not support duplicate items.")
         self._index_by_item[item] = len(self._items)
         self._items.append(ref(item))
 
     def __iter__(self) -> Iterator[T]:
-        """Iterate over live items in order."""
-        for item_ref in self._items:
-            item = item_ref()
+        """Iterate over live items in order, including repeated occurrences."""
+        return self._live_items(0)
+
+    def _live_items(self, start: int) -> Iterator[T]:
+        for index in range(start, len(self._items)):
+            item = self._items[index]()
             if item is not None:
                 yield item
 
-    def next_item(self, item: T) -> T | None:
-        """Return the live item that follows ``item``, if any."""
-        index = self._index_by_item[item]
-        next_index = index + 1
-        if next_index >= len(self._items):
-            return None
-        return self._items[next_index]()
+    def next_items(self, item: T) -> Iterator[T]:
+        """Consume ``item`` and return its successors within this execution.
+
+        A recorded sequence validates each call before advancing its position.
+        Static orders retain identity-based lookup independent of call order.
+        """
+        if self._position is None:
+            index = self._index_by_item[item]
+        else:
+            index = self._position
+            if not self._items or self._items[index]() is not item:
+                raise RuntimeError("FSDP module calls diverged from the recorded prefetch order.")
+            self._position = (index + 1) % len(self._items)
+        return self._live_items(index + 1)
