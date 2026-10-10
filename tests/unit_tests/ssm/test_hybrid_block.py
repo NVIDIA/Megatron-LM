@@ -735,7 +735,10 @@ class TestHybridBlock:
         model_parallel_cuda_manual_seed(123)
 
     def get_pg_collection(self):
-        return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+        # MoE layers also read the expert and router groups.
+        return ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'pp', 'cp', 'ep', 'expt_tp', 'tp_ep', 'tp_cp', 'tp_dp_cp']
+        )
 
     def test_hybrid_mtp_rejects_expert_parallel_overlap_before_build(self, monkeypatch):
         """Reject overlap before constructing any HybridModel submodule."""
