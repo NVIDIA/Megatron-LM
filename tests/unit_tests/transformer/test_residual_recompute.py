@@ -499,7 +499,7 @@ class TestResidualStreamRecomputeConfig:
             )
 
     def test_inherits_wide_residual_cuda_graph_guard(self):
-        with pytest.raises(NotImplementedError, match="wide_residual does not yet support"):
+        with pytest.raises(NotImplementedError, match="wide_residual supports CUDA graphs only"):
             TransformerConfig(
                 num_layers=2,
                 hidden_size=8,
