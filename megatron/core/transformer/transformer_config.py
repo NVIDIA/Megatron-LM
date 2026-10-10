@@ -1392,9 +1392,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
-    - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and TRT-LLM routed
-      block-scale MoE for MXFP8. The MXFP8 path retains canonical expert weights
-      for refit and also stores a padded TRT-LLM Major-K copy, increasing
+    - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and tanh-clamped
+      squared-ReLU MXFP8, and TRT-LLM routed block-scale MoE for unclamped MXFP8.
+      The MXFP8 paths retain canonical expert weights
+      for refit and also store a derived execution copy, increasing
       expert-weight memory relative to the torch backend.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
@@ -1984,6 +1985,52 @@ class TransformerConfig(ModelParallelConfig):
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and (mxfp8_enabled or self.activation_func_tanh_clamp_scale is not None)
+                and self.activation_func != squared_relu
+            ):
+                raise ValueError(
+                    "FlashInfer MXFP8 or tanh-clamped MoE supports only non-gated squared-ReLU "
+                    "experts."
+                )
+
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and self.activation_func_tanh_clamp_scale is not None
+            ):
+                if not math.isfinite(self.activation_func_tanh_clamp_scale):
+                    raise ValueError("FlashInfer ClampedRelu2 requires a finite clamp scale.")
+                if mxfp8_enabled:
+                    expert_hidden = (
+                        self.moe_latent_size
+                        if self.moe_latent_size is not None
+                        else self.hidden_size
+                    )
+                    expert_ffn = (
+                        self.moe_ffn_hidden_size
+                        if self.moe_ffn_hidden_size is not None
+                        else self.ffn_hidden_size
+                    )
+                    if expert_hidden % 128 or expert_ffn % 128:
+                        raise ValueError(
+                            "FlashInfer CUTLASS MXFP8 requires expert hidden and FFN "
+                            f"dimensions divisible by 128; got ({expert_hidden}, {expert_ffn})."
+                        )
+                if self.add_bias_linear:
+                    raise ValueError(
+                        "FlashInfer CUTLASS ClampedRelu2 requires add_bias_linear=False."
+                    )
+                if self.batch_invariant_mode:
+                    raise ValueError(
+                        "FlashInfer CUTLASS ClampedRelu2 does not support batch_invariant_mode."
+                    )
+                if self.inference_flashinfer_mxfp8_token_capacity is not None:
+                    raise ValueError(
+                        "inference_flashinfer_mxfp8_token_capacity is supported only by the "
+                        "unclamped routed backend, not CUTLASS ClampedRelu2."
+                    )
+
             if mxfp8_enabled:
                 if not self.fp8_param:
                     raise ValueError(
@@ -1991,18 +2038,6 @@ class TransformerConfig(ModelParallelConfig):
                         "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
                         "Please set --fp8-param-gather."
                     )
-
-            if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
-                and mxfp8_enabled
-                and (self.gated_linear_unit or self.activation_func != squared_relu)
-            ):
-                raise ValueError(
-                    "FlashInfer routed MXFP8 MoE currently supports only non-gated "
-                    "squared-ReLU experts. Set activation_func=squared_relu and "
-                    "gated_linear_unit=False, or select inference_grouped_gemm_backend "
-                    "'torch' or 'vllm'."
-                )
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
                 if self.inference_flashinfer_mxfp8_token_capacity <= 0:

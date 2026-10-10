@@ -683,7 +683,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         notes="MXFP8Tensor dispatches the Megatron quantize kernel (replayed: "
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
-        "flashinfer on Blackwell and are not replayed in CI.",
+        "flashinfer on Blackwell. The clamped CUTLASS BF16/MXFP8 adapters are replayed "
+        "by test_flashinfer_clamped_relu2_replays with top-k=1, including CUDA graphs; "
+        "the default atomic top-k finalize and routed backend are not covered by that test.",
     ),
     KernelEntry(
         name="inference_flashinfer_sampling",

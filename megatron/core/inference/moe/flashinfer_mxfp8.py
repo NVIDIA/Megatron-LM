@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""FlashInfer routed-MoE support for MCore MXFP8 expert weights."""
+"""FlashInfer MoE support for MCore MXFP8 expert weights."""
 
 from __future__ import annotations
 
@@ -8,6 +8,16 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+
+try:
+    from flashinfer import mxfp8_quantize
+    from flashinfer.fused_moe import cutlass_fused_moe
+
+    HAVE_FLASHINFER_CUTLASS_MXFP8 = True
+    _FLASHINFER_CUTLASS_MXFP8_IMPORT_ERROR: ImportError | None = None
+except ImportError as exc:
+    HAVE_FLASHINFER_CUTLASS_MXFP8 = False
+    _FLASHINFER_CUTLASS_MXFP8_IMPORT_ERROR = exc
 
 try:
     from flashinfer import mxfp8_quantize, shuffle_matrix_a
@@ -28,6 +38,16 @@ from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 logger = logging.getLogger(__name__)
 _LOGGED_TOKEN_POLICIES: set[tuple[str, int, int]] = set()
+
+
+def require_flashinfer_cutlass_mxfp8() -> None:
+    """Raise an error when the CUTLASS MXFP8 APIs are unavailable."""
+    if not HAVE_FLASHINFER_CUTLASS_MXFP8:
+        raise RuntimeError(
+            "FlashInfer CUTLASS MXFP8 MoE requires mxfp8_quantize and "
+            "cutlass_fused_moe. Upgrade flashinfer-python or select a different "
+            "inference_grouped_gemm_backend."
+        ) from _FLASHINFER_CUTLASS_MXFP8_IMPORT_ERROR
 
 
 def require_flashinfer_routed_mxfp8() -> None:
@@ -53,8 +73,108 @@ class FlashInferRoutedMXFP8Weight:
     padded_cols: int
 
 
+@dataclass(frozen=True)
+class FlashInferCutlassMXFP8Weight:
+    """An expert-weight stack in CUTLASS row-major MXFP8 layout."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+    input_scale: torch.Tensor
+    logical_rows: int
+    logical_cols: int
+
+
 def _round_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+def _pack_cutlass_mxfp8_scale(
+    scale: torch.Tensor, experts: int, rows: int, cols: int
+) -> torch.Tensor:
+    """Repackage existing MXFP8 scales for FlashInfer's CUTLASS interface.
+
+    Each scale occupies one byte and applies to 32 weights. CUTLASS expects four
+    adjacent scale bytes per int32 entry, with shape [experts, rows, cols // 128].
+    Only the tensor view changes: scale values and byte order are preserved.
+    """
+    if rows % 128 or cols % 128:
+        raise ValueError(
+            "FlashInfer CUTLASS MXFP8 requires weight rows and columns divisible "
+            f"by 128; got shape=({rows}, {cols})"
+        )
+    scale_cols = cols // 32
+    if scale.ndim != 2 or scale.shape[0] != experts:
+        raise ValueError(
+            "FlashInfer CUTLASS requires 1D swizzled scales per expert, stacked "
+            "as [experts, bytes]; unswizzled scale matrices are not supported."
+        )
+    scale_u8 = scale.contiguous().view(torch.uint8)
+    expected = experts * rows * scale_cols
+    if scale_u8.numel() != expected:
+        raise ValueError(
+            "unexpected MXFP8 scale size for FlashInfer CUTLASS: "
+            f"got {scale_u8.numel()}, expected {expected} for "
+            f"weight shape=({experts}, {rows}, {cols})"
+        )
+    # The bytes already have the GPU-required SWIZZLE_32_4_4 ordering; keep it intact.
+    # view(int32) groups bytes without changing them; to(int32) would convert values.
+    return scale_u8.reshape(experts, rows, scale_cols).view(torch.int32).contiguous()
+
+
+def prepare_cutlass_mxfp8_weights(
+    weight: MXFP8Tensor, out: FlashInferCutlassMXFP8Weight | None = None
+) -> FlashInferCutlassMXFP8Weight:
+    """View a canonical expert stack as CUTLASS weights, sharing its storage.
+
+    Callers must retain canonical per-expert views for in-place refits. Neither
+    the data nor the scale bytes need a layout conversion for this backend.
+    """
+    require_flashinfer_cutlass_mxfp8()
+    if weight.backend != "triton":
+        raise ValueError(
+            "FlashInfer CUTLASS MXFP8 weights must use MCore's canonical "
+            f"Triton/cuBLAS layout; got backend={weight.backend!r}."
+        )
+    if weight.data.ndim != 3:
+        raise ValueError(f"expected [experts, M, K] MXFP8 data, got {weight.data.shape}")
+    if out is None and (not weight.data.is_contiguous() or not weight.scale.is_contiguous()):
+        raise ValueError(
+            "FlashInfer CUTLASS shared weights require contiguous data and scales; "
+            "copying them would disconnect execution weights from in-place refits."
+        )
+
+    experts, rows, cols = weight.data.shape
+    packed_scale = _pack_cutlass_mxfp8_scale(weight.scale, experts, rows, cols)
+    expected_scale_shape = (experts, rows, cols // 128)
+
+    if out is None:
+        return FlashInferCutlassMXFP8Weight(
+            data=weight.data,
+            scale=packed_scale,
+            input_scale=torch.ones(experts, dtype=torch.float32, device=weight.data.device),
+            logical_rows=rows,
+            logical_cols=cols,
+        )
+
+    if (out.logical_rows, out.logical_cols) != (rows, cols):
+        raise ValueError(
+            "existing FlashInfer CUTLASS MXFP8 metadata changed across refit: "
+            f"got {(out.logical_rows, out.logical_cols)}, expected {(rows, cols)}"
+        )
+    if tuple(out.data.shape) != tuple(weight.data.shape):
+        raise ValueError(
+            "existing FlashInfer CUTLASS MXFP8 data shape changed across refit: "
+            f"got {tuple(out.data.shape)}, expected {tuple(weight.data.shape)}"
+        )
+    if tuple(out.scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "existing FlashInfer CUTLASS MXFP8 scale shape changed across refit: "
+            f"got {tuple(out.scale.shape)}, expected {expected_scale_shape}"
+        )
+    out.data.copy_(weight.data)
+    out.scale.copy_(packed_scale)
+    out.input_scale.fill_(1.0)
+    return out
 
 
 def _unshuffle_cublas_scale(
@@ -247,6 +367,76 @@ def select_routed_mxfp8_active_rows(
     if use_bounded_rows:
         return min(token_capacity, full_rows), "bounded-decode"
     return full_rows, "full"
+
+
+def flashinfer_cutlass_mxfp8_moe(
+    hidden_states: torch.Tensor,
+    routing_map: torch.Tensor,
+    probabilities: torch.Tensor,
+    fc1_weight: FlashInferCutlassMXFP8Weight,
+    fc2_weight: FlashInferCutlassMXFP8Weight,
+    *,
+    ep_size: int,
+    ep_rank: int,
+    activation_type,
+    out: torch.Tensor | None = None,
+    activation_clamp_limit: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run full-row MXFP8 MoE through FlashInfer's CUTLASS backend."""
+    require_flashinfer_cutlass_mxfp8()
+    if hidden_states.dtype != torch.bfloat16:
+        raise TypeError(
+            "FlashInfer CUTLASS MXFP8 expects BF16 source activations, "
+            f"got {hidden_states.dtype}."
+        )
+    if hidden_states.shape[-1] != fc1_weight.logical_cols:
+        raise ValueError(
+            f"hidden size {hidden_states.shape[-1]} does not match FC1 K "
+            f"{fc1_weight.logical_cols}"
+        )
+    if fc2_weight.logical_rows != fc1_weight.logical_cols:
+        raise ValueError("FC2 output size must match the model hidden size")
+    if fc2_weight.logical_cols != fc1_weight.logical_rows:
+        raise ValueError("FC2 K size must match the FC1 output size")
+    if probabilities.dtype != torch.float32:
+        raise TypeError(
+            f"FlashInfer CUTLASS MXFP8 requires FP32 probabilities; got {probabilities.dtype}"
+        )
+
+    quantized_hidden, hidden_scale = mxfp8_quantize(hidden_states.contiguous(), True, 32)
+
+    output = _unwrap_output(
+        cutlass_fused_moe(
+            quantized_hidden,
+            routing_map.to(torch.int32).contiguous(),
+            probabilities.contiguous(),
+            fc1_weight.data,
+            fc2_weight.data,
+            hidden_states.dtype,
+            quant_scales=[
+                fc1_weight.scale,
+                fc1_weight.input_scale,
+                fc2_weight.scale,
+                fc2_weight.input_scale,
+            ],
+            input_sf=hidden_scale,
+            clamped_relu2_limit=activation_clamp_limit,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            use_mxfp8_act_scaling=True,
+            activation_type=activation_type,
+            swizzled_input_sf=True,
+        )
+    )
+
+    if out is not None:
+        if out.shape[0] < output.shape[0] or out.shape[1:] != output.shape[1:]:
+            raise ValueError(
+                f"output buffer shape {tuple(out.shape)} cannot hold {tuple(output.shape)}"
+            )
+        out[: output.shape[0]].copy_(output)
+        return out
+    return output
 
 
 def flashinfer_routed_mxfp8_moe_prequantized(
