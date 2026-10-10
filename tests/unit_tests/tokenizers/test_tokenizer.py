@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -1235,3 +1235,69 @@ def test_load_generation_config_unreadable_file_degrades_gracefully(monkeypatch)
     # Must not raise -- graceful degradation to None, same as the pre-existing
     # behavior for a missing/unreadable local file.
     assert hf_mod._load_generation_config("org/unreachable-model") is None
+
+
+def _bare_hf_tokenizer(use_gigatoken):
+    """HuggingFaceTokenizer with a mocked inner tokenizer, skipping file loading."""
+    tok = object.__new__(HuggingFaceTokenizer)
+    tok.use_gigatoken = use_gigatoken
+    tok.tokenizer = MagicMock()
+    return tok
+
+
+def _bare_text_tokenizer(library):
+    tok = object.__new__(MegatronTokenizerText)
+    tok.library = library
+    tok._tokenizer = MagicMock()
+    return tok
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_hf_encode_batch_gigatoken_delegates():
+    tok = _bare_hf_tokenizer(use_gigatoken=True)
+    expected = object()
+    tok.tokenizer.tokenizer.encode_batch.return_value = expected
+
+    with patch("megatron.core.tokenizers.utils.has_gigatoken_support", return_value=True):
+        assert tok.encode_batch(["a", "b"]) is expected
+
+    tok.tokenizer.tokenizer.encode_batch.assert_called_once_with(["a", "b"], parallel=True)
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_hf_encode_batch_gigatoken_not_installed():
+    tok = _bare_hf_tokenizer(use_gigatoken=True)
+
+    with patch("megatron.core.tokenizers.utils.has_gigatoken_support", return_value=False):
+        with pytest.raises(ModuleNotFoundError, match="gigatoken"):
+            tok.encode_batch(["a"])
+
+    tok.tokenizer.tokenizer.encode_batch.assert_not_called()
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_hf_encode_batch_requires_gigatoken():
+    tok = _bare_hf_tokenizer(use_gigatoken=False)
+
+    with pytest.raises(NotImplementedError, match="use_gigatoken=True"):
+        tok.encode_batch(["a"])
+
+
+@pytest.mark.parametrize("library", ["huggingface", "megatron"])
+def test_tokenize_batch_delegates(library):
+    tok = _bare_text_tokenizer(library)
+    expected = object()
+    tok._tokenizer.encode_batch.return_value = expected
+
+    assert tok.tokenize_batch(["x", "y"]) is expected
+    tok._tokenizer.encode_batch.assert_called_once_with(["x", "y"])
+
+
+@pytest.mark.parametrize("library", ["sentencepiece", "tiktoken", "null-text", "byte-level"])
+def test_tokenize_batch_unsupported_library(library):
+    tok = _bare_text_tokenizer(library)
+
+    with pytest.raises(NotImplementedError, match="huggingface"):
+        tok.tokenize_batch(["x"])
+
+    tok._tokenizer.encode_batch.assert_not_called()
