@@ -2,26 +2,22 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+from megatron.lite.model.deepseek_v4.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.model.deepseek_v4.lite.checkpoint import (
-    EXPERT_CLASSIFIER,
-    PLACEMENT_FN,
     export_hf_weights as _export_hf_weights_impl,
-    load_hf_weights as _load_hf_weights_impl,
-    save_hf_weights as _save_hf_weights_impl,
 )
-from megatron.lite.model.protocol_utils import (
-    add_loss_context_kwargs,
-    nested_from_packed,
-    pack_r3_replay_mask as _pack_r3_replay_mask,
-    pack_routed_experts as _pack_routed_experts,
-    router_replay_roots as router_replay_roots,
-)
+from megatron.lite.model.deepseek_v4.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
+from megatron.lite.model.deepseek_v4.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
+from megatron.lite.model.protocol_utils import add_loss_context_kwargs, nested_from_packed
+from megatron.lite.model.protocol_utils import pack_r3_replay_mask as _pack_r3_replay_mask
+from megatron.lite.model.protocol_utils import pack_routed_experts as _pack_routed_experts
+from megatron.lite.model.protocol_utils import router_replay_roots as router_replay_roots
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
@@ -36,13 +32,12 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
+from megatron.lite.primitive.quantization import QATSpec, apply_qat_to_chunks, normalize_qat_spec
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
-from megatron.lite.primitive.quantization import (
-    QATSpec,
-    apply_qat_to_chunks,
-    normalize_qat_spec,
-)
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
+
+if TYPE_CHECKING:
+    from megatron.lite.primitive.kernels.indexer_topk import IndexerTopKConfig
 
 
 def is_expert_param(name: str) -> bool:
@@ -68,6 +63,18 @@ class ImplConfig:
     num_nextn_predict_layers: int | None = None
     mtp_loss_scaling_factor: float = 0.1
     qat: QATSpec | dict | None = None
+    # How the C4 CSA layers select their indexer top-k in eval mode with gradients disabled
+    # (experimental/lite/docs/indexer_topk.md). None keeps the upstream selectors and imports
+    # nothing of the indexer top-k package.
+    indexer_topk: "IndexerTopKConfig | dict | None" = None
+
+    def __post_init__(self) -> None:
+        if self.indexer_topk is not None:
+            # Validate only (unknown keys and invalid combinations fail here); build_model
+            # passes the value as given to configure_indexer_topk.
+            from megatron.lite.primitive.kernels.indexer_topk import normalize_indexer_topk_config
+
+            normalize_indexer_topk_config(self.indexer_topk)
 
 
 MODULE_MAP = {
@@ -125,12 +132,7 @@ def _as_batch_row(tensor):
     return tensor
 
 
-def _infer_cp_local_seq_len(
-    *,
-    input_ids,
-    position_ids,
-    cp_size,
-):
+def _infer_cp_local_seq_len(*, input_ids, position_ids, cp_size):
     seq_len = input_ids.size(1)
     if cp_size <= 1:
         return seq_len
@@ -201,9 +203,7 @@ def _prepare_packed_contiguous_cp_kwargs(model, kwargs):
 def _prepare_contiguous_cp_kwargs(model, kwargs):
     ps = parallel_state_from_model(model) or ParallelState()
     local_seq_len = _infer_cp_local_seq_len(
-        input_ids=kwargs["input_ids"],
-        position_ids=kwargs.get("position_ids"),
-        cp_size=ps.cp_size,
+        input_ids=kwargs["input_ids"], position_ids=kwargs.get("position_ids"), cp_size=ps.cp_size
     )
     kwargs["input_ids"] = local_sequence_tensor_for_cp(
         kwargs["input_ids"],
@@ -215,10 +215,7 @@ def _prepare_contiguous_cp_kwargs(model, kwargs):
     if kwargs.get("position_ids") is None:
         full_seq_len = local_seq_len * ps.cp_size
         position_ids = contiguous_position_ids_for_cp(
-            full_seq_len,
-            cp_rank=ps.cp_rank,
-            cp_size=ps.cp_size,
-            device=kwargs["input_ids"].device,
+            full_seq_len, cp_rank=ps.cp_rank, cp_size=ps.cp_size, device=kwargs["input_ids"].device
         ).expand(kwargs["input_ids"].size(0), -1)
     else:
         position_ids = local_position_ids_for_cp(
@@ -409,6 +406,14 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
     chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
     _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
+    indexer_topk_extras: dict[str, Any] = {}
+    if impl_cfg.indexer_topk is not None:
+        from megatron.lite.primitive.modules.attention.indexer_topk import configure_indexer_topk
+
+        # The IndexerTopKInstallation, or None for backend "default" (nothing bound).
+        indexer_topk_extras["indexer_topk"] = configure_indexer_topk(
+            chunks, impl_cfg.indexer_topk, native_format="mxfp4"
+        )
 
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     if recompute_spec:
@@ -488,6 +493,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
             "pre_forward_hook": _make_aux_loss_hook(),
+            **indexer_topk_extras,
         },
     )
 
