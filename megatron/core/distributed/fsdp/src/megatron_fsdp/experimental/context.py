@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 from .indexed_order import IndexedOrder
-from .schedule import TraceAndReplayScheduler
+from .schedule import PrefetchOrder
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -45,9 +45,8 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Static orders used to drive all-gather prefetch. We may want to switch to
-    # capturing runtime order if static module order proves too fragile. Each
-    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
+    # Static orders used to drive all-gather prefetch. Each FsdpModule tracks
+    # its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder[nn.Module]
     backward_order: IndexedOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
@@ -66,8 +65,6 @@ class FsdpContext:
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         caller_managed_grad_sync: bool = False,
-        use_trace_replay: bool = False,
-        max_reuse_distance: int | None = 0,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -88,9 +85,6 @@ class FsdpContext:
                 allowing delayed weight gradients or custom backward schedules. The caller must
                 call ``finish_grad_sync()`` after all backward work and before reading or
                 modifying gradients.
-            use_trace_replay: Enable communication replay inside explicit iteration scopes.
-            max_reuse_distance: Maximum intervening logical events for retaining weights.
-                None disables retention; zero allows only immediate reuse.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -103,9 +97,9 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
-        self.scheduler = TraceAndReplayScheduler(max_reuse_distance) if use_trace_replay else None
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
+        self._recorded_prefetch_order: PrefetchOrder | None = None
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
@@ -197,45 +191,33 @@ class FsdpContext:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
 
-    def begin_iteration(self) -> None:
-        """Begin a global batch after construction, before any module execution."""
-        self.ensure_finalized()
-        if self.scheduler is not None:
-            self.scheduler.begin_iteration()
-
-    def end_iteration(self) -> None:
-        """End a global batch after all backward work and before optimizer updates.
-
-        This boundary does not replace ``finish_grad_sync()`` for callers that
-        explicitly manage delayed gradient reductions.
-        """
-        if self.scheduler is not None:
-            self.scheduler.end_iteration()
-
     @contextmanager
-    def iteration(self) -> Iterator[None]:
-        """Scope all microbatches of one global batch, including backward work.
+    def record_prefetch_order(self) -> Iterator[PrefetchOrder]:
+        """Record demand-unshard occurrences without changing communication.
 
-        Trace replay requires the same logical execution pattern each iteration.
-        A mismatch or interrupted iteration is fatal: discard its graph and use a
-        fresh model/runtime rather than resume the failed forward or backward.
-        All ranks must follow collective-compatible control flow; validation
-        cannot undo speculative collectives on rank-divergent paths.
+        Enter after construction and include all forwards and backwards whose
+        order is needed, for example all microbatches in a global batch. Each
+        scope yields a fresh order; modules executed outside it are not recorded.
+        The returned order remains available after the scope exits and holds
+        references to its modules. Nested recording scopes are not supported.
 
         Example:
-            After constructing with ``use_trace_replay=True``, run each batch as::
+            Record one training batch after exiting ``fully_shard_context``::
 
-                optimizer.zero_grad()
-                with context.iteration():
-                    for index, inputs in enumerate(microbatches):
-                        with microbatch(context, is_last=index == len(microbatches) - 1):
-                            (model(inputs).sum() / len(microbatches)).backward()
-                    context.finish_grad_sync()
-                optimizer.step()
+                with context.record_prefetch_order() as order:
+                    model(inputs).sum().backward()
+                forward_names = [module.name for module in order.forward]
+                backward_names = [module.name for module in order.backward]
         """
-        self.begin_iteration()
-        yield
-        self.end_iteration()
+        self.ensure_finalized()
+        if self._recorded_prefetch_order is not None:
+            raise RuntimeError("An FSDP prefetch-order recording is already active.")
+        order = PrefetchOrder()
+        self._recorded_prefetch_order = order
+        try:
+            yield order
+        finally:
+            self._recorded_prefetch_order = None
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
