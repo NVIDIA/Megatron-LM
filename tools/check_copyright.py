@@ -17,6 +17,9 @@ def has_correct_header(file_path):
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
+        # Executable scripts keep their shebang as the first line.
+        if content.startswith('#!'):
+            content = content.partition('\n')[2]
         # Check if the expected header is at the start of the file
         return content.startswith(EXPECTED_HEADER.format(str(datetime.now().year)))
     except Exception as e:
