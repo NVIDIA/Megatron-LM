@@ -15,7 +15,6 @@ from weakref import WeakKeyDictionary
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.inference.quantization.utils import (
     quantize_params_to_mxfp8,
     resolve_mxfp8_backend,
@@ -224,10 +223,13 @@ def _unwrap_model_cores(src_model, target_model):
     """Extract (src_core, tgt_core, num_experts) from model arguments.
 
     Handles list-wrapped modules and None (non-collocated) models.
-    Fills in missing source DP groups for legacy single-mesh models.
 
     Returns:
         (src_core, tgt_core, num_experts)
+
+    Raises:
+        ValueError: If the source model does not declare ``refit_modules`` and its
+            ``pg_collection`` does not set ``dp``.
     """
     src_core = None
     tgt_core = None
@@ -238,13 +240,15 @@ def _unwrap_model_cores(src_model, target_model):
         src_core = unwrap_model(src_lm)
         num_experts = getattr(getattr(src_core, "config", None), "num_moe_experts", None)
         pg = getattr(src_core, "pg_collection", None)
-        # Preserve the legacy single-model fallback; module providers own
-        # their groups independently of any root collection.
+        # Module providers own their groups independently of any root collection.
         if getattr(src_core, "refit_modules", None) is None:
             if pg is None:
                 raise RuntimeError("Source model missing pg_collection required for reshard")
             if getattr(pg, "dp", None) is None:
-                pg.dp = parallel_state.get_data_parallel_group(with_gtp_remat=False)
+                raise ValueError(
+                    "Source model pg_collection must set dp, the data-parallel group that "
+                    "the reshard plan routes over"
+                )
 
     if target_model is not None:
         tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
