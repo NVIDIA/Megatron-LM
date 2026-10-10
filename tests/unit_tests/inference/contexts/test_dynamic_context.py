@@ -3260,7 +3260,7 @@ class TestDynamicContext:
 
         # Ref counts on the shared full blocks should be 2.
         for bid in first_full_blocks:
-            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
+            assert ctx.kv_block_allocator.pc_state.block_ref_counts[bid].item() == 2
 
         # Second request should skip the 3 full cached blocks (96 tokens),
         # leaving only the trailing tokens as the query.
@@ -3360,17 +3360,17 @@ class TestDynamicContext:
 
         # Verify initial ref counts are 2.
         for bid in shared_blocks:
-            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
+            assert ctx.kv_block_allocator.pc_state.block_ref_counts[bid].item() == 2
 
         # Release one request. Ref counts should decrement to 1.
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         for bid in shared_blocks:
-            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 1
+            assert ctx.kv_block_allocator.pc_state.block_ref_counts[bid].item() == 1
 
         # Blocks should still be discoverable via hash map.
         for bid in shared_blocks:
-            h = ctx.kv_block_allocator.block_hashes[bid].item()
-            assert h in ctx.kv_block_allocator.kv_hash_to_block_id
+            h = ctx.kv_block_allocator.pc_state.block_hashes[bid].item()
+            assert h in ctx.kv_block_allocator.registry.kv_hash_to_block_id
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -3446,8 +3446,8 @@ class TestDynamicContext:
         assert new_block != shared_b1
 
         # Shared blocks should remain intact with ref count 2.
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b0].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b1].item() == 2
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -3817,7 +3817,7 @@ class TestDynamicContext:
             [block_a, block_b, block_c, block_d], dtype=torch.int32, device='cpu'
         )
         ctx.request_to_kv_block_ids[3, 0] = block_d
-        ctx.kv_block_allocator.block_ref_counts[blocks] = torch.tensor(
+        ctx.kv_block_allocator.pc_state.block_ref_counts[blocks] = torch.tensor(
             [1, 2, 2, 2], dtype=torch.int32, device='cpu'
         )
 
@@ -3869,8 +3869,8 @@ class TestDynamicContext:
         shared_b1 = ctx.request_to_kv_block_ids[0, 1].item()
 
         # Both blocks should be safely shared with ref count 2
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b0].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b1].item() == 2
 
         # Evicting only the right-most sharer releases no physical blocks. Both
         # requests must be selected before either shared block reaches ref-zero.
@@ -3901,8 +3901,8 @@ class TestDynamicContext:
         assert evicted_ids[0].item() == 1
 
         # req2 remains active, so the shared blocks should drop to a ref count of 1
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 1
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b0].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b1].item() == 1
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -4107,8 +4107,8 @@ class TestDynamicContext:
         assert ctx.request_kv_block_counts[1].item() == 4
 
         # Verify block references updated appropriately
-        assert ctx.kv_block_allocator.block_ref_counts[req1_blocks[2]].item() == 2
-        assert ctx.kv_block_allocator.block_ref_counts[req1_blocks[3]].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[req1_blocks[2]].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[req1_blocks[3]].item() == 2
 
     # ------------------------------------------------------------------ #
     #  Tests for active_logit_idxs / last_token_logits / pad_active_slices

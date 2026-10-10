@@ -7,6 +7,8 @@ import torch
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
+from megatron.core.inference.contexts.prefix_cache_block_state import PrefixCacheBlockState
+from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
 
 POOL_SIZE = 10
 PAUSED_LIMIT = 2
@@ -32,6 +34,17 @@ def _make_context(
         request_kv_block_counts=request_kv_block_counts,
         request_to_kv_block_ids=request_to_kv_block_ids,
         prefix_cache_lru_clock=prefix_cache_lru_clock,
+    )
+
+
+def _pc_allocator(ctx, pool_size, paused_limit, policy=PrefixCachingEvictionPolicy.REF_ZERO):
+    """Prefix-caching allocator with its own per-block state and hash registry."""
+    return KVBlockAllocator(
+        ctx,
+        pool_size=pool_size,
+        paused_limit=paused_limit,
+        pc_state=PrefixCacheBlockState(pool_size, policy),
+        prefix_cache_registry=PrefixCacheRegistry(),
     )
 
 
@@ -100,16 +113,10 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
 
 @pytest.mark.parametrize("policy", list(PrefixCachingEvictionPolicy))
 def test_reset_clears_mtp_successors_before_block_reuse(policy):
-    allocator = KVBlockAllocator(
-        _make_context(),
-        pool_size=POOL_SIZE,
-        paused_limit=PAUSED_LIMIT,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=policy,
-    )
+    allocator = _pc_allocator(_make_context(), POOL_SIZE, PAUSED_LIMIT, policy)
     blocks = allocator.allocate_memory_blocks(2).clone()
     allocator.register_kv_block_hashes(blocks.tolist(), [101, 102], [0, 101])
-    allocator.block_mtp_next_token[blocks] = torch.tensor([42, 43])
+    allocator.pc_state.block_mtp_next_token[blocks] = torch.tensor([42, 43])
 
     allocator.reset()
     reused = allocator.allocate_memory_blocks(2)
@@ -117,12 +124,12 @@ def test_reset_clears_mtp_successors_before_block_reuse(policy):
     # Handoff registration has no MTP successor information. Reusing these IDs
     # must not advertise the previous owner's draft KV as inheritable.
     allocator.register_kv_block_hashes(reused.tolist(), [201, 202], [0, 201])
-    assert (allocator.block_mtp_next_token == -1).all()
-    assert (allocator.block_ref_counts[reused] == 1).all()
-    assert set(allocator.kv_hash_to_block_id) == {201, 202}
+    assert (allocator.pc_state.block_mtp_next_token == -1).all()
+    assert (allocator.pc_state.block_ref_counts[reused] == 1).all()
+    assert set(allocator.registry.kv_hash_to_block_id) == {201, 202}
     if policy == PrefixCachingEvictionPolicy.LRU:
-        assert allocator.block_parent_id[reused[1]].item() == reused[0].item()
-        assert allocator.block_child_count[reused[0]].item() == 1
+        assert allocator.pc_state.block_parent_id[reused[1]].item() == reused[0].item()
+        assert allocator.pc_state.block_child_count[reused[0]].item() == 1
 
 
 def test_reset_under_inference_mode_preserves_mutable_block_bag():
@@ -167,26 +174,20 @@ def test_block_usage_counts_no_prefix_caching(
     [(PrefixCachingEvictionPolicy.LRU, True), (PrefixCachingEvictionPolicy.REF_ZERO, False)],
 )
 def test_prefix_caching_state_layout(policy, expect_timestamps):
-    """Prefix-caching mode allocates block_hashes (initially -1) and ref_counts
+    """PrefixCacheBlockState allocates block_hashes (initially -1) and ref_counts
     (initially 0). LRU policy also allocates timestamps and the persisted
     prefix-forest bookkeeping (block_parent_id / block_child_count); REF_ZERO
-    does not."""
-    a = KVBlockAllocator(
-        _make_context(),
-        pool_size=8,
-        paused_limit=2,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=policy,
-    )
-    assert (a.block_hashes == -1).all().item()
-    assert (a.block_ref_counts == 0).all().item()
-    assert a.kv_hash_to_block_id == {}
-    assert hasattr(a, "block_timestamps") is expect_timestamps
-    assert hasattr(a, "block_parent_id") is expect_timestamps
-    assert hasattr(a, "block_child_count") is expect_timestamps
+    leaves them as None. The hash dict lives on the PrefixCacheRegistry."""
+    a = _pc_allocator(_make_context(), 8, 2, policy)
+    assert (a.pc_state.block_hashes == -1).all().item()
+    assert (a.pc_state.block_ref_counts == 0).all().item()
+    assert a.registry.kv_hash_to_block_id == {}
+    assert (a.pc_state.block_timestamps is not None) is expect_timestamps
+    assert (a.pc_state.block_parent_id is not None) is expect_timestamps
+    assert (a.pc_state.block_child_count is not None) is expect_timestamps
     if expect_timestamps:
-        assert (a.block_parent_id == -1).all().item()
-        assert (a.block_child_count == 0).all().item()
+        assert (a.pc_state.block_parent_id == -1).all().item()
+        assert (a.pc_state.block_child_count == 0).all().item()
 
 
 def test_prefix_caching_allocate_and_hash_registration():
@@ -194,26 +195,20 @@ def test_prefix_caching_allocate_and_hash_registration():
     populates both block_hashes[] and the kv_hash_to_block_id dict; the
     `is_memory_available` short-circuit returns False under REF_ZERO when
     the free pool can't satisfy and no cached blocks are evictable."""
-    a = KVBlockAllocator(
-        _make_context(),
-        pool_size=8,
-        paused_limit=2,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
-    )
+    a = _pc_allocator(_make_context(), 8, 2, PrefixCachingEvictionPolicy.REF_ZERO)
 
     # Newly allocated blocks have ref_count == 1.
     ids = a.allocate_memory_blocks(2)
-    assert (a.block_ref_counts[ids] == 1).all().item()
+    assert (a.pc_state.block_ref_counts[ids] == 1).all().item()
 
     # Hash registration populates both the tensor and the dict. Parent hashes are
     # ignored under REF_ZERO (they only drive LRU eviction ordering), so this mode
     # keeps no per-block parent bookkeeping.
     assert a.register_kv_block_hashes(block_ids=[1, 3], block_hashes=[111, 333]) == [1, 3]
-    assert a.block_hashes[1].item() == 111
-    assert a.block_hashes[3].item() == 333
-    assert not hasattr(a, "block_parent_id")
-    assert a.kv_hash_to_block_id == {111: 1, 333: 3}
+    assert a.pc_state.block_hashes[1].item() == 111
+    assert a.pc_state.block_hashes[3].item() == 333
+    assert a.pc_state.block_parent_id is None
+    assert a.registry.kv_hash_to_block_id == {111: 1, 333: 3}
 
     # Supplying parent hashes is accepted (and ignored) under REF_ZERO.
     a.register_kv_block_hashes(block_ids=[2, 4], block_hashes=[222, 444], parent_hashes=[111, 222])
@@ -224,45 +219,33 @@ def test_prefix_caching_allocate_and_hash_registration():
 
     # Empty inputs are a no-op (avoids zero-element tensor construction).
     assert a.register_kv_block_hashes(block_ids=[], block_hashes=[]) == []
-    assert a.kv_hash_to_block_id == {111: 1, 333: 3, 222: 2, 444: 4}
+    assert a.registry.kv_hash_to_block_id == {111: 1, 333: 3, 222: 2, 444: 4}
 
     # REF_ZERO has no eviction path when the free pool is short.
-    small = KVBlockAllocator(
-        _make_context(),
-        pool_size=4,
-        paused_limit=1,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
-    )
+    small = _pc_allocator(_make_context(), 4, 1, PrefixCachingEvictionPolicy.REF_ZERO)
     assert small.pool_avail == 3
     assert small.get_allocatable_count() == 3
     assert small.is_memory_available(5) is False
 
 
 def test_retain_memory_blocks_adds_one_reference_per_owner():
-    allocator = KVBlockAllocator(
-        _make_context(),
-        pool_size=8,
-        paused_limit=0,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
-    )
+    allocator = _pc_allocator(_make_context(), 8, 0, PrefixCachingEvictionPolicy.REF_ZERO)
     block = allocator.allocate_memory_blocks(1)
     block_id = int(block[0])
     allocator.register_kv_block_hashes([block_id], [101])
 
     allocator.retain_memory_blocks([block_id])
     allocator.retain_memory_blocks([block_id])
-    assert allocator.block_ref_counts[block_id].item() == 3
+    assert allocator.pc_state.block_ref_counts[block_id].item() == 3
 
     allocator.retain_memory_blocks([block_id, block_id])
-    assert allocator.block_ref_counts[block_id].item() == 5
+    assert allocator.pc_state.block_ref_counts[block_id].item() == 5
 
     allocator.release_memory_blocks(block)
     allocator.release_memory_blocks(block)
     allocator.release_memory_blocks(torch.tensor([block_id, block_id, block_id]))
-    assert allocator.block_ref_counts[block_id].item() == 0
-    assert 101 not in allocator.kv_hash_to_block_id
+    assert allocator.pc_state.block_ref_counts[block_id].item() == 0
+    assert 101 not in allocator.registry.kv_hash_to_block_id
 
 
 @pytest.mark.parametrize(
@@ -271,13 +254,7 @@ def test_retain_memory_blocks_adds_one_reference_per_owner():
 def test_release_shared_block_aggregates_duplicate_references(policy):
     """Releasing a shared block once per request decrements every reference but
     returns the physical block to the free pool at most once."""
-    a = KVBlockAllocator(
-        _make_context(),
-        pool_size=6,
-        paused_limit=1,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=policy,
-    )
+    a = _pc_allocator(_make_context(), 6, 1, policy)
     block = a.allocate_memory_blocks(1)
     block_id = int(block.item())
     raw_avail_after_allocate = a.pool_avail
@@ -285,18 +262,18 @@ def test_release_shared_block_aggregates_duplicate_references(policy):
 
     # Model two requests sharing the same registered prefix block, then release
     # both request references in one batched call.
-    a.block_ref_counts[block_id] = 2
+    a.pc_state.block_ref_counts[block_id] = 2
     a.release_memory_blocks(block.repeat(2))
 
-    assert a.block_ref_counts[block_id].item() == 0
+    assert a.pc_state.block_ref_counts[block_id].item() == 0
     if policy == PrefixCachingEvictionPolicy.REF_ZERO:
-        assert a.block_hashes[block_id].item() == -1
+        assert a.pc_state.block_hashes[block_id].item() == -1
         assert a.pool_avail == raw_avail_after_allocate + 1
         assert a.get_total_used() == 0
     else:
         # LRU keeps the physical block outside the free pool but exposes it
         # through get_allocatable_count because it is now evictable.
-        assert a.block_hashes[block_id].item() == 111
+        assert a.pc_state.block_hashes[block_id].item() == 111
         assert a.pool_avail == raw_avail_after_allocate
         assert a.get_allocatable_count() == raw_avail_after_allocate + 1
         assert a.get_total_used() == 1
@@ -328,7 +305,7 @@ def test_block_usage_counts_with_prefix_caching(
         total_request_count=total,
         request_to_kv_block_ids=request_to_kv,
     )
-    a = KVBlockAllocator(ctx, pool_size=POOL_SIZE, paused_limit=3, enable_prefix_caching=True)
+    a = _pc_allocator(ctx, POOL_SIZE, 3)
     assert a.get_active_used() == expected_active
     assert a.get_paused_used() == expected_paused
 
@@ -339,53 +316,41 @@ def test_release_shared_block_decrements_once_per_owner():
     reaching ref 0 with a duplicated ID is freed/deregistered exactly once."""
     # REF_ZERO: three owners of a shared block finish in stages, with a private
     # block mixed into the final batch.
-    a = KVBlockAllocator(
-        _make_context(),
-        pool_size=8,
-        paused_limit=2,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
-    )
+    a = _pc_allocator(_make_context(), 8, 2, PrefixCachingEvictionPolicy.REF_ZERO)
     ids = a.allocate_memory_blocks(2)  # ref_count == 1 each
     shared, private = int(ids[0]), int(ids[1])
     a.register_kv_block_hashes(block_ids=[shared], block_hashes=[111])
-    a.block_ref_counts[shared] += 2  # two more owners pin the shared block -> ref 3
+    a.pc_state.block_ref_counts[shared] += 2  # two more owners pin the shared block -> ref 3
     avail0 = a.pool_avail
 
     # One owner finishes alone: ref 3 -> 2, nothing freed yet.
     a.release_memory_blocks(torch.tensor([shared], dtype=torch.int32))
-    assert a.block_ref_counts[shared].item() == 2
+    assert a.pc_state.block_ref_counts[shared].item() == 2
     assert a.pool_avail == avail0
-    assert 111 in a.kv_hash_to_block_id
+    assert 111 in a.registry.kv_hash_to_block_id
 
     # The final two owners and the private request finish in one batch: the
     # shared block appears twice and both decrements must land (ref 2 -> 0).
     a.release_memory_blocks(torch.tensor([shared, private, shared], dtype=torch.int32))
-    assert a.block_ref_counts[shared].item() == 0
-    assert a.block_ref_counts[private].item() == 0
+    assert a.pc_state.block_ref_counts[shared].item() == 0
+    assert a.pc_state.block_ref_counts[private].item() == 0
     # Two distinct blocks return to the pool; the shared one only once (not twice).
     assert a.pool_avail == avail0 + 2
-    assert 111 not in a.kv_hash_to_block_id  # deregistered exactly once
+    assert 111 not in a.registry.kv_hash_to_block_id  # deregistered exactly once
     free_region = a.block_bag[: a.pool_avail].tolist()
     assert len(set(free_region)) == len(free_region)  # no double-returned id
 
     # LRU: a hashed shared block released by both owners in one batch must hit
     # ref 0 (becoming evictable), not stall at 1 with a leaked reference. A hashed
     # block stays cached for reuse rather than returning to the pool.
-    lru = KVBlockAllocator(
-        _make_context(),
-        pool_size=8,
-        paused_limit=2,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
-    )
+    lru = _pc_allocator(_make_context(), 8, 2, PrefixCachingEvictionPolicy.LRU)
     lshared = int(lru.allocate_memory_blocks(1)[0])
     lru.register_kv_block_hashes(block_ids=[lshared], block_hashes=[333], parent_hashes=[0])
-    lru.block_ref_counts[lshared] += 1  # second owner -> ref 2
+    lru.pc_state.block_ref_counts[lshared] += 1  # second owner -> ref 2
     lru.release_memory_blocks(torch.tensor([lshared, lshared], dtype=torch.int32))
-    assert lru.block_ref_counts[lshared].item() == 0
+    assert lru.pc_state.block_ref_counts[lshared].item() == 0
     assert int(lru.get_evictable_block_count()) == 1
-    assert lru.block_hashes[lshared].item() == 333  # kept cached, not pool-returned
+    assert lru.pc_state.block_hashes[lshared].item() == 333  # kept cached, not pool-returned
 
 
 # ---------------------------------------------------------------------------
@@ -395,13 +360,7 @@ def test_release_shared_block_decrements_once_per_owner():
 
 def _lru_allocator(pool_size=16, paused_limit=1):
     """LRU-mode prefix-caching allocator over a fresh fake context."""
-    return KVBlockAllocator(
-        _make_context(),
-        pool_size=pool_size,
-        paused_limit=paused_limit,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
-    )
+    return _pc_allocator(_make_context(), pool_size, paused_limit, PrefixCachingEvictionPolicy.LRU)
 
 
 def _seed_cached_chain(a, block_ids, hashes, parents, timestamps):
@@ -409,19 +368,19 @@ def _seed_cached_chain(a, block_ids, hashes, parents, timestamps):
     timestamps, bypassing the allocation path to control the layout directly."""
     a.register_kv_block_hashes(block_ids=block_ids, block_hashes=hashes, parent_hashes=parents)
     ids = torch.tensor(block_ids, dtype=torch.int64)
-    a.block_ref_counts[ids] = 0  # cached / evictable
-    a.block_timestamps[ids] = torch.tensor(timestamps, dtype=torch.int64)
-    # Mark the blocks as out of the free pool so _deregister_blocks (which pushes
-    # them back) keeps pool_avail bookkeeping consistent.
+    a.pc_state.block_ref_counts[ids] = 0  # cached / evictable
+    a.pc_state.block_timestamps[ids] = torch.tensor(timestamps, dtype=torch.int64)
+    # Mark the blocks as out of the free pool so eviction (which pushes them back)
+    # keeps pool_avail bookkeeping consistent.
     a.pool_avail -= len(block_ids)
 
 
 def _assert_prefix_invariant(a):
     """Every cached block must have its parent cached too (or be a root). This is
     exactly the invariant _find_kv_match_count relies on."""
-    cached_ids = set(a.kv_hash_to_block_id.values())
-    for block_hash, block_id in a.kv_hash_to_block_id.items():
-        parent_id = a.block_parent_id[block_id].item()
+    cached_ids = set(a.registry.kv_hash_to_block_id.values())
+    for block_hash, block_id in a.registry.kv_hash_to_block_id.items():
+        parent_id = a.pc_state.block_parent_id[block_id].item()
         if parent_id >= 0:
             assert parent_id in cached_ids, (
                 f"dangling child: block {block_id} (hash {block_hash}) parent "
@@ -441,11 +400,11 @@ def test_evict_lru_never_orphans_a_child():
 
     assert a.evict_lru_blocks(1) is True
     # The leaf (b2, hash 30) is evicted, not the older parent b1 (hash 20).
-    assert a.kv_hash_to_block_id == {10: 0, 20: 1}
-    assert a.block_hashes[2].item() == -1
-    assert a.block_parent_id[2].item() == -1
+    assert a.registry.kv_hash_to_block_id == {10: 0, 20: 1}
+    assert a.pc_state.block_hashes[2].item() == -1
+    assert a.pc_state.block_parent_id[2].item() == -1
     # Evicting the leaf drops it from its parent's child count.
-    assert a.block_child_count[1].item() == 0
+    assert a.pc_state.block_child_count[1].item() == 0
     _assert_prefix_invariant(a)
 
 
@@ -459,7 +418,7 @@ def test_evict_lru_cascades_up_the_chain():
 
     assert a.evict_lru_blocks(2) is True
     # b2 then b1 evicted; only the root b0 remains.
-    assert a.kv_hash_to_block_id == {10: 0}
+    assert a.registry.kv_hash_to_block_id == {10: 0}
     _assert_prefix_invariant(a)
 
 
@@ -474,7 +433,7 @@ def test_evict_lru_normal_lru_order_when_leaf_is_oldest():
     )
 
     assert a.evict_lru_blocks(1) is True
-    assert a.kv_hash_to_block_id == {10: 0, 20: 1}
+    assert a.registry.kv_hash_to_block_id == {10: 0, 20: 1}
     _assert_prefix_invariant(a)
 
 
@@ -489,12 +448,12 @@ def test_evict_lru_branching_prefix_tree():
 
     # Evicting one block takes a leaf (b1, the older child), never the parent.
     assert a.evict_lru_blocks(1) is True
-    assert a.kv_hash_to_block_id == {10: 0, 30: 2}
+    assert a.registry.kv_hash_to_block_id == {10: 0, 30: 2}
     _assert_prefix_invariant(a)
 
     # Evicting the second child leaves only the parent.
     assert a.evict_lru_blocks(1) is True
-    assert a.kv_hash_to_block_id == {10: 0}
+    assert a.registry.kv_hash_to_block_id == {10: 0}
     _assert_prefix_invariant(a)
 
 
@@ -514,8 +473,8 @@ def test_evict_lru_cached_child_with_pinned_parent_treated_as_root():
     # S0 pinned (active request), S1 and SX cached/evictable. S0 is the OLDEST
     # (ts=0) — a pin-blind oldest-first eviction would wrongly take it and orphan
     # nothing here, but in general orphan its children.
-    a.block_ref_counts[ids] = torch.tensor([1, 0, 0], dtype=torch.int32)
-    a.block_timestamps[ids] = torch.tensor([0, 1, 9], dtype=torch.int64)
+    a.pc_state.block_ref_counts[ids] = torch.tensor([1, 0, 0], dtype=torch.int32)
+    a.pc_state.block_timestamps[ids] = torch.tensor([0, 1, 9], dtype=torch.int64)
     a.pool_avail -= 3
 
     # Only S1 and SX are candidates; the pinned S0 is excluded.
@@ -523,16 +482,16 @@ def test_evict_lru_cached_child_with_pinned_parent_treated_as_root():
 
     # Evict one: S1 (ts=1) is the oldest candidate and a leaf; evicted first.
     assert a.evict_lru_blocks(1) is True
-    assert a.kv_hash_to_block_id == {10: 0, 30: 2}  # S0 (pinned) + SX survive
-    assert a.block_ref_counts[0].item() == 1  # parent still pinned
-    assert a.block_hashes[0].item() == 10  # parent hash intact
-    assert a.block_hashes[1].item() == -1  # child deregistered
+    assert a.registry.kv_hash_to_block_id == {10: 0, 30: 2}  # S0 (pinned) + SX survive
+    assert a.pc_state.block_ref_counts[0].item() == 1  # parent still pinned
+    assert a.pc_state.block_hashes[0].item() == 10  # parent hash intact
+    assert a.pc_state.block_hashes[1].item() == -1  # child deregistered
     _assert_prefix_invariant(a)
 
     # Evict again: only SX remains as a candidate; S0 stays pinned throughout.
     assert a.evict_lru_blocks(1) is True
-    assert a.kv_hash_to_block_id == {10: 0}
-    assert a.block_ref_counts[0].item() == 1
+    assert a.registry.kv_hash_to_block_id == {10: 0}
+    assert a.pc_state.block_ref_counts[0].item() == 1
     # The pinned parent can never be evicted, so a third eviction fails.
     assert a.evict_lru_blocks(1) is False
 
@@ -553,10 +512,10 @@ def test_evict_lru_partial_chain_eviction_peels_from_leaf_keeping_root():
 
     assert a.evict_lru_blocks(2) is True
     # Leaf C and its parent B are evicted; the root A survives despite being oldest.
-    assert a.kv_hash_to_block_id == {10: 0}
-    assert a.block_hashes[0].item() == 10  # root A retained
-    assert a.block_hashes[1].item() == -1  # B deregistered
-    assert a.block_hashes[2].item() == -1  # C deregistered
+    assert a.registry.kv_hash_to_block_id == {10: 0}
+    assert a.pc_state.block_hashes[0].item() == 10  # root A retained
+    assert a.pc_state.block_hashes[1].item() == -1  # B deregistered
+    assert a.pc_state.block_hashes[2].item() == -1  # C deregistered
     _assert_prefix_invariant(a)
 
 
@@ -566,7 +525,7 @@ def test_evict_lru_insufficient_cached_blocks_returns_false():
     a = _lru_allocator()
     _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[0, 10], timestamps=[1, 2])
     assert a.evict_lru_blocks(3) is False
-    assert a.kv_hash_to_block_id == {10: 0, 20: 1}
+    assert a.registry.kv_hash_to_block_id == {10: 0, 20: 1}
 
 
 def test_evict_lru_keeps_hottest_leaf_over_cold_interior_parent():
@@ -592,9 +551,9 @@ def test_evict_lru_keeps_hottest_leaf_over_cold_interior_parent():
     assert a.evict_lru_blocks(3) is True
     # Evicted F(3), C(5), then B(2) once childless. Retains A, D, and the hottest
     # block E -- never evicting E in favor of the colder interior B.
-    assert a.kv_hash_to_block_id == {10: 0, 50: 4, 60: 5}
-    assert a.block_hashes[5].item() == 60  # hottest leaf E retained
-    assert a.block_hashes[1].item() == -1  # cold interior B evicted
+    assert a.registry.kv_hash_to_block_id == {10: 0, 50: 4, 60: 5}
+    assert a.pc_state.block_hashes[5].item() == 60  # hottest leaf E retained
+    assert a.pc_state.block_hashes[1].item() == -1  # cold interior B evicted
     _assert_prefix_invariant(a)
 
 
@@ -614,22 +573,22 @@ def test_register_existing_block_is_idempotent_and_keeps_parent_evictable():
     """
     a = _lru_allocator()
     _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[0, 10], timestamps=[1, 2])
-    assert a.block_child_count[0].item() == 1
+    assert a.pc_state.block_child_count[0].item() == 1
 
     # Re-register the child exactly as it stands: same block, hash and parent.
     assert a.register_kv_block_hashes(block_ids=[1], block_hashes=[20], parent_hashes=[10]) == []
 
     # The chain is unchanged -- one child on the parent, not two.
-    assert a.block_child_count[0].item() == 1
-    assert a.block_child_count[1].item() == 0
-    assert a.block_parent_id[1].item() == 0
-    assert a.kv_hash_to_block_id == {10: 0, 20: 1}
+    assert a.pc_state.block_child_count[0].item() == 1
+    assert a.pc_state.block_child_count[1].item() == 0
+    assert a.pc_state.block_parent_id[1].item() == 0
+    assert a.registry.kv_hash_to_block_id == {10: 0, 20: 1}
 
     # Both cached blocks stay reachable by the leaf peel: B is evicted first,
     # which makes A childless and evictable in turn.
     assert int(a.get_evictable_block_count()) == 2
     assert a.evict_lru_blocks(2) is True
-    assert a.kv_hash_to_block_id == {}
+    assert a.registry.kv_hash_to_block_id == {}
     _assert_prefix_invariant(a)
 
 
@@ -645,17 +604,17 @@ def test_register_mixed_batch_skips_only_the_already_registered_blocks():
         block_ids=[1, 2, 3], block_hashes=[20, 30, 40], parent_hashes=[10, 20, 30]
     )
     assert registered == [2, 3]
-    a.block_ref_counts[torch.tensor([2, 3])] = 0
+    a.pc_state.block_ref_counts[torch.tensor([2, 3])] = 0
     a.pool_avail -= 2
 
-    assert a.kv_hash_to_block_id == {10: 0, 20: 1, 30: 2, 40: 3}
-    assert a.block_parent_id[2].item() == 1  # resolved through the skipped block
-    assert a.block_parent_id[3].item() == 2
-    assert a.block_child_count.tolist()[:4] == [1, 1, 1, 0]
+    assert a.registry.kv_hash_to_block_id == {10: 0, 20: 1, 30: 2, 40: 3}
+    assert a.pc_state.block_parent_id[2].item() == 1  # resolved through the skipped block
+    assert a.pc_state.block_parent_id[3].item() == 2
+    assert a.pc_state.block_child_count.tolist()[:4] == [1, 1, 1, 0]
 
     # The whole chain peels leaf-first without stalling.
     assert a.evict_lru_blocks(4) is True
-    assert a.kv_hash_to_block_id == {}
+    assert a.registry.kv_hash_to_block_id == {}
     _assert_prefix_invariant(a)
 
 
@@ -673,8 +632,8 @@ def test_register_rejects_hash_change_on_a_registered_block():
     assert a.evict_lru_blocks(1) is True
     a.pool_avail -= 1
     a.register_kv_block_hashes(block_ids=[1], block_hashes=[99], parent_hashes=[10])
-    assert a.kv_hash_to_block_id == {10: 0, 99: 1}
-    assert a.block_child_count[0].item() == 1
+    assert a.registry.kv_hash_to_block_id == {10: 0, 99: 1}
+    assert a.pc_state.block_child_count[0].item() == 1
 
 
 def test_evict_lru_asserts_on_cyclic_parent_graph():
@@ -705,7 +664,7 @@ def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
     # drops to 0 and the hash is retained, but the block stays out of the free
     # pool (pool_avail unchanged).
     a.register_kv_block_hashes(block_ids=[0, 1], block_hashes=[10, 20], parent_hashes=[0, 10])
-    a.block_ref_counts[torch.tensor([0, 1])] = 0
+    a.pc_state.block_ref_counts[torch.tensor([0, 1])] = 0
     assert a.pool_avail == 0
     assert a.get_allocatable_count() == 2
     assert int(a.get_evictable_block_count()) == 2
@@ -725,7 +684,7 @@ def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
     assert allocated is not None and allocated.numel() == 2
     assert a.pool_avail == 0
     assert a.get_allocatable_count() == 0
-    assert a.kv_hash_to_block_id == {}
+    assert a.registry.kv_hash_to_block_id == {}
 
 
 def _reference_leaf_peel(block_ids, hashes, parents, timestamps, k_evict):
@@ -785,7 +744,7 @@ def test_evict_lru_preserves_invariant_under_random_chains():
         expected_evicted = _reference_leaf_peel(block_ids, hashes, parents, timestamps, k_evict)
 
         assert a.evict_lru_blocks(k_evict) is True
-        retained = set(a.kv_hash_to_block_id.values())
+        retained = set(a.registry.kv_hash_to_block_id.values())
         assert retained == set(block_ids) - expected_evicted
         assert len(retained) == n - k_evict
         _assert_prefix_invariant(a)

@@ -574,6 +574,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/inference/contexts/dynamic_context.py",
             "megatron/core/inference/contexts/kv_block_allocator.py",
+            "megatron/core/inference/contexts/prefix_cache_block_state.py",
             "megatron/core/context_parallel/layout.py",
         ),
         kind="torch-op",
