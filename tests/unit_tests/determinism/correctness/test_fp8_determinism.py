@@ -10,6 +10,7 @@ modes don't depend on parallelism degree):
                        the runner's ``_reset_quantizer_state`` between runs
                        A and B (per-module ``fp8_meta`` carries amax across
                        forward passes).
+* ``fp8-blockwise``  — blockwise FP8 scaling.
 * ``fp8-mxfp8``      — Blackwell-only microscaling FP8; capability-skipped on Hopper.
 * ``fp4-nvfp4``      — Blackwell-only NVFP4 block scaling; capability-skipped on Hopper.
 """
@@ -30,6 +31,7 @@ RUNNER = make_gpt_runner(supports_pp=False)
 _QUANT_RECIPES = [
     pytest.param({"fp8": "hybrid", "fp8_recipe": "tensorwise"}, id="fp8-tensorwise"),
     pytest.param({"fp8": "hybrid", "fp8_recipe": "delayed"}, id="fp8-delayed"),
+    pytest.param({"fp8": "hybrid", "fp8_recipe": "blockwise"}, id="fp8-blockwise"),
     pytest.param(
         {"fp8": "hybrid", "fp8_recipe": "mxfp8"},
         id="fp8-mxfp8",
@@ -99,3 +101,26 @@ class TestQuantizationDeterminism:
             backward=False,
             what="grouped MXFP8 parameter update",
         )
+
+    @pytest.mark.internal
+    def test_blockwise_recipe_guards_zero_backward_blocks(self):
+        """The blockwise recipe must keep a finite scale for zero E5M2 wgrad blocks."""
+        from megatron.core.enums import Fp8Recipe
+        from megatron.core.fp8_utils import HAVE_TE, get_fp8_recipe, is_te_min_version
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        if not HAVE_TE or not is_te_min_version("2.3.0.dev0"):
+            pytest.skip("blockwise FP8 recipe requires Transformer Engine >= 2.3")
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=2,
+            fp8="hybrid",
+            fp8_recipe=Fp8Recipe.blockwise,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+        )
+        recipe = get_fp8_recipe(config)
+        assert recipe.fp8_quant_bwd_grad.amax_epsilon == pytest.approx(1e-12)
