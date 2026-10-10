@@ -97,3 +97,6 @@ megatron/rl/ @NVIDIA/reinforcement-learning
 examples/rl/ @NVIDIA/reinforcement-learning
 tests/unit_tests/rl/ @NVIDIA/reinforcement-learning
 train_rl.py @NVIDIA/reinforcement-learning
+
+megatron/diffusion/ @NVIDIA/diffusion
+tests/unit_tests/diffusion/ @NVIDIA/diffusion
