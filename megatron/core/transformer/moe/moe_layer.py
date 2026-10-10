@@ -8,7 +8,7 @@ from typing import Optional, Protocol
 
 import torch
 
-from megatron.core import tensor_parallel, utils
+from megatron.core import utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
@@ -35,6 +35,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     NVLSAllGatherVDispatcher,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
@@ -62,9 +63,9 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, TENorm, te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, TENorm
 else:
-    TELinear, TENorm, te_checkpoint = None, None, None
+    TELinear, TENorm = None, None
 
 
 class ExpertsInterface(Protocol):
@@ -590,18 +591,9 @@ class MoELayer(BaseMoELayer):
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
             if self.shared_experts_recompute:
-                if self.config.fp8 or self.config.fp4:
-                    shared_expert_output = te_checkpoint(
-                        apply_module(self.shared_experts),
-                        False,
-                        tensor_parallel.random.get_cuda_rng_tracker,
-                        self.tp_group,
-                        hidden_states,
-                    )
-                else:
-                    shared_expert_output = tensor_parallel.checkpoint(
-                        apply_module(self.shared_experts), False, hidden_states
-                    )
+                shared_expert_output = precision_aware_checkpoint(
+                    apply_module(self.shared_experts), self.config, self.tp_group, hidden_states
+                )
             else:
                 shared_expert_output = apply_module(self.shared_experts)(hidden_states)
 
@@ -770,20 +762,14 @@ class MoELayer(BaseMoELayer):
             return output, mlp_bias
 
         if self.moe_layer_recompute and self.training:
-            if self.config.fp8 or self.config.fp4:
-                outputs = te_checkpoint(
-                    custom_forward,
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.tp_group,
-                    hidden_states,
-                    intermediate_tensors,
-                    padding_mask,
-                )
-            else:
-                outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
-                )
+            outputs = precision_aware_checkpoint(
+                custom_forward,
+                self.config,
+                self.tp_group,
+                hidden_states,
+                intermediate_tensors,
+                padding_mask,
+            )
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 

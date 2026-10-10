@@ -2,15 +2,16 @@
 
 """Utilities for transformer layers."""
 
+import functools
 import gc
 import logging
 import os
 from operator import itemgetter
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.enums import AttnBackend
@@ -601,3 +602,46 @@ def is_layer_window_attention(
         f"Invalid `window_attn_skip_freq`: {type(window_attn_skip_freq)}, "
         f"{window_attn_skip_freq}"
     )
+
+
+def precision_aware_checkpoint(
+    function: Callable[..., Any],
+    config: 'TransformerConfig',
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    /,
+    *args: Any,
+    distribute_saved_activations: bool = False,
+    **kwargs: Any,
+) -> Any:
+    """Activation-checkpoint ``function`` with the implementation its precision requires.
+
+    FP8 and FP4 recompute must go through Transformer Engine's checkpoint, because FP4 is
+    also implemented with TE's ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``). Other
+    precisions use ``tensor_parallel.checkpoint``.
+
+    Args:
+        function: Callable to checkpoint.
+        config: Transformer config whose ``fp8`` and ``fp4`` fields select the implementation.
+        tp_group: Tensor-parallel group for Transformer Engine's checkpoint.
+        *args: Positional arguments for ``function``.
+        distribute_saved_activations: Passed through to the checkpoint implementation.
+        **kwargs: Keyword arguments for ``function``.
+
+    Returns:
+        The output of ``function``.
+    """
+    if config.fp8 or config.fp4:
+        # Imported lazily to avoid a circular import.
+        from megatron.core.extensions.transformer_engine import te_checkpoint
+
+        return te_checkpoint(
+            function,
+            distribute_saved_activations,
+            tensor_parallel.random.get_cuda_rng_tracker,
+            tp_group,
+            *args,
+            **kwargs,
+        )
+    if kwargs:
+        function = functools.partial(function, **kwargs)
+    return tensor_parallel.checkpoint(function, distribute_saved_activations, *args)
