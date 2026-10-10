@@ -163,3 +163,14 @@ The operator-level numerical test
 (`smoke/model/test_magi_attention_e2e.py`) require a real MagiAttention
 build; they are marked `optional` and run through their dedicated venv-based
 runner. See `../docs/magi_attention.md` and `run_magi_attention_e2e.sh`.
+
+## Optional Indexer Top-K Suites
+
+The LiteTopK plugins and the exact-tie top-k package of the optional indexer
+top-k selectors are external dependencies. The CPU tests use fake plugins and
+run in the standard workflow. The GPU tests under
+`smoke/primitive/indexer_topk/` and the `indexer_topk` case of
+`smoke/model/glm5/lite/test_glm5_lite_cp_smoke.py` are marked `optional`; the
+ones that need a plugin or the exact-tie package skip unless its location is
+given through `LITETOPK_TEST_SELECTORS`, `LITETOPK_TEST_EXACT_TOPK` or
+`LITETOPK_TEST_PLUGINS`. See `../docs/indexer_topk.md#optional-tests`.
