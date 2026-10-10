@@ -81,6 +81,7 @@ def test_inference_pipeline(
         "Some request IDs from groundtruth are missing in current or current has unexpected IDs: "
         f"{sorted(groundtruth_request_ids)} vs {sorted(current_request_ids)}"
     )
+    assert current_request_ids or not groundtruth_request_ids, "No current requests to validate."
     if groundtruth_request_ids != current_request_ids:
         logger.warning(
             "Some request IDs from groundtruth are missing in output; only the subset of ids in groundtruth will be tested: "
@@ -148,7 +149,7 @@ def test_inference_pipeline(
         # TODO: Compare liftime_prefill_token_count to groundtruth
         pass
 
-    for request_id in groundtruth_request_ids:
+    for request_id in current_request_ids:
         groundtruth_results = output_groundtruth[request_id]
         current_results = output_current[request_id]
 
