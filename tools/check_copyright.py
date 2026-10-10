@@ -43,10 +43,12 @@ def main():
 
         if not path.exists():
             print(f"File not found: {file_path}")
+            missing_headers.append(path)
             continue
 
         if not path.is_file():
             print(f"Not a file: {file_path}")
+            missing_headers.append(path)
             continue
 
         if has_correct_header(path):
