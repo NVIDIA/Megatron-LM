@@ -3,7 +3,7 @@
 import contextlib
 from functools import partial
 from itertools import chain
-from typing import Callable, Dict, Iterator, List, Optional, Union
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 from torch.autograd.variable import Variable
@@ -23,6 +23,9 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    require_process_groups,
+    resolve_process_groups,
+    warn_global_process_group_fallback,
 )
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
 from megatron.core.transformer.moe.paged_stash import paged_stash_reset
@@ -143,11 +146,23 @@ def get_forward_backward_func(
         data-parallel ranks have fully reduced gradients. This is useful for easier wgrad saving
         (can just inspect DP replica 0 to get full set of wgrads for entire model).
 
+    pg_collection (ProcessGroupCollection, optional): The model's process groups. The schedules
+        read tp and cp, and pass the collection to config.finalize_model_grads_func. Omitting it
+        is deprecated: the schedule then warns and uses the global process groups in
+        parallel_state.
+
+    p2p_communicator (P2PCommunicator, optional): Communicator over the pipeline-parallel group
+        of pg_collection. The pipelined schedules take both arguments or neither; the
+        non-pipelined schedule does not use it.
+
     Args:
-        pp_size (Optional[int]): Pipeline model parallel size to use.
-        vp_size (Optional[int]): Virtual pipeline model parallel size to use.
-            If both pp_size and vp_size are None, both values fall back to parallel_state.
-            Otherwise, provided values are used as-is and None is treated as an explicit input.
+        pp_size (Optional[int]): Pipeline model parallel size to use, for example
+            ``pg_collection.pp.size()``.
+        vp_size (Optional[int]): Virtual pipeline model parallel size to use, for example
+            ``config.virtual_pipeline_model_parallel_size``.
+            If both pp_size and vp_size are None, both values fall back to parallel_state; this
+            fallback is deprecated and warns. Otherwise, provided values are used as-is and None
+            is treated as an explicit input.
         schedule_pg_collection (Optional[MultiModuleProcessGroupCollection]): When a
             multi-module (cross-grid) collection is passed, select the bridge schedule.
 
@@ -156,6 +171,9 @@ def get_forward_backward_func(
         return forward_backward_pipelining_without_interleaving
 
     if pp_size is None and vp_size is None:
+        warn_global_process_group_fallback(
+            "get_forward_backward_func", "pp_size/vp_size", deprecated_in="0.21", removed_in="0.23"
+        )
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
@@ -677,37 +695,78 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
-def _build_default_pg_collection() -> ProcessGroupCollection:
-    """Build a ``ProcessGroupCollection`` from the global ``parallel_state`` defaults.
+# The fields that a schedule, and the functions it passes its collection to, read: tp and cp
+# (tensor shapes, loss scaling), pp (the default pipeline communicator), tp_dp_cp
+# (activation-offload reset, MoE expert-bias update), dp_cp and dp_cp_gtp_remat (hybrid-CP
+# scheduling, num_tokens all-reduce), and embd, pos_embd, gtp_remat and expt_gtp_remat
+# (finalize_model_grads).
+_SCHEDULE_PROCESS_GROUPS = (
+    'tp',
+    'cp',
+    'pp',
+    'embd',
+    'pos_embd',
+    'dp_cp',
+    'dp_cp_gtp_remat',
+    'tp_dp_cp',
+    'gtp_remat',
+    'expt_gtp_remat',
+)
 
-    Used by the schedule entry points as the fallback when the caller does not
-    supply a ``pg_collection`` explicitly.
+
+def _build_default_pg_collection(owner: str) -> ProcessGroupCollection:
+    """Warn and build the schedule's collection from the global ``parallel_state`` groups.
+
+    Used by the schedule entry points when the caller passes no ``pg_collection``. The fields map
+    to ``parallel_state`` as in ``ProcessGroupCollection.use_mpu_process_groups()``: ``dp_cp`` is
+    the replicate data-parallel group and ``dp_cp_gtp_remat`` the one that includes the GTP-remat
+    peers. The readers of these fields use ``dp_cp_gtp_remat`` when it is set, so they reduce over
+    ``parallel_state.get_data_parallel_group(with_context_parallel=True)``.
+
+    Args:
+        owner: Name of the schedule entry point, used in the warning.
     """
-    pg_collection = ProcessGroupCollection()
-    pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
-    pg_collection.cp = parallel_state.get_context_parallel_group()
-    pg_collection.embd = parallel_state.get_embedding_group(check_initialized=False)
-    pg_collection.pos_embd = parallel_state.get_position_embedding_group(check_initialized=False)
-    pg_collection.pp = parallel_state.get_pipeline_model_parallel_group()
-    pg_collection.dp_cp = parallel_state.get_data_parallel_group(
-        with_context_parallel=True, partial_data_parallel=False
+    return resolve_process_groups(
+        None,
+        owner=owner,
+        required=_SCHEDULE_PROCESS_GROUPS,
+        deprecated_in="0.21",
+        removed_in="0.23",
     )
-    pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-        with_context_parallel=True
-    )
-    pg_collection.dp = parallel_state.get_data_parallel_group(
-        with_context_parallel=False, partial_data_parallel=False
-    )
-    # gtp_remat axis: consumers read these with getattr and silently skip the gtp_remat
-    # reduction when absent, so populate them even when GTP_remat is inactive.
-    pg_collection.gtp_remat = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
-    pg_collection.expt_gtp_remat = parallel_state.get_expert_gtp_weight_remat_group(
-        check_initialized=False
-    )
-    pg_collection.dp_cp_gtp_remat = parallel_state.get_data_parallel_group(
-        with_context_parallel=True, partial_data_parallel=False
-    )
-    return pg_collection
+
+
+def _resolve_schedule_groups(
+    pg_collection: Optional[ProcessGroupCollection],
+    p2p_communicator: Optional[P2PCommunicator],
+    *,
+    owner: str,
+    config,
+    needs_p2p_communicator: bool,
+) -> Tuple[ProcessGroupCollection, Optional[P2PCommunicator]]:
+    """Return the process groups and the pipeline communicator that a schedule runs on.
+
+    A caller that passes neither ``pg_collection`` nor ``p2p_communicator`` falls back to the
+    global groups in ``parallel_state``: the schedule warns once and builds the communicator over
+    the resolved ``pp`` group. A collection the caller passes must set ``tp`` and ``cp``.
+
+    Args:
+        pg_collection: The caller's collection, or None to fall back to the global groups.
+        p2p_communicator: The caller's pipeline communicator, or None.
+        owner: Name of the schedule entry point, used in the warning and in error messages.
+        config: Model config, used to build the default communicator.
+        needs_p2p_communicator: Whether the schedule communicates between pipeline stages. Such a
+            schedule takes both arguments or neither; the other schedule ignores
+            ``p2p_communicator``.
+    """
+    if needs_p2p_communicator and (pg_collection is None) != (p2p_communicator is None):
+        raise ValueError(f"{owner}: provide both p2p_communicator and pg_collection, or neither.")
+    if pg_collection is None:
+        pg_collection = _build_default_pg_collection(owner)
+        if needs_p2p_communicator:
+            p2p_communicator = P2PCommunicator(pp_group=pg_collection.pp, config=config)
+    else:
+        require_process_groups(pg_collection, ('tp', 'cp'), owner=owner)
+    return pg_collection, p2p_communicator
 
 
 def _reset_activation_offload(
@@ -740,13 +799,6 @@ def forward_backward_no_pipelining(
 ):
     """Run forward and backward passes with no pipeline parallelism"""
 
-    if pg_collection is None:
-        pg_collection = _build_default_pg_collection()
-
-    elif pg_collection is not None:
-        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
-        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
-
     if isinstance(model, list):
         assert len(model) == 1, "non-pipeline-parallel schedule does not support model chunking"
         model = model[0]
@@ -760,6 +812,13 @@ def forward_backward_no_pipelining(
     ), "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
 
     config = get_model_config(model)
+    pg_collection, _ = _resolve_schedule_groups(
+        pg_collection,
+        p2p_communicator,
+        owner="forward_backward_no_pipelining",
+        config=config,
+        needs_p2p_communicator=False,
+    )
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
@@ -938,19 +997,17 @@ def get_pp_rank_microbatches(
     microbatch_group_size_per_vp_stage,
     forward_only=False,
     overlap_moe_expert_parallel_comm=False,
-    p2p_communicator: Optional[P2PCommunicator] = None,
+    *,
+    p2p_communicator: P2PCommunicator,
 ):
-    """Get the number of total, warmup, and remaining microbatches in PP scheduling."""
-    if p2p_communicator is not None:
-        pipeline_parallel_size = p2p_communicator.pp_group.size()
-        pipeline_parallel_rank = p2p_communicator.pp_group.rank()
-        virtual_pipeline_parallel_size = p2p_communicator.virtual_pipeline_model_parallel_size
-    else:
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
-        pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
-        virtual_pipeline_parallel_size = (
-            parallel_state.get_virtual_pipeline_model_parallel_world_size()
-        )
+    """Get the number of total, warmup, and remaining microbatches in PP scheduling.
+
+    ``p2p_communicator`` is the schedule's communicator; its pipeline group and virtual-pipeline
+    size give this rank's stage and the number of stages.
+    """
+    pipeline_parallel_size = p2p_communicator.pp_group.size()
+    pipeline_parallel_rank = p2p_communicator.pp_group.rank()
+    virtual_pipeline_parallel_size = p2p_communicator.virtual_pipeline_model_parallel_size
 
     total_num_microbatches = num_microbatches * num_model_chunks
     are_all_microbatches_in_warmup = False
@@ -1054,28 +1111,16 @@ def forward_backward_pipelining_with_interleaving(
     # virtual_microbatch_id in [0, total_num_microbatches)
 
     config = get_model_config(model[0])
-    if p2p_communicator is None and pg_collection is None:
-        p2p_communicator = P2PCommunicator(
-            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
-        )
-        pg_collection = _build_default_pg_collection()
-        tp_group = pg_collection.tp
-        cp_group = pg_collection.cp
-        cp_size = cp_group.size()
-
-    elif p2p_communicator is not None and pg_collection is not None:
-        model_type = get_model_type(model[0])
-        assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
-        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
-        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
-        tp_group = pg_collection.tp
-        cp_group = pg_collection.cp
-        cp_size = cp_group.size()
-    else:
-        raise ValueError(
-            "Invalid combination of p2p_communicator, pg_collection"
-            " provide none or provide all the process groups"
-        )
+    pg_collection, p2p_communicator = _resolve_schedule_groups(
+        pg_collection,
+        p2p_communicator,
+        owner="forward_backward_pipelining_with_interleaving",
+        config=config,
+        needs_p2p_communicator=True,
+    )
+    tp_group = pg_collection.tp
+    cp_group = pg_collection.cp
+    cp_size = cp_group.size()
 
     assert isinstance(model, list), "interleaved pipeline parallelism expected model chunking"
     assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid model chunking"
@@ -2208,46 +2253,35 @@ def forward_backward_pipelining_without_interleaving(
         p2p_communicator, MultiModulePipelineCommunicator
     )
 
-    if p2p_communicator is None and pg_collection is None:
-        # Default: single-module with parallel_state groups
-        p2p_communicator = P2PCommunicator(
-            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
+    if is_multimodule:
+        if p2p_communicator is None or pg_collection is None:
+            raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
+        # Multi-module: use language model's CP size for loss scaling
+        if not config.variable_seq_lengths:
+            raise ValueError("config.variable_seq_lengths=True required for multi-module pipelines")
+        if pg_collection.has_language_model():
+            cp_size = pg_collection.get_language_model_cp_size()
+        else:
+            # Encoder-only ranks should not use CP loss scaling.
+            cp_size = None
+
+    elif pg_collection is None or isinstance(pg_collection, ProcessGroupCollection):
+        pg_collection, p2p_communicator = _resolve_schedule_groups(
+            pg_collection,
+            p2p_communicator,
+            owner="forward_backward_pipelining_without_interleaving",
+            config=config,
+            needs_p2p_communicator=True,
         )
-        pg_collection = _build_default_pg_collection()
         tp_group = pg_collection.tp
         cp_group = pg_collection.cp
         cp_size = cp_group.size()
 
-    elif p2p_communicator is not None and pg_collection is not None:
-        assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
-
-        if is_multimodule:
-            # Multi-module: use language model's CP size for loss scaling
-            if not config.variable_seq_lengths:
-                raise ValueError(
-                    "config.variable_seq_lengths=True required for multi-module pipelines"
-                )
-            if pg_collection.has_language_model():
-                cp_size = pg_collection.get_language_model_cp_size()
-            else:
-                # Encoder-only ranks should not use CP loss scaling.
-                cp_size = None
-
-        elif isinstance(pg_collection, ProcessGroupCollection):
-            # Single-module: extract tp/cp groups and cp_size
-            assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
-            assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
-            tp_group = pg_collection.tp
-            cp_group = pg_collection.cp
-            cp_size = cp_group.size()
-
-        else:
-            raise TypeError(
-                f"pg_collection must be ProcessGroupCollection or "
-                f"MultiModuleProcessGroupCollection, got {type(pg_collection)}"
-            )
     else:
-        raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
+        raise TypeError(
+            f"pg_collection must be ProcessGroupCollection or "
+            f"MultiModuleProcessGroupCollection, got {type(pg_collection)}"
+        )
 
     if is_multimodule:
         p2p_communicator.set_forward_only(forward_only)

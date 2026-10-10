@@ -12,7 +12,7 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.hybrid_cp_schedule as hybrid_cp_schedule
 import megatron.core.pipeline_parallel.schedules as schedule
-from megatron.core import ModelParallelConfig
+from megatron.core import ModelParallelConfig, parallel_state
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
@@ -527,9 +527,21 @@ def test_get_pipeline_parallel_order(
         if virtual_pipeline_model_parallel_size is not None
         else 1
     )
+    config = ModelParallelConfig(
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+        pipeline_dtype=torch.float,
+    )
+    p2p_communicator = P2PCommunicator(
+        pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
+    )
 
     _, _, num_warmup_microbatches, _ = schedule.get_pp_rank_microbatches(
-        num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage, False
+        num_microbatches,
+        num_model_chunks,
+        microbatch_group_size_per_vp_stage,
+        False,
+        p2p_communicator=p2p_communicator,
     )
     schedule_table = schedule.get_schedule_table(
         num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage
