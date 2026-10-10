@@ -846,6 +846,7 @@ jobs:
       selected-runner-gb200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
       registry-gcp-h100: asia-southeast1-docker.pkg.dev/nv-nemoautomati-20260505210812/megatron-lm
       use-gcp-h100: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
+      also-build-aws-h100: ${{ needs.configure.outputs.run_functional == 'true' }}
       source-sha: ${{ needs.configure.outputs.sha }}
       lts: ${{ needs.configure.outputs.lts == 'true' }}
 
