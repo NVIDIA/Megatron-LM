@@ -7,9 +7,9 @@ from typing import List, Literal, Optional, Tuple
 
 import torch
 
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import get_attr_wrapped_model, unwrap_model
 
 
 @dataclass
@@ -485,6 +485,12 @@ class MultimodalPromptConfig:
         )
 
 
+# The process groups that inference reads from `InferenceConfig.pg_collection`: the model wrapper
+# (tp, pp), the text generation controller (pp, dp), the dynamic context (tp, pp, ep) and the
+# dynamic engine (tp, pp, dp, mp, ep).
+_INFERENCE_PROCESS_GROUPS = ("tp", "pp", "dp", "mp", "ep")
+
+
 @dataclass
 class InferenceConfig:
     """
@@ -833,17 +839,46 @@ class InferenceConfig:
     only when model weights are guaranteed not to change across those boundaries.
     """
 
-    def resolve_pg_collection(self) -> ProcessGroupCollection:
-        """Return the configured process groups, falling back to the MPU globals.
+    def resolve_pg_collection(
+        self, model: Optional[torch.nn.Module] = None
+    ) -> ProcessGroupCollection:
+        """Return the process groups that inference runs on, and store them in `pg_collection`.
 
-        This is the compatibility boundary for inference: engines and wrappers call it once and
-        can then assume a collection, instead of each re-deriving one from global state. Resolution
-        is lazy so it happens after ``initialize_model_parallel``, not at config construction.
+        This is the compatibility boundary for inference: contexts, wrappers, controllers and
+        engines call it and share the collection it returns, instead of each re-deriving one from
+        global state. Resolution is lazy so it happens after ``initialize_model_parallel``, not at
+        config construction.
+
+        If `pg_collection` is unset, the collection that `model` was built with is used when it
+        sets every group that inference reads (tp, pp, dp, mp and ep). Otherwise the groups come
+        from `megatron.core.parallel_state`; that fallback is deprecated and warns.
 
         See ``docs/developer/parallel-state-deprecation.md``.
+
+        Args:
+            model: The model to run inference on, possibly wrapped, when the caller holds it.
+
+        Returns:
+            The collection, which is also stored in `pg_collection`.
         """
         if self.pg_collection is None:
-            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            model_pg_collection = None
+            if model is not None:
+                model_pg_collection = getattr(unwrap_model(model), "pg_collection", None)
+            # A model built on a partial collection, for example one from
+            # use_mpu_process_groups(required_pgs=[...]), lacks groups that inference reads.
+            if model_pg_collection is not None and all(
+                name in vars(model_pg_collection) for name in _INFERENCE_PROCESS_GROUPS
+            ):
+                self.pg_collection = model_pg_collection
+            else:
+                self.pg_collection = resolve_process_groups(
+                    None,
+                    owner=type(self).__name__,
+                    required=_INFERENCE_PROCESS_GROUPS,
+                    deprecated_in="0.21",
+                    removed_in="0.23",
+                )
         return self.pg_collection
 
     def __post_init__(self, verbose: bool):

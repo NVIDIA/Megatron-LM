@@ -422,13 +422,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
         projection_size = model_config.kv_channels * num_attention_heads
-        pg_collection = inference_config.pg_collection
-        if pg_collection is not None:
-            tp_size = get_pg_size(pg_collection.tp)
-            pp_size = get_pg_size(pg_collection.pp)
-        else:
-            tp_size = model_config.tensor_model_parallel_size
-            pp_size = model_config.pipeline_model_parallel_size
+        # The wrapper, controller and engine built on this context use the same collection.
+        pg_collection = inference_config.resolve_pg_collection()
+        tp_size = get_pg_size(pg_collection.tp)
+        pp_size = get_pg_size(pg_collection.pp)
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         if num_attention_heads >= tp_size:
             self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
@@ -444,23 +441,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self._async_sched_token_offsets = None
 
         # Cache the PP group we should use for PP collectives inside the context.
-        # If the model provides a pg_collection with a pp group, prefer it.
-        # Otherwise:
-        # - for PP=1 we don't need a PP group at all
-        # - for PP>1 we require Megatron parallel_state to be initialized
-        if pg_collection is not None and get_pg_size(pg_collection.pp) > 1:
+        # For PP=1 we don't need a PP group at all.
+        if pp_size > 1:
             self.pipeline_parallel_group = pg_collection.pp
-        elif pp_size > 1:
-            self.pipeline_parallel_group = parallel_state.get_pipeline_model_parallel_group()
         else:
             self.pipeline_parallel_group = None
 
-        if pg_collection is not None:
-            self.expert_model_parallel_group = pg_collection.ep
-        elif parallel_state.get_expert_model_parallel_world_size() > 1:
-            self.expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
-        else:
-            self.expert_model_parallel_group = None
+        self.expert_model_parallel_group = pg_collection.ep
 
         # Optional CPU-side collective for EP batch-dimension sync. Populated by
         # the engine via set_ep_zmq_communicator() when available. When set,
@@ -524,13 +511,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # AbstractModelInferenceWrapper: Iterable models are rejected). Always pass
             # vp_stage=None into get_num_layers_to_build, consistent with attention inference
             # (e.g. get_transformer_layer_offset(..., vp_stage=None, pp_rank=...)).
-            # When pg_collection is set, use the PP group's rank (same as attention.py).
-            if pg_collection is not None:
-                pp_rank = get_pg_rank(pg_collection.pp)
-            else:
-                pp_rank = None
+            # Use the PP group's rank (same as attention.py).
             self.num_attention_layers = get_num_layers_to_build(
-                model_config, vp_stage=None, pp_rank=pp_rank
+                model_config, vp_stage=None, pp_rank=get_pg_rank(pg_collection.pp)
             )
             self.num_mamba_layers = 0
             self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)

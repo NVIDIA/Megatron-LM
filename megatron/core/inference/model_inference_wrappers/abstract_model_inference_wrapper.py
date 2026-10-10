@@ -66,8 +66,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
             self.multimodal_prompt_config = configured_prompt_contract
 
         # Resolved once at the inference-config boundary; during RL this may be the training
-        # collection rather than an inference-specific one.
-        pg_collection = self.inference_context.config.resolve_pg_collection()
+        # collection rather than an inference-specific one. A config without a collection takes
+        # the one the model was built with.
+        pg_collection = self.inference_context.config.resolve_pg_collection(self.model)
 
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
