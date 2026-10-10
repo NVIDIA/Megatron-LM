@@ -991,6 +991,69 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     )
 
 
+@pytest.mark.parametrize("cached_count", [0, 1, 2])
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("pipeline_metadata", [False, True])
+def test_handoff_skips_empty_kv_pull_but_starts_ssm(
+    handoff_loop, cached_count, hybrid, pipeline_metadata
+):
+    engine = _HandoffHarness(handoff_loop, hybrid=hybrid, available=1)
+    hashes = [11, 22]
+    allocator = engine.context.kv_block_allocator
+    cached = allocator.allocate_memory_blocks(cached_count)
+    allocator.release_memory_blocks(cached)
+    allocator.kv_hash_to_block_id.update(zip(hashes, cached.tolist()))
+    kv_meta = {"request_id": 5, "resume_tokens": [99]}
+    if pipeline_metadata:
+        kv_meta["pp_metas"] = [{"tp_metas": {"rank": 0}, "block_ids": [100, 101]}]
+    ssm_import = PendingSSMImport(handles=[], live_slot=20)
+    if hybrid:
+        kv_meta["ssm"] = {"request_id": 5}
+    engine._reserve_ssm_handoff_import = mock.Mock(return_value=ssm_import)
+    engine._start_ssm_handoff_import = mock.Mock()
+
+    def begin_pull(peer_meta, src_blocks, dst_blocks):
+        # NIXL cannot construct transfer descriptors from empty block lists.
+        assert src_blocks and dst_blocks
+        return _PendingHandle()
+
+    engine._kv_transfer_agent.begin_pull_blocks = mock.Mock(side_effect=begin_pull)
+    handoff = DeferredKvHandoff(
+        request_id=5,
+        prompt=[1] * 8,
+        sampling_params=SamplingParams(num_tokens_to_generate=2),
+        kv_meta=kv_meta,
+        src_block_ids=[100, 101],
+        hashes=hashes,
+        num_blocks=2,
+        future=handoff_loop.create_future(),
+    )
+
+    assert engine._try_start_kv_handoff_import(handoff)
+    _drain_loop(handoff_loop)
+    pending = engine._pending_kv_imports[0]
+    assert pending.local_error is None
+    assert pending.cached_prefix_block_count == cached_count
+    assert len(pending.local_blocks) == 2
+    assert len(pending.continuation_blocks) == 1
+    assert torch.all(allocator.block_ref_counts[pending.local_blocks] == 1)
+    if cached_count == 2:
+        engine._kv_transfer_agent.begin_pull_blocks.assert_not_called()
+        assert pending.handle is None
+    else:
+        assert engine._kv_transfer_agent.begin_pull_blocks.call_count == 1
+        _, src_blocks, dst_blocks = engine._kv_transfer_agent.begin_pull_blocks.call_args.args
+        assert src_blocks == [100, 101][cached_count:]
+        assert len(dst_blocks) == 2 - cached_count
+    if hybrid:
+        engine._start_ssm_handoff_import.assert_called_once_with(5, kv_meta["ssm"], ssm_import)
+        assert pending.ssm is ssm_import
+    else:
+        engine._reserve_ssm_handoff_import.assert_not_called()
+        engine._start_ssm_handoff_import.assert_not_called()
+        assert pending.ssm is None
+
+
 def test_decode_handoff_defers_until_kv_capacity_is_available(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine.context.kv_block_allocator.capacity_available = False

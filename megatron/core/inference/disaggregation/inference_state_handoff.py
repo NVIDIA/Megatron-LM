@@ -821,9 +821,10 @@ class InferenceStateHandoffMixin:
             transfer_meta, transfer_src_blocks = drop_transfer_prefix_blocks(
                 handoff.kv_meta, handoff.src_block_ids, len(cached_blocks)
             )
-            handle = self._kv_transfer_agent.begin_pull_blocks(
-                transfer_meta, transfer_src_blocks, imported_blocks
-            )
+            if imported_blocks:
+                handle = self._kv_transfer_agent.begin_pull_blocks(
+                    transfer_meta, transfer_src_blocks, imported_blocks
+                )
             if ssm_import is not None:
                 self._start_ssm_handoff_import(handoff.request_id, ssm_meta, ssm_import)
         except Exception as exc:
