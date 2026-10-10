@@ -775,6 +775,27 @@ class GlobalMemoryBuffer:
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
 
 
+_GLOBAL_MEMORY_BUFFER: Optional[GlobalMemoryBuffer] = None
+
+
+def get_global_memory_buffer() -> GlobalMemoryBuffer:
+    """Return the process-wide GlobalMemoryBuffer, creating it on first use.
+
+    The buffer is scratch memory shared by every model in the process. It does not depend on any
+    process group, so it is available without ``parallel_state.initialize_model_parallel``.
+    """
+    global _GLOBAL_MEMORY_BUFFER
+    if _GLOBAL_MEMORY_BUFFER is None:
+        _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
+    return _GLOBAL_MEMORY_BUFFER
+
+
+def destroy_global_memory_buffer() -> None:
+    """Drop the process-wide GlobalMemoryBuffer; the next use creates an empty one."""
+    global _GLOBAL_MEMORY_BUFFER
+    _GLOBAL_MEMORY_BUFFER = None
+
+
 def _kernel_make_viewless_tensor(inp, requires_grad):
     """Make a viewless tensor.
 
@@ -1417,8 +1438,6 @@ def drain_embedding_wgrad_compute(
     ), "Length of activation and gradient buffers need to be equal!"
 
     import fused_weight_gradient_mlp_cuda
-
-    from megatron.core.parallel_state import get_global_memory_buffer
 
     input = embedding_activation_buffer.pop(0)
     world_size = tp_group.size()
