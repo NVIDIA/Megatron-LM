@@ -157,6 +157,13 @@ def _violations_in(path: pathlib.Path):
     """Return (lineno, scope:kind:detail) pairs for global process-group reads in one file."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
+    postponed_annotations = any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "__future__"
+        and any(alias.name == "annotations" for alias in statement.names)
+        for statement in tree.body
+    )
+
     class Visitor(ast.NodeVisitor):
         """Attach a stable enclosing scope to each directly imported global-state call."""
 
@@ -171,6 +178,19 @@ def _violations_in(path: pathlib.Path):
             for expression in (*node.decorator_list, *node.args.defaults, *node.args.kw_defaults):
                 if expression:
                     self.visit(expression)
+            if not postponed_annotations:
+                args = node.args
+                for arg in (
+                    *args.posonlyargs,
+                    *args.args,
+                    *args.kwonlyargs,
+                    args.vararg,
+                    args.kwarg,
+                ):
+                    if arg and arg.annotation:
+                        self.visit(arg.annotation)
+                if node.returns:
+                    self.visit(node.returns)
             self._visit_scope(node, "function")
 
         visit_AsyncFunctionDef = visit_FunctionDef
