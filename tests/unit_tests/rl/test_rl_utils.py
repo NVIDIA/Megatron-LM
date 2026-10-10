@@ -1,7 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import io
 import itertools
+import math
+import tempfile
+import traceback
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -9,12 +13,17 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
@@ -36,6 +45,8 @@ from megatron.core.transformer.cuda_graphs import (
 )
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.utils import get_pg_size
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.inference import ReturnsRaw
@@ -51,25 +62,28 @@ from tests.unit_tests.test_utilities import Utils
 
 BATCH = 2
 SEQ = 4
-VOCAB = 754
+VOCAB = 768
 
 
 class MockModel(LanguageModule):
-    def __init__(self, batch=BATCH, seq=SEQ, vocab=VOCAB):
+    def __init__(self, batch=BATCH, seq=SEQ, vocab=VOCAB, dtype=torch.float32):
         self.batch = batch
         self.seq = seq
         self.vocab = vocab
+        self.dtype = dtype
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.config = TransformerConfig(
             num_attention_heads=8, num_layers=8, pipeline_dtype=torch.bfloat16
         )
         self.model_type = ModelType.encoder_or_decoder
 
-    def __call__(self, x, position_ids, attention_mask, **kwargs):
+    def __call__(self, x, position_ids, attention_mask, runtime_gather_output=True, **kwargs):
         del position_ids
         del attention_mask
         batch, seq = x.shape
-        mock_model_outputs = torch.ones((batch, seq, self.vocab), device=x.device)
+        tp_size = get_pg_size(self.pg_collection.tp)
+        width = self.vocab if runtime_gather_output else self.vocab // tp_size
+        mock_model_outputs = torch.ones((batch, seq, width), device=x.device, dtype=self.dtype)
         return mock_model_outputs
 
     def load_state_dict(self, params):
@@ -198,6 +212,82 @@ def cleanup_global_state():
     yield
     destroy_global_vars()
     destroy_num_microbatches_calculator()
+
+
+# (dtype, chunk_tokens, sliced) cases shared by the in-process and spawned-TP2 parity runs.
+_VP_CASES = [
+    (dtype, chunk_tokens, sliced)
+    for dtype in (torch.float32, torch.bfloat16)
+    for chunk_tokens in (None, 3)
+    for sliced in (False, True)
+]
+
+
+def _vp_inputs(dtype, sliced):
+    """Deterministic parity inputs; the spawned TP2 workers rebuild the identical tensors."""
+    torch.manual_seed(0)
+    batch, seq, vocab = 2, 17, 64
+    logits = torch.randn(batch, seq, vocab, dtype=dtype)
+    tokens = torch.randint(0, vocab, (batch, seq))
+    grad_out = torch.randn(batch, seq - 1 if sliced else seq, dtype=dtype)
+    return logits, tokens, grad_out
+
+
+def _vp_view(logits, tokens, sliced):
+    """The call-site shape get_logprobs uses: logits[:, :-1, :] against the shifted tokens."""
+    return (logits[:, :-1, :], tokens[:, 1:]) if sliced else (logits, tokens)
+
+
+def _vp_tp2_worker(rank, world_size, store_path, result_queue):
+    """One rank of a gloo TP group: forward logprobs and local-shard grads for every case."""
+    try:
+        store = dist.FileStore(store_path, world_size)
+        dist.init_process_group(backend="gloo", store=store, rank=rank, world_size=world_size)
+        tp_group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+        results = {}
+        for dtype, chunk_tokens, sliced in _VP_CASES:
+            logits, tokens, grad_out = _vp_inputs(dtype, sliced)
+            partition = logits.size(-1) // world_size
+            shard = slice(rank * partition, (rank + 1) * partition)
+            local = logits[..., shard].clone().requires_grad_(True)
+            got = rl_utils.vocab_parallel_selective_log_softmax(
+                *_vp_view(local, tokens, sliced), tp_group=tp_group, chunk_tokens=chunk_tokens
+            )
+            got.backward(grad_out)
+            results[(dtype, chunk_tokens, sliced)] = (got.detach(), local.grad)
+        # Ship plain bytes: shared-memory tensor handles would dangle once this process exits.
+        buffer = io.BytesIO()
+        torch.save(results, buffer)
+        result_queue.put(("ok", rank, buffer.getvalue()))
+    except Exception:  # pragma: no cover
+        result_queue.put(("err", rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def vp_tp2_results():
+    """{rank: {case: (logprobs, shard_grad)}} from a single 2-process gloo run over _VP_CASES."""
+    world_size = 2
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    with tempfile.NamedTemporaryFile(delete=True) as f:
+        store_path = f.name + ".store"
+    procs = [
+        ctx.Process(target=_vp_tp2_worker, args=(rank, world_size, store_path, queue))
+        for rank in range(world_size)
+    ]
+    for p in procs:
+        p.start()
+    by_rank = {}
+    for _ in procs:
+        status, rank, payload = queue.get(timeout=300)
+        assert status == "ok", f"rank {rank} failed:\n{payload}"
+        by_rank[rank] = torch.load(io.BytesIO(payload))
+    for p in procs:
+        p.join(timeout=120)
+    return by_rank
 
 
 class TestRLUtils:
@@ -708,22 +798,157 @@ class TestRLUtils:
         indirect=["initialize_model_parallel"],
     )
     @pytest.mark.parametrize("use_sequence_packing", [False])
-    def test_get_logprobs(self, initialize_model_parallel, use_sequence_packing):
-        """Test that getting logprobs at least does not crash."""
+    @pytest.mark.parametrize("batch_invariant", [False, True])
+    def test_get_logprobs(
+        self, initialize_model_parallel, use_sequence_packing, batch_invariant, monkeypatch
+    ):
+        """get_logprobs runs end to end and honors the output-dtype contract that
+        compute_logprobs_batch asserts: fp32 under --batch-invariant-mode (where it falls back to
+        the gathered path), the logits dtype otherwise."""
         self.create_test_args(rl_use_sequence_packing=use_sequence_packing)
+        monkeypatch.setattr(rl_utils, "is_batch_invariant_mode_enabled", lambda: batch_invariant)
 
-        model = MockModel()
-        tokens = torch.ones((BATCH, SEQ), dtype=torch.long)
+        model = MockModel(dtype=torch.bfloat16)
+        # CUDA tokens (MockModel follows x.device): the vocab-parallel path
+        # all-reduces over the NCCL-only TP group, which rejects CPU tensors.
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Spread the ids over the vocab so the targets land on every TP rank's shard.
+        num_tokens = BATCH * SEQ
+        tokens = torch.arange(num_tokens, device=device).view(BATCH, SEQ) * (VOCAB // num_tokens)
         logprobs = rl_utils.get_logprobs(
             model, tokens, position_ids=None, sequence_packing=use_sequence_packing
         )
         if is_pp_last_stage(model.pg_collection.pp):
             # We chop off 1 element from the sequence dimension.
             assert logprobs.shape == (BATCH, SEQ - 1)
-            # As we return ones as logits, all logprobs should be the same.
-            assert torch.all(logprobs == logprobs[0, 0]).item()
+            assert logprobs.dtype == (torch.float32 if batch_invariant else torch.bfloat16)
+            # Uniform logits: every token has logprob -log(VOCAB), whichever rank owns its id.
+            torch.testing.assert_close(logprobs, torch.full_like(logprobs, -math.log(VOCAB)))
         else:
-            assert logprobs.shape == (BATCH, SEQ, VOCAB)
+            # Non-last stages return the model output as is: vocab-sharded unless gathered.
+            vocab = VOCAB if batch_invariant else VOCAB // get_pg_size(model.pg_collection.tp)
+            assert logprobs.shape == (BATCH, SEQ, vocab)
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((tp, 1), id=f"tp{tp}-pp1") for tp in [1, 2, 4] if tp <= Utils.world_size],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_get_logprobs_mtp(self, initialize_model_parallel, monkeypatch):
+        """An MTP model trained through get_logprobs must give the same MTP loss, acceptance
+        counts and MTP-layer gradients whether the main logits stay vocab-parallel (the default
+        path) or are gathered (the --batch-invariant-mode fallback): process_mtp_loss keeps its
+        own logits vocab-sharded either way, so the vocab-parallel cross-entropy never sees a
+        TP-times larger vocabulary (loss +ln(TP), wrong gradients). RL derives the MTP labels
+        from the tokens, so the metrics must cover every position but the two rolled off the
+        end of the sequence."""
+        _, _, tp, _ = initialize_model_parallel
+        self.create_test_args(tensor_model_parallel_size=tp, bf16=True)
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            tensor_model_parallel_size=tp,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+            # Both passes run in training mode (process_mtp_loss records its metrics and
+            # attaches the loss only then), so they must see identical activations.
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        torch.manual_seed(0)  # Identical CPU-initialized weights (and tokens) on every rank.
+        gpt_model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            mtp_block_spec=get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=True),
+            vocab_size=VOCAB,
+            max_sequence_length=32,
+        ).cuda()
+        # Float16Module takes get_logprobs' fp32_output argument, as in RL training.
+        model = Float16Module(config, gpt_model)
+        mtp_params = {name: p for name, p in model.named_parameters() if "mtp.layers." in name}
+        assert mtp_params
+
+        # batch 1: get_logprobs' default PackedSeqParams describe a single thd sequence.
+        batch_size, seq_length = 1, 32
+        tokens = torch.randint(0, VOCAB, (batch_size, seq_length), dtype=torch.long).cuda()
+        position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
+
+        results = {}
+        for batch_invariant in (False, True):
+            monkeypatch.setattr(
+                rl_utils, "is_batch_invariant_mode_enabled", lambda flag=batch_invariant: flag
+            )
+            model.zero_grad(set_to_none=True)
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            logprobs = rl_utils.get_logprobs(model, tokens, position_ids=position_ids)
+            logprobs.sum().backward()
+            tracker = MTPLossLoggingHelper.tracker
+            assert all(p.grad is not None for p in mtp_params.values())
+            results[batch_invariant] = (
+                logprobs.detach().float(),
+                {k: tracker[k].clone() for k in ("loss_values", "correct_values", "total_values")},
+                {name: p.grad.clone() for name, p in mtp_params.items()},
+            )
+
+        vp_logprobs, vp_metrics, vp_grads = results[False]
+        gathered_logprobs, gathered_metrics, gathered_grads = results[True]
+        assert vp_logprobs.shape == (batch_size, seq_length - 1)
+        # bf16 logits: the same tolerance as test_vocab_parallel_selective_log_softmax.
+        torch.testing.assert_close(vp_logprobs, gathered_logprobs, atol=5e-2, rtol=5e-2)
+        # One MTP layer: the labels roll once (derived from the tokens), the layer rolls again.
+        expected_total = torch.full_like(vp_metrics["total_values"], batch_size * (seq_length - 2))
+        torch.testing.assert_close(vp_metrics["total_values"], expected_total)
+        for key in ("loss_values", "correct_values", "total_values"):
+            torch.testing.assert_close(vp_metrics[key], gathered_metrics[key], atol=1e-3, rtol=1e-3)
+        # MTP-layer parameters get their gradient from the MTP loss alone.
+        for name, grad in vp_grads.items():
+            torch.testing.assert_close(grad, gathered_grads[name], atol=1e-5, rtol=2e-2)
+
+    @pytest.mark.parametrize("dtype, chunk_tokens, sliced", _VP_CASES)
+    @pytest.mark.parametrize("tp_world", [1, 2])
+    def test_vocab_parallel_selective_log_softmax(
+        self, dtype, chunk_tokens, sliced, tp_world, vp_tp2_results
+    ):
+        """vocab_parallel_selective_log_softmax must be a numerically-safe drop-in for
+        selective_log_softmax: forward/backward parity with the gathered-path implementation,
+        in-process on full logits (tp_world=1) and on TP-sharded logits over a spawned gloo
+        group (tp_world=2: every rank must return the full-sequence logprobs and its own vocab
+        shard of the reference gradient), with and without chunking, on the non-contiguous
+        ``logits[:, :-1, :]`` view get_logprobs actually passes (whose sliced-away position must
+        receive no gradient), and without mutating the input."""
+        logits, tokens, grad_out = _vp_inputs(dtype, sliced)
+        # fp32 stats vs selective_log_softmax's native bf16 log_softmax diverge by more than
+        # reduction-order noise; vp is the more accurate one (see commit message).
+        atol = 1e-5 if dtype == torch.float32 else 5e-2
+
+        reference = logits.clone().requires_grad_(True)
+        want = rl_utils.selective_log_softmax(*_vp_view(reference, tokens, sliced))
+        want.backward(grad_out)
+
+        if tp_world == 1:
+            local = logits.clone().requires_grad_(True)
+            got = rl_utils.vocab_parallel_selective_log_softmax(
+                *_vp_view(local, tokens, sliced), chunk_tokens=chunk_tokens
+            )
+            got.backward(grad_out)
+            torch.testing.assert_close(local.detach(), logits)  # forward must not mutate the input
+            shards = {0: (got.detach(), local.grad)}
+        else:
+            case = (dtype, chunk_tokens, sliced)
+            shards = {rank: results[case] for rank, results in vp_tp2_results.items()}
+
+        partition = logits.size(-1) // len(shards)
+        for rank, (got, grad) in shards.items():
+            assert got.dtype == dtype
+            torch.testing.assert_close(got.float(), want.float(), atol=atol, rtol=atol)
+            want_grad = reference.grad[..., rank * partition : (rank + 1) * partition]
+            torch.testing.assert_close(grad.float(), want_grad.float(), atol=atol, rtol=atol)
+            if sliced:
+                assert torch.all(grad[:, -1, :] == 0)
 
     @pytest.mark.parametrize(
         "ratio, advantage, clamp_eps, kl_beta, entropy_weight, expected",
