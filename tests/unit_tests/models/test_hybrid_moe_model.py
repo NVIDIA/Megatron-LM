@@ -157,6 +157,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mtp_grad_scale_func": None,
     "grad_sync_func": None,
     "gradient_accumulation_fusion": True,
+    "hca_aligned_backward": False,
     "hetereogenous_dist_checkpoint": False,
     "heterogeneous_block_specs": False,
     "hidden_dropout": 0.0,
