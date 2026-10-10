@@ -87,3 +87,4 @@ METRICS:
 
 THROUGHPUT_TEST_PARAMS:
   --start_step: 1
+LAUNCHER: ft_launcher

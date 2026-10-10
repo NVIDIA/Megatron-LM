@@ -23,6 +23,7 @@ Use :meth:`InferenceSetupConfig.to_inference_config` to produce the runtime engi
 from this declarative config plus the runtime artifacts. This mirrors the
 ``GPTModelConfig -> TransformerConfig`` relationship.
 """
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -132,15 +133,19 @@ class InferenceSetupConfig:
     down to tp_size, giving a log-spaced distribution with bounded relative padding. "linear" uses
     varying linear strides across the range."""
 
-    inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "torch"
-    """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
-    "flashinfer" is requested but the package is not installed."""
+    inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "flashinfer"
+    """Which sampling kernels to use during inference. Defaults to "flashinfer" and falls back to
+    "torch" with a warning if the flashinfer package is not installed."""
 
-    inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial", "overlap"] = "legacy"
+    offset_sampling_seed_by_dp_rank: bool = True
+    """Offset the inference sampling seed by the data-parallel rank so each DP rank gets a unique
+    generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
+    --deterministic-mode is enabled."""
+
+    inference_dynamic_batching_async_sched_mode: Literal["legacy", "async"] = "legacy"
     """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
-    existing resolve-before-prepare path. "serial" speculatively prepares and forwards decode-only
-    steps before resolving finished requests. "overlap" uses the same async scheduling path while
-    overlapping prepare/sample and forward/resolve phases."""
+    existing resolve-before-prepare path. "async" overlaps asynchronous scheduling phases by
+    reordering them to prepare-before-resolve."""
 
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
@@ -174,7 +179,9 @@ class InferenceSetupConfig:
     """Enable/disable prefix caching for dynamic batching inference. When disabled, KV cache blocks
     cannot be shared between requests with identical prompt prefixes."""
 
-    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = "ref_zero"
+    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = (
+        "ref_zero"
+    )
     """Eviction policy for prefix caching blocks. "ref_zero" (default) immediately returns blocks to
     the free pool when ref_count hits 0. "lru" keeps blocks cached and evicts via LRU only when
     space is needed."""
@@ -373,8 +380,7 @@ class InferenceSetupConfig:
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
-            async_sched_mode=AsyncScheduleMode(
-                self.inference_dynamic_batching_async_sched_mode
-            ),
+            offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
+            async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
         )

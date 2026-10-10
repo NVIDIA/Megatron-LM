@@ -15,3 +15,4 @@ MODEL_ARGS:
   data.seq_length: 512
   log.log_dir: ${CHECKPOINT_SAVE_PATH}
 TEST_TYPE: regular
+LAUNCHER: ft_launcher

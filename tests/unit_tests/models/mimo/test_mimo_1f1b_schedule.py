@@ -7,7 +7,6 @@ Run with:
 """
 
 import logging
-from contextlib import ExitStack, contextmanager
 from functools import partial
 from types import SimpleNamespace
 
@@ -59,27 +58,6 @@ logger = logging.getLogger(__name__)
 
 _active_grids: list = []
 _embedding_pg_cache: dict = {}
-
-
-def build_no_sync_func(mimo_model):
-    """Build a no_sync_func that stacks DDP no_sync over each sub-module.
-
-    Shared by 1F1B pipeline tests and colocated-correctness tests — both need
-    DDP's gradient sync disabled during microbatches and resumed via the
-    schedule's finalize_grads_func.
-    """
-
-    @contextmanager
-    def no_sync_func():
-        with ExitStack() as stack:
-            if mimo_model.language_model is not None:
-                stack.enter_context(mimo_model.language_model.no_sync())
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    stack.enter_context(submodule.no_sync())
-            yield
-
-    return no_sync_func
 
 
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
@@ -623,8 +601,6 @@ def run_mimo_1f1b_test(
         per_token_loss=True,
     )
 
-    mimo_model.config.no_sync_func = build_no_sync_func(mimo_model)
-
     # Use the production grad-sync hook (finalize per module over its own groups +
     # cross-grid N_global per-token mean) for every config.
     grad_sync_topology = SimpleNamespace(
@@ -634,7 +610,11 @@ def run_mimo_1f1b_test(
             **{name: vision_pg for name in mimo_model.modality_submodules},
         },
     )
-    configure_grad_sync(SimpleNamespace(), mimo_model, grad_sync_topology)
+    configure_grad_sync(
+        SimpleNamespace(overlap_grad_reduce=True, align_grad_reduce=False),
+        mimo_model,
+        grad_sync_topology,
+    )
 
     # Create optimizer
     opt_config = OptimizerConfig(

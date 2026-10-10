@@ -148,7 +148,8 @@ def test_inference_pipeline(
         # TODO: Compare liftime_prefill_token_count to groundtruth
         pass
 
-    for request_id, groundtruth_results in output_groundtruth.items():
+    for request_id in groundtruth_request_ids:
+        groundtruth_results = output_groundtruth[request_id]
         current_results = output_current[request_id]
 
         at_least_one_test_loop = False

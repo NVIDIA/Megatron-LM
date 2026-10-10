@@ -184,6 +184,13 @@ class FullyParallelLoadStrategyWrapper:
         self.cached_distribution: Optional[ShardDistribution] = None
         self.cached_global_metadata: Optional[Metadata] = None
 
+    @property
+    def stream_ckpt_dequant(self) -> bool:
+        """Forward the streaming dequantize flag from the wrapped strategy so that
+        ``serialization.load`` can skip the upfront ``force_all_tensors_to_non_fp8`` pass
+        when streaming is enabled."""
+        return getattr(self.base_strategy, "stream_ckpt_dequant", False)
+
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)
     def load(
         self,
@@ -238,11 +245,11 @@ class FullyParallelLoadStrategyWrapper:
         # Step 3: load part of the checkpoint.
         # Load only sharded objects first. ShardedTensors will be loaded separately
         # so that we can keep track of sharded tensors loaded by this rank
-        (sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards) = (
+        sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards = (
             self._defer_loading_sharded_tensors(sharded_state_dict)
         )
 
-        (sharded_objects, sharded_state_dict, to_load_objects, unloaded_objects) = (
+        sharded_objects, sharded_state_dict, to_load_objects, unloaded_objects = (
             self._defer_loading_sharded_objects(sharded_state_dict)
         )
 

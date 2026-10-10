@@ -191,3 +191,12 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
     # The schedule always calls grad_scale_func with a Tensor loss; the per-token
     # mean is applied in finalize_grads_func, so no extra scaling is needed here.
     mimo_model.config.grad_scale_func = lambda loss: loss
+
+    if getattr(args, "overlap_grad_reduce", False):
+        assert mimo_model.config.no_sync_func is None, (
+            "MIMO overlap owns config.no_sync_func; a second synchronization context "
+            "cannot be composed safely"
+        )
+        mimo_model.config.no_sync_func = mimo_model.no_sync
+        if getattr(args, "align_grad_reduce", False):
+            mimo_model.config.grad_sync_func = mimo_model.start_grad_sync

@@ -6,7 +6,8 @@ This module hosts private helpers shared by ``MegatronLLM`` and
 ``MegatronAsyncLLM``: ``_EventLoopManager``, ``_CoordinatorRuntime``, and
 ``_MegatronLLMBase``. The public sync/async wrappers live on the subclasses;
 this base only exposes shared engine state, runtime spawn, validation
-helpers, and the private ``_<method>_impl`` coroutines.
+helpers, the public sync bridge (``submit``/``run_sync``), and the private
+``_<method>_impl`` coroutines.
 """
 
 import asyncio
@@ -296,6 +297,7 @@ class _MegatronLLMBase:
         self._loop_manager: "Optional[_EventLoopManager]" = None
         self._coord_runtime: "Optional[_CoordinatorRuntime]" = None
         self._shutdown_called: bool = False
+        self._serve_started: bool = False
 
         if use_coordinator:
             loop_manager = _EventLoopManager()
@@ -342,7 +344,60 @@ class _MegatronLLMBase:
         """The underlying :class:`TextGenerationController`."""
         return self._controller
 
+    # ---- sync bridge (public) ----
+
+    def submit(self, coro: Coroutine) -> "concurrent.futures.Future":
+        """Schedule ``coro`` on the background runtime loop; return its future.
+
+        The returned :class:`concurrent.futures.Future` can be consumed from
+        any context: block with ``.result()`` from sync code, or wrap with
+        ``asyncio.wrap_future(...)`` and ``await`` it from a coroutine.
+        Callable from any thread, including threads whose own event loop is
+        running (e.g. an embedder's dispatch loop) -- the coroutine executes
+        on the runtime loop either way.
+
+        Raises:
+            RuntimeError: in direct mode (``use_coordinator=False``), which
+                has no background runtime loop.
+        """
+        self._assert_coordinator()
+        assert self._loop_manager is not None
+        return self._loop_manager.submit(coro)
+
+    def run_sync(self, coro: Coroutine):
+        """Schedule ``coro`` on the background runtime loop and block on it.
+
+        Safe to call from any thread except the runtime loop itself (that
+        would deadlock and raises instead). Calling from a thread whose own
+        event loop is running is allowed: the caller's loop stalls until the
+        result returns, while ``coro`` runs on the runtime loop.
+
+        Raises:
+            RuntimeError: in direct mode (``use_coordinator=False``), or when
+                called from a coroutine running on the runtime loop itself.
+        """
+        self._assert_coordinator()
+        assert self._loop_manager is not None
+        return self._loop_manager.run_sync(coro)
+
     # ---- internal helpers ----
+
+    def _stop_frontend_if_started(self) -> None:
+        """Stop the HTTP frontend if ``serve()`` started one on this rank.
+
+        Called first by both facades' ``shutdown()`` so no new requests
+        arrive while the coordinator is torn down. Invariant:
+        ``_serve_started`` can only be True when ``use_coordinator=True``
+        because ``serve()`` raises otherwise.
+        """
+        if not self._serve_started:
+            return
+        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (  # pylint: disable=line-too-long
+            stop_text_gen_server,
+        )
+
+        stop_text_gen_server()
+        self._serve_started = False
 
     def _assert_primary(self) -> None:
         if not self._is_primary_rank:

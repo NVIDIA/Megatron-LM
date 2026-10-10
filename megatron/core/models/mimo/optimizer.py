@@ -103,6 +103,11 @@ class MimoOptimizer(MegatronOptimizer):
         num_zeros = self.count_zeros() if self.config.log_num_zeros_in_grad else None
         success = self.step_with_ready_grads()
 
+        # Reduce update success across the world (MIN) so disjoint-grid ranks agree.
+        success_tensor = torch.tensor([1 if success else 0], dtype=torch.int, device="cuda")
+        torch.distributed.all_reduce(success_tensor, op=torch.distributed.ReduceOp.MIN)
+        success = bool(success_tensor.item())
+
         return success, grad_norm, num_zeros
 
     @torch.no_grad()
@@ -117,6 +122,11 @@ class MimoOptimizer(MegatronOptimizer):
         """Clear gradients on all active module optimizers."""
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
+
+    def prepare_model_params_for_param_sync(self) -> None:
+        """Stage parameters for explicit synchronization in all active module optimizers."""
+        for opt in self._active_optimizers:
+            opt.prepare_model_params_for_param_sync()
 
     def get_loss_scale(self) -> torch.Tensor:
         """Return the loss scale tensor from the first active optimizer."""

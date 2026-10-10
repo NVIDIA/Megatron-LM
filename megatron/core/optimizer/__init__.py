@@ -47,7 +47,6 @@ HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
 
-from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
     ParamGroupOverride,
@@ -688,11 +687,12 @@ def _get_megatron_optimizer_based_on_param_groups(
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
     if pg_collection is None or not hasattr(pg_collection, 'tp'):
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-    else:
-        tp_group = pg_collection.tp
-    # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    tp_group = pg_collection.tp
+    expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
+    # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
     setattr(optimizer, 'tp_group', tp_group)
+    setattr(optimizer, 'expert_tp_group', expert_tp_group)
 
     return optimizer
 
@@ -820,15 +820,23 @@ def _get_megatron_emerging_optimizer(
                 )
                 tp_size = get_pg_size(tp_group)
                 tp_rank = get_pg_rank(tp_group)
+                # GTP_remat shards dim 0 of the TP-local weight (padded for alignment) without
+                # regard for q/k/v or head boundaries. Muon rebuilds the TP-local rows before
+                # splitting, so check the layout against them rather than this rank's shard.
+                tp_local_rows = (
+                    param._unsharded_shape[0]
+                    if getattr(param, 'is_gtp_weight_remat', False)
+                    else param.shape[0]
+                )
 
-                expected_logical_rows = param.shape[0] * tp_size
+                expected_logical_rows = tp_local_rows * tp_size
                 if expected_logical_rows != sum(logical_split_shapes):
                     log_single_rank(
                         logger,
                         logging.DEBUG,
                         f"Emerging optimizer QKV split skipped for {name}: "
                         f"logical_rows={sum(logical_split_shapes)}, "
-                        f"local_rows={param.shape[0]}, tp_size={tp_size}",
+                        f"local_rows={tp_local_rows}, tp_size={tp_size}",
                     )
                     param.is_qkv = False
                     param.qkv_split_shapes = None
@@ -839,17 +847,17 @@ def _get_megatron_emerging_optimizer(
 
                 param.is_qkv = True
                 param.qkv_split_shapes_global = logical_split_shapes
-                local_start = tp_rank * param.shape[0]
+                local_start = tp_rank * tp_local_rows
                 if config.muon_split_qkv_per_head:
                     param.qkv_split_shapes, param.qkv_split_heads_are_complete = (
                         _localize_qkv_split_shapes(
-                            qkv_split_shapes, local_start=local_start, local_rows=param.shape[0]
+                            qkv_split_shapes, local_start=local_start, local_rows=tp_local_rows
                         )
                     )
                 else:
                     param.qkv_split_shapes = qkv_split_shapes
                     param.qkv_split_groups_are_complete = _qkv_split_groups_are_complete(
-                        qkv_split_shapes, local_start=local_start, local_rows=param.shape[0]
+                        qkv_split_shapes, local_start=local_start, local_rows=tp_local_rows
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
@@ -953,11 +961,10 @@ def _get_megatron_emerging_optimizer(
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
-            if pg_collection is None or not hasattr(pg_collection, 'tp'):
-                tp_group = parallel_state.get_tensor_model_parallel_group()
-            else:
-                tp_group = pg_collection.tp
+            tp_group = pg_collection.tp
+            expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
             setattr(optimizer, 'tp_group', tp_group)
+            setattr(optimizer, 'expert_tp_group', expert_tp_group)
             results.append(optimizer)
             continue
         else:
@@ -1119,10 +1126,12 @@ def get_megatron_optimizer(
     intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
     mp_group = process_groups_dict['mp_group']
     expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
+    expt_tp_pp_with_egtp_remat_group = process_groups_dict['expt_tp_pp_with_egtp_remat_group']
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
+    # ``mp_group`` spans TP×GTP_remat×PP (GTP_remat-merged).
     model_parallel_rank = get_pg_rank(mp_group)
 
     if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
@@ -1247,8 +1256,9 @@ def get_megatron_optimizer(
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
     if len(moe_param_groups) > 0:
-        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
-        # Pass Gloo process groups into optimizer only if needed.
+        # Expert analog of dense ``model_parallel_rank``; use the EGTP_remat-merged group so each
+        # EGTP_remat peer gets a distinct distopt ShardedObject key (else DCP "duplicate" error).
+        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_with_egtp_remat_group)
         if use_gloo_process_groups:
             expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
         else:
@@ -1259,7 +1269,7 @@ def get_megatron_optimizer(
                 model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
-                model_parallel_group=expt_tp_pp_group,
+                model_parallel_group=expt_tp_pp_with_egtp_remat_group,
                 data_parallel_group=intra_expt_dp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
