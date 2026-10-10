@@ -566,6 +566,56 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_te_quantile_balancing_histogram_replays(dtype):
+    """Exercise the QB-capable TE dispatch, including its atomic histogram output."""
+    from megatron.core.extensions.transformer_engine import (
+        fused_topk_with_score_function_supports_qb,
+    )
+    from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
+
+    if not fused_topk_with_score_function_supports_qb:
+        pytest.skip("requires the Transformer Engine QB fused-router API")
+    seeded()
+    num_tokens, num_experts = 8192, 64
+    logits = torch.randn(num_tokens, num_experts, device="cuda", dtype=dtype, requires_grad=True)
+    bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
+    bounds = torch.tensor([-1.0, 1.0], device="cuda")
+    histogram = torch.zeros(num_experts, 128, device="cuda", dtype=torch.int32)
+
+    def fn(logits, histogram):
+        outputs = []
+        for microbatch in logits.chunk(2):
+            outputs.append(
+                topk_routing_with_score_function(
+                    microbatch,
+                    topk=8,
+                    score_function="sigmoid",
+                    expert_bias=bias,
+                    fused=True,
+                    qb_histogram=histogram,
+                    qb_bin_bounds=bounds,
+                )
+            )
+        return (
+            torch.cat([output[0] for output in outputs]),
+            torch.cat([output[1] for output in outputs]),
+            histogram,
+        )
+
+    outputs, grads = assert_replays_bit_exact(
+        fn,
+        (logits, histogram),
+        grad_outputs={"out[0]": torch.randn(num_tokens, num_experts, device="cuda")},
+        replays=3,
+        contention=True,
+        what=f"TE quantile balancing[{dtype}]",
+    )
+    assert torch.all(outputs["out[2]"].sum(dim=-1) == num_tokens)
+    assert torch.all(outputs["out[1]"].sum(dim=-1) == 8)
+    assert grads["in[0]"].abs().sum() > 0
+
+
 # --- fused top-k router with dense indices ------------------------------------------------------
 
 

@@ -1940,7 +1940,9 @@ class _NCCLEPManager(_DispatchManager):
             topk_idx,
             topk_weights,
             recv_tokens=_NCCLEPManager._zc_fwd_token_buf if self._zc_quant else None,
-            recv_topk_weights=_NCCLEPManager._zc_recv_topk_weights_buf,
+            recv_topk_weights=(
+                _NCCLEPManager._zc_recv_topk_weights_buf if self._zc_quant else None
+            ),
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         if not self.eager:
