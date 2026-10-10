@@ -53,6 +53,33 @@ def test_mhc_fused_backend_defaults_to_auto():
     assert config.mhc_fused_backend == "auto"
 
 
+def _make_dsa_kpool_config(**overrides) -> TransformerConfig:
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        experimental_attention_variant="dsa",
+        add_bias_linear=False,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("kpool", [0, -1])
+def test_dsa_kpool_requires_positive_pool_size(kpool):
+    with pytest.raises(ValueError, match="dsa_indexer_kpool must be positive"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=kpool)
+
+
+def test_dsa_kpool_requires_divisible_topk():
+    with pytest.raises(ValueError, match="dsa_indexer_topk must be divisible"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=4, dsa_indexer_topk=6)
+
+
+def test_dsa_kpool_requires_topk():
+    with pytest.raises(ValueError, match="dsa_indexer_topk must be set"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=4)
+
+
 @pytest.mark.parametrize("backend", ["native", "triton", "cutile"])
 def test_mhc_fused_backend_accepts_explicit_policy(backend: str):
     config = TransformerConfig(
