@@ -463,6 +463,7 @@ def apply_swiglu_sharded_factory(
     singleton_local_shards: bool = False,
     tp_group: torch.distributed.ProcessGroup | None = None,
     dp_group: torch.distributed.ProcessGroup | None = None,
+    glu_interleave_size: int | None = None,
 ):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
@@ -473,6 +474,12 @@ def apply_swiglu_sharded_factory(
     original_shape = original_sh_ten.local_shape
     original_numel = int(np.prod(original_shape))
     local_axis_size = original_shape[swiglu_shard_axis]
+    if glu_interleave_size is not None and (
+        type(glu_interleave_size) is not int
+        or glu_interleave_size <= 0
+        or local_axis_size % (2 * glu_interleave_size) != 0
+    ):
+        raise ValueError("GLU interleave size must divide each gate/up half")
     assert (
         original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
     )
@@ -486,6 +493,9 @@ def apply_swiglu_sharded_factory(
         is_dp_sharded = dp_size > 1
     else:
         is_dp_sharded = False
+
+    if is_dp_sharded and glu_interleave_size is not None:
+        raise ValueError("Interleaved GLU checkpoints do not yet support FSDP parameter shards")
 
     @torch.no_grad()
     def sh_ten_build_fn(
@@ -509,7 +519,12 @@ def apply_swiglu_sharded_factory(
             w_key = key
             v_key = key
 
-        tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
+        if glu_interleave_size is None:
+            tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
+        else:
+            blocks = t.reshape(-1, 2, glu_interleave_size, *original_shape[1:])
+            tensor_w = blocks[:, 0].reshape(local_axis_size // 2, *original_shape[1:])
+            tensor_v = blocks[:, 1].reshape(local_axis_size // 2, *original_shape[1:])
         return [
             ShardedTensor.from_rank_offsets(
                 w_key,
@@ -584,13 +599,24 @@ def apply_swiglu_sharded_factory(
             )
         ]
 
+    def merge_glu(sub_state_dict):
+        if glu_interleave_size is None:
+            return cat_with_oom_fallback(sub_state_dict)
+        gate, up = sub_state_dict
+        pieces = [
+            piece
+            for pair in zip(gate.split(glu_interleave_size), up.split(glu_interleave_size))
+            for piece in pair
+        ]
+        return cat_with_oom_fallback(pieces)
+
     # Construct a ShardedTensorFactory.
     sh_ten_factory_build_function = dp_sh_ten_build_fn if is_dp_sharded else sh_ten_build_fn
     return ShardedTensorFactory(
         original_sh_ten.key,
         original_sh_ten.data,
         sh_ten_factory_build_function,
-        cat_with_oom_fallback,
+        merge_glu,
         original_sh_ten.replica_id,
         flattened_range=original_sh_ten.flattened_range,
     )
