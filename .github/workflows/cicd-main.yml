@@ -35,6 +35,9 @@ env:
   container-registry-gb200: 766267172432.dkr.ecr.us-east-2.amazonaws.com
   # GAR path includes the repository; the reusable workflow appends the image name.
   container-registry-gcp-h100: asia-southeast1-docker.pkg.dev/nv-nemoautomati-20260505210812/megatron-lm
+  # Repository variable: aws (default), gcp, or 50-50. Applied only to
+  # NVIDIA-member PRs; external contributors and non-PR events stay on AWS.
+  H100_RUNNER_TRAFFIC_MODE: ${{ vars.H100_RUNNER_TRAFFIC_MODE || 'aws' }}
 
 jobs:
   ephemeral-runner-routing:
@@ -182,10 +185,14 @@ jobs:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
     with:
       workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160 # pragma: allowlist secret
+      # Enabling the runner prefix makes the preflight return its SSO is_member value.
+      default_runner_prefix: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/pull-request/') && 'nvidia-ci-aws-gpu-x8' || '' }}
+    secrets:
+      NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
   configure:
     runs-on: ubuntu-latest
-    needs: [pre-flight]
+    needs: [pre-flight, is-not-external-contributor, ephemeral-runner-routing]
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
       scope:          ${{ steps.configure.outputs.scope }}
@@ -196,6 +203,12 @@ jobs:
       run_mbridge:    ${{ steps.configure.outputs.run_mbridge }}
       run_nemo_rl:    ${{ steps.configure.outputs.run_nemo_rl }}
       run_functional: ${{ steps.configure.outputs.run_functional }}
+      run_h100_functional: ${{ steps.configure.outputs.run_h100_functional }}
+      h100_cloud: ${{ steps.configure.outputs.h100_cloud }}
+      h100_build_runner: ${{ steps.configure.outputs.h100_build_runner }}
+      h100_gpu_runs_on: ${{ steps.configure.outputs.h100_gpu_runs_on }}
+      h100_registry: ${{ steps.configure.outputs.h100_registry }}
+      h100_use_gcp: ${{ steps.configure.outputs.h100_use_gcp }}
       dev:            ${{ steps.configure.outputs.dev }}
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
@@ -249,6 +262,14 @@ jobs:
           REF: ${{ github.ref }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           ENABLE_SELECTIVE_UNIT_TESTS: ${{ vars.ENABLE_SELECTIVE_UNIT_TESTS }}
+          H100_TRAFFIC_MODE: ${{ env.H100_RUNNER_TRAFFIC_MODE }}
+          PREFLIGHT_IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
+          IS_PR: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/pull-request/') }}
+          IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
+          EPHEMERAL_RUNNER: ${{ needs.ephemeral-runner-routing.outputs.runner_label_base }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REGISTRY_AWS: ${{ env.container-registry }}
+          REGISTRY_GCP_H100: ${{ env.container-registry-gcp-h100 }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
@@ -272,8 +293,7 @@ jobs:
             FORCE_RUN_ALL=true
           fi
 
-          # Ordinary PR pushes run unit tests only. Keep the integration tier
-          # available for explicit test labels and the existing full-CI paths.
+          # Keep the existing functional-test selection for GB200 unchanged.
           RUN_FUNCTIONAL=false
           if [ "$HAS_RUN_TESTS" == "true" ] \
             || [ "$HAS_RUN_FUNCTIONAL" == "true" ] \
@@ -282,6 +302,65 @@ jobs:
             || [ "$EVENT_NAME" == "workflow_dispatch" ] \
             || [ "$FORCE_RUN_ALL" == "true" ]; then
             RUN_FUNCTIONAL=true
+          fi
+
+          # H100 functional tests now run on PRs as well. Keep this separate
+          # from RUN_FUNCTIONAL so GB200 test selection remains unchanged.
+          RUN_H100_FUNCTIONAL=$RUN_FUNCTIONAL
+          if [ "$IS_PR" == "true" ]; then
+            RUN_H100_FUNCTIONAL=true
+          fi
+
+          # Select one H100 cloud per PR run. Membership comes from the reusable
+          # preflight SSO check; every non-member PR stays on its ephemeral AWS
+          # runner. Merge queue and all non-PR events keep the existing AWS path.
+          H100_CLOUD=aws-h100
+          H100_BUILD_RUNNER=nvidia-ci-aws-cpu
+          H100_GPU_RUNS_ON='{"group":"nemo-ci-gpu-x8","labels":"nvidia-ci-aws-gpu-x8"}'
+          H100_REGISTRY=$REGISTRY_AWS
+          H100_USE_GCP=false
+
+          if [ "$IS_PR" == "true" ]; then
+            if [ "$PREFLIGHT_IS_MEMBER" == "true" ]; then
+              case "$H100_TRAFFIC_MODE" in
+                aws)
+                  ;;
+                gcp)
+                  H100_CLOUD=gcp-h100
+                  H100_BUILD_RUNNER=nvidia-ci-gcp-cpu-h100
+                  H100_GPU_RUNS_ON='{"group":"nemo-ci-gpu-x8","labels":"nvidia-ci-gcp-h100-x8"}'
+                  H100_REGISTRY=$REGISTRY_GCP_H100
+                  H100_USE_GCP=true
+                  ;;
+                50-50)
+                  if (( RANDOM % 2 )); then
+                    H100_CLOUD=gcp-h100
+                    H100_BUILD_RUNNER=nvidia-ci-gcp-cpu-h100
+                    H100_GPU_RUNS_ON='{"group":"nemo-ci-gpu-x8","labels":"nvidia-ci-gcp-h100-x8"}'
+                    H100_REGISTRY=$REGISTRY_GCP_H100
+                    H100_USE_GCP=true
+                  fi
+                  ;;
+                *)
+                  echo "::error::H100_RUNNER_TRAFFIC_MODE must be aws, gcp, or 50-50; got '$H100_TRAFFIC_MODE'"
+                  exit 1
+                  ;;
+              esac
+            else
+              H100_BUILD_RUNNER=$EPHEMERAL_RUNNER
+              H100_GPU_RUNS_ON="\"$EPHEMERAL_RUNNER\""
+              if [[ "$EPHEMERAL_RUNNER" == ephe-v2-* ]]; then
+                H100_BUILD_RUNNER="${EPHEMERAL_RUNNER}-a${RUN_ATTEMPT}"
+                H100_GPU_RUNS_ON="\"${H100_BUILD_RUNNER}\""
+              fi
+            fi
+          elif [ "$IS_MAINTAINER" != "true" ]; then
+            H100_BUILD_RUNNER=$EPHEMERAL_RUNNER
+            H100_GPU_RUNS_ON="\"$EPHEMERAL_RUNNER\""
+            if [[ "$EPHEMERAL_RUNNER" == ephe-v2-* ]]; then
+              H100_BUILD_RUNNER="${EPHEMERAL_RUNNER}-a${RUN_ATTEMPT}"
+              H100_GPU_RUNS_ON="\"${H100_BUILD_RUNNER}\""
+            fi
           fi
 
           if [ "$IS_MERGE_GROUP" == "true" ]; then
@@ -389,6 +468,12 @@ jobs:
           echo "run_mbridge=$RUN_MBRIDGE"       | tee -a $GITHUB_OUTPUT
           echo "run_nemo_rl=$RUN_NEMO_RL"       | tee -a $GITHUB_OUTPUT
           echo "run_functional=$RUN_FUNCTIONAL" | tee -a $GITHUB_OUTPUT
+          echo "run_h100_functional=$RUN_H100_FUNCTIONAL" | tee -a $GITHUB_OUTPUT
+          echo "h100_cloud=$H100_CLOUD" | tee -a $GITHUB_OUTPUT
+          echo "h100_build_runner=$H100_BUILD_RUNNER" | tee -a $GITHUB_OUTPUT
+          echo "h100_gpu_runs_on=$H100_GPU_RUNS_ON" | tee -a $GITHUB_OUTPUT
+          echo "h100_registry=$H100_REGISTRY" | tee -a $GITHUB_OUTPUT
+          echo "h100_use_gcp=$H100_USE_GCP" | tee -a $GITHUB_OUTPUT
           echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
@@ -419,6 +504,9 @@ jobs:
           | \`run_mbridge\` | \`$RUN_MBRIDGE\` |
           | \`run_nemo_rl\` | \`$RUN_NEMO_RL\` |
           | \`run_functional\` | \`$RUN_FUNCTIONAL\` |
+          | \`run_h100_functional\` | \`$RUN_H100_FUNCTIONAL\` |
+          | \`h100_cloud\` | \`$H100_CLOUD\` |
+          | \`h100_traffic_mode\` | \`$H100_TRAFFIC_MODE\` |
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`cadence\` | \`$CADENCE\` |
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
@@ -842,11 +930,10 @@ jobs:
     uses: ./.github/workflows/_build_ci_container.yml
     with:
       is-maintainer: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
-      selected-runner: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-cpu-h100' || (startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner) }}
+      selected-runner: ${{ needs.configure.outputs.h100_build_runner }}
       selected-runner-gb200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
       registry-gcp-h100: asia-southeast1-docker.pkg.dev/nv-nemoautomati-20260505210812/megatron-lm
-      use-gcp-h100: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
-      also-build-aws-h100: ${{ needs.configure.outputs.run_functional == 'true' }}
+      use-gcp-h100: ${{ needs.configure.outputs.h100_use_gcp == 'true' }}
       source-sha: ${{ needs.configure.outputs.sha }}
       lts: ${{ needs.configure.outputs.lts == 'true' }}
 
@@ -894,7 +981,7 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
-    runs-on: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && fromJSON('{"group":"nemo-ci-gpu-x8","labels":"nvidia-ci-gcp-h100-x8"}') || (startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner) }}
+    runs-on: ${{ fromJSON(needs.configure.outputs.h100_gpu_runs_on) }}
     timeout-minutes: 60
     name: "${{ matrix.bucket }} - latest"
     if: |
@@ -929,7 +1016,7 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
-          container-image: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && format('{0}/megatron-lm:{1}-gcp-h100', env.container-registry-gcp-h100, needs.configure.outputs.sha) || format('{0}/megatron-lm:{1}-aws-h100', env.container-registry, needs.configure.outputs.sha) }}
+          container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
           sha: ${{ needs.configure.outputs.sha }}
           unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
@@ -1054,6 +1141,7 @@ jobs:
       && !cancelled()
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
+      should_run_gb200: ${{ steps.gate.outputs.should_run_gb200 }}
     steps:
       - id: gate
         env:
@@ -1062,6 +1150,7 @@ jobs:
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
+          RUN_H100_FUNCTIONAL: ${{ needs.configure.outputs.run_h100_functional }}
           RUN_FUNCTIONAL: ${{ needs.configure.outputs.run_functional }}
         shell: bash
         run: |
@@ -1080,13 +1169,19 @@ jobs:
              || [ "$FORCE_RUN_ALL" = "true" ]; then
             unit=true
           fi
-          if [ "$approval" = "true" ] && [ "$unit" = "true" ] && [ "$RUN_FUNCTIONAL" = "true" ]; then
+          if [ "$approval" = "true" ] && [ "$unit" = "true" ] && [ "$RUN_H100_FUNCTIONAL" = "true" ]; then
             should_run=true
           else
             should_run=false
           fi
           echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
-          echo "approval=$approval unit=$unit run_functional=$RUN_FUNCTIONAL -> should_run=$should_run"
+          if [ "$approval" = "true" ] && [ "$unit" = "true" ] && [ "$RUN_FUNCTIONAL" = "true" ]; then
+            should_run_gb200=true
+          else
+            should_run_gb200=false
+          fi
+          echo "should_run_gb200=$should_run_gb200" >> "$GITHUB_OUTPUT"
+          echo "approval=$approval unit=$unit run_h100_functional=$RUN_H100_FUNCTIONAL run_gb200_functional=$RUN_FUNCTIONAL -> H100=$should_run GB200=$should_run_gb200"
           echo "  (wait-in-queue=$WAIT_RESULT, unit-tests=$UNIT_RESULT,"
           echo "   is_merge_group=$IS_MERGE_GROUP, is_ci_workload=$IS_CI_WORKLOAD,"
           echo "   force_run_all=$FORCE_RUN_ALL)"
@@ -1154,7 +1249,7 @@ jobs:
       - configure
       - cicd-integration-gate
       - cicd-parse-integration-tests-h100
-    runs-on: ${{ startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner }}
+    runs-on: ${{ fromJSON(needs.configure.outputs.h100_gpu_runs_on) }}
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
@@ -1179,7 +1274,7 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
+          container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
@@ -1194,7 +1289,7 @@ jobs:
       - cicd-integration-gate
     if: |
       !cancelled()
-      && needs.cicd-integration-gate.outputs.should_run == 'true'
+      && needs.cicd-integration-gate.outputs.should_run_gb200 == 'true'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && vars.ENABLE_GB200_TESTING == 'true'
     outputs:
@@ -1262,7 +1357,7 @@ jobs:
       PIP_RETRIES: 5
     if: |
       !cancelled()
-      && needs.cicd-integration-gate.outputs.should_run == 'true'
+      && needs.cicd-integration-gate.outputs.should_run_gb200 == 'true'
       && needs.cicd-parse-integration-tests-gb200.result == 'success'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && vars.ENABLE_GB200_TESTING == 'true'
@@ -1323,6 +1418,7 @@ jobs:
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           RUN_FUNCTIONAL: ${{ needs.configure.outputs.run_functional }}
+          RUN_H100_FUNCTIONAL: ${{ needs.configure.outputs.run_h100_functional }}
           ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
           UNIT_GB200_RESULT: ${{ needs.cicd-unit-tests-latest-gb200.result }}
@@ -1356,8 +1452,8 @@ jobs:
             fi
           fi
 
-          if [ "$RUN_FUNCTIONAL" != "true" ] && [ "$H100_RESULT" == "skipped" ]; then
-            echo "✅ Functional tests skipped by unit-only PR scope"
+          if [ "$RUN_H100_FUNCTIONAL" != "true" ] && [ "$H100_RESULT" == "skipped" ]; then
+            echo "✅ H100 functional tests skipped by configured test scope"
           elif [ "$H100_RESULT" != "success" ] && [ "$H100_RESULT" != "skipped-by-unit-failure" ]; then
             echo "❌ cicd-integration-tests-latest-h100: $H100_RESULT"
             FAILED=true

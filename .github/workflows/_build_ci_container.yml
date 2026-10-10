@@ -52,11 +52,6 @@ on:
         required: false
         default: false
         type: boolean
-      also-build-aws-h100:
-        description: Also build the H100 image in ECR for AWS functional test runners
-        required: false
-        default: false
-        type: boolean
       registry-gb200:
         description: Registry for GB200 images and caches
         required: false
@@ -103,19 +98,12 @@ jobs:
           REGISTRY_AWS: ${{ inputs.registry-aws }}
           REGISTRY_GCP_H100: ${{ inputs.registry-gcp-h100 }}
           USE_GCP_H100: ${{ inputs.use-gcp-h100 }}
-          ALSO_BUILD_AWS_H100: ${{ inputs.also-build-aws-h100 }}
           REGISTRY_GB_GPU: ${{ inputs.registry-gb200 }}
         run: |
           if [ "$IS_MAINTAINER" = "true" ] && [ "$USE_GCP_H100" = "true" ]; then
             GCP_H100=$(jq -nc --arg registry "$REGISTRY_GCP_H100" --arg runner "$SELECTED_RUNNER" \
               '{"cloud": "gcp-h100", "registry": $registry, "runner": $runner}')
-            if [ "$ALSO_BUILD_AWS_H100" = "true" ]; then
-              AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" \
-                '{"cloud": "aws-h100", "registry": $registry, "runner": "nvidia-ci-aws-cpu"}')
-              H100_MATRIX=$(jq -nc --argjson gcp "$GCP_H100" --argjson aws "$AWS_H100" '[$gcp, $aws]')
-            else
-              H100_MATRIX=$(jq -nc --argjson gcp "$GCP_H100" '[$gcp]')
-            fi
+            H100_MATRIX=$(jq -nc --argjson gcp "$GCP_H100" '[$gcp]')
           else
             AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
               '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
@@ -138,8 +126,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
     runs-on: >-
-      ${{ inputs.is-maintainer && matrix.cloud == 'aws-h100' && !inputs.use-gcp-h100 && 'nvidia-ci-aws-cpu'
-          || inputs.is-maintainer && matrix.cloud == 'gb-gpu' && 'nvidia-ci-aws-cpu-arm64'
+      ${{ inputs.is-maintainer && matrix.cloud == 'gb-gpu' && 'nvidia-ci-aws-cpu-arm64'
           || matrix.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     env:
