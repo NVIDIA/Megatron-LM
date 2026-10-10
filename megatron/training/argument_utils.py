@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
+from megatron.core.tuning import AutotunePolicy
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
@@ -88,12 +89,22 @@ class ArgumentGroupFactory:
             argument generation. Useful for omitting internal fields, computed properties,
             or attributes that should be configured through other means. If None, all 
             dataclass fields will be converted to command-line arguments. Default: None.
+        prefix: Optional prefix for every argument name and destination, for dataclasses
+            whose attribute names are only unique within the dataclass. For example, the
+            prefix 'triton_autotune' turns attribute `mode` into `--triton-autotune-mode`
+            with destination `triton_autotune_mode`. Default: None.
     """
 
-    def __init__(self, src_cfg_class: type, exclude: Optional[list[str]] = None) -> None:
+    def __init__(
+        self,
+        src_cfg_class: type,
+        exclude: Optional[list[str]] = None,
+        prefix: Optional[str] = None,
+    ) -> None:
         self.src_cfg_class = src_cfg_class
         self.field_docstrings = self._get_field_docstrings(src_cfg_class)
         self.exclude = set(exclude) if exclude is not None else set()
+        self.prefix = prefix
 
     def _format_arg_name(self, config_attr_name: str, prefix: Optional[str] = None) -> str:
         """Convert dataclass name into appropriate argparse flag name.
@@ -151,6 +162,12 @@ class ArgumentGroupFactory:
             else:
                 raise TypeInferenceError(f"Multi-type lists not supported by argparse: {config_type}")
 
+        elif origin is tuple and len(type_tuple) == 2 and type_tuple[1] is Ellipsis:
+            # Variable-length tuple of one type, such as tuple[str, ...]
+            kwargs = self._extract_type(type_tuple[0])
+            kwargs["nargs"] = "+"
+            return kwargs
+
         elif origin is typing.Literal:
             choices_types = [type(choice) for choice in type_tuple]
             assert all([t == choices_types[0] for t in choices_types]), "Type of each choice in a Literal type should all be the same."
@@ -167,8 +184,9 @@ class ArgumentGroupFactory:
             attribute: dataclass attribute
         """
         argparse_kwargs = {}
-        argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)]
-        argparse_kwargs["dest"] = attribute.name
+        name = attribute.name if self.prefix is None else f"{self.prefix}_{attribute.name}"
+        argparse_kwargs["arg_names"] = [self._format_arg_name(name)]
+        argparse_kwargs["dest"] = name
         argparse_kwargs["help"] = self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else ""
 
         # dataclasses specifies that both should not be set
@@ -196,7 +214,7 @@ class ArgumentGroupFactory:
 
                 # add '--no-*' and '--disable-*' prefix if this is a store_false argument
                 if argparse_kwargs["action"] == "store_false":
-                    argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")] 
+                    argparse_kwargs["arg_names"] = [self._format_arg_name(name, prefix="no"), self._format_arg_name(name, prefix="disable")] 
         except TypeInferenceError as e:
             if attr_argparse_meta is not None:
                 print(
@@ -326,6 +344,29 @@ def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | Non
     )
 
 
+def _triton_autotune_config_from_args(args: Namespace) -> AutotunePolicy:
+    """Build the Triton autotune policy from the ``--triton-autotune-*`` arguments.
+
+    A ``--yaml-cfg`` configuration replaces those arguments and sets the same fields in
+    an optional top-level ``triton_autotune`` section.
+    """
+    if args.yaml_cfg is None:
+        return _default_config_from_args(AutotunePolicy, args, prefix='triton_autotune')
+    # A YAML namespace only has the sections that the file sets.
+    section = getattr(args, 'triton_autotune', None)
+    if section is None:
+        return AutotunePolicy()
+    if isinstance(section, types.SimpleNamespace):
+        section = vars(section)
+    if not isinstance(section, dict):
+        raise TypeError('The triton_autotune YAML section must be a mapping.')
+    section = dict(section)
+    if isinstance(section.get('block_sizes'), types.SimpleNamespace):
+        section['block_sizes'] = vars(section['block_sizes'])
+    # Null YAML values fall back to defaults, and unknown or mistyped keys raise.
+    return AutotunePolicy.from_mapping(section)
+
+
 def _model_rng_config(args: Namespace) -> RNGConfig:
     """Use parsed RNG inputs only during bootstrap, before a run config exists."""
     from megatron.training.global_vars import get_run_config, is_run_config_initialized
@@ -448,6 +489,7 @@ def core_transformer_config_from_args(args, config_class=None):
     if wide_residual is not None or 'wide_residual' not in kw_args:
         kw_args['wide_residual'] = wide_residual
 
+
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
         # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
@@ -500,16 +542,20 @@ def _apply_yarn_config_from_args(config, args) -> None:
     _set('yarn_correction_range_round_to_int', args.yarn_correction_range_round_to_int, True)
 
 
-def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
+def _default_config_from_args(
+    cls: type, args: Namespace, return_instance: bool = True, prefix: Optional[str] = None
+) -> Any:
     """Create a config dataclass from the appropriate values in the `args` Namespace.
 
     This is generic, i.e. it will work if dataclass attribute names map 1-to-1 with
-    names in `args`. Some classes might require additional logic.
+    names in `args`. Some classes might require additional logic. `prefix` matches
+    arguments added by an `ArgumentGroupFactory` with the same prefix.
     """
     kwargs = {}
     for f in fields(cls):
-        if f.init and hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
+        name = f.name if prefix is None else f"{prefix}_{f.name}"
+        if f.init and hasattr(args, name):
+            kwargs[f.name] = getattr(args, name)
 
     if return_instance:
         return cls(**kwargs)
