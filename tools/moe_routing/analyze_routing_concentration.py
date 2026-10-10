@@ -109,7 +109,7 @@ def main():
 
     for rank, step, layer_key, topk, ntok, top_indices in load_traces(args.trace_dir):
         step_layer_count[rank][step].add(layer_key)
-        step_token_count[rank][step] = ntok
+        step_token_count[rank][step] = max(step_token_count[rank][step], ntok)
         step_records[(rank, step)].append((layer_key, ntok, top_indices))
         if topk is not None and layer_key not in per_layer_topk:
             per_layer_topk[layer_key] = topk
