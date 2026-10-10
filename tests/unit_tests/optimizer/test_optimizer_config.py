@@ -21,6 +21,34 @@ def test_layer_sharded_muon_tp_mode_requirements():
         OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'muon_split_qkv': True})
 
 
+def test_hybrid_muon_expert_tp_mode_requirements():
+    """muon_expert_tp_mode is a muon-only knob; layer_sharded on the expert side needs the
+    layer-wise path too; the split-QKV restriction is keyed to the dense side, which alone
+    owns QKV weights."""
+    ok = dict(optimizer='muon', use_layer_wise_distributed_optimizer=True)
+    hybrid = dict(muon_tp_mode='auto', muon_expert_tp_mode='layer_sharded')
+    # Dense auto + expert layer_sharded keeps dense split-QKV available.
+    OptimizerConfig(**hybrid, muon_split_qkv=True, **ok)
+    with pytest.raises(ValueError, match="layer-wise"):
+        OptimizerConfig(**hybrid, **{**ok, 'use_layer_wise_distributed_optimizer': False})
+    # Reverse hybrid: the dense side is layer_sharded, so split-QKV must be off.
+    reverse = dict(muon_tp_mode='layer_sharded', muon_expert_tp_mode='duplicated')
+    OptimizerConfig(**reverse, muon_split_qkv=False, **ok)
+    with pytest.raises(ValueError, match="split-QKV"):
+        OptimizerConfig(**reverse, muon_split_qkv=True, **ok)
+    # An explicit expert mode equal to the dense one changes nothing.
+    OptimizerConfig(optimizer='muon', muon_tp_mode='duplicated', muon_expert_tp_mode='duplicated')
+    # dist_muon is the deprecated alias for muon + the layer-wise path.
+    OptimizerConfig(optimizer='dist_muon', muon_tp_mode='auto', muon_expert_tp_mode='duplicated')
+    # Every other optimizer applies muon_tp_mode to all weights and would silently ignore the
+    # override, so an explicit expert mode is rejected for them, layer_sharded or not.
+    for other in ('adaptive_muon', 'adam'):
+        with pytest.raises(ValueError, match="only implemented for optimizer='muon'"):
+            OptimizerConfig(optimizer=other, muon_tp_mode='auto', muon_expert_tp_mode='duplicated')
+        with pytest.raises(ValueError, match="only implemented for optimizer='muon'"):
+            OptimizerConfig(optimizer=other, **hybrid)
+
+
 def test_paramkey_matches():
     len_1_predicate = ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1)
     endswith_bias = ParamKey(name="*.bias")
