@@ -649,17 +649,21 @@ class HybridStack(MegatronModule):
         use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         use_fp4_context = self.config.fp4 is not None
-        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+        outer_fp8_context = (
+            get_fp8_context(self.config, pg_collection=self.pg_collection)
+            if use_outer_fp8_context
+            else nullcontext()
+        )
 
         if use_inner_fp8_context:
 
             def get_inner_quant_context(config, layer_number):
-                return get_fp8_context(config, layer_number)
+                return get_fp8_context(config, layer_number, pg_collection=self.pg_collection)
 
         elif use_fp4_context:
 
             def get_inner_quant_context(config, layer_number):
-                return get_fp4_context(config, layer_number)
+                return get_fp4_context(config, layer_number, pg_collection=self.pg_collection)
 
         else:
 

@@ -97,12 +97,12 @@ def checkpointed_forward(
                 if use_inner_quantization_context:
                     if self.config.fp8:
                         inner_quantization_context = get_fp8_context(
-                            self.config, layer.layer_number - 1
+                            self.config, layer.layer_number - 1, pg_collection=self.pg_collection
                         )
                     # TODO: check if fp4 is supported in this case
                     elif self.config.fp4:
                         inner_quantization_context = get_fp4_context(
-                            self.config, layer.layer_number - 1
+                            self.config, layer.layer_number - 1, pg_collection=self.pg_collection
                         )
                     else:
                         inner_quantization_context = nullcontext()

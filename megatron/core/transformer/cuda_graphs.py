@@ -21,7 +21,7 @@ import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, amax_reduction_group
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     cudagraph_needs_generator_registration,
@@ -1123,11 +1123,19 @@ class _CudaGraphRunner(torch.nn.Module):
         if self.fp8_runtime_enabled:
             from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
 
-            return get_fp8_context(self.base_module.config, self.base_module.layer_number - 1)
+            return get_fp8_context(
+                self.base_module.config,
+                self.base_module.layer_number - 1,
+                pg_collection=self.base_module.pg_collection,
+            )
         elif self.fp4_runtime_enabled:
             from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
 
-            return get_fp4_context(self.base_module.config, self.base_module.layer_number - 1)
+            return get_fp4_context(
+                self.base_module.config,
+                self.base_module.layer_number - 1,
+                pg_collection=self.base_module.pg_collection,
+            )
         else:
             return nullcontext()
 
@@ -2596,23 +2604,6 @@ class TECudaGraphHelper:
 
         return sample_args, sample_kwargs
 
-    def _get_amax_reduction_group(self, with_context_parallel=False, tp_only_amax_red=False):
-        """Get the FP8 amax reduction group the caller rank belongs to."""
-        if with_context_parallel:
-            if not tp_only_amax_red:
-                assert self.pg_collection.tp_dp_cp is not None
-                return self.pg_collection.tp_dp_cp
-            else:
-                assert self.pg_collection.tp_cp is not None
-                return self.pg_collection.tp_cp
-        else:
-            if not tp_only_amax_red:
-                assert self.pg_collection.tp_dp is not None
-                return self.pg_collection.tp_dp
-            else:
-                assert self.pg_collection.tp is not None
-                return self.pg_collection.tp
-
     def _get_cuda_graph_input_data(self):
         """
         Create the CUDA Graph capturing input data.
@@ -2758,8 +2749,8 @@ class TECudaGraphHelper:
                     and self.pg_collection is not None
                     and self.pg_collection.tp is not None
                 ):
-                    kwargs['fp8_group'] = self._get_amax_reduction_group(
-                        with_context_parallel=True, tp_only_amax_red=self.config.tp_only_amax_red
+                    kwargs['fp8_group'] = amax_reduction_group(
+                        self.pg_collection, self.config.tp_only_amax_red
                     )
             else:
                 kwargs['fp8_enabled'] = False

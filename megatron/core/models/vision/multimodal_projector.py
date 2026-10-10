@@ -96,7 +96,7 @@ class MultimodalProjector(MegatronModule):
                     dim=0,
                 )
 
-        fp8_context = get_fp8_context(self.config)
+        fp8_context = get_fp8_context(self.config, pg_collection=self.pg_collection)
         with fp8_context:
             # Run encoder.
             encoder_output, encoder_output_bias = apply_module(self.encoder)(hidden_states)
