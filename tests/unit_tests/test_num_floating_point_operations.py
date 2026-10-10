@@ -74,6 +74,7 @@ def _make_gpt_args(
     args.moe_shared_expert_intermediate_size = None
     args.mtp_num_layers = None
     args.mtp_use_repeated_layer = False
+    args.mtp_detach_heads = False
     # Linear attention disabled.
     args.experimental_attention_variant = None
     args.linear_attention_freq = None
@@ -618,6 +619,84 @@ class TestHybridMatchesStandard:
             args.gated_attention_proj_granularity = gate_granularity
 
         self._assert_match(configure)
+
+
+class TestMTPLogitFlops:
+    """MTP head detachment removes draft wgrad without changing the final LM head."""
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    @pytest.mark.parametrize("mtp_loss_type", ("cross_entropy", "e2e_tv"))
+    def test_detached_draft_heads_omit_only_weight_gradient(self, make_args, mtp_loss_type):
+        args = make_args()
+        args.mtp_num_layers = 3
+        args.mtp_loss_type = mtp_loss_type
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        args.mtp_detach_heads = False
+        attached_flops = num_floating_point_operations(args, batch_size)
+        args.mtp_detach_heads = True
+        detached_flops = num_floating_point_operations(args, batch_size)
+
+        # One FMA-counted output-projection pass (wgrad) disappears per draft
+        # head. Forward and hidden-state dgrad remain.
+        expected_removed_wgrad = (
+            2 * total_tokens * args.hidden_size * args.padded_vocab_size * args.mtp_num_layers
+        )
+        assert attached_flops - detached_flops == expected_removed_wgrad
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    def test_detached_heads_preserve_e2e_tv_target_projection(self, make_args):
+        args = make_args()
+        args.mtp_num_layers = 3
+        args.mtp_detach_heads = True
+        batch_size = 2
+
+        args.mtp_loss_type = "cross_entropy"
+        cross_entropy_flops = num_floating_point_operations(args, batch_size)
+        args.mtp_loss_type = "e2e_tv"
+        e2e_tv_flops = num_floating_point_operations(args, batch_size)
+
+        # The frozen target projection adds one forward pass, independent of
+        # the number of draft heads and their omitted weight gradients.
+        expected_target_projection = (
+            2 * batch_size * args.seq_length * args.hidden_size * args.padded_vocab_size
+        )
+        assert e2e_tv_flops - cross_entropy_flops == expected_target_projection
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    def test_detach_flag_does_not_change_final_lm_head(self, make_args):
+        args = make_args()
+        args.mtp_num_layers = None
+        batch_size = 2
+
+        args.mtp_detach_heads = False
+        attached_flops = num_floating_point_operations(args, batch_size)
+        args.mtp_detach_heads = True
+        detached_flops = num_floating_point_operations(args, batch_size)
+
+        assert attached_flops == detached_flops
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    def test_missing_detach_flag_keeps_legacy_three_pass_count(self, make_args):
+        args = make_args()
+        args.mtp_num_layers = 3
+        batch_size = 2
+
+        del args.mtp_detach_heads
+        legacy_flops = num_floating_point_operations(args, batch_size)
+        args.mtp_detach_heads = False
+        explicit_attached_flops = num_floating_point_operations(args, batch_size)
+
+        assert legacy_flops == explicit_attached_flops
 
 
 class TestKimiDeltaAttentionFlops:
