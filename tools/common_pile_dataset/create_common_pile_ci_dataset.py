@@ -416,7 +416,7 @@ def main():
 
     gpt_prefix = os.path.join(args.output_dir, "my-gpt3_00")
     gpt_bin = gpt_prefix + "_text_document.bin"
-    if os.path.exists(gpt_bin):
+    if os.path.exists(gpt_bin) and os.path.exists(gpt_bin[:-4] + ".idx"):
         print(f"  GPT data already exists: {gpt_bin}")
     else:
         run_preprocess(
@@ -439,7 +439,7 @@ def main():
 
     bert_prefix = os.path.join(args.output_dir, "my-bert_00")
     bert_bin = bert_prefix + "_text_sentence.bin"
-    if os.path.exists(bert_bin):
+    if os.path.exists(bert_bin) and os.path.exists(bert_bin[:-4] + ".idx"):
         print(f"  BERT data already exists: {bert_bin}")
     else:
         # BERT with --split-sentences requires two passes when partitions=1:
@@ -480,7 +480,7 @@ def main():
 
     t5_prefix = os.path.join(args.output_dir, "my-t5_00")
     t5_bin = t5_prefix + "_text_document.bin"
-    if os.path.exists(t5_bin):
+    if os.path.exists(t5_bin) and os.path.exists(t5_bin[:-4] + ".idx"):
         print(f"  T5 data already exists: {t5_bin}")
     else:
         run_preprocess(
