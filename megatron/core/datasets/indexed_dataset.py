@@ -906,7 +906,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         Returns:
             numpy.ndarray: The sequence modes
         """
-        assert self.index.sequence_modes
+        assert self.index.sequence_modes is not None
         return self.index.sequence_modes
 
     @staticmethod
