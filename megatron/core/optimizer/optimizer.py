@@ -9,7 +9,7 @@ import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from typing_extensions import override
@@ -52,6 +52,9 @@ from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
+
+if TYPE_CHECKING:
+    from ..full_cuda_graph import FullIterationGradCopy
 
 logger = getLogger(__name__)
 
@@ -1022,6 +1025,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
 
+        # Enabled by the layer-wise optimizer when its model uses full-iteration CG.
+        self._full_iteration_grad_copy: Optional["FullIterationGradCopy"] = None
+
         # Handle main parameters.
 
         if optimizer:
@@ -1145,6 +1151,20 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return model_data, main_data
 
     def _copy_model_grads_to_main_grads(self):
+        if self._full_iteration_grad_copy is None:
+            return self._copy_model_grads_to_main_grads_eager()
+
+        # Layer-wise DDP owns persistent main_grad buffers. Reuse F/B scratch
+        # for their FP32 conversion after the training graph has finished.
+        pairs = []
+        for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
+            pairs.extend((model.main_grad, main) for model, main in zip(model_group, main_group))
+        for model_group in self.fp32_from_fp32_groups:
+            pairs.extend((model.main_grad, model) for model in model_group)
+        self._full_iteration_grad_copy.copy(self._copy_model_grads_to_main_grads_eager, pairs)
+
+    def _copy_model_grads_to_main_grads_eager(self):
+        """Convert model gradients without graph capture or replay."""
         # This only needs to be done for the float16 group.
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
