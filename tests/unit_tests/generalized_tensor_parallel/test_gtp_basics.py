@@ -2103,8 +2103,6 @@ class TestWgradAccumBatchScheduleGate:
 
     def _tag_output_layer(self, monkeypatch, schedule):
         """Enabled flag for one output_layer param, under the calculator production builds."""
-        from types import SimpleNamespace
-
         from megatron.core import num_microbatches_calculator as nmb
 
         nmb.destroy_num_microbatches_calculator()
@@ -2116,13 +2114,15 @@ class TestWgradAccumBatchScheduleGate:
                 data_parallel_size=1,
                 step_batch_size_schedule=schedule,
             )
-        # The stub stands in for a GTPShardedParam; only the name drives the decision.
-        monkeypatch.setattr(gtp_module, "is_gtp_param", lambda p: True)
-        param = SimpleNamespace()
+        # Use the real module traversal interface; only GTP parameter detection is mocked.
+        model = nn.Module()
+        model.module = nn.Module()
+        model.module.output_layer = nn.Module()
+        param = nn.Parameter(torch.zeros(1))
+        model.module.output_layer.weight = param
+        monkeypatch.setattr(gtp_module, "is_gtp_param", lambda p: p is param)
         try:
-            gtp_module.tag_gtp_params_with_names(
-                SimpleNamespace(named_parameters=lambda: [("module.output_layer.weight", param)])
-            )
+            gtp_module.tag_gtp_params_with_names(model)
         finally:
             nmb.destroy_num_microbatches_calculator()
         return param._wgrad_accum_enabled
