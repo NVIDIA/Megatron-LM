@@ -27,8 +27,17 @@ def select_ge_2d_params(param: torch.Tensor) -> bool:
 def ns_cost_fn(num_ns_steps: int) -> Callable[[torch.Size], int]:
     """Estimate Newton-Schulz work from a tensor's full shape.
 
-    Uses `numel * (min(rows, cols) * num_steps + 1)` with the DBuffer's
-    leading-dim view `(shape[0], shape[1:].numel())`.
+    View the tensor as `(rows, cols) = (shape[0], shape[1:].numel())`. After
+    normalization and transposing so that rows <= cols, a quintic Newton-Schulz
+    step with scalar coefficients `(a, b, c)` is:
+
+        A = X @ X.T
+        X = a * X + (b * A + c * (A @ A)) @ X
+
+    The matrix products cost O(numel * min(rows, cols)) per step. We use
+    `numel * (min(rows, cols) * num_ns_steps + 1)` as a relative work estimate,
+    omitting constant factors and adding a linear term for normalization and
+    elementwise work.
     """
 
     def cost_fn(shape: torch.Size) -> int:
