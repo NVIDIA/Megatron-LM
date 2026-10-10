@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 from statistics import median
 from typing import Any, Dict, List, Tuple
 
@@ -56,6 +57,11 @@ def validate_with_tolerance(
             continue
 
         current_val = current_values[step]
+        if not math.isfinite(golden_val) or not math.isfinite(current_val):
+            mismatches.append(
+                f"Step {step}: non-finite comparison value (golden={golden_val}, current={current_val})"
+            )
+            continue
 
         # Handle the case where golden value is zero or near-zero
         if golden_val == 0 or abs(golden_val) < absolute_tolerance:
