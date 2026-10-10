@@ -1802,8 +1802,8 @@ class DSAIndexer(MegatronModule):
     """
 
     def _projection_quantization_context(self, *, is_init: bool = False):
-        """Disable query/key projection quantization only when explicitly requested."""
-        if self.config.dsa_indexer_qk_proj_disable_quantization:
+        """Use the enclosing quantization context only when explicitly enabled."""
+        if not self.config.dsa_indexer_qk_proj_use_quantization:
             return get_fp8_disabled_context(self.config, is_init=is_init)
         return nullcontext()
 
