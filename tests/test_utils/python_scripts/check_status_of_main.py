@@ -34,6 +34,8 @@ def most_recent_pipeline(target_branch: str):
             )
             break
         except Exception as e:
+            if n_attempts == 2:
+                raise
             logger.error(f"Network error, retrying... ({n_attempts}/3)")
             time.sleep(10 * (2**n_attempts))  # Exponential backoff: 10s, 20s, 40s
             n_attempts += 1
