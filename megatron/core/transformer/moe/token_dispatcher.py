@@ -3,7 +3,7 @@
 import logging
 import os
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -2078,6 +2078,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         probs: Optional[torch.Tensor] = None,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        dispatch_backward_callback: Callable[[], None] | None = None,
     ):
         """
         Execute fused permutation and AlltoAll communication.
@@ -2092,6 +2093,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             probs (torch.Tensor): Routing probabilities (unused in current implementation)
             async_finish (bool): Whether to use asynchronous communication completion
             allocate_on_comm_stream (bool): Whether to allocate buffers on communication stream
+            dispatch_backward_callback (Callable, optional): Submit independent work after
+                dispatch backward, before its input gradient joins the shared-expert branch.
 
         Returns:
             A tuple of dispatched tokens and probabilities.
@@ -2101,6 +2104,13 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         dispatched_hidden_states = self._comm_manager.dispatch(
             hidden_states, async_finish, allocate_on_comm_stream
         )
+        if dispatch_backward_callback is not None and dispatched_hidden_states.grad_fn is not None:
+            # Managers return the dispatch Function's output directly. Its post-hook
+            # submits wgrad before autograd proceeds to the shared-input gradient merge.
+            def launch_wgrad(grad_inputs, grad_outputs):
+                dispatch_backward_callback()
+
+            dispatched_hidden_states.grad_fn.register_hook(launch_wgrad)
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states, wait_current_stream=False)
             self.shared_experts.linear_fc1_forward_and_act(dispatched_hidden_states)
