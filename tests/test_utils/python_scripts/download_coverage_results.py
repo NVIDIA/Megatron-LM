@@ -60,12 +60,20 @@ def main(pipeline_id: int):
                 continue
 
             os.unlink(file_name)
-            iteration_dir = sorted(
+            iterations = sorted(
                 (pathlib.Path("tmp") / "results").glob("iteration=*"),
                 key=lambda p: int(p.name.split("=")[1]),
-            )[-1]
-            restart_dir = sorted(os.listdir(iteration_dir))[-1]
-            coverage_report_source = list(
+            )
+            if not iterations:
+                logger.info("No coverage iterations for job %s. Skip.", job.name)
+                continue
+            iteration_dir = iterations[-1]
+            restarts = sorted(p.name for p in iteration_dir.iterdir() if p.is_dir())
+            if not restarts:
+                logger.info("No coverage attempts for job %s. Skip.", job.name)
+                continue
+            restart_dir = restarts[-1]
+            coverage_reports = list(
                 glob.glob(
                     str(
                         iteration_dir
@@ -76,7 +84,11 @@ def main(pipeline_id: int):
                         / "coverage_report"
                     )
                 )
-            )[0]
+            )
+            if not coverage_reports:
+                logger.info("No coverage report for job %s. Skip.", job.name)
+                continue
+            coverage_report_source = coverage_reports[0]
 
             coverage_report_target = (
                 pathlib.Path("coverage_results") / job.name.replace("/", "-") / "coverage_report"
