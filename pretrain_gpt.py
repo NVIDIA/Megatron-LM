@@ -115,6 +115,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 mtp_num_layers=config.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=vp_stage,
+                pp_group=mpu.get_pipeline_model_parallel_group(),
             ),
             vp_stage=vp_stage,
         )
@@ -129,6 +130,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=mpu.get_pipeline_model_parallel_group(),
     )
     is_hybrid_cp = args.hybrid_context_parallel
 
@@ -414,6 +416,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=mpu.get_pipeline_model_parallel_group(),
     )
 
 

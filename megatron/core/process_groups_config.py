@@ -2,13 +2,88 @@
 
 """Dataclasses for organizing model parallelism and gradient communication process groups."""
 
+import os
+import warnings
 from dataclasses import dataclass, field, fields
 from functools import partial
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
 from megatron.core import parallel_state
+
+# Removal follows the N+2 policy in docs/api-backwards-compatibility-check.md. These are the
+# defaults for fallbacks deprecated in 0.20; a fallback that starts to warn in a later release
+# passes its own versions to warn_global_process_group_fallback or resolve_process_groups.
+_FALLBACK_DEPRECATED_IN = "0.20"
+_FALLBACK_REMOVED_IN = "0.22"
+
+# The fallback is reached through subclass constructors, build_module, nn.Module calls and
+# autograd functions, so no fixed stacklevel finds the caller. Skipping Megatron Core and torch
+# frames attributes the warning to the first frame outside them, i.e. the code that omitted the
+# argument.
+_FALLBACK_WARNING_SKIP_PREFIXES = (
+    os.path.dirname(__file__) + os.sep,
+    os.path.dirname(torch.__file__) + os.sep,
+)
+
+# (owner, argument) pairs that have already warned in this process.
+_warned_global_process_group_fallbacks: Set[Tuple[str, str]] = set()
+
+
+class ProcessGroupFallbackWarning(FutureWarning):
+    """A Megatron Core component fell back to the global process groups in ``parallel_state``.
+
+    It is a ``FutureWarning``, so filters and tests that match ``FutureWarning`` also match it.
+    To turn every fallback into an error, for example in CI, call
+    ``warnings.simplefilter("error", ProcessGroupFallbackWarning)``, or run pytest with
+    ``-W error::megatron.core.process_groups_config.ProcessGroupFallbackWarning``. The same option
+    passed to ``python`` itself, or set in ``PYTHONWARNINGS``, has no effect: Python resolves it
+    before site-packages, and so torch, can be imported, and ignores it with a note on stderr.
+    """
+
+
+def warn_global_process_group_fallback(
+    owner: str,
+    argument: str = "pg_collection",
+    *,
+    deprecated_in: str = _FALLBACK_DEPRECATED_IN,
+    removed_in: str = _FALLBACK_REMOVED_IN,
+) -> None:
+    """Warn, once per ``owner`` and ``argument``, that a missing argument uses the global grid.
+
+    Callers that omit ``argument`` keep the previous behavior during the deprecation period: the
+    caller resolves the groups from ``megatron.core.parallel_state``. That global grid belongs to
+    a single model, so the fallback is deprecated and ``argument`` becomes required once the
+    fallback is removed. See docs/developer/parallel-state-deprecation.md.
+
+    The warning is a ``ProcessGroupFallbackWarning``, which is a ``FutureWarning`` because Python
+    hides ``DeprecationWarning`` unless it is attributed to ``__main__``, and the callers to reach
+    are libraries and training scripts built on Megatron Core.
+
+    Each (``owner``, ``argument``) pair warns once per process, so a caller that omits two
+    arguments of one owner hears about both. A warning that a filter turns into an error is not
+    recorded, so under an ``error`` filter every fallback raises.
+
+    Args:
+        owner: Name of the class or function whose caller omitted ``argument``.
+        argument: Name of the omitted process-group argument.
+        deprecated_in: Megatron Core release in which this fallback started to warn.
+        removed_in: Megatron Core release that removes this fallback. Under the N+2 policy, a
+            fallback that starts to warn after 0.20 passes both versions.
+    """
+    key = (owner, argument)
+    if key in _warned_global_process_group_fallbacks:
+        return
+    warnings.warn(
+        f"{owner} was called without `{argument}` and falls back to the global process groups "
+        "in megatron.core.parallel_state. This fallback is deprecated since Megatron Core "
+        f"{deprecated_in} and will be removed in {removed_in}; pass the "
+        "owning model's process groups explicitly.",
+        ProcessGroupFallbackWarning,
+        skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+    )
+    _warned_global_process_group_fallbacks.add(key)
 
 
 class ProcessGroupHelperMeta(type):
@@ -874,3 +949,95 @@ class MultiModuleProcessGroupCollection:
             else ""
         )
         return f"MultiModuleProcessGroupCollection(modules=[{modules_str}]{lm_str})"
+
+
+def require_process_groups(
+    pg_collection: ProcessGroupCollection, names: Sequence[str], *, owner: str
+) -> Tuple[Any, ...]:
+    """Return the fields ``names`` of ``pg_collection`` in order, or raise if any is absent.
+
+    A field is present once the caller assigns it, including an explicit ``None``, which means
+    that the axis is off or that this rank is not a member of the group (for example ``embd`` on
+    a middle pipeline stage, or ``gtp_remat`` without GTP). A field that was never assigned also
+    reads as ``None`` through ``ProcessGroupCollection.__getattr__``, so a component cannot tell
+    it apart from an axis that is off; this function treats it as a caller error instead.
+
+    Args:
+        pg_collection: The collection the caller passed.
+        names: Fields that ``owner`` and the modules it builds read.
+        owner: Name of the class or function, used in error messages.
+
+    Returns:
+        The groups, one per name and in the order of ``names``.
+
+    Raises:
+        ValueError: ``pg_collection`` is None, a field is absent, or a field holds
+            ``torch.distributed.GroupMember.NON_GROUP_MEMBER``.
+        TypeError: ``pg_collection`` is a ``MultiModuleProcessGroupCollection``. Its modules
+            have different groups, so the caller selects the module's collection.
+    """
+    if pg_collection is None:
+        raise ValueError(f"{owner} requires a ProcessGroupCollection, got None.")
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        raise TypeError(
+            f"{owner} requires the ProcessGroupCollection of one module, got a "
+            f"MultiModuleProcessGroupCollection with modules {list(pg_collection.keys())}. "
+            "Pass the collection of the module that owns these groups, for example "
+            "pg_collection.get_language_model_collection()."
+        )
+    groups = vars(pg_collection)
+    missing = [name for name in names if name not in groups]
+    if missing:
+        raise ValueError(
+            f"{owner} requires pg_collection to set {', '.join(missing)}. Set a field to None "
+            "only when its axis is off or this rank is not a member of the group."
+        )
+    non_members = [
+        name for name in names if groups[name] is torch.distributed.GroupMember.NON_GROUP_MEMBER
+    ]
+    if non_members:
+        raise ValueError(
+            f"{owner}: pg_collection sets {', '.join(non_members)} to NON_GROUP_MEMBER, which is "
+            "not a usable group. Use None on ranks that are not members of the group."
+        )
+    return tuple(groups[name] for name in names)
+
+
+def resolve_process_groups(
+    pg_collection: Optional[ProcessGroupCollection],
+    *,
+    owner: str,
+    required: Sequence[str],
+    argument: str = "pg_collection",
+    deprecated_in: str = _FALLBACK_DEPRECATED_IN,
+    removed_in: str = _FALLBACK_REMOVED_IN,
+) -> ProcessGroupCollection:
+    """Return the caller's collection, or warn and fall back to the global process groups.
+
+    This is the compatibility fallback for a component whose callers may still omit its process
+    groups. When ``pg_collection`` is None, it emits a ``ProcessGroupFallbackWarning`` (see
+    ``warn_global_process_group_fallback``) and builds a collection with only the ``required``
+    fields from ``megatron.core.parallel_state``. In both cases ``require_process_groups`` then
+    checks that every field in ``required`` is set.
+
+    ``tools/check_process_group_usage.py`` counts each call in ``megatron/core`` as a guarded
+    read of the global grid.
+
+    Args:
+        pg_collection: The caller's collection, or None to fall back to the global groups.
+        owner: Name of the class or function, used in the warning and in error messages.
+        required: Fields that ``owner`` and the modules it builds read.
+        argument: Name of the argument the caller omitted.
+        deprecated_in: Megatron Core release in which this fallback started to warn.
+        removed_in: Megatron Core release that removes this fallback.
+
+    Returns:
+        ``pg_collection`` itself, or the collection built from the global groups.
+    """
+    if pg_collection is None:
+        warn_global_process_group_fallback(
+            owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=list(required))
+    require_process_groups(pg_collection, required, owner=owner)
+    return pg_collection

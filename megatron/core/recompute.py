@@ -192,7 +192,10 @@ def checkpointed_forward(
                 )
             else:
                 hidden_states, context = tensor_parallel.checkpoint(
-                    cf, self.config.distribute_saved_activations, *args
+                    cf,
+                    self.config.distribute_saved_activations,
+                    *args,
+                    tp_group=self.pg_collection.tp,
                 )
         else:
             # Note: original block-branch no-checkpoint path omitted padding_mask

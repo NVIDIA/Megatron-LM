@@ -6,6 +6,7 @@ import torch.distributed as dist
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    require_process_groups,
     resolve_gtp_remat_group,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -177,6 +178,53 @@ class TestResolveGtpRematGroup:
 
         assert resolve_gtp_remat_group(wrapper, is_expert=False) is None
         assert resolve_gtp_remat_group(wrapper, is_expert=True) is None
+
+
+class TestRequireProcessGroups:
+    """require_process_groups tells a field the caller never set from an explicit None.
+
+    These run without torch.distributed: the collections only need to carry sentinels.
+    """
+
+    def test_returns_the_groups_in_the_requested_order(self, mocker):
+        tp = mocker.Mock(spec=dist.ProcessGroup)
+        cp = mocker.Mock(spec=dist.ProcessGroup)
+        groups = require_process_groups(
+            ProcessGroupCollection(tp=tp, cp=cp), ("cp", "tp"), owner="Owner"
+        )
+        assert len(groups) == 2
+        assert groups[0] is cp
+        assert groups[1] is tp
+
+    def test_explicit_none_is_an_axis_that_is_off(self):
+        pgs = ProcessGroupCollection(gtp_remat=None, embd=None)
+        assert require_process_groups(pgs, ("gtp_remat", "embd"), owner="Owner") == (None, None)
+
+    def test_absent_fields_raise_naming_the_owner_and_every_field(self, mocker):
+        pgs = ProcessGroupCollection(tp=mocker.Mock(spec=dist.ProcessGroup))
+        # Through __getattr__, a field that was never set reads like an axis that is off.
+        assert pgs.cp is None
+        with pytest.raises(ValueError, match=r"^Owner requires pg_collection to set cp, pp\."):
+            require_process_groups(pgs, ("tp", "cp", "pp"), owner="Owner")
+
+    def test_rejects_the_non_member_sentinel(self):
+        pgs = ProcessGroupCollection(embd=dist.GroupMember.NON_GROUP_MEMBER)
+        with pytest.raises(ValueError, match="Owner: pg_collection sets embd to NON_GROUP_MEMBER"):
+            require_process_groups(pgs, ("embd",), owner="Owner")
+
+    def test_rejects_a_missing_collection(self):
+        with pytest.raises(ValueError, match="Owner requires a ProcessGroupCollection, got None"):
+            require_process_groups(None, ("tp",), owner="Owner")
+
+    def test_rejects_a_multi_module_collection(self, mocker):
+        # The modules have different groups, so the caller must pick the module's collection.
+        llm = ProcessGroupCollection(tp=mocker.Mock(spec=dist.ProcessGroup))
+        wrapper = MultiModuleProcessGroupCollection(
+            module_pgs={"encoder": ProcessGroupCollection(), "llm": llm},
+            language_model_module_name="llm",
+        )
+        with pytest.raises(TypeError, match=r"^Owner requires the ProcessGroupCollection of one"):
+            require_process_groups(wrapper, ("tp",), owner="Owner")
 
 
 class TestPGConfigDefaultInitialization:
