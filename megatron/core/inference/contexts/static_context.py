@@ -1,6 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Optional
+
 from megatron.core.inference.config import InferenceConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .base_context import BaseInferenceContext
 
@@ -12,12 +15,22 @@ class StaticInferenceContext(BaseInferenceContext):
     Args:
         max_batch_size (int): Max supported batch size.
         max_sequence_length (int): Max supported sequence length.
+        pg_collection (Optional[ProcessGroupCollection]): Process groups of the model this
+            context serves, stored in the context's `config`. Inference components built on
+            this context use these groups; if None, they use the global parallel state.
     """
 
     def __init__(
-        self, max_batch_size: int, max_sequence_length: int, use_flashinfer_fused_rope: bool = None
+        self,
+        max_batch_size: int,
+        max_sequence_length: int,
+        use_flashinfer_fused_rope: bool = None,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        config = InferenceConfig(materialize_only_last_token_logits=True)
+        config = InferenceConfig(
+            materialize_only_last_token_logits=True, pg_collection=pg_collection
+        )
         super().__init__(inference_config=config)
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size
