@@ -46,6 +46,7 @@ from megatron.core.utils import (
     get_pg_size,
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
+    make_viewless_tensor,
 )
 
 try:
@@ -551,6 +552,10 @@ class MultiLatentAttention(Attention):
         self._discard_core_attention_output(output)
 
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+
+        output = make_viewless_tensor(
+            output.view_as(output), requires_grad=output.requires_grad, keep_graph=True
+        )
 
         return output, bias
 
