@@ -220,7 +220,7 @@ class PRReviewTracker:
             if not (members & approvers):
                 pending_final_teams.add(team)
 
-        # 4. Compute pending reviewers: unsatisfied team members + individual blockers
+        # 4. Compute pending reviewers and teams, including individual blockers.
         all_excluded_members = self._get_teams_members(self.EXCLUDED_TEAMS)
         expert_non_approvers = non_approvers - all_excluded_members
         final_non_approvers = non_approvers & all_excluded_members
@@ -231,6 +231,11 @@ class PRReviewTracker:
         pending_final = (
             self._get_teams_members(pending_final_teams) | final_non_approvers
         ) - approvers
+        # An unsatisfied team stays pending even when membership is empty or
+        # unavailable. Preserve it explicitly so the state machine cannot
+        # mistake an empty reviewer set for completed team approval.
+        pending_expert.update(f"@NVIDIA/{team}" for team in pending_expert_teams)
+        pending_final.update(f"@NVIDIA/{team}" for team in pending_final_teams)
 
         logger.info(f"Pending expert teams: {pending_expert_teams}, reviewers: {pending_expert}")
         logger.info(f"Pending final teams: {pending_final_teams}, reviewers: {pending_final}")
