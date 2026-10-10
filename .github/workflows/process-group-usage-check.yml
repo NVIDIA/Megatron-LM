@@ -52,5 +52,9 @@ jobs:
         run: python tests/unit_tests/test_check_process_group_usage.py
 
       # No third-party dependencies: the checker and its tests are stdlib-only.
+      # Report-only: new reads are listed in the log but do not fail the job. Whether new code may
+      # fall back to parallel_state is still to be decided, see
+      # https://github.com/NVIDIA/Megatron-LM/issues/6307.
       - name: Check for new global process-group reads in megatron/core
+        continue-on-error: true
         run: python tools/check_process_group_usage.py
