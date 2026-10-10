@@ -298,6 +298,16 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
     k_dim = 128
     v_dim = 128
     emb_dim = 64
+    _check_fused_mla_rope_kv_split(
+        input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+    )
+
+
+def _check_fused_mla_rope_kv_split(
+    input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+):
+    """Compare the fused key/value split, forward and backward, with the unfused PyTorch path."""
+    assert fused_mla_rope_kv_split is not None
     dtype = torch.bfloat16
     transformer_config = TransformerConfig(
         num_attention_heads=num_heads,
@@ -532,6 +542,24 @@ class TestFusedApplyMLARope:
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):
         _test_fused_mla_rope_kv_split(input_format, remove_interleaving=remove_interleaving)
+
+    @pytest.mark.parametrize("remove_interleaving", [False, True])
+    @pytest.mark.parametrize(
+        ("num_heads", "k_dim", "v_dim", "emb_dim"),
+        [
+            # GLM-5 at TP 8: qk_head_dim 192, v_head_dim 256, qk_pos_emb_head_dim 64.
+            pytest.param(8, 192, 256, 64, id="glm5-tp8"),
+            # Key, value and rotary half (24 pairs) all padded.
+            pytest.param(4, 96, 160, 48, id="k96-v160-rope48"),
+        ],
+    )
+    def test_kv_split_non_power_of_two_head_dims(
+        self, input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+    ):
+        """The key/value split must handle head dims that are not powers of two."""
+        _check_fused_mla_rope_kv_split(
+            input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+        )
 
 
 @pytest.mark.experimental
