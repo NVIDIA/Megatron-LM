@@ -322,6 +322,39 @@ class _InQuantizationContext(torch.nn.Module):
             return self.module(*args)
 
 
+class _GlobalAuxLossWindow(torch.nn.Module):
+    """Replay a full window, resetting the router's nonpersistent accumulation state."""
+
+    def __init__(self, router, valid_counts, with_padding):
+        super().__init__()
+        self.router = router
+        self.valid_counts = valid_counts
+        self.with_padding = with_padding
+
+    def forward(self, *inputs):
+        self.router.reset_global_aux_loss_tracker()
+        moe_utils.get_moe_metrics_tracker().clear()
+        probs, routing_maps, token_counts, expert_counts, steps = [], [], [], [], []
+        for hidden, valid_count in zip(inputs, self.valid_counts):
+            padding_mask = None
+            if self.with_padding:
+                padding_mask = torch.arange(hidden.shape[0], device=hidden.device)[:, None]
+                padding_mask = padding_mask >= valid_count
+            scores, routing_map = self.router(hidden, padding_mask=padding_mask)
+            probs.append(scores)
+            routing_maps.append(routing_map)
+            token_counts.append(self.router.global_num_tokens.clone())
+            expert_counts.append(self.router.global_tokens_per_expert.clone())
+            steps.append(self.router.ga_steps.clone())
+        return {
+            "probs": torch.cat(probs),
+            "routing_map": torch.cat(routing_maps),
+            "token_counts": torch.stack(token_counts),
+            "expert_counts": torch.stack(expert_counts),
+            "steps": torch.stack(steps),
+        }
+
+
 class TestMoEModules:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -491,6 +524,70 @@ class TestMoEModules:
         assert_module_replays_bit_exact(
             router, (hidden,), replays=3, what=f"TopKRouter[flex-{backend}-dense]"
         )
+
+    @pytest.mark.parametrize("with_padding", [False, True], ids=["uneven", "padded"])
+    def test_global_aux_loss_window_replays(self, with_padding, monkeypatch):
+        """Uneven valid-token prefixes replay with identical outputs, gradients and state."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="global_aux_loss",
+            bf16=False,
+            params_dtype=torch.float32,
+            calculate_per_token_loss=False,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(1)
+        monkeypatch.setattr(
+            moe_utils.MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.ones(1, device="cuda")
+        )
+        valid_counts = (4096, 1536, 3072)
+        inputs = tuple(
+            torch.randn(
+                max(valid_counts) if with_padding else count,
+                1,
+                config.hidden_size,
+                device="cuda",
+                requires_grad=True,
+            )
+            for count in valid_counts
+        )
+        # Zero upstream gradients isolate the attached auxiliary loss in backward.
+        grad_output = torch.zeros(
+            sum(hidden.shape[0] for hidden in inputs), config.num_moe_experts, device="cuda"
+        )
+        try:
+            with deterministic_algorithms(True):
+                outputs, grads = assert_module_replays_bit_exact(
+                    _GlobalAuxLossWindow(router, valid_counts, with_padding),
+                    inputs,
+                    replays=3,
+                    grad_output=grad_output,
+                    contention=True,
+                    what=f"global aux loss window[padding={with_padding}]",
+                )
+            expected_tokens = torch.tensor(valid_counts, device="cuda").cumsum(0)
+            expected_tokens *= router.tp_dp_cp_group.size()
+            torch.testing.assert_close(outputs["out.token_counts"].flatten(), expected_tokens)
+            torch.testing.assert_close(
+                outputs["out.expert_counts"].sum(dim=-1),
+                expected_tokens.float() * config.moe_router_topk,
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                outputs["out.steps"].flatten(),
+                torch.arange(1, len(valid_counts) + 1, device="cuda", dtype=router.ga_steps.dtype),
+            )
+            assert all(torch.isfinite(grad).all() for grad in grads.values())
+            assert torch.count_nonzero(grads["chunk0.router.weight"]) > 0
+        finally:
+            router.reset_global_aux_loss_tracker()
+            moe_utils.get_moe_metrics_tracker().clear()
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     def test_te_grouped_mlp_replays_on_uneven_experts(self):
