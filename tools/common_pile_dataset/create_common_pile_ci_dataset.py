@@ -189,12 +189,12 @@ def copy_vocab_files(output_dir, source_base):
 
     for src, dst in copies:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        if not os.path.exists(src):
-            print(f"  ERROR: Source vocab file not found: {src}")
-            sys.exit(1)
         if os.path.exists(dst):
             print(f"  Already exists: {dst}")
             continue
+        if not os.path.exists(src):
+            print(f"  ERROR: Source vocab file not found: {src}")
+            sys.exit(1)
         print(f"  Copying {src} -> {dst}")
         with open(src, 'rb') as f_in, open(dst, 'wb') as f_out:
             f_out.write(f_in.read())
