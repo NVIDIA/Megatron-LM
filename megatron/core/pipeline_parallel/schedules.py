@@ -2246,6 +2246,9 @@ def forward_backward_pipelining_without_interleaving(
 
     if is_multimodule:
         p2p_communicator.set_forward_only(forward_only)
+        # Forward-only evaluation leaves lengths unconsumed by backward.
+        # Keep fan-in metadata local to this schedule invocation.
+        p2p_communicator.reset_forward_fanin_state()
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
