@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import copy
 import inspect
 import multiprocessing
 import os
@@ -719,6 +720,7 @@ def save_checkpoint(
     """
     start_ckpt = time()
     args = get_args()
+    is_conversion = getattr(args, 'ckpt_convert_format', None) is not None
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0(
@@ -1196,6 +1198,14 @@ def save_checkpoint(
                         raise
                     warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
                 else:
+                    if is_conversion:
+                        # Conversion updates legacy args, not the active config.
+                        run_config = copy.copy(run_config)
+                        run_config.checkpoint = copy.copy(run_config.checkpoint)
+                        run_config.checkpoint.ckpt_format = ckpt_format
+                        run_config.checkpoint.save = save_dir
+                        if ckpt_format != 'torch_dist':
+                            run_config.checkpoint.verify_integrity = False
                     run_config.to_yaml(run_config_filename)
 
                 train_state_local_filename = get_checkpoint_train_state_filename(checkpoint_name)
