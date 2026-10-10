@@ -60,6 +60,7 @@ def _run_launcher(
         "MIMO_CHECKPOINT_PADDING_MANIFEST_DIR": str(scratch / "padding-manifest"),
         "MIMO_CHECKPOINT_TEST_PRETRAIN": "1",
         "MIMO_PRETRAIN_MODULE": _MODULE,
+        "NVTE_FLASH_ATTN_V4": "0",
         "TRAIN_ITERS": "2",
         "TORCHRUN_LOG_DIR": str(scratch / f"torchrun-{name}"),
     }
@@ -75,6 +76,8 @@ def _run_launcher(
     command = [
         "bash",
         str(_LAUNCHER),
+        "--flash-attention-version",
+        "2",
         "--num-experts",
         "8",
         "--no-save-tokenizer-assets",

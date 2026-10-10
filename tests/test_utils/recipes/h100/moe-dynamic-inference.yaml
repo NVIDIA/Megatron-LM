@@ -91,7 +91,8 @@ products:
   - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_inference_optimized_swiglu_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        # https://github.com/NVIDIA/Megatron-LM/issues/7700
+        scope: [mr, mr-github-broken]
         platforms: [dgx_h100]
   # Regression guard for the MTP + sequence-parallel all-gather fixes in
   # https://github.com/NVIDIA/Megatron-LM/pull/5748 (under block-scope CUDA

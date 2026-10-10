@@ -65,6 +65,8 @@ def build_server_cmd(
         "4096",
         "--attention-backend",
         "flash",
+        "--flash-attention-version",
+        "2",
         "--use-checkpoint-args",
         "--micro-batch-size",
         "1",
@@ -129,6 +131,7 @@ def cleaned_env() -> dict:
     env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     env["NCCL_ALGO"] = "Ring"
     env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+    env["NVTE_FLASH_ATTN_V4"] = "0"
     env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     return env
 
