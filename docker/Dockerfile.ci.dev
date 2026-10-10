@@ -87,6 +87,32 @@ RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_n
     esac
 EOF
 
+ARG CUBLAS_VERSION=13.8.1.7
+RUN bash -euxo pipefail <<"EOF"
+    # cuBLAS 13.8.1 includes the grouped GEMM correctness fix.
+    case "${TARGETARCH}" in
+        amd64)
+            CUBLAS_ARCH=x86_64
+            ;;
+        arm64)
+            CUBLAS_ARCH=sbsa
+            ;;
+        *) echo "Unsupported TARGETARCH for cuBLAS: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    CUBLAS_ARCHIVE="libcublas-linux-${CUBLAS_ARCH}-${CUBLAS_VERSION}_cuda13-archive"
+    CUBLAS_TMP=$(mktemp -d)
+    curl -fLSs --retry 3 -o "${CUBLAS_TMP}/cublas.tar.xz" \
+        "https://developer.download.nvidia.com/compute/cublas/redist/libcublas/linux-${CUBLAS_ARCH}/${CUBLAS_ARCHIVE}.tar.xz"
+    tar -xJf "${CUBLAS_TMP}/cublas.tar.xz" -C "${CUBLAS_TMP}"
+    # Replace the toolkit copies so existing linker paths pick up both cuBLAS and cuBLASLt.
+    CUDA_ROOT="${CUDA_HOME:-/usr/local/cuda}"
+    cp -a "${CUBLAS_TMP}/${CUBLAS_ARCHIVE}/include/." "${CUDA_ROOT}/include/"
+    cp -a "${CUBLAS_TMP}/${CUBLAS_ARCHIVE}/lib/." "${CUDA_ROOT}/lib64/"
+    install -Dm644 "${CUBLAS_TMP}/${CUBLAS_ARCHIVE}/LICENSE" "${CUDA_ROOT}/doc/cublas/LICENSE"
+    ldconfig
+    rm -rf "${CUBLAS_TMP}"
+EOF
+
 COPY pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
