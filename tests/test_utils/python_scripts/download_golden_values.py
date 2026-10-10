@@ -243,7 +243,7 @@ def _create_job_name_map(cicd_jobs: list) -> dict:
 
 def _match_artifact_to_job(artifact: dict, workflow_id: int, job_name_map: dict) -> dict:
     """Match an artifact to a job from the job name map."""
-    artifact_job_name = artifact["name"].lower().replace("logs-", "").split(f"-{workflow_id}")[0]
+    artifact_job_name = artifact["name"].lower().removeprefix("logs-").split(f"-{workflow_id}")[0]
     for normalized_job_name, job in job_name_map.items():
         if normalized_job_name == artifact_job_name:
             logger.info("Artifact '%s' matched to job '%s'", artifact["name"], job["name"])
