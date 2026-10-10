@@ -38,6 +38,7 @@ from megatron.core.tensor_parallel.mappings import (
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import Attention, LinearProjBuilder, QKVLayout
+from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -539,53 +540,22 @@ class MultiLatentAttention(Attention):
         self, core_attn_out: torch.Tensor, gate: torch.Tensor
     ) -> torch.Tensor:
         """Apply an MLA output gate with the configured projection granularity."""
-        if core_attn_out.shape[:-1] != gate.shape[:-1]:
-            raise ValueError(
-                "MLA output gate and core attention output must have matching token/batch "
-                f"dimensions, got {tuple(gate.shape)} and {tuple(core_attn_out.shape)}."
-            )
-
-        if self.config.gated_attention_proj_granularity == 'elementwise':
-            if core_attn_out.shape != gate.shape:
-                raise ValueError(
-                    "Elementwise MLA output gating requires the gate and core attention output "
-                    f"to have the same shape, got {tuple(gate.shape)} and "
-                    f"{tuple(core_attn_out.shape)}."
-                )
-            return self._apply_mla_elementwise_output_gate(core_attn_out, gate)
-
-        if core_attn_out.size(-1) % gate.size(-1) != 0:
-            raise ValueError(
-                "Headwise MLA output gating requires the core attention output dimension "
-                f"({core_attn_out.size(-1)}) to be divisible by the number of local gates "
-                f"({gate.size(-1)})."
-            )
-        return self._apply_mla_headwise_output_gate(core_attn_out, gate)
-
-    @staticmethod
-    def _apply_mla_elementwise_output_gate(
-        core_attn_out: torch.Tensor, gate: torch.Tensor
-    ) -> torch.Tensor:
-        """Apply one gate per local MLA output element in the activation dtype."""
+        granularity = self.config.gated_attention_proj_granularity
+        if granularity == 'headwise':
+            # Retain the existing fused headwise entry point.
+            return self._apply_mla_headwise_output_gate(core_attn_out, gate)
         # Keep the FP32 sigmoid followed by native-dtype multiplication used by the
-        # released model. Do not jit-fuse this helper: nvFuser can move the cast
-        # across the elementwise multiply and silently change the rounding/VJP.
-        gate = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
-        return core_attn_out * gate
+        # released model. Do not jit-fuse this elementwise path: preserve its eager
+        # cast/multiply rounding and VJP.
+        return apply_attention_output_gate(core_attn_out, gate, granularity, cast_mode='before')
 
     @staticmethod
     @jit_fuser
     def _apply_mla_headwise_output_gate(
         core_attn_out: torch.Tensor, gate: torch.Tensor
     ) -> torch.Tensor:
-        """Apply one gate per local MLA attention head in the activation dtype."""
-        output_shape = core_attn_out.shape
-        core_attn_out = core_attn_out.view(*output_shape[:2], gate.size(-1), -1)
-        # Compute the sigmoid in FP32 for a stable gate VJP, then cast back to the
-        # attention output dtype.
-        gate = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
-        core_attn_out = core_attn_out * gate.unsqueeze(-1)
-        return core_attn_out.reshape(output_shape)
+        """Compile the shared gate arithmetic with MLA's headwise cast policy."""
+        return apply_attention_output_gate(core_attn_out, gate, 'headwise', cast_mode='before')
 
 
 class MLASelfAttention(MultiLatentAttention):

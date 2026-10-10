@@ -21,6 +21,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -36,10 +37,12 @@ from megatron.core.tensor_parallel.mappings import (
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import Attention, QKVLayout
+from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 try:
@@ -118,6 +121,7 @@ class AbsorbedMLASelfAttentionSubmodules:
     linear_k_up_proj: Union[ModuleSpec, type] = None
     linear_v_up_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
+    linear_gate: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
     kv_layernorm: Union[ModuleSpec, type] = None
@@ -228,6 +232,31 @@ class AbsorbedMLASelfAttention(Attention):
             pg_collection=self.pg_collection,
             is_mtp_layer=is_mtp_layer,
         )
+
+        if self.config.attention_output_gate:
+            if submodules.linear_gate is None:
+                raise ValueError("MLA output gating requires a linear_gate module spec.")
+            gate_projection_size = (
+                self.config.num_attention_heads
+                if self.config.gated_attention_proj_granularity == 'headwise'
+                else self.query_projection_size
+            )
+            self.linear_gate = build_module(
+                submodules.linear_gate,
+                self.config.hidden_size,
+                gate_projection_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='mla_gate',
+                tp_group=self.pg_collection.tp,
+                name=(name + ".linear_gate") if name is not None else None,
+            )
+        else:
+            self.linear_gate = None
 
         # Output.
         self.linear_proj = build_module(
@@ -1017,6 +1046,9 @@ class AbsorbedMLASelfAttention(Attention):
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
+        if self.linear_gate is not None:
+            core_attn_out = self._project_and_apply_mla_output_gate(core_attn_out, hidden_states)
+
         # =================
         # Output. [sq, b, h]
         # =================
@@ -1025,10 +1057,39 @@ class AbsorbedMLASelfAttention(Attention):
         self.pg_collection.cp = _orig_cp_group
         return output, bias
 
+    def _project_and_apply_mla_output_gate(
+        self, core_attn_out: torch.Tensor, gate_input: torch.Tensor
+    ) -> torch.Tensor:
+        """Project the gate after V expansion, then apply it to the MLA output."""
+        gate, _ = apply_module(self.linear_gate)(gate_input)
+        return self._apply_mla_output_gate(core_attn_out, gate)
+
+    def _apply_mla_output_gate(
+        self, core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Dispatch to the compiled headwise or eager elementwise gate."""
+        granularity = self.config.gated_attention_proj_granularity
+        if granularity == 'headwise':
+            return self._apply_mla_headwise_output_gate(core_attn_out, gate)
+        # Match ordinary MLA's FP32 sigmoid followed by native-dtype multiplication.
+        # Do not jit-fuse this elementwise path: preserve its eager cast/multiply
+        # rounding and VJP.
+        return apply_attention_output_gate(core_attn_out, gate, granularity, cast_mode='before')
+
+    @staticmethod
+    @jit_fuser
+    def _apply_mla_headwise_output_gate(
+        core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Compile the shared gate arithmetic with MLA's headwise cast policy."""
+        return apply_attention_output_gate(core_attn_out, gate, 'headwise', cast_mode='before')
+
     def backward_dw(self) -> NoReturn:
         """Execute weight gradient computation."""
         self._backward_kv_proj()
         self._backward_q_proj()
+        if self.linear_gate is not None:
+            self.linear_gate.backward_dw()
         core_attention_backward_dw = getattr(self.core_attention, "backward_dw", None)
         if core_attention_backward_dw is not None:
             core_attention_backward_dw()
@@ -1057,6 +1118,8 @@ class AbsorbedMLASelfAttention(Attention):
         if self.config.q_lora_rank is not None:
             set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_down_proj)
+        if self.linear_gate is not None:
+            set_save_original_input(self.linear_gate)
 
     def clip_qk(self):
         """
