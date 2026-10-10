@@ -126,6 +126,94 @@ class TestGPTModel:
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.gpt_model.vocab_size
 
+    @pytest.mark.parametrize("sequence_parallel", [False, True])
+    @pytest.mark.parametrize("has_padding_mask", [False, True])
+    def test_mtp_keeps_raw_padding_mask_after_decoder_preprocess(
+        self, sequence_parallel, has_padding_mask
+    ):
+        """Decoder SP transforms must not change the MTP sequence-roll source layout."""
+        input_ids = torch.arange(8, dtype=torch.long).view(2, 4)
+        position_ids = input_ids.clone()
+        raw_padding_mask = (
+            torch.tensor([[False, False, True, True], [False, True, False, True]])
+            if has_padding_mask
+            else None
+        )
+        transformed_padding_mask = raw_padding_mask
+        if sequence_parallel and raw_padding_mask is not None:
+            transformed_padding_mask = raw_padding_mask[:, :2].contiguous()
+        decoder_input = torch.zeros(4, 2, self.gpt_model.config.hidden_size)
+        decoder_output = torch.ones_like(decoder_input)
+        self.gpt_model.config.sequence_parallel = sequence_parallel
+
+        with (
+            patch.object(
+                self.gpt_model,
+                "_preprocess",
+                return_value=(decoder_input, None, None, None, None, transformed_padding_mask),
+            ),
+            patch.object(self.gpt_model.decoder, "forward", return_value=decoder_output) as decoder,
+            patch.object(
+                self.gpt_model, "_postprocess", return_value=decoder_output
+            ) as postprocess,
+        ):
+            self.gpt_model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                padding_mask=raw_padding_mask,
+            )
+
+        assert decoder.call_args.kwargs["padding_mask"] is transformed_padding_mask
+        assert postprocess.call_args.kwargs["padding_mask"] is transformed_padding_mask
+        assert postprocess.call_args.kwargs["mtp_padding_mask"] is raw_padding_mask
+
+    def test_postprocess_reuses_supplied_mtp_sequence_roll_context(self):
+        """Fine-grained callers can reuse one prepared context without rebuilding it."""
+
+        class RecordingMTP(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.kwargs = None
+
+            def forward(self, **kwargs):
+                self.kwargs = kwargs
+                return kwargs["hidden_states"]
+
+        self.gpt_model.config.mtp_num_layers = 1
+        self.gpt_model.post_process = False
+        self.gpt_model.mtp = RecordingMTP()
+        supplied_context = object()
+        hidden_states = torch.zeros(4, 2, self.gpt_model.config.hidden_size)
+        input_ids = torch.zeros(2, 4, dtype=torch.long)
+        position_ids = torch.zeros_like(input_ids)
+        local_padding_mask = torch.zeros(2, 2, dtype=torch.bool)
+        raw_padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+
+        with patch(
+            "megatron.core.models.gpt.gpt_model.prepare_mtp_sequence_roll_context",
+            side_effect=AssertionError("A supplied MTP context must not be rebuilt."),
+        ):
+            output = self.gpt_model._postprocess(
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=None,
+                rotary_pos_emb=None,
+                rotary_pos_cos=None,
+                rotary_pos_sin=None,
+                mtp_in_postprocess=True,
+                attention_mask=None,
+                padding_mask=local_padding_mask,
+                mtp_padding_mask=raw_padding_mask,
+                sequence_roll_context=supplied_context,
+            )
+
+        assert output is hidden_states
+        assert self.gpt_model.mtp.kwargs["sequence_roll_context"] is supplied_context
+        assert self.gpt_model.mtp.kwargs["padding_mask"] is local_padding_mask
+        assert self.gpt_model.mtp.kwargs["sequence_roll_padding_mask"] is raw_padding_mask
+
     @pytest.mark.internal
     def test_output_processor_forward(self):
         config: TransformerConfig = self.gpt_model.config
