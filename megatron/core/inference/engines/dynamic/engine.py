@@ -36,7 +36,6 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
     round_up_to_nearest_multiple,
-    unwrap_model,
 )
 
 from .coordinator import CoordinatorMixin
@@ -506,7 +505,7 @@ class DynamicInferenceEngine(
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
-        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
+        unwrapped = controller._language_model
         mtp_warmup_enabled = (
             controller.num_mtp_depths > 0
             and (controller.num_speculative_tokens or 0) > 0

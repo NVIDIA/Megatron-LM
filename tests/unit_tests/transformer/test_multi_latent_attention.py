@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
@@ -30,6 +31,7 @@ from megatron.core.transformer.multi_latent_attention import (
     MultiLatentAttention,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version, is_torch_min_version, unwrap_model
 from megatron.training.arguments import parse_args
@@ -1579,8 +1581,7 @@ def test_parallel_multi_latent_attention_correctness(
         mock_args.sequence_parallel = sp
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
-            with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
-                load_checkpoint(gpt_model, None, None)
+            load_checkpoint(gpt_model, None, None)
 
         # Function to get tensor on this tp and cp rank
         cp_group = parallel_state.get_context_parallel_group()
@@ -1669,6 +1670,160 @@ def test_parallel_multi_latent_attention_correctness(
     os.environ.update(_environ)
 
 
+@pytest.mark.parametrize("mla_down_proj_fusion", [False, True])
+def test_moe_pre_mlp_layernorm_has_residual(mla_down_proj_fusion):
+    """The MoE pre-MLP norm of both MLA specs declares its residual, so that
+    ``fused_residual_rmsnorm`` fuses the residual-gradient add into the norm backward."""
+    submodules = get_gpt_layer_with_transformer_engine_submodules(
+        num_experts=8,
+        moe_grouped_gemm=True,
+        multi_latent_attention=True,
+        mla_down_proj_fusion=mla_down_proj_fusion,
+    )
+    assert submodules.pre_mlp_layernorm is backend.layer_norm(has_residual=True)
+
+
+@pytest.mark.skipif(not is_te_min_version("1.13.0"), reason="Requires TE >= 1.13.0")
+class TestFusedMLAPreMLPResidualNorm:
+    """``fused_residual_rmsnorm`` on a MoE layer built from the ``mla_down_proj_fusion`` spec."""
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        yield
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _build_layer(fused_residual_rmsnorm):
+        model_parallel_cuda_manual_seed(123)
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            normalization="RMSNorm",
+            fused_residual_rmsnorm=fused_residual_rmsnorm,
+            mla_down_proj_fusion=True,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=256,
+            moe_token_dispatcher_type="alltoall",
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            num_experts=config.num_moe_experts,
+            multi_latent_attention=True,
+            mla_down_proj_fusion=True,
+        )
+        return TransformerLayer(config, submodules).cuda()
+
+    @staticmethod
+    def _assert_close_up_to_rounding(actual, expected, name):
+        error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        assert error < 1e-2, f"{name}: relative error {error.item():.2e}"
+
+    def test_fused_residual_norm_matches_unfused(self):
+        """Fusing the residual-gradient add into the norm backward keeps the forward bitwise and
+        the gradients equal up to the rounding of that add."""
+        reference = self._build_layer(fused_residual_rmsnorm=False)
+        fused = self._build_layer(fused_residual_rmsnorm=True)
+        fused.load_state_dict(reference.state_dict())
+        assert not reference.pre_mlp_layernorm.returns_residual
+        assert fused.pre_mlp_layernorm.returns_residual
+
+        seq_len, batch, hidden_size = 64, 2, reference.config.hidden_size
+        torch.manual_seed(0)
+        hidden_states = torch.randn(
+            seq_len, batch, hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        output_grad = torch.randn_like(hidden_states)
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+
+        results = []
+        for layer in (reference, fused):
+            layer_input = hidden_states.clone().requires_grad_(True)
+            output, _ = layer(hidden_states=layer_input, attention_mask=attention_mask)
+            output.backward(output_grad)
+            grads = {
+                name: param.grad
+                for name, param in layer.named_parameters()
+                if param.grad is not None
+            }
+            results.append((output.detach(), layer_input.grad, grads))
+        (ref_output, ref_input_grad, ref_grads), (output, input_grad, grads) = results
+
+        torch.testing.assert_close(output, ref_output, rtol=0, atol=0)
+        # The MoE backward runs before the residual-gradient add, so its gradients are unchanged.
+        # The gradients that flow through the add differ only by its bf16 rounding.
+        assert grads.keys() == ref_grads.keys()
+        for name, ref_grad in ref_grads.items():
+            if name.startswith("mlp."):
+                torch.testing.assert_close(grads[name], ref_grad, rtol=0, atol=0)
+            else:
+                self._assert_close_up_to_rounding(grads[name], ref_grad, name)
+        self._assert_close_up_to_rounding(input_grad, ref_input_grad, "input")
+
+
+class TestMLAUpProjectionInput:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_local_up_projection_reads_the_slice_without_a_copy(self):
+        """Only Transformer Engine projections get the vectorized copy; a local (non-TE)
+        up-projection receives the row-strided kv slice of the down-projection output as it is."""
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True
+        ).self_attention.submodules
+        submodules.linear_q_up_proj = ColumnParallelLinear
+        submodules.linear_kv_up_proj = ColumnParallelLinear
+        attention = MLASelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        ).cuda()
+        seq_len, batch = 32, 2
+        hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+        received = []
+        hook = attention.linear_kv_up_proj.register_forward_pre_hook(
+            lambda module, args: received.append(args[0])
+        )
+        with mock.patch.object(
+            mla_module, "contiguous_rows", wraps=mla_module.contiguous_rows
+        ) as copy:
+            attention(hidden_states, attention_mask)
+        hook.remove()
+        assert copy.call_count == 0
+        assert len(received) == 1 and not received[0].is_contiguous()
+
+
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestFusedMLASelfAttention:
 
@@ -1705,6 +1860,20 @@ class TestFusedMLASelfAttention:
         assert isinstance(self.fused_attention, MLASelfAttention)
         assert self.fused_attention.layer_number == 1
         assert hasattr(self.fused_attention, 'linear_qkv_down_proj')
+
+    def test_up_projection_inputs_copied_as_contiguous_rows(self):
+        config = self.transformer_config
+        self.fused_attention.cuda()
+        seq_len, batch = 32, 2
+        hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+        with mock.patch.object(
+            mla_module, "contiguous_rows", wraps=mla_module.contiguous_rows
+        ) as copy:
+            self.fused_attention(hidden_states, attention_mask)
+        # The q and kv slices of the fused down-projection output take the vectorized copy.
+        assert copy.call_count == 2
+        assert not any(call.args[0].is_contiguous() for call in copy.call_args_list)
 
     def test_fused_weight_shape(self):
         config = self.transformer_config

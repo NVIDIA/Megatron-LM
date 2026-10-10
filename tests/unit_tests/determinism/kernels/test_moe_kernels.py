@@ -50,7 +50,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 HAVE_TE = moe_utils.HAVE_TE
 HAVE_TE_PERMUTE = HAVE_TE and moe_utils.fused_permute is not None
 HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
-from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
+from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
 
@@ -238,18 +238,25 @@ def test_group_limited_topk_replays():
         ),
     ],
 )
-def test_switch_load_balancing_loss_replays(fused):
+@pytest.mark.parametrize("all_padding", [False, True])
+def test_switch_load_balancing_loss_replays(fused, all_padding):
     seeded()
     routing_map, probs = _routing(num_tokens=65536, num_experts=256, topk=8)
+    if all_padding:
+        routing_map.zero_()
+        probs.zero_()
     probs = probs.detach().requires_grad_(True)
     tokens_per_expert = routing_map.sum(dim=0)
+    total_num_tokens = tokens_per_expert.sum() // 8 if all_padding else 65536
 
     def fn(probs):
         return moe_utils.switch_load_balancing_loss_func(
-            probs, tokens_per_expert, 65536, 8, 256, 1e-2, fused=fused
+            probs, tokens_per_expert, total_num_tokens, 8, 256, 1e-2, fused=fused
         )
 
-    assert_replays_bit_exact(fn, (probs,), replays=4, what=f"aux loss[fused={fused}]")
+    assert_replays_bit_exact(
+        fn, (probs,), replays=4, what=f"aux loss[fused={fused}, all_padding={all_padding}]"
+    )
 
 
 @pytest.mark.parametrize("router_dtype", [torch.float32, torch.float64])
@@ -653,6 +660,13 @@ class TestMoEModules:
                 id="flex-deepep-ep2",
                 marks=pytest.mark.skipif(not HAVE_DEEP_EP, reason="DeepEP not installed"),
             ),
+            pytest.param(
+                "flex",
+                2,
+                {"moe_flex_dispatcher_backend": "deepepv2"},
+                id="flex-deepepv2-ep2",
+                marks=pytest.mark.skipif(not HAVE_DEEP_EP_V2, reason="DeepEP v2 not installed"),
+            ),
         ],
     )
     def test_moe_layer_replays(self, dispatcher, ep, extra):
@@ -683,6 +697,17 @@ class TestMoEModules:
             input_ids = torch.arange(4096, device="cuda").view(2, 2048) % config.hash_moe_vocab_size
             inputs = {"hidden_states": hidden, "input_ids": input_ids}
         with deterministic_algorithms(True):
-            assert_module_replays_bit_exact(
-                layer, inputs, replays=3, contention=True, what=f"MoELayer[{dispatcher}, ep={ep}]"
-            )
+            prev_fill = torch.utils.deterministic.fill_uninitialized_memory
+            try:
+                if extra.get("moe_flex_dispatcher_backend") in ("deepep", "deepepv2"):
+                    # PyTorch memory-fill kernels can race with DeepEP communication.
+                    torch.utils.deterministic.fill_uninitialized_memory = False
+                assert_module_replays_bit_exact(
+                    layer,
+                    inputs,
+                    replays=3,
+                    contention=True,
+                    what=f"MoELayer[{dispatcher}, ep={ep}]",
+                )
+            finally:
+                torch.utils.deterministic.fill_uninitialized_memory = prev_fill

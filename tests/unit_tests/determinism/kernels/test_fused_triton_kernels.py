@@ -4,6 +4,8 @@
 
 * ``fused_pad_routing_map`` / ``fused_indices_to_multihot``: integer routing bookkeeping with
   unique stores -- replay and agree with the torch reference.
+* ``fused_row_copy``: copy with unique stores -- replays and agrees bit for bit with
+  ``Tensor.contiguous`` on row-strided views.
 * MLA YaRN RoPE (``fused_mla_yarn_rope_apply``): elementwise rotations under a timing-based
   ``triton.autotune``; forward and backward replay in sbhd and thd layouts, at a head count the
   autotuned ``BLOCK_H`` divides and at one it does not, plus a check that the result does not
@@ -23,11 +25,16 @@ from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
+from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_replays_bit_exact,
+    bytes_equal,
+    seeded,
+)
 
 try:
     import triton  # noqa: F401
@@ -50,6 +57,20 @@ except ImportError:
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and HAVE_TRITON), reason="needs a GPU and Triton"
 )
+
+
+def test_teacher_lse_reports_unsupported_cpu_inputs():
+    """The public entry point keeps RuntimeError and reports the unsupported reason."""
+    with pytest.raises(RuntimeError, match="teacher LSE is unavailable:.*(Triton|CUDA)"):
+        fused_csa_teacher_lse(
+            torch.zeros(4, 2, 16, device="cpu"),
+            torch.zeros(4, 16, device="cpu"),
+            torch.zeros(1, 16, device="cpu"),
+            torch.zeros(2, device="cpu"),
+            torch.zeros(4, 2, dtype=torch.int32, device="cpu"),
+            softmax_scale=0.25,
+            ratio=4,
+        )
 
 
 @pytest.fixture
@@ -153,6 +174,24 @@ def test_fused_indices_to_multihot_replays_fwd_bwd(experimental_enabled):
         return multihot, probs_in_multihot
 
     assert_replays_bit_exact(fn, (experts, probs), replays=3, what="fused_indices_to_multihot")
+
+
+# --- row-strided contiguous copy -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "width, start, stop", [(2112, 0, 1536), (2112, 1536, 2048), (576, 0, 512), (300, 7, 200)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_contiguous_rows_replays_and_matches_torch(width, start, stop, dtype):
+    seeded()
+    view = torch.randn(4096, 1, width, device="cuda", dtype=dtype)[..., start:stop]
+    view.requires_grad_(True)
+    outputs, _ = assert_replays_bit_exact(
+        contiguous_rows, (view,), replays=3, contention=True, what="contiguous_rows"
+    )
+    assert outputs["out"].is_contiguous()
+    assert bytes_equal(outputs["out"], view.detach().contiguous())
 
 
 # --- MLA YaRN RoPE --------------------------------------------------------------------------
@@ -413,4 +452,59 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
         (x, weight, alpha_pre, alpha_post, alpha_res, bias),
         replays=3,
         what=f"mhc proj_rms_compute_h[{backend}]",
+    )
+
+
+def test_contiguous_thd_rope_and_teacher_replay():
+    """Replay explicit packed positions and the packed streaming teacher LSE."""
+    seeded()
+    cu = torch.tensor([0, 193, 193, 512], device="cuda", dtype=torch.int32)
+    comp_cu = torch.tensor([0, 48, 48, 127], device="cuda", dtype=torch.int32)
+    q = torch.randn(256, 64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    angles = torch.randn(512, 1, 1, 64, device="cuda")
+    cos, sin = angles.cos().to(q.dtype), angles.sin().to(q.dtype)
+
+    def rope(x):
+        return fused_mla_rope_inplace(
+            x.clone(),
+            cos,
+            sin,
+            64,
+            64,
+            cu_seqlens_q=cu,
+            remove_interleaving=True,
+            position_ids=torch.arange(256, 512, device="cuda", dtype=torch.int32) - 193,
+        )
+
+    assert_replays_bit_exact(rope, (q,), contention=True, what="contiguous THD RoPE")
+    full_q = torch.randn(512, 64, 128, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(512, 128, device="cuda", dtype=torch.bfloat16)
+    compressed = torch.randn(127, 128, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(64, device="cuda")
+    rows = torch.arange(512, device="cuda")
+    starts = torch.where(rows < 193, 0, 193)
+    window = rows[:, None] - torch.arange(32, device="cuda")
+    window = torch.where(window >= starts[:, None], window, -1).int()
+
+    def teacher(query, keys, ck, bias):
+        return fused_csa_teacher_lse(
+            query,
+            keys,
+            ck,
+            bias,
+            window,
+            128**-0.5,
+            4,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=comp_cu,
+            max_seqlen_q=319,
+            max_seqlen_k=79,
+        )
+
+    assert_replays_bit_exact(
+        teacher,
+        (full_q, kv, compressed, sink),
+        backward=False,
+        contention=True,
+        what="packed CSA teacher",
     )
