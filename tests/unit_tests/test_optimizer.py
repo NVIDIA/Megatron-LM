@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.optimizer import (
+    HAVE_EMERGING_OPTIMIZERS,
     ChainedOptimizer,
     OptimizerConfig,
     ParamKey,
@@ -1522,17 +1523,197 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
         )
 
-    # Test 6: Gloo process groups should not be used with custom process groups
+    # Test 6: Enabling Gloo requires the collection to supply its Gloo groups.
     pg_collection_complete.mp = None  # Explicitly set to None as allowed
     pg_collection_complete.tp_ep_pp = None  # Explicitly set to None as allowed
 
-    with pytest.raises(ValueError, match="Gloo process groups are not supported"):
-        get_megatron_optimizer(
-            config=optimizer_config,
-            model_chunks=model_chunks,
-            use_gloo_process_groups=True,  # Should be False when using custom groups
-            pg_collection=pg_collection_complete,
+    with pytest.raises(ValueError, match="use_gloo_process_groups=True requires"):
+        ProcessGroupCollection.setup_process_groups_for_optimizer(
+            pg_collection_complete, model_chunks, use_gloo_process_groups=True
         )
+    groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection_complete, model_chunks, use_gloo_process_groups=False
+    )
+    assert groups['intra_dp_cp_group_gloo'] is None
+    assert groups['intra_expt_dp_group_gloo'] is None
+
+    # This collection has no expert data-parallel group (expt_dp is None), so the dense Gloo
+    # group is enough, and it is passed straight through.
+    gloo_dp = torch.distributed.new_group(backend="gloo")
+    pg_collection_complete.intra_dp_cp_gloo = gloo_dp
+    groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection_complete, model_chunks, use_gloo_process_groups=True
+    )
+    assert groups['intra_dp_cp_group_gloo'] is gloo_dp
+    assert groups['intra_expt_dp_group_gloo'] is None
+
+
+@pytest.mark.parametrize('num_distributed_optimizer_instances', [1, 2])
+def test_optimizer_gloo_groups_must_mirror_sharding_groups(num_distributed_optimizer_instances):
+    """Each Gloo group must hold the ranks of the group the distributed optimizer shards over."""
+    if torch.distributed.get_world_size() < 2 * num_distributed_optimizer_instances:
+        pytest.skip("Needs an optimizer-instance data-parallel group larger than one rank")
+    Utils.initialize_model_parallel(
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances
+    )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    ddp_config = SimpleNamespace(
+        use_distributed_optimizer=True,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+    )
+    model_chunks = [SimpleNamespace(ddp_config=ddp_config)]
+
+    # The groups built by parallel_state mirror each other (intra_dp_cp / intra_expt_dp with
+    # more than one optimizer instance, dp_cp / expt_dp otherwise).
+    groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection, model_chunks, use_gloo_process_groups=True
+    )
+    assert groups['intra_dp_cp_group_gloo'] is pg_collection.intra_dp_cp_gloo
+    assert groups['intra_expt_dp_group_gloo'] is pg_collection.intra_expt_dp_gloo
+
+    single_rank_gloo_group, _ = torch.distributed.new_subgroups(group_size=1, backend="gloo")
+    for gloo_group_name in ('intra_dp_cp_gloo', 'intra_expt_dp_gloo'):
+        mirrored_gloo_group = getattr(pg_collection, gloo_group_name)
+        setattr(pg_collection, gloo_group_name, single_rank_gloo_group)
+        with pytest.raises(ValueError, match=f"pg_collection.{gloo_group_name} has ranks"):
+            ProcessGroupCollection.setup_process_groups_for_optimizer(
+                pg_collection, model_chunks, use_gloo_process_groups=True
+            )
+        setattr(pg_collection, gloo_group_name, mirrored_gloo_group)
+
+
+def test_optimizer_gloo_group_must_mirror_a_replaced_dp_cp_group():
+    """Replacing dp_cp but keeping parallel_state's Gloo mirror raises instead of gathering
+    checkpoint state over other ranks."""
+    world_size = torch.distributed.get_world_size()
+    if world_size < 4:
+        pytest.skip("Needs two data-parallel groups of at least two ranks")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_chunks = [
+        SimpleNamespace(
+            ddp_config=SimpleNamespace(
+                use_distributed_optimizer=True, num_distributed_optimizer_instances=1
+            )
+        )
+    ]
+
+    # With TP=2, data-parallel peers are two ranks apart. A caller-built group of the same size
+    # over adjacent ranks has the size of dp_cp but different members.
+    data_parallel_size = world_size // 2
+    adjacent_ranks_group, _ = torch.distributed.new_subgroups_by_enumeration(
+        [
+            list(range(start, start + data_parallel_size))
+            for start in range(0, world_size, data_parallel_size)
+        ]
+    )
+    adjacent_ranks = torch.distributed.get_process_group_ranks(adjacent_ranks_group)
+    assert adjacent_ranks != torch.distributed.get_process_group_ranks(pg_collection.dp_cp)
+    pg_collection.dp_cp = adjacent_ranks_group
+
+    with pytest.raises(ValueError, match="pg_collection.intra_dp_cp_gloo has ranks"):
+        ProcessGroupCollection.setup_process_groups_for_optimizer(
+            pg_collection, model_chunks, use_gloo_process_groups=True
+        )
+
+
+class DenseAndExpertLinear(nn.Module):
+    """One dense and one expert-parallel weight, as the optimizer factory sees an MoE layer."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.dense = nn.Linear(16, 16, bias=False, device='cuda')
+        self.experts = nn.Linear(16, 16, bias=False, device='cuda')
+        self.experts.weight.allreduce = False
+
+
+@pytest.mark.parametrize('use_gloo', [False, True])
+def test_get_megatron_optimizer_with_gloo_collection(use_gloo):
+    """The dense and expert distributed optimizers take their Gloo groups from the collection."""
+    Utils.initialize_model_parallel()
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    # Fresh Gloo groups over every rank, which are the dp_cp and expt_dp ranks here. They are
+    # distinct from the parallel_state Gloo groups, so only reading the collection passes.
+    pg_collection.intra_dp_cp_gloo = torch.distributed.new_group(backend="gloo")
+    pg_collection.intra_expt_dp_gloo = torch.distributed.new_group(backend="gloo")
+    config = TransformerConfig(num_attention_heads=1, num_layers=1)
+    model = DistributedDataParallel(
+        config,
+        DistributedDataParallelConfig(use_distributed_optimizer=True),
+        DenseAndExpertLinear(config),
+        pg_collection=pg_collection,
+    )
+    optimizer_config = OptimizerConfig(optimizer='adam', lr=0.001, use_distributed_optimizer=True)
+
+    optimizer = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=use_gloo
+    )
+
+    dense_optimizer, expert_optimizer = optimizer.chained_optimizers
+    assert isinstance(dense_optimizer, DistributedOptimizer)
+    assert isinstance(expert_optimizer, DistributedOptimizer)
+    assert dense_optimizer.data_parallel_group_gloo is (
+        pg_collection.intra_dp_cp_gloo if use_gloo else None
+    )
+    assert expert_optimizer.data_parallel_group_gloo is (
+        pg_collection.intra_expt_dp_gloo if use_gloo else None
+    )
+
+
+def test_get_megatron_optimizer_requires_gloo_groups_when_enabled():
+    """Requesting Gloo in a job built without Gloo groups is an error, not a silent downgrade."""
+    Utils.initialize_model_parallel(create_gloo_process_groups=False)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    assert pg_collection.intra_dp_cp_gloo is None
+    assert pg_collection.intra_expt_dp_gloo is None
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        DistributedDataParallelConfig(use_distributed_optimizer=True),
+        nn.Linear(16, 16, bias=False, device='cuda'),
+        pg_collection=pg_collection,
+    )
+    optimizer_config = OptimizerConfig(optimizer='adam', lr=0.001, use_distributed_optimizer=True)
+
+    with pytest.raises(
+        ValueError, match="use_gloo_process_groups=True requires pg_collection.intra_dp_cp_gloo"
+    ):
+        get_megatron_optimizer(
+            optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=True
+        )
+
+
+@pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed")
+def test_emerging_optimizer_expert_grad_norm_covers_egtp_remat_shards():
+    """Every EGTP_remat peer reports the norm over all expert-weight shards."""
+    if torch.distributed.get_world_size() % 4 != 0:
+        pytest.skip("Needs a world size divisible by expert_model_parallel_size x egtp_remat (4)")
+    Utils.initialize_model_parallel(expert_model_parallel_size=2, expert_gtp_remat_size=2)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model = DenseAndExpertLinear(TransformerConfig(num_attention_heads=1, num_layers=1))
+    # EGTP_remat shards each expert weight, so every peer owns distinct gradient values.
+    model.experts.weight.is_gtp_weight_remat = True
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(optimizer='muon', lr=0.01, muon_tp_mode='duplicated'),
+        [model],
+        pg_collection=pg_collection,
+    )
+
+    # Dense gradients are replicated. Each (EP rank, EGTP_remat rank) pair holds its own expert
+    # shard, filled here with that shard's 1-based index.
+    num_egtp_remat_ranks = pg_collection.expt_gtp_remat.size()
+    num_expert_shards = pg_collection.ep.size() * num_egtp_remat_ranks
+    expert_shard_index = (
+        pg_collection.ep.rank() * num_egtp_remat_ranks + pg_collection.expt_gtp_remat.rank()
+    )
+    model.dense.weight.grad = torch.ones_like(model.dense.weight)
+    model.experts.weight.grad = torch.full_like(model.experts.weight, expert_shard_index + 1.0)
+    expected_grad_norm = (
+        model.dense.weight.numel()
+        + model.experts.weight.numel() * sum(i**2 for i in range(1, num_expert_shards + 1))
+    ) ** 0.5
+
+    assert optimizer.get_grad_norm() == pytest.approx(expected_grad_norm, rel=1e-6)
 
 
 def _chain_member(param_groups):
