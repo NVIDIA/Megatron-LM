@@ -206,6 +206,7 @@ def _postprocess_after_decoder(
                 config=model.config,
                 cp_group=mtp_cp_group,
                 tp_group=model.tp_group,
+                dp_cp_group=model.pg_collection.dp_cp,
                 packed_seq_params=packed_seq_params,
                 sequence_roll_context=sequence_roll_context,
                 scale_logits_fn=model._scale_logits if model.config.use_mup else None,

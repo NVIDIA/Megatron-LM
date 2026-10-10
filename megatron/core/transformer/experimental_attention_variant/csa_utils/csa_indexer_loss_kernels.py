@@ -43,7 +43,9 @@ if _TRITON_AVAILABLE:
         stride_sanitized_topk_col,
         stride_sanitized_physical_row,
         stride_sanitized_physical_col,
-        SCORE_WIDTH: tl.constexpr,
+        # The indexer score width is the per-microbatch compressed-K maximum
+        # under THD; it is a bound check only, so keep it off the JIT key.
+        score_width,
         TOPK_WIDTH: tl.constexpr,
         HAS_PADDING: tl.constexpr,
         HAS_PHYSICAL_INDICES: tl.constexpr,
@@ -81,7 +83,7 @@ if _TRITON_AVAILABLE:
                     mask=col_mask,
                 )
 
-        selected = col_mask & (indices >= 0) & (indices < SCORE_WIDTH)
+        selected = col_mask & (indices >= 0) & (indices < score_width)
         if HAS_PADDING:
             selected = selected & ~row_is_padding
         safe_indices = tl.where(selected, indices, 0)
@@ -244,7 +246,7 @@ def prepare_sparse_loss(
             sanitized_topk_flat.stride(1),
             sanitized_physical_flat.stride(0),
             sanitized_physical_flat.stride(1),
-            SCORE_WIDTH=score_width,
+            score_width,
             TOPK_WIDTH=topk_width,
             HAS_PADDING=padding_row_mask is not None,
             HAS_PHYSICAL_INDICES=physical_indices is not None,

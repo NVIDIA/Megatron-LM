@@ -26,7 +26,9 @@ if _TRITON_AVAILABLE:
         q_causal_offsets,
         seq_lens,
         total_q,
-        NUM_SEQUENCES: tl.constexpr,
+        # The packed segment count changes with every microbatch, so it is a
+        # runtime loop bound instead of an unrolled compile-time one.
+        num_sequences,
         RATIO: tl.constexpr,
         HAS_CAUSAL_OFFSETS: tl.constexpr,
         BLOCK_ROWS: tl.constexpr,
@@ -39,7 +41,7 @@ if _TRITON_AVAILABLE:
         owner_kv_len = tl.zeros((BLOCK_ROWS,), dtype=tl.int32)
         owner_causal_offset = tl.zeros((BLOCK_ROWS,), dtype=tl.int32)
 
-        for seq in range(NUM_SEQUENCES):
+        for seq in range(num_sequences):
             q_start = tl.load(cu_seqlens_q + seq)
             q_end = tl.load(cu_seqlens_q + seq + 1)
             owns_row = launch_mask & (rows >= q_start) & (rows < q_end)
@@ -70,16 +72,19 @@ if _TRITON_AVAILABLE:
         stride_scores_col,
         stride_sanitized_row,
         stride_sanitized_col,
-        CANDIDATE_WIDTH: tl.constexpr,
-        OUTPUT_WIDTH: tl.constexpr,
-        SCORE_WIDTH: tl.constexpr,
+        # Masks and bounds only. ``score_width`` tracks the per-microbatch
+        # compressed-K maximum under THD, so none of the three may enter the
+        # JIT key; ``BLOCK_TOPK`` already quantizes the vector width.
+        candidate_width,
+        output_width,
+        score_width,
         BLOCK_TOPK: tl.constexpr,
     ):
         """Validate one row of top-k ids and reduce its valid length."""
         row = tl.program_id(0)
         cols = tl.arange(0, BLOCK_TOPK)
-        output_mask = cols < OUTPUT_WIDTH
-        candidate_mask = cols < CANDIDATE_WIDTH
+        output_mask = cols < output_width
+        candidate_mask = cols < candidate_width
         candidates = tl.load(
             candidate_indices + row * stride_candidate_row + cols * stride_candidate_col,
             mask=candidate_mask,
@@ -87,7 +92,7 @@ if _TRITON_AVAILABLE:
         )
         seq_len = tl.load(seq_lens + row)
         index_valid = (
-            candidate_mask & (candidates >= 0) & (candidates < seq_len) & (candidates < SCORE_WIDTH)
+            candidate_mask & (candidates >= 0) & (candidates < seq_len) & (candidates < score_width)
         )
         safe_candidates = tl.where(index_valid, candidates, 0)
         selected_scores = tl.load(
@@ -176,7 +181,7 @@ def build_seq_lens(
             offsets,
             seq_lens,
             total_q,
-            NUM_SEQUENCES=cu_seqlens_q.shape[0] - 1,
+            cu_seqlens_q.shape[0] - 1,
             RATIO=ratio,
             HAS_CAUSAL_OFFSETS=q_causal_offsets is not None,
             BLOCK_ROWS=block_rows,
@@ -268,9 +273,9 @@ def sanitize_topk(
             scores.stride(1),
             sanitized_indices.stride(0),
             sanitized_indices.stride(1),
-            CANDIDATE_WIDTH=candidate_width,
-            OUTPUT_WIDTH=output_width,
-            SCORE_WIDTH=scores.shape[1],
+            candidate_width,
+            output_width,
+            scores.shape[1],
             BLOCK_TOPK=block_topk,
             num_warps=num_warps,
         )

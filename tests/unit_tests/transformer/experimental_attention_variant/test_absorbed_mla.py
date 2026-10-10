@@ -368,6 +368,13 @@ def _run_functionality(
     assert standard_mla.q_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
     assert standard_mla.kv_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
 
+    assert absorbed_mla.linear_q_up_proj.weight.qkv_layout.num_groups == config.num_attention_heads
+    if combined_kv_up_projection:
+        assert absorbed_mla.linear_kv_up_proj.weight.qkv_layout.projection_split_shapes == (
+            config.qk_head_dim,
+            config.v_head_dim,
+        )
+
     state_dict = standard_mla.state_dict()
     absorbed_mla.load_state_dict(state_dict)
 
