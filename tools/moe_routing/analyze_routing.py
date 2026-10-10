@@ -78,7 +78,7 @@ def main():
     # 1. Expert concentration (hot-set size).
     run(
         "analyze_routing_concentration.py",
-        [args.trace_dir] + nexpert_args + outdir_args,
+        [args.trace_dir] + nexpert_args + topk_args + outdir_args,
         "Expert concentration  (hot-set size, routing distribution)",
     )
 
