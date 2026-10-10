@@ -1148,6 +1148,30 @@ def test_streaming_sparse_kl_uses_fused_target_when_supported(monkeypatch):
     assert calls[0][3] == 0.5
 
 
+@pytest.mark.parametrize(
+    ("topk", "expected"),
+    [(64, True), (256, True), (320, False), (512, True), (576, False)],
+)
+def test_fused_sparse_indexer_target_declines_unsupported_topk(monkeypatch, topk, expected):
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+
+        def __init__(self, shape):
+            self.shape = shape
+            self.ndim = len(shape)
+
+        def size(self, dim):
+            return self.shape[dim]
+
+    monkeypatch.setattr(tilelang_dsa, "sparse_indexer_target_interface", object())
+    query = FakeCudaTensor((2, 8, 256))
+    key = FakeCudaTensor((512, 256))
+    topk_indices = FakeCudaTensor((2, topk))
+
+    assert tilelang_dsa._can_use_fused_sparse_indexer_target(query, key, topk_indices) is expected
+
+
 @pytest.mark.parametrize("heads", [48, 96])
 def test_fused_sparse_indexer_target_and_kl_match_reference(heads):
     if not torch.cuda.is_available():
