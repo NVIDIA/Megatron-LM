@@ -1190,7 +1190,7 @@ class TestMegatronFSDPE2E:
             model_cfg = gpt_config_from_args(args)
             cfg = pretrain_cfg_container_from_args(args, model_cfg)
             set_run_config(cfg)
-            initialize_runtime_services(args)
+            initialize_runtime_services(args, training=True)
             resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
 
             from gpt_builders import gpt_builder

@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Memory-accounting tests for Megatron-FSDP."""
+"""Memory-accounting tests for Megatron-FSDP.
+
+Tests asserting memory usage or storage release belong here, including during
+CUDA graph capture and replay.
+"""
 
 import logging
 

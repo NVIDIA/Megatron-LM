@@ -1400,11 +1400,21 @@ class TestChunkedPrefillCudaGraphs:
         reset_rounder()
         Utils.destroy_model_parallel()
 
-    def _create_model(self, model_provider, num_cuda_graphs, ssm_mixer="mamba"):
+    def _create_model(
+        self,
+        model_provider,
+        num_cuda_graphs,
+        ssm_mixer="mamba",
+        hidden_size=32,
+        num_query_groups=None,
+        flash_attention_version=None,
+        init_method_std=0.02,
+    ):
         """Create a GPT or hybrid model with optional CUDA graph support.
 
         `ssm_mixer` selects the hybrid stack's linear-attention mixer ("mamba"
-        or "gdp"); it is ignored for GPT.
+        or "gdp"); it is ignored for GPT. `hidden_size`, `num_query_groups`,
+        `flash_attention_version` and `init_method_std` apply to GPT only.
         """
         cuda_graph_impl = "local" if num_cuda_graphs else "none"
 
@@ -1412,8 +1422,11 @@ class TestChunkedPrefillCudaGraphs:
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=4,
-                hidden_size=32,
+                hidden_size=hidden_size,
                 num_attention_heads=4,
+                num_query_groups=num_query_groups,
+                flash_attention_version=flash_attention_version,
+                init_method_std=init_method_std,
                 use_cpu_initialization=True,
                 cuda_graph_impl=cuda_graph_impl,
                 inference_rng_tracker=True,
@@ -1465,7 +1478,14 @@ class TestChunkedPrefillCudaGraphs:
         model.eval()
         return model
 
-    def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
+    def _build_engine(
+        self,
+        model,
+        enable_chunked_prefill,
+        num_cuda_graphs,
+        context_max_tokens,
+        enable_prefix_caching=False,
+    ):
         """Build an engine with the given chunked prefill / CUDA graph config."""
         set_rounder(4)
         # FP32 recurrent state. Chunked prefill hands a request's recurrence
@@ -1486,6 +1506,7 @@ class TestChunkedPrefillCudaGraphs:
             num_cuda_graphs=num_cuda_graphs,
             use_cuda_graphs_for_non_decode_steps=True,
             enable_chunked_prefill=enable_chunked_prefill,
+            enable_prefix_caching=enable_prefix_caching,
             max_tokens=context_max_tokens,
             max_requests=128,
             sampling_backend='torch',
@@ -1508,21 +1529,36 @@ class TestChunkedPrefillCudaGraphs:
         delete_cuda_graphs()
         return DynamicInferenceEngine(controller, context)
 
-    def _run_to_completion(self, engine, prompts, num_tokens_to_generate, conv_snapshots=None):
+    def _run_to_completion(
+        self,
+        engine,
+        prompts,
+        num_tokens_to_generate,
+        conv_snapshots=None,
+        generated_log_probs=None,
+        enable_prefix_caching=False,
+        ssm_snapshots=None,
+    ):
         """Add all prompts and run to completion, returning {req_id: generated_tokens}.
 
-        `conv_snapshots`, if given, is appended one clone of request 0's conv
-        state per step, so a caller can inspect the state at a chosen step
-        instead of only the generated tokens.
+        `conv_snapshots` and `ssm_snapshots`, if given, are appended one clone of
+        request 0's conv / SSM state per step, so a caller can inspect the state at
+        a chosen step instead of only the generated tokens. `generated_log_probs`,
+        if given, is filled with {req_id: log probs of the generated tokens}.
         """
         for i, prompt in enumerate(prompts):
             request = DynamicInferenceRequest(
                 request_id=i,
                 prompt_tokens=prompt,
                 sampling_params=SamplingParams(
-                    num_tokens_to_generate=num_tokens_to_generate, termination_id=-1, top_k=1
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=-1,
+                    top_k=1,
+                    return_log_probs=generated_log_probs is not None,
+                    skip_prompt_log_probs=generated_log_probs is not None,
                 ),
                 block_size_tokens=CHUNKED_CG_BLOCK_SIZE,
+                enable_prefix_caching=enable_prefix_caching,
             )
             engine._add_request(request)
 
@@ -1535,13 +1571,18 @@ class TestChunkedPrefillCudaGraphs:
         while engine.has_unfinished_requests():
             result = engine.step_modern()
             step_count += 1
-            if conv_snapshots is not None:
+            if conv_snapshots is not None or ssm_snapshots is not None:
                 if mamba_idx is None:
                     mamba_idx = engine.context.mamba_metadata.request_to_mamba_state_idx[0].item()
                     assert mamba_idx >= 0, "request 0 has no mamba slot after its first step"
-                conv_snapshots.append(engine.context.mamba_conv_states[:, mamba_idx].clone())
+                if conv_snapshots is not None:
+                    conv_snapshots.append(engine.context.mamba_conv_states[:, mamba_idx].clone())
+                if ssm_snapshots is not None:
+                    ssm_snapshots.append(engine.context.mamba_ssm_states[:, mamba_idx].clone())
             for request in result["finished_requests"]:
                 finished[request.request_id] = list(request.generated_tokens)
+                if generated_log_probs is not None:
+                    generated_log_probs[request.request_id] = list(request.generated_log_probs)
 
         return finished, step_count
 
@@ -1618,13 +1659,13 @@ class TestChunkedPrefillCudaGraphs:
                 f"({test_steps} <= {baseline_steps})"
             )
 
-    # d_conv is 4 for both mixers, so a final chunk of 2 or 3 tokens is shorter
+    # d_conv is 4 for both mixers, so a final chunk of 1, 2 or 3 tokens is shorter
     # than the conv window. Deriving the conv state from that slice alone
     # zero-fills the columns that predate it, and the first decode step then
     # convolves against zeros instead of the previous chunk's tail.
     @pytest.mark.internal
     @pytest.mark.parametrize("ssm_mixer", ["mamba", "gdp"])
-    @pytest.mark.parametrize("final_chunk_len", [2, 3])
+    @pytest.mark.parametrize("final_chunk_len", [1, 2, 3])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
     @torch.inference_mode()
     def test_short_final_prefill_chunk_carries_conv_state(
@@ -1656,8 +1697,7 @@ class TestChunkedPrefillCudaGraphs:
         model = self._create_model("hybrid", num_cuda_graphs=2, ssm_mixer=ssm_mixer)
 
         # Budget the prompt so the last chunk is exactly `final_chunk_len` tokens.
-        # Prefix caching is off, so no block-alignment snapping shifts the split,
-        # and the engine's flash-attn guard only special-cases a 1-token tail.
+        # Prefix caching is off, so no block-alignment snapping shifts the split.
         context_max_tokens = 128
         prompt_len = 2 * context_max_tokens + final_chunk_len
         device = torch.cuda.current_device()
@@ -1668,8 +1708,13 @@ class TestChunkedPrefillCudaGraphs:
         baseline_engine = self._build_engine(
             model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
         )
+        baseline_ssm_snapshots = []
         baseline_outputs, _ = self._run_to_completion(
-            baseline_engine, prompts, num_tokens_to_generate, conv_snapshots=baseline_snapshots
+            baseline_engine,
+            prompts,
+            num_tokens_to_generate,
+            conv_snapshots=baseline_snapshots,
+            ssm_snapshots=baseline_ssm_snapshots,
         )
 
         chunked_snapshots = []
@@ -1679,8 +1724,13 @@ class TestChunkedPrefillCudaGraphs:
             num_cuda_graphs=num_cuda_graphs,
             context_max_tokens=context_max_tokens,
         )
+        chunked_ssm_snapshots = []
         chunked_outputs, _ = self._run_to_completion(
-            chunked_engine, prompts, num_tokens_to_generate, conv_snapshots=chunked_snapshots
+            chunked_engine,
+            prompts,
+            num_tokens_to_generate,
+            conv_snapshots=chunked_snapshots,
+            ssm_snapshots=chunked_ssm_snapshots,
         )
 
         assert baseline_outputs[0] == chunked_outputs[0], (
@@ -1732,3 +1782,135 @@ class TestChunkedPrefillCudaGraphs:
                 f"the carry restores.\n{default}"
             ),
         )
+
+        # The recurrent state must also match: the final chunk resumes the scan from the
+        # state the previous chunk left, however short that final chunk is. The mamba state
+        # here peaks around 5e-2, so its tolerance is tighter than the conv state's; losing
+        # the carried state moves it by about that much.
+        torch.testing.assert_close(
+            baseline_ssm_snapshots[baseline_prefill_steps - 1],
+            chunked_ssm_snapshots[chunked_prefill_steps - 1],
+            rtol=1e-2,
+            atol=5e-3,
+            msg=lambda default: (
+                f"{ssm_mixer}: SSM state after a {final_chunk_len}-token final prefill "
+                f"chunk does not match the unchunked baseline "
+                f"(num_cuda_graphs={num_cuda_graphs}).\n{default}"
+            ),
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
+    @torch.inference_mode()
+    def test_single_token_prefill_chunks_match_unchunked_baseline(
+        self, monkeypatch, num_cuda_graphs
+    ):
+        """One-token prefill chunks produce the same tokens and log probs as an unchunked run.
+
+        A batch whose prefill rows are all one token publishes max_seqlen_q == 1 unless the
+        context raises it, and FlashAttention-2 then reshapes q assuming total_q == num_seqs
+        under GQA. Tokens and requests are padded independently here, as in production, so
+        that assumption fails. The chunked run makes one-token prefill chunks from a prompt
+        one token past a multiple of the budget and from a prefix-cache hit covering all but
+        the last prompt token.
+
+        FlashAttention-2 computes each query row independently of the rest of the batch, so the
+        chunked run matches the baseline to within rounding. The init std makes the logits
+        depend strongly enough on attention that a one-token row missing its own key moves the
+        first log prob by several times the tolerance. FlashAttention-4's split heuristics
+        depend on batch shape, so its chunked and unchunked runs legitimately differ by more
+        than that; its one-token rows are checked against a reference in the context tests.
+        """
+        clear_nvte_env_vars()
+
+        random.seed(123)
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        )
+        model = self._create_model(
+            "gpt",
+            num_cuda_graphs=2,
+            hidden_size=64,
+            num_query_groups=1,
+            flash_attention_version=2,
+            init_method_std=0.3,
+        )
+
+        context_max_tokens = 128
+        device = torch.cuda.current_device()
+        long_prompt = torch.arange(2 * CHUNKED_CG_BLOCK_SIZE + 1, dtype=torch.int64, device=device)
+        # The long prompt's last chunk is one token. Its copy is a prefix-cache hit on all but
+        # the last token, scheduled once the original has registered its blocks; only decodes
+        # share that step, so every prefill row in it is one token.
+        prompts = [
+            long_prompt,
+            torch.arange(1000, 1000 + context_max_tokens - 1, dtype=torch.int64, device=device),
+            long_prompt.clone(),
+        ]
+        num_tokens_to_generate = 8
+
+        baseline_log_probs = {}
+        baseline_engine = self._build_engine(
+            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
+        )
+        monkeypatch.setattr(DynamicInferenceContext, "TOKEN_ROUNDER", 64)
+        baseline_outputs, _ = self._run_to_completion(
+            baseline_engine, prompts, num_tokens_to_generate, generated_log_probs=baseline_log_probs
+        )
+
+        # Record each prefill step's query lengths and whether it ran under a CUDA graph.
+        prefill_steps = []
+        initialize_attention_state = DynamicInferenceContext.initialize_attention_state
+
+        def recording_initialize_attention_state(ctx, *args, **kwargs):
+            initialize_attention_state(ctx, *args, **kwargs)
+            if ctx.num_prefill_requests > 0:
+                active = slice(ctx.paused_request_count, ctx.total_request_count)
+                prefill_steps.append(
+                    (ctx.request_query_lengths[active].tolist(), ctx.using_cuda_graph_this_step())
+                )
+
+        chunked_log_probs = {}
+        chunked_engine = self._build_engine(
+            model,
+            enable_chunked_prefill=True,
+            num_cuda_graphs=num_cuda_graphs,
+            context_max_tokens=context_max_tokens,
+            enable_prefix_caching=True,
+        )
+        monkeypatch.setattr(DynamicInferenceContext, "TOKEN_ROUNDER", 64)
+        monkeypatch.setattr(
+            DynamicInferenceContext,
+            "initialize_attention_state",
+            recording_initialize_attention_state,
+        )
+        chunked_outputs, _ = self._run_to_completion(
+            chunked_engine,
+            prompts,
+            num_tokens_to_generate,
+            generated_log_probs=chunked_log_probs,
+            enable_prefix_caching=True,
+        )
+
+        for req_id, expected_tokens in baseline_outputs.items():
+            tokens, log_probs = chunked_outputs[req_id], chunked_log_probs[req_id]
+            expected_log_probs = baseline_log_probs[req_id]
+            detail = (
+                f"request {req_id}\n chunked:  {tokens}\n {log_probs}\n"
+                f" baseline: {expected_tokens}\n {expected_log_probs}"
+            )
+            assert tokens == expected_tokens, detail
+            torch.testing.assert_close(
+                torch.tensor(log_probs),
+                torch.tensor(expected_log_probs),
+                atol=1e-3,
+                rtol=0,
+                msg=lambda default: f"{detail}\n{default}",
+            )
+
+        # The shape under test: a prefill step in which every row is one token.
+        single_token_steps = [graphed for lengths, graphed in prefill_steps if max(lengths) == 1]
+        assert single_token_steps, f"no prefill step had only one-token rows: {prefill_steps}"
+        if num_cuda_graphs is None:
+            assert not any(single_token_steps), "expected eager one-token prefill steps"

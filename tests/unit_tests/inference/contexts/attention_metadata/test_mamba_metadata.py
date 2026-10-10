@@ -692,8 +692,6 @@ class TestMambaIntermediateChunkLayout:
     def test_snapshot_uses_actual_chunk_layout(
         self, cu_seqlens, last_chunks, real_count, padded_count, expected_index
     ):
-        # Intermediate extraction lives on the prefix-cached subclass; the scratch
-        # output buffers are irrelevant here, so leave them unallocated.
         metadata = PrefixCachedMambaMetadata(
             max_requests=4, max_tokens=1024, max_intermediate_count=12, d_conv=4
         )

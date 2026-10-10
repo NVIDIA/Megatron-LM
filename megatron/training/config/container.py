@@ -48,6 +48,9 @@ class ConfigContainerBase:
 
     def validate(self) -> None:
         """Run each sub-config's explicit validation before runtime initialization."""
+        rng = getattr(self, "rng", None)
+        if rng is not None:
+            rng.finalize_model_config(getattr(self, "model", None))
         for config_field in dataclass_fields(self):
             config = getattr(self, config_field.name)
             validate = getattr(config, "validate", None)
@@ -267,6 +270,21 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+
+    def validate(self) -> None:
+        """Validate each section, then the RL section against the rest of the run."""
+        super().validate()
+        transformer = getattr(self.model, "transformer", None)
+        cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
+        self.rl.validate_run(
+            cuda_graph_impl=cuda_graph_impl,
+            micro_batch_size=self.train.micro_batch_size,
+            global_batch_size=self.train.global_batch_size,
+            skip_train=self.validation.skip_train,
+            load_optim=self.checkpoint.load_optim,
+            save_interval=self.checkpoint.save_interval,
+            exit_interval=self.train.exit_interval,
+        )
 
 
 @dataclass(kw_only=True)
