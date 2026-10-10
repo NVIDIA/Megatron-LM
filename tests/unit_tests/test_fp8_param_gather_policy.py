@@ -272,7 +272,10 @@ def test_compact_transport_lifecycle(monkeypatch, completion, dp_size, has_fp8, 
     collective = Mock(side_effect=gather)
     monkeypatch.setattr(torch.distributed, "all_gather", collective)
     before_high_precision = [p.detach().clone() for p in high_precision]
+    allocations = Mock(wraps=torch.empty)
+    monkeypatch.setattr(torch, "empty", allocations)
     for step in range(2):
+        allocations.reset_mock()
         if step:
             # Parameter values change; owner lists, dtype groups and receive sizes do not.
             quantized[0].main_param.add_(0.5)
@@ -282,11 +285,18 @@ def test_compact_transport_lifecycle(monkeypatch, completion, dp_size, has_fp8, 
         group.start_param_sync()
         assert bucket.layerwise_gather_plan is gather_plan
         reuse_policy.assert_not_called()
+        # FP8 copy-back may create meta templates, but DP1 needs no receive allocation.
+        receive_allocations = [
+            call for call in allocations.call_args_list if call.kwargs.get("device") != "meta"
+        ]
+        assert len(receive_allocations) == (len(dtypes) if dp_size > 1 else 0)
         if completion != "sync":
             assert (
                 group.param_gather_handle is not None
             ), "DP1 still needs local copy-back completion"
-            assert len(bucket.layerwise_gather_list) == len(dtypes) + has_fp8
+            assert (
+                len(bucket.layerwise_gather_list) == (len(dtypes) if dp_size > 1 else 0) + has_fp8
+            )
             for params_by_rank, received, reuse in bucket.layerwise_gather_list:
                 assert all(
                     getattr(p, "test_fp8", False) == reuse

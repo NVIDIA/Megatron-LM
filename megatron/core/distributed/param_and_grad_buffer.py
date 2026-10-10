@@ -559,6 +559,10 @@ class _ParamAndGradBucketGroup:
             for bucket in self.buckets:
                 bucket.layerwise_gather_list = []
                 for plan in bucket.layerwise_gather_plan:
+                    if dp_size == 1 and not plan.reuse_grad_buffer:
+                        # The optimizer already updated the local model parameters.
+                        # Reused FP8 plans still need staging and local quantization.
+                        continue
                     if plan.reuse_grad_buffer:
                         transport = bucket.grad_data.view(torch.bfloat16)
                         assert transport.numel() >= plan.total_size
