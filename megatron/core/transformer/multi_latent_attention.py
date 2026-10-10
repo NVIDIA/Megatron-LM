@@ -1244,13 +1244,12 @@ class MLASelfAttention(MultiLatentAttention):
             set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_down_proj)
 
-    def clip_qk(self):
-        """
-        QK Clipping is a technique to clip the query and key attention logits to prevent the
-        attention logits from exploding. Per MuonClip usage, we update the weight by calling this
-        function after Muon optimizer step.
-        """
+    @torch.no_grad()
+    def get_qk_clip_factors(self):
+        """Return (parameter, FP32 row factors) without modifying model or master weights.
 
+        Statistics remain available until all sub-optimizers finish.
+        """
         if not self.config.qk_clip:
             raise ValueError("qk_clip option needs to be enabled")
 
@@ -1280,36 +1279,35 @@ class MLASelfAttention(MultiLatentAttention):
                 self.num_attention_heads_per_partition,
             ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition},) \
                 but {self.core_attention.current_max_attn_logits.shape}"
+            # Clamp the denominator so heads below threshold keep a factor of one.
             self.qk_clip_balancing_eta = torch.clamp(
-                self.config.qk_clip_threshold / self.core_attention.current_max_attn_logits, max=1.0
+                self.config.qk_clip_threshold
+                / self.core_attention.current_max_attn_logits.clamp(
+                    min=self.config.qk_clip_threshold
+                ),
+                max=1.0,
             ).view(self.num_attention_heads_per_partition, 1, 1)
             assert torch.all(self.qk_clip_balancing_eta <= 1.0)
 
-            # Update q side weight, keep qk_pos_emb_head_dim side weight unchanged
+            # Q NoPE scales by eta**alpha; Q RoPE scales by eta.
             if self.config.q_lora_rank is None:
                 q_proj_weight = self.linear_q_proj.weight
             else:
                 q_proj_weight = self.linear_q_up_proj.weight
 
-            # Handle different weight access patterns (main_param vs direct access)
-            if hasattr(q_proj_weight, 'main_param'):
-                q_proj_weight.main_param.data.copy_(
-                    self._clip_q_proj_weight(q_proj_weight.main_param.data)
-                )
-            q_proj_weight.data.copy_(self._clip_q_proj_weight(q_proj_weight.data))
-
-            # Update k side weight, keep v side weight unchanged
             kv_proj_weight = self.linear_kv_up_proj.weight
-
-            # Handle different weight access patterns
-            if hasattr(kv_proj_weight, 'main_param'):
-                kv_proj_weight.main_param.data.copy_(
-                    self._clip_kv_proj_weight(kv_proj_weight.main_param.data)
+            q_factor = self._clip_q_proj_weight(
+                torch.ones(
+                    q_proj_weight.shape[0], 1, device=q_proj_weight.device, dtype=torch.float32
                 )
-            kv_proj_weight.data.copy_(self._clip_kv_proj_weight(kv_proj_weight.data))
-
-        # reset current_max_attn_logits
-        self.core_attention.current_max_attn_logits = None
+            )
+            kv_factor = self._clip_kv_proj_weight(
+                torch.ones(
+                    kv_proj_weight.shape[0], 1, device=kv_proj_weight.device, dtype=torch.float32
+                )
+            )
+            return [(q_proj_weight, q_factor), (kv_proj_weight, kv_factor)]
+        return []
 
     def _clip_q_proj_weight(self, weight):
         """Clip q_proj_weight"""

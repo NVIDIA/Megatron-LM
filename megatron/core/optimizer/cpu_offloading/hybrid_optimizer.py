@@ -4,6 +4,8 @@ from typing import Dict
 
 import torch
 
+from megatron.core.optimizer.qk_clip import apply_qk_clip
+
 
 def _param_generator(cpu_optimizer):
     for group in cpu_optimizer.param_groups:
@@ -117,6 +119,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def _register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
+                apply_qk_clip(self, sub_optimizer=optimizer)
                 self._h2d_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
@@ -128,6 +131,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
         def fp32_param_copy_back_gpu_hook_closure():
             def fp32_param_copy_back_gpu_hook(optimizer, args, kwargs):
+                apply_qk_clip(self, sub_optimizer=optimizer)
                 for group in self.param_groups:
                     for param in group["params"]:
                         if param in self.gpu_params_map_cpu_copy:

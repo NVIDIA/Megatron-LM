@@ -83,7 +83,7 @@ from megatron.core.optimizer.layer_wise_optimizer import (
 )
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
-from megatron.core.optimizer.qk_clip import clip_qk
+from megatron.core.optimizer.qk_clip import clear_qk_clip, prepare_qk_clip
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
@@ -3829,13 +3829,12 @@ def train_step(
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-
-    # get max attention logit for logging and run clip_qk()
-    # Part of MuonClip Optimizer step
-    log_max_attention_logit = 0
+    log_max_attention_logit = 0.0
     if args.qk_clip or args.log_max_attention_logit:
-        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+        log_max_attention_logit = prepare_qk_clip(model, optimizer, log_max_only=not args.qk_clip)
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if args.qk_clip:
+        clear_qk_clip(optimizer)
 
     timers('optimizer').stop()
 
@@ -4046,6 +4045,17 @@ def training_log(
     )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
+    # All TP/PP ranks participate, including stages without attention layers.
+    # Reduce only the logging scalar; per-head clipping statistics stay unchanged.
+    if (
+        args.log_max_attention_logit
+        and args.tensorboard_dir
+        and iteration % args.tensorboard_log_interval == 0
+    ):
+        max_attention_logit = reduce_max_stat_across_model_parallel_group(
+            max_attention_logit, group=_lr_mp_group
+        )
+
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:

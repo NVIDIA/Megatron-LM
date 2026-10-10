@@ -1,9 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
+
 import torch
 
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.optimizer.qk_clip import clip_qk
+from megatron.core.optimizer.qk_clip import apply_qk_clip, clear_qk_clip, prepare_qk_clip
 from megatron.core.transformer.attention import Attention
 
 
@@ -19,9 +21,9 @@ class _FakeAttention(Attention):
         self.core_attention = _FakeCoreAttention(max_logits)
         self.clip_calls = 0
 
-    def clip_qk(self):
+    def get_qk_clip_factors(self):
         self.clip_calls += 1
-        self.core_attention.current_max_attn_logits = None
+        return []
 
     def get_query_key_value_tensors(self, *args, **kwargs):
         raise NotImplementedError
@@ -35,7 +37,7 @@ class _FakeQKLikeModule(torch.nn.Module):
         self.core_attention = _FakeCoreAttention([1000.0])
         self.clip_calls = 0
 
-    def clip_qk(self):
+    def get_qk_clip_factors(self):
         self.clip_calls += 1
 
 
@@ -48,18 +50,11 @@ class _FakeHybridModel(HybridModel):
         self.unrelated = _FakeQKLikeModule()
 
 
-class _ModelWrapper(torch.nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.module = torch.nn.Module()
-        self.module.module = model
-
-
 def test_clip_qk_reaches_nested_mtp(monkeypatch):
     decoder_attention = _FakeAttention([80.0, 120.0])
     mtp_attention = _FakeAttention([150.0, 90.0])
     model = _FakeHybridModel(decoder_attention, mtp_attention)
-    model_chunk = _ModelWrapper(model)
+    wrapped_model = SimpleNamespace(module=SimpleNamespace(module=model))
     all_reduce_calls = []
 
     monkeypatch.setattr(
@@ -72,7 +67,18 @@ def test_clip_qk_reaches_nested_mtp(monkeypatch):
         lambda **kwargs: None,
     )
 
-    assert clip_qk([model_chunk]) == 150.0
+    optimizer = SimpleNamespace(optimizer=SimpleNamespace(param_groups=[]))
+    assert prepare_qk_clip([wrapped_model], optimizer) == 150.0
+    assert decoder_attention.clip_calls == 0
+    assert mtp_attention.clip_calls == 0
+    apply_qk_clip(optimizer)
+    assert decoder_attention.core_attention.current_max_attn_logits is not None
+    assert mtp_attention.core_attention.current_max_attn_logits is not None
+    clear_qk_clip(optimizer)
+    assert decoder_attention.core_attention.current_max_attn_logits is None
+    assert mtp_attention.core_attention.current_max_attn_logits is None
+    assert optimizer._qk_clip_layers == []
+    assert optimizer._qk_clip_shards == {}
     assert decoder_attention.clip_calls == 1
     assert mtp_attention.clip_calls == 1
     assert model.unrelated.clip_calls == 0
@@ -83,7 +89,7 @@ def test_clip_qk_log_only_resets_nested_mtp(monkeypatch):
     decoder_attention = _FakeAttention([80.0])
     mtp_attention = _FakeAttention([150.0])
     model = _FakeHybridModel(decoder_attention, mtp_attention)
-    model_chunk = _ModelWrapper(model)
+    wrapped_model = SimpleNamespace(module=SimpleNamespace(module=model))
 
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -91,7 +97,7 @@ def test_clip_qk_log_only_resets_nested_mtp(monkeypatch):
         lambda **kwargs: None,
     )
 
-    assert clip_qk([model_chunk], log_max_only=True) == 150.0
+    assert prepare_qk_clip([wrapped_model], log_max_only=True) == 150.0
     assert decoder_attention.clip_calls == 0
     assert mtp_attention.clip_calls == 0
     assert decoder_attention.core_attention.current_max_attn_logits is None
