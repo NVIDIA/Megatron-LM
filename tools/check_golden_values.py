@@ -154,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with golden_value_file.open() as file:
                 golden_values = json.load(file)
-        except (OSError, json.JSONDecodeError) as error:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
             logger.error("Could not read %s: %s", golden_value_file, error)
             failed = True
             continue
