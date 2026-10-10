@@ -11,7 +11,7 @@ Model execution lives in `megatron.core.models.hybrid` (`shared_prefix.py`,
 Mamba kernels under `megatron.core.ssm`. Reusable packing lives in `megatron.rl`:
 row/star/forest planning, group sharding and slots, tensor materialization,
 TP/CP geometry, real-row alignment, and dense-bin reconstruction. See the
-[packing API and integration contract](../../megatron/rl/shared_prefix.md).
+[packing API and integration contract](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/rl/shared_prefix.md).
 Callers retain their configuration, batch transport, distributed coordination,
 and RL objective. NeMo RL uses adapters to this implementation.
 
@@ -51,13 +51,13 @@ The recurrent prefix is evaluated up to a scan-chunk boundary. Its SSM state is
 forked into independent completion branches. The remaining prompt tail is replayed
 with each branch, and convolution carries the required prompt halo. This preserves
 the kernel's chunk alignment and boundary context while eliminating most duplicated
-prompt work. Ragged branches track their own lengths and boundaries rather than
-turning the longest completion into useful work for every branch. Backward combines
-branch state, halo, and shared-prefix contributions.
+prompt work. Backward combines branch state, halo, and shared-prefix contributions.
 
 The implementation therefore does not promise that every prompt token executes
 exactly once in every Mamba sub-operation. The shared aligned prefix, residual-tail
-replay, and convolution halo are distinct parts of the contract.
+replay, and convolution halo are distinct parts of the contract. Every shared path
+passes channel-last input to `causal_conv1d`, as `MambaMixer` does, because its
+channel-first backward is wrong at some sequence lengths.
 
 `NRL_SP_MAMBA_IMPL` selects the Mamba backend. The default, `ragged_state_fork`,
 applies to every topology and root count, including TP1/CP1 single stars; it pads
@@ -115,9 +115,9 @@ branches from `input_ids`, requires `loss_mask`, and rejects `decoder_input` and
 also requires `calculate_per_token_loss=True`. With `compute_mtp_loss=False`,
 these MTP-only checks are skipped. Prompt-copy gradients are summed in a fixed
 FP32 order over the prompt rows only, so a shared rerun is as reproducible as a
-dense one, and the backward needs only an FP32 accumulator for the prompt rows
-beyond a plain `index_select` gather. MTP MoE layers run under the same fixed
-router row-block scope as the backbone.
+dense one. The backward peak memory of this gather is at or below that of a plain
+`index_select`. MTP MoE layers run under the same fixed router row-block scope as
+the backbone.
 
 When several independently normalized groups share one forward, `process_mtp_loss`
 takes their CP-local `loss_group_lengths` and normalizes each group as a packed
@@ -177,14 +177,33 @@ replaces:
 - `tests/unit_tests/models/hybrid/test_shared_prefix_guards.py` and
   `test_shared_prefix_layout.py`: the explicit guards and layout metadata, on CPU.
 
-The reference is an FP32 dense run of the same BF16-representable weights, with
-MoE top-k choices replayed from a fixed per-token table so that rounding cannot
-flip them. Shared BF16 execution must stay within 1.25x of the dense BF16 error
-against that reference (1.5x for a single Mamba layer). At TP/CP, where no FP32
-reference exists, the shared-versus-dense gap must stay within 1.5x of the same
-model's TP1/CP1 gap. Expert-bias counts must match exactly. The model tests use an
-init std of 0.1: at Megatron's default of 0.02 attention is nearly uniform, and
-wrong RoPE positions stay below BF16 rounding.
+In FP32, shared and dense execution differ only in summation order. The layer
+tests bound that difference at 1e-5 relative L2 for MoE and 5e-5 for Mamba. Their
+FP32 runs use local PyTorch linear layers with TF32 disabled. Transformer Engine
+runs FP32 GEMMs in TF32 whatever PyTorch's TF32 flags say, which leaves a relative
+error floor of about 1e-4 to 3e-4. An FP32 reference built from Transformer Engine
+modules needs `NVIDIA_TF32_OVERRIDE=0`, and FP32 Triton kernels need
+`TRITON_F32_DEFAULT=ieee`.
+
+BF16 shared and dense runs do not produce identical gradients. The two layouts
+add the same terms in different orders, so each rounds differently. In an MoE
+model a rounding difference can flip a top-k expert choice, and a flipped choice
+moves the gradient far more than the rounding itself. Two dense runs with
+different packings disagree for the same reason. Repeating one dense run with the
+same packing (an A/A comparison) measures only run-to-run nondeterminism, so it
+is the wrong null for a shared-versus-dense comparison. The right null is dense
+against dense with a different packing, or each run's distance from a
+high-precision reference with routing held fixed.
+
+The BF16 tests use that reference: an FP32 dense run of the same
+BF16-representable weights, with MoE top-k choices replayed from a fixed
+per-token table so that rounding cannot flip them. Shared BF16 execution must stay
+within 1.25x of the dense BF16 error against that reference (1.5x for a single
+Mamba layer). At TP/CP, where no FP32 reference exists, the shared-versus-dense
+gap must stay within 1.5x of the same model's TP1/CP1 gap. Expert-bias counts
+must match exactly. The model tests use an init std of 0.1: at Megatron's default
+of 0.02 attention is nearly uniform, and wrong RoPE positions stay below BF16
+rounding.
 
 The attention and Mamba kernels are registered in the
 [kernel manifest](../../tests/unit_tests/determinism/kernels/manifest.py) and
@@ -195,7 +214,9 @@ tests also compare outputs and gradients with an FP64 reference, within twice th
 error of ordinary FlashAttention over the dense branches, use real NCCL exchanges
 at CP1/2/4, and drive the shared-prefix branch of `SelfAttention.forward`. The
 CPU packing contracts are described with the
-[packing API](../../megatron/rl/shared_prefix.md#validation-scope).
+[packing API](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/rl/shared_prefix.md#validation-scope).
 
-These tests qualify layer- and model-level numerics and determinism. They do not
-qualify RL training quality, which the integrating framework must establish.
+These tests qualify layer- and model-level numerics and determinism on small
+models. They include no whole-model gradient comparison at a large training
+topology, such as TP2/CP4 with sequence parallelism and MTP. They do not qualify
+RL training quality, which the integrating framework must establish.

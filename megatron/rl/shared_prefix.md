@@ -150,10 +150,11 @@ normalization group per original dense bin. Prefix sharing in MTP itself is
 outside this API's current execution scope.
 
 NeMo RL supplies batch/configuration adapters and worker integration. Its
-historical shared-prefix imports are compatibility exports of this canonical
-implementation. Install the matching Megatron version in **both the driver
-and model-worker environments** when using shared-prefix planning; ordinary
-dense NeMo imports remain independent of the optional Megatron backend.
+shared-prefix code imports `megatron.rl` directly, and only on shared-prefix
+paths; it does not re-export these modules. Install the matching Megatron
+version in **both the driver and model-worker environments** when using
+shared-prefix planning; ordinary dense NeMo imports remain independent of the
+optional Megatron backend.
 
 ## Validation scope
 
@@ -166,7 +167,8 @@ Their pure CPU contracts can run without the repository's distributed CUDA
 fixtures:
 
 ```bash
-uv run python -m pytest --noconftest tests/unit_tests/rl/test_shared_prefix*.py tests/unit_tests/rl/test_tree_layout.py
+uv run python -m pytest --noconftest \
+    tests/unit_tests/rl/test_shared_prefix*.py tests/unit_tests/rl/test_tree_layout.py
 ```
 
 `test_shared_prefix_core_parity.py` additionally checks that the padding quantum

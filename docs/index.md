@@ -109,6 +109,7 @@ developer/submit
 developer/oncall
 developer/generate_docs
 developer/gdn_ew_fusion
+developer/shared_prefix
 ```
 
 ```{toctree}
