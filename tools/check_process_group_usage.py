@@ -196,6 +196,72 @@ def _violations_in(path: pathlib.Path):
             self.scope.pop()
             self.bindings.pop()
 
+        def _expression_bindings(self, names, position=None):
+            _, outer, events = next(
+                binding for binding in reversed(self.bindings) if binding[0] != "class"
+            )
+            visible = {
+                **outer,
+                **{
+                    name: (
+                        _binding_at(seen, position)
+                        if position
+                        else _binding_seen_by_nested_scopes(seen)
+                    )
+                    for name, seen in events.items()
+                },
+            }
+            self.bindings.append(("function", visible, {name: [((0, -1), "")] for name in names}))
+
+        def visit_Lambda(self, node):
+            for expression in (*node.args.defaults, *node.args.kw_defaults):
+                if expression:
+                    self.visit(expression)
+            args = node.args
+            names = [
+                arg.arg
+                for arg in (
+                    *args.posonlyargs,
+                    *args.args,
+                    *args.kwonlyargs,
+                    args.vararg,
+                    args.kwarg,
+                )
+                if arg
+            ]
+            self._expression_bindings(names)
+            self.visit(node.body)
+            self.bindings.pop()
+
+        def visit_ListComp(self, node):
+            self.visit(node.generators[0].iter)
+            names = [
+                target.id
+                for generator in node.generators
+                for target in ast.walk(generator.target)
+                if isinstance(target, ast.Name) and isinstance(target.ctx, ast.Store)
+            ]
+            # Only generator expressions defer their body until iteration.
+            position = (
+                None if isinstance(node, ast.GeneratorExp) else (node.lineno, node.col_offset)
+            )
+            self._expression_bindings(names, position)
+            for index, generator in enumerate(node.generators):
+                if index:
+                    self.visit(generator.iter)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            if isinstance(node, ast.DictComp):
+                self.visit(node.key)
+                self.visit(node.value)
+            else:
+                self.visit(node.elt)
+            self.bindings.pop()
+
+        visit_SetComp = visit_ListComp
+        visit_DictComp = visit_ListComp
+        visit_GeneratorExp = visit_ListComp
+
         def visit_Call(self, node):
             """Record calls resolved through an import, including import aliases."""
             name = _qualified_name(node.func)
