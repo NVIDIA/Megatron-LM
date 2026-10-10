@@ -2,13 +2,13 @@
 
 """MCore adapter and optimizer integration tests for experimental MFSDP v2."""
 
-import contextlib
 import logging
 import os
 from dataclasses import replace
 
 import pytest
 import torch
+import transformer_engine.pytorch as te
 from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
@@ -16,6 +16,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -33,6 +34,9 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
+    run_forward_backward_on_microbatches,
+)
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -263,6 +267,179 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
+    def test_rejects_shared_context_without_caller_managed_grad_sync(self, distributed_setup):
+        """The adapter rejects an incompatible shared context before sharding the model."""
+        config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
+        layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
+        with fully_shard_context(device=distributed_setup.device) as context:
+            with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
+                FullyShardedDataParallel(
+                    config=config,
+                    ddp_config=DistributedDataParallelConfig(
+                        use_megatron_fsdp=True,
+                        megatron_fsdp_version=2,
+                        use_distributed_optimizer=False,
+                        data_parallel_sharding_strategy="optim_grads_params",
+                    ),
+                    module=layer,
+                    pg_collection=self.pg_collection,
+                )
+            assert not context.caller_managed_grad_sync
+            assert not isinstance(layer, FsdpModule)
+
+    def test_finish_grad_sync_waits_for_delayed_wgrad(self, distributed_setup):
+        """Delayed-wgrad reductions must rejoin the compute stream before capture ends."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        layer = te.Linear(
+            16,
+            16,
+            bias=False,
+            params_dtype=config.params_dtype,
+            device=distributed_setup.device,
+            delay_wgrad_compute=True,
+            fuse_wgrad_accumulation=False,
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=layer,
+            pg_collection=self.pg_collection,
+        )
+
+        x = torch.randn(
+            4, 16, device=distributed_setup.device, dtype=config.params_dtype, requires_grad=True
+        )
+
+        def forward():
+            output = model(x)
+            return torch.nn.functional.mse_loss(
+                output.float(), torch.zeros_like(output, dtype=torch.float32)
+            )
+
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        # Warm up on the capture stream so autograd's gradient accumulators do not
+        # create cross-stream memory growth. See test_cuda_graph.py.
+        with torch.cuda.stream(capture_stream):
+            for _ in range(3):
+                # Retain the grad views so reduction includes the accumulation kernel.
+                model.zero_grad(set_to_none=False)
+                run_forward_backward_on_microbatches(
+                    model, forward, delayed_wgrad_compute=model.module.backward_dw
+                )
+
+        # Ending capture rejects an unjoined reduction stream if finish_grad_sync
+        # fails to wait for the reductions launched by backward_dw.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            model.zero_grad(set_to_none=False)
+            run_forward_backward_on_microbatches(
+                model, forward, delayed_wgrad_compute=model.module.backward_dw
+            )
+        torch.cuda.current_stream().wait_stream(capture_stream)
+
+        for _ in range(5):
+            graph.replay()
+
+    def test_delayed_wgrad_matches_immediate(self, distributed_setup):
+        """Delaying weight gradients preserves training losses with microbatch accumulation."""
+        num_microbatches = 3
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+
+        def build_layer(delay_wgrad_compute):
+            return te.Linear(
+                16,
+                16,
+                bias=False,
+                params_dtype=config.params_dtype,
+                device=distributed_setup.device,
+                delay_wgrad_compute=delay_wgrad_compute,
+                fuse_wgrad_accumulation=False,
+            )
+
+        immediate_layer = build_layer(delay_wgrad_compute=False)
+        delayed_layer = build_layer(delay_wgrad_compute=True)
+        delayed_layer.load_state_dict(immediate_layer.state_dict())
+        # Both runs see the same inputs, with distinct data on each rank and microbatch.
+        batches = [
+            [
+                torch.randn(4, 16, device=distributed_setup.device, dtype=config.params_dtype)
+                + distributed_setup.rank
+                for _ in range(num_microbatches)
+            ]
+            for _ in range(5)
+        ]
+
+        def train(layer, delayed_wgrad_compute=None):
+            model = FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    megatron_fsdp_version=2,
+                    use_distributed_optimizer=False,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                ),
+                module=layer,
+                pg_collection=self.pg_collection,
+            )
+            optimizer = get_megatron_optimizer(
+                OptimizerConfig(
+                    optimizer="adam",
+                    lr=1.0e-3,
+                    weight_decay=0.0,
+                    bf16=True,
+                    params_dtype=config.params_dtype,
+                    use_distributed_optimizer=False,
+                    use_precision_aware_optimizer=True,
+                    clip_grad=0.0,
+                ),
+                [model],
+            )
+            optimizer.reload_model_params()
+            losses = []
+            for microbatches in batches:
+                microbatch_iterator = iter(microbatches)
+
+                def forward():
+                    output = model(next(microbatch_iterator).detach().requires_grad_())
+                    return torch.nn.functional.mse_loss(
+                        output.float(), torch.zeros_like(output, dtype=torch.float32)
+                    )
+
+                optimizer.zero_grad()
+                microbatch_losses = run_forward_backward_on_microbatches(
+                    model,
+                    forward,
+                    num_microbatches=num_microbatches,
+                    loss_scale=1 / num_microbatches,
+                    delayed_wgrad_compute=delayed_wgrad_compute,
+                )
+                success, _, _ = optimizer.step()
+                assert success
+                losses.append(torch.stack(microbatch_losses).mean())
+            return torch.stack(losses)
+
+        immediate_losses = train(immediate_layer)
+        delayed_losses = train(delayed_layer, delayed_layer.backward_dw)
+        torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
+
     def test_build_train_and_step(self):
         """Match eager training against an MFSDP v2 train-and-step sequence."""
         config = TransformerConfig(
@@ -330,13 +507,21 @@ class TestMcoreAdapterDense:
         def run(model, optimizer) -> torch.Tensor:
             losses = []
             for microbatches in steps:
+                batches = iter(microbatches)
+
+                def forward():
+                    output = model(hidden_states=next(batches), attention_mask=None)
+                    return torch.nn.functional.mse_loss(
+                        output.float(), torch.zeros_like(output, dtype=torch.float32)
+                    )
+
                 optimizer.zero_grad(set_to_none=True)
-                microbatch_losses = []
-                for batch in microbatches:
-                    output = model(hidden_states=batch, attention_mask=None)
-                    loss = output.float().square().mean()
-                    (loss / len(microbatches)).backward()
-                    microbatch_losses.append(loss.detach())
+                microbatch_losses = run_forward_backward_on_microbatches(
+                    model,
+                    forward,
+                    num_microbatches=len(microbatches),
+                    loss_scale=1 / len(microbatches),
+                )
                 success, _, _ = optimizer.step()
                 assert success
                 losses.append(torch.stack(microbatch_losses).mean())
@@ -386,14 +571,16 @@ class TestMcoreAdapterDense:
         )
         optimizer = get_megatron_optimizer(optimizer_config, [model])
 
+        hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+        def forward():
+            output = model(hidden_states=hidden, attention_mask=None)
+            return torch.nn.functional.mse_loss(
+                output.float(), torch.zeros_like(output, dtype=torch.float32)
+            )
+
         optimizer.zero_grad(set_to_none=True)
-        output = model(
-            hidden_states=torch.randn(
-                8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
-            ),
-            attention_mask=None,
-        )
-        output.float().square().mean().backward()
+        run_forward_backward_on_microbatches(model, forward)
 
         success, _, _ = optimizer.step()
         assert success
@@ -452,16 +639,17 @@ class TestMcoreAdapterDense:
             return squared_norm.sqrt().item()
 
         optimizer.zero_grad(set_to_none=True)
-        output = model(
-            hidden_states=(
-                torch.arange(1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16)
-                .view(1, 1, -1)
-                .expand(8, 2, -1)
-                * (torch.distributed.get_rank() + 1)
-            ),
-            attention_mask=None,
-        )
-        output.float().square().sum().backward()
+        hidden = torch.arange(1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16).view(
+            1, 1, -1
+        ).expand(8, 2, -1) * (torch.distributed.get_rank() + 1)
+
+        def forward():
+            output = model(hidden_states=hidden, attention_mask=None)
+            return torch.nn.functional.mse_loss(
+                output.float(), torch.zeros_like(output, dtype=torch.float32), reduction="sum"
+            )
+
+        run_forward_backward_on_microbatches(model, forward)
 
         parameters = [
             parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
@@ -563,18 +751,25 @@ class TestMcoreAdapterCudaGraph:
             return model, optimizer
 
         # FullCudaGraphWrapper requires this keyword-only schedule callback signature.
-        def forward_backward(*, model, data_iterator, num_microbatches, seq_length, forward_only):
+        def schedule(*, model, data_iterator, num_microbatches, seq_length, forward_only):
             assert seq_length is None
             assert not forward_only
-            microbatch_losses = []
-            for _ in range(num_microbatches):
-                batch = next(data_iterator[0])
-                # Pipeline schedules receive model chunks as a list, including with PP=1.
-                output = model[0](hidden_states=batch["hidden_states"], attention_mask=None)
-                loss = output.float().square().mean()
-                (loss / num_microbatches).backward()
-                microbatch_losses.append({"loss": loss.detach()})
-            return microbatch_losses
+
+            def forward():
+                hidden = next(data_iterator[0])["hidden_states"]
+                output = model[0](hidden_states=hidden, attention_mask=None)
+                return torch.nn.functional.mse_loss(
+                    output.float(), torch.zeros_like(output, dtype=torch.float32)
+                )
+
+            # Pipeline schedules receive model chunks as a list, including with PP=1.
+            losses = run_forward_backward_on_microbatches(
+                model[0],
+                forward,
+                num_microbatches=num_microbatches,
+                loss_scale=1 / num_microbatches,
+            )
+            return [{"loss": loss} for loss in losses]
 
         steps = [
             [
@@ -584,11 +779,11 @@ class TestMcoreAdapterCudaGraph:
             for _ in range(10)
         ]
 
-        def run(model, optimizer, forward_backward) -> torch.Tensor:
+        def run(model, optimizer, schedule) -> torch.Tensor:
             losses = []
             for microbatches in steps:
                 optimizer.zero_grad(set_to_none=True)
-                microbatch_losses = forward_backward(
+                microbatch_losses = schedule(
                     model=[model],
                     data_iterator=[iter([{"hidden_states": batch} for batch in microbatches])],
                     num_microbatches=len(microbatches),
@@ -609,10 +804,8 @@ class TestMcoreAdapterCudaGraph:
         )
         graph_model.load_state_dict(eager_model.state_dict())
 
-        eager_losses = run(eager_model, eager_optimizer, forward_backward)
-        cuda_graph_forward_backward = FullCudaGraphWrapper(
-            forward_backward, cuda_graph_warmup_steps=1
-        )
+        eager_losses = run(eager_model, eager_optimizer, schedule)
+        cuda_graph_forward_backward = FullCudaGraphWrapper(schedule, cuda_graph_warmup_steps=1)
         with torch.profiler.profile() as prof:
             graph_losses = run(graph_model, graph_optimizer, cuda_graph_forward_backward)
 
@@ -760,38 +953,40 @@ class TestMcoreAdapterExpertParallel:
             torch.distributed.get_rank() * local_batch_size,
             (torch.distributed.get_rank() + 1) * local_batch_size,
         )
+
+        def reference_forward():
+            output = reference_model(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=None
+            )
+            return torch.nn.functional.mse_loss(output, targets)
+
         reference_losses = []
         for _ in range(5):
             reference_optimizer.zero_grad(set_to_none=True)
-            reference_loss = torch.nn.functional.mse_loss(
-                reference_model(
-                    input_ids=input_ids, position_ids=position_ids, attention_mask=None
-                ),
-                targets,
+            (reference_loss,) = run_forward_backward_on_microbatches(
+                reference_model, reference_forward
             )
-            reference_loss.backward()
             reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
             assert reference_success
             assert (
                 reference_pre_clip_norm > optimizer_config.clip_grad
             ), "Reference gradients must exceed the clipping threshold to exercise clipping."
-            reference_losses.append(reference_loss.detach())
+            reference_losses.append(reference_loss)
+
+        def forward():
+            output = model(
+                input_ids=input_ids[input_slice],
+                position_ids=position_ids[input_slice],
+                attention_mask=None,
+            )
+            return torch.nn.functional.mse_loss(output, targets[input_slice])
 
         losses = []
         for _ in range(5):
             optimizer.zero_grad(set_to_none=True)
-            loss = torch.nn.functional.mse_loss(
-                model(
-                    input_ids=input_ids[input_slice],
-                    position_ids=position_ids[input_slice],
-                    attention_mask=None,
-                ),
-                targets[input_slice],
-            )
-            loss.backward()
+            (loss,) = run_forward_backward_on_microbatches(model, forward)
             success, _, _ = optimizer.step()
             assert success
-            loss = loss.detach()
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
             losses.append(loss)
 
@@ -863,27 +1058,32 @@ class TestMcoreAdapterHybrid:
             ),
             [model],
         )
+
         losses = []
         for step in range(steps):
             optimizer.zero_grad(set_to_none=True)
-            step_losses = []
+            batches = []
             for index in range(microbatches):
-                # Only the last microbatch finalizes gradients, so it runs outside no_sync.
-                sync_context = (
-                    contextlib.nullcontext() if index == microbatches - 1 else model.no_sync()
+                # Rank-dependent but step-deterministic input, so every configuration
+                # sees the same global batch however the domain is split. Microbatches
+                # differ so that dropping any of them changes the result.
+                hidden = torch.arange(
+                    1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
+                ).view(1, 1, -1).expand(8, 2, -1) * (
+                    torch.distributed.get_rank() + 1 + step + index
                 )
-                with sync_context:
-                    # Rank-dependent but step-deterministic input, so every configuration
-                    # sees the same global batch however the domain is split. Microbatches
-                    # differ so that dropping any of them changes the result.
-                    hidden = torch.arange(
-                        1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
-                    ).view(1, 1, -1).expand(8, 2, -1) * (
-                        torch.distributed.get_rank() + 1 + step + index
-                    )
-                    loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
-                    loss.backward()
-                step_losses.append(loss.detach())
+                batches.append(hidden)
+            batch_iterator = iter(batches)
+
+            def forward():
+                output = model(hidden_states=next(batch_iterator), attention_mask=None)
+                return torch.nn.functional.mse_loss(
+                    output.float(), torch.zeros_like(output, dtype=torch.float32)
+                )
+
+            step_losses = run_forward_backward_on_microbatches(
+                model, forward, num_microbatches=microbatches
+            )
             success, _, _ = optimizer.step()
             assert success
             # No update happens until optimizer.step(), so every microbatch in a step sees
@@ -911,13 +1111,16 @@ class TestMcoreAdapterHybrid:
             module=_build_block(config),
             pg_collection=pg_collection,
         )
-        output = model(
-            hidden_states=torch.randn(
-                8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
-            ),
-            attention_mask=None,
-        )
-        output.float().square().sum().backward()
+
+        hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+        def forward():
+            output = model(hidden_states=hidden, attention_mask=None)
+            return torch.nn.functional.mse_loss(
+                output.float(), torch.zeros_like(output, dtype=torch.float32), reduction="sum"
+            )
+
+        run_forward_backward_on_microbatches(model, forward)
 
         expected_outer = Replicate() if outer_strategy == "no_shard" else Shard(0)
         graded = [p for p in model.parameters() if p.grad is not None]
@@ -1031,8 +1234,14 @@ class TestMcoreAdapterHybrid:
         optimizer.zero_grad(set_to_none=True)
         input_ids = torch.randint(0, 128, (2, 8), device="cuda")
         position_ids = torch.arange(8, device="cuda").repeat(2, 1)
-        output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
-        output.float().square().mean().backward()
+
+        def forward():
+            output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+            return torch.nn.functional.mse_loss(
+                output.float(), torch.zeros_like(output, dtype=torch.float32)
+            )
+
+        run_forward_backward_on_microbatches(model, forward)
         success, _, _ = optimizer.step()
         assert success
 

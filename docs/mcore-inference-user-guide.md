@@ -1,4 +1,4 @@
-# Megatron Core Inference User Guide
+# Inference User Guide
 
 A practical guide to running inference with Megatron Core (MCore) using the
 dynamic inference path. This is the recommended and actively developed
