@@ -264,6 +264,17 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_qkv_per_head: bool = False
+    """Whether to apply semantic per-head Muon and AdamW gate routing. Requires
+    ``muon_split_qkv``. Heads of the same size share a batch dimension for Newton-Schulz
+    with Emerging-Optimizers >=0.3.0; older versions and SYRK use individual head calls.
+    Semantic projection layouts keep GDN Q/K/V heads independent and route its
+    z/beta/alpha (GDN2: z/f/b/w) slices and attention output gates to AdamW.
+    SwiGLU gate/up and MLA latent/RoPE projections are separate Muon matrices.
+    Fused AdamW slices use adam_beta1/adam_beta2/adam_eps, group LR and decoupled decay.
+    Old per-head optimizer checkpoints require an explicit optimizer reset.
+    Standard attention uses projection-wise QKV splitting when this flag is false."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
@@ -461,6 +472,12 @@ class OptimizerConfig:
             assert not math.isfinite(
                 self.grad_norm_skip_threshold
             ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
+
+        if self.muon_split_qkv_per_head:
+            if not self.muon_split_qkv:
+                raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True")
+            if self.muon_tp_mode == "layer_sharded":
+                raise ValueError("Per-head Muon does not support muon_tp_mode='layer_sharded'")
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.

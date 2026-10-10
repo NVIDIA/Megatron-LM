@@ -47,13 +47,14 @@ HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
 
+from megatron.core.muon_layout import MuonProjectionLayout
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
     ParamGroupOverride,
     combine_param_group_overrides,
     param_group_override_to_tuple,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
@@ -66,6 +67,7 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
+    _localize_qkv_split_shapes,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
@@ -791,6 +793,8 @@ def _get_megatron_emerging_optimizer(
         raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
+    if config.muon_split_qkv_per_head and not config.muon_split_qkv:
+        raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True")
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -799,12 +803,99 @@ def _get_megatron_emerging_optimizer(
 
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
     for model_chunk in model_chunks:
+        if config.muon_split_qkv_per_head and getattr(model_chunk.config, "use_kitchen", False):
+            raise ValueError(
+                "Per-head Muon does not support Kitchen projection layouts. "
+                "Disable Kitchen or muon_split_qkv_per_head."
+            )
         qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
+            if config.muon_split_qkv_per_head:
+                if (
+                    'linear_qkv.weight' in name
+                    and len(param.shape) == 2
+                    and getattr(param, "muon_layout", None) is None
+                ):
+                    # Compatibility for custom attention modules without owned metadata.
+                    param.muon_layout = MuonProjectionLayout.attention(model_chunk.config)
+                qkv_layout = getattr(param, 'qkv_layout', None)
+                if (qkv_layout is not None or 'linear_qkv.weight' in name) and len(
+                    param.shape
+                ) == 2:
+                    # Layer-owned layouts handle heterogeneous attention and MLA.
+                    layout_config = qkv_layout if qkv_layout is not None else model_chunk.config
+                    logical_split_shapes = _get_qkv_split_shapes(
+                        layout_config, split_qkv_per_head=True
+                    )
+
+                    tp_group = (
+                        pg_collection.expt_tp
+                        if getattr(param, 'expert_tp', False)
+                        else pg_collection.tp
+                    )
+                    tp_size = get_pg_size(tp_group)
+                    tp_rank = get_pg_rank(tp_group)
+                    gtp_remat_group = (
+                        resolve_gtp_remat_group(pg_collection, getattr(param, "expert_tp", False))
+                        if getattr(param, 'is_gtp_weight_remat', False)
+                        else None
+                    )
+                    gtp_size = get_pg_size(gtp_remat_group)
+                    gtp_rank = get_pg_rank(gtp_remat_group)
+
+                    qkv_gtp_pad_length = (
+                        int(getattr(param, 'pad_length', 0))
+                        if getattr(param, 'is_gtp_weight_remat', False)
+                        else 0
+                    )
+                    physical_tp_local_rows = param.shape[0] * gtp_size
+                    if not 0 <= qkv_gtp_pad_length < physical_tp_local_rows:
+                        raise RuntimeError(
+                            f"Invalid Muon QKV GTP padding for {name}: "
+                            f"pad_length={qkv_gtp_pad_length}, "
+                            f"physical_tp_local_rows={physical_tp_local_rows}"
+                        )
+                    logical_tp_local_rows = physical_tp_local_rows - qkv_gtp_pad_length
+                    expected_logical_rows = logical_tp_local_rows * tp_size
+                    if expected_logical_rows != sum(logical_split_shapes):
+                        log_single_rank(
+                            logger,
+                            logging.DEBUG,
+                            f"Emerging optimizer QKV split skipped for {name}: "
+                            f"logical_rows={sum(logical_split_shapes)}, "
+                            f"local_rows={param.shape[0]}, tp_size={tp_size}, "
+                            f"gtp_remat_size={gtp_size}, "
+                            f"gtp_pad_length={qkv_gtp_pad_length}",
+                        )
+                        param.is_qkv = False
+                        param.qkv_split_shapes = None
+                        param.qkv_split_shapes_global = None
+                        param.qkv_gtp_pad_length = 0
+                        param.qkv_split_groups_are_complete = False
+                        param.qkv_split_heads_are_complete = False
+                        continue
+
+                    param.is_qkv = True
+                    param.qkv_split_shapes_global = logical_split_shapes
+                    param.qkv_gtp_pad_length = qkv_gtp_pad_length
+                    local_start = tp_rank * logical_tp_local_rows + gtp_rank * param.shape[0]
+                    if qkv_gtp_pad_length > 0:
+                        # Padding is not part of a logical matrix; reconstruct before NS.
+                        param.qkv_split_shapes = None
+                        param.qkv_split_heads_are_complete = False
+                    else:
+                        param.qkv_split_shapes, param.qkv_split_heads_are_complete = (
+                            _localize_qkv_split_shapes(
+                                logical_split_shapes,
+                                local_start=local_start,
+                                local_rows=param.shape[0],
+                            )
+                        )
+                continue
             # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 if qkv_split_shapes is None:

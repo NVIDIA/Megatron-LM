@@ -151,7 +151,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            K + "test_per_head_muon.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
@@ -260,6 +264,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/tensor_parallel/layers.py",),
         tests=(
             K + "test_tensor_parallel_kernels.py",
+            K + "test_per_head_muon.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
         ),
         kind="torch-op",
@@ -447,7 +452,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
         ),
-        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
+        tests=(
+            K + "test_ssm_kernels.py",
+            K + "test_gated_norm.py",
+            C + "test_hybrid_model.py",
+            K + "test_per_head_muon.py",
+        ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
     ),
@@ -484,6 +494,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_optimizer_kernels.py",
+            K + "test_per_head_muon.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
         ),
         kind="external-lib",
@@ -651,7 +662,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/multi_latent_attention.py",
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            K + "test_te_wrappers.py",
+            K + "test_per_head_muon.py",
+        ),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py) and TE fused RoPE (test_te_wrappers.py). The TE "
@@ -731,6 +746,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         exempt_reason="TE make_graphed_callables captures and replays kernels that are registered on "
         "their own; the capture order is fixed by the callable list and adds no numerics.",
+    ),
+    KernelEntry(
+        name="per_head_muon_dispatch",
+        sources=("megatron/core/optimizer/emerging_optimizers.py",),
+        tests=(K + "test_per_head_muon.py",),
+        kind="dispatch",
+        notes="Replays batched per-head Emerging-Optimizers NS and mixed AdamW updates, "
+        "including optimizer moments. Attention/GDN/MLA source changes only attach metadata; "
+        "their routing is replayed here while existing tests retain forward-kernel coverage.",
     ),
     KernelEntry(
         name="muon_newton_schulz_dispatch",
