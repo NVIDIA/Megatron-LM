@@ -26,7 +26,18 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
+from .range import Range
+
 Shape: TypeAlias = torch.Size | Iterable[int]
+
+
+@dataclasses.dataclass(frozen=True)
+class TensorRange:
+    """Contiguous global element range occupied by one logical tensor."""
+
+    start: int
+    end: int
+    tensor_id: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -40,7 +51,7 @@ class GlobalLayout:
         rank_to_offset: Global element offset of each rank segment's first element
             (``dp_size`` entries). Segment ``k`` spans ``rank_to_offset[k]`` up to the
             next entry, or ``size`` for the last segment; see ``rank_size``. On a 1-D
-            mesh ``k`` is the rank; on a multi-axis mesh ``get_local_range`` maps the ranks
+            mesh ``k`` is the rank; on a multi-axis mesh ``get_rank_range`` maps the ranks
             of the Shard axes to ``k``. Segment sizes are equal (``size // dp_size``) for
             ``RowAtomic`` / ``BlockAtomic``; generally uneven for ``TensorAtomic``.
     """
@@ -49,6 +60,22 @@ class GlobalLayout:
     tensor_to_offset: tuple[int, ...]
     size: int
     rank_to_offset: tuple[int, ...]
+
+    def __init__(
+        self,
+        tensor_shapes: Iterable[Shape],
+        tensor_to_offset: Iterable[int],
+        size: int,
+        rank_to_offset: Iterable[int],
+    ) -> None:
+        """Normalize iterable inputs to immutable tuples and validate the layout."""
+        object.__setattr__(
+            self, "tensor_shapes", tuple(torch.Size(shape) for shape in tensor_shapes)
+        )
+        object.__setattr__(self, "tensor_to_offset", tuple(tensor_to_offset))
+        object.__setattr__(self, "size", size)
+        object.__setattr__(self, "rank_to_offset", tuple(rank_to_offset))
+        self.__post_init__()
 
     @classmethod
     def build_for_row_atomic(
@@ -192,9 +219,9 @@ class GlobalLayout:
         segment = size // dp_size
         layout = cls(
             tensor_shapes=tensor_shapes,
-            tensor_to_offset=tuple(tensor_to_offset),
+            tensor_to_offset=tensor_to_offset,
             size=size,
-            rank_to_offset=tuple(segment * rank for rank in range(dp_size)),
+            rank_to_offset=(segment * rank for rank in range(dp_size)),
         )
         layout.validate_for_row_atomic(block_size=block_size)
         return layout
@@ -262,7 +289,7 @@ class GlobalLayout:
 
         layout = cls(
             tensor_shapes=tensor_shapes,
-            tensor_to_offset=tuple(tensor_to_offset),
+            tensor_to_offset=tensor_to_offset,
             size=sum(numels),
             rank_to_offset=rank_to_offset,
         )
@@ -271,14 +298,6 @@ class GlobalLayout:
 
     def __post_init__(self) -> None:
         """Validate offsets are in bounds and tensor ranges do not overlap."""
-
-        @dataclasses.dataclass(frozen=True)
-        class TensorRange:
-            """Contiguous global element range occupied by one logical tensor."""
-
-            start: int
-            end: int
-            tensor_id: int
 
         if self.size < 0:
             raise AssertionError(f"Global layout size {self.size} is negative.")
@@ -295,32 +314,30 @@ class GlobalLayout:
         if any(a > b for a, b in zip(offsets, offsets[1:])):
             raise AssertionError(f"rank_to_offset must be non-decreasing, got {offsets}.")
 
-        tensor_ranges: list[TensorRange] = []
-        for tensor_id, (shape, start) in enumerate(
-            zip(self.tensor_shapes, self.tensor_to_offset, strict=True)
-        ):
-            if start < 0:
-                raise AssertionError(f"Tensor {tensor_id} offset {start} is negative.")
-
-            end = start + shape.numel()
-            if end > self.size:
+        tensor_ranges = [
+            self.get_tensor_range(tensor_id) for tensor_id in range(len(self.tensor_shapes))
+        ]
+        for tensor_id, tensor_range in enumerate(tensor_ranges):
+            if tensor_range.start < 0:
+                raise AssertionError(f"Tensor {tensor_id} offset {tensor_range.start} is negative.")
+            if tensor_range.end > self.size:
                 raise AssertionError(
-                    f"Tensor {tensor_id} range [{start}, {end}) exceeds "
+                    f"Tensor {tensor_id} range [{tensor_range.start}, {tensor_range.end}) exceeds "
                     f"layout size {self.size}."
                 )
-            tensor_ranges.append(TensorRange(start, end, tensor_id))
 
-        previous_range: TensorRange | None = None
-        for current_range in sorted(tensor_ranges, key=lambda tensor_range: tensor_range.start):
-            if previous_range is not None and current_range.start < previous_range.end:
+        ordered_ranges = sorted(enumerate(tensor_ranges), key=lambda item: item[1].start)
+        for (previous_id, previous_range), (current_id, current_range) in itertools.pairwise(
+            ordered_ranges
+        ):
+            if current_range.start < previous_range.end:
                 raise AssertionError(
                     "Global layout tensors overlap: "
-                    f"tensor {previous_range.tensor_id} "
+                    f"tensor {previous_id} "
                     f"[{previous_range.start}, {previous_range.end}) and "
-                    f"tensor {current_range.tensor_id} "
+                    f"tensor {current_id} "
                     f"[{current_range.start}, {current_range.end})."
                 )
-            previous_range = current_range
 
     def validate_for_row_atomic(self, *, block_size: int = 1) -> None:
         """Check equal-size shards and row/block alignment from the actual offsets."""
@@ -382,8 +399,18 @@ class GlobalLayout:
         """Whether every rank's segment has the same numel."""
         return len({self.rank_size(rank) for rank in range(self.dp_size)}) == 1
 
-    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> tuple[int, int]:
-        """Return this rank's local element ``(offset, numel)`` for ``placements``."""
+    def get_rank_range(self, mesh: DeviceMesh, placements: Iterable[Placement], rank: int) -> Range:
+        """Return the global buffer element range for a global process rank.
+
+        Args:
+            mesh: The device mesh defining the distribution.
+            placements: Per-mesh-axis placements.
+            rank: Global process rank belonging to ``mesh``.
+        """
+        coordinates = (mesh.mesh == rank).nonzero(as_tuple=False)
+        if coordinates.size(0) == 0:
+            raise ValueError(f"Global rank {rank} is not in the device mesh.")
+        coordinate = coordinates[0].tolist()
         placements = tuple(placements)
         # Innermost Shard axis is the most significant digit of the shard index.
         shard_index = 0
@@ -393,7 +420,7 @@ class GlobalLayout:
             if not isinstance(placements[axis], Shard):
                 continue
             shard_axes.append(axis)
-            shard_index = shard_index * mesh.size(axis) + mesh.get_local_rank(axis)
+            shard_index = shard_index * mesh.size(axis) + coordinate[axis]
             num_shards *= mesh.size(axis)
         if self.dp_size % num_shards != 0:
             raise ValueError(
@@ -404,7 +431,15 @@ class GlobalLayout:
         first = shard_index * segments_per_rank
         last = first + segments_per_rank - 1
         start = self.rank_to_offset[first]
-        return start, self.rank_to_offset[last] + self.rank_size(last) - start
+        return Range(start, self.rank_to_offset[last] + self.rank_size(last) - start)
+
+    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> Range:
+        """Return this rank's element range in the global buffer for ``placements``."""
+        return self.get_rank_range(mesh, placements, mesh.get_rank())
+
+    def get_tensor_range(self, tensor_index: int) -> Range:
+        """Return the full tensor's element range in the global buffer."""
+        return Range(self.tensor_to_offset[tensor_index], self.tensor_shapes[tensor_index].numel())
 
 
 def non_leading_numel(shape: torch.Size) -> int:

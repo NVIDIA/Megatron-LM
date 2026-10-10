@@ -9,7 +9,7 @@ import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
-from megatron.training.global_vars import set_args
+from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
@@ -60,7 +60,6 @@ def create_test_args():
     args.start_eval_at_iter = None
     args.full_validation = False
     args.multiple_validation_sets = False
-    args.perform_rl_step = False
     args.phase_transition_iterations = None
 
     return args
@@ -126,8 +125,9 @@ class TestTraining:
         Utils.initialize_model_parallel(1, 1)
         args = create_test_args()
         set_args(args)
+        _set_train_state()
 
-    def test_build_train_valid_test_data_iterators(self):
+    def test_build_train_valid_test_data_iterators(self, run_config):
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
             mock_train_valid_test_datasets_provider
         )
@@ -136,10 +136,11 @@ class TestTraining:
         test_data = next(test_iter)
         assert (train_data, valid_data, test_data) == (1, 2, 3)
 
-    def test_params_norm_is_computed_only_when_it_can_be_logged(self):
+    def test_params_norm_is_computed_only_when_it_can_be_logged(self, run_config):
         args = SimpleNamespace(
             log_params_norm=True, log_interval=20, tensorboard_dir=None, tensorboard_log_interval=1
         )
+        run_config.logger = args
 
         assert _should_compute_params_norm(args, iteration=1, is_first_iteration=True)
         assert _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
@@ -152,7 +153,7 @@ class TestTraining:
         args.log_params_norm = False
         assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
 
-    def test_build_train_valid_test_data_iterators_multi_full_validation(self):
+    def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
         """multiple_validation_sets + full_validation builds a list of iterators
         (one per validation set) and sets args.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""
@@ -198,6 +199,7 @@ class TestTraining:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        destroy_global_vars()
 
 
 class TestGetModelBucketSizingPgCollection:

@@ -383,7 +383,9 @@ def test_save_and_load_checkpoint_vpp(
             )
             new_model = new_model if isinstance(new_model, list) else [new_model]
 
-            load_checkpoint(new_model, optimizer, opt_param_scheduler, strict=False)
+            load_checkpoint(
+                new_model, optimizer, opt_param_scheduler, strict=False, restore_training_state=True
+            )
             set_ckpt_path(ckpt_dir_B)
             save_checkpoint(
                 iteration,
@@ -407,7 +409,9 @@ def test_save_and_load_checkpoint_vpp(
                 pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
                 is_moe=is_moe,
             )
-            load_checkpoint([model_A], optimizer, opt_param_scheduler, strict=False)
+            load_checkpoint(
+                [model_A], optimizer, opt_param_scheduler, strict=False, restore_training_state=True
+            )
 
             set_ckpt_path(ckpt_dir_B)
             model_B = initialize_gpt_model(
@@ -422,7 +426,9 @@ def test_save_and_load_checkpoint_vpp(
                 pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
                 is_moe=is_moe,
             )
-            load_checkpoint([model_B], optimizer, opt_param_scheduler, strict=False)
+            load_checkpoint(
+                [model_B], optimizer, opt_param_scheduler, strict=False, restore_training_state=True
+            )
 
             for k in model_A.state_dict():
                 if "_extra_state" in k:  # Ignore extra states

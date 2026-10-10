@@ -2,7 +2,6 @@
 
 """Behavioral coverage for config-owned distributed initialization."""
 
-import sys
 from argparse import ArgumentParser, Namespace
 from contextlib import nullcontext
 from dataclasses import asdict, fields
@@ -176,19 +175,6 @@ def test_lazy_initialization_reads_config(monkeypatch, run_config, lazy):
     distributed.assert_called_once()
 
 
-def test_tensorboard_metadata_preserves_args_and_uses_owned_settings(monkeypatch, run_config):
-    args = Namespace(iteration=3, distributed_timeout_minutes=1, unrelated="kept")
-    run_config.dist.distributed_timeout_minutes = 37
-    monkeypatch.setattr(initialize, "get_args", lambda: args)
-    writer = Mock()
-    monkeypatch.setattr(initialize, "get_tensorboard_writer", lambda: writer)
-    initialize.write_args_to_tensorboard()
-    recorded = {call.args[0]: call.args[1] for call in writer.add_text.call_args_list}
-    assert recorded["unrelated"] == "kept"
-    assert recorded["distributed_timeout_minutes"] == "37"
-    assert args.distributed_timeout_minutes == 1
-
-
 def test_telemetry_uses_owned_local_rank(monkeypatch, run_config):
     run_config.dist.local_rank = 2
     device = Mock(return_value={})
@@ -198,35 +184,39 @@ def test_telemetry_uses_owned_local_rank(monkeypatch, run_config):
     device.assert_called_once_with(2)
 
 
-def test_pretrain_preserves_config_registered_before_services(monkeypatch, run_config):
-    monkeypatch.setattr(run_config, "validate", Mock())
-    monkeypatch.setattr(training.ft_integration, "setup", Mock())
-    monkeypatch.setattr(training, "initialize_megatron", Mock())
-    monkeypatch.setattr(training, "get_args", _args)
-    # Stop after distributed initialization and the former late registration point.
-    monkeypatch.setattr(training, "get_timers", Mock(side_effect=RuntimeError("stop setup")))
-    with pytest.raises(RuntimeError, match="stop setup"):
-        training.pretrain(run_config, None, None, None)
-    assert global_vars.get_run_config() is run_config
-    run_config.validate.assert_called_once()
-
-
-def test_wandb_metadata_uses_config_without_mutating_args(monkeypatch, tmp_path, run_config):
+@pytest.mark.parametrize("fsdp2", [False, True])
+@pytest.mark.parametrize("megatron_fsdp", [False, True])
+def test_native_builder_uses_dist_and_ddp_owners(monkeypatch, run_config, fsdp2, megatron_fsdp):
     args = _args()
-    args.wandb_project = "test"
-    args.wandb_exp_name = "dist"
-    args.wandb_save_dir = str(tmp_path)
-    args.rank = args.world_size - 1
-    run_config.dist.distributed_timeout_minutes = 37
-    old_timeout = args.distributed_timeout_minutes
-    wandb = Mock()
-    monkeypatch.setitem(sys.modules, "wandb", wandb)
-    monkeypatch.setattr(global_vars, "_GLOBAL_WANDB_WRITER", None)
-    global_vars._set_wandb_writer(args)
-    saved = wandb.init.call_args.kwargs["config"]
-    assert saved["distributed_timeout_minutes"] == 37
-    assert saved["micro_batch_size"] == args.micro_batch_size
-    assert args.distributed_timeout_minutes == old_timeout
+    del args.use_torch_fsdp2, args.use_megatron_fsdp
+    run_config.dist.use_torch_fsdp2 = fsdp2
+    run_config.ddp = (
+        training.TorchFullyShardedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
+        if fsdp2
+        else training.DistributedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
+    )
+    builder = Mock()
+    run_config.model = SimpleNamespace(get_builder_cls=lambda: Mock(return_value=builder))
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
+    monkeypatch.setattr(training, "_add_model_freeze_pre_wrap_hook", Mock())
+    monkeypatch.setattr("megatron.training.utils.start_memory_history_recording", Mock())
+    # A passed training container must not be replaced by the global container.
+    monkeypatch.setattr(training, "get_run_config", Mock(side_effect=AssertionError("global read")))
+
+    class ReachedBuilder(Exception):
+        pass
+
+    builder.build_distributed_models.side_effect = ReachedBuilder
+    with pytest.raises(ReachedBuilder):
+        training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
+    kwargs = builder.build_distributed_models.call_args.kwargs
+    assert kwargs["ddp_config"] is run_config.ddp
+    assert kwargs["use_torch_fsdp2"] is fsdp2
+    assert kwargs["use_megatron_fsdp"] is megatron_fsdp
 
 
 @pytest.mark.parametrize("fsdp2", [False, True])

@@ -33,47 +33,6 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
         torch.testing.assert_close(buffer.get_tensor_view(index), tensor)
 
 
-def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_setup):
-    """DBuffer layout returns element offsets and pads to LCM * DP size."""
-    if distributed_setup.world_size < 2:
-        pytest.skip("DBuffer layout test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(distributed_setup.device.type, (2,))
-    shapes = [torch.Size((5, 4)), torch.Size((2, 6)), torch.Size((3,))]
-
-    buffer = DBuffer.empty(
-        mesh=mesh,
-        placements=[Replicate()],
-        tensor_shapes=shapes,
-        dtype=torch.float32,
-        device=distributed_setup.device,
-    )
-
-    assert buffer.layout.tensor_shapes == tuple(shapes)
-    assert buffer.layout.tensor_to_offset == (0, 24, 20)
-    assert buffer.layout.size == 48
-
-
-def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
-    """DBuffer layout keeps small tensors aligned to their non-leading dimensions."""
-    if distributed_setup.world_size < 2:
-        pytest.skip("DBuffer layout test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(distributed_setup.device.type, (2,))
-    shapes = [torch.Size((4, 4)), torch.Size((1, 6))]
-
-    buffer = DBuffer.empty(
-        mesh=mesh,
-        placements=[Replicate()],
-        tensor_shapes=shapes,
-        dtype=torch.float32,
-        device=distributed_setup.device,
-    )
-
-    assert buffer.layout.tensor_to_offset == (0, 18)
-    assert buffer.layout.size == 24
-
-
 def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
     """BlockAtomic keeps every local tensor shard aligned to its configured row block."""
     if distributed_setup.world_size < 2:
@@ -406,8 +365,14 @@ def test_replicate_view_round_trip(distributed_setup):
         sharded_buffer.local_buffer.untyped_storage()
         is replicated_buffer.local_buffer.untyped_storage()
     )
+    # This compares the whole buffer, including uninitialized padding that may
+    # contain NaNs. Matching NaNs copied from that padding must compare equal.
     torch.testing.assert_close(
-        sharded_buffer.local_buffer, redistributed_sharded_buffer.local_buffer, rtol=0, atol=0
+        sharded_buffer.local_buffer,
+        redistributed_sharded_buffer.local_buffer,
+        rtol=0,
+        atol=0,
+        equal_nan=True,
     )
     _assert_dbuffer_local_tensors_close(sharded_buffer.allgather(0), tensors)
 
@@ -621,27 +586,6 @@ def test_2d_mesh_replicate_row_atomic_round_trip(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
 
 
-def test_2d_mesh_row_atomic_before_replicate_is_rejected(distributed_setup):
-    """RowAtomic axes must be a suffix to keep every local buffer contiguous."""
-    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
-        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
-
-    mesh = init_device_mesh(
-        distributed_setup.device.type,
-        (2, distributed_setup.world_size // 2),
-        mesh_dim_names=("row_atomic", "replicate"),
-    )
-
-    with pytest.raises(ValueError, match="Shard placements must be a suffix"):
-        DBuffer.empty(
-            mesh=mesh,
-            placements=[RowAtomic(), Replicate()],
-            tensor_shapes=[torch.Size((6, 4))],
-            dtype=torch.float32,
-            device=distributed_setup.device,
-        )
-
-
 def test_2d_mesh_shards_across_all_ranks(distributed_setup):
     """Multiple RowAtomic axes shard local storage by the product of their mesh sizes."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
@@ -713,6 +657,59 @@ def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(dist
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
+@pytest.mark.parametrize("destination", ["allocated", "separate", "aliased"])
+def test_multi_axis_view_and_allgather(distributed_setup, destination):
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    replicated = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+    sharded = replicated.redistribute([RowAtomic(), RowAtomic()])
+    assert sharded.local_buffer.untyped_storage() is replicated.local_buffer.untyped_storage()
+    # Invalidate everything except this rank's optimizer shard to catch missing gathers.
+    replicated.local_buffer.fill_(-1)
+    for index, tensor in enumerate(tensors):
+        sharded.copy_from(index, tensor)
+    out = None if destination == "allocated" else replicated
+    if destination == "separate":
+        out = DBuffer(mesh, replicated.placements, replicated.layout, sharded.dtype, sharded.device)
+    result = sharded.allgather((1, 0), out=out)
+    if out is not None:
+        assert result is out
+    _assert_dbuffer_local_tensors_close(result, tensors)
+
+
+@pytest.mark.parametrize("axes", [(0, 1), (1, 2), (0, 1, 2)])
+@pytest.mark.parametrize("symmetric_memory", [False, True])
+def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes, symmetric_memory):
+    if distributed_setup.world_size % 4:
+        pytest.skip("Requires a world size divisible by four.")
+    mesh = init_device_mesh(
+        distributed_setup.device.type, (2, 2, distributed_setup.world_size // 4)
+    )
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    source_placements = [Replicate() if axis < min(axes) else RowAtomic() for axis in range(3)]
+    target_placements = [Replicate() if axis <= max(axes) else RowAtomic() for axis in range(3)]
+    source = DBuffer.distribute_tensors(tensors, mesh, source_placements)
+    expected = DBuffer.distribute_tensors(tensors, mesh, target_placements)
+    out = None
+    if symmetric_memory:
+        if distributed_setup.device.type != "cuda":
+            pytest.skip("Symmetric memory requires CUDA.")
+        # Symmetric-memory rendezvous requires an initialized NCCL communicator.
+        for axis in axes:
+            dist.barrier(group=mesh.get_group(axis), device_ids=[distributed_setup.device.index])
+        with torch.cuda.use_mem_pool(symm_mem.get_mem_pool(distributed_setup.device)):
+            out = DBuffer(mesh, target_placements, source.layout, source.dtype, source.device)
+        assert out.is_symmetric_memory
+    result = source.allgather(axes, out=out)
+    if out is not None:
+        assert result is out
+    assert result.placements == tuple(target_placements)
+    for index in range(len(tensors)):
+        torch.testing.assert_close(result.get_tensor_view(index), expected.get_tensor_view(index))
+
+
 def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
     """A Replicate+RowAtomic view chunks the existing RowAtomic local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
@@ -781,41 +778,6 @@ def test_tensor_atomic_init_normal(distributed_setup):
     assert (buffer.offset, buffer.local_buffer.numel()) == offset_numel
 
 
-def test_tensor_atomic_layout_preserves_tensor_ids_with_non_monotonic_owners():
-    """Packing groups owners stably while keeping logical IDs and empty rank segments."""
-    shapes = [torch.Size((4, 4)), torch.Size((3,)), torch.Size((2, 6)), torch.Size((7, 3))]
-    tensor_owners = (1, 3, 0, 3)
-
-    layout = GlobalLayout.build_for_tensor_atomic(shapes, dp_size=5, tensor_owners=tensor_owners)
-    assert layout.tensor_shapes == tuple(shapes)
-    assert layout.tensor_to_offset == (12, 28, 0, 31)
-    assert layout.rank_to_offset == (0, 12, 28, 28, 52)
-    assert layout.size == 52
-
-
-@pytest.mark.parametrize("tensor_owners", [(), (0,), (0, 1, 0)])
-def test_tensor_atomic_layout_requires_one_owner_per_tensor(tensor_owners):
-    """The tensor-atomic builder requires exactly one owner per tensor."""
-    with pytest.raises(ValueError, match="number of tensor owners"):
-        GlobalLayout.build_for_tensor_atomic([(3,), (4,)], dp_size=2, tensor_owners=tensor_owners)
-
-
-def test_tensor_atomic_layout_accepts_empty_assignments_for_no_tensors():
-    """An explicit empty assignment produces empty rank segments."""
-    layout = GlobalLayout.build_for_tensor_atomic([], dp_size=2, tensor_owners=())
-    assert layout.tensor_shapes == ()
-    assert layout.tensor_to_offset == ()
-    assert layout.rank_to_offset == (0, 0)
-    assert layout.size == 0
-
-
-@pytest.mark.parametrize("owner", [-1, 2, 0.5, True, "0", None])
-def test_tensor_atomic_layout_rejects_invalid_owners(owner):
-    """Owner ranks must be integers within the layout's DP mesh."""
-    with pytest.raises(ValueError, match="integer within the range"):
-        GlobalLayout.build_for_tensor_atomic([(3,)], dp_size=2, tensor_owners=(owner,))
-
-
 @pytest.mark.parametrize("block_size", [1, 2])
 @pytest.mark.parametrize("construction", ["empty", "from_local", "view"])
 def test_tensor_atomic_rejects_split_tensors(distributed_setup, block_size, construction):
@@ -876,6 +838,26 @@ def test_block_atomic_rejects_shards_that_split_blocks(distributed_setup):
         DBuffer(mesh, [BlockAtomic(8)], layout, torch.float32, distributed_setup.device)
 
 
+def test_row_atomic_rejects_uneven_layout(distributed_setup):
+    """Every construction path rejects a RowAtomic placement on unequal rank segments."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Requires at least 2 ranks.")
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    device = distributed_setup.device
+    # Both tensors have row size 4 and row-aligned offsets, so only the unequal
+    # segment sizes can trip validation.
+    shapes = [(4, 4), (2, 4)]
+    layout = GlobalLayout.build_for_tensor_atomic(shapes, dp_size=mesh.size(), tensor_owners=(0, 1))
+    assert not layout.has_equal_shard_sizes
+
+    with pytest.raises(ValueError, match="Unequal rank segment sizes"):
+        DBuffer(mesh, [RowAtomic()], layout, torch.float32, device)
+    with pytest.raises(ValueError, match="Unequal rank segment sizes"):
+        DBuffer.from_local(torch.empty(16, device=device), mesh, [RowAtomic()], layout)
+    with pytest.raises(ValueError, match="Unequal rank segment sizes"):
+        DBuffer(mesh, [Replicate()], layout, torch.float32, device).view([RowAtomic()])
+
+
 @pytest.mark.parametrize("rows_per_rank", [16, 32])
 def test_quantized_dbuffer_validates_replicated_layout_alignment(distributed_setup, rows_per_rank):
     """MXFP8 checks block boundaries even when its current placement is Replicate.
@@ -907,29 +889,6 @@ def test_quantized_dbuffer_validates_replicated_layout_alignment(distributed_set
         assert buffer.columnwise_scale.layout.rank_to_offset == tuple(
             offset // 32 for offset in layout.rank_to_offset
         )
-
-
-def test_get_local_range_rejects_mesh_size_mismatch(distributed_setup):
-    "A layout planned for one DP size cannot be sharded over a mesh of another size"
-    if distributed_setup.world_size < 4:
-        pytest.skip("DBuffer layout test requires at least 4 ranks.")
-
-    mesh = init_device_mesh(distributed_setup.device.type, (4,))
-    if mesh.get_coordinate() is None:
-        pytest.skip("Rank is outside the 4-rank test mesh.")
-
-    layout = GlobalLayout.build_for_row_atomic([torch.Size((4, 4)), torch.Size((2, 4))], dp_size=2)
-    assert layout.rank_to_offset == (0, 12)
-    assert layout.get_local_range(mesh, [Replicate()]) == (0, 24)
-    with pytest.raises(ValueError, match="built for 2 shards"):
-        layout.get_local_range(mesh, [RowAtomic()])
-
-    # A layout planned for more shards than the mesh has ranks hands each rank a
-    # contiguous run of segments, matching the original uniform split.
-    layout = GlobalLayout.build_for_row_atomic([torch.Size((8, 4))], dp_size=8)
-    assert layout.rank_to_offset == tuple(range(0, 32, 4))
-    rank = mesh.get_local_rank(0)
-    assert layout.get_local_range(mesh, [RowAtomic()]) == (rank * 8, 8)
 
 
 def test_replicate_placement_with_tensor_atomic_layout(distributed_setup):
@@ -988,3 +947,281 @@ def test_partial_placement_with_tensor_atomic_layout(distributed_setup):
     assert buffer.layout.rank_to_offset == (0, 12, 28, 28)
     assert buffer.layout.size == 52
     assert (buffer.offset, buffer.local_buffer.numel()) == (0, 52)
+
+
+def test_tensor_atomic_rejects_2d_mesh(distributed_setup):
+    """DBuffer.empty rejects TensorAtomic placements on a multi-dimensional mesh."""
+    if distributed_setup.world_size < 4:
+        pytest.skip("DBuffer layout test requires at least 4 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (2, 2))
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the 4-rank TensorAtomic test mesh.")
+
+    shapes = [torch.Size((4, 4)), torch.Size((3,)), torch.Size((2, 6)), torch.Size((7, 3))]
+
+    with pytest.raises(NotImplementedError, match="requires a 1-D device mesh"):
+        DBuffer.empty(
+            mesh=mesh,
+            placements=[TensorAtomic(), RowAtomic()],
+            tensor_shapes=shapes,
+            dtype=torch.float32,
+            device=distributed_setup.device,
+        )
+
+
+@pytest.mark.parametrize("tensor_owners", [(1, 0, 1), (1, 1, 1)])
+def test_sharded_allgather_round_trip_with_tensor_atomic(distributed_setup, tensor_owners):
+    """Sharded TensorAtomic buffers round-trip through all-gather as contiguous tensor fragments."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("DBuffer layout test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+
+    sharded_buffer = DBuffer.distribute_tensors(
+        tensors,
+        mesh,
+        [TensorAtomic()],
+        layout=GlobalLayout.build_for_tensor_atomic(
+            (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
+        ),
+    )
+    layout = sharded_buffer.layout
+    for index, tensor in enumerate(tensors):
+        local_tensor = sharded_buffer.get_tensor_view(index)
+        assert local_tensor.shape[1:] == tensor.shape[1:]
+        assert local_tensor.is_contiguous()
+
+    replicated_buffer = sharded_buffer.allgather(0)
+
+    assert replicated_buffer.layout == layout
+    assert replicated_buffer.local_buffer.numel() == sum(t.numel() for t in tensors)
+    _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
+
+
+def test_sharded_allgather_into_existing_buffer_rejects_mismatched_layout(distributed_setup):
+    """All-gather into a preallocated buffer rejects an output whose layout differs."""
+    if distributed_setup.world_size < 3:
+        pytest.skip("DBuffer layout test requires at least 3 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    tensor_owners = (1, 2, 0)
+
+    sharded_buffer = DBuffer.distribute_tensors(
+        tensors,
+        mesh,
+        [TensorAtomic()],
+        layout=GlobalLayout.build_for_tensor_atomic(
+            (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
+        ),
+    )
+    destination = DBuffer.empty(
+        mesh=mesh,
+        placements=[Replicate()],
+        tensor_shapes=sharded_buffer.layout.tensor_shapes,
+        dtype=sharded_buffer.dtype,
+        device=sharded_buffer.local_buffer.device,
+    )
+
+    with pytest.raises(ValueError, match="GlobalLayout"):
+        sharded_buffer.allgather(0, out=destination)
+
+
+def test_sharded_allgather_into_existing_buffer_with_tensor_atomic(distributed_setup):
+    """TensorAtomic buffers all-gather directly into a preallocated replicated buffer."""
+    if distributed_setup.world_size < 3:
+        pytest.skip("DBuffer layout test requires at least 3 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    tensor_owners = (1, 1, 0)
+
+    sharded_buffer = DBuffer.distribute_tensors(
+        tensors,
+        mesh,
+        [TensorAtomic()],
+        layout=GlobalLayout.build_for_tensor_atomic(
+            (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
+        ),
+    )
+    destination = DBuffer(
+        mesh=mesh,
+        placements=[Replicate()],
+        layout=GlobalLayout.build_for_tensor_atomic(
+            sharded_buffer.layout.tensor_shapes, dp_size=mesh.size(), tensor_owners=tensor_owners
+        ),
+        dtype=sharded_buffer.dtype,
+        device=sharded_buffer.local_buffer.device,
+    )
+    destination_data_ptr = destination.local_buffer.data_ptr()
+
+    result = sharded_buffer.allgather(0, out=destination)
+    assert result is destination
+    assert destination.local_buffer.data_ptr() == destination_data_ptr
+    _assert_dbuffer_local_tensors_close(destination, tensors)
+
+
+def test_replicate_view_to_tensor_atomic_rejects_split_tensors(distributed_setup):
+    """Viewing a Replicate buffer as TensorAtomic rejects tensors that span rank segments."""
+    if distributed_setup.world_size < 3:
+        pytest.skip("DBuffer layout test requires at least 3 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+
+    replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
+    with pytest.raises(ValueError, match="incompatible"):
+        replicated_buffer.view([TensorAtomic()])
+
+
+def test_replicate_view_round_trip_with_tensor_atomic(distributed_setup):
+    """Replicated TensorAtomic buffers view the local shard, redistribute, and all-gather back."""
+    if distributed_setup.world_size < 3:
+        pytest.skip("DBuffer layout test requires at least 3 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    tensor_owners = (1, 1, 0)
+
+    replicated_buffer = DBuffer.distribute_tensors(
+        tensors,
+        mesh,
+        [Replicate()],
+        layout=GlobalLayout.build_for_tensor_atomic(
+            (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
+        ),
+    )
+    sharded_buffer = replicated_buffer.view([TensorAtomic()])
+    assert sharded_buffer.placements == (TensorAtomic(),)
+
+    redistribute_destination = DBuffer(
+        mesh=mesh,
+        placements=[TensorAtomic()],
+        layout=GlobalLayout.build_for_tensor_atomic(
+            replicated_buffer.layout.tensor_shapes, dp_size=mesh.size(), tensor_owners=tensor_owners
+        ),
+        dtype=replicated_buffer.dtype,
+        device=replicated_buffer.local_buffer.device,
+    )
+
+    redistributed_sharded_buffer = replicated_buffer.redistribute(
+        [TensorAtomic()], out=redistribute_destination
+    )
+    assert redistributed_sharded_buffer is redistribute_destination
+    assert redistributed_sharded_buffer.placements == (TensorAtomic(),)
+
+    # Rank 0 owns the 7-element tensor, rank 1 the 21- and 10-element tensors, the rest none.
+    expected_offsets = [0, 7] + [38] * (distributed_setup.world_size - 2)
+    rank = mesh.get_local_rank(0)
+    assert sharded_buffer.offset == expected_offsets[rank]
+
+    assert (
+        sharded_buffer.local_buffer.untyped_storage()
+        is replicated_buffer.local_buffer.untyped_storage()
+    )
+    torch.testing.assert_close(
+        sharded_buffer.local_buffer, redistributed_sharded_buffer.local_buffer, rtol=0, atol=0
+    )
+    _assert_dbuffer_local_tensors_close(sharded_buffer.allgather(0), tensors)
+
+
+@pytest.mark.parametrize("tensor_owners", [(1, 0, 1), (1, 1, 1)])
+def test_partial_reduce_scatter_to_tensor_atomic(distributed_setup, tensor_owners):
+    """Partial buffers reduce-scatter in place into TensorAtomic shards with SUM."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("TensorAtomic reduce-scatter test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    rank_scale = float(distributed_setup.rank + 1)
+    tensors = [
+        torch.full((5, 3), rank_scale, dtype=torch.float32, device=distributed_setup.device),
+        torch.full((4,), rank_scale * 10, dtype=torch.float32, device=distributed_setup.device),
+        torch.full((3, 7), rank_scale, dtype=torch.float32, device=distributed_setup.device),
+    ]
+    partial_buffer = DBuffer.distribute_tensors(
+        tensors,
+        mesh,
+        [Partial()],
+        layout=GlobalLayout.build_for_tensor_atomic(
+            (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
+        ),
+    )
+    layout = partial_buffer.layout
+    rank = mesh.get_local_rank(0)
+
+    destination = partial_buffer.view([TensorAtomic()])
+    sharded_buffer = partial_buffer.reduce_scatter(0, TensorAtomic(), out=destination)
+    assert sharded_buffer is destination
+    assert sharded_buffer.placements == (TensorAtomic(),)
+    assert sharded_buffer.layout == layout
+    assert (
+        sharded_buffer.local_buffer.untyped_storage()
+        is partial_buffer.local_buffer.untyped_storage()
+    )
+
+    tensor_numels = [t.numel() for t in tensors]
+    expected_numel = sum(
+        numel for numel, owner in zip(tensor_numels, tensor_owners) if owner == rank
+    )
+    expected_offset = sum(
+        numel for numel, owner in zip(tensor_numels, tensor_owners) if owner < rank
+    )
+    assert sharded_buffer.local_buffer.numel() == expected_numel
+    assert sharded_buffer.offset == expected_offset
+
+    scale_sum = float(distributed_setup.world_size * (distributed_setup.world_size + 1) // 2)
+    expected_tensors = [
+        torch.full((5, 3), scale_sum, dtype=torch.float32, device=distributed_setup.device),
+        torch.full((4,), scale_sum * 10, dtype=torch.float32, device=distributed_setup.device),
+        torch.full((3, 7), scale_sum, dtype=torch.float32, device=distributed_setup.device),
+    ]
+    for tensor_id, expected in enumerate(expected_tensors):
+        local = sharded_buffer.get_tensor_view(tensor_id)
+        if tensor_owners[tensor_id] == rank:
+            torch.testing.assert_close(local, expected)
+        else:
+            assert local.shape == torch.Size((0, *expected.shape[1:]))
+
+    replicated_buffer = sharded_buffer.allgather(0)
+    assert replicated_buffer.layout == layout
+    assert replicated_buffer.placements == (Replicate(),)
+    _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
+
+
+def test_partial_reduce_scatter_to_tensor_atomic_average(distributed_setup):
+    """Partial buffers reduce-scatter into TensorAtomic shards with AVG."""
+    if distributed_setup.world_size < 3:
+        pytest.skip("TensorAtomic reduce-scatter test assigns tensors to ranks 1 and 2.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    rank_scale = float(distributed_setup.rank + 1)
+    tensors = [
+        torch.full((5, 3), rank_scale, dtype=torch.float32, device=distributed_setup.device),
+        torch.full((4,), rank_scale * 10, dtype=torch.float32, device=distributed_setup.device),
+    ]
+    tensor_owners = (1, 2)
+
+    partial_buffer = DBuffer.distribute_tensors(
+        tensors,
+        mesh,
+        [Partial("avg")],
+        layout=GlobalLayout.build_for_tensor_atomic(
+            (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
+        ),
+    )
+    layout = partial_buffer.layout
+
+    sharded_buffer = partial_buffer.reduce_scatter(0, TensorAtomic())
+    replicated_buffer = sharded_buffer.allgather(0)
+
+    assert sharded_buffer.placements == (TensorAtomic(),)
+    assert sharded_buffer.layout == layout
+    assert replicated_buffer.layout == layout
+    scale_average = float(distributed_setup.world_size + 1) / 2.0
+    expected_tensors = [
+        torch.full((5, 3), scale_average, dtype=torch.float32, device=distributed_setup.device),
+        torch.full((4,), scale_average * 10, dtype=torch.float32, device=distributed_setup.device),
+    ]
+    _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)

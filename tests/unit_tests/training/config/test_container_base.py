@@ -474,11 +474,11 @@ class TestConfigContainer_ToYaml:
 
         assert parsed == config.to_dict()
 
-    def test_to_yaml_with_msc_url(self):
+    def test_to_yaml_with_msc_url(self, monkeypatch):
         """Test to_yaml with MSC URL."""
         config = TestConfigContainer(name="msc_test", value=999)
 
-        MultiStorageClientFeature.enable()
+        monkeypatch.setattr(MultiStorageClientFeature, "_enabled", True)
 
         # Verify that the file is created in the temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:

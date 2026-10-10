@@ -21,10 +21,10 @@ from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.training import get_args, get_model, print_rank_0
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 from pretrain_vlm import model_provider
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def add_text_generation_args(parser):

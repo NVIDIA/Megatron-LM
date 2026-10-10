@@ -4,6 +4,7 @@ import ast
 import builtins
 import dataclasses
 import enum
+import importlib
 import inspect
 import itertools
 import types
@@ -28,6 +29,7 @@ from megatron.training.config import (
     PretrainConfigContainer,
     ProfilingConfig,
     RerunStateMachineConfig,
+    RLConfig,
     RNGConfig,
     SchedulerConfig,
     StragglerDetectionConfig,
@@ -324,6 +326,16 @@ def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | Non
     )
 
 
+def _model_rng_config(args: Namespace) -> RNGConfig:
+    """Use parsed RNG inputs only during bootstrap, before a run config exists."""
+    from megatron.training.global_vars import get_run_config, is_run_config_initialized
+
+    if is_run_config_initialized():
+        cfg = get_run_config()
+        return cfg.rng
+    return _default_config_from_args(RNGConfig, args)
+
+
 def core_transformer_config_from_args(args, config_class=None):
     """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
@@ -450,6 +462,7 @@ def core_transformer_config_from_args(args, config_class=None):
     config = config_class(**kw_args)
 
     _apply_yarn_config_from_args(config, args)
+    _model_rng_config(args).finalize_model_config(config)
 
     # Return config.
     return config
@@ -495,7 +508,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
     """
     kwargs = {}
     for f in fields(cls):
-        if hasattr(args, f.name):
+        if f.init and hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
 
     if return_instance:
@@ -592,6 +605,33 @@ def gpt_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> ModuleSpec | None:
+    """Return the inference_optimized counterpart of a HybridStack training --spec.
+
+    Checkpoints record their training spec, which --use-checkpoint-args restores; its inference
+    sibling keeps the layer types, e.g. gated_delta_product_stack_spec ->
+    wide_residual_gated_delta_product_inference_stack_spec (GDP rather than Mamba). Aliases such
+    as gdp_stack_spec resolve through the spec object they name. Returns None if the module
+    defines no counterpart.
+    """
+    if len(spec) != 2:
+        raise ValueError(f"--spec must name a module and a spec, got {spec}.")
+    base_path, name = spec
+    training_spec = import_module((base_path, name))
+    module_specs = vars(importlib.import_module(base_path))
+    aliases = sorted({alias for alias, value in module_specs.items() if value is training_spec})
+    for alias in aliases or [name]:
+        stem = alias.removeprefix("wide_residual_").replace("_inference_", "_")
+        if not stem.endswith("_stack_spec"):
+            continue
+        candidate = stem.removesuffix("_stack_spec") + "_inference_stack_spec"
+        if wide_residual:
+            candidate = "wide_residual_" + candidate
+        if isinstance(module_specs.get(candidate), ModuleSpec):
+            return module_specs[candidate]
+    return None
+
+
 def hybrid_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
@@ -623,6 +663,17 @@ def hybrid_config_from_args(
         assert (
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
+        if args.spec is not None:
+            hybrid_stack_spec = _hybrid_inference_stack_spec(
+                args.spec, wide_residual=transformer_cfg.wide_residual is not None
+            )
+            if hybrid_stack_spec is None:
+                warnings.warn(
+                    f"No inference_optimized counterpart of --spec {args.spec}; using the "
+                    "default hybrid inference stack spec."
+                )
+            else:
+                kwargs["hybrid_stack_spec"] = hybrid_stack_spec
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
         if not isinstance(hybrid_stack_spec, ModuleSpec):
@@ -682,18 +733,12 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         warnings.warn(msg)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    if hasattr(args, "no_save_optim"):
-        ckpt_kwargs["save_optim"] = not getattr(args, "no_save_optim")
-    if hasattr(args, "no_save_rng"):
-        ckpt_kwargs["save_rng"] = not getattr(args, "no_save_rng")
-    if hasattr(args, "no_load_optim"):
-        ckpt_kwargs["load_optim"] = not getattr(args, "no_load_optim")
-    if hasattr(args, "no_load_rng"):
-        ckpt_kwargs["load_rng"] = not getattr(args, "no_load_rng")
-    if hasattr(args, "ckpt_fully_parallel_save"):
-        ckpt_kwargs["fully_parallel_save"] = getattr(args, "ckpt_fully_parallel_save")
-    if hasattr(args, "ckpt_fully_parallel_load"):
-        ckpt_kwargs["fully_parallel_load"] = getattr(args, "ckpt_fully_parallel_load")
+    ckpt_kwargs["save_optim"] = not args.no_save_optim
+    ckpt_kwargs["save_rng"] = not args.no_save_rng
+    ckpt_kwargs["load_optim"] = not args.no_load_optim
+    ckpt_kwargs["load_rng"] = not args.no_load_rng
+    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
+    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
 
     rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
@@ -710,10 +755,11 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         ddp=ddp_config,
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
-        logger=_default_config_from_args(LoggerConfig, args),
+        logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=profiling_config_from_args(args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
+        rl=_default_config_from_args(RLConfig, args),
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
@@ -759,18 +805,14 @@ def inference_cfg_container_from_args(
             model_cfg = gpt_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    if hasattr(args, "no_save_optim"):
-        ckpt_kwargs["save_optim"] = not getattr(args, "no_save_optim")
-    if hasattr(args, "no_save_rng"):
-        ckpt_kwargs["save_rng"] = not getattr(args, "no_save_rng")
-    if hasattr(args, "no_load_optim"):
-        ckpt_kwargs["load_optim"] = not getattr(args, "no_load_optim")
-    if hasattr(args, "no_load_rng"):
-        ckpt_kwargs["load_rng"] = not getattr(args, "no_load_rng")
-    if hasattr(args, "ckpt_fully_parallel_save"):
-        ckpt_kwargs["fully_parallel_save"] = getattr(args, "ckpt_fully_parallel_save")
-    if hasattr(args, "ckpt_fully_parallel_load"):
-        ckpt_kwargs["fully_parallel_load"] = getattr(args, "ckpt_fully_parallel_load")
+    # Args-only entrypoints need not supply checkpoint/profiling CLI aliases.
+    # Preserve canonical config values or defaults when an alias is absent.
+    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+        if hasattr(args, f"no_{name}"):
+            ckpt_kwargs[name] = not getattr(args, f"no_{name}")
+    for name in ("fully_parallel_save", "fully_parallel_load"):
+        if hasattr(args, f"ckpt_{name}"):
+            ckpt_kwargs[name] = getattr(args, f"ckpt_{name}")
 
     cfg = InferenceConfigContainer(
         model=model_cfg,
@@ -779,7 +821,7 @@ def inference_cfg_container_from_args(
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
-        logger=_default_config_from_args(LoggerConfig, args),
+        logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         profiling=profiling_config_from_args(args),
     )
 

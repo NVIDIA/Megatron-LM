@@ -23,9 +23,9 @@ from megatron.core.models.gpt import GPTModel
 from typing import Union
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 def model_provider(pre_process=True, post_process=True) -> GPTModel:
     """Builds the model.

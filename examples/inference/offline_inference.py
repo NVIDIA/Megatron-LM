@@ -52,8 +52,8 @@ from megatron.inference.utils import (
 )
 from megatron.training import initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def add_offline_inference_args(parser: ArgumentParser) -> ArgumentParser:

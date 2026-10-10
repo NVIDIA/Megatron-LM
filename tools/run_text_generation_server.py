@@ -30,7 +30,6 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 
 try:
@@ -49,6 +48,7 @@ from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:

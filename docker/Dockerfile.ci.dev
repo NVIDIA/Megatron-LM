@@ -2,15 +2,12 @@
 # syntax=docker/dockerfile:1.3-labs
 
 ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.06-py3
-FROM ${FROM_IMAGE_NAME} AS main
+FROM ${FROM_IMAGE_NAME} AS base
 ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
 ARG TARGETARCH
 ARG YQ_VERSION=4.44.1
-ARG REINSTALL_NCCL=False
-ARG NCCL_VERSION
-ARG NCCL_EXTENSIONS_VERSION=0.1.0
 ENV PATH="/usr/local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
@@ -47,6 +44,31 @@ RUN bash -ex <<"EOF"
     rm -rf "/tmp/${UV_ARCHIVE}" "/tmp/uv-${UV_ARCH}-unknown-linux-gnu"
 EOF
 
+# Cache the MoK wheel independently of the other dev dependencies. The shared base
+# pins its Python, PyTorch, CUDA, compiler, and CPU architecture; BuildKit also keys
+# this stage on the source revision, GPU target, helper, and patch.
+FROM base AS mok-wheel
+ARG MOK_COMMIT=a2ad2d0ce2366c1817d15498cdbaf8ead5966117
+# Include both GPU architectures supported by the pinned MoK source by default.
+ARG MOK_ARCH=ALL
+RUN --mount=type=bind,source=docker/common/install_mok.sh,target=/opt/install_mok.sh \
+    --mount=type=bind,source=docker/patches/mok.patch,target=/opt/mok.patch \
+    bash -ex <<"EOF"
+    # The mount in main requires this directory even when MoK is skipped.
+    mkdir -p /opt/mok-wheels
+    # The ARM64 image serves GB200/GB300; the AMD64 image serves H100.
+    if [ "${TARGETARCH}" = "arm64" ]; then
+        uv venv --system-site-packages "${UV_PROJECT_ENVIRONMENT}"
+        MOK_ARCH=${MOK_ARCH} bash /opt/install_mok.sh "${MOK_COMMIT}" /opt/mok.patch /opt/mok-wheels
+    else
+        echo "[MoK] skipping build for TARGETARCH=${TARGETARCH}"
+    fi
+EOF
+
+FROM base AS main
+ARG REINSTALL_NCCL=False
+ARG NCCL_VERSION
+ARG NCCL_EXTENSIONS_VERSION=0.1.0
 RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
     bash -ex <<"EOF"
     case "${REINSTALL_NCCL}" in
@@ -139,6 +161,16 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
     cp -a "${NCCL_EP_JIT_HEADERS}/../nccl_ep.h" /opt/nccl-ep/include/
     test -f /opt/nccl-ep/include/nccl_ep/device/ht_ep.cuh
     test -f /opt/nccl-ep/include/nccl_ep.h
+EOF
+
+# Reuse the wheel without copying a second archive into the final image.
+RUN --mount=type=bind,from=mok-wheel,source=/opt/mok-wheels,target=/opt/mok-wheels \
+    bash -ex <<"EOF"
+    if [ "${TARGETARCH}" = "arm64" ]; then
+        uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" --no-deps --no-cache /opt/mok-wheels/*.whl
+    else
+        echo "[MoK] skipping install for TARGETARCH=${TARGETARCH}"
+    fi
 EOF
 
 ENV NCCL_EXTENSIONS_VERSION=${NCCL_EXTENSIONS_VERSION}
@@ -277,6 +309,9 @@ RUN export HOME=/home/nemo-runtime \
     rmdir /tmp/regent-cache/.nonroot-mkdir-probe
 
 USER root
+
+# Remove the Nsight Systems EFA metrics plugin to address CVE-2026-27143.
+RUN rm -rf /usr/local/cuda-*/NsightSystems-cli-*/target-linux-x64/plugins/efa_metrics/
 
 ##### For NVIDIANS only #####
 FROM main AS jet

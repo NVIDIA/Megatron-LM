@@ -6,7 +6,6 @@ import os
 import random
 import time
 import warnings
-from dataclasses import fields
 from datetime import timedelta
 from typing import Optional
 
@@ -43,8 +42,8 @@ from megatron.training import (
     inprocess_restart,
 )
 from megatron.training.async_utils import init_persistent_async_worker
-from megatron.training.global_vars import get_run_config
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
+from megatron.training.global_vars import get_run_config
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +62,8 @@ def initialize_megatron(
     seed_etp_group=None,
     skip_random_seed=False,
     skip_dependency_compilation=False,
+    *,
+    training: bool = False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -71,20 +72,30 @@ def initialize_megatron(
     what you are doing.
     `skip_dependency_compilation` should only be set by workloads that do not
     use the C++ dataset helpers.
+    `training` enables training rerun, checkpoint workers, autoresume and dataset
+    compilation in addition to the shared distributed execution and RNG setup.
     Returns a function to finalize distributed env initialization
     (optionally, only when cfg.dist.lazy_mpu_init == True)
     """
-    cfg = get_run_config()
     if not allow_no_cuda:
         # Make sure cuda is available.
         assert torch.cuda.is_available(), "Megatron requires CUDA."
 
     args = get_args()
 
+    cfg = get_run_config()
+    cfg.validate()
+    if not training and args.tp_comm_overlap:
+        raise ValueError(
+            "--tp-comm-overlap uses fixed training user buffers and is not supported by "
+            "inference initialization. Disable it until inference has a validated buffer-sizing "
+            "contract. Inference-specific communication optimizations are unaffected."
+        )
+
     # set logging level
     setup_logging()
 
-    if args.async_save and args.use_persistent_ckpt_worker:
+    if training and args.async_save and args.use_persistent_ckpt_worker:
         init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state
@@ -96,16 +107,17 @@ def initialize_megatron(
             tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
 
     args = get_args()
-    initialize_rerun_state_machine(
-        state_save_func=state_save_func,
-        state_restore_func=state_restore_func,
-        mode=RerunMode(args.rerun_mode),
-        error_injector=RerunErrorInjector(
-            error_injection_rate=args.error_injection_rate,
-            error_injection_type=RerunDiagnostic(args.error_injection_type),
-        ),
-        result_rejected_tracker_filename=args.result_rejected_tracker_filename,
-    )
+    if training:
+        initialize_rerun_state_machine(
+            state_save_func=state_save_func,
+            state_restore_func=state_restore_func,
+            mode=RerunMode(args.rerun_mode),
+            error_injector=RerunErrorInjector(
+                error_injection_rate=args.error_injection_rate,
+                error_injection_type=RerunDiagnostic(args.error_injection_type),
+            ),
+            result_rejected_tracker_filename=args.result_rejected_tracker_filename,
+        )
 
     if args.batch_invariant_mode:
         backend = args.batch_invariant_backend
@@ -117,6 +129,7 @@ def initialize_megatron(
 
     # torch.distributed initialization
     def finish_mpu_init():
+        cfg = get_run_config()
         args = get_args()
         # Pytorch distributed.
         _initialize_distributed(
@@ -137,12 +150,12 @@ def initialize_megatron(
 
         # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
         if not skip_random_seed:
-            print_rank_0("> setting random seeds to {} ...".format(args.seed))
+            print_rank_0("> setting random seeds to {} ...".format(cfg.rng.seed))
             _set_random_seed(
-                args.seed,
-                args.data_parallel_random_init,
-                args.te_rng_tracker,
-                args.inference_rng_tracker,
+                cfg.rng.seed,
+                cfg.rng.data_parallel_random_init,
+                cfg.rng.te_rng_tracker,
+                cfg.rng.inference_rng_tracker,
                 use_cudagraphable_rng=args.cuda_graph_impl != "none",
                 pp_group=seed_pp_group,
                 dp_group=seed_dp_group,
@@ -176,10 +189,11 @@ def initialize_megatron(
         finish_mpu_init()
 
         # Autoresume.
-        _init_autoresume()
+        if training:
+            _init_autoresume()
 
         # Compile dependencies.
-        if not skip_dependency_compilation:
+        if training and not skip_dependency_compilation:
             _compile_dependencies()
 
         if args.tp_comm_overlap:
@@ -509,14 +523,10 @@ def _set_random_seed(
 def write_args_to_tensorboard():
     """Write arguments to tensorboard."""
     args = get_args()
-    cfg = get_run_config()
     writer = get_tensorboard_writer()
     if writer:
         for arg in vars(args):
-            if not hasattr(cfg.dist, arg):
-                writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
-        for field in fields(cfg.dist):
-            writer.add_text(field.name, str(getattr(cfg.dist, field.name)), global_step=args.iteration)
+            writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
 
 
 def set_jit_fusion_options(tp_size=None):
@@ -672,13 +682,13 @@ def setup_logging() -> None:
 
     Returns: None
     """
-    args = get_args()
+    cfg = get_run_config()
     logging_level = None
     env_logging_level = os.getenv('MEGATRON_LOGGING_LEVEL', None)
     if env_logging_level is not None:
         logging_level = int(env_logging_level)
-    if args.logging_level is not None:
-        logging_level = args.logging_level
+    if cfg.logger.logging_level is not None:
+        logging_level = cfg.logger.logging_level
 
     if logging_level is not None:
         if is_rank0():
