@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 
@@ -64,18 +64,15 @@ class _FakeLayerwiseBucket:
         self.params_list = params
         self.params = set(params)
         self.layerwise_params_list = None
-        self.layerwise_param_flat_sizes = None
 
     def set_layerwise_params_list(self, layerwise_params_list):
         self.layerwise_params_list = layerwise_params_list
-        self.layerwise_param_flat_sizes = [
-            sum(param.numel() for param in param_list) for param_list in layerwise_params_list
-        ]
 
 
 class _FakeBucketGroup:
     def __init__(self, buckets):
         self.buckets = buckets
+        self.param_sync_via_bucket_group = True
 
 
 class _FakeModelChunk:
@@ -97,6 +94,7 @@ def test_set_bucket_layerwise_params_list_single_dp_rank():
     bucket = _FakeLayerwiseBucket(params)
 
     optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.use_layer_wise_param_layout = False
     optimizer.pg_collection = ProcessGroupCollection(dp_cp=None, expt_dp=None)
     optimizer.dp_cp_params_list = None
     optimizer.expt_dp_params_list = None
@@ -104,7 +102,6 @@ def test_set_bucket_layerwise_params_list_single_dp_rank():
     optimizer.set_bucket_layerwise_params_list([_FakeModelChunk(bucket)])
 
     assert bucket.layerwise_params_list == [params]
-    assert bucket.layerwise_param_flat_sizes == [sum(param.numel() for param in params)]
 
 
 class MuonExcludedMatrixModel(nn.Module):
@@ -898,17 +895,19 @@ class TestLayerWiseOptimizer:
                     all_lw_params == bucket.params
                 ), "Union of per-rank layerwise_params should equal bucket params"
 
-                # layerwise_param_flat_sizes should be populated and have correct length
-                assert bucket.layerwise_param_flat_sizes is not None
-                assert len(bucket.layerwise_param_flat_sizes) == dp_size
-
-                # Each flat size should equal the sum of param numels for that rank
-                for rank_idx in range(dp_size):
-                    expected_size = sum(p.numel() for p in bucket.layerwise_params_list[rank_idx])
-                    assert bucket.layerwise_param_flat_sizes[rank_idx] == expected_size, (
-                        f"Rank {rank_idx}: expected flat_size {expected_size}, "
-                        f"got {bucket.layerwise_param_flat_sizes[rank_idx]}"
-                    )
+                # Cached transports preserve every owner and cover all bucket parameters.
+                planned_params = set()
+                for plan in bucket.layerwise_gather_plan:
+                    assert len(plan.params_by_rank) == dp_size
+                    assert plan.flat_sizes == [
+                        sum(param.numel() for param in params) for params in plan.params_by_rank
+                    ]
+                    assert plan.total_size == sum(plan.flat_sizes)
+                    for rank, params in enumerate(plan.params_by_rank):
+                        assert set(params).issubset(bucket.layerwise_params_list[rank])
+                        assert not planned_params.intersection(params)
+                        planned_params.update(params)
+                assert planned_params == bucket.params
 
     def test_overlap_param_gather_vs_standard_ddp(self):
         """Verify DDP with overlap_param_gather=True produces same results as standard DDP.

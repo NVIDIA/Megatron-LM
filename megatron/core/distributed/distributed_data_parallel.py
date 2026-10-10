@@ -1,5 +1,6 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
 import logging
 import weakref
 from contextlib import contextmanager
@@ -116,6 +117,22 @@ class DistributedDataParallel(_BaseDataParallel):
         full_param_layout: Optional[FullParamLayout] = None,
     ):
         super().__init__(config=config, module=module)
+        if (
+            ddp_config.use_distributed_optimizer
+            and not ddp_config.use_layer_wise_param_layout
+            and any(
+                getattr(param, "is_managed_by_layer_wise_optimizer", False)
+                for param in module.parameters()
+                if param.requires_grad
+            )
+        ):
+            # Compact LayerWise owns both Muon and Adam. Normalize direct core callers
+            # before selecting process groups or layouts, without changing their config.
+            ddp_config = dataclasses.replace(
+                ddp_config,
+                use_distributed_optimizer=False,
+                num_buckets=None if ddp_config.bucket_size is not None else ddp_config.num_buckets,
+            )
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -194,8 +211,13 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
-        buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
+        # Compact Muon keeps FP8 and high-precision gradient reductions together;
+        # parameter gather chooses separate transport storage for each kind.
+        buffer_groups = group_params_for_buffers(
+            all_params,
+            self.ddp_config.grad_reduce_in_fp32,
+            merge_layerwise_fp8_grads=not self.ddp_config.use_layer_wise_param_layout,
+        )
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
@@ -206,8 +228,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 logging.WARNING,
                 "DistributedDataParallel: full_param_layout not provided with "
                 "use_distributed_optimizer=True. Auto-computing layout inside DDP. "
-                "Callers should pre-compute layouts via "
-                "DistributedOptimizer.compute_full_param_layout() and pass them in.",
+                "Callers should pre-compute their optimizer's full parameter layout "
+                "and pass it in.",
             )
             from ..optimizer.distrib_optimizer import DistributedOptimizer
 
@@ -679,6 +701,12 @@ class DistributedDataParallel(_BaseDataParallel):
             )
             bucket_group.param_gather_dispatched = False
 
+    def finish_pending_param_sync(self) -> None:
+        """Publish existing gathers before clearing or restaging gradient storage."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            if bucket_group.param_gather_handle is not None:
+                bucket_group.start_param_sync(force_sync=True)
+
     @_otel_trace_fn('communication', 'megatron.grad_sync.start')
     def start_grad_sync(self, *unused):
         """
@@ -720,6 +748,7 @@ class DistributedDataParallel(_BaseDataParallel):
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
+        self.finish_pending_param_sync()
         if getattr(self.config, 'cuda_graph_impl', 'none') != 'transformer_engine':
             # Don't reset grad_added_to_main_grad when CUDA Graph is used.
             # Because in CUDA Graph it no longer has the opportunity to set it back

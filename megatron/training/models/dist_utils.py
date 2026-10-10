@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import logging
 from contextlib import nullcontext
 from typing import Any, Callable
@@ -88,7 +89,8 @@ def unimodal_build_distributed_models(
         model_type: Deprecated flag, only used for backwards compatibility.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
+            selects padded Muon plus sharded Adam (True), or compact LayerWise
+            ownership for both Muon and Adam (False).
 
     Returns:
         List of model stages, wrapped and ready for distributed training.
@@ -163,7 +165,8 @@ def prepare_existing_model_chunks_for_distributed_training(
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
+            selects padded Muon plus sharded Adam (True), or compact LayerWise
+            ownership for both Muon and Adam (False).
 
     Returns:
         List of model chunks, wrapped and ready for distributed training.
@@ -292,8 +295,8 @@ def _ddp_wrap(
         pg_collection: Model communication process groups.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
-            ``False`` keeps LayerWise on its legacy ``allgather_params`` sync path.
+            selects padded Muon plus sharded Adam (True), or compact LayerWise
+            ownership for both Muon and Adam (False).
 
     Returns:
         list[MegatronModule]: List of DDP/FSDP wrapped model modules
@@ -327,23 +330,22 @@ def _ddp_wrap(
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 
-    # Argument validation converts --use-distributed-optimizer into
-    # use_layer_wise_distributed_optimizer and clears the original, so re-enable it here:
-    # the layerwise optimizer needs the reduce-scatter and the shard-aligned param layout
-    # that the distributed-optimizer path provides. Mirrors wrap_model_chunks_with_ddp() in
-    # megatron/training/training.py, which handles the non-ModelBuilder path.
+    # Mirror wrap_model_chunks_with_ddp(): only padded LayerWise uses a separate
+    # Adam DistributedOptimizer; compact keeps both raw optimizers inside LayerWise.
     compute_full_param_layout = DistributedOptimizer.compute_full_param_layout
-    if (
-        DP is DistributedDataParallel
-        and use_layer_wise_distributed_optimizer
-        and use_layer_wise_param_layout
-    ):
-        ddp_config.use_distributed_optimizer = True
-        compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-        # Tag params so DDP buffer grouping routes LayerWise-managed matrices
-        # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
-        # everything else (embeddings, biases, layernorm) to a separate
-        # DistOpt-style buffer.
+    if DP is DistributedDataParallel and use_layer_wise_distributed_optimizer:
+        if use_layer_wise_param_layout:
+            ddp_config.use_layer_wise_param_layout = True
+            ddp_config.use_distributed_optimizer = True
+            compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+        else:
+            ddp_config = dataclasses.replace(
+                ddp_config,
+                use_distributed_optimizer=False,
+                use_layer_wise_param_layout=False,
+                num_buckets=None,
+            )
+        # Tags select Muon's FP8 staging policy, including inside the compact container.
         tag_params_for_buffer_routing(model)
 
     cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl

@@ -1,6 +1,5 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import contextlib
 import gc
 import os
 import sys
@@ -11,18 +10,25 @@ from packaging.version import Version
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import DistributedDataParallelConfig, finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
+from megatron.core.fp8_utils import (
+    is_float8tensor,
+    is_grouped_mxfp8tensor,
+    is_layerwise_fp8_param,
+    is_mxfp8tensor,
+    uses_grad_buffer_for_fp8_param_gather,
+)
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.checkpointing import save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
@@ -32,12 +38,16 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import (
     force_param_sync,
-    get_model,
     setup_model_and_optimizer,
     should_disable_forward_pre_hook,
 )
 from megatron.training.utils import get_device_arch_version
+from tests.unit_tests.a2a_overlap.utils import deterministic_mode
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.test_fp8_param_gather_policy import (
+    assert_param_storage_policy,
+    require_fp8_recipe,
+)
 from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
@@ -48,7 +58,7 @@ reason_for_no_cuda_graph = ""
 try:
     from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
 
-    if is_te_min_version("2.10.0"):
+    if callable(post_all_gather_processing) and is_te_min_version("2.10.0"):
         cuda_graph_supported = True
     else:
         reason_for_no_cuda_graph = "Need newer TransformerEngine"
@@ -201,19 +211,16 @@ class TestFP8Param:
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def copy_main_params_to_param_buffer(self, model_chunks, optimizer):
-        # Mirrors MBridge's pre-eval fix: disable_forward_pre_hook(param_sync=True)
-        # force-syncs params before eval callbacks run, so MXFP8 must repopulate
-        # the shared param/grad buffer before disabling forward hooks.
+        # Explicit sync delegates staging to all optimizer leaves, including nested
+        # LayerWise optimizers and implicit blockwise staging.
         for model_chunk in model_chunks:
             model_chunk.zero_grad_buffer()
-        for optim_instance in optimizer.chained_optimizers:
-            if isinstance(optim_instance, DistributedOptimizer):
-                optim_instance._copy_main_params_to_param_buffer()
+        optimizer.prepare_model_params_for_param_sync()
 
     def run_eval_transition(self, args, model_chunks, optimizer, batch):
         input_ids, labels, position_ids, attention_mask, loss_mask = batch
 
-        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+        if args.overlap_param_gather:
             self.copy_main_params_to_param_buffer(model_chunks, optimizer)
 
         if should_disable_forward_pre_hook(args):
@@ -315,10 +322,10 @@ class TestFP8Param:
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if getattr(args, "use_layer_wise_distributed_optimizer", False):
             has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
-            assert has_param_layout == args.use_layer_wise_param_layout, (
-                "LayerWise test did not enter the requested parameter-layout path: "
-                f"requested={args.use_layer_wise_param_layout}, actual={has_param_layout}"
-            )
+            assert (
+                has_param_layout == args.use_layer_wise_param_layout
+            ), "Only padded Muon uses a full parameter layout and separate Adam DistOpt"
+            assert_param_storage_policy(gpt_model[0], args)
         self._on_model_built(gpt_model, optimizer, args)
 
         # Hard coded to use cuda_graph_impl="transformer_engine"
@@ -358,27 +365,8 @@ class TestFP8Param:
                 if not inference:
                     assert len(optimizer.chained_optimizers) >= 2
 
-        # Verify that bf16 params (embedding, LN, etc.) in the MXFP8 model are mapped
-        # to the param buffer (shared with grad buffer) rather than allocated separately.
-        if args.reuse_grad_buf_for_mxfp8_param_ag:
-            for buffer in gpt_model[0].buffers:
-                if buffer.param_data is None:
-                    continue
-                buf_start = buffer.param_data.data_ptr()
-                buf_end = buf_start + buffer.param_data.numel() * buffer.param_data.element_size()
-                for param in buffer.param_to_bucket:
-                    if is_mxfp8tensor(param):
-                        # MXFP8 params keep their own quantized storage.
-                        assert not (
-                            buf_start <= param.data.data_ptr() < buf_end
-                        ), "MXFP8 param should not be mapped to the param buffer"
-                    else:
-                        # BF16 params should be views into the param buffer
-                        # (no double allocation).
-                        assert buf_start <= param.data.data_ptr() < buf_end, (
-                            "BF16 param should be a view into the param buffer "
-                            "(no separate allocation)"
-                        )
+        if not inference:
+            assert_param_storage_policy(gpt_model[0], args)
 
         loss_list = []
         eval_loss_list = []
@@ -432,11 +420,7 @@ class TestFP8Param:
             forward_pre_hook_enabled = bool(
                 getattr(gpt_model[0], 'remove_forward_pre_hook_handles', {})
             )
-            if (
-                args.reuse_grad_buf_for_mxfp8_param_ag
-                and args.overlap_param_gather
-                and forward_pre_hook_enabled
-            ):
+            if args.overlap_param_gather and forward_pre_hook_enabled:
                 self.copy_main_params_to_param_buffer(gpt_model, optimizer)
 
             gpt_model[0].set_is_first_microbatch()
@@ -460,11 +444,9 @@ class TestFP8Param:
             loss = output.mean()
             loss.backward()
 
-            if args.overlap_grad_reduce:
-                # Production order (finalize_model_grads): the GTP fence runs BEFORE the DP
-                # grad sync and is what flushes an accumulated wgrad.
-                _gtp_grad_fence()
-                gpt_model[0].finish_grad_sync()
+            # Match finalize_model_grads in both sync and overlap modes.
+            _gtp_grad_fence()
+            gpt_model[0].finish_grad_sync()
 
             for name, param in gpt_model[0].named_parameters():
                 assert param.main_grad is not None
@@ -589,7 +571,7 @@ class TestFP8Param:
     @pytest.mark.parametrize("dp_overlap", [(True, True)])
     def test_blockwise_scaling(self, tp_size, dp_overlap):
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
-        self.run_test(tp_size=tp_size, recipe="blockwise")
+        self.run_test(tp_size=tp_size, recipe="blockwise", **kwargs)
 
     @pytest.mark.skipif(
         get_device_arch_version() != 9, reason="blockwise is only supported on Hopper architecture"
@@ -760,14 +742,15 @@ class TestFP8Param:
         assert len(model) == 1
         return args, model, optimizer, opt_param_scheduler
 
-    def run_train_steps(self, args, model, optimizer, num_steps):
+    def run_train_steps(self, args, model, optimizer, num_steps, opt_param_scheduler=None):
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         input_ids, labels, position_ids, attention_mask, loss_mask = batch
+        losses = []
         for _ in range(num_steps):
             model[0].zero_grad_buffer()
             optimizer.zero_grad()
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                self.copy_main_params_to_param_buffer(model, optimizer)
+            if args.overlap_param_gather:
+                optimizer.prepare_model_params_for_param_sync()
             model[0].set_is_first_microbatch()
             output = model[0].forward(
                 input_ids=input_ids,
@@ -776,14 +759,331 @@ class TestFP8Param:
                 labels=labels,
                 loss_mask=loss_mask,
             )
-            output.mean().backward()
-            if args.overlap_grad_reduce:
-                # Production order (finalize_model_grads): the GTP fence runs BEFORE the DP
-                # grad sync and is what flushes an accumulated wgrad.
-                _gtp_grad_fence()
-                model[0].finish_grad_sync()
+            loss = output.mean()
+            losses.append(loss.detach().clone())
+            loss.backward()
+            # Include TP reductions for sequence-parallel layernorms. DDP alone leaves
+            # replicated Adam moments inconsistent across TP ranks before checkpointing.
+            finalize_model_grads(
+                model, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+            )
             update_successful, _, _ = optimizer.step()
             assert update_successful
+            if opt_param_scheduler is not None:
+                opt_param_scheduler.step(increment=args.global_batch_size)
+        return torch.stack(losses)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("kind", ["float8", "nvfp4", "grouped_bf16", "grouped_mxfp8"])
+    def test_native_compact_layerwise_rejects_unsupported_storage(self, monkeypatch, kind):
+        """Reject real TE storage before DDP can replace payloads or quantization metadata."""
+        import transformer_engine.pytorch as te
+
+        # The launch marker selects GB200 tests; H100 CI also collects this file.
+        # Skip only hardware that cannot construct the requested native storage.
+        if kind in ("nvfp4", "grouped_mxfp8") and torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip(f"{kind} tensor construction requires compute capability 10.0 or newer")
+        if kind == "float8":
+            if not fp8_available:
+                pytest.skip(reason_for_no_fp8)
+            from transformer_engine.common.recipe import Float8CurrentScaling
+            from transformer_engine.pytorch.tensor.float8_tensor import Float8Tensor
+
+            recipe = Float8CurrentScaling()
+            expected_class = Float8Tensor
+        elif kind == "nvfp4":
+            from transformer_engine.common.recipe import NVFP4BlockScaling
+            from transformer_engine.pytorch.fp8 import check_nvfp4_support
+            from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor
+
+            supported, reason = check_nvfp4_support()
+            assert supported, reason
+            recipe = NVFP4BlockScaling()
+            expected_class = NVFP4Tensor
+        else:
+            from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
+
+            expected_class = GroupedTensor
+            if kind == "grouped_mxfp8":
+                from transformer_engine.common.recipe import MXFP8BlockScaling
+                from transformer_engine.pytorch.fp8 import check_mxfp8_support
+
+                supported, reason = check_mxfp8_support()
+                assert supported, reason
+                recipe = MXFP8BlockScaling()
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        config_kwargs = {}
+        if kind == "grouped_bf16":
+            grouped = GroupedTensor.make_grouped_tensor_from_rowwise_data(
+                num_tensors=2,
+                tensor_shape=(128, 128),
+                rowwise_data=torch.zeros(2, 128, 128, dtype=torch.bfloat16, device="cuda"),
+            )
+            module = torch.nn.Module()
+            module.register_parameter("weight", torch.nn.Parameter(grouped))
+        else:
+            with te.fp8_model_init(enabled=True, recipe=recipe):
+                if kind == "grouped_mxfp8":
+                    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+                    module = te.GroupedLinear(
+                        2,
+                        128,
+                        128,
+                        bias=False,
+                        params_dtype=torch.bfloat16,
+                        device="cuda",
+                        single_grouped_weight=True,
+                    )
+                else:
+                    module = te.Linear(
+                        128, 128, bias=False, params_dtype=torch.bfloat16, device="cuda"
+                    )
+            if kind == "nvfp4":
+                config_kwargs = dict(fp4="e2m1", fp4_param=True)
+            else:
+                config_kwargs = dict(
+                    fp8="e4m3",
+                    fp8_param=True,
+                    fp8_recipe="mxfp8" if kind == "grouped_mxfp8" else "tensorwise",
+                )
+
+        param = module.weight
+        assert isinstance(param, expected_class)
+        param.is_managed_by_layer_wise_optimizer = True
+        config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True,
+            use_layer_wise_param_layout=False,
+            fp8_param_gather=True,
+            reuse_grad_buf_for_mxfp8_param_ag=True,
+        )
+        assert not is_layerwise_fp8_param(param)
+        assert is_grouped_mxfp8tensor(param) is (kind == "grouped_mxfp8")
+        # Grouped MXFP8 obeys the global opt-in but has no compact whole-param copy-back.
+        assert uses_grad_buffer_for_fp8_param_gather(param, config) is (kind == "grouped_mxfp8")
+        if kind == "float8":
+            attributes = ("_data", "_scale_inv", "_transpose")
+        elif kind == "nvfp4":
+            attributes = (
+                "_rowwise_data",
+                "_columnwise_data",
+                "_rowwise_scale_inv",
+                "_columnwise_scale_inv",
+                "_amax_rowwise",
+                "_amax_columnwise",
+            )
+        else:
+            attributes = (
+                "rowwise_data",
+                "columnwise_data",
+                "scale_inv",
+                "columnwise_scale_inv",
+                "amax",
+                "columnwise_amax",
+                "scale",
+            )
+        assert torch.is_tensor(getattr(param, attributes[0]))
+        before = {}
+        for name in attributes:
+            tensor = getattr(param, name)
+            before[name] = (
+                None
+                if tensor is None
+                else (
+                    tensor.data_ptr(),
+                    tensor.dtype,
+                    tensor.shape,
+                    tensor.stride(),
+                    tensor.detach().contiguous().reshape(-1).view(torch.uint8).clone(),
+                )
+            )
+        with pytest.raises(TypeError) as error:
+            DDP(
+                TransformerConfig(
+                    num_layers=1, hidden_size=128, num_attention_heads=4, bf16=True, **config_kwargs
+                ),
+                config,
+                module,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+        assert str(error.value) == (
+            "Compact LayerWise parameter gather supports only plain MXFP8Tensor "
+            "and Float8BlockwiseQTensor quantized parameters; "
+            f"got {type(param).__name__}. GroupedTensor is not supported."
+        )
+        assert config.use_distributed_optimizer  # The shared configuration was not changed.
+        for name, original in before.items():
+            tensor = getattr(param, name)
+            if original is None:
+                assert tensor is None, name
+                continue
+            pointer, dtype, shape, stride, values = original
+            assert (tensor.data_ptr(), tensor.dtype, tensor.shape, tensor.stride()) == (
+                pointer,
+                dtype,
+                shape,
+                stride,
+            ), name
+            assert torch.equal(
+                tensor.detach().contiguous().reshape(-1).view(torch.uint8), values
+            ), name
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.parametrize("optimizer_name", ["adam", "muon"])
+    @pytest.mark.parametrize("use_param_layout", [False, True])
+    @pytest.mark.parametrize("reuse_grad_buf", [False, True])
+    def test_native_mxfp8_reuse_transport(
+        self, tmp_path_dist_ckpt, optimizer_name, use_param_layout, reuse_grad_buf
+    ):
+        """Exercise real MXFP8 storage: four training cases and four refusal boundaries.
+
+        Reuse ON trains and completes a pending gather without retaining scratch data.
+        With reuse OFF, TE 2.14/2.16 cannot remap plain MXFP8 storage for native gather;
+        Muon reports its explicit requirement and Adam preserves TE's exact rejection.
+        These negative cases do not count as successful training with reuse disabled.
+        """
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+        require_fp8_recipe("mxfp8")
+        if Utils.world_size != 8:
+            pytest.skip("Native MXFP8 transport matrix requires eight ranks (TP1 x DP8)")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        owner = optimizer_name == "muon"
+        if not reuse_grad_buf:
+            # Construct real TE parameters without the training CLI, so both layouts
+            # reach DDP's storage boundary rather than only testing argument validation.
+            with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+                module = te.Linear(128, 128, bias=False, params_dtype=torch.bfloat16, device="cuda")
+            param = module.weight
+            assert isinstance(param, MXFP8Tensor) and is_mxfp8tensor(param)
+            param.is_managed_by_layer_wise_optimizer = owner
+            config = DistributedDataParallelConfig(
+                use_distributed_optimizer=True,
+                use_layer_wise_param_layout=use_param_layout,
+                fp8_param_gather=True,
+                reuse_grad_buf_for_mxfp8_param_ag=False,
+            )
+            assert not uses_grad_buffer_for_fp8_param_gather(param, config)
+            raw_storage = param._rowwise_data.untyped_storage().data_ptr()
+            error = ValueError if owner else NotImplementedError
+            message = (
+                "LayerWise MXFP8 parameter gather requires"
+                if owner
+                else r"^replace_raw_data for MXFP8Tensor is not supported yet$"
+            )
+            with pytest.raises(error, match=message):
+                DDP(
+                    TransformerConfig(
+                        num_layers=1,
+                        hidden_size=128,
+                        num_attention_heads=4,
+                        bf16=True,
+                        fp8="e4m3",
+                        fp8_recipe="mxfp8",
+                        fp8_param=True,
+                    ),
+                    config,
+                    module,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
+            assert not config.reuse_grad_buf_for_mxfp8_param_ag
+            assert not uses_grad_buffer_for_fp8_param_gather(param, config)
+            assert param._rowwise_data.untyped_storage().data_ptr() == raw_storage
+            return
+
+        self.seq_length = 128
+        self.micro_batch_size = 1
+        kwargs = dict(
+            num_layers=2,
+            padded_vocab_size=512,
+            ffn_hidden_size=256,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            clip_grad=1.0,
+            attention_backend="unfused",
+            overlap_param_gather=True,
+            overlap_grad_reduce=True,
+            optimizer=optimizer_name,
+            use_layer_wise_param_layout=use_param_layout,
+            reuse_grad_buf_for_mxfp8_param_ag=True,
+            tensor_parallel_num_weight_shards=1,
+        )
+        if owner:
+            kwargs["muon_tp_mode"] = "duplicated"
+        with (
+            deterministic_mode(),
+            TempNamedDir(tmp_path_dist_ckpt / "native_mxfp8_transport", sync=True) as ckpt_dir,
+        ):
+            args, model, optimizer, scheduler = self.setup_checkpoint_case(
+                1, "mxfp8", str(ckpt_dir), **kwargs
+            )
+            ddp = model[0]
+            assert args.tensor_model_parallel_size == 1
+            assert args.tensor_parallel_num_weight_shards == 1
+            assert_param_storage_policy(ddp, args)
+            native_params = [param for param in ddp.parameters() if is_mxfp8tensor(param)]
+            assert native_params, "The matrix must exercise native MXFP8 parameters"
+            assert all(isinstance(param, MXFP8Tensor) for param in native_params)
+            assert all(
+                bool(getattr(param, "is_managed_by_layer_wise_optimizer", False)) == owner
+                for param in native_params
+            )
+            assert all(
+                uses_grad_buffer_for_fp8_param_gather(param, ddp.ddp_config)
+                for param in native_params
+            )
+            losses = self.run_train_steps(args, model, optimizer, 2, scheduler)
+            assert torch.isfinite(losses).all()
+
+            # Match the next iteration's staging order, then inspect real receive views
+            # while the gather is pending. Force completion must release those views.
+            ddp.zero_grad_buffer()
+            optimizer.zero_grad()
+            optimizer.prepare_model_params_for_param_sync()
+            ddp.start_param_sync()
+            groups = ddp.bucket_groups + ddp.expert_parallel_bucket_groups
+            assert any(group.param_gather_handle is not None for group in groups)
+            reused_buckets = []
+            for buffer in ddp.buffers + ddp.expert_parallel_buffers:
+                for bucket in buffer.buckets:
+                    if not bucket.reuse_grad_buffer_for_param_ag:
+                        continue
+                    reused_buckets.append(bucket)
+                    grad_ptr = bucket.grad_data.untyped_storage().data_ptr()
+                    if bucket.param_data is not None:
+                        assert bucket.param_data.dtype == torch.bfloat16
+                        assert bucket.param_data.untyped_storage().data_ptr() == grad_ptr
+                    else:
+                        assert owner and not use_param_layout
+                        transports = [
+                            views for _, views, reuse in bucket.layerwise_gather_list if reuse
+                        ]
+                        assert transports
+                        assert all(
+                            view.dtype == torch.bfloat16 for views in transports for view in views
+                        )
+                        assert all(
+                            view.untyped_storage().data_ptr() == grad_ptr
+                            for views in transports
+                            for view in views
+                        )
+            assert reused_buckets
+            ddp.start_param_sync(force_sync=True)
+            assert all(group.param_gather_handle is None for group in groups)
+            assert all(bucket.layerwise_gather_list is None for bucket in reused_buckets)
+            assert all(torch.count_nonzero(bucket.grad_data) == 0 for bucket in reused_buckets)
+            state = self.quantized_param_state(ddp)
+            assert state
+            for name, values in state.items():
+                for kind, value in values.items():
+                    replicas = [torch.empty_like(value) for _ in range(Utils.world_size)]
+                    torch.distributed.all_gather(replicas, value.contiguous())
+                    assert all(
+                        torch.equal(replicas[0], other) for other in replicas[1:]
+                    ), f"{name}.{kind} differs across DP replicas after MXFP8 gather"
 
     def cleanup_between_runs(self):
         Utils.destroy_model_parallel()
@@ -792,99 +1092,177 @@ class TestFP8Param:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @pytest.mark.launch_on_gb200
+    @staticmethod
+    def snapshot_optimizer_state(value):
+        if torch.is_tensor(value):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {key: TestFP8Param.snapshot_optimizer_state(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return type(value)(TestFP8Param.snapshot_optimizer_state(item) for item in value)
+        return value
+
+    @staticmethod
+    def complete_optimizer_state(optimizer):
+        """Include rank-local Adam moments and FP32 masters omitted by DistOpt.state_dict."""
+        children = getattr(optimizer, "chained_optimizers", None)
+        if children is not None:
+            return [TestFP8Param.complete_optimizer_state(child) for child in children]
+        inner = optimizer.optimizer
+        state = {"wrapper": optimizer.state_dict()}
+        if inner is not None:
+            state["inner"] = inner.state_dict()
+            state["masters"] = [
+                [param for param in group["params"]] for group in inner.param_groups
+            ]
+        state = TestFP8Param.snapshot_optimizer_state(state)
+        if inner is not None:
+            # Checkpoints align TE FusedAdam's step across groups, while FusedAdam
+            # never advances empty groups. Normalize only that field in copied raw
+            # state, including Float16Optimizer's duplicate payload. Populated groups,
+            # canonical DistOpt metadata, moments and masters remain strict.
+            raw_states = [state["inner"]]
+            wrapped_inner = state["wrapper"].get("optimizer", {})
+            if "state" in wrapped_inner:
+                raw_states.append(wrapped_inner)
+            for raw_state in raw_states:
+                for group in raw_state["param_groups"]:
+                    if not group["params"]:
+                        group.pop("step", None)
+        return state
+
+    @staticmethod
+    def assert_state_equal(actual, expected, path="optimizer"):
+        if torch.is_tensor(expected):
+            assert actual.dtype == expected.dtype and actual.shape == expected.shape, path
+            assert torch.equal(actual.cpu(), expected.cpu()), path
+        elif isinstance(expected, dict):
+            assert actual.keys() == expected.keys(), path
+            for key in expected:
+                TestFP8Param.assert_state_equal(actual[key], expected[key], f"{path}.{key}")
+        elif isinstance(expected, (list, tuple)):
+            assert len(actual) == len(expected), path
+            for index, (got, want) in enumerate(zip(actual, expected)):
+                TestFP8Param.assert_state_equal(got, want, f"{path}[{index}]")
+        else:
+            assert actual == expected, path
+
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
-    # MXFP8 params cannot be re-homed into the DDP param buffer ("replace_raw_data for
-    # MXFP8Tensor is not supported yet"), so mxfp8 + --fp8-param-gather always runs with
-    # reuse_grad_buf_for_mxfp8_param_ag. That covers the shared param/grad buffer branch of
-    # the re-derivation; tensorwise and delayed cover the direct quantize_param_shard branch.
-    # LayerWiseDistributedOptimizer is a ChainedOptimizer nested inside the outer one, so
-    # it re-derives through ChainedOptimizer._stage_model_params_from_main_params. Covered
-    # on mxfp8 only: tensorwise + muon does not round-trip on some ranks for a reason that
-    # predates this change -- the layer-wise path quantizes from the FP32 main param while
-    # DistributedOptimizer quantizes from bf16(main), so the two derive different tensorwise
-    # scales from a checkpoint that stores BF16.
+    @pytest.mark.parametrize("overlap", [False, True])
     @pytest.mark.parametrize(
-        ("recipe", "reuse_grad_buf", "optimizer_name"),
+        ("recipe", "reuse_grad_buf", "optimizer_name", "use_param_layout"),
         [
-            ("mxfp8", True, "adam"),
-            ("tensorwise", False, "adam"),
-            ("delayed", False, "adam"),
-            ("mxfp8", True, "muon"),
+            ("mxfp8", True, "adam", True),
+            ("tensorwise", False, "adam", True),
+            ("delayed", False, "adam", True),
+            ("blockwise", False, "adam", True),
+            # The MXFP8 opt-in must not redirect Adam's blockwise native FP8 gather.
+            ("blockwise", True, "adam", True),
+            ("mxfp8", True, "muon", False),
+            ("mxfp8", True, "muon", True),
+            ("blockwise", False, "muon", False),
+            ("blockwise", False, "muon", True),
         ],
     )
+    @pytest.mark.launch_on_gb200
     def test_fp8_param_checkpoint_resume_is_bitwise_exact(
-        self, tmp_path_dist_ckpt, monkeypatch, tp_size, recipe, reuse_grad_buf, optimizer_name
+        self,
+        tmp_path_dist_ckpt,
+        monkeypatch,
+        tp_size,
+        overlap,
+        recipe,
+        reuse_grad_buf,
+        optimizer_name,
+        use_param_layout,
     ):
-        """A resumed run must hold exactly the quantized weights the saving run held.
+        """Save/load preserves codes, then resumes the same losses and optimizer state.
 
-        Quantized params are dequantized to BF16 for the checkpoint and MXFP8 block scales
-        are not stored, so loading re-quantizes a value that has already been through one
-        quantization round trip, whereas a training step quantizes the FP32 main param. Same
-        quantizer, same blocks, different input: roughly 5% of 32-element blocks come back
-        one E8M0 exponent finer, and every element in those blocks re-encodes. The load path
-        re-derives the params from the restored FP32 main params, which reproduces them exactly.
-
-        Tensorwise and delayed scaling are expected to round-trip on their own, and are
-        covered here so the re-derivation cannot silently perturb them.
+        Native FP8 checkpoint values are dequantized to BF16. Loading must derive
+        the live weights from restored FP32 masters, rather than quantizing an
+        already lossy dequantized value again. Both step-time and deferred gathers
+        must reproduce uninterrupted training, including optimizer moments and LR.
         """
-        if recipe == "mxfp8" and get_device_arch_version() < 10:
-            pytest.skip("MXFP8 is supported since Blackwell architecture")
+        require_fp8_recipe(recipe)
         if optimizer_name == "muon" and Version(
             os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")
         ) <= Version("25.05"):
             pytest.skip("Layer-wise optimizer is not supported on LTS")
-        # Delayed scaling stores its FP8 metadata as a pickled TE extra state, which TE
-        # refuses to load by default. This checkpoint is created by the test and is
-        # therefore trusted.
         monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
+        self.seq_length = 256  # TP2 blockwise sequence-parallel partitions need 128 tokens.
+        self.micro_batch_size = 1
         kwargs = {
-            "overlap_param_gather": True,
-            "overlap_grad_reduce": True,
+            "num_layers": 2,
+            "padded_vocab_size": 512,
+            "ffn_hidden_size": 256,
+            "hidden_dropout": 0.0,
+            "attention_dropout": 0.0,
+            "clip_grad": 1.0,
+            "attention_backend": "unfused",
+            "overlap_param_gather": overlap,
+            "overlap_grad_reduce": overlap,
             "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf,
             "optimizer": optimizer_name,
+            "use_layer_wise_param_layout": use_param_layout,
         }
         if optimizer_name == "muon":
-            # validate_args turns --optimizer muon + --use-distributed-optimizer into the
-            # layer-wise optimizer.
             kwargs["muon_tp_mode"] = "duplicated"
-        # TempNamedDir(sync=True) barriers, so the process group has to exist first.
-        Utils.initialize_distributed()
-        with TempNamedDir(tmp_path_dist_ckpt / "test_fp8_ckpt_resume", sync=True) as ckpt_dir:
-            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+        # deterministic_mode seeds the model-parallel RNG, so its groups must exist first.
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        with (
+            deterministic_mode(),
+            TempNamedDir(tmp_path_dist_ckpt / "test_fp8_ckpt_resume", sync=True) as ckpt_dir,
+        ):
+            args, model, optimizer, scheduler = self.setup_checkpoint_case(
                 tp_size, recipe, str(ckpt_dir), **kwargs
             )
-            self.run_train_steps(args, model, optimizer, num_steps=3)
-            # Mirror save_checkpoint_and_time: the params are staged from the FP32 main params
-            # and gathered before the state dict is taken.
+            if optimizer_name == "muon" or recipe == "blockwise":
+                counts = assert_param_storage_policy(model[0], args)
+                if optimizer_name == "adam" and recipe == "blockwise":
+                    assert counts["adam_blockwise"]
+            self.run_train_steps(args, model, optimizer, 3, scheduler)
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
-            save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
+            saved_optimizer = self.complete_optimizer_state(optimizer)
+            saved_scheduler = self.snapshot_optimizer_state(scheduler.state_dict())
+            save_checkpoint(3, model, optimizer, scheduler, 0)
             torch.distributed.barrier()
 
+            # Continue the saving run as the reference; all state snapshots are copies.
+            model[0].reset_param_sync_dispatch_state()
+            reference_losses = self.run_train_steps(args, model, optimizer, 3, scheduler)
+            force_param_sync(model, optimizer=optimizer)
+            reference_params = self.quantized_param_state(model[0])
+            reference_optimizer = self.complete_optimizer_state(optimizer)
+            reference_scheduler = self.snapshot_optimizer_state(scheduler.state_dict())
+            del model, optimizer, scheduler
             self.cleanup_between_runs()
 
-            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+            args, model, optimizer, scheduler = self.setup_checkpoint_case(
                 tp_size, recipe, str(ckpt_dir), **kwargs
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
-            assert iteration == 3
+            # setup_model_and_optimizer performs the single production load.
+            assert args.iteration == 3
             loaded_state = self.quantized_param_state(model[0])
+            self.assert_state_equal(loaded_state, saved_state, "loaded.quantized_params")
+            self.assert_state_equal(
+                self.complete_optimizer_state(optimizer), saved_optimizer, "loaded.optimizer"
+            )
+            self.assert_state_equal(scheduler.state_dict(), saved_scheduler, "loaded.scheduler")
+            model[0].reset_param_sync_dispatch_state()
+            resumed_losses = self.run_train_steps(args, model, optimizer, 3, scheduler)
+            force_param_sync(model, optimizer=optimizer)
+            self.assert_state_equal(resumed_losses, reference_losses, "resumed.losses")
+            self.assert_state_equal(
+                self.quantized_param_state(model[0]), reference_params, "resumed.quantized_params"
+            )
+            self.assert_state_equal(
+                self.complete_optimizer_state(optimizer), reference_optimizer, "resumed.optimizer"
+            )
+            self.assert_state_equal(
+                scheduler.state_dict(), reference_scheduler, "resumed.scheduler"
+            )
 
-        # Each layer contributes 4 GEMM weights: qkv, proj, fc1, fc2. Assert the count rather
-        # than just non-emptiness, so a config change that quietly drops --fp8-param-gather
-        # cannot turn this into a vacuous pass.
         assert len(saved_state) == 4 * args.num_layers, sorted(saved_state)
-        assert saved_state.keys() == loaded_state.keys()
-        mismatches = []
-        for name, saved_tensors in saved_state.items():
-            for attr, saved_tensor in saved_tensors.items():
-                loaded_tensor = loaded_state[name][attr]
-                num_differing = int((saved_tensor != loaded_tensor).sum())
-                if num_differing:
-                    mismatches.append(f"{name}{attr}: {num_differing}/{saved_tensor.numel()}")
-        assert (
-            not mismatches
-        ), "quantized params changed across a checkpoint round trip:\n" + "\n".join(mismatches)

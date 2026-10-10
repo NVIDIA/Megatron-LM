@@ -188,13 +188,13 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
     get_wandb_writer,
-    get_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -2356,12 +2356,10 @@ def wrap_model_chunks_with_ddp(
     Centralises the DDP-wrapping wiring shared between :func:`get_model` and
     unit tests.
 
-    For ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``:
-    forces ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed
-    for reduce-scatter), and computes per-chunk shard-aligned layouts via
-    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. With
-    ``use_layer_wise_param_layout=False``, no layout is supplied and LayerWise falls back
-    to its legacy ``allgather_params`` sync path.
+    For ``use_layer_wise_distributed_optimizer=True``, padded layout keeps Muon in
+    LayerWise and scalar parameters in DistributedOptimizer. Compact layout keeps
+    both optimizers inside LayerWise, with whole-parameter ownership and all-reduced
+    gradients. Its private DDP config does not enable DistributedOptimizer.
 
     For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
     computes per-chunk byte-level layouts via
@@ -2376,12 +2374,12 @@ def wrap_model_chunks_with_ddp(
     Args:
         model_chunks: List of model chunks to wrap (un-DDP-wrapped).
         config: :class:`TransformerConfig`.
-        ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
-            ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``.
+        ddp_config: :class:`DistributedDataParallelConfig`. Padded LayerWise enables
+            DistOpt in place; compact LayerWise uses a private configuration copy.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout
-            to DDP. ``False`` keeps LayerWise on its legacy sync path.
+            selects padded Muon plus sharded Adam (True), or compact LayerWise
+            ownership for both Muon and Adam (False).
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
@@ -2404,13 +2402,23 @@ def wrap_model_chunks_with_ddp(
     # Compute per-chunk layouts (DDP only).
     per_chunk_layouts = [None] * n
     if DP is DDP:
-        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
-            ddp_config.use_distributed_optimizer = True
-            compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-            # Tag params so DDP buffer grouping routes LayerWise-managed matrices
-            # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
-            # everything else (embeddings, biases, layernorm) to a separate
-            # DistOpt-style buffer.
+        if use_layer_wise_distributed_optimizer:
+            if use_layer_wise_param_layout:
+                ddp_config.use_layer_wise_param_layout = True
+                ddp_config.use_distributed_optimizer = True
+                compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+            else:
+                # Keep main's compact LayerWise(Muon + Adam) ownership. Bucket sizing
+                # has already been resolved, so clear the count in this private copy.
+                ddp_config = dataclasses.replace(
+                    ddp_config,
+                    use_distributed_optimizer=False,
+                    use_layer_wise_param_layout=False,
+                    num_buckets=None,
+                )
+                compute_layout = None
+            # Retain the Muon/scalar distinction for the shared FP8 reuse policy.
+            # Compact LayerWise owns both kinds; padded Adam keeps its DistOpt buffer.
             tag_params_for_buffer_routing(model_chunks)
         elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout
@@ -3351,8 +3359,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         else:
             adjust_tensor_shapes_fn = None
 
-        # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
-        # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
+        # For FP8 parameters that reuse gradient storage with overlapped gather,
+        # we need to call _copy_main_params_to_param_buffer() after the grad buffer
         # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
         #
         # However, we should skip this on the first iteration when forward_pre_hook is disabled,
@@ -3369,21 +3377,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # DistributedOptimizer config that owns the buffers and hooks; non-overlapped
         # optimizers stage during optimizer.step().
         optimizer_instances = getattr(optimizer, 'chained_optimizers', [optimizer])
-        mxfp8_overlap_optimizers = [
+        reused_buffer_overlap_optimizers = [
             optim_instance
             for optim_instance in optimizer_instances
             if (
                 isinstance(optim_instance, DistributedOptimizer)
-                and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and optim_instance.reuse_grad_buffer_for_param_ag
                 and optim_instance.ddp_config.overlap_param_gather
             )
         ]
-        if mxfp8_overlap_optimizers:
+        if reused_buffer_overlap_optimizers:
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
-                for optim_instance in mxfp8_overlap_optimizers:
+                for optim_instance in reused_buffer_overlap_optimizers:
                     optim_instance._copy_main_params_to_param_buffer()
 
         if getattr(config, "sequence_packing_scheduler", None) is not None:
@@ -4920,7 +4928,12 @@ def train(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        copy_main_params = any(
+            isinstance(optim_instance, DistributedOptimizer)
+            and optim_instance.reuse_grad_buffer_for_param_ag
+            and optim_instance.ddp_config.overlap_param_gather
+            for optim_instance in getattr(optimizer, 'chained_optimizers', [optimizer])
+        )
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
@@ -5689,7 +5702,8 @@ def evaluate(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        # Evaluation has no optimizer from which to restage master parameters.
+        copy_main_params = False
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
