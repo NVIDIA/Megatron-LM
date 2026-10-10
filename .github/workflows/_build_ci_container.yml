@@ -30,6 +30,11 @@ on:
         required: false
         default: nvidia-ci-aws-gpu-x8
         type: string
+      selected-runner-gcp-h100:
+        description: Runner label for an additional Singapore GCP H100 build
+        required: false
+        default: nvidia-ci-gcp-cpu-h100
+        type: string
       selected-runner-gb200:
         description: Runner label for the GB200 build
         required: false
@@ -49,6 +54,11 @@ on:
         type: string
       use-gcp-h100:
         description: Build and publish the H100 image on the Singapore GCP CPU runner
+        required: false
+        default: false
+        type: boolean
+      include-gcp-h100:
+        description: Also build and publish the Singapore GCP H100 image alongside the selected H100 build
         required: false
         default: false
         type: boolean
@@ -94,10 +104,12 @@ jobs:
           IS_MAINTAINER: ${{ inputs.is-maintainer }}
           ENABLE_GB_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           SELECTED_RUNNER: ${{ inputs.selected-runner }}
+          SELECTED_RUNNER_GCP_H100: ${{ inputs.selected-runner-gcp-h100 }}
           SELECTED_RUNNER_GB_GPU: ${{ inputs.selected-runner-gb200 }}
           REGISTRY_AWS: ${{ inputs.registry-aws }}
           REGISTRY_GCP_H100: ${{ inputs.registry-gcp-h100 }}
           USE_GCP_H100: ${{ inputs.use-gcp-h100 }}
+          INCLUDE_GCP_H100: ${{ inputs.include-gcp-h100 }}
           REGISTRY_GB_GPU: ${{ inputs.registry-gb200 }}
         run: |
           if [ "$IS_MAINTAINER" = "true" ] && [ "$USE_GCP_H100" = "true" ]; then
@@ -108,6 +120,11 @@ jobs:
             AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
               '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
             H100_MATRIX=$(jq -nc --argjson aws "$AWS_H100" '[$aws]')
+            if [ "$IS_MAINTAINER" = "true" ] && [ "$INCLUDE_GCP_H100" = "true" ]; then
+              GCP_H100=$(jq -nc --arg registry "$REGISTRY_GCP_H100" --arg runner "$SELECTED_RUNNER_GCP_H100" \
+                '{"cloud": "gcp-h100", "registry": $registry, "runner": $runner}')
+              H100_MATRIX=$(jq -nc --argjson h100 "$H100_MATRIX" --argjson gcp "$GCP_H100" '($h100 + [$gcp])')
+            fi
           fi
           if [ "$IS_MAINTAINER" = "true" ] && [ "$ENABLE_GB_TESTING" = "true" ]; then
             GB_GPU=$(jq -nc --arg registry "$REGISTRY_GB_GPU" --arg runner "$SELECTED_RUNNER_GB_GPU" \
@@ -334,7 +351,7 @@ jobs:
           echo "pr-build-hash=$PR_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Configure GAR Docker authentication
-        if: inputs.is-maintainer && inputs.use-gcp-h100 && matrix.cloud == 'gcp-h100' && startsWith(matrix.registry, 'asia-southeast1-docker.pkg.dev/')
+        if: inputs.is-maintainer && matrix.cloud == 'gcp-h100' && startsWith(matrix.registry, 'asia-southeast1-docker.pkg.dev/')
         shell: bash
         env:
           REGISTRY: ${{ matrix.registry }}
