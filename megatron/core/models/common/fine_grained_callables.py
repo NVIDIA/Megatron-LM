@@ -18,6 +18,11 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.models.gpt.fine_grained_callables import build_transformer_layer_callables
+from megatron.core.models.hybrid.fine_grained_callables import (
+    build_hybrid_stack_callables,
+    get_hybrid_stack_moe_metadata,
+)
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
@@ -67,8 +72,12 @@ def build_mtp_layer_callables(layer):
             offset = get_mtp_layer_offset(
                 layer.config, model.vp_stage, pp_rank=model.pg_collection.pp.rank()
             )
-            node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
-            hidden_states = node.chunk_state.mtp_hidden_states[offset]
+            chunks = list(torch.chunk(hidden_states, 1 + offset, dim=0))
+            # These chunks cross from pre-dispatch to MTP post-process. Detach
+            # their stored views so the slots do not traverse final_norm's graph
+            # twice; node.backward_impl merges their gradients into this slot.
+            node.chunk_state.mtp_hidden_states = [node.detach(chunk) for chunk in chunks]
+            hidden_states = chunks[offset]
 
         input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states = (
             layer._get_embeddings(
@@ -154,6 +163,8 @@ def get_layer_moe_metadata(layer):
 
     if isinstance(layer, MultiTokenPredictionLayer):
         return get_layer_moe_metadata(layer.mtp_model_layer)
+    if isinstance(layer, HybridStack):
+        return get_hybrid_stack_moe_metadata(layer)
     if isinstance(layer, TransformerLayer):
         is_moe = isinstance(layer.mlp, MoELayer)
         num_local_experts = layer.mlp.num_local_experts if is_moe else None
@@ -170,6 +181,9 @@ def build_layer_callables(layer):
 
     if isinstance(layer, MultiTokenPredictionLayer):
         return build_mtp_layer_callables(layer)
+    if isinstance(layer, HybridStack):
+        forward_funcs, backward_dw, _, _ = build_hybrid_stack_callables(layer)
+        return forward_funcs, backward_dw
     if isinstance(layer, TransformerLayer):
         return build_transformer_layer_callables(layer)
 
