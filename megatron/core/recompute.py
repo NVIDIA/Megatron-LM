@@ -24,18 +24,14 @@ def use_te_checkpoint(config) -> bool:
     TE's checkpoint is used under FP8/FP4 — ``tensor_parallel.checkpoint`` recomputes outside the
     FP8 autocast, so a TE module in the region would recompute in BF16 (or dequantize FP8
     parameters and lose their ``main_grad``), whereas TE's checkpoint re-enters the recorded FP8
-    state — and under chunk-granularity Transformer Engine CUDA graphs for any precision: the
+    state — and under chunk-wise Transformer Engine CUDA graphs for any precision: the
     captured block contains the checkpointed forward and its recompute as one unit, whereas
     ``tensor_parallel.checkpoint`` runs the forward without a checkpoint node during graph warm-up
     and capture, which would keep every activation of the block alive inside the graph.
     """
     if config.fp8 or config.fp4:
         return True
-    return (
-        te_checkpoint is not None
-        and config.cuda_graph_impl == "transformer_engine"
-        and getattr(config, "cuda_graph_granularity", "layer") == "chunk"
-    )
+    return te_checkpoint is not None and getattr(config, "cuda_graph_impl", "none") == "chunk_wise"
 
 
 def checkpoint_activations(config, function, distribute_saved_activations, tp_group, *args):

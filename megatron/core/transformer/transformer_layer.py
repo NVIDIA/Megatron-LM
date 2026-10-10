@@ -1107,7 +1107,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if (
             self.is_moe_layer
-            and self.config.cuda_graph_impl == "transformer_engine"
+            and self.config.cuda_graph_impl in ("transformer_engine", "chunk_wise")
             and self.training
             and is_graph_capturing()
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules
@@ -2535,7 +2535,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # intermediate outputs + HC state. The post-processing will be done during replay.
         if (
             self.is_moe_layer
-            and self.config.cuda_graph_impl == "transformer_engine"
+            and self.config.cuda_graph_impl in ("transformer_engine", "chunk_wise")
             and self.training
             and is_graph_capturing()
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules

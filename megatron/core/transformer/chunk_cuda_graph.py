@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Chunk-granularity Transformer Engine CUDA graphs.
+"""Chunk-wise Transformer Engine CUDA graphs.
 
-With ``cuda_graph_granularity="chunk"`` the decoder block of every PP/VPP model chunk (and, on the
+With ``cuda_graph_impl="chunk_wise"`` the decoder block of every PP/VPP model chunk (and, on the
 last stage, the post-process block: MTP, LM head and loss) is the callable handed to Transformer
 Engine's ``make_graphed_callables`` instead of the individual layers. One forward graph and one
 backward graph are captured per callable and microbatch slot, so activation recompute, MoE
@@ -208,7 +208,7 @@ class ChunkCudaGraphBlockMixin:
 
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """Run the block forward on the static inputs so TE records it as one graph."""
-        if self.config.cuda_graph_granularity != "chunk":
+        if self.config.cuda_graph_impl != "chunk_wise":
             return super()._te_cuda_graph_capture(*args, **kwargs)
 
         args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
@@ -274,7 +274,7 @@ class ChunkCudaGraphBlockMixin:
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """Replay the graph of microbatch ``current_microbatch``."""
-        if self.config.cuda_graph_granularity != "chunk":
+        if self.config.cuda_graph_impl != "chunk_wise":
             return super()._te_cuda_graph_replay(*args, **kwargs)
 
         args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
@@ -416,14 +416,13 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
 def build_postprocess_block(model, block_cls):
     """Attach a post-process chunk callable to ``model`` when the configuration supports it.
 
-    Post-process capture is part of chunk granularity for packed-sequence (THD) training on the
+    Post-process capture is part of chunk-wise graphs for packed-sequence (THD) training on the
     last pipeline stage; other layouts keep the eager post-process.
     """
     config = model.config
     if not (
         model.post_process
-        and config.cuda_graph_impl == "transformer_engine"
-        and config.cuda_graph_granularity == "chunk"
+        and config.cuda_graph_impl == "chunk_wise"
         and config.sequence_packing_scheduler is not None
     ):
         return None

@@ -1201,9 +1201,7 @@ def validate_args(args, defaults={}):
                 "--inference-dynamic-batching-sampling-backend=torch."
             ) from e
 
-    if args.moe_megakernel_backend == "mok" and (
-        args.use_megatron_fsdp or args.use_torch_fsdp2
-    ):
+    if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
     if args.use_megatron_fsdp:
@@ -2176,12 +2174,12 @@ def validate_args(args, defaults={}):
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
         if (
-            "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
-            and not args.te_rng_tracker
-        ):
+            args.transformer_impl == "transformer_engine"
+            or args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
+        ) and not args.te_rng_tracker:
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        if args.cuda_graph_impl == "transformer_engine":
+        if args.cuda_graph_impl in ("transformer_engine", "chunk_wise"):
             assert (
                 "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
                 or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"

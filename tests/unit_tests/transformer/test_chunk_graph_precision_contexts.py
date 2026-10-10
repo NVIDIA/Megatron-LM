@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-"""Precision handling inside chunk-granularity CUDA graph captures: BF16 boundary layers must opt
+"""Precision handling inside chunk-wise CUDA graph captures: BF16 boundary layers must opt
 out of the block-wide FP8 context, and activation checkpointing must go through TE's checkpoint
 (mcore's tensor_parallel.checkpoint skips the checkpoint node while a graph is captured)."""
 
@@ -24,8 +24,7 @@ def _config(**overrides):
 
 
 _CHUNK = dict(
-    cuda_graph_impl="transformer_engine",
-    cuda_graph_granularity="chunk",
+    cuda_graph_impl="chunk_wise",
     cuda_graph_modules=[],
     cuda_graph_dynamic_microbatches=True,
     sequence_packing_scheduler="dp_balanced",
@@ -42,9 +41,7 @@ class TestChunkGraphPrecisionContexts:
         assert use_te_checkpoint(_config(fp8="e4m3", fp8_recipe="mxfp8"))
         # BF16: mcore's checkpoint outside graphs ...
         assert not use_te_checkpoint(_config())
-        assert not use_te_checkpoint(
-            _config(cuda_graph_impl="transformer_engine", cuda_graph_granularity="layer")
-        )
+        assert not use_te_checkpoint(_config(cuda_graph_impl="transformer_engine"))
         # ... but TE's checkpoint inside a chunk capture, where mcore's would skip checkpointing.
         assert use_te_checkpoint(_config(**_CHUNK))
 
@@ -156,7 +153,7 @@ class TestChunkGraphPrecisionContexts:
                 assert not FP8GlobalStateManager.is_fp8_enabled()
         # Outside chunk captures the boundary layers simply get no FP8 context of their own
         # (per-layer capture never runs them under an outer one).
-        config.cuda_graph_granularity = "layer"
+        config.cuda_graph_impl = "transformer_engine"
         with te.fp8_autocast(enabled=True, fp8_recipe=get_fp8_recipe(config)):
             with get_layer_fp8_context(config, 0):
                 assert FP8GlobalStateManager.is_fp8_enabled()

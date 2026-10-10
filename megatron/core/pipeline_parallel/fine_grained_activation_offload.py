@@ -442,7 +442,7 @@ class PipelineOffloadManager:
         self._is_warmup = True
         # Whether the manager is in CUDA graph replay phase.
         self._in_replay = False
-        # Whole-block (chunk-granularity TE CUDA graph) capture mode, see enter_block_capture().
+        # Whole-block (chunk-wise TE CUDA graph) capture mode, see enter_block_capture().
         self._block_capture = False
         self._block_capture_keep_last_group = False
         self._block_capture_live_chunks = []
@@ -753,12 +753,12 @@ class PipelineOffloadManager:
         self._cached_chunks_forward.append(cur_chunk)
 
     def enter_block_capture(self, keep_last_group=False):
-        """Serve a whole-block (chunk-granularity) TE CUDA graph capture.
+        """Serve a whole-block (chunk-wise) TE CUDA graph capture.
 
         ``keep_last_group``: keep the last group of every name resident per slot (see
         ``_block_capture_keep_last_groups``; ``fine_grained_offloading_graph_keep_last_group``).
 
-        With chunk-granularity graphs the offload hooks run only inside the captured block, so
+        With chunk-wise graphs the offload hooks run only inside the captured block, so
         nothing drives this manager at replay and every slot's graphs must be self-contained:
         each capture-time model-chunk forward gets its own handler cloned from the warm-up
         policy (``begin_block_capture_chunk``) with fresh, never pooled pinned buffers, a backward
@@ -768,7 +768,7 @@ class PipelineOffloadManager:
         """
         if self._is_warmup:
             assert self._cached_chunks_forward, (
-                "Chunk-granularity CUDA graphs with fine-grained activation offloading need at "
+                "Chunk-wise CUDA graphs with fine-grained activation offloading need at "
                 "least one eager warm-up iteration (cuda_graph_warmup_steps >= 1) to record the "
                 "offload policy before capture."
             )
@@ -1727,7 +1727,7 @@ class FineGrainedActivationOffloadingInterface:
 
     @staticmethod
     def enter_block_capture(keep_last_group=False):
-        """Enter the whole-block (chunk-granularity) TE CUDA graph capture mode."""
+        """Enter the whole-block (chunk-wise) TE CUDA graph capture mode."""
         PipelineOffloadManager.get_instance().enter_block_capture(keep_last_group=keep_last_group)
 
     @staticmethod

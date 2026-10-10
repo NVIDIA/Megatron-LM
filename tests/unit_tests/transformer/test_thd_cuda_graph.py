@@ -1245,7 +1245,7 @@ class TestDecomposeReconstruct:
     @pytest.mark.parametrize("scope", ["layer", "block"])
     def test_reconstruct_preserves_cu_tensors_and_uses_conservative_padding_flag(self, scope):
         """Reconstruction preserves cu tensors and uses a graph-static padding flag — for a layer
-        callable and for the chunk-granularity block callable alike."""
+        callable and for the chunk-wise block callable alike."""
         psp = _make_psp([100, 50, 30])
         orig = {
             k: getattr(psp, k).clone()
@@ -1337,8 +1337,7 @@ def _build_chunk_gpt_model(
         hidden_dropout=0.0,
         attention_dropout=0.0,
         mtp_num_layers=mtp_layers or None,
-        cuda_graph_impl="transformer_engine",
-        cuda_graph_granularity="chunk",
+        cuda_graph_impl="chunk_wise",
         cuda_graph_modules=[],
         cuda_graph_dynamic_microbatches=True,
         sequence_packing_scheduler="dp_balanced",

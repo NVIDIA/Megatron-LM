@@ -2166,6 +2166,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
+
             # Treat missing and explicit None identifier values as equivalent.
             # Wrap each component so None never compares directly with floats or strings.
             def key_fn(pg):
@@ -2173,6 +2174,7 @@ def preprocess_common_state_dict(common_state_dict):
                     (value is not None, value)
                     for value in (pg.get(key) for key in param_group_identifier_keys)
                 ]
+
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -5055,9 +5057,9 @@ def train(
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            # Chunk CUDA graphs capture into the shared pool; the optimizer step joins it.
+            # Chunk-wise CUDA graphs capture into the shared pool; the optimizer step joins it.
             use_single_mempool=(
-                config.cuda_graph_use_single_mempool or config.cuda_graph_granularity == "chunk"
+                config.cuda_graph_use_single_mempool or config.cuda_graph_impl == "chunk_wise"
             ),
         )
 
@@ -5138,7 +5140,7 @@ def train(
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # Initialize CUDA Graphs helper.
-    if args.cuda_graph_impl == "transformer_engine":
+    if args.cuda_graph_impl in ("transformer_engine", "chunk_wise"):
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
@@ -5217,7 +5219,7 @@ def train(
 
         # Capture CUDA Graphs.
         if (
-            args.cuda_graph_impl == "transformer_engine"
+            args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
             and not cuda_graph_helper.capture_finished()
             and iteration - start_iteration == args.cuda_graph_warmup_steps
         ):
@@ -5357,7 +5359,7 @@ def train(
                     pre_hook_enabled = True
                     # Set the manual hooks here since it's not set right after the capturing.
                     if (
-                        args.cuda_graph_impl == "transformer_engine"
+                        args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
                         and args.cuda_graph_warmup_steps == 0
                     ):
                         assert (
@@ -5576,7 +5578,10 @@ def train(
             break
 
     # Destroy CUDA Graphs.
-    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if (
+        args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
+        and cuda_graph_helper.graphs_created()
+    ):
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph

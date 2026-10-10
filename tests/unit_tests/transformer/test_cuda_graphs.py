@@ -2385,13 +2385,12 @@ def is_nccl_ep_available():
     return HAVE_TE_EP
 
 
-class TestChunkGranularity:
-    """Chunk-granularity TE CUDA graphs: config validation, CLI, callable selection."""
+class TestChunkWiseCudaGraphs:
+    """Chunk-wise TE CUDA graphs (cuda_graph_impl='chunk_wise'): config validation, callable selection."""
 
     def test_chunk_config_accepts_full_recompute(self):
         cfg = _base_cuda_graph_config(
-            cuda_graph_impl='transformer_engine',
-            cuda_graph_granularity='chunk',
+            cuda_graph_impl='chunk_wise',
             cuda_graph_modules=[],
             recompute_granularity='full',
             recompute_method='uniform',
@@ -2399,33 +2398,24 @@ class TestChunkGranularity:
             hidden_dropout=0.0,
             attention_dropout=0.0,
         )
-        assert cfg.cuda_graph_granularity == 'chunk'
+        assert cfg.cuda_graph_impl == 'chunk_wise'
 
     def test_chunk_config_accepts_fine_grained_activation_offloading(self):
         cfg = _base_cuda_graph_config(
-            cuda_graph_impl='transformer_engine',
-            cuda_graph_granularity='chunk',
+            cuda_graph_impl='chunk_wise',
             cuda_graph_modules=[],
             fine_grained_activation_offloading=True,
             offload_modules=['core_attn', 'attn_proj'],
         )
-        assert cfg.cuda_graph_granularity == 'chunk'
+        assert cfg.cuda_graph_impl == 'chunk_wise'
         assert cfg.fine_grained_activation_offloading
 
     @pytest.mark.parametrize(
         "overrides, match",
         [
-            ({'cuda_graph_impl': 'local', 'cuda_graph_modules': []}, "transformer_engine"),
+            ({'cuda_graph_modules': [CudaGraphModule.attn]}, "cuda_graph_modules must be empty"),
             (
                 {
-                    'cuda_graph_impl': 'transformer_engine',
-                    'cuda_graph_modules': [CudaGraphModule.attn],
-                },
-                "cuda_graph_modules must be empty",
-            ),
-            (
-                {
-                    'cuda_graph_impl': 'transformer_engine',
                     'cuda_graph_modules': [],
                     'recompute_granularity': 'full',
                     'recompute_method': 'uniform',
@@ -2439,10 +2429,10 @@ class TestChunkGranularity:
     )
     def test_chunk_config_rejections(self, overrides, match):
         with pytest.raises(ValueError, match=match):
-            _base_cuda_graph_config(cuda_graph_granularity='chunk', **overrides)
+            _base_cuda_graph_config(cuda_graph_impl='chunk_wise', **overrides)
 
     def test_chunk_uses_outer_block_callable(self):
-        config = SimpleNamespace(cuda_graph_granularity='chunk')
+        config = SimpleNamespace(cuda_graph_impl='chunk_wise')
         for block_type in (TransformerBlock, HybridStack):
             block = object.__new__(block_type)
             object.__setattr__(block, 'config', config)

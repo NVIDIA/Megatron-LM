@@ -135,12 +135,6 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             and config.recompute_granularity == "selective"
             and "mhc" in (config.recompute_modules or [])
             and not uses_mhc_recompute_attn_cuda_graph_split(config)
-            # Chunk capture records producer, checkpoint registration, recompute and consumer
-            # of the whole HybridStack as one graph, so the per-layer concern below does not apply.
-            and not (
-                config.cuda_graph_impl == "transformer_engine"
-                and getattr(config, 'cuda_graph_granularity', 'layer') == "chunk"
-            )
         ):
             # Warn rather than reject: this combination was constructible before the
             # attention-only split existed and nothing here is known to be wrong, it
@@ -963,7 +957,7 @@ class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
     """
 
     def create_mcore_cudagraph_manager(self, config):
-        """The stack is graphed as a whole only through Transformer Engine (chunk granularity);
+        """The stack is graphed as a whole only through Transformer Engine (chunk-wise graphs);
         the local CUDA graph implementation keeps graphing its layers."""
         return None
 

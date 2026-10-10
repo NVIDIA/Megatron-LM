@@ -1639,9 +1639,19 @@ class CudaGraphManager(torch.nn.Module):
 
 
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
-def is_chunk_cuda_graph_granularity(config) -> bool:
-    """Whether ``config`` selects chunk-granularity (whole decoder block) TE CUDA graphs."""
-    return getattr(config, 'cuda_graph_granularity', 'layer') == "chunk"
+TE_CUDA_GRAPH_IMPLS = ("transformer_engine", "chunk_wise")
+
+
+def uses_te_cuda_graphs(config) -> bool:
+    """Whether ``config`` captures its training CUDA graphs with Transformer Engine's
+    ``make_graphed_callables`` (per layer with ``transformer_engine``, whole decoder blocks with
+    ``chunk_wise``)."""
+    return getattr(config, 'cuda_graph_impl', 'none') in TE_CUDA_GRAPH_IMPLS
+
+
+def is_chunk_wise_cuda_graph(config) -> bool:
+    """Whether ``config`` selects chunk-wise (whole decoder block) TE CUDA graphs."""
+    return getattr(config, 'cuda_graph_impl', 'none') == "chunk_wise"
 
 
 def _layer_is_graphable(layer, config):
@@ -1655,7 +1665,7 @@ def _layer_is_graphable(layer, config):
 
     # Chunk granularity graphs the decoder block (and the post-process block) as a whole; the
     # per-layer module scopes below do not describe those callables.
-    if is_chunk_cuda_graph_granularity(config):
+    if is_chunk_wise_cuda_graph(config):
         return bool(getattr(layer, 'is_cuda_graph_chunk_callable', False))
 
     # If cuda_graph_modules is not set, every layer is graphed.
@@ -1792,9 +1802,9 @@ class TECudaGraphHelper:
         thd_sequence_length_upper_bound=None,
     ):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
-        assert (
-            config.cuda_graph_impl == "transformer_engine"
-        ), "Option cuda_graph_impl=transformer_engine not enabled."
+        assert uses_te_cuda_graphs(
+            config
+        ), "Option cuda_graph_impl=transformer_engine or chunk_wise not enabled."
         assert (
             "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
             or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
@@ -2246,7 +2256,7 @@ class TECudaGraphHelper:
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
                 else:
                     num_mtp_layers = 0
-                if is_chunk_cuda_graph_granularity(self.config):
+                if is_chunk_wise_cuda_graph(self.config):
                     # The decoder block is the callable (exactly the PP/VPP chunk boundary the
                     # schedule drives). On the last stage the post-process block (which runs MTP,
                     # so the MTP layers are not separate callables) follows it in the same
@@ -3083,7 +3093,7 @@ class TECudaGraphHelper:
                 # invariant after capture.
                 kwargs['_reuse_graph_input_output_buffers'] = True
 
-            if is_chunk_cuda_graph_granularity(self.config):
+            if is_chunk_wise_cuda_graph(self.config):
                 te_parameters = inspect.signature(make_graphed_callables).parameters
                 # One process-wide pool: the optimizer step graph (optimizer_cuda_graph) is
                 # captured into the same pool and reuses the blocks the chunk graphs leave idle.
@@ -3110,7 +3120,7 @@ class TECudaGraphHelper:
                 # since TE currently uses fp8_autocast for both FP8 and FP4 quantization
 
                 def _get_fp8_enabled():
-                    if is_chunk_cuda_graph_granularity(self.config):
+                    if is_chunk_wise_cuda_graph(self.config):
                         # Per-layer FP8/BF16 selection happens inside the block forward; the
                         # outer TE context only enables the quantization bookkeeping.
                         return tuple(True for _ in self.flattened_callables)
@@ -3236,7 +3246,7 @@ class TECudaGraphHelper:
             and has_local_moe_layer
             # Chunk callables capture with the runtime-keyed stash instead of TE's per-layer
             # capture order (see paged_stash_prepare_for_cuda_graph_capture).
-            and not is_chunk_cuda_graph_granularity(self.config)
+            and not is_chunk_wise_cuda_graph(self.config)
         )
 
     def create_cudagraphs(self):
@@ -3251,9 +3261,7 @@ class TECudaGraphHelper:
                     "DSA metric tracker must be initialized before CUDA Graph capture."
                 )
         # getattr: unit tests drive this entry point with stand-in configs.
-        if getattr(self.config, "moe_paged_stash", False) and is_chunk_cuda_graph_granularity(
-            self.config
-        ):
+        if getattr(self.config, "moe_paged_stash", False) and is_chunk_wise_cuda_graph(self.config):
             from megatron.core.transformer.moe.paged_stash import (
                 paged_stash_prepare_for_cuda_graph_capture,
             )
@@ -3280,7 +3288,7 @@ class TECudaGraphHelper:
 
             block_offload_capture = (
                 self.config.fine_grained_activation_offloading
-                and is_chunk_cuda_graph_granularity(self.config)
+                and is_chunk_wise_cuda_graph(self.config)
             )
             if block_offload_capture:
                 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (

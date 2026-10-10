@@ -140,10 +140,10 @@ The split does not support cross-attention or fine-grained offloading of `qkv_li
 `core_attn`, and `attn_proj`. Hybrid wrappers must not combine attention and MLP in the same
 inner layer. Graph capacities and the attention backend's existing THD/CP constraints still apply.
 
-### Chunk granularity (`--cuda-graph-granularity chunk`)
+### Chunk-wise graphs (`--cuda-graph-impl chunk_wise`)
 
-`--cuda-graph-granularity chunk` changes the callable handed to `make_graphed_callables()` from
-each transformer layer to the whole decoder block of every PP/VPP model chunk: one forward graph
+`--cuda-graph-impl chunk_wise` keeps Transformer Engine's `make_graphed_callables()` but changes the
+callable handed to it from each transformer layer to the whole decoder block of every PP/VPP model chunk: one forward graph
 and one backward graph per model chunk and microbatch slot. Activation recompute (including
 `--recompute-granularity full`), MoE dispatch/combine and the hyper-connection residual streams are
 recorded inside the graph, so a training step launches one graph per chunk and pass instead of one
@@ -153,8 +153,7 @@ shares the graph memory pool with the decoder graphs. With `--optimizer-cuda-gra
 step graph is captured into that same pool.
 
 ```bash
---cuda-graph-impl transformer_engine \
---cuda-graph-granularity chunk \
+--cuda-graph-impl chunk_wise \
 --cuda-graph-warmup-steps 2 \
 # packed sequences: static shapes and a capture bound on the packed microbatch count
 --pad-packed-seq-alignment max --thd-max-packed-sequences <N> --cuda-graph-dynamic-microbatches \

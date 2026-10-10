@@ -1845,7 +1845,7 @@ def test_mhc_recompute_with_non_conflicting_offload_modules():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 def test_block_capture_mode_serves_one_handler_per_capture_forward():
-    """Chunk-granularity CUDA graphs drive the offload manager in block-capture mode.
+    """Chunk-wise CUDA graphs drive the offload manager in block-capture mode.
 
     Warm-up records two virtual pipeline stages (two ``mlp`` groups on stage 0; two ``mlp``
     groups and a ``post`` group on stage 1). In block-capture mode every capture-time decoder

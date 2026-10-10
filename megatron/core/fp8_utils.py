@@ -1018,7 +1018,7 @@ else:
 def get_layer_fp8_context(config: TransformerConfig, layer_no: int, is_mtp_layer: bool = False):
     """FP8 context for one layer of a block whose enclosing FP8 state cannot be inherited.
 
-    Chunk-granularity CUDA graphs capture a whole block under one ``fp8_autocast`` (the outer
+    Chunk-wise CUDA graphs capture a whole block under one ``fp8_autocast`` (the outer
     context enables the quantization bookkeeping for every layer of the block). While it warms
     up and captures, TE wraps the ``__call__`` of the *class* of every graphed module in that
     autocast, so an instance of the same class that is not itself one of the graphed callables
@@ -1038,7 +1038,7 @@ def get_layer_fp8_context(config: TransformerConfig, layer_no: int, is_mtp_layer
 
     Outside chunk graphs this is exactly ``get_fp8_context``.
     """
-    if not config.fp8 or getattr(config, "cuda_graph_granularity", "layer") != "chunk":
+    if not config.fp8 or getattr(config, "cuda_graph_impl", "none") != "chunk_wise":
         return get_fp8_context(config, layer_no)
     if is_mtp_layer:
         return get_fp8_context(config)

@@ -493,7 +493,7 @@ class PagedStashManager:
     def configure_runtime_schedule(self, enabled, config):
         """Select recorded-order or runtime-keyed scheduling for this iteration.
 
-        Chunk-granularity TE CUDA graphs capture whole decoder blocks, so a captured backward
+        Chunk-wise TE CUDA graphs capture whole decoder blocks, so a captured backward
         holds each layer's reload (and, with full recompute, its recompute forward) itself. The
         stash keys are then the live (vp, layer, microbatch) coordinates and no cross-layer
         prefetch is derived from the recorded pipeline order.
@@ -501,8 +501,7 @@ class PagedStashManager:
         self.runtime_schedule = bool(
             enabled
             and config is not None
-            and getattr(config, 'cuda_graph_impl', 'none') == 'transformer_engine'
-            and getattr(config, 'cuda_graph_granularity', 'layer') == 'chunk'
+            and getattr(config, 'cuda_graph_impl', 'none') == 'chunk_wise'
             and getattr(config, 'moe_paged_stash', False)
         )
         self.runtime_schedule_stash_activations = bool(
@@ -1415,7 +1414,7 @@ class PagedStashRunner:
         """Fail fast when a captured TE whole-MoE graph exceeds its static buffers."""
         te_whole_moe_graph_replay = (
             training
-            and self.config.cuda_graph_impl == "transformer_engine"
+            and self.config.cuda_graph_impl in ("transformer_engine", "chunk_wise")
             and is_whole_moe_cuda_graph_scope(self.config.cuda_graph_modules)
             and self._te_graph_capture_finished
         )
@@ -1439,8 +1438,6 @@ class PagedStashRunner:
             and is_whole_moe_cuda_graph_scope(self.config.cuda_graph_modules)
             and self.config.moe_paged_stash
             and self._te_graph_capture_finished
-            # Chunk graphs key the stash by runtime coordinates; there is no recorded order.
-            and getattr(self.config, 'cuda_graph_granularity', 'layer') != 'chunk'
         )
         if not te_whole_moe_paged_stash_replay:
             return
