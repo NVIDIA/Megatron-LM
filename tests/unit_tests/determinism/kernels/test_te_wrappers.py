@@ -155,6 +155,7 @@ class TestTEWrappers:
                     bias=False,
                     skip_bias_add=False,
                     is_expert=True,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
                 .cuda()
                 .train()
@@ -312,6 +313,7 @@ class TestTEWrappers:
             bias=False,
             skip_bias_add=False,
             is_expert=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         m_splits = [4096, 13, 0, 2048, 1, 8191, 33, 1999]
         x = torch.randn(
@@ -418,6 +420,7 @@ class TestTEWrappers:
                     skip_bias_add=False,
                     is_expert=True,
                     name=name,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
 
         edge = build(0)
