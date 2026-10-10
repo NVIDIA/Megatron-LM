@@ -6,6 +6,9 @@ import os
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
+import types
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -175,3 +178,65 @@ def test_deterministic_indexer_grads_match_cudnn_kernel():
     for actual, reference in ((det_k, expected["d_index_k"]), (det_w, expected["d_weights"])):
         error = (actual.float() - reference.float()).norm() / reference.float().norm()
         assert error < 1e-2, f"relative L2 error {error.item():.3e}"
+
+
+class _FakeBackwardApi:
+    """Stands in for ``cudnn.DSA.SparseAttentionBackward``."""
+
+    workspace_bytes = 4096
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def check_support(self):
+        return True
+
+    def scratch_workspace_bytes(self):
+        return type(self).workspace_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_sparse_bwd_kwargs_select_deterministic_kernel_and_cache_workspace(monkeypatch):
+    def sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale,
+        topk_length,
+        deterministic=False,
+        workspace=None,
+    ):  # signature only; never called here
+        raise AssertionError
+
+    monkeypatch.setattr(
+        dk,
+        "_DSA",
+        types.SimpleNamespace(
+            sparse_attention_backward_wrapper=sparse_attention_backward_wrapper,
+            SparseAttentionBackward=_FakeBackwardApi,
+        ),
+    )
+    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACES", {})
+    device = torch.device("cuda", torch.cuda.current_device())
+    q = torch.zeros(8, 64, 16, device=device, dtype=torch.bfloat16)
+    kv = torch.zeros(32, 16, device=device, dtype=torch.bfloat16)
+    lse = torch.zeros(8, 64, device=device)
+    sink = torch.zeros(64, device=device)
+    idx = torch.zeros(8, 4, device=device, dtype=torch.int32)
+    args = (q, kv, q, lse, sink, idx)
+
+    # Not requested: the default (atomic) kernel, no extra kwargs.
+    assert dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5) == {}
+    with patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)):
+        kwargs = dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+        assert kwargs["deterministic"] is True
+        workspace = kwargs["workspace"]
+        assert workspace.is_cuda and workspace.dtype == torch.uint8 and workspace.numel() == 4096
+        # Same device and size -> the retained buffer is reused, so a pointer captured into a
+        # CUDA graph stays valid.
+        again = dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+        assert again["workspace"] is workspace
