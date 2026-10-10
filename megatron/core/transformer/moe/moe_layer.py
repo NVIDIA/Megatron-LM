@@ -811,6 +811,16 @@ class MoELayer(BaseMoELayer):
             if self.config.moe_latent_size and self.config.overlap_moe_expert_parallel_comm:
                 self.fc1_latent_proj.backward_dw()
 
+    def wgrad_parameters(self):
+        """Yield the parameters whose wgrads ``backward_dw()`` computes under its defaults.
+
+        The shared experts and ``fc1_latent_proj`` are excluded: their wgrads belong to the
+        ``shared_experts=True`` half, which the pre-dispatch schedule slot owns.
+        """
+        yield from self.experts.parameters()
+        if self.config.moe_latent_size and self.config.overlap_moe_expert_parallel_comm:
+            yield from self.fc2_latent_proj.parameters()
+
     def set_for_recompute_pre_mlp_layernorm(self):
         """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8/fp4."""
         # If shared_experts_recompute is used, nothing needs to be done because the checkpoint
