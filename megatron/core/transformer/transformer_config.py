@@ -1055,6 +1055,23 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
+    moe_latent_projection_scaling: bool = False
+    """Scale the hidden-to-latent projection output by sqrt(hidden_size / moe_latent_size).
+    Applies before routed expert dispatch; does not scale the latent-to-hidden projection.
+    Requires a positive ``moe_latent_size`` and MoE experts.
+    Disabled by default to preserve existing checkpoint behavior."""
+
+    moe_latent_up_projection_scaling: bool = False
+    """Independently scale the up-projection output by sqrt(hidden_size / moe_latent_size).
+    Applies after the latent-to-hidden projection and before adding shared experts.
+    Generally unnecessary with latent fan-in-aware initialization. Requires a positive
+    ``moe_latent_size`` and MoE experts. Disabled by default."""
+
+    moe_latent_sigmoid_input_scale: float = 1.0
+    """Scale only the sigmoid argument of routed latent experts' SwiGLU or SiTU gates.
+    Independent of both latent projection gains; leaves linear factors and tanh inputs unchanged.
+    A non-unit value requires latent MoE with gated SiLU. Must be finite. Defaults to 1.0."""
+
     moe_use_norm_before_up_proj: bool = False
     """Apply normalization before the latent-to-hidden MoE projection. Requires
     ``moe_latent_size`` to be set."""
@@ -2190,6 +2207,33 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
+
+        if not math.isfinite(self.moe_latent_sigmoid_input_scale):
+            raise ValueError("moe_latent_sigmoid_input_scale must be finite.")
+        if self.moe_latent_sigmoid_input_scale != 1.0:
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "Non-unit moe_latent_sigmoid_input_scale is not supported by the TE op fuser; "
+                    "disable use_transformer_engine_op_fuser and use bias_activation_fusion."
+                )
+            if self.moe_latent_size is None or self.moe_latent_size <= 0:
+                raise ValueError(
+                    "moe_latent_sigmoid_input_scale requires a positive moe_latent_size."
+                )
+            if self.num_moe_experts is None:
+                raise ValueError("moe_latent_sigmoid_input_scale requires num_moe_experts.")
+            if not self.gated_linear_unit or self.activation_func != F.silu:
+                raise ValueError(
+                    "moe_latent_sigmoid_input_scale requires gated SiLU (SwiGLU/SiTU)."
+                )
+
+        if self.moe_latent_projection_scaling or self.moe_latent_up_projection_scaling:
+            if self.moe_latent_size is None or self.moe_latent_size <= 0:
+                raise ValueError(
+                    "MoE latent projection scaling requires a positive moe_latent_size."
+                )
+            if self.num_moe_experts is None:
+                raise ValueError("MoE latent projection scaling requires num_moe_experts.")
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit

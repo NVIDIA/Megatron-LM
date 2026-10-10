@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
+from megatron.core.activations import scaled_silu, situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -251,6 +251,11 @@ class TEGroupedMLP(MegatronModule):
         """
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
+        self.sigmoid_input_scale = (
+            self.config.moe_latent_sigmoid_input_scale
+            if self.config.moe_latent_size is not None
+            else 1.0
+        )
         self.input_size = self.config.hidden_size
         assert not (
             self.config.add_bias_linear and config.bias_dropout_fusion
@@ -278,7 +283,11 @@ class TEGroupedMLP(MegatronModule):
             name=(name + ".linear_fc1") if name is not None else None,
         )
 
-        if self.config.use_te_activation_func and not (submodules.activation_func is None):
+        if (
+            self.config.use_te_activation_func
+            and self.sigmoid_input_scale == 1.0
+            and submodules.activation_func is not None
+        ):
             self.activation_func = apply_module(submodules.activation_func(config=self.config))
         else:
             self.activation_func = self.config.activation_func
@@ -468,6 +477,10 @@ class TEGroupedMLP(MegatronModule):
 
     def _is_fused_impl_supported(self) -> bool:
         """Check if the TE op fuser supports implementing this module."""
+
+        if self.sigmoid_input_scale != 1.0:
+            # TE op-fuser activations do not expose an independent sigmoid argument scale.
+            return False
 
         # Check Transformer Engine installation
         if not HAVE_TE:
@@ -1039,7 +1052,7 @@ class TEGroupedMLP(MegatronModule):
                 and self.config.moe_mlp_glu_interleave_size is not None
             )
 
-            if self.config.use_te_activation_func:
+            if self.config.use_te_activation_func and self.sigmoid_input_scale == 1.0:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
                 if with_glu_interleaving:
@@ -1062,6 +1075,7 @@ class TEGroupedMLP(MegatronModule):
                         self.config.activation_func_clamp_value,
                         gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
                         linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
+                        sigmoid_input_scale=self.sigmoid_input_scale,
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
@@ -1100,6 +1114,7 @@ class TEGroupedMLP(MegatronModule):
                             tanh_clamp_scale,
                             self.config.activation_func_tanh_clamp_scale_linear,
                             self.config.glu_linear_offset,
+                            sigmoid_input_scale=self.sigmoid_input_scale,
                         )
                     else:
 
@@ -1108,9 +1123,12 @@ class TEGroupedMLP(MegatronModule):
                             if (val := self.config.activation_func_clamp_value) is not None:
                                 x_glu = x_glu.clamp(min=None, max=val)
                                 x_linear = x_linear.clamp(min=-val, max=val)
-                            return self.config.activation_func(x_glu) * (
-                                x_linear + self.config.glu_linear_offset
+                            gate = (
+                                scaled_silu(x_glu, self.sigmoid_input_scale)
+                                if self.sigmoid_input_scale != 1.0
+                                else self.config.activation_func(x_glu)
                             )
+                            return gate * (x_linear + self.config.glu_linear_offset)
 
                         intermediate_parallel = glu(intermediate_parallel)
                 else:
@@ -1611,6 +1629,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 not self.config.fp8 or self.config.fp8_recipe != Fp8Recipe.mxfp8
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+
+        if self.sigmoid_input_scale != 1.0:
+            raise ValueError(
+                "Inference-optimized MoE kernels do not support moe_latent_sigmoid_input_scale; "
+                "use the standard TEGroupedMLP or SequentialMLP experts."
+            )
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
