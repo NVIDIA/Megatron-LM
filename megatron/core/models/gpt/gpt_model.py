@@ -583,6 +583,14 @@ class GPTModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        # MTP rolls its token-side fields (input_ids, position_ids, labels, loss_mask and
+        # the padding mask) together in the caller's CP-local sequence layout, so it must
+        # receive the caller's padding mask. _preprocess scatters the decoder's copy to the
+        # sequence-parallel shard; a shard-length mask cannot be rolled with full-length
+        # fields. MoE layers align a full-length mask to sequence-parallel hidden states
+        # themselves, also inside the MTP layers.
+        mtp_padding_mask = padding_mask
+
         preproc_output = self._preprocess(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -642,7 +650,7 @@ class GPTModel(LanguageModule):
             loss_mask=loss_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
-            padding_mask=padding_mask,
+            padding_mask=mtp_padding_mask,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,

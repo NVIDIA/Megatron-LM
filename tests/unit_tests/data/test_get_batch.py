@@ -210,7 +210,7 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
 
     assert result[-1] is packed_seq_params
     scheduler.assert_called_once()
-    finalize.assert_called_once_with(packed_seq_params)
+    finalize.assert_called_once_with(packed_seq_params, sequence_parallel=False)
     if enabled:
         prebuild.assert_called_once_with(
             packed_seq_params,
@@ -271,7 +271,7 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
 
     assert result is scheduler_batch
     scheduler.assert_called_once()
-    finalize.assert_called_once_with(packed_seq_params)
+    finalize.assert_called_once_with(packed_seq_params, sequence_parallel=False)
     if enabled:
         prebuild.assert_called_once_with(
             packed_seq_params,
@@ -341,7 +341,7 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
         result = module.get_batch(None)
         assert result[-1] is packed_seq_params
 
-    finalize.assert_called_once_with(packed_seq_params)
+    finalize.assert_called_once_with(packed_seq_params, sequence_parallel=False)
     prebuild.assert_called_once_with(
         packed_seq_params,
         cp_group=packed_seq_params.cp_group,
@@ -382,7 +382,7 @@ def test_hybrid_legacy_thd_prebuilds_after_forward_constructs_params(monkeypatch
     monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
     monkeypatch.setattr(pretrain_hybrid, "get_timers", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(pretrain_hybrid, "get_batch", MagicMock(return_value=batch))
-    finalize = MagicMock(side_effect=lambda params: params)
+    finalize = MagicMock(side_effect=lambda params, **kwargs: params)
     monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
     monkeypatch.setattr(pretrain_hybrid, "update_seqlen_stats_from_cu_seqlens", MagicMock())
     monkeypatch.setattr(pretrain_hybrid, "stimer", MagicMock())
@@ -398,7 +398,7 @@ def test_hybrid_legacy_thd_prebuilds_after_forward_constructs_params(monkeypatch
     pretrain_hybrid.forward_step(None, model)
 
     (packed_seq_params,), kwargs = prebuild.call_args
-    finalize.assert_called_once_with(packed_seq_params)
+    finalize.assert_called_once_with(packed_seq_params, sequence_parallel=False)
     prebuild.assert_called_once()
     assert packed_seq_params.cu_seqlens_q.tolist() == [0, 1024, 4096]
     assert kwargs == {
