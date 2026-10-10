@@ -45,6 +45,7 @@ spec:
 
     cd /opt/megatron-lm
 
+    export NVTE_FLASH_ATTN_V4=0
     uv run --no-sync python -m torch.distributed.run \
       --log-dir {assets_dir}/logs/1 \
       --tee "0:3,7:3" \
@@ -56,5 +57,6 @@ products:
   - test_case: [moe_perf]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        # https://github.com/NVIDIA/Megatron-LM/issues/7739
+        scope: [mr, mr-github-broken]
         platforms: [dgx_h100]

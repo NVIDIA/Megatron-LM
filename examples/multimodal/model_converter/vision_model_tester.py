@@ -55,8 +55,8 @@ def run_mcore_vision(model_path):
 
     args = parse_and_validate_args(extra_args_provider=add_multimodal_extra_args)
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args)
-    initialize_megatron()
+    initialize_runtime_services(args, training=True)
+    initialize_megatron(training=True)
 
     def wrapped_model_provider(pre_process, post_process):
         return model_provider(pre_process, post_process, parallel_output=False)

@@ -282,7 +282,7 @@ if __name__ == "__main__":
     args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
     full_config = pretrain_cfg_container_from_args(args)
     set_run_config(full_config)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, training=True)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,

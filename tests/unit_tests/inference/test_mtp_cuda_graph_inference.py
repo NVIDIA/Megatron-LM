@@ -163,6 +163,7 @@ class TestMTPCudaGraphInference:
         """Build a GPT or Hybrid model with MTP layers and local CUDA graph support."""
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         config = TransformerConfig(
+            flash_attention_version=2,
             num_layers=self.NUM_LAYERS,
             hidden_size=self.HIDDEN_SIZE,
             num_attention_heads=self.NUM_ATTN_HEADS,
@@ -979,6 +980,7 @@ class TestMTPCudaGraphExpertParallel:
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         mtp_num_layers = 2
         config = TransformerConfig(
+            flash_attention_version=2,
             num_layers=self.NUM_LAYERS,
             hidden_size=self.HIDDEN_SIZE,
             num_attention_heads=self.NUM_ATTN_HEADS,
@@ -1317,6 +1319,7 @@ class TestMtpKvCacheIdleExpertParallelRank:
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         mtp_num_layers = 1
         config = TransformerConfig(
+            flash_attention_version=2,
             num_layers=self.NUM_LAYERS,
             hidden_size=self.HIDDEN_SIZE,
             num_attention_heads=self.NUM_ATTN_HEADS,
@@ -1561,6 +1564,7 @@ class TestMTPBlockScopeCudaGraph:
         """Build a GPT or Hybrid model with MTP and local CUDA graph support."""
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         config = TransformerConfig(
+            flash_attention_version=2,
             num_layers=self.NUM_LAYERS,
             hidden_size=self.HIDDEN_SIZE,
             num_attention_heads=self.NUM_ATTN_HEADS,
