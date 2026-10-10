@@ -21,7 +21,6 @@ from megatron.core.parallel_state import (
     get_global_memory_buffer,
     get_gtp_weight_remat_rank,
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.utils import (
@@ -259,15 +258,18 @@ def _initialize_affine_weight_cpu(
     return_master_weight=False,
     *,
     params_dtype=torch.float32,
-    rank=None,
-    world_size=None,
+    rank,
+    world_size,
     skip_set_tensor_parallel_attributes=False,
 ):
     """Initialize affine weight for model parallel.
 
     Build the master weight on all processes and scatter
     the relevant chunk. A ``weight`` that is already GTP_remat-sharded is sliced down to this
-    rank's GTP rows as well, so the initialization matches a run with GTP off."""
+    rank's GTP rows as well, so the initialization matches a run with GTP off.
+
+    ``rank`` and ``world_size`` are this rank's position in, and the size of, the
+    tensor-parallel group that ``partition_dim`` is split across."""
 
     if not skip_set_tensor_parallel_attributes:
         set_tensor_model_parallel_attributes(
@@ -281,9 +283,6 @@ def _initialize_affine_weight_cpu(
     # Split and copy
     per_partition_per_stride_size = divide(per_partition_size, stride)
     weight_list = torch.split(master_weight, per_partition_per_stride_size, dim=partition_dim)
-    if rank is None:
-        rank = get_tensor_model_parallel_rank()
-        world_size = get_tensor_model_parallel_world_size()
     my_weight_list = weight_list[rank::world_size]
 
     with torch.no_grad():
@@ -1686,7 +1685,7 @@ class RowParallelLinear(torch.nn.Module):
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
             allreduce_dgrad=allreduce_dgrad,
             sequence_parallel=False,
-            tp_group=None,
+            tp_group=self.tp_group,
             grad_output_buffer=None,
             gtp_remat_size=self.gtp_remat_size,
         )

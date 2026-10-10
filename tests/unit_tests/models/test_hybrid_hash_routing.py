@@ -227,7 +227,7 @@ def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature
     monkeypatch.setattr(
         recompute_module.tensor_parallel,
         "checkpoint",
-        lambda function, _distribute_saved_activations, *args: function(*args),
+        lambda function, _distribute_saved_activations, *args, tp_group: function(*args),
     )
     transformer_layer = RecordingTransformerLayer()
     learned_transformer_layer = RecordingTransformerLayer(layer_number=2, is_hash_layer=False)

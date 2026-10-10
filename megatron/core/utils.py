@@ -608,7 +608,16 @@ def round_up_to_nearest_multiple(value: int, multiple: int) -> int:
 
 
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
-    """Issue a deprecation warning if tp_group is None and return the default tp group."""
+    """Return ``tp_group``, or the global tensor-parallel group when it is None.
+
+    Falling back to the global group is deprecated: pass the owning model's group, for example
+    ``pg_collection.tp``, or ``pg_collection.expt_tp`` for expert layers (``is_expert=True``).
+    The fallback emits a ``ProcessGroupFallbackWarning`` once per calling function. Its owner
+    names this helper and the function that called it, which is the one that needs the group.
+
+    Returns ``tp_group`` unchanged when ``parallel_state`` is not initialized, and None when
+    ``torch.distributed`` is not initialized.
+    """
     # TODO(zijiey): remove this function later.
     if not torch.distributed.is_initialized():
         return None
@@ -618,13 +627,17 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
         return tp_group
 
     if tp_group is None:
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            warnings.warn(
-                "Warning: tp_group is None, using default tp group. "
-                "Passing tp_group will be mandatory soon",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import warn_global_process_group_fallback
+
+        caller = sys._getframe(1).f_code.co_qualname
+        warn_global_process_group_fallback(
+            f"get_tensor_model_parallel_group_if_none (from {caller})",
+            "tp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
         if is_expert:
             tp_group = parallel_state.get_expert_tensor_parallel_group(
                 check_initialized=check_initialized

@@ -2061,6 +2061,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     rotary_pos_cos,
                     rotary_pos_sin,
                     sequence_len_offset,
+                    tp_group=self.tp_group,
                 )
 
         if self.config.recompute_method == 'uniform':
