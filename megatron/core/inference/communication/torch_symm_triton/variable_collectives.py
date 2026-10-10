@@ -73,7 +73,7 @@ def _multimem_all_gather_v_kernel(
             exit together — the barrier for those CTAs is never entered on any rank.
         output_byte_offset: byte offset of this tensor within the symmetric memory buffer.
         HIDDEN_SIZE: hidden dimension, i.e. number of elements per token row (constexpr).
-        BLOCK_SIZE: threads per block (constexpr, >= numel_per_token).
+        BLOCK_SIZE: threads per block (constexpr, capped at 1024).
         NUMEL_PER_THREAD: elements per thread per load/store, i.e. BITS / element_bits (constexpr).
         BITS: width of each load/store in bits — 128 for activations (bf16) and expert
             indices (int64, always 16-byte aligned for any topk); 64 for routing probs
@@ -95,22 +95,17 @@ def _multimem_all_gather_v_kernel(
     rank_token_offset = tl.load(rank_token_offset_ptr)
 
     numel_per_token = tl.cdiv(HIDDEN_SIZE, NUMEL_PER_THREAD)
-    local_numel = local_tokens * numel_per_token
-    # BLOCK_SIZE is the next power of 2 >= numel_per_token, so it may be larger.
-    # channel_mask deactivates the extra padding threads (tid >= numel_per_token).
-    channel_mask = tid < numel_per_token
 
     for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
         for channel_offset in range(0, numel_per_token, BLOCK_SIZE):
             local_offsets = token_offset * numel_per_token + channel_offset + tid
-            # Two independent masks in orthogonal dimensions:
-            #   channel_mask — deactivates power-of-2 padding threads (tid >= numel_per_token).
-            #   token_mask   — deactivates overflow threads in the last inner-loop chunk
-            #                  when numel_per_token > BLOCK_SIZE and the window
-            #                  [channel_offset, channel_offset+BLOCK_SIZE) extends past
-            #                  the final token row.
-            token_mask = local_offsets < local_numel
-            mask = token_mask & channel_mask
+
+            # BLOCK_SIZE is the next power of 2 >= numel_per_token, capped at 1024.
+            #   if BLOCK_SIZE > numel_per_token -   deactivates the extra threads.
+            #   if BLOCK_SIZE < numel_per_token -   deactivates threads of the last window
+            #                                       [channel_offset, channel_offset + BLOCK_SIZE)
+            #                                       that fall past the end of the row
+            mask = channel_offset + tid < numel_per_token
 
             # This rank's tokens start at rank_token_offset in the global output.
             global_offsets = rank_token_offset * numel_per_token + local_offsets
@@ -187,7 +182,7 @@ def _multimem_reduce_scatter_v_kernel(
             immediately — safe because the value is identical on all ranks.
         input_byte_offset: byte offset of the input tensor within the symmetric memory buffer.
         HIDDEN_SIZE: number of elements per token row (constexpr).
-        BLOCK_SIZE: threads per block (constexpr, >= numel_per_token).
+        BLOCK_SIZE: threads per block (constexpr, capped at 1024).
         NUMEL_PER_THREAD: elements per thread per load/store, i.e. 128 / element_bits (constexpr).
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
@@ -217,23 +212,19 @@ def _multimem_reduce_scatter_v_kernel(
     rank_token_offset = tl.load(rank_token_offset_ptr)
 
     numel_per_token = tl.cdiv(HIDDEN_SIZE, NUMEL_PER_THREAD)
-    local_numel = local_tokens * numel_per_token
-    # channel_mask: deactivates power-of-2 padding threads (tid >= numel_per_token).
-    channel_mask = tid < numel_per_token
 
     for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
         program_offset = token_offset * numel_per_token
 
         for channel_offset in range(0, numel_per_token, BLOCK_SIZE):
             local_offsets = program_offset + channel_offset + tid
-            # Two independent masks in orthogonal dimensions:
-            #   channel_mask — deactivates power-of-2 padding threads (tid >= numel_per_token).
-            #   token_mask   — deactivates overflow threads in the last inner-loop chunk
-            #                  when numel_per_token > BLOCK_SIZE and the window
-            #                  [channel_offset, channel_offset+BLOCK_SIZE) extends past
-            #                  the final token row.
-            token_mask = local_offsets < local_numel
-            mask = token_mask & channel_mask
+
+            # BLOCK_SIZE is the next power of 2 >= numel_per_token, capped at 1024.
+            #   if BLOCK_SIZE > numel_per_token -   deactivates the extra threads.
+            #   if BLOCK_SIZE < numel_per_token -   deactivates threads of the last window
+            #                                       [channel_offset, channel_offset + BLOCK_SIZE)
+            #                                       that fall past the end of the row
+            mask = channel_offset + tid < numel_per_token
 
             # This rank's tokens start at rank_token_offset in the global input.
             global_offsets = rank_token_offset * numel_per_token + local_offsets
@@ -392,7 +383,7 @@ def _multimem_all_gatherv_3tensor_kernel(
     The outer token loop is shared across all three tensors; each tensor has its
     own inner channel loop with independent masking. BLOCK_SIZE is the maximum
     of the three per-tensor block sizes — smaller tensors mask out the extra threads
-    via channel_mask.
+    via a mask.
 
     signal_pad_ptrs from the first output buffer's symmetric memory handle are used
     for the single end-of-kernel barrier. Since all three writes complete before the
@@ -429,21 +420,17 @@ def _multimem_all_gatherv_3tensor_kernel(
     numel_per_token_1 = tl.cdiv(HIDDEN_SIZE_1, NUMEL_PER_THREAD_1)
     numel_per_token_2 = tl.cdiv(HIDDEN_SIZE_2, NUMEL_PER_THREAD_2)
 
-    local_numel_0 = local_tokens * numel_per_token_0
-    local_numel_1 = local_tokens * numel_per_token_1
-    local_numel_2 = local_tokens * numel_per_token_2
-
-    # channel_mask: deactivates threads beyond each tensor's numel_per_token (power-of-2 padding).
-    channel_mask_0 = tid < numel_per_token_0
-    channel_mask_1 = tid < numel_per_token_1
-    channel_mask_2 = tid < numel_per_token_2
-
     for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
         # --- Tensor 0 ---
         for channel_offset in range(0, numel_per_token_0, BLOCK_SIZE):
             local_offsets = token_offset * numel_per_token_0 + channel_offset + tid
-            token_mask = local_offsets < local_numel_0
-            mask = token_mask & channel_mask_0
+
+            # BLOCK_SIZE is the max of the three per-tensor block sizes, capped at 1024.
+            #   if BLOCK_SIZE > numel_per_token_i -   deactivates the extra threads.
+            #   if BLOCK_SIZE < numel_per_token_i -   deactivates threads of the last window
+            #                                       [channel_offset, channel_offset + BLOCK_SIZE)
+            #                                       that fall past the end of the row
+            mask = channel_offset + tid < numel_per_token_0
             global_offsets = rank_token_offset * numel_per_token_0 + local_offsets
             if BITS_0 == 128:
                 multicast_ptrs = (
@@ -467,8 +454,7 @@ def _multimem_all_gatherv_3tensor_kernel(
         # --- Tensor 1 ---
         for channel_offset in range(0, numel_per_token_1, BLOCK_SIZE):
             local_offsets = token_offset * numel_per_token_1 + channel_offset + tid
-            token_mask = local_offsets < local_numel_1
-            mask = token_mask & channel_mask_1
+            mask = channel_offset + tid < numel_per_token_1
             global_offsets = rank_token_offset * numel_per_token_1 + local_offsets
             if BITS_1 == 128:
                 multicast_ptrs = (
@@ -492,8 +478,7 @@ def _multimem_all_gatherv_3tensor_kernel(
         # --- Tensor 2 ---
         for channel_offset in range(0, numel_per_token_2, BLOCK_SIZE):
             local_offsets = token_offset * numel_per_token_2 + channel_offset + tid
-            token_mask = local_offsets < local_numel_2
-            mask = token_mask & channel_mask_2
+            mask = channel_offset + tid < numel_per_token_2
             global_offsets = rank_token_offset * numel_per_token_2 + local_offsets
             if BITS_2 == 128:
                 multicast_ptrs = (
@@ -739,7 +724,7 @@ def multimem_all_gatherv_3tensor(
     hidden_size_2, bits_2, numel_per_thread_2, block_size_2 = _tensor_params(input_tensor_2)
 
     # Use the largest block size so all threads are occupied for at least one tensor;
-    # smaller tensors mask out excess threads via channel_mask inside the kernel.
+    # smaller tensors mask out excess threads via a mask inside the kernel.
     block_size = max(block_size_0, block_size_1, block_size_2)
     num_warps = max(1, block_size // WARP_SIZE)
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
