@@ -94,7 +94,7 @@ def main() -> None:
     model_cfg = MimoBuildConfig()
     cfg = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(cfg)
-    initialize_runtime_services(args, build_tokenizer=False)
+    initialize_runtime_services(args, build_tokenizer=False, training=True)
     provider = resolve_provider(args)
 
     prefetch_loader = None

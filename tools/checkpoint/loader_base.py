@@ -213,7 +213,8 @@ class MegatronCheckpointLoaderBase:
                 self.margs.consumed_train_samples = 0
                 self.margs.consumed_valid_samples = 0
                 self.margs.exit_on_missing_checkpoint = True
-                load_checkpoint(model_list, None, None)
+                # Preserve training progress in the converted checkpoint.
+                load_checkpoint(model_list, None, None, restore_training_state=True)
 
                 # Validate that train/valid samples match across ranks
                 nonlocal consumed_train_samples, consumed_valid_samples
