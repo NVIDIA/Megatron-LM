@@ -424,8 +424,8 @@ def load_workloads(
             if (
                 workload.spec["build"] == build_workload.spec["name"]
             ) and build_workload not in workloads:
-                container_image = container_image or build_workload.spec["source"]["image"]
-                build_workload.spec["source"]["image"] = f"{container_image}:{container_tag}"
+                image = container_image or build_workload.spec["source"]["image"]
+                build_workload.spec["source"]["image"] = f"{image}:{container_tag}"
                 workloads.append(build_workload)
 
         workload.spec["n_repeat"] = n_repeat
