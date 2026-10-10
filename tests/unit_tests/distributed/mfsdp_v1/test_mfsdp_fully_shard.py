@@ -15,6 +15,7 @@ import transformer_engine as te
 from packaging import version
 from torch.nn.functional import mse_loss
 from torch.optim import Adam
+from torch.utils._pytree import tree_leaves
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam
@@ -251,6 +252,39 @@ class RootParamModel(torch.nn.Module):
 
     def forward(self, x):
         return torch.nn.functional.linear(x, self.weight, self.bias)
+
+
+class ContainerOutputModel(RootParamModel):
+    """Return structured outputs without executing the last registered child module."""
+
+    def __init__(self, output_type: str) -> None:
+        super().__init__()
+        self.output_type = output_type
+        self.bias.requires_grad_(False)
+        # The extra root hook attached to the final child must not mask a missing
+        # hook on the actual model output, as it can with ordinary LoRA layers.
+        self.unused = torch.nn.Identity()
+
+    def forward(self, x: torch.Tensor):
+        """Return predictions in the requested container.
+
+        Args:
+            x: Tensor of shape [batch, DIM_SIZE].
+
+        Returns:
+            Tensor of shape [batch, DIM_SIZE], or a container holding it, an
+            auxiliary tensor of the same shape, detached data, and metadata.
+        """
+        output = super().forward(x)
+        if self.output_type == "tensor":
+            return output
+        if self.output_type == "tuple":
+            return output, output * 2, output.detach(), None
+        if self.output_type == "list":
+            return [output, output * 2, output.detach(), None]
+        if self.output_type == "dict":
+            return {"prediction": output, "aux": output * 2, "detached": output.detach()}
+        return {"prediction": [None, (output, {"aux": output * 2})], "metadata": "nested"}
 
 
 class ToyTETransformer(torch.nn.Module):
@@ -958,6 +992,81 @@ class TestMegatronFsdpFullyShard:
             optimizer.step()
 
         torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses))
+
+    @pytest.mark.parametrize("output_type", ["tensor", "tuple", "list", "dict", "nested"])
+    @pytest.mark.parametrize("num_microbatches", [1, 2])
+    def test_output_containers_preserve_optimizer_updates(self, output_type, num_microbatches):
+        """Automatic gradient handoff must work for every supported output container."""
+        torch.manual_seed(1234)
+        reference = ContainerOutputModel(output_type).cuda()
+        model = deepcopy(reference)
+        model = fully_shard_model(
+            module=model,
+            fsdp_unit_modules=[ContainerOutputModel],
+            zero_dp_strategy=OPTIM_GRADS_PARAMS,
+        )
+        reference_optimizer = Adam([p for p in reference.parameters() if p.requires_grad], lr=0.01)
+        optimizer_parameters = dict(model.named_parameters())
+        optimizer = fully_shard_optimizer(
+            Adam([p for p in optimizer_parameters.values() if p.requires_grad], lr=0.01)
+        )
+        generator = torch.Generator(device="cuda").manual_seed(91011 + torch.distributed.get_rank())
+
+        # The second step is a partial accumulation window when num_microbatches=2.
+        for microbatch_count in (num_microbatches, 1):
+            previous_weight = reference.weight.detach().clone()
+            for _ in range(microbatch_count):
+                inputs = torch.randn(DIM_SIZE, DIM_SIZE, device="cuda", generator=generator)
+                for current_model in (reference, model):
+                    outputs = tree_leaves(current_model(inputs))
+                    loss = sum(
+                        value.square().mean()
+                        for value in outputs
+                        if isinstance(value, torch.Tensor) and value.requires_grad
+                    )
+                    (loss / microbatch_count).backward()
+
+            reference_parameters = dict(reference.named_parameters(prefix="module"))
+            local_norm_squared = torch.zeros((), device="cuda")
+            for name, param in optimizer_parameters.items():
+                expected = reference_parameters[name]
+                if not expected.requires_grad:
+                    assert param.grad is None
+                    continue
+                torch.distributed.all_reduce(expected.grad, op=torch.distributed.ReduceOp.AVG)
+                if param.to_local().numel() == 0:
+                    assert param.grad is None
+                    continue
+                assert param.grad is not None, f"Missing optimizer gradient for {name}"
+                local_grad = param.grad.to_local().reshape(-1)
+                torch.testing.assert_close(
+                    local_grad, expected.grad.reshape(-1)[param.megatron_fsdp_slice]
+                )
+                local_norm_squared += local_grad.square().sum()
+            torch.distributed.all_reduce(local_norm_squared)
+            torch.testing.assert_close(local_norm_squared.sqrt(), reference.weight.grad.norm())
+
+            reference_optimizer.step()
+            optimizer.step()
+            assert not torch.equal(reference.weight, previous_weight)
+            for name, param in optimizer_parameters.items():
+                torch.testing.assert_close(
+                    param.to_local().reshape(-1),
+                    reference_parameters[name].detach().reshape(-1)[param.megatron_fsdp_slice],
+                )
+            reference_optimizer.zero_grad()
+            optimizer.zero_grad()
+
+        # No differentiable outputs are available in inference mode.
+        with torch.no_grad():
+            actual = tree_leaves(model(inputs))
+            expected = tree_leaves(reference(inputs))
+        for actual_leaf, expected_leaf in zip(actual, expected):
+            if isinstance(expected_leaf, torch.Tensor):
+                torch.testing.assert_close(actual_leaf, expected_leaf)
+                assert not actual_leaf.requires_grad
+            else:
+                assert actual_leaf == expected_leaf
 
     def test_root_module_forward_uses_gathered_parameters(self):
         """
