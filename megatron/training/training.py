@@ -2286,7 +2286,20 @@ def pretrain(
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
 
-        set_ideal_affinity_for_current_gpu()
+        try:
+            set_ideal_affinity_for_current_gpu()
+        except Exception as exc:  # pylint: disable=broad-except
+            # The NUMA-affinity hint speeds up the offload copies but is not required for
+            # correctness. It fails per rank, e.g. when the job's cgroup (SLURM cpus-per-task)
+            # holds no CPU of this GPU's socket, so the pinned buffers land on the remote socket
+            # and the D2H/H2D copies run at the cross-socket bandwidth. Warn from every rank.
+            allowed = len(os.sched_getaffinity(0))
+            print(
+                f"[rank {torch.distributed.get_rank()}] WARNING: could not set the GPU-local CPU "
+                f"affinity for fine-grained offloading ({exc}); the process may use {allowed} "
+                f"CPU(s) that are not on this GPU's socket, which slows the offload copies.",
+                flush=True,
+            )
 
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")

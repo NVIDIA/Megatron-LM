@@ -336,6 +336,26 @@ def get_te_version():
     return _te_version
 
 
+def with_current_cuda_device(forward_func):
+    """Wrap a checkpointed function so its recompute runs with a current CUDA context.
+
+    The recompute runs on the autograd engine's worker thread. Kernel runtimes that launch through
+    the CUDA driver directly (cuTile in the fused mHC kernels) need a current context on that
+    thread, which torch only establishes lazily by running one of its own ops; the first op of a
+    recomputed layer may be such a kernel ("Failed to launch cuTile kernel: invalid device
+    context"). Setting the device of the first CUDA argument is a no-op elsewhere.
+    """
+
+    def _wrapped(*args, **kwargs):
+        for arg in args:
+            if torch.is_tensor(arg) and arg.is_cuda:
+                torch.cuda.set_device(arg.device)
+                break
+        return forward_func(*args, **kwargs)
+
+    return _wrapped
+
+
 def is_te_min_version(version, check_equality=True):
     """Check if minimum version of `transformer-engine` is installed."""
     if not HAVE_PACKAGING:
