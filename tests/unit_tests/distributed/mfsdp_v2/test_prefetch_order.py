@@ -107,8 +107,8 @@ def test_static_order_lookup():
     assert order.next_item(first, 2) is third
 
 
-def test_recording_matches_dense_training(distributed_setup):
-    """Observe runtime order across microbatches without changing gradients or updates."""
+def test_shared_module_recording_matches_dense_training(distributed_setup):
+    """Record and replay MTP-like module reuse, preserving gradients and updates."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
@@ -119,7 +119,9 @@ def test_recording_matches_dense_training(distributed_setup):
             self.second = nn.Linear(8, 8, bias=False)
 
         def forward(self, inputs):
-            return self.first(self.second(inputs)).relu()
+            # Reuse one projection in the same graph, as MTP does with its
+            # output layer. The two occurrences have different successors.
+            return self.second(self.first(self.second(inputs))).relu()
 
     torch.manual_seed(42)
     dense, model = Model().to(device), Model()
@@ -148,8 +150,9 @@ def test_recording_matches_dense_training(distributed_setup):
                     (actual.square().mean() / num_microbatches).backward()
                 torch.testing.assert_close(actual, expected)
             context.finish_grad_sync()
-        assert list(context.forward_order) == [model, model.second, model.first] * num_microbatches
-        assert list(context.backward_order) == [model, model.first, model.second] * num_microbatches
+        expected_order = [model, model.second, model.first, model.second] * num_microbatches
+        assert list(context.forward_order) == expected_order
+        assert list(context.backward_order) == expected_order
         for reference in dense.parameters():
             dist.all_reduce(reference.grad, group=mesh.get_group())
             reference.grad.div_(distributed_setup.world_size)
