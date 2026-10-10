@@ -21,6 +21,12 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      send_notification:
+        description: Send a Slack notification for failed runs on main or dev
+        required: false
+        default: true
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref || github.ref }}
@@ -554,6 +560,9 @@ jobs:
 
       - name: Test superseded merge-group cleanup
         run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
+
+      - name: Test CI failure notification wiring
+        run: python3 .github/scripts/test_notify_ci_failure.py
 
       - name: Get PR info
         id: get-pr-info
@@ -1265,6 +1274,46 @@ jobs:
           platform: dgx_gb200
           cadence: ${{ needs.configure.outputs.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
+
+  notify-failure:
+    name: Notify CI failure
+    runs-on: ubuntu-latest
+    permissions: {}
+    needs:
+      - ephemeral-runner-routing
+      - is-not-external-contributor
+      - pre-flight
+      - configure
+      - linting
+      - cicd-wait-in-queue
+      - cicd-parse-downstream-testing
+      - cicd-mbridge-testing
+      - cicd-nemo-rl-testing
+      - cicd-container-build
+      - cicd-parse-unit-tests
+      - cicd-unit-tests-latest
+      - cicd-parse-unit-tests-gb200
+      - cicd-unit-tests-latest-gb200
+      - cicd-integration-gate
+      - cicd-parse-integration-tests-h100
+      - cicd-integration-tests-latest-h100
+      - cicd-parse-integration-tests-gb200
+      - cicd-integration-tests-latest-gb200
+      - Nemo_CICD_Test
+    # Use the event directly so preparation failures can still alert.
+    # Keep PR mirrors, merge queues and ad-hoc feature dispatches silent.
+    if: >-
+      ${{ always() && !cancelled() && failure() &&
+          github.repository == 'NVIDIA/Megatron-LM' &&
+          (github.ref_name == 'main' || github.ref_name == 'dev') &&
+          (github.event_name == 'schedule' ||
+           (github.event_name == 'workflow_dispatch' && inputs.send_notification)) }}
+    steps:
+      - name: Notify CI failure
+        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/notify-ci-failure@631c404d00a9e60afc591cd071d35d2e18f82fc6 # merged PR #593
+        with:
+          needs-json: ${{ toJSON(needs) }}
+          webhook: ${{ secrets.SLACK_CI_CHANNEL_WEBHOOK }}
 
   Nemo_CICD_Test:
     needs:
