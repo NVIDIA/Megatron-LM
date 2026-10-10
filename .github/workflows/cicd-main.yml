@@ -842,7 +842,7 @@ jobs:
     uses: ./.github/workflows/_build_ci_container.yml
     with:
       is-maintainer: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
-      selected-runner: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-cpu-sin' || (startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner) }}
+      selected-runner: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-cpu-h100' || (startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner) }}
       selected-runner-gb200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
       registry-gcp-h100: asia-southeast1-docker.pkg.dev/nv-nemoautomati-20260505210812/megatron-lm
       use-gcp-h100: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
