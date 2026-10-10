@@ -54,6 +54,7 @@ def unimodal_build_distributed_models(
     pre_wrap_hook: Callable[[list[MegatronModule]], list[MegatronModule]] | None = None,
     model_type: ModelType = ModelType.encoder_or_decoder,
     use_layer_wise_distributed_optimizer: bool = False,
+    use_layer_wise_param_layout: bool = True,
 ) -> list[MegatronModule]:
     """Build model stages and wrap for distributed training.
 
@@ -84,6 +85,9 @@ def unimodal_build_distributed_models(
         model_type: Deprecated flag, only used for backwards compatibility.
         use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
             parameters for the layer-wise distributed optimizer.
+        use_layer_wise_param_layout: Accepted for API parity with main's ModelBuilder
+            path; the padded vs compact LayerWise layout is selected inside
+            ``compute_full_param_layout`` from ``ddp_config.use_layer_wise_param_layout``.
 
     Returns:
         List of model stages, wrapped and ready for distributed training.
@@ -125,6 +129,7 @@ def unimodal_build_distributed_models(
         data_parallel_random_init=data_parallel_random_init,
         mixed_precision_wrapper=mixed_precision_wrapper,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+        use_layer_wise_param_layout=use_layer_wise_param_layout,
     )
 
 
@@ -140,6 +145,7 @@ def prepare_existing_model_chunks_for_distributed_training(
     data_parallel_random_init: bool = False,
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     use_layer_wise_distributed_optimizer: bool = False,
+    use_layer_wise_param_layout: bool = True,
 ) -> list[MegatronModule]:
     """Apply the shared post-build distributed lifecycle to already-built model chunks.
 
@@ -160,6 +166,9 @@ def prepare_existing_model_chunks_for_distributed_training(
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
             parameters for the layer-wise distributed optimizer.
+        use_layer_wise_param_layout: Accepted for API parity with main's ModelBuilder
+            path; the padded vs compact LayerWise layout is selected inside
+            ``compute_full_param_layout`` from ``ddp_config.use_layer_wise_param_layout``.
 
     Returns:
         List of model chunks, wrapped and ready for distributed training.
@@ -209,6 +218,7 @@ def prepare_existing_model_chunks_for_distributed_training(
             use_torch_fsdp2=use_torch_fsdp2,
             pg_collection=pg_collection,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
     return model_list
@@ -272,6 +282,7 @@ def _ddp_wrap(
     *,
     pg_collection: ProcessGroupCollection,
     use_layer_wise_distributed_optimizer: bool = False,
+    use_layer_wise_param_layout: bool = True,
 ) -> list[MegatronModule]:
     """Wrap model with Distributed Data Parallel (DDP) or Fully Sharded Data Parallel (FSDP).
 
@@ -286,6 +297,9 @@ def _ddp_wrap(
         pg_collection: Model communication process groups.
         use_layer_wise_distributed_optimizer: Whether to use the layer-wise
             distributed optimizer parameter routing and layout.
+        use_layer_wise_param_layout: Accepted for API parity with main's ModelBuilder
+            path; the padded vs compact LayerWise layout is selected inside
+            ``compute_full_param_layout`` from ``ddp_config.use_layer_wise_param_layout``.
 
     Returns:
         list[MegatronModule]: List of DDP/FSDP wrapped model modules

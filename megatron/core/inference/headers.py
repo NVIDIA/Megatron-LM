@@ -27,6 +27,8 @@ class Request(IntEnum):
 
     SUBMIT_REQUEST = 20
     ENGINE_REPLY = 21
+    ENGINE_REPLY_PARTIAL = 22
+    ABORT_REQUEST = 23
 
 
 class Control(IntEnum):

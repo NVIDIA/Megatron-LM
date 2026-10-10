@@ -57,7 +57,12 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
-    if transformer_cfg.transformer_impl == "inference_optimized":
+    if (
+        transformer_cfg.transformer_impl == "inference_optimized"
+        and transformer_cfg.num_moe_experts is None
+    ):
+        # MoE models fall through to the shared num_moe_experts branch below;
+        # get_gpt_decoder_block_spec already handles the inference_optimized impl.
         return get_gpt_layer_with_inference_spec(
             transformer_cfg.qk_layernorm,
             transformer_cfg.multi_latent_attention,
@@ -376,6 +381,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool = True,
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -392,6 +398,9 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
                 parameters for the layer-wise distributed optimizer.
+            use_layer_wise_param_layout: Accepted for API parity with main's ModelBuilder
+                path; the padded vs compact LayerWise layout is selected inside
+                ``compute_full_param_layout`` from ``ddp_config.use_layer_wise_param_layout``.
 
         Returns:
             List of model stages.
@@ -412,6 +421,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             composed_pre_wrap_hook,
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

@@ -1310,17 +1310,22 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         state_dict = self.state_dict()
 
         # Optimizer state ids enumerate the inner optimizer params: the fp32 main
-        # copies of float16 params and the native fp32 params, interleaved in the
-        # original param-group order. Yield the model-side param for each inner
-        # param in that order so the ids line up even when both kinds are present.
+        # copies of float16 params, native fp32 params, and any frozen params,
+        # interleaved in the original param-group order. Map each fp32 main copy
+        # back to its model-side param; all other params already are model params.
+        main_param_id_to_model_param = {
+            id(main_param): model_param
+            for model_group, main_group in zip(
+                self.float16_groups, self.fp32_from_float16_groups, strict=True
+            )
+            for model_param, main_param in zip(model_group, main_group, strict=True)
+        }
+
         def model_params_in_optimizer_order():
-            for inner_group, float16_group, fp32_group in zip(
-                self.optimizer.param_groups, self.float16_groups, self.fp32_from_fp32_groups
+            for param in chain.from_iterable(
+                inner_group['params'] for inner_group in self.optimizer.param_groups
             ):
-                float16_params = iter(float16_group)
-                fp32_param_ids = {id(p) for p in fp32_group}
-                for param in inner_group['params']:
-                    yield param if id(param) in fp32_param_ids else next(float16_params)
+                yield main_param_id_to_model_param.get(id(param), param)
 
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, model_params_in_optimizer_order()
@@ -1334,19 +1339,18 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         assert len(state_dict['fp32_from_fp16_params']) == len(
             state_dict['optimizer']['param_groups']
         )
-        # State ids of the fp32 main copies only, skipping native fp32 params.
+        # State ids of the fp32 main copies only, skipping native fp32 and frozen params.
         float16_param_ids_per_group = []
-        for state_group, inner_group, fp32_group in zip(
-            state_dict['optimizer']['param_groups'],
-            self.optimizer.param_groups,
-            self.fp32_from_fp32_groups,
+        for state_group, inner_group in zip(
+            state_dict['optimizer']['param_groups'], self.optimizer.param_groups, strict=True
         ):
-            fp32_param_ids = {id(p) for p in fp32_group}
             float16_param_ids_per_group.append(
                 [
                     param_id
-                    for param_id, param in zip(state_group['params'], inner_group['params'])
-                    if id(param) not in fp32_param_ids
+                    for param_id, param in zip(
+                        state_group['params'], inner_group['params'], strict=True
+                    )
+                    if id(param) in main_param_id_to_model_param
                 ]
             )
         state_dict['fp32_from_fp16_params'] = [
@@ -1356,10 +1360,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     fp32_param,
                     prefix=f'optimizer.state.fp32_param',
                 )
-                for param_id, fp32_param in zip(param_ids, fp32_group)
+                for param_id, fp32_param in zip(param_ids, fp32_group, strict=True)
             ]
             for fp32_group, param_ids in zip(
-                state_dict['fp32_from_fp16_params'], float16_param_ids_per_group
+                state_dict['fp32_from_fp16_params'], float16_param_ids_per_group, strict=True
             )
         ]
 

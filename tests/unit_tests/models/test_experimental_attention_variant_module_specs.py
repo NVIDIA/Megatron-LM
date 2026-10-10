@@ -112,6 +112,7 @@ class TestIsLinearAttentionVariant:
         "variant, expected",
         [
             ("gdn", True),
+            ("gdn2", True),
             ("kda", True),
             ("gated_delta_net", True),
             ("dsa", False),
@@ -469,6 +470,7 @@ class TestGetExperimentalAttentionVariantModuleSpec:
         "variant, target_fn",
         [
             ("gdn", "get_gated_delta_net_module_spec"),
+            ("gdn2", "get_gated_delta_net_module_spec"),
             ("kda", "get_gated_delta_net_module_spec"),
             ("gated_delta_net", "get_gated_delta_net_module_spec"),
             ("dsa", "get_dsa_module_spec_for_backend"),

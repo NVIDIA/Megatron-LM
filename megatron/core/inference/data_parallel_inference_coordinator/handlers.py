@@ -87,6 +87,7 @@ def handle_submit_request(coordinator, sender_identity, payload):
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Serialize prompt.
     if isinstance(prompt, (str, list)):
@@ -117,6 +118,7 @@ def handle_submit_request(coordinator, sender_identity, payload):
         logging.error("Coordinator: no reachable engines for request %d", request_id)
         del coordinator.request_id_to_client_id[request_id]
         del coordinator.request_id_to_client_request_id[request_id]
+        del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
         return True
 
     coordinator.request_id_to_rank[request_id] = next_identity
@@ -196,9 +198,10 @@ def handle_engine_reply(coordinator, sender_identity, payload):
         coordinator.detokenize(finished_request)
         fid = finished_request["request_id"]
         client_identity = coordinator.request_id_to_client_id[fid]
-        client_request_identity = coordinator.request_id_to_client_request_id[fid]
+        client_request_id = coordinator.request_id_to_client_request_id[fid]
         del coordinator.request_id_to_client_id[fid]
         del coordinator.request_id_to_client_request_id[fid]
+        del coordinator.client_request_to_request_id[(client_identity, client_request_id)]
         assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
         if assigned_rank is not None:
             idx = coordinator.identity_to_rank_index.get(assigned_rank)
@@ -210,10 +213,53 @@ def handle_engine_reply(coordinator, sender_identity, payload):
             [
                 client_identity,
                 msgpack.packb(
-                    [Headers.ENGINE_REPLY.value, client_request_identity, finished_request],
+                    [Headers.ENGINE_REPLY.value, client_request_id, finished_request],
                     use_bin_type=True,
                 ),
             ]
+        )
+
+
+@message_handler(Headers.ENGINE_REPLY_PARTIAL)
+def handle_engine_reply_partial(coordinator, sender_identity, payload):
+    """Route incremental engine replies without releasing request routing state."""
+    if sender_identity not in coordinator.identities_of_data_parallel_ranks:
+        assert (
+            sender_identity in coordinator.removed_engine_identities
+        ), f"ENGINE_REPLY_PARTIAL from never-connected sender {sender_identity!r}"
+        logging.warning("Coordinator: ENGINE_REPLY_PARTIAL from removed engine %r", sender_identity)
+        return
+    for partial in payload[1]:
+        request_id = partial["request_id"]
+        client_identity = coordinator.request_id_to_client_id[request_id]
+        client_request_id = coordinator.request_id_to_client_request_id[request_id]
+        # Partial tokens are detokenized incrementally by the client-facing streaming layer.
+        coordinator.router_socket.send_multipart(
+            [
+                client_identity,
+                msgpack.packb(
+                    [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id, partial],
+                    use_bin_type=True,
+                ),
+            ]
+        )
+
+
+@message_handler(Headers.ABORT_REQUEST)
+def handle_abort_request(coordinator, sender_identity, payload):
+    """Forward a client cancellation to the engine serving that request."""
+    if sender_identity not in coordinator.known_clients:
+        logging.warning("Coordinator: ignoring abort from unknown client.")
+        return
+    client_request_id = int(payload[1])
+    request_id = coordinator.client_request_to_request_id.get((sender_identity, client_request_id))
+    if request_id is None:
+        return
+    assigned_rank = coordinator.request_id_to_rank.get(request_id)
+    if assigned_rank is not None:
+        coordinator._send_to_engine(
+            assigned_rank,
+            msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True),
         )
 
 

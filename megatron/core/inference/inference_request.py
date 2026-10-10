@@ -695,13 +695,16 @@ class DynamicInferenceRequestRecord:
             }
         )
 
-        # New request.
+        # Preserve prefix-cache configuration and let __post_init__ recompute hashes for the
+        # expanded prompt. The previous hash list may not include newly completed blocks.
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            block_size_tokens=old_request.block_size_tokens,
+            enable_prefix_caching=old_request.enable_prefix_caching,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
