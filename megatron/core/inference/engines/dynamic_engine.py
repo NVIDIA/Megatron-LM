@@ -82,7 +82,6 @@ from megatron.core.utils import (
     nvtx_range_push,
     round_up_to_nearest_multiple,
     trace_async_exceptions,
-    unwrap_model,
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
@@ -1021,7 +1020,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
-        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
+        unwrapped = controller._language_model
         mtp_warmup_enabled = (
             controller.num_mtp_depths > 0
             and (controller.num_speculative_tokens or 0) > 0
