@@ -53,7 +53,7 @@ def ci_is_busy(pipeline, target_branch: str):
         ]
     )
     logger.info(f"Position in queue: {in_queue+1}. Waiting for resources...")
-    return in_queue > NUM_CONCURRENT_JOBS
+    return in_queue >= NUM_CONCURRENT_JOBS
 
 
 @click.command()
