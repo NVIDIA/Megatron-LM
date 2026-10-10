@@ -8,6 +8,7 @@ keep model config classes out of the primitive layer.
 from __future__ import annotations
 
 from collections.abc import Hashable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -22,6 +23,8 @@ from megatron.lite.primitive.parallel.cp import (
 )
 
 if TYPE_CHECKING:
+    from megatron.lite.primitive.kernels.indexer_topk import IndexerGeometry, QueryLayout
+    from megatron.lite.primitive.modules.attention.indexer_topk import IndexerTopKBinding
     from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
 
 
@@ -376,6 +379,127 @@ def _cp_indexer_loss(
         sparse_loss=sparse_loss,
         calculate_per_token_loss=calculate_per_token_loss,
     )
+
+
+def _bound_indexer_topk(module) -> IndexerTopKBinding | None:
+    """Return the module's indexer top-k binding when it selects.
+
+    A binding selects only in eval mode with gradients disabled. A training forward
+    keeps the upstream selector even without autograd: Lite's reentrant activation
+    recompute (``primitive/recompute.py``) runs it under ``torch.no_grad()`` and
+    recomputes it with gradients in the backward pass, and both must select the
+    same top-k. ``getattr`` keeps test doubles of the module (no binding set, no
+    ``training`` flag) working.
+    """
+    binding = getattr(module, "_indexer_topk", None)
+    if binding is None or getattr(module, "training", False) or not binding.active():
+        return None
+    return binding
+
+
+@dataclass(frozen=True, eq=False)
+class _CPIndexerQuery:
+    """The indexer top-k selection of one DSA native CP forward through a binding.
+
+    Built in place of the dense [local query, global key] causal mask. It keeps
+    what that mask is built from, so a selection the binding does not take can
+    build the mask exactly as the caller would have.
+
+    Attributes:
+        binding: The active binding of the layer.
+        layout: The rank's query rows and the keys each one sees.
+        query_positions: Global positions of the local queries (the mask rows).
+        cu_seqlens: Packed sequence offsets, or None for one dense sequence.
+        device: Device of the mask.
+    """
+
+    binding: IndexerTopKBinding
+    layout: QueryLayout
+    query_positions: torch.Tensor
+    cu_seqlens: torch.Tensor | None
+    device: torch.device
+
+    def select(
+        self,
+        q_indexer: torch.Tensor,
+        k_indexer: torch.Tensor,
+        weights_indexer: torch.Tensor,
+        *,
+        topk: int,
+        softmax_scale: float,
+    ) -> torch.Tensor | None:
+        """Select the top-k of the local queries.
+
+        Returns:
+            int32 ``[1, rows, topk]`` rows of the gathered keys, -1 for missing
+            keys (the contract of ``_index_scores_and_topk``); None when the
+            binding does not select (the caller then builds the mask and runs
+            the upstream selector).
+        """
+        selected = self.binding.select(
+            q_indexer[:, 0],
+            k_indexer[:, 0],
+            weights_indexer[:, 0],
+            layout=self.layout,
+            topk=topk,
+            softmax_scale=softmax_scale,
+        )
+        return None if selected is None else selected.unsqueeze(0)
+
+    def build_mask(self, key_rows: int) -> torch.Tensor:
+        """Build the caller's causal mask over ``key_rows`` (padded) gathered keys."""
+        if self.cu_seqlens is None:
+            return _build_cp_causal_mask(
+                self.query_positions,
+                torch.arange(key_rows, device=self.device),
+            )
+        key_pos = torch.arange(key_rows, device=self.device, dtype=torch.long)
+        return _build_cp_causal_mask(
+            self.query_positions,
+            key_pos,
+            cu_seqlens=self.cu_seqlens,
+        )
+
+
+def _cp_indexer_query(
+    module,
+    query_positions: torch.Tensor,
+    *,
+    batch: int,
+    device: torch.device,
+    key_rows: int | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+) -> _CPIndexerQuery | None:
+    """Return how a DSA native CP forward selects through the layer's binding.
+
+    The local queries are the contiguous rows ``[cp_rank * L, (cp_rank + 1) * L)``
+    of one sequence whose ``key_rows`` keys (before the alignment padding) are
+    the gathered keys, or of the packed sequences of ``cu_seqlens`` (read once
+    here), with ids into the gathered keys.
+
+    Returns:
+        The selection, or None when the caller builds the mask: the layer has
+        no active binding (checked first, so CP test doubles need no other
+        attribute), selects no top-k (IndexShare shared layers), or gets a
+        batch of several sequences (declined).
+    """
+    binding = _bound_indexer_topk(module)
+    if binding is None or module.skip_topk:
+        return None
+    if batch != 1:
+        binding.decline("batch>1")
+        return None
+    from megatron.lite.primitive.kernels.indexer_topk import QueryLayout
+
+    rows = query_positions.shape[0]
+    row_start = module.cp_rank * rows
+    if cu_seqlens is None:
+        layout = QueryLayout.contiguous(rows, position=row_start, keys=key_rows)
+    else:
+        layout = QueryLayout.packed(
+            cu_seqlens.tolist(), row_start=row_start, rows=rows, absolute_ids=True
+        )
+    return _CPIndexerQuery(binding, layout, query_positions, cu_seqlens, device)
 
 
 def is_dsa_skip_topk_layer(
@@ -815,6 +939,45 @@ class DynamicSparseAttention(nn.Module):
             torch.full((num_attention_heads,), -1.0e20, dtype=torch.float32),
             persistent=False,
         )
+        # Optional selector of the indexer top-k in eval mode with gradients disabled
+        # (set_indexer_topk).
+        self._indexer_topk: IndexerTopKBinding | None = None
+
+    def indexer_geometry(self) -> IndexerGeometry | None:
+        """Return the shape of this layer's indexer for an indexer top-k binding.
+
+        Returns:
+            The indexer geometry, or None for IndexShare shared layers, which reuse the
+            top-k of their source layer and select none.
+        """
+        if self.skip_topk or self.indexer is None:
+            return None
+        from megatron.lite.primitive.kernels.indexer_topk import IndexerGeometry
+
+        return IndexerGeometry(
+            num_heads=self.indexer.num_heads,
+            head_dim=self.indexer.head_dim,
+            topk=self.index_topk,
+        )
+
+    def set_indexer_topk(self, binding: IndexerTopKBinding | None) -> None:
+        """Select the indexer top-k with ``binding`` in eval mode with gradients disabled.
+
+        Args:
+            binding: The binding (see ``configure_indexer_topk``), or None for the
+                upstream selector. Training forwards (also those without autograd, as
+                in a reentrant activation recompute) and every forward with autograd
+                enabled always use the upstream selector.
+
+        Raises:
+            ValueError: If a binding is given to a layer without an indexer.
+        """
+        if binding is not None and self.indexer_geometry() is None:
+            raise ValueError(
+                f"DSA layer {self.layer_number} reuses the top-k of layer "
+                f"{self.index_share_source_layer} and selects none; it takes no binding"
+            )
+        self._indexer_topk = binding
 
     def forward(
         self,
@@ -980,11 +1143,20 @@ class DynamicSparseAttention(nn.Module):
         q_indexer: torch.Tensor | None,
         k_indexer: torch.Tensor | None,
         weights_indexer: torch.Tensor | None,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None,
         *,
         index_share_state: DSAIndexShareState | None,
         index_share_cache_key: Hashable | None,
+        cp_query: _CPIndexerQuery | None = None,
     ) -> torch.Tensor:
+        """Select or reuse CP top-k indices and run the sparse attention.
+
+        ``mask`` is the explicit local-Q/global-K causal mask. IndexShare shared
+        layers (``skip_topk``) reuse the source layer's indices and never read
+        it, so their callers pass ``None``. So do the callers of layers that
+        select with an indexer top-k binding (``cp_query``); if the binding does
+        not select, the mask is built here as the caller would have.
+        """
         batch = query.shape[1]
         topk_indices: torch.Tensor | None = None
         if self.skip_topk:
@@ -1001,14 +1173,33 @@ class DynamicSparseAttention(nn.Module):
         else:
             assert q_indexer is not None and k_indexer is not None
             assert weights_indexer is not None
-            _scores, topk_indices = _index_scores_and_topk(
-                q_indexer,
-                k_indexer,
-                weights_indexer,
-                mask=mask,
-                topk=self.index_topk,
-                scale=self.indexer_softmax_scale,
-            )
+            if cp_query is not None:
+                # This replaces _index_scores_and_topk and its stream synchronization,
+                # which lets the cuDNN frontend radix top-k finish before compactify
+                # reuses that kernel's freed scratch buffer. The binding's reference
+                # selector runs the exact-tie top-k whenever the configuration names one
+                # (precision "exact" requires it) and the radix top-k otherwise; both
+                # launch on the current stream, where the caching allocator reuses a
+                # freed buffer only after the work queued before the free.
+                topk_indices = cp_query.select(
+                    q_indexer,
+                    k_indexer,
+                    weights_indexer,
+                    topk=self.index_topk,
+                    softmax_scale=self.indexer_softmax_scale,
+                )
+                if topk_indices is None:
+                    mask = cp_query.build_mask(kv.shape[0])
+            if topk_indices is None:
+                assert mask is not None
+                _scores, topk_indices = _index_scores_and_topk(
+                    q_indexer,
+                    k_indexer,
+                    weights_indexer,
+                    mask=mask,
+                    topk=self.index_topk,
+                    scale=self.indexer_softmax_scale,
+                )
             if self.index_share_enabled and index_share_state is not None:
                 index_share_state.save_topk(
                     self.layer_number,
@@ -1082,12 +1273,20 @@ class DynamicSparseAttention(nn.Module):
             if k_idx_local is not None
             else None
         )
+        cp_query = _cp_indexer_query(
+            self, query_pos, batch=x.shape[0], device=x.device, key_rows=kv.shape[0]
+        )
         if kv.is_cuda and not self.skip_topk:
             kv, k_idx = _pad_cp_projected_kv(kv, k_idx)
-        mask = _build_cp_causal_mask(
-            query_pos,
-            torch.arange(kv.shape[0], device=x.device),
-        )
+        # Shared layers reuse the source layer's indices and bound layers select
+        # without it: skip the dense [local query, global key] mask for both.
+        mask = None
+        if not self.skip_topk and cp_query is None:
+            mask = _build_cp_causal_mask(
+                query_pos,
+                torch.arange(kv.shape[0], device=x.device),
+            )
+        # ``mask`` is None here for shared layers.
         out = self._run_cp_sparse_segment(
             query,
             kv,
@@ -1097,6 +1296,7 @@ class DynamicSparseAttention(nn.Module):
             mask,
             index_share_state=index_share_state,
             index_share_cache_key=None,
+            cp_query=cp_query,
         )
         return self._project_cp_output(out, v_up_weight)
 
@@ -1141,14 +1341,21 @@ class DynamicSparseAttention(nn.Module):
             if k_idx_local is not None
             else None
         )
+        cp_query = _cp_indexer_query(
+            self, query_pos, batch=x.shape[0], device=x.device, cu_seqlens=cu_seqlens
+        )
         if kv.is_cuda and not self.skip_topk:
             kv, k_idx = _pad_cp_projected_kv(kv, k_idx)
-        key_pos = torch.arange(kv.shape[0], device=x.device, dtype=torch.long)
-        mask = _build_cp_causal_mask(
-            query_pos,
-            key_pos,
-            cu_seqlens=cu_seqlens,
-        )
+        # Shared layers reuse the source layer's indices and bound layers select
+        # without it: skip the dense [local query, global key] mask for both.
+        mask = None
+        if not self.skip_topk and cp_query is None:
+            key_pos = torch.arange(kv.shape[0], device=x.device, dtype=torch.long)
+            mask = _build_cp_causal_mask(
+                query_pos,
+                key_pos,
+                cu_seqlens=cu_seqlens,
+            )
         out = self._run_cp_sparse_segment(
             query,
             kv,
@@ -1158,6 +1365,7 @@ class DynamicSparseAttention(nn.Module):
             mask,
             index_share_state=index_share_state,
             index_share_cache_key=None,
+            cp_query=cp_query,
         )
         return self._project_cp_output(out, v_up_weight)
 
@@ -1327,14 +1535,24 @@ class DynamicSparseAttention(nn.Module):
                     and k_indexer is not None
                     and weights_indexer is not None
                 )
-                topk_indices, _ = _dsa_kernels.indexer_topk(
-                    q_indexer,
-                    k_indexer,
-                    weights_indexer,
-                    effective_indexer_topk,
-                    1,
-                    indexer_softmax_scale=self.indexer_softmax_scale,
-                )
+                binding = _bound_indexer_topk(self)
+                if binding is not None:
+                    topk_indices = self._select_full_prompt_topk(
+                        binding,
+                        q_indexer,
+                        k_indexer,
+                        weights_indexer,
+                        effective_indexer_topk,
+                    )
+                if topk_indices is None:
+                    topk_indices, _ = _dsa_kernels.indexer_topk(
+                        q_indexer,
+                        k_indexer,
+                        weights_indexer,
+                        effective_indexer_topk,
+                        1,
+                        indexer_softmax_scale=self.indexer_softmax_scale,
+                    )
                 if self.index_share_enabled and index_share_state is not None:
                     index_share_state.save_topk(
                         self.layer_number,
@@ -1359,6 +1577,43 @@ class DynamicSparseAttention(nn.Module):
         out = torch.einsum("bshr,hvr->bshv", out, v_up_weight)
         out = out.reshape(batch, seq_len, self.num_heads * self.v_head_dim)
         return self.o_proj(out)
+
+    def _select_full_prompt_topk(
+        self,
+        binding: IndexerTopKBinding,
+        q_indexer: torch.Tensor,
+        k_indexer: torch.Tensor,
+        weights_indexer: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor | None:
+        """Select the indexer top-k of a whole prompt with the layer's binding.
+
+        Args:
+            binding: The active binding of the layer.
+            q_indexer: Indexer queries ``[sq, b, H, D]``.
+            k_indexer: Indexer keys ``[sk, b, D]``.
+            weights_indexer: Head weights ``[sq, b, H]``, before the softmax scale.
+            topk: Keys per query row.
+
+        Returns:
+            int32 ``[1, sq, topk]`` key ids of the prompt (-1 for missing keys), the
+            contract of ``dsa_kernels.indexer_topk``; None to run the upstream selector
+            (batches of several prompts, or an inactive binding).
+        """
+        if q_indexer.shape[1] != 1:
+            binding.decline("batch>1")
+            return None
+        from megatron.lite.primitive.kernels.indexer_topk import QueryLayout
+
+        selected = binding.select(
+            q_indexer[:, 0],
+            k_indexer[:, 0],
+            weights_indexer[:, 0],
+            layout=QueryLayout.full(q_indexer.shape[0], keys=k_indexer.shape[0]),
+            topk=topk,
+            softmax_scale=self.indexer_softmax_scale,
+        )
+        return None if selected is None else selected.unsqueeze(0)
 
     def _split_kv_b_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         kv_b = self.kv_b_proj.weight.view(
