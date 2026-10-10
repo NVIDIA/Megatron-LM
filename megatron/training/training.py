@@ -1694,6 +1694,11 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    # initialize_megatron built the global parallel grid; from here on the model and the
+    # training loop take their process groups from this one collection.
+    if pg_collection is None:
+        pg_collection = _build_pg_collection_from_parallel_state(args)
+
     # OTel span setup (_start_otel_job_spans) is deferred until after
     # kernel warmup below, where program_start/main_entry/pretrain_entry
     # and the other startup timestamps are all available -- see the block right
@@ -1720,10 +1725,8 @@ def pretrain(
             else next(iter(pg_collection))
         )
         warmup_tp_group = warmup_pg_collection.tp
-    elif pg_collection is not None:
-        warmup_tp_group = pg_collection.tp
     else:
-        warmup_tp_group = mpu.get_tensor_model_parallel_group()
+        warmup_tp_group = pg_collection.tp
     warmup_training_kernels(args, warmup_tp_group)
     print_rank_0("Finished training-kernel warmup.")
 
@@ -1950,16 +1953,14 @@ def pretrain(
             model_provider_func=model_provider,
             checkpointing_context=checkpointing_context,
             cfg_container=cfg_container,
-            # TODO (@maanug): temporary until initialize.py builds a pgcollection as bridge does.
-            pg_collection=(
-                pg_collection
-                if pg_collection is not None
-                else ProcessGroupCollection.use_mpu_process_groups()
-            ),
+            pg_collection=pg_collection,
         )
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
+    # A multi-module collection comes with its own cross-grid communicator.
+    if p2p_communicator is None and isinstance(pg_collection, ProcessGroupCollection):
+        p2p_communicator = P2PCommunicator(pp_group=pg_collection.pp, config=model_cfg)
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -2385,8 +2386,9 @@ def wrap_model_chunks_with_ddp(
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
-            forwarded to both standard DDP and FSDP variants, and used to source
-            DP world sizes for layout computation.
+            forwarded to standard DDP and Megatron-FSDP, used to pick the DP x CP group
+            Torch FSDP2 shards over, and used to source DP world sizes for layout
+            computation.
         bucket_sizes: Optional per-chunk bucket size override; defaults to
             ``[ddp_config.bucket_size] * len(model_chunks)``.
         disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
@@ -2478,9 +2480,15 @@ def wrap_model_chunks_with_ddp(
             model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
         ):
             chunk_kwargs = {}
-            # TorchFSDP takes process_group, not pg_collection.
-            if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
-                chunk_kwargs["pg_collection"] = pg_collection
+            if pg_collection is not None:
+                if HAVE_FSDP2 and DP is torch_FSDP:
+                    # TorchFSDP takes the one group it shards over: DP x CP, including the
+                    # GTP-remat axis when the collection has one.
+                    chunk_kwargs["process_group"] = (
+                        pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+                    )
+                else:
+                    chunk_kwargs["pg_collection"] = pg_collection
             if layout is not None:
                 chunk_kwargs["full_param_layout"] = layout
             wrapped.append(
@@ -2562,26 +2570,59 @@ def _forward_backward_grad_context(args):
     return grad_context, forward_only
 
 
+def _build_pg_collection_from_parallel_state(args):
+    """Return the process groups of the global parallel grid as one collection.
+
+    pretrain() builds the model and runs the training loop on this collection, and get_model()
+    builds one when it is called without a collection. With ``--create-all-gather-group`` the
+    collection also carries the separate data-parallel all-gather communicators (``dp_cp_ag``,
+    and ``expt_dp_ag`` with expert parallelism), which Megatron-FSDP uses to overlap the
+    parameter all-gather with the gradient reduce-scatter.
+    """
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+    if args.create_all_gather_group:
+        timeout = (
+            timedelta(minutes=args.distributed_timeout_minutes)
+            if args.distributed_timeout_minutes
+            else None
+        )
+        dp_cp_ag, expt_dp_ag = create_all_gather_groups(
+            for_expert_parallelism=(args.expert_model_parallel_size > 1),
+            timeout=timeout,
+        )
+        # create_all_gather_groups lays the ranks out in the default order, so check that each
+        # all-gather group spans the ranks of the group whose parameters it gathers.
+        for ag_group, group in (
+            (dp_cp_ag, pg_collection.dp_cp),
+            (expt_dp_ag, pg_collection.expt_dp),
+        ):
+            if ag_group is not None and (
+                torch.distributed.get_process_group_ranks(ag_group)
+                != torch.distributed.get_process_group_ranks(group)
+            ):
+                raise ValueError(
+                    "--create-all-gather-group built all-gather groups whose ranks differ from "
+                    "the data-parallel groups; it supports only the default tp-cp-ep-dp-pp "
+                    "rank order."
+                )
+        pg_collection.dp_cp_ag = dp_cp_ag
+        pg_collection.expt_dp_ag = expt_dp_ag
+
+        print_rank_0("> created all-gather process groups for AG/RS overlap")
+        if expt_dp_ag is not None:
+            print_rank_0(">   including expert parallelism AG group")
+
+    return pg_collection
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-
-        if args.create_all_gather_group:
-            timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
-            dp_cp_ag, expt_dp_ag = create_all_gather_groups(
-                for_expert_parallelism=(args.expert_model_parallel_size > 1),
-                timeout=timeout,
-            )
-            pg_collection.dp_cp_ag = dp_cp_ag
-            pg_collection.expt_dp_ag = expt_dp_ag
-
-            print_rank_0("> created all-gather process groups for AG/RS overlap")
-            if expt_dp_ag is not None:
-                print_rank_0(">   including expert parallelism AG group")
+        pg_collection = _build_pg_collection_from_parallel_state(args)
 
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
@@ -2751,7 +2792,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     args, 'use_layer_wise_param_layout', True
                 ),
                 DP=DP,
-                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                pg_collection=pg_collection,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
@@ -3040,6 +3081,9 @@ def setup_model_and_optimizer(
             model,
             config_overrides=config_overrides,
             use_gloo_process_groups=args.use_gloo_process_groups,
+            # A collection carries no Gloo groups, so get_megatron_optimizer accepts one only
+            # without them; with Gloo groups it builds all of its groups from parallel_state.
+            pg_collection=None if args.use_gloo_process_groups else pg_collection,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
@@ -3306,10 +3350,11 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
-    pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
-        preserves the default behavior. Reductions source per-rank groups from the model.
-    p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
-        preserves the default behavior.
+    pg_collection: process groups forwarded to the schedule: the model's collection, or a
+        multi-module collection for the cross-grid case. None makes the schedule use the global
+        parallel state. Reductions source per-rank groups from the model.
+    p2p_communicator: pipeline communicator forwarded to the schedule; the pipelined schedules
+        take it together with pg_collection.
     """
     args = get_args()
     timers = get_timers()
@@ -4622,6 +4667,21 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def _get_forward_backward_func(pg_collection, config):
+    """Select the schedule for the process groups the training loop runs on.
+
+    A single-model collection selects by its pipeline group and the model's virtual-pipeline
+    size, and a multi-module collection selects the cross-grid schedule. Without a collection,
+    the schedule follows the global parallel state.
+    """
+    if isinstance(pg_collection, ProcessGroupCollection):
+        return get_forward_backward_func(
+            pp_size=pg_collection.pp.size(),
+            vp_size=config.virtual_pipeline_model_parallel_size,
+        )
+    return get_forward_backward_func(schedule_pg_collection=pg_collection)
+
+
 def train(
     forward_step_func,
     model,
@@ -4640,10 +4700,11 @@ def train(
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
-    p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
-        preserves the default behavior.
-    pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
-        preserves the default behavior.
+    p2p_communicator: pipeline communicator forwarded to the schedule; the pipelined schedules
+        take it together with pg_collection.
+    pg_collection: process groups that select the schedule and are forwarded to it: the model's
+        collection, or a multi-module collection for the cross-grid case. None selects and runs
+        the schedule on the global parallel state.
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
@@ -4788,6 +4849,12 @@ def train(
         model_module.train()
 
     model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    # The parameter norm of a multi-module model sums over every module's grid.
+    params_norm_pg_collection = (
+        pg_collection
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection)
+        else model_pg_collection
+    )
 
     # Tracking loss.
     total_loss_dict = {}
@@ -4909,9 +4976,7 @@ def train(
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func(
-        schedule_pg_collection=pg_collection
-    )
+    forward_backward_func = _get_forward_backward_func(pg_collection, config)
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -5401,7 +5466,9 @@ def train(
                 # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
                 # cost span (it stalls the critical path), unlike passive monitors.
                 with _otel_managed_span('step', 'megatron.train.params_norm', is_goodput_span=True):
-                    params_norm = calc_params_l2_norm(model, pg_collection=pg_collection)
+                    params_norm = calc_params_l2_norm(
+                        model, pg_collection=params_norm_pg_collection
+                    )
             if optimizer is not None:
                 learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
             else:
@@ -5671,7 +5738,7 @@ def evaluate(
     eval_num_microbatches = eval_batch_size // (
         eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
     )
-    forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    forward_backward_func = _get_forward_backward_func(pg_collection, config)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:
