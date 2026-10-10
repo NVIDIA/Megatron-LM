@@ -211,6 +211,7 @@ hybrid_stack_spec = ModuleSpec(
                         linear_q_up_proj=TEColumnParallelLinear,
                         linear_kv_down_proj=TELinear,
                         linear_kv_up_proj=TEColumnParallelLinear,
+                        linear_gate=TEColumnParallelLinear,
                         core_attention=ModuleSpec(
                             module=DSAttention,
                             submodules=DSAttentionSubmodules(
