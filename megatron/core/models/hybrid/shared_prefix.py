@@ -888,12 +888,15 @@ def _validate_hybrid_stack(
         if stack.config.moe_expert_rank_capacity_factor is not None:
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support MoE expert rank capacity or "
-                "token dropping"
+                "token dropping: the per-rank budget counts physical star rows, and a dropped "
+                "prompt row is lost for every completion that shares it"
             )
         # Replay targets are recorded per dense row; shared-prefix routes physical star rows.
         if stack.config.moe_enable_routing_replay:
             raise NotImplementedError(
-                "shared-prefix Hybrid adapter does not support MoE routing replay"
+                "shared-prefix Hybrid adapter does not support MoE routing replay: replay "
+                "targets are indexed by dense rows, while a shared-prefix forward routes "
+                "physical star rows that store each prompt once"
             )
         if getattr(stack.config, "mlp_chunks_for_training", 1) != 1:
             raise NotImplementedError(
@@ -920,7 +923,9 @@ def _validate_hybrid_stack(
             # helper to undo it; a contiguous linear layout would skip that reordering.
             if cp_size > 1 and layer.mixer.cp.sequence_is_contiguous:
                 raise NotImplementedError(
-                    "shared-prefix Mamba CP requires linear_cp_layout='zigzag'"
+                    "shared-prefix Mamba CP requires linear_cp_layout='zigzag': the shared-prefix "
+                    "forward shards each star in zigzag order and relies on the Mamba CP helper "
+                    "to undo it"
                 )
         elif isinstance(layer, TransformerLayer):
             if not isinstance(layer.self_attention, (IdentityOp, SelfAttention)):
