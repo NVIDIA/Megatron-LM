@@ -514,6 +514,7 @@ def _set_random_seed(
                 egtp_remat_rank=egtp_remat_rank,
                 gtp_remat_world_size=gtp_remat_world_size,
                 egtp_remat_world_size=egtp_remat_world_size,
+                pp_rank=pp_rank,
             )
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
