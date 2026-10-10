@@ -11,6 +11,11 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    require_process_groups,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -61,6 +66,33 @@ def is_first_microbatch_tracked(config) -> bool:
         or getattr(config, 'use_kitchen', False)
         or getattr(config, 'quant_recipe', None) is not None
     )
+
+
+def _require_pipeline_group(
+    pg_collection: ProcessGroupCollection, config: TransformerConfig, owner: str
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Return the ``pp`` group of ``pg_collection``, which gives the pipeline stage of this rank.
+
+    Without pipeline parallelism (``config.pipeline_model_parallel_size == 1``) there is one
+    stage, so ``pp`` may be unset or None. With pipeline parallelism, ``pp`` must be the
+    pipeline-parallel group of this rank: an unset field or None reads as rank 0 of a group of
+    size 1, so every rank would act as the only stage.
+
+    Args:
+        pg_collection: The collection of the model that ``owner`` belongs to.
+        config: The config of ``owner``.
+        owner: Name of the class, used in error messages.
+    """
+    if config.pipeline_model_parallel_size == 1:
+        return pg_collection.pp
+    (pp_group,) = require_process_groups(pg_collection, ('pp',), owner=owner)
+    if pp_group is None:
+        raise ValueError(
+            f"{owner}: config.pipeline_model_parallel_size is "
+            f"{config.pipeline_model_parallel_size}, but pg_collection.pp is None. Pass the "
+            "pipeline-parallel group of this rank."
+        )
+    return pp_group
 
 
 class MegatronModule(torch.nn.Module):
@@ -517,16 +549,33 @@ class Float16Module(MegatronModule):
 
     Args:
         config (TransformerConfig): The transformer config used to initalize the model
+        module (torch.nn.Module): The module to wrap.
+        pg_collection (ProcessGroupCollection | None): process groups of the wrapped module. Its
+            ``pp`` group decides on which pipeline stages inputs and outputs are converted, so
+            with ``config.pipeline_model_parallel_size > 1`` it must be set. Defaults to the
+            ``pg_collection`` of the wrapped module. Without either, the global
+            pipeline-parallel group is used with a ``ProcessGroupFallbackWarning``; this
+            fallback is deprecated.
     """
 
-    def __init__(self, config: TransformerConfig, module: torch.nn.Module):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        module: torch.nn.Module,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
         super(Float16Module, self).__init__(config)
         self.config = config
         self.fp16 = config.fp16
         self.bf16 = config.bf16
         self.vp_size = config.virtual_pipeline_model_parallel_size
         self.vp_stage = getattr(module, 'vp_stage', None)
-        self.pg_collection = getattr(module, 'pg_collection', None)
+        if pg_collection is None:
+            # A Megatron Core model carries the collection it was built with.
+            pg_collection = getattr(module, 'pg_collection', None)
+        if pg_collection is not None:
+            _require_pipeline_group(pg_collection, config, type(self).__name__)
+        self.pg_collection = pg_collection
 
         if self.fp16:
             self.add_module(
@@ -583,6 +632,9 @@ class Float16Module(MegatronModule):
         )
 
         if self.pg_collection is None:
+            warn_global_process_group_fallback(
+                type(self).__name__, deprecated_in="0.21", removed_in="0.23"
+            )
             pp_group = parallel_state.get_pipeline_model_parallel_group()
         else:
             pp_group = self.pg_collection.pp

@@ -232,7 +232,8 @@ class TestMultiTokenPredictionLayer:
             loss_mask=torch.ones(1, seq_len),
             output_layer=lambda hidden, **kwargs: (hidden, None),
             output_weight=None,
-            runtime_gather_output=None,
+            # The output layer returns whole-vocabulary logits, so no tensor-parallel group.
+            runtime_gather_output=True,
             is_training=True,
             compute_language_model_loss=lambda labels, logits: torch.ones_like(
                 labels, dtype=logits.dtype

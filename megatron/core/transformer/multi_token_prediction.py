@@ -25,6 +25,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
+    require_process_groups,
     warn_global_process_group_fallback,
 )
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
@@ -808,20 +809,19 @@ def _compute_mtp_acceptance_counts(
     runtime_gather_output: Optional[bool],
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[Tensor, Tensor]:
-    """Compute MTP acceptance correct/total counts."""
+    """Compute MTP acceptance correct/total counts.
+
+    Vocab-sharded logits need ``tp_group``, the group they are sharded over, to find the argmax
+    over the whole vocabulary. Without tensor parallelism it is a group of size 1.
+    """
     with torch.no_grad():
         logits_are_vocab_sharded = _mtp_logits_are_vocab_sharded(
             output_layer, runtime_gather_output
         )
-        if (
-            tp_group is None
-            and logits_are_vocab_sharded
-            and parallel_state.is_initialized()
-            and parallel_state.get_tensor_model_parallel_world_size() > 1
-        ):
+        if tp_group is None and logits_are_vocab_sharded:
             raise ValueError(
                 "tp_group must be provided when computing MTP acceptance counts "
-                "from vocab-sharded logits under tensor model parallelism."
+                "from vocab-sharded logits; pass the model's tensor-parallel group."
             )
         tp_size = torch.distributed.get_world_size(group=tp_group) if tp_group is not None else 1
 
@@ -996,7 +996,9 @@ def get_mtp_layer_offset(
     if config.pipeline_model_parallel_size > 1:
         if config.pipeline_model_parallel_layout:
             if pp_rank is None:
-                # Compatibility fallback for callers without explicit pipeline metadata.
+                warn_global_process_group_fallback(
+                    "get_mtp_layer_offset", "pp_rank", deprecated_in="0.21", removed_in="0.23"
+                )
                 pp_rank = parallel_state.get_pipeline_model_parallel_rank()
             layout = config.pipeline_model_parallel_layout
             if layout.virtual_pipeline_model_parallel_size > 1:
@@ -1024,7 +1026,9 @@ def get_mtp_num_layers_to_build(
 ) -> int:
     """Get the number of MTP layers to build."""
     if pp_rank is None:
-        # Compatibility fallback for callers that have not migrated to explicit PP ranks.
+        warn_global_process_group_fallback(
+            "get_mtp_num_layers_to_build", "pp_rank", deprecated_in="0.21", removed_in="0.23"
+        )
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     if config.pipeline_model_parallel_layout is not None:
@@ -1306,7 +1310,9 @@ def process_mtp_loss(
             )
 
             if metric_avg_group is None:
-                # Compatibility fallback for callers that have not migrated to explicit groups.
+                warn_global_process_group_fallback(
+                    "process_mtp_loss", "metric_avg_group", deprecated_in="0.21", removed_in="0.23"
+                )
                 metric_avg_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True
                 )
@@ -1404,6 +1410,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 "Multi-token prediction with hyper connections requires the HybridModel "
                 "MTP contract: both mtp_layer_pattern and hybrid_submodules must be provided."
             )
+        require_process_groups(pg_collection, ('tp', 'cp', 'pp'), owner=type(self).__name__)
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number + get_mtp_layer_offset(
