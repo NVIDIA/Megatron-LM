@@ -680,8 +680,9 @@ class MTPLossLoggingHelper:
             tracker["correct_values"].zero_()
         if "total_values" in tracker:
             tracker["total_values"].zero_()
-        tracker["reduce_group"] = None
-        tracker["avg_group"] = None
+        # Keep the reduce_group and avg_group across logging intervals: CUDA graph replay
+        # updates the tensors but does not repeat save_metrics_to_tracker's Python
+        # assignments. A new eager forward will overwrite the groups.
 
     @staticmethod
     def reduce_metrics_in_tracker():
