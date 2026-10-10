@@ -553,6 +553,14 @@ class _ParamAndGradBucketGroup:
             # high-precision parameters through separate storage. Only the FP8 transport
             # borrows grad_data; BF16/FP32 forward weights and transport remain independent.
             dp_size = self.intra_distributed_optimizer_instance_size
+            if dp_size == 1 and all(
+                bucket.layerwise_gather_plan is None for bucket in self.buckets
+            ):
+                # Preserve the single-rank no-op before LayerWise plans are bound.
+                if force_sync and self.ddp_config.overlap_param_gather:
+                    self._post_param_sync()
+                self.param_gather_dispatched = True
+                return
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
             layerwise_work_handles = []
