@@ -150,6 +150,48 @@ def test_clamped_swiglu_matches_eager_reference(with_probs: bool) -> None:
 
 
 @pytest.mark.gpus(1)
+@pytest.mark.parametrize("with_probs", [False, True])
+def test_quick_geglu_is_bitwise_core_fused_kernel(with_probs: bool) -> None:
+    """MiniMax-M3 swigluoai (alpha=1.702, offset=1, limit=7) is Core's weighted quick_geglu, forward and backward."""
+    from megatron.core.fusions.fused_bias_geglu import weighted_bias_quick_geglu_impl
+
+    y = (torch.randn(TOKENS, FFN * 2, device="cuda", dtype=torch.bfloat16) * 8).requires_grad_()
+    probs = torch.rand(TOKENS, 1, device="cuda", dtype=torch.float32).requires_grad_() if with_probs else None
+    y_ref = y.detach().clone().requires_grad_()
+    probs_ref = probs.detach().clone().requires_grad_() if with_probs else torch.ones(TOKENS, 1, device="cuda", dtype=y.dtype)
+
+    actual = swiglu_with_probs(y, probs, 7.0, 1.702, 1.0)
+    expected = weighted_bias_quick_geglu_impl(y_ref, None, probs_ref, linear_offset=1.0, clamp_value=7.0)
+    assert actual.dtype == y.dtype and torch.equal(actual, expected)
+
+    g = torch.randn_like(actual)
+    actual.backward(g)
+    expected.backward(g)
+    assert torch.equal(y.grad, y_ref.grad)
+    if with_probs:
+        assert torch.equal(probs.grad, probs_ref.grad)
+
+
+@pytest.mark.gpus(1)
+def test_quick_geglu_matches_hf_swigluoai_reference() -> None:
+    """Same numbers as the HF MiniMax-M3 ``_apply_gate`` expression (bf16 eager), within bf16 rounding."""
+    y = torch.randn(TOKENS, FFN * 2, device="cuda", dtype=torch.bfloat16) * 8
+    gate, up = y.chunk(2, dim=-1)
+    gate = gate.clamp(max=7.0)
+    up = up.clamp(min=-7.0, max=7.0)
+    expected = (up + 1.0) * (gate * torch.sigmoid(gate * 1.702))
+
+    actual = swiglu_with_probs(y, None, 7.0, 1.702, 1.0)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    # The dense MLP passes [B, S, 2H]; the fused kernel flattens, so the wrapper must restore the shape.
+    actual_3d = swiglu_with_probs(y.view(2, TOKENS // 2, FFN * 2), None, 7.0, 1.702, 1.0)
+    assert torch.equal(actual_3d.view(TOKENS, FFN), actual)
+    # An EP rank may own zero tokens.
+    empty = swiglu_with_probs(y[:0], None, 7.0, 1.702, 1.0)
+    assert empty.shape == (0, FFN)
+
+
+@pytest.mark.gpus(1)
 def test_clamped_and_unclamped_differ_on_saturating_input() -> None:
     """Guard the guard: the clamp must change the result on this fixture."""
     y = torch.randn(TOKENS, FFN * 2, device="cuda", dtype=torch.bfloat16) * 8
