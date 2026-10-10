@@ -220,6 +220,7 @@ def update_active_oncall_team(org, new_oncall):
             print(
                 f"Failed to add {new_oncall} to {ACTIVE_ONCALL_TEAM_SLUG}: {resp.status_code} {resp.text}"
             )
+            sys.exit(1)
 
     # 3. Remove everyone else
     old_members = []
