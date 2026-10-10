@@ -171,6 +171,12 @@ def _violations_in(path: pathlib.Path):
             for expression in (*node.decorator_list, *node.args.defaults, *node.args.kw_defaults):
                 if expression:
                     self.visit(expression)
+            args = node.args
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg):
+                if arg and arg.annotation:
+                    self.visit(arg.annotation)
+            if node.returns:
+                self.visit(node.returns)
             self._visit_scope(node, "function")
 
         visit_AsyncFunctionDef = visit_FunctionDef
