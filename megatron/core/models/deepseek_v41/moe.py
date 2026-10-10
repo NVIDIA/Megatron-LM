@@ -2,6 +2,8 @@
 
 """Modality-specific auxiliary-loss-free routing using the standard MoE dispatcher."""
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -32,8 +34,14 @@ class ModalityBalance(nn.Module):
 class ModalityRouter(Router):
     """Select using modality biases, but weight experts using unbiased sqrt-softplus scores."""
 
-    def __init__(self, config, pg_collection, is_mtp_layer=False) -> None:
-        super().__init__(config, pg_collection, is_mtp_layer)
+    def __init__(
+        self,
+        config,
+        pg_collection,
+        is_mtp_layer=False,
+        hash_moe_layer_threshold: Optional[int] = None,
+    ) -> None:
+        super().__init__(config, pg_collection, is_mtp_layer, hash_moe_layer_threshold)
         if config.moe_router_score_function != "sqrtsoftplus":
             raise ValueError("V4.1 modality routing requires sqrtsoftplus scores")
         if config.moe_aux_loss_coeff:
