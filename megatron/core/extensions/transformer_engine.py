@@ -30,7 +30,6 @@ from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
-    get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
@@ -933,14 +932,20 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 f"{', '.join(missing_attrs)}."
             )
 
-    def _get_te_ops_tensor_parallel_context() -> (
-        Tuple[int, Optional[torch.distributed.ProcessGroup]]
-    ):
-        """Return tensor-parallel world size and group for TE ops."""
-        tp_world_size = get_tensor_model_parallel_world_size()
-        tp_group = None
-        if tp_world_size > 1:
-            tp_group = get_tensor_model_parallel_group()
+    def _get_te_ops_tensor_parallel_context(
+        tp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> Tuple[int, Optional[torch.distributed.ProcessGroup]]:
+        """Return tensor-parallel world size and group for TE ops.
+
+        Args:
+            tp_group: Tensor-parallel group of the module that the TE ops implement.
+
+        Returns:
+            The size of ``tp_group``, and ``tp_group`` if that size is greater than 1, else None.
+        """
+        tp_world_size = get_pg_size(tp_group)
+        if tp_world_size == 1:
+            tp_group = None
         return tp_world_size, tp_group
 
     def _get_te_ops_rng_state_tracker_function() -> Optional[Callable]:
@@ -2158,8 +2163,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     that also has "flash attention" enabled.
 
     Note that if Megatron's parallel_state has not been initialized yet, the
-    tp_group and cp_group passed to TE will be None and must be set later
-    via set_tensor_parallel_group() and set_context_parallel_group().
+    tp_group passed to TE will be None and must be set later via
+    set_tensor_parallel_group(). With context_parallel_size > 1, the
+    context-parallel group is required at construction.
     """
 
     cp_stream: torch.cuda.Stream = None
@@ -2242,6 +2248,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # This check is important as CP config can be disabled while having a valid CP group
         # Example - Disabling CP for encoder while a valid CP group exists for decoder
         if self.config.context_parallel_size > 1:
+            # torch.distributed resolves a None group to the default group, so the ranks of the
+            # whole job would become the context-parallel ranks.
+            if pg_collection.cp is None:
+                raise ValueError(
+                    "TEDotProductAttention with context_parallel_size > 1 requires a "
+                    "context-parallel group in pg_collection.cp"
+                )
             assert is_te_min_version(
                 "1.0.0"
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
@@ -3208,7 +3221,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Container for fusible ops
             fused_impl = te.pytorch.ops.Sequential()
 
-            tp_world_size, tp_group = _get_te_ops_tensor_parallel_context()
+            # The ops alias FC1's and FC2's weights, which MLP shards over self.tp_group.
+            tp_world_size, tp_group = _get_te_ops_tensor_parallel_context(self.tp_group)
             rng_state_tracker_function = _get_te_ops_rng_state_tracker_function()
 
             # Check submodule types
@@ -3364,7 +3378,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
-            tp_world_size = get_tensor_model_parallel_world_size()
+            tp_world_size = get_pg_size(self.tp_group)
             if tp_world_size > 1:
                 return super()._make_fused_impl()
 
@@ -3467,7 +3481,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         ) -> None:
             """Register hook forwarding for the grouped and normalization boundaries."""
 
-            if get_tensor_model_parallel_world_size() > 1:
+            if get_pg_size(self.tp_group) > 1:
                 super()._register_hooks_on_fused_impl(
                     fused_impl, pre_forward_submodules=pre_forward_submodules
                 )
@@ -3496,7 +3510,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
-            if get_tensor_model_parallel_world_size() > 1:
+            if get_pg_size(self.tp_group) > 1:
                 return super().forward(hidden_states, **kwargs)
 
             orig_shape = hidden_states.shape
