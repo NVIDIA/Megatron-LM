@@ -81,12 +81,9 @@
       "send_to_next_pipeline_rank:accessor:parallel_state.get_pipeline_model_parallel_next_rank"
     ],
     "megatron/core/inference/config.py": [
-      "InferenceConfig.resolve_pg_collection:shim:use_mpu_process_groups"
+      "InferenceConfig.resolve_pg_collection:guarded:resolve_process_groups"
     ],
     "megatron/core/inference/contexts/dynamic_context.py": [
-      "DynamicInferenceContext.__init__:accessor:parallel_state.get_expert_model_parallel_group",
-      "DynamicInferenceContext.__init__:accessor:parallel_state.get_expert_model_parallel_world_size",
-      "DynamicInferenceContext.__init__:accessor:parallel_state.get_pipeline_model_parallel_group",
       "DynamicInferenceContext.round_up_requests:accessor:parallel_state.get_tensor_model_parallel_world_size",
       "DynamicInferenceContext.round_up_tokens:accessor:parallel_state.get_tensor_model_parallel_world_size"
     ],
@@ -96,10 +93,6 @@
       "build_inference_pg_collection:accessor:parallel_state.get_expert_tensor_parallel_world_size",
       "build_inference_pg_collection:accessor:parallel_state.get_pipeline_model_parallel_world_size",
       "build_inference_pg_collection:accessor:parallel_state.get_tensor_model_parallel_world_size"
-    ],
-    "megatron/core/inference/text_generation_controllers/text_generation_controller.py": [
-      "TextGenerationController.__init__:accessor:parallel_state.get_data_parallel_group",
-      "TextGenerationController.__init__:accessor:parallel_state.get_pipeline_model_parallel_group"
     ],
     "megatron/core/inference/text_generation_server/dynamic_text_gen_server/tokenization.py": [
       "tokenize_prompts:accessor:parallel_state.get_data_parallel_src_rank"
@@ -289,5 +282,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 183
+  "total": 178
 }
