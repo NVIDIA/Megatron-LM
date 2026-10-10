@@ -51,8 +51,6 @@ def is_pending(target_branch: str):
         "preparing",
         "pending",
         "running",
-        "canceled",
-        "skipped",
         "manual",
         "scheduled",
     ]
