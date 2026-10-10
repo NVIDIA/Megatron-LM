@@ -44,11 +44,12 @@ echo "HF cache:   ${HF_HOME}"
 echo "============================================================"
 
 # Create work directory
+# Resolve the script location before changing the working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "${WORK_DIR}"
 cd "${WORK_DIR}"
 
 # Check if create_common_pile_ci_dataset.py was scp'd alongside this script
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "${SCRIPT_DIR}/create_common_pile_ci_dataset.py" ]; then
     DATASET_SCRIPT="${SCRIPT_DIR}/create_common_pile_ci_dataset.py"
     echo "Found dataset script at: ${DATASET_SCRIPT}"
