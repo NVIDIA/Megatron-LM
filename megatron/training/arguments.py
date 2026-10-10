@@ -3545,7 +3545,9 @@ def _add_experimental_args(parser):
                        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
                        '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
                        'stage boundaries for flexible virtual pipeline parallel (fVPP). '
-                       'Use / to separate MTP patterns. '
+                       'Use / to separate MTP patterns. Use [...] to group layers into one '
+                       'logical layer, e.g. "[M*E][M*E]" (see the "Bracketed layer groups" '
+                       'section of docs/user-guide/hybrid-model-migration.md). '
                        'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
