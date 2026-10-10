@@ -463,6 +463,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
     def _semantic_plan(self, p):
         """Cache physical shard offsets and a collective schedule shared by all peers."""
+        if p.ndim != 2:
+            raise ValueError(
+                "Per-head Muon requires 2-D projection parameters; flattened optimizer "
+                "shards are unsupported. Use LayerWiseDistributedOptimizer for Muon "
+                "matrices, not the standard DistributedOptimizer."
+            )
         if p in self._semantic_plans:
             return self._semantic_plans[p]
         layout = p.muon_layout

@@ -13,6 +13,20 @@ absent. Layer-wise data-parallel optimizer ownership is supported. The separate
 and is rejected with this flag. Supported TP modes are `blockwise`, `duplicated`,
 `distributed`, and `auto`; head fragments are reconstructed before local NS.
 
+For Muon, the training CLI translates `--use-distributed-optimizer` into
+`use_layer_wise_distributed_optimizer=True` and clears `use_distributed_optimizer`.
+The optimizer factory assigns whole matrix parameters to DP ranks through
+`LayerWiseDistributedOptimizer`; BF16 master copies retain their two-dimensional
+shape. With the buffer-layout path, ordinary `DistributedOptimizer` instances
+manage the separate scalar/embedding groups. Wrapping semantic Muon matrices in
+the standard optimizer's flattened DP shards is unsupported and raises an error.
+
+Per-head Muon with Kitchen is rejected by the optimizer factory. Kitchen uses
+stride-1 FC1 storage and its backend is not publicly available for validation;
+it must supply a verified layout contract before this combination is supported.
+Kitchen parameters do not receive the stride-2 SwiGLU layout. The default Muon
+path remains available when per-head mode is disabled.
+
 This enables the following routing for module-owned fused projections:
 
 | Projection | Muon matrices | AdamW rows |
@@ -85,7 +99,8 @@ For GPU integration tests:
 
 ```bash
 MUON_TEST_DEVICE=cuda python -m torch.distributed.run --standalone --nproc-per-node=8 \
-  -m pytest tests/unit_tests/test_muon_per_head.py tests/unit_tests/test_muon_semantics.py
+  -m pytest tests/unit_tests/test_muon_per_head.py tests/unit_tests/test_muon_semantics.py \
+  tests/unit_tests/test_muon_layerwise_integration.py
 ```
 
 ## Validation scope and limitations
@@ -97,6 +112,12 @@ down projections. Replay tests compare parameters and moment tensors byte for
 byte, using side-stream contention when CUDA is available. GPU module tests
 instantiate standard/output-gated attention, GDN1/GDN2, MLA and dense SwiGLU;
 they skip cleanly without CUDA.
+
+Layer-wise integration tests exercise the documented CLI conversion and the real
+DDP/optimizer factory with both parameter-layout and legacy ping-pong ownership.
+They supply controlled, already-reduced gradients, compare three updates with an
+unsharded reference, check BF16 masters and moment shapes, and run DP parameter
+synchronization. They isolate optimizer integration rather than full training.
 
 Native distributed on-disk checkpoint save/load/resume and full GPU training
 still require validation on the upstream integration. Grouped MoE expert FC1

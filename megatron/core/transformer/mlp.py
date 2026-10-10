@@ -235,9 +235,9 @@ class MLP(MegatronModule):
             name=(name + ".linear_fc1") if name is not None else None,
         )
 
-        if self.config.gated_linear_unit:
-            # Physical TP storage is [gate_local, up_local], not a contiguous
-            # chunk of [gate_global, up_global]. Both are feature matrices.
+        if self.config.gated_linear_unit and not self.config.use_kitchen:
+            # The supported stride-2 TP storage is [gate_local, up_local].
+            # Kitchen uses stride=1 and needs its own verified layout contract.
             local_width = ffn_hidden_size // (2 * get_pg_size(self.tp_group))
             self.linear_fc1.weight.muon_layout = MuonProjectionLayout.matrices(
                 (local_width, local_width), tp_local=True, tp_partitioned=True

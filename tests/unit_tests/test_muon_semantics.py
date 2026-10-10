@@ -274,6 +274,13 @@ class TestMuonSemantics(unittest.TestCase):
         copy_tensor_model_parallel_attributes(q, p)
         self.assertEqual(q.muon_layout, p.muon_layout)
 
+    def test_flattened_semantic_parameter_is_rejected(self):
+        """Flattened optimizer shards cannot be interpreted as projection rows."""
+        p = torch.nn.Parameter(torch.randn(64))
+        p.muon_layout = MuonProjectionLayout((4, 4), (False, True))
+        with self.assertRaisesRegex(ValueError, "2-D.*LayerWiseDistributedOptimizer"):
+            self.optimizer([p])
+
     def test_checkpoint_tensors_follow_parameter_sharding(self):
         from megatron.core.dist_checkpointing.mapping import ShardedTensor
         from megatron.core.dist_checkpointing.optimizer import optim_state_to_sharding_state

@@ -411,6 +411,49 @@ class TestMuonPerHeadMultiRankTP:
         assert layer.mlp.linear_fc1.weight.muon_layout.tp_partitioned
         assert optimizer is not None
 
+    @pytest.mark.parametrize("split_per_head", [False, True])
+    def test_kitchen_layout_requires_explicit_support(self, split_per_head):
+        """Exercise the Kitchen config branch without claiming backend validation."""
+        from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+        from megatron.core.transformer.mlp import MLP, MLPSubmodules
+
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+            ffn_hidden_size=32,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            use_kitchen=True,
+            add_bias_linear=False,
+        )
+        # The public Kitchen backend is a stub. Local linears let us test the
+        # stride-1 metadata/validation branch without pretending to run Kitchen.
+        model = MLP(
+            config,
+            MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
+            tp_group=pg.tp,
+            ffn_hidden_size=32,
+        )
+        assert model.linear_fc1.weight.partition_stride == 1
+        assert not hasattr(model.linear_fc1.weight, "muon_layout")
+        kwargs = dict(
+            config=OptimizerConfig(
+                optimizer="muon", lr=0.01, muon_split_qkv_per_head=split_per_head
+            ),
+            model_chunks=[model],
+            use_gloo_process_groups=False,
+            pg_collection=pg,
+        )
+        if split_per_head:
+            with pytest.raises(ValueError, match="does not support Kitchen projection layouts"):
+                get_megatron_optimizer(**kwargs)
+        else:
+            assert get_megatron_optimizer(**kwargs) is not None
+
     def test_optimizer_factory_skips_mismatched_qkv_layout(self):
         """A QKV layout mismatch falls back to whole-matrix Muon orthogonalization."""
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()

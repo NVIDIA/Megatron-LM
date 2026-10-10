@@ -803,6 +803,11 @@ def _get_megatron_emerging_optimizer(
 
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
     for model_chunk in model_chunks:
+        if config.muon_split_qkv_per_head and getattr(model_chunk.config, "use_kitchen", False):
+            raise ValueError(
+                "Per-head Muon does not support Kitchen projection layouts. "
+                "Disable Kitchen or muon_split_qkv_per_head."
+            )
         qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
