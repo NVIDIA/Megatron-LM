@@ -250,7 +250,6 @@
     ],
     "megatron/core/transformer/multi_token_prediction.py": [
       "MultiTokenPredictionBlock.__init__:shim:use_mpu_process_groups",
-      "_compute_mtp_acceptance_counts:accessor:parallel_state.get_tensor_model_parallel_world_size",
       "get_mtp_layer_offset:accessor:parallel_state.get_pipeline_model_parallel_rank",
       "get_mtp_num_layers_to_build:accessor:parallel_state.get_pipeline_model_parallel_rank",
       "mtp_on_this_rank:accessor:parallel_state.get_pipeline_model_parallel_rank",
@@ -262,11 +261,11 @@
       "PipelineParallelLayerLayout.get_num_layers_to_build:accessor:parallel_state.get_pipeline_model_parallel_rank"
     ],
     "megatron/core/transformer/transformer_block.py": [
-      "TransformerBlock.__init__:shim:use_mpu_process_groups",
+      "TransformerBlock.__init__:guarded:resolve_process_groups",
       "get_num_layers_to_build:accessor:parallel_state.get_pipeline_model_parallel_rank"
     ],
     "megatron/core/transformer/transformer_layer.py": [
-      "TransformerLayer.__init__:shim:use_mpu_process_groups",
+      "TransformerLayer.__init__:guarded:resolve_process_groups",
       "get_transformer_layer_offset:accessor:parallel_state.get_pipeline_model_parallel_rank"
     ],
     "megatron/core/transformer/utils.py": [
@@ -289,5 +288,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 183
+  "total": 182
 }
