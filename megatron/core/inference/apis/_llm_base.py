@@ -31,6 +31,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.utils import unwrap_model
 
 
 class _EventLoopManager:
@@ -269,18 +270,29 @@ class _MegatronLLMBase:
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
             raise ValueError("coordinator_host/port require use_coordinator=True")
 
-        if not use_coordinator:
-            from megatron.core import parallel_state
+        if inference_config is None:
+            inference_config = InferenceConfig()
 
-            ep_size = parallel_state.get_expert_model_parallel_world_size()
+        if not use_coordinator:
+            # Take the EP group from the configured inference process groups, else from the
+            # model's own collection, which a legacy model does not have.
+            pg_collection = inference_config.pg_collection
+            if pg_collection is None:
+                pg_collection = getattr(unwrap_model(model), "pg_collection", None)
+            if pg_collection is not None:
+                # An unset EP group means expert parallelism is off.
+                ep_group = vars(pg_collection).get("ep")
+                ep_size = 1 if ep_group is None else ep_group.size()
+            else:
+                # Compatibility fallback for models that do not carry a process-group collection.
+                from megatron.core import parallel_state
+
+                ep_size = parallel_state.get_expert_model_parallel_world_size()
             if ep_size > 1:
                 raise ValueError(
                     f"use_coordinator=True is required when expert_model_parallel_size > 1 "
                     f"(got EP={ep_size}). Use coordinator mode to handle EP routing."
                 )
-
-        if inference_config is None:
-            inference_config = InferenceConfig()
 
         # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
         context = DynamicInferenceContext(model.config, inference_config)
