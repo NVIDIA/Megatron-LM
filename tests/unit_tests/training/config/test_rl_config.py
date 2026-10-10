@@ -65,7 +65,7 @@ class TestGeneratedArgumentGroup:
         # Every init field is a flag with the dataclass default; the derived field is not a flag.
         assert set(vars(ns)) == {f.name for f in INIT_FIELDS}
         assert all(getattr(_parse([]), f.name) == getattr(RLConfig(), f.name) for f in INIT_FIELDS)
-        # validate_args mirrors the derived value onto args; rebuilding the section ignores it.
+        # A stray derived value on the namespace is ignored when the section is rebuilt.
         ns.grpo_samples_per_iteration = 999
         assert _default_config_from_args(RLConfig, ns).grpo_samples_per_iteration == 12
         from megatron.rl import rollout_granularity
@@ -115,11 +115,6 @@ class TestPostInit:
     @pytest.mark.parametrize(
         "kwargs, match, rl_only",
         [
-            (
-                dict(rl_kv_cache_management_mode="offload"),
-                "requires --rl-persist-cuda-graphs",
-                True,
-            ),
             (dict(rl_generation_lag=1.0), "requires --rl-partial-rollouts", True),
             (dict(rl_generation_lag=-2.0, rl_partial_rollouts=True), "must be >= -1", True),
             (dict(rl_max_inflight_requests=0), "must be >= 1", True),
@@ -179,7 +174,106 @@ def _instantiate(as_dict):
     return instantiate(sanitize_dataclass_config(as_dict))
 
 
-def test_validate_args_mirrors_derived_values_onto_args():
+RUN = dict(
+    cuda_graph_impl="local",
+    micro_batch_size=1,
+    global_batch_size=12,
+    skip_train=False,
+    load_optim=True,
+    save_interval=None,
+    exit_interval=None,
+)
+
+
+@pytest.mark.parametrize(
+    "rl_kwargs, run_overrides, match",
+    [
+        (dict(rl_training_cuda_graphs=True), dict(cuda_graph_impl="none"), "no CUDA graphs"),
+        (dict(rl_use_sequence_packing=True), dict(micro_batch_size=4), "must be 1"),
+        (dict(grpo_iterations=1), dict(global_batch_size=8), "divisible by global_batch_size"),
+        (dict(), dict(exit_interval=3), "exit_interval should be divisible"),
+        (dict(), dict(save_interval=5), "save_interval should be divisible"),
+        (
+            dict(rl_offload_optimizer_during_inference=True),
+            dict(skip_train=True, load_optim=False),
+            "no optimizer to offload",
+        ),
+        (dict(), dict(global_batch_size=None), "must be resolved"),
+    ],
+)
+def test_validate_run_rejects_runs_inconsistent_with_the_section(rl_kwargs, run_overrides, match):
+    # 4 x 3 samples per iteration over 2 GRPO iterations: 24 samples, 2 batches of 12.
+    cfg = RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs)
+    with pytest.raises(ValueError, match=match):
+        cfg.validate_run(**{**RUN, **run_overrides})
+
+
+def test_validate_run_at_every_call_site():
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.training.config import (
+        CheckpointConfig,
+        LoggerConfig,
+        PretrainConfigContainer,
+        SchedulerConfig,
+        TrainingConfig,
+    )
+
+    # Direct: a consistent run passes, the CUDA-graph rule is skipped without a model config, and
+    # nothing is checked unless the run is an RL run.
+    cfg = RLConfig(
+        perform_rl_step=True, rl_training_cuda_graphs=True, rl_use_sequence_packing=True, **GRPO_4x3
+    )
+    cfg.validate_run(**{**RUN, "save_interval": 4, "exit_interval": 2})
+    cfg.validate_run(**{**RUN, "cuda_graph_impl": None})
+    RLConfig(rl_use_sequence_packing=True).validate_run(**{**RUN, "micro_batch_size": 4})
+
+    # Through the container: the sections supply the inputs.
+    # The CUDA-graph rule reads the model's transformer section; skipped for a model without one.
+    from megatron.training.models.base import ModelConfig
+
+    @dataclasses.dataclass
+    class TopologyOnlyModelConfig(ModelConfig):
+        builder: typing.ClassVar[str] = "tests.topology_only"
+
+    @dataclasses.dataclass
+    class TransformerModelConfig(ModelConfig):
+        builder: typing.ClassVar[str] = "tests.transformer"
+        transformer: types.SimpleNamespace = dataclasses.field(
+            default_factory=lambda: types.SimpleNamespace(cuda_graph_impl="none")
+        )
+
+    def container(model=None, rl=None, **rl_kwargs):
+        return PretrainConfigContainer(
+            train=TrainingConfig(micro_batch_size=4, global_batch_size=12),
+            model=model,
+            optimizer=OptimizerConfig(),
+            scheduler=SchedulerConfig(),
+            logger=LoggerConfig(),
+            checkpoint=CheckpointConfig(),
+            rl=rl if rl is not None else RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs),
+        )
+
+    container(rl_training_cuda_graphs=True).validate()
+    container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
+    container(model=TopologyOnlyModelConfig(), rl=RLConfig()).validate()
+    with pytest.raises(ValueError, match="no CUDA graphs"):
+        container(model=TransformerModelConfig(), rl_training_cuda_graphs=True).validate()
+    with pytest.raises(ValueError, match="must be 1"):
+        container(rl_use_sequence_packing=True).validate()
+
+    # Through validate_args: CLI runs still fail at parse time.
+    dp = int(os.environ.get("WORLD_SIZE", "1"))
+    argv = (
+        "test_rl_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
+        f"--micro-batch-size 2 --global-batch-size {2 * dp} --seq-length 32 "
+        f"--max-position-embeddings 32 --perform-rl-step --grpo-prompts-per-step {dp} "
+        "--grpo-group-size 2 --rl-use-sequence-packing"
+    ).split()
+    with patch("sys.argv", argv), pytest.raises(ValueError, match="must be 1"):
+        validate_args(parse_args())
+
+
+def test_validate_args_leaves_derived_values_on_the_section():
     dp = int(os.environ.get("WORLD_SIZE", "1"))
     samples = 12 * dp
     argv = (
@@ -191,5 +285,7 @@ def test_validate_args_mirrors_derived_values_onto_args():
     with patch("sys.argv", argv):
         args = validate_args(parse_args())
     cfg = _default_config_from_args(RLConfig, args)
-    assert (args.grpo_samples_per_iteration, args.rl_generation_lag) == (samples, 1.0)
+    # validate_args checks the section but does not mirror its derived values onto args.
+    assert not hasattr(args, "grpo_samples_per_iteration")
+    assert args.rl_generation_lag is None
     assert (cfg.grpo_samples_per_iteration, cfg.rl_generation_lag) == (samples, 1.0)
