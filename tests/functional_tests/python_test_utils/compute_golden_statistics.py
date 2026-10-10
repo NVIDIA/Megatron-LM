@@ -233,7 +233,7 @@ def _is_valid_numeric(value) -> bool:
 
 
 def _to_float(value) -> Optional[float]:
-    """Convert value to float, returning None for invalid/NaN values."""
+    """Convert value to float, returning None for invalid/non-finite values."""
     if isinstance(value, str):
         try:
             value = float(value)
@@ -241,7 +241,7 @@ def _to_float(value) -> Optional[float]:
             return None
 
     if isinstance(value, (int, float)):
-        if math.isnan(value):
+        if not math.isfinite(value):
             return None
         return float(value)
 
