@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core import recompute as recompute_module
+from megatron.core.context_parallel.utils import ContextParallelBatch
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
@@ -387,6 +388,70 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
     else:
         assert decoder.kwargs["input_ids"] is None
     assert torch.equal(decoder.kwargs["padding_mask"], padding_mask[:, :2])
+
+
+@pytest.mark.parametrize("pre_process", [True, False])
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_hybrid_model_shards_each_layout_padding_mask(
+    monkeypatch, pre_process, tp_rank, sequence_parallel
+):
+    decoder = RecordingDecoder()
+    tp_group = object()
+
+    def scatter(tensor, group):
+        assert group is tp_group
+        return tensor.chunk(2, dim=0)[tp_rank].contiguous()
+
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.tensor_parallel."
+        "scatter_to_sequence_parallel_region",
+        scatter,
+    )
+    masks = {
+        "contiguous": torch.tensor([[False, True, False, False, True, True, False, True]]),
+        # A padded zigzag view may be longer than the contiguous view.
+        "zigzag": torch.tensor(
+            [[True, False, True, True, False, False, True, False, True, True, True, True]]
+        ),
+    }
+    cp_batch = ContextParallelBatch(
+        boundary_layout="contiguous",
+        batches_by_layout={layout: {"padding_mask": mask} for layout, mask in masks.items()},
+        packed_seq_params_by_layout={layout: None for layout in masks},
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_num_hash_layers=0,
+            sequence_parallel=sequence_parallel,
+            freeze_base_model_for_mtp=False,
+        ),
+        decoder=decoder,
+        position_embedding_type="none",
+        pre_process=pre_process,
+        post_process=False,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
+        pg_collection=SimpleNamespace(tp=tp_group),
+    )
+    hidden_states = torch.randn(4 if sequence_parallel else 8, 1, 8)
+    decoder.input_tensor = hidden_states
+    HybridModel.forward(
+        model,
+        input_ids=None,
+        position_ids=None,
+        attention_mask=None,
+        decoder_input=hidden_states if pre_process else None,
+        padding_mask=masks["contiguous"],
+        cp_batch=cp_batch,
+    )
+    for layout, mask in masks.items():
+        expected = mask.chunk(2, dim=1)[tp_rank] if sequence_parallel else mask
+        torch.testing.assert_close(decoder.kwargs["padding_mask_by_layout"][layout], expected)
+        # MTP and other consumers still need the original CP-only views.
+        assert cp_batch.get_batch(layout)["padding_mask"] is mask
 
 
 def test_chunked_hash_moe_keeps_ids_and_padding_aligned():

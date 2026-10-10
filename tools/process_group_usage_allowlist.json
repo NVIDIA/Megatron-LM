@@ -2,9 +2,6 @@
   "_comment": "Grandfathered reads of global process-group state in megatron/core. Entries are scope:kind:detail; duplicates count separate calls. This list must only shrink. Remove stale entries with `python tools/check_process_group_usage.py --update`.",
   "allowed": {
     "megatron/core/datasets/data_schedule.py": [
-      "HybridCPDataLoaderWrapper.__init__:accessor:parallel_state.get_data_parallel_group",
-      "HybridCPDataLoaderWrapper.__init__:accessor:parallel_state.get_data_parallel_group",
-      "HybridCPDataLoaderWrapper.__init__:accessor:parallel_state.get_tensor_model_parallel_group",
       "get_batch_on_this_rank_for_sequence_packing:accessor:parallel_state.get_context_parallel_group",
       "get_batch_on_this_rank_for_sequence_packing:accessor:parallel_state.get_pipeline_model_parallel_group",
       "get_batch_on_this_rank_for_sequence_packing:accessor:parallel_state.get_tensor_model_parallel_group",
@@ -162,13 +159,6 @@
     "megatron/core/optimizer/qk_clip.py": [
       "clip_qk:accessor:parallel_state.get_data_parallel_group"
     ],
-    "megatron/core/pipeline_parallel/hybrid_cp_schedule.py": [
-      "hybrid_context_parallel_forward_backward._broadcast:accessor:parallel_state.get_tensor_model_parallel_group",
-      "hybrid_context_parallel_forward_backward._broadcast:accessor:parallel_state.get_tensor_model_parallel_src_rank",
-      "hybrid_context_parallel_forward_backward:accessor:parallel_state.get_data_parallel_group",
-      "hybrid_context_parallel_forward_backward:accessor:parallel_state.get_data_parallel_rank",
-      "hybrid_context_parallel_forward_backward:accessor:parallel_state.get_tensor_model_parallel_rank"
-    ],
     "megatron/core/pipeline_parallel/schedules.py": [
       "_build_default_pg_collection:accessor:parallel_state.get_context_parallel_group",
       "_build_default_pg_collection:accessor:parallel_state.get_data_parallel_group",
@@ -320,5 +310,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 210
+  "total": 202
 }
