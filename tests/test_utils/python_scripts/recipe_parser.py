@@ -348,11 +348,11 @@ def filter_by_tag(workload_manifests: List[dotdict], tag: str) -> List[dotdict]:
 
 def filter_by_test_cases(workload_manifests: List[dotdict], test_cases: str) -> List[dotdict]:
     """Returns a workload with matching name. Raises an error if there no or more than a single workload."""
+    selected_test_cases = set(test_cases.split(","))
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
-        for test_case in test_cases.split(",")
-        if workload_manifest["spec"]["test_case"] == test_case
+        if workload_manifest["spec"]["test_case"] in selected_test_cases
     )
 
     if len(workload_manifests) == 0:
