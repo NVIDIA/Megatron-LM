@@ -27,6 +27,22 @@ The following table summarizes MTP configuration fields:
 | --- | --- |
 | `mtp_num_layers` | Number of MTP layers. MTP extends prediction to multiple future tokens at each position. This stack uses `mtp_num_layers` sequential modules to predict that many additional tokens per position. Default: `None`. |
 | `mtp_loss_scaling_factor` | Weight for the MTP loss term. The implementation averages MTP losses across depths, multiplies by this factor, and adds the result to the training objective. Default: `0.1`. |
+| `mtp_loss_type` | MTP training objective: `cross_entropy` or `e2e_tv`. Default: `cross_entropy`. |
+
+## End-to-End TV Loss
+
+Set `mtp_loss_type: e2e_tv` to select the end-to-end TV objective when MTP is enabled.
+This mode automatically enables `mtp_detach_heads` with a warning if it was disabled,
+preventing MTP loss gradients from flowing into the main model. Set
+`mtp_detach_heads: true` explicitly to avoid the warning. The auxiliary loss is
+scaled by `mtp_loss_scaling_factor`. To train only MTP parameters, the optimizer
+must additionally freeze the base model or select only MTP parameters; `mtp_detach_heads` does not
+change the optimizer parameter set. See
+[Bebop](https://arxiv.org/abs/2606.12370) for the objective definition.
+
+The fused TV kernel supports FP16, BF16, and FP32 logits. Softmax statistics,
+vocabulary reductions, and the TV and prefix loss outputs use FP32; draft-logit
+gradients are returned in the draft logits' dtype.
 
 ## Pipeline Parallel Layout for MTP
 
@@ -52,6 +68,9 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 
 - For models with MTP layers, the final LayerNorm sits in the stage that contains the last decoder layer, not in the post-process stage. That can change gradient norm reduction slightly in deterministic mode when LayerNorm would otherwise live in another stage. For bitwise alignment, disable gradient norm clipping.
 - MTP loss is computed in the post-processing stage.
+- Both MTP objectives use the caller-provided `dp_cp_group` for training loss and
+  acceptance logging. If omitted, they use the default MPU data-and-context-parallel
+  group. Evaluation does not require this logging group.
 
 ## Unsupported Combinations
 
