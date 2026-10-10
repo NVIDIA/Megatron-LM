@@ -1,0 +1,121 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Coverage for recording MFSDP demand-unshard order."""
+
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard
+
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+    fully_shard_optimizer,
+    microbatch,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.indexed_order import IndexedOrder
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+
+
+@pytest.mark.parametrize('budget', [None, 0, 2])
+def test_prefetch_replays_occurrences(budget):
+    """A reused module prefetches different successors at each recorded position."""
+    modules, prefetched = [], []
+    for _ in range(3):
+        module = object.__new__(FsdpModule)
+        parameter = SimpleNamespace(unsharded=torch.empty(1))
+        module._parameter_groups = (SimpleNamespace(fsdp_parameters=[parameter]),)
+        module._unshard_parameter_groups = Mock(
+            side_effect=lambda target=module: prefetched.append(target)
+        )
+        modules.append(module)
+    first, second, third = modules
+    sequence = [first, second, first, third]
+    order = IndexedOrder(sequence)
+    expected = [[second], [first], [third], []]
+    if budget == 0:
+        expected = [[], [], [], []]
+    elif budget == 2:
+        expected = [[second, first], [first, third], [third], []]
+    for _ in range(2):
+        for module, targets in zip(sequence, expected):
+            prefetched.clear()
+            module._prefetch_parameter_groups(order, budget)
+            assert prefetched == targets
+    with pytest.raises(RuntimeError, match='diverged'):
+        order.advance(third)
+    order.advance(first)
+    assert order.next_item(first) is second
+
+
+def test_shared_module_recording_matches_dense_training(distributed_setup):
+    """Record and replay MTP-like module reuse, preserving gradients and updates."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = nn.Linear(8, 8, bias=False)
+            self.second = nn.Linear(8, 8, bias=False)
+
+        def forward(self, inputs):
+            hidden = self.first(inputs)
+            # MTP and main logits call the same output layer consecutively
+            # on different hidden states; both uses contribute gradients.
+            auxiliary = self.second(hidden + 0.1)
+            main = self.second(hidden)
+            return (auxiliary + main).relu()
+
+    torch.manual_seed(42)
+    dense, model = Model().to(device), Model()
+    model.load_state_dict(dense.state_dict())
+    placements = Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
+    with fully_shard_context(device=device) as context:
+        fully_shard(model.first, mesh=mesh, placements=placements)
+        fully_shard(model.second, mesh=mesh, placements=placements)
+        fully_shard(model, mesh=mesh, placements=placements)
+    dense_optimizer = torch.optim.SGD(dense.parameters(), lr=0.01)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+    num_microbatches = 3
+    base_inputs = torch.arange(16, dtype=torch.float32, device=device).reshape(2, 8) / 16
+    for iteration in range(2):
+        dense_optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
+        recording = context.record_prefetch_order() if iteration == 0 else nullcontext()
+        with recording:
+            for index in range(num_microbatches):
+                inputs = base_inputs + 0.1 * distributed_setup.rank + 0.02 * (iteration + index)
+                expected = dense(inputs)
+                (expected.square().mean() / num_microbatches).backward()
+                with microbatch(context, is_last=index == num_microbatches - 1):
+                    actual = model(inputs)
+                    (actual.square().mean() / num_microbatches).backward()
+                torch.testing.assert_close(actual, expected)
+            context.finish_grad_sync()
+        assert (
+            list(context.forward_order)
+            == [model, model.first, model.second, model.second] * num_microbatches
+        )
+        assert (
+            list(context.backward_order)
+            == [model, model.second, model.second, model.first] * num_microbatches
+        )
+        for reference in dense.parameters():
+            dist.all_reduce(reference.grad, group=mesh.get_group())
+            reference.grad.div_(distributed_setup.world_size)
+        for reference, sharded in zip(dense.parameters(), model.parameters()):
+            torch.testing.assert_close(sharded.grad.full_tensor(), reference.grad)
+        dense_optimizer.step()
+        optimizer.step()
+        for reference, sharded in zip(dense.parameters(), model.parameters()):
+            torch.testing.assert_close(sharded.full_tensor(), reference)
+        assert all(module._unshard_event is None for module in (model, model.first, model.second))

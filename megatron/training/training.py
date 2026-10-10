@@ -20,7 +20,7 @@ import math
 import os
 import sys
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -188,13 +188,13 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
     get_wandb_writer,
-    get_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -3309,13 +3309,14 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
     return samples_seen_in_iteration
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None, record_prefetch_order: bool = False):
     """Single training step.
 
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior. Reductions source per-rank groups from the model.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
+    record_prefetch_order: record this step's module calls for MFSDP v2 prefetch.
     """
     args = get_args()
     timers = get_timers()
@@ -3418,7 +3419,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
         )
-        with grad_context, _fb_cm:
+        with grad_context, _fb_cm, ExitStack() as prefetch_recording:
+            if record_prefetch_order:
+                # VPP chunks share a context; enter each distinct context only once.
+                contexts = dict.fromkeys(model_chunk.module.context for model_chunk in model)
+                for context in contexts:
+                    prefetch_recording.enter_context(context.record_prefetch_order())
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
@@ -4889,6 +4895,7 @@ def train(
     should_exit = False
     exit_code = 0
     is_first_iteration = True
+    record_prefetch_order = getattr(args, 'megatron_fsdp_record_prefetch_order', False)
 
     if args.manual_gc:
         # Disable the default garbage collector and perform the collection manually.
@@ -5240,7 +5247,9 @@ def train(
                     forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
+                    record_prefetch_order=record_prefetch_order,
                 )
+                record_prefetch_order = False
                 ft_integration.on_training_step_end()
                 if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                     _maybe_raise_workload_exception()
