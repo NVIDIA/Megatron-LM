@@ -82,7 +82,8 @@ def find_result_json_files(results_dir: str, workspace_root: Optional[str] = Non
     for out_file in out_files:
         json_path = _extract_result_path_from_log(out_file, workspace_root)
         if json_path and os.path.exists(json_path):
-            result_files.append(json_path)
+            if json_path not in result_files:
+                result_files.append(json_path)
         elif json_path:
             logger.warning(f"Result file not found: {json_path} (from {out_file.name})")
 
