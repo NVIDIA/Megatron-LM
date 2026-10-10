@@ -142,7 +142,7 @@ def _extract_result_path_from_log(out_file: Path, workspace_root: str) -> Option
                     return str(json_files[0])
 
             logger.debug(f"Output directory not found or empty: {output_path}")
-            return None
+            continue
 
     logger.debug(f"No output path marker found in {out_file.name}")
     return None
