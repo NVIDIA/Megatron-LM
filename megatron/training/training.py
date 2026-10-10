@@ -3793,7 +3793,9 @@ def training_log(
             wandb_writer.log({'batch-size': batch_size}, iteration)
         # Log bins for packed mode
         if has_rl_utils and cfg.rl.rl_use_sequence_packing:
-            packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(args)
+            packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(
+                rl_utils.get_rl_runtime_state().consumed_train_bins, args.micro_batch_size
+            )
             for metric_name, metric_value in packing_metrics.items():
                 writer.add_scalar(metric_name, metric_value, iteration)
             if wandb_writer and packing_metrics:
@@ -4003,7 +4005,9 @@ def training_log(
         else:
             log_string += ' consumed samples: {:12d} |'.format(train_state.consumed_train_samples)
         if has_rl_utils and cfg.rl.rl_use_sequence_packing:
-            log_string += rl_utils.get_sequence_packing_log_info(args)
+            log_string += rl_utils.get_sequence_packing_log_info(
+                rl_utils.get_rl_runtime_state().consumed_train_bins
+            )
         if train_state.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(train_state.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
@@ -5328,7 +5332,7 @@ def train(
             bin_count = (
                 _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             )
-            args.consumed_train_bins += bin_count
+            rl_utils.get_rl_runtime_state().consumed_train_bins += bin_count
         if samples_seen_in_iteration is not None:
             iteration_sequences = samples_seen_in_iteration
         else:

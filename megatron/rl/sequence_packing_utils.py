@@ -1191,22 +1191,22 @@ def get_microbatch_dataloader(num_bins_this_rank, micro_batch_size):
     dataset = TensorDataset(bin_indices)
     return DataLoader(dataset, batch_size=micro_batch_size, shuffle=False, collate_fn=lambda x: x[0])
 
-def get_sequence_packing_log_info(args):
+def get_sequence_packing_log_info(consumed_train_bins):
     """Get logging information for sequence packing mode."""
-    if args.consumed_train_bins > 0:
-        return f' consumed bins: {args.consumed_train_bins:12d} |'
+    if consumed_train_bins > 0:
+        return f' consumed bins: {consumed_train_bins:12d} |'
     return ''
 
 
-def get_sequence_packing_tensorboard_metrics(args):
+def get_sequence_packing_tensorboard_metrics(consumed_train_bins, micro_batch_size):
     """Get tensorboard metrics for sequence packing mode."""
     metrics = {}
-    if args.consumed_train_bins > 0:
+    if consumed_train_bins > 0:
         bin_batch_size = (
-            mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            mpu.get_data_parallel_world_size() * micro_batch_size * get_num_microbatches()
         )
         metrics['bin-batch-size'] = bin_batch_size
-        metrics['consumed-bins'] = args.consumed_train_bins
+        metrics['consumed-bins'] = consumed_train_bins
     return metrics
 
 
