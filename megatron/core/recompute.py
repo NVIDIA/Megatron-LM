@@ -14,6 +14,7 @@ from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import make_viewless_tensor
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import te_checkpoint
@@ -109,9 +110,9 @@ def checkpointed_forward(
                 else:
                     inner_quantization_context = nullcontext()
 
-                # Build the full TransformerLayer kwarg set; for non-TL
-                # layers (currently MambaLayer in HybridStack) pop the kwargs
-                # they don't accept and treat the return as a single tensor.
+                # Build the full TransformerLayer kwarg set. Hybrid mHC wrappers expose
+                # an explicit capability flag so this module does not need to import
+                # hybrid_block (which would create a circular import).
                 layer_kwargs = dict(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
@@ -130,11 +131,17 @@ def checkpointed_forward(
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
-                    elif isinstance(getattr(layer, "inner_layer", None), TransformerLayer):
-                        # Hybrid mHC wrappers accept the TransformerLayer execution inputs,
-                        # including hash-routing token IDs, but not cross-attention-only kwargs.
+                    elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
+                        # HyperConnectionHybridLayer accepts the routing metadata
+                        # consumed by wrapped MoE layers, but not cross-attention kwargs
+                        # from the TransformerLayer interface. This also covers a wrapper
+                        # around a MambaLayer; the wrapper narrows kwargs for its inner layer.
                         for k in ("context", "context_mask", "attention_bias"):
                             layer_kwargs.pop(k, None)
+                        if packed_sequence_cp_metadata is not None:
+                            layer_kwargs["packed_sequence_cp_metadata"] = (
+                                packed_sequence_cp_metadata
+                            )
                         hidden_states, context = layer(**layer_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in (
@@ -169,6 +176,13 @@ def checkpointed_forward(
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
         cf = custom(start, end)
+        if use_checkpoint and self.config.enable_mhc_connections:
+            # mHC expands the block input and its zero-dropout BDA path can return views.
+            # Distributed activation checkpointing replaces the first input's .data, which
+            # requires a viewless tensor at every checkpoint boundary.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
         args = (
             hidden_states,

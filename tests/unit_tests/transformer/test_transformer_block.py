@@ -2,6 +2,7 @@
 
 import copy
 from contextlib import nullcontext
+from dataclasses import replace
 
 import pytest
 import torch
@@ -10,19 +11,79 @@ from packaging import version
 from megatron.core import mpu, parallel_state
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    BaseTransformerLayer,
+    HyperConnectionTransformerLayer,
+    TransformerLayer,
+)
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="Requires at least two GPUs for TP=2")
+def test_mhc_full_recompute_distributed_saved_activations_tp2():
+    """Full recompute must accept view-producing mHC boundaries with distributed activations."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_query_groups=4,
+            kv_channels=16,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            transformer_impl="transformer_engine",
+            tensor_model_parallel_size=2,
+            sequence_parallel=False,
+            distribute_saved_activations=True,
+            recompute_granularity="full",
+            recompute_method="block",
+            recompute_num_layers=1,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=2,
+            mhc_sinkhorn_iterations=2,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        layer_submodules = replace(
+            get_gpt_layer_with_transformer_engine_submodules(),
+            self_attention_hyper_connection=HyperConnectionModule,
+            mlp_hyper_connection=HyperConnectionModule,
+        )
+        block = TransformerBlock(
+            config,
+            ModuleSpec(module=HyperConnectionTransformerLayer, submodules=layer_submodules),
+            post_process=False,
+        ).cuda()
+
+        hidden_states = torch.randn(
+            8, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        attention_mask = torch.zeros((1, 1, 8, 8), device="cuda", dtype=torch.bool)
+        output = block(hidden_states=hidden_states, attention_mask=attention_mask)
+        output.float().sum().backward()
+
+        assert output.shape == (8, 1, config.hidden_size * config.mhc_num_residual_streams)
+        assert hidden_states.grad is not None
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class _ResidualObservationLayer(torch.nn.Module, BaseTransformerLayer):
