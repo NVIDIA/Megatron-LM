@@ -25,6 +25,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
+from megatron.core.process_groups_config import warn_global_process_group_fallback
 from megatron.core.utils import deprecate_inference_params, internal_api
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,8 @@ class RotaryEmbedding(nn.Module):
         use_cpu_initialization (bool, optional): If False, initialize the inv_freq directly
             on the GPU. Defaults to False
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
-            Defaults to None.
+            Omitting it is deprecated: the global context-parallel group is used and a
+            FutureWarning is emitted. It becomes required when the fallback is removed.
     """
 
     def __init__(
@@ -83,11 +85,10 @@ class RotaryEmbedding(nn.Module):
         if rope_scaling:
             self.inv_freq = self._apply_scaling(self.inv_freq, factor=rope_scaling_factor)
 
-        self.cp_group = (
-            cp_group
-            if cp_group is not None
-            else parallel_state.get_context_parallel_group(check_initialized=False)
-        )
+        if cp_group is None:
+            warn_global_process_group_fallback(type(self).__name__, "cp_group")
+            cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+        self.cp_group = cp_group
 
     def _apply_scaling(
         self,
@@ -351,11 +352,10 @@ class MultimodalRotaryEmbedding(nn.Module):
                 / dim
             )
         )
-        self.cp_group = (
-            cp_group
-            if cp_group is not None
-            else parallel_state.get_context_parallel_group(check_initialized=False)
-        )
+        if cp_group is None:
+            warn_global_process_group_fallback(type(self).__name__, "cp_group")
+            cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+        self.cp_group = cp_group
 
     def forward(
         self,
