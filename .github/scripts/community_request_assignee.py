@@ -16,6 +16,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -187,6 +188,8 @@ def confidence_value(value, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         confidence = default
 
+    if not math.isfinite(confidence):
+        confidence = default
     return max(0.0, min(confidence, 1.0))
 
 
