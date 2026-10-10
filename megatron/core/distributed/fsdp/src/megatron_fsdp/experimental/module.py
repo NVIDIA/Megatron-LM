@@ -587,8 +587,12 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
-        self.phase = FsdpModule.Phase.BACKWARD
-        torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
+        # A shared module has one backward-pre hook per call, but its parameter
+        # gradients finish accumulating only once after all uses. Keep that
+        # lifecycle open while recording/prefetching every backward occurrence.
+        if self.phase is not FsdpModule.Phase.BACKWARD:
+            self.phase = FsdpModule.Phase.BACKWARD
+            torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
