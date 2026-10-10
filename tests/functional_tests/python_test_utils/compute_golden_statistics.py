@@ -158,7 +158,12 @@ def _find_json_files_directly(results_dir: str) -> List[str]:
     results_path = Path(results_dir)
 
     # Look for golden_values*.json files in subdirectories
-    patterns = ["**/golden_values*.json", "**/test_results*.json", "**/*_output.json"]
+    patterns = [
+        "**/golden_values*.json",
+        "**/generations*.json",
+        "**/test_results*.json",
+        "**/*_output.json",
+    ]
 
     for pattern in patterns:
         matches = list(results_path.glob(pattern))
