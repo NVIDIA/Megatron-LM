@@ -288,6 +288,7 @@ def sync_team_to_usergroup(team_slug, usergroup_handle, dry_run=False):
         print(f"\nWarning: Could not resolve {len(missing_users)} users:")
         for username, email, reason in missing_users:
             print(f"  - {username}: {reason}" + (f" (tried {email})" if email else ""))
+        return False
 
     if not slack_user_ids:
         print(f"Error: No Slack users found for team '{team_slug}'")
