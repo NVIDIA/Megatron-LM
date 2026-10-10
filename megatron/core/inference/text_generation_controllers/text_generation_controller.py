@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
-from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -235,13 +234,10 @@ class TextGenerationController(MTPControllerMixin):
         self.extra_eos_token_id_set = self._build_extra_eos_token_id_set(tokenizer)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
 
-        pg_collection = inference_config.pg_collection
-        if pg_collection is not None:
-            self.pp_group = pg_collection.pp
-            self.dp_group = pg_collection.dp
-        else:
-            self.pp_group = parallel_state.get_pipeline_model_parallel_group()
-            self.dp_group = parallel_state.get_data_parallel_group()
+        # The collection that the wrapper resolved from the same config.
+        pg_collection = inference_config.resolve_pg_collection(self.inference_wrapped_model.model)
+        self.pp_group = pg_collection.pp
+        self.dp_group = pg_collection.dp
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
