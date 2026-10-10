@@ -28,7 +28,7 @@ def recursively_lint_files():
     print("Linting the following: ")
     for py_path in all_py_paths:
         print(py_path)
-        command = 'autopep8 --max-line-length 100 --aggressive --in-place {}'.format(py_path)
+        command = ['autopep8', '--max-line-length', '100', '--aggressive', '--in-place', py_path]
         subprocess.check_call(command)
 
 
