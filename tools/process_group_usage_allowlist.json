@@ -14,11 +14,6 @@
       "wrap_data_iterator:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/distributed/finalize_model_grads.py": [
-      "_allreduce_conditional_embedding_grads:accessor:parallel_state.get_pipeline_model_parallel_group",
-      "_allreduce_router_grads:accessor:parallel_state.get_pipeline_model_parallel_group",
-      "_allreduce_router_grads:accessor:parallel_state.get_pipeline_model_parallel_world_size",
-      "_allreduce_word_embedding_grads:accessor:parallel_state.get_embedding_group",
-      "_allreduce_word_embedding_grads:accessor:parallel_state.get_pipeline_model_parallel_group",
       "finalize_model_grads:accessor:parallel_state.get_data_parallel_group",
       "finalize_model_grads:accessor:parallel_state.get_embedding_group",
       "finalize_model_grads:accessor:parallel_state.get_expert_gtp_weight_remat_group",
@@ -40,10 +35,6 @@
       "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_expert_tensor_parallel_group",
       "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_inter_distributed_optimizer_instance_group",
       "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_tensor_model_parallel_group"
-    ],
-    "megatron/core/distributed/param_and_grad_buffer.py": [
-      "_ParamAndGradBuffer.__init__:accessor:parallel_state.get_data_and_context_parallel_group",
-      "_ParamAndGradBuffer.__init__:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/distributed/torch_fully_sharded_data_parallel.py": [
       "TorchFullyShardedDataParallel.__init__:accessor:parallel_state.get_data_parallel_group"
@@ -320,5 +311,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 210
+  "total": 203
 }
