@@ -1334,7 +1334,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
             for key in dst_tensors:
-                if not isinstance(tensors[key], torch.Tensor):
+                if key not in tensors or not isinstance(tensors[key], torch.Tensor):
                     continue
                 dst_tensors[key].copy_(tensors[key])
 
