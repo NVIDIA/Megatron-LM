@@ -3508,7 +3508,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Part of MuonClip Optimizer step
     log_max_attention_logit = 0
     if args.qk_clip or config.log_max_attention_logit:
-        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+        # Every rank holding these weights must apply the same clipping, so reduce over the
+        # gtp_remat-inclusive DP x CP group, as the global default does.
+        log_max_attention_logit = clip_qk(
+            model,
+            log_max_only=not args.qk_clip,
+            dp_cp_group=getattr(model_pg_collection, 'dp_cp_gtp_remat', None)
+            or model_pg_collection.dp_cp,
+        )
 
     timers('optimizer').stop()
 
