@@ -11,6 +11,7 @@ import torch
 import transformer_engine.pytorch as te
 from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor.debug import _clear_sharding_prop_cache
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
@@ -64,6 +65,10 @@ def _destroy_model_parallel():
     reference to the rest, so their NCCL communicators -- and, with NVLS enabled, their
     multicast reservations -- would outlive the test. See #6897.
     """
+    # TODO(#7322): Remove this workaround when runtime parameters become local tensors.
+    # Clear both sharding caches (Python and C++) before destroying groups; otherwise
+    # nn.Parameter(DTensor) can reuse stale meshes in later tests through detach().
+    _clear_sharding_prop_cache()
     Utils.destroy_model_parallel()
     for group in list(_world.pg_map):
         if group is not torch.distributed.group.WORLD:
