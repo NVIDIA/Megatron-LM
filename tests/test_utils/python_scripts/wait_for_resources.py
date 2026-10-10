@@ -76,7 +76,7 @@ def main(pipeline_id, target_branch):
             continue
         except Exception as e:
             logger.error(f"Error: {e}")
-            break
+            raise click.ClickException(str(e)) from e
 
 
 if __name__ == "__main__":
