@@ -119,9 +119,12 @@ def test_shared_module_recording_matches_dense_training(distributed_setup):
             self.second = nn.Linear(8, 8, bias=False)
 
         def forward(self, inputs):
-            # Reuse one projection in the same graph, as MTP does with its
-            # output layer. The two occurrences have different successors.
-            return self.second(self.first(self.second(inputs))).relu()
+            hidden = self.first(inputs)
+            # MTP and main logits call the same output layer consecutively
+            # on different hidden states; both uses contribute gradients.
+            auxiliary = self.second(hidden + 0.1)
+            main = self.second(hidden)
+            return (auxiliary + main).relu()
 
     torch.manual_seed(42)
     dense, model = Model().to(device), Model()
@@ -150,9 +153,14 @@ def test_shared_module_recording_matches_dense_training(distributed_setup):
                     (actual.square().mean() / num_microbatches).backward()
                 torch.testing.assert_close(actual, expected)
             context.finish_grad_sync()
-        expected_order = [model, model.second, model.first, model.second] * num_microbatches
-        assert list(context.forward_order) == expected_order
-        assert list(context.backward_order) == expected_order
+        assert (
+            list(context.forward_order)
+            == [model, model.first, model.second, model.second] * num_microbatches
+        )
+        assert (
+            list(context.backward_order)
+            == [model, model.second, model.second, model.first] * num_microbatches
+        )
         for reference in dense.parameters():
             dist.all_reduce(reference.grad, group=mesh.get_group())
             reference.grad.div_(distributed_setup.world_size)
