@@ -354,8 +354,11 @@ class LanguageModule(MegatronModule):
         """
         assert not sharded_offsets, "Unexpected sharded offsets"
 
-        # Guard for cases metadata is not provided
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided: replica ids span the model's GTP-inclusive
+        # DP x CP group, the group the global default stands for.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
 
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 

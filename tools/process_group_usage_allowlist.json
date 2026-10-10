@@ -302,7 +302,6 @@
     ],
     "megatron/core/transformer/utils.py": [
       "ensure_metadata_has_dp_cp_group:accessor:parallel_state.get_data_parallel_group",
-      "ensure_metadata_has_dp_cp_group:accessor:parallel_state.get_data_parallel_group",
       "make_sharded_object_for_checkpoint:accessor:parallel_state.get_data_parallel_rank",
       "make_sharded_object_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_rank",
       "make_sharded_tensors_for_checkpoint:accessor:parallel_state.get_data_parallel_group"
@@ -320,5 +319,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 210
+  "total": 209
 }

@@ -175,11 +175,16 @@ def make_sharded_tensors_for_checkpoint(
         extra_state_suffix (str, default = '_extra_state'): layers with this
             suffix will be wrapped with ShardedObject instead of ShardedTensor.
         tp_group (Optional[torch.distributed.ProcessGroup], optional): tensor parallel group.
-            If None, defaults to parallel_state.get_tensor_model_parallel_group()
+            None with a `dp_cp_group` means the tensors are not tensor-parallel. If both groups
+            are None, defaults to parallel_state.get_tensor_model_parallel_group()
         dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): data parallel group
-            with context parallel. If None, defaults to
+            with context parallel that replica ids are computed over. Required with a
+            `tp_group`. If both groups are None, defaults to
             parallel_state.get_data_parallel_group(with_context_parallel=True)
 
+    Raises:
+        ValueError: If `tp_group` is given without `dp_cp_group`. Every data-parallel rank
+            would otherwise claim to be the main replica of each shard.
     """
 
     if tensor_parallel_layers_axis_map is None:
@@ -188,6 +193,11 @@ def make_sharded_tensors_for_checkpoint(
     if tp_group is None and dp_cp_group is None:
         tp_group = get_tensor_model_parallel_group_if_none(tp_group)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    elif dp_cp_group is None:
+        raise ValueError(
+            "make_sharded_tensors_for_checkpoint got a tp_group without a dp_cp_group; pass "
+            "both, or neither to use the global groups"
+        )
 
     # GTP-sharded weights need the GTP axis layered onto the TP/DP offsets. The GTP helper
     # is a no-op for non-GTP state_dicts, but importing it eagerly would be circular, so
@@ -290,18 +300,33 @@ def _get_extra_state_offsets(
     return extra_state_shape, extra_state_offset
 
 
-def ensure_metadata_has_dp_cp_group(metadata: Optional[dict]) -> dict:
+def ensure_metadata_has_dp_cp_group(
+    metadata: Optional[dict], dp_cp_group: Optional[torch.distributed.ProcessGroup] = None
+) -> dict:
     """Ensure `metadata` is a dict containing `dp_cp_group` entry.
 
     If `metadata` is None, a new dict is returned with `dp_cp_group` set.
     If `metadata` is a dict and missing `dp_cp_group`, it is updated in-place.
     Otherwise, asserts that `dp_cp_group` exists.
+
+    Args:
+        metadata: Sharded state dict metadata from the caller, or None.
+        dp_cp_group: The group to fill in when `metadata` has none: the module's data- and
+            context-parallel group including GTP-remat peers (``dp_cp_gtp_remat``), whose ranks
+            the replica ids are computed over. A `dp_cp_group` already in `metadata` takes
+            precedence. Defaults to the global
+            ``parallel_state.get_data_parallel_group(with_context_parallel=True)``.
     """
+    if metadata is not None:
+        assert isinstance(metadata, dict), "metadata must be a dict with dp_cp_group as key"
+        if 'dp_cp_group' in metadata:
+            return metadata
+    if dp_cp_group is None:
+        # Migration fallback for callers that do not pass their module's group.
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
     if metadata is None:
-        return {'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)}
-    assert isinstance(metadata, dict), "metadata must be a dict with dp_cp_group as key"
-    if 'dp_cp_group' not in metadata:
-        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        return {'dp_cp_group': dp_cp_group}
+    metadata['dp_cp_group'] = dp_cp_group
     return metadata
 
 
