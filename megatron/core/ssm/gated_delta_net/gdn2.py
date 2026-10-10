@@ -59,10 +59,6 @@ class GatedDeltaNet2(_GDNBase):
 
     def _setup_variant_attrs(self):
         """Set the GDN2 in_proj sizing, split tables, gate parameter dims, and kernel."""
-        assert (
-            chunk_gdn2 is not None or self.config.deterministic_mode
-        ), "GDN2 requires flash-linear-attention >= 0.5.1 with the fla.ops.gdn2 kernel."
-
         # f (decay pre-activation), b (erase gate), w (write gate), on top of the
         # q/k/v/z sections the base class already accounts for.
         # TODO: for now, output gate is forced for GDN2.
@@ -95,10 +91,23 @@ class GatedDeltaNet2(_GDNBase):
         self.dt_bias_dim = self.qk_dim_local_tp
         self.a_log_dim = self.num_k_heads_local_tp
 
-        if self.config.deterministic_mode:
+        backend = self.config.gdn_kernel_backend
+        if self.config.deterministic_mode and backend != "torch":
+            raise ValueError(
+                "deterministic_mode=True requires gdn_kernel_backend='torch' for GDN2."
+            )
+        if backend == "transformer_engine":
+            raise ValueError("GDN2 does not support gdn_kernel_backend='transformer_engine'.")
+        if backend == "torch":
+            self.gdn_backend = "torch"
             self.gated_delta_rule = torch_chunk_gdn2
-        else:
-            self.gated_delta_rule = chunk_gdn2
+            return
+
+        assert (
+            chunk_gdn2 is not None
+        ), "GDN2 requires flash-linear-attention >= 0.5.1 with the fla.ops.gdn2 kernel."
+        self.gdn_backend = "fla"
+        self.gated_delta_rule = chunk_gdn2
 
     def _reset_dt_bias(self):
         """Softplus-inverse init of dt_bias.
