@@ -49,7 +49,7 @@
       "TorchFullyShardedDataParallel.__init__:accessor:parallel_state.get_data_parallel_group"
     ],
     "megatron/core/export/trtllm/trtllm_weights_converter/distributed_trtllm_model_weights_converter.py": [
-      "DistributedTRTLLMModelWeightsConverter.__init__:shim:use_mpu_process_groups"
+      "DistributedTRTLLMModelWeightsConverter.__init__:guarded:resolve_process_groups"
     ],
     "megatron/core/extensions/transformer_engine.py": [
       "TEDotProductAttention.__init__:accessor:parallel_state.get_context_parallel_group",
