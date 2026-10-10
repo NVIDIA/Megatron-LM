@@ -348,10 +348,9 @@ def main():
             if args.keep_sequential_samples:
                 total_sample_count = 0
                 for filename in in_file_names:
-                    with open(filename, "r") as fin:
-                        for fc, _ in enumerate(fin):
-                            pass
-                    total_sample_count += (fc + 1)
+                    opener = gzip.open if filename.endswith(".gz") else open
+                    with opener(filename, "rt", encoding="utf-8") as fin:
+                        total_sample_count += sum(1 for _ in fin)
                 partition_size = math.ceil(total_sample_count / args.partitions)
 
             # create .jsonl parition files
@@ -376,10 +375,8 @@ def main():
                 if args.keep_sequential_samples: line_count = 0
                 for in_file_name in in_file_names:
                     # support for gzip files
-                    if in_file_name.endswith(".gz"):
-                        fin = gzip.open(in_file_name, 'rt')
-                    else:
-                        fin = open(in_file_name, 'r', encoding='utf-8')
+                    opener = gzip.open if in_file_name.endswith(".gz") else open
+                    fin = opener(in_file_name, "rt", encoding="utf-8")
 
                     for line in fin:
                         partitioned_input_files[index].write(line)
