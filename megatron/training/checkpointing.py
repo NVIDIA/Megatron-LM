@@ -69,6 +69,7 @@ from . import ft_integration, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
+from .state import TRAIN_STATE_FILENAME, TrainState, load_train_state
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
 try:
@@ -584,6 +585,24 @@ class CheckpointType(Enum):
     FSDP_DTENSOR = auto()
 
 
+def _get_checkpoint_train_state_filename(checkpoint_name, ckpt_type):
+    """Return the per-iteration train-state sidecar path for a loaded checkpoint."""
+    checkpoint_path = maybe_msc.Path(checkpoint_name)
+    if ckpt_type == CheckpointType.LEGACY:
+        checkpoint_path = checkpoint_path.parent.parent
+    return str(checkpoint_path.joinpath(TRAIN_STATE_FILENAME))
+
+
+def _snapshot_train_state(args, iteration, num_floating_point_operations_so_far):
+    """Capture checkpoint progress without requiring full runtime initialization."""
+    active_train_state = get_train_state()
+    source_train_state = active_train_state if active_train_state is not None else TrainState()
+    source_train_state.update_from_args(args, iteration, num_floating_point_operations_so_far)
+    snapshot = TrainState()
+    snapshot.load_state_dict(source_train_state.state_dict())
+    return snapshot
+
+
 def _build_sharded_state_dict_metadata(
     args: Namespace, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None
 ) -> dict:
@@ -800,7 +819,6 @@ def save_checkpoint(
         expert_rank=expert_rank,
         return_base_dir=return_base_dir,
     )
-
     # Save distributed optimizer's custom parameter state.
     if (
         args.use_distributed_optimizer
@@ -1157,13 +1175,11 @@ def save_checkpoint(
             gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
             gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
 
-            train_state = get_train_state()
-            train_state_dict = None
-            if train_state is not None:
-                train_state_dict = train_state.state_dict()
-                train_state_dict["floating_point_operations_so_far"] = torch.tensor(
-                    num_floating_point_operations_so_far, dtype=torch.float64
-                )
+            # Capture legacy progress before deferred finalization; the upstream finalizer
+            # writes this snapshot to both the iteration sidecar and latest-state tracker.
+            train_state_dict = _snapshot_train_state(
+                args, iteration, num_floating_point_operations_so_far
+            ).state_dict()
 
             def iter_finalize_fn():
                 cfg = get_run_config()
@@ -1182,7 +1198,9 @@ def save_checkpoint(
                     iteration=iteration,
                     return_base_dir=True,
                 )
-                from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+                from megatron.training.utils.checkpoint_utils import (
+                    get_checkpoint_run_config_filename,
+                )
 
                 run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
@@ -1329,9 +1347,9 @@ def save_checkpoint(
         # thread), then writes logits in the background.  Finalize_fns are
         # moved from the checkpoint request to the logits request so that
         # "success" callbacks only fire after both writes are confirmed.
-        from megatron.training.distillation import get_logits_saver
-
         from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+
+        from megatron.training.distillation import get_logits_saver
 
         logits_saver = get_logits_saver()
         if logits_saver is not None:
@@ -3109,6 +3127,11 @@ def load_checkpoint(
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
 
+    loaded_train_state = None
+    if not args.finetune and not release and ckpt_type != CheckpointType.LOCAL:
+        train_state_filename = _get_checkpoint_train_state_filename(checkpoint_name, ckpt_type)
+        loaded_train_state = load_train_state(train_state_filename, missing_ok=True)
+
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
@@ -3120,6 +3143,8 @@ def load_checkpoint(
     # Set iteration.
     if args.finetune or release:
         iteration = 0
+    elif loaded_train_state is not None:
+        iteration = loaded_train_state.iteration
     else:
         try:
             iteration = state_dict['iteration']
@@ -3133,7 +3158,11 @@ def load_checkpoint(
                     )
                 )
                 sys.exit()
-    num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
+    num_floating_point_operations_so_far = (
+        loaded_train_state.num_floating_point_operations_so_far
+        if loaded_train_state is not None
+        else state_dict.get('num_floating_point_operations_so_far', 0)
+    )
 
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
@@ -3162,12 +3191,27 @@ def load_checkpoint(
         check_checkpoint_args(
             checkpoint_args, skip_args=skip_args, checkpoint_config=checkpoint_config
         )
-        args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
-        args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
-        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
-        args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
+        if loaded_train_state is None:
+            args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
+            args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
+            args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
+            args.do_train = getattr(checkpoint_args, 'do_train', False)
+            args.do_valid = getattr(checkpoint_args, 'do_valid', False)
+            args.do_test = getattr(checkpoint_args, 'do_test', False)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
+
+    active_train_state = get_train_state()
+    if active_train_state is None:
+        active_train_state = TrainState()
+    if loaded_train_state is not None:
+        active_train_state.load_state_dict(loaded_train_state.state_dict())
+    else:
+        active_train_state.update_from_args(args, iteration, num_floating_point_operations_so_far)
+    active_train_state.apply_to_args(args)
+
+    if not args.finetune and (loaded_train_state is not None or 'args' in state_dict):
+        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
 
     # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The
@@ -3192,6 +3236,9 @@ def load_checkpoint(
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
                      f'(consumed_train_samples {args.consumed_train_samples})')
+
+    # Keep the canonical runtime state consistent with any load-time iteration override.
+    active_train_state.update_from_args(args, iteration, num_floating_point_operations_so_far)
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
@@ -3274,8 +3321,10 @@ def load_checkpoint(
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_torch_dist
                 tracker_filename = get_checkpoint_tracker_filename(load_dir)
-                iteration, release = read_metadata(tracker_filename)
-                model_checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+                checkpoint_iteration, checkpoint_release = read_metadata(tracker_filename)
+                model_checkpoint_name = get_checkpoint_name(
+                    load_dir, checkpoint_iteration, checkpoint_release
+                )
                 optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(
                     model_checkpoint_name
                 )

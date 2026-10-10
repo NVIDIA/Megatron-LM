@@ -21,13 +21,16 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from megatron.training import global_vars
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _snapshot_train_state,
     check_checkpoint_args,
     get_checkpoint_tracker_filename,
     get_checkpoint_version,
+    get_distributed_optimizer_checkpoint_name,
     load_args_from_checkpoint,
     load_checkpoint,
     maybe_save_dataloader_state,
@@ -36,11 +39,58 @@ from megatron.training.checkpointing import (
     set_checkpoint_version,
 )
 from megatron.training.config import ProfilingConfig
-from megatron.training.global_vars import set_args
+from megatron.training.global_vars import get_train_state, set_args
+from megatron.training.state import TrainState, save_train_state
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.usefixtures("run_config")
+
+
+@pytest.fixture(autouse=True)
+def active_train_state(monkeypatch):
+    """Provide the initialized runtime state used by checkpoint save and load."""
+    monkeypatch.setattr(global_vars, "_GLOBAL_TRAIN_STATE", TrainState())
+
+
+def test_train_state_snapshot_is_stable_for_async_finalize(create_args, tmp_path):
+    """Deferred finalization writes the save-time state, not later runtime mutations."""
+    args = create_args
+    args.async_save = True
+    args.consumed_train_samples = 11
+    args.skipped_train_samples = 12
+    args.consumed_valid_samples = 13
+    args.do_train = True
+    args.do_valid = False
+    args.do_test = True
+
+    snapshot = _snapshot_train_state(args, iteration=14, num_floating_point_operations_so_far=15)
+    request = SimpleNamespace(finalize_fns=[])
+    request.add_finalize_fn = request.finalize_fns.append
+    sidecar = tmp_path / "iter_0000014" / "train_state.pt"
+    sidecar.parent.mkdir()
+    request.add_finalize_fn(lambda: save_train_state(snapshot, sidecar))
+
+    active = global_vars.get_train_state()
+    active.iteration = 99
+    active.consumed_train_samples = 100
+    request.finalize_fns[0]()
+    saved = torch.load(sidecar, map_location="cpu", weights_only=True)
+
+    assert saved["step"].item() == 14
+    assert saved["consumed_train_samples"].item() == 11
+    assert saved["floating_point_operations_so_far"].item() == 15
+
+
+def test_train_state_snapshot_supports_legacy_args_only_path(create_args, monkeypatch):
+    """Checkpoint helpers remain usable before the canonical global state is initialized."""
+    monkeypatch.setattr(global_vars, "_GLOBAL_TRAIN_STATE", None)
+    snapshot = _snapshot_train_state(
+        create_args, iteration=7, num_floating_point_operations_so_far=8
+    )
+
+    assert snapshot.iteration == 7
+    assert snapshot.num_floating_point_operations_so_far == 8
 
 
 class MockModel(MegatronModule):
@@ -697,6 +747,7 @@ def test_save_checkpoint(
             assert iteration == int(f.read())
 
         ckpt_dir = args.save / f"iter_{iteration:07d}"
+        train_state_path = ckpt_dir / "train_state.pt"
 
         expected_ckpt_path = None
         if ckpt_format == "torch":
@@ -715,6 +766,28 @@ def test_save_checkpoint(
             assert saved_config["profiling"][field.name] == getattr(profiling, field.name)
         assert args.profile is False and args.profile_ranks == [99]
         assert args.memory_snapshot_path == "stale.pickle"
+        assert os.path.exists(train_state_path)
+        train_state_dict = torch.load(train_state_path, map_location="cpu", weights_only=True)
+        latest_train_state_dict = torch.load(
+            args.save / "latest_train_state.pt", map_location="cpu", weights_only=True
+        )
+        assert latest_train_state_dict.keys() == train_state_dict.keys()
+        for key in train_state_dict:
+            assert torch.equal(latest_train_state_dict[key], train_state_dict[key])
+        assert train_state_dict["step"].item() == iteration
+        assert (
+            train_state_dict["floating_point_operations_so_far"].item()
+            == num_floating_point_operations_so_far
+        )
+        assert train_state_dict["consumed_train_samples"].item() == getattr(
+            state["args"], "consumed_train_samples", 0
+        )
+        assert train_state_dict["skipped_train_samples"].item() == getattr(
+            state["args"], "skipped_train_samples", 0
+        )
+        assert train_state_dict["consumed_valid_samples"].item() == getattr(
+            state["args"], "consumed_valid_samples", 0
+        )
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
@@ -754,6 +827,12 @@ def test_load_checkpoint(
         args.load = ckpt_dir
         args.save = ckpt_dir
         args.save_tokenizer_assets = False
+        args.consumed_train_samples = 11
+        args.skipped_train_samples = 12
+        args.consumed_valid_samples = 13
+        args.do_train = True
+        args.do_valid = False
+        args.do_test = True
         set_args(args)
 
         # Create and save a checkpoint first.
@@ -778,11 +857,40 @@ def test_load_checkpoint(
         # With TP=PP=1, rank 0 writes the checkpoint. Other ranks can still call
         # torch.save internally while serializing RNG tensors for all_gather_object.
         if torch.distributed.get_rank() == 0:
-            assert serialized.call_args.args[0]["args"] is args
+            model_saves = [
+                call
+                for call in serialized.call_args_list
+                if isinstance(call.args[0], dict) and "args" in call.args[0]
+            ]
+            assert len(model_saves) == 1
+            assert model_saves[0].args[0]["args"] is args
         with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
             assert saved_config["rng"][field.name] == getattr(rng_config, field.name)
+
+        # Make the sidecar differ from legacy checkpoint args to verify it is preferred.
+        sidecar_state = TrainState(
+            iteration=321,
+            consumed_train_samples=31,
+            skipped_train_samples=32,
+            consumed_valid_samples=33,
+            num_floating_point_operations_so_far=654,
+            do_train=False,
+            do_valid=True,
+            do_test=False,
+        )
+        sidecar_path = ckpt_dir / f"iter_{iteration:07d}" / "train_state.pt"
+        if torch.distributed.get_rank() == 0:
+            torch.save(sidecar_state.state_dict(), sidecar_path)
+        torch.distributed.barrier()
+
+        args.consumed_train_samples = 0
+        args.skipped_train_samples = 0
+        args.consumed_valid_samples = 0
+        args.do_train = True
+        args.do_valid = False
+        args.do_test = True
 
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
@@ -790,22 +898,65 @@ def test_load_checkpoint(
         new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
 
         # Load checkpoint
-        loaded_iter, loaded_flops = load_checkpoint(
-            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+        with mock.patch.object(
+            new_optimizer, "load_parameter_state", wraps=new_optimizer.load_parameter_state
+        ) as load_parameter_state:
+            loaded_iter, loaded_flops = load_checkpoint(
+                [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+            )
+        expected_optimizer_path = get_distributed_optimizer_checkpoint_name(
+            str(ckpt_dir / f"iter_{iteration:07d}" / "mp_rank_00" / "model_optim_rng.pt")
         )
+        assert load_parameter_state.call_args.args[0] == expected_optimizer_path
 
         assert torch.equal(torch.get_rng_state(), expected_cpu_rng)
         if owned_rng:
             assert not hasattr(args, "seed")
             assert not hasattr(args, "data_parallel_random_init")
-        assert loaded_iter == iteration
-        assert loaded_flops == num_floating_point_operations_so_far
+        assert loaded_iter == sidecar_state.iteration
+        assert loaded_flops == sidecar_state.num_floating_point_operations_so_far
+        assert args.consumed_train_samples == sidecar_state.consumed_train_samples
+        assert args.skipped_train_samples == sidecar_state.skipped_train_samples
+        assert args.consumed_valid_samples == sidecar_state.consumed_valid_samples
+        assert args.do_train == sidecar_state.do_train
+        assert args.do_valid == sidecar_state.do_valid
+        assert args.do_test == sidecar_state.do_test
+        assert get_train_state() == sidecar_state
 
         for k in model.state_dict():
             assert torch.equal(model.state_dict()[k], new_model.state_dict()[k])
 
         assert new_optimizer.state_dict() == optimizer.state_dict()
         assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
+
+        # Removing the sidecar preserves the legacy mutable-state fallback.
+        if torch.distributed.get_rank() == 0:
+            sidecar_path.unlink()
+        torch.distributed.barrier()
+        args.consumed_train_samples = 0
+        args.skipped_train_samples = 0
+        args.consumed_valid_samples = 0
+
+        loaded_iter, loaded_flops = load_checkpoint(
+            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+        )
+
+        assert loaded_iter == iteration
+        assert loaded_flops == num_floating_point_operations_so_far
+        assert args.consumed_train_samples == 11
+        assert args.skipped_train_samples == 12
+        assert args.consumed_valid_samples == 13
+        assert args.do_train is True
+        assert args.do_valid is False
+        assert args.do_test is True
+        assert get_train_state().iteration == iteration
+        assert (
+            get_train_state().num_floating_point_operations_so_far
+            == num_floating_point_operations_so_far
+        )
+        assert get_train_state().consumed_train_samples == 11
+        assert get_train_state().skipped_train_samples == 12
+        assert get_train_state().consumed_valid_samples == 13
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
