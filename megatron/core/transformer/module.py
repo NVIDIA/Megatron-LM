@@ -482,7 +482,7 @@ class GraphableMegatronModule(MegatronModule):
                 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
                 self.cudagraph_manager = CudaGraphManager(config)
-        elif config.cuda_graph_impl == "transformer_engine":
+        elif config.cuda_graph_impl in ("transformer_engine", "chunk_wise"):
             # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
             # the number of microbatches. Multiple CUDA graphs per layer is required to support
             # pipelining which requires running FWD graph of multiple microbatches before BWD
@@ -776,8 +776,15 @@ class GraphableMegatronModule(MegatronModule):
         """
         from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
+        if getattr(self.config, 'cuda_graph_impl', 'none') == "chunk_wise" and not getattr(
+            self, 'is_cuda_graph_chunk_callable', False
+        ):
+            # The decoder block is the TE callable; its layers run their ordinary forward
+            # inside that outer capture instead of following the per-layer capture protocol.
+            return False
+
         return (
-            self.config.cuda_graph_impl == "transformer_engine"
+            self.config.cuda_graph_impl in ("transformer_engine", "chunk_wise")
             and self.training
             and (is_graph_capturing() or self.cuda_graphs)
         )

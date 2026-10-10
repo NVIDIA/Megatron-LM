@@ -15,14 +15,16 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_fp8_context, get_layer_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import use_te_checkpoint
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
+from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
@@ -276,7 +278,7 @@ def _get_block_submodules(
         raise Exception(f"specialize for {type(spec).__name__}.")
 
 
-class TransformerBlock(GraphableMegatronModule, MegatronModule):
+class TransformerBlock(ChunkCudaGraphBlockMixin, GraphableMegatronModule, MegatronModule):
     """Transformer class."""
 
     def __init__(
@@ -339,6 +341,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.num_residual_streams = config.num_residual_streams
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+
+    def _get_inner_quantization_context(self, layer):
+        """Return the per-layer quantization context used inside this block."""
+        if self.config.fp8:
+            # Under a chunk capture the block runs inside one FP8 context, so BF16 boundary
+            # layers opt out explicitly instead of inheriting it (get_layer_fp8_context).
+            return get_layer_fp8_context(self.config, layer.layer_number - 1)
+        if self.config.fp4:
+            return get_fp4_context(self.config, layer.layer_number - 1)
+        return nullcontext()
 
     def _build_layers(self):
         # Transformer layers.
@@ -640,17 +652,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
-                        if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        # TODO: check if fp4 is supported in this case
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        else:
-                            inner_quantization_context = nullcontext()
+                        inner_quantization_context = self._get_inner_quantization_context(layer)
                     else:
                         inner_quantization_context = nullcontext()
 
@@ -674,7 +676,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         def checkpoint_handler(forward_func):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             # TODO: check if fp4 is supported in this case
-            if self.config.fp8 or self.config.fp4:
+            if use_te_checkpoint(self.config):
                 return te_checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
@@ -727,11 +729,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # A method fully use the device memory removing redundant re-computation.
             recompute_skip_num_layers = 0
             for layer_idx in range(self.num_layers_per_pipeline_rank):
-                # Skip recomputation when input grad computation is not needed.
-                # Need to have at least one input tensor with gradient computation
-                # for re-enterant autograd engine.
-                # TODO: check if fp4 is supported in this case
-                if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
+                # Skip recomputation when input grad computation is not needed. TE's
+                # re-entrant checkpoint needs at least one input tensor with gradient
+                # computation, so this applies wherever it is the backend.
+                if use_te_checkpoint(self.config) and not hidden_states.requires_grad:
                     recompute_skip_num_layers += 1
                 if (
                     layer_idx >= recompute_skip_num_layers
@@ -993,16 +994,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 for l_no, layer in enumerate(self.layers):
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
-                        if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        else:
-                            inner_quantization_context = nullcontext()
+                        inner_quantization_context = self._get_inner_quantization_context(layer)
                     else:
                         inner_quantization_context = nullcontext()
 

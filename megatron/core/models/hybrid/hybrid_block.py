@@ -19,7 +19,7 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TENorm
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context, is_first_last_bf16_layer
+from megatron.core.fp8_utils import get_fp8_context, get_layer_fp8_context, is_first_last_bf16_layer
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
@@ -28,6 +28,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
@@ -927,7 +928,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         return hidden_states
 
 
-class HybridStack(MegatronModule):
+class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
     """
     Constructor for the HybridStack class.
 
@@ -954,6 +955,11 @@ class HybridStack(MegatronModule):
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers. Defaults to the standard config semantics.
     """
+
+    def create_mcore_cudagraph_manager(self, config):
+        """The stack is graphed as a whole only through Transformer Engine (chunk-wise graphs);
+        the local CUDA graph implementation keeps graphing its layers."""
+        return None
 
     def __init__(
         self,
@@ -1361,7 +1367,9 @@ class HybridStack(MegatronModule):
         if use_inner_fp8_context:
 
             def get_inner_quant_context(config, layer_number):
-                return get_fp8_context(config, layer_number)
+                # Under chunk graphs, BF16 boundary layers opt out of the block-wide FP8 context
+                # and MTP layers (numbered from 1 in their own stack) opt in explicitly.
+                return get_layer_fp8_context(config, layer_number, is_mtp_layer=self.is_mtp_layer)
 
         elif use_fp4_context:
 

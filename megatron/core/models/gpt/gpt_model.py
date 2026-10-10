@@ -27,6 +27,10 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.transformer.chunk_cuda_graph import (
+    ChunkCudaGraphPostProcessBlock,
+    build_postprocess_block,
+)
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
@@ -44,6 +48,43 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_using_quantization_scales,
 )
+
+
+class GPTPostProcessBlock(ChunkCudaGraphPostProcessBlock):
+    """``GPTModel._postprocess`` (MTP block, LM head, loss) as a chunk CUDA graph callable."""
+
+    def forward(
+        self,
+        hidden_states,
+        input_ids=None,
+        position_ids=None,
+        labels=None,
+        loss_mask=None,
+        attention_mask=None,
+        packed_seq_params=None,
+        padding_mask=None,
+        rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        mhc_multistream=None,
+    ):
+        """Run the owner's training post-process on the (static) graph inputs."""
+        owner = self._owner
+        return owner._postprocess(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            mtp_in_postprocess=owner.mtp_process,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
+            mhc_multistream=mhc_multistream,
+        )
 
 
 class GPTModel(LanguageModule):
@@ -301,6 +342,9 @@ class GPTModel(LanguageModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+        # Chunk CUDA graphs also capture the post-process of the last pipeline stage.
+        self.postprocess_block = build_postprocess_block(self, GPTPostProcessBlock)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -592,13 +636,17 @@ class GPTModel(LanguageModule):
             padding_mask=padding_mask,
         )
 
+        # Under sequence parallelism the pre-process scatters the padding mask along the sequence
+        # for the decoder (whose hidden states are scattered). The post-process keeps the caller's
+        # full-length mask: the MTP rolls it alongside input_ids / position_ids, and its MoE
+        # layers re-align it to their hidden states themselves.
         (
             decoder_input,
             rotary_pos_emb,
             rotary_pos_cos,
             rotary_pos_sin,
             sequence_len_offset,
-            padding_mask,
+            decoder_padding_mask,
         ) = preproc_output[:6]
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
@@ -619,7 +667,7 @@ class GPTModel(LanguageModule):
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
+            padding_mask=decoder_padding_mask,
             **decoder_extra_block_kwargs,
         )
         # When mHC + MTP, the decoder returns (contracted, multi-stream).
@@ -629,6 +677,30 @@ class GPTModel(LanguageModule):
         else:
             hidden_states = decoder_output
             mhc_multistream = None
+
+        postprocess_block = getattr(self, 'postprocess_block', None)
+        if (
+            postprocess_block is not None
+            and self.training
+            and labels is not None
+            and output_processor is None
+            and not InferenceMode.is_active()
+        ):
+            # Captured into / replayed from the chunk CUDA graphs.
+            return postprocess_block(
+                hidden_states,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                mhc_multistream=mhc_multistream,
+            )
 
         return self._postprocess(
             hidden_states=hidden_states,

@@ -125,6 +125,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_logging import
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -2179,6 +2180,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
+
             # Treat missing and explicit None identifier values as equivalent.
             # Wrap each component so None never compares directly with floats or strings.
             def key_fn(pg):
@@ -2186,6 +2188,7 @@ def preprocess_common_state_dict(common_state_dict):
                     (value is not None, value)
                     for value in (pg.get(key) for key in param_group_identifier_keys)
                 ]
+
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -2300,7 +2303,20 @@ def pretrain(
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
 
-        set_ideal_affinity_for_current_gpu()
+        try:
+            set_ideal_affinity_for_current_gpu()
+        except Exception as exc:  # pylint: disable=broad-except
+            # The NUMA-affinity hint speeds up the offload copies but is not required for
+            # correctness. It fails per rank, e.g. when the job's cgroup (SLURM cpus-per-task)
+            # holds no CPU of this GPU's socket, so the pinned buffers land on the remote socket
+            # and the D2H/H2D copies run at the cross-socket bandwidth. Warn from every rank.
+            allowed = len(os.sched_getaffinity(0))
+            print(
+                f"[rank {torch.distributed.get_rank()}] WARNING: could not set the GPU-local CPU "
+                f"affinity for fine-grained offloading ({exc}); the process may use {allowed} "
+                f"CPU(s) that are not on this GPU's socket, which slows the offload copies.",
+                flush=True,
+            )
 
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
@@ -5055,7 +5071,10 @@ def train(
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            use_single_mempool=config.cuda_graph_use_single_mempool,
+            # Chunk-wise CUDA graphs capture into the shared pool; the optimizer step joins it.
+            use_single_mempool=(
+                config.cuda_graph_use_single_mempool or config.cuda_graph_impl == "chunk_wise"
+            ),
         )
 
     def get_e2e_base_metrics():
@@ -5135,7 +5154,7 @@ def train(
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # Initialize CUDA Graphs helper.
-    if args.cuda_graph_impl == "transformer_engine":
+    if args.cuda_graph_impl in ("transformer_engine", "chunk_wise"):
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
@@ -5214,13 +5233,18 @@ def train(
 
         # Capture CUDA Graphs.
         if (
-            args.cuda_graph_impl == "transformer_engine"
+            args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
             and not cuda_graph_helper.capture_finished()
             and iteration - start_iteration == args.cuda_graph_warmup_steps
         ):
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model, param_sync=False)
             cuda_graph_helper.create_cudagraphs()
+            # TE's warm-up passes ran the training forward on the static inputs and accumulated
+            # into the per-step loss trackers; drop that so this step logs only its real forward.
+            clear_aux_losses_tracker()
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
+            MTPLossLoggingHelper.clean_loss_in_tracker()
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
@@ -5349,7 +5373,7 @@ def train(
                     pre_hook_enabled = True
                     # Set the manual hooks here since it's not set right after the capturing.
                     if (
-                        args.cuda_graph_impl == "transformer_engine"
+                        args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
                         and args.cuda_graph_warmup_steps == 0
                     ):
                         assert (
@@ -5568,7 +5592,10 @@ def train(
             break
 
     # Destroy CUDA Graphs.
-    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if (
+        args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
+        and cuda_graph_helper.graphs_created()
+    ):
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
