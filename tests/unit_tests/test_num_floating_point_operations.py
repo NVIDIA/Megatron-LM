@@ -64,6 +64,8 @@ def _make_gpt_args(
     args.num_query_groups = num_attention_heads
     args.attention_output_gate = False
     args.gated_attention_proj_granularity = "elementwise"
+    args.enable_attention_residuals = False
+    args.attn_res_block_layers = None
     args.multi_latent_attention = False
     # MoE / MTP disabled.
     args.num_experts = None
@@ -82,6 +84,8 @@ def _make_gpt_args(
     args.linear_num_key_heads = None
     args.linear_num_value_heads = None
     args.linear_conv_kernel_dim = None
+    args.kda_f_lora_rank = None
+    args.kda_gate_lora_rank = None
     # MLA fields (unused but referenced).
     args.q_lora_rank = None
     args.qk_head_dim = None
@@ -107,6 +111,7 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     args.mamba_head_dim = 64
     args.mamba_num_groups = 8
     args.mamba_num_heads = 128
+    args.gdp_num_householder = 3
     return args
 
 
@@ -116,6 +121,8 @@ def _make_kda_hybrid_args():
     args.hybrid_layer_pattern = "K"
     args.linear_key_head_dim = 32
     args.linear_value_head_dim = 32
+    args.kda_f_lora_rank = 16
+    args.kda_gate_lora_rank = None
     args.linear_num_key_heads = 8
     args.linear_num_value_heads = 8
     args.linear_conv_kernel_dim = 4
@@ -539,6 +546,7 @@ class TestHybridMatchesStandard:
         hybrid.mamba_head_dim = 64
         hybrid.mamba_num_groups = 8
         hybrid.mamba_num_heads = 128
+        hybrid.gdp_num_householder = 3
         # Match the standard model's attention implementation explicitly:
         # '*' is regular attention and '+' is dense MLA in the hybrid grammar.
         attention_symbol = "+" if hybrid.multi_latent_attention else "*"
@@ -623,21 +631,35 @@ class TestHybridMatchesStandard:
 class TestKimiDeltaAttentionFlops:
     """KDA layers must contribute their projection and kernel work."""
 
-    def test_direct_projection_formula(self):
+    @pytest.mark.parametrize(
+        ("f_lora_rank", "gate_lora_rank"),
+        [(None, None), (16, None), (16, 24), (None, 24)],
+        ids=["legacy-fused", "kimi-k3", "both-low-rank", "low-rank-gate-only"],
+    )
+    def test_projection_formula(self, f_lora_rank, gate_lora_rank):
         args = _make_kda_hybrid_args()
+        args.kda_f_lora_rank = f_lora_rank
+        args.kda_gate_lora_rank = gate_lora_rank
         batch_size = 2
         total_tokens = batch_size * args.seq_length
         qk_dim = args.linear_key_head_dim * args.linear_num_key_heads
         v_dim = args.linear_value_head_dim * args.linear_num_value_heads
-        in_proj_dim = 3 * qk_dim + 2 * v_dim
+        f_projection_flops = args.hidden_size * qk_dim
+        if f_lora_rank is not None:
+            f_projection_flops = args.hidden_size * f_lora_rank + f_lora_rank * qk_dim
+        gate_projection_flops = args.hidden_size * v_dim
+        if gate_lora_rank is not None:
+            gate_projection_flops = args.hidden_size * gate_lora_rank + gate_lora_rank * v_dim
+        projection_flops = (
+            args.hidden_size * (2 * qk_dim + v_dim + args.linear_num_key_heads)
+            + f_projection_flops
+            + gate_projection_flops
+            + args.hidden_size * v_dim
+        )
         kda_forward = (
             2
             * total_tokens
-            * (
-                args.hidden_size * (in_proj_dim + args.linear_num_key_heads)
-                + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
-                + args.hidden_size * v_dim
-            )
+            * (projection_flops + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim))
         )
         kda_forward += (
             8
@@ -710,6 +732,82 @@ class TestHybridAttentionOutputGateFlops:
 
         expected_delta = 3 * 2 * total_tokens * args.hidden_size * gate_projection_size
         assert gated_flops - ungated_flops == expected_delta
+
+
+class TestGatedDeltaProductFlops:
+    """GDP FLOPs must use the Householder count from the model configuration."""
+
+    def test_householder_count_changes_flops(self):
+        args = _make_hybrid_args()
+        args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "gdp_stack_spec"]
+        batch_size = 4
+
+        flops_m3 = num_floating_point_operations(args, batch_size)
+        args.gdp_num_householder = 4
+        flops_m4 = num_floating_point_operations(args, batch_size)
+
+        total_tokens = batch_size * args.seq_length
+        d_inner = args.mamba_num_heads * args.mamba_head_dim
+        group_state_dim = args.mamba_num_groups * args.mamba_state_dim
+        forward_delta_per_layer = (
+            2
+            * total_tokens
+            * (
+                args.hidden_size * (d_inner + group_state_dim + args.mamba_num_heads)
+                + 4 * (d_inner + group_state_dim)
+            )
+            + 4 * total_tokens * d_inner * args.mamba_state_dim
+        )
+        num_gdp_layers = 2
+        expected_delta = 3 * num_gdp_layers * forward_delta_per_layer
+
+        assert flops_m4 - flops_m3 == expected_delta
+
+
+class TestAttentionResidualFlops:
+    """AttnRes FLOPs must follow the runtime depth-source schedule."""
+
+    @staticmethod
+    def _enabled_delta(args, batch_size=2):
+        disabled_flops = num_floating_point_operations(args, batch_size)
+        args.enable_attention_residuals = True
+        args.attn_res_block_layers = 2
+        enabled_flops = num_floating_point_operations(args, batch_size)
+        return enabled_flops - disabled_flops
+
+    def test_standard_transformer_counts_both_sublayers_and_final_head(self):
+        args = _make_gpt_args(num_layers=4)
+        total_tokens = 2 * args.seq_length
+
+        # Source arities for block size 2:
+        # attention = [1, 2, 2, 3], MLP = [2, 2, 3, 3], final = [3].
+        total_source_arity = 21
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args) == expected_delta
+
+    def test_hybrid_counts_pattern_entries_and_final_head(self):
+        args = _make_hybrid_args(num_layers=4)
+        total_tokens = 2 * args.seq_length
+
+        # A hybrid pattern entry is one sublayer. For block size 2, "*M*M"
+        # therefore has per-entry arities [1, 2, 2, 3] and final arity 3.
+        total_source_arity = 11
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args) == expected_delta
+
+    def test_standard_mtp_counts_three_aggregations_per_depth(self):
+        args = _make_gpt_args(num_layers=4)
+        args.mtp_num_layers = 2
+        total_tokens = 2 * args.seq_length
+
+        # The trunk contributes 21 source-visits. Its final history has arity
+        # three; each MTP depth adds a fresh partial to three aggregations.
+        total_source_arity = 21 + 2 * 3 * 4
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args) == expected_delta
 
 
 class TestPaddingRemoval:
@@ -1604,6 +1702,7 @@ def _make_dsv4_pair(*, ratios, mtp, moe):
     hybrid.mamba_head_dim = 64
     hybrid.mamba_num_groups = 8
     hybrid.mamba_num_heads = 128
+    hybrid.gdp_num_householder = 3
     main_pattern = "".join(_RATIO_TO_SYMBOL[r] + ffn_symbol for r in ratios)
     mtp_pattern = ("/" + "W" + ffn_symbol) * mtp  # MTP layer = Window attention
     hybrid.hybrid_layer_pattern = main_pattern + mtp_pattern

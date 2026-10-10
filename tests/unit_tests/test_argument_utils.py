@@ -1075,3 +1075,27 @@ class TestTrainingConfigMapping:
         assert result.train.train_iters is None
         assert result.train.micro_batch_size is None
         assert result.train.global_batch_size is None
+
+
+@pytest.mark.parametrize("precision", ["highest", "high", "medium"])
+def test_muon_cli_precision_is_accepted_by_optimizer(precision):
+    """The CLI must accept the actual PyTorch/emerging-optimizers precision names."""
+    import torch
+
+    emerging_utils = pytest.importorskip("emerging_optimizers.utils")
+    from megatron.training.arguments import _add_regularization_args
+
+    parser = _add_regularization_args(ArgumentParser())
+    args = parser.parse_args(["--muon-fp32-matmul-prec", precision])
+    previous = torch.get_float32_matmul_precision()
+    with emerging_utils.fp32_matmul_precision(args.muon_fp32_matmul_prec):
+        assert torch.get_float32_matmul_precision() == precision
+    assert torch.get_float32_matmul_precision() == previous
+
+
+def test_muon_cli_rejects_nonexistent_low_precision():
+    from megatron.training.arguments import _add_regularization_args
+
+    parser = _add_regularization_args(ArgumentParser())
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--muon-fp32-matmul-prec", "low"])

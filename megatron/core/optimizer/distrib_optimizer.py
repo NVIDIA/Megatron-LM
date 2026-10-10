@@ -5,6 +5,7 @@
 import gc
 import itertools
 import logging
+import math
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -36,7 +37,7 @@ except ImportError:
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
-from .. import tensor_parallel
+from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
 from ..dist_checkpointing.dict_utils import nested_values
@@ -60,11 +61,13 @@ from ..fp8_utils import (
     is_grouped_tensor_with_quantized_storage,
     quantize_param_shard,
 )
+from ..tensor_parallel import gtp_api
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
+    _strip_module_prefix,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
     param_group_identifier_keys,
@@ -73,6 +76,97 @@ from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
+
+
+def _resolve_gtp_sharded_metadata(model_param, model_sharded_state_dict):
+    """Find the model ShardedTensor for a GTP_remat param the identity map missed.
+
+    ``param_to_sharded_metadata`` is keyed by ``id`` of the tensor each model entry
+    carries, and matched against the parameter the grad buffer registered. Two GTP cases
+    put a DIFFERENT tensor in the model entry and so break that match:
+
+    1. Native-FP8 GTP weights: the entry holds a dequantized BF16 copy, which carries a
+       ``_gtp_dequant_src`` backlink to the live param (see
+       ``make_tp_sharded_tensor_for_checkpoint``).
+    2. Factory-backed weights (GDN / Mamba ``in_proj``): the entry is a factory exposing
+       the GATHERED tensor, so nothing matches the per-shard param. Return the model's own
+       factory, matched by name.
+    3. Anything else GTP-sharded falls back to rebuilding the same per-shard ShardedTensor
+       every other GTP weight gets (refused for expert-parallel params).
+
+    This mirrors ``_backfill_gtp_sharded_param_map`` in optimizer.py, which fixes the same
+    two cases for the distributed-Muon path. That helper explicitly does not cover
+    distributed Adam ("Distributed Adam uses its own DistributedOptimizer.sharded_state_dict
+    (flat-buffer path) and is unaffected") — true for the dp_reshardable format, which keys
+    optimizer state by DP-group index and never consults the model entries, but NOT for
+    the fully-reshardable format, which does.
+
+    Returns the ShardedTensor, or None when this is not a GTP param (caller raises).
+    """
+    try:
+        from megatron.core.tensor_parallel.gtp_api import (
+            is_gtp_param,
+            make_sharded_tensors_for_checkpoint_with_gtp_remat,
+        )
+        from megatron.core.tensor_parallel.gtp_utils import gtp_entry_backlink
+    except ImportError:
+        return None  # GTP not built in.
+
+    if not is_gtp_param(model_param):
+        return None
+
+    # Case 1: the entry carries a backlink saying it stands for this param -- see
+    # gtp_entry_backlink for the two kinds and why they exist. Missing the padding one sends the
+    # trailing GTP shard down the Case 3 rebuild, which keys it by ``_debug_name`` -- a DIFFERENT
+    # checkpoint FQN -- so the real tensor silently loses those rows and DCP rejects the plan for
+    # incomplete coverage.
+    for entry in nested_values(model_sharded_state_dict):
+        if gtp_entry_backlink(entry) is model_param:
+            return entry
+
+    # Case 2: a factory-backed weight (GDN / Mamba in_proj). The model gathers the GTP
+    # shards back to TP-local before splitting into [z|x|B|C|dt] (see
+    # mamba_mixer/gated_delta_net sharded_state_dict), because those split boundaries do
+    # not line up with GTP slice boundaries. The optimizer must key its state the same way
+    # or a checkpoint written under GTP cannot be read back without GTP: the model side
+    # emits `...in_proj.weight.z`, the rebuilt-per-shard side emits `...in_proj.weight`.
+    #
+    # Return the model's own factory; the caller gathers the state tensors across the GTP
+    # group to the shape the factory expects. Match by name, since the factory's data is
+    # the gathered tensor and therefore never identical to this shard.
+    # Case 2a: the factory carries a backlink to the per-shard param it was built from. This is
+    # exact, unlike the name match below -- a grouped-expert factory's key is rewritten by the
+    # prefix replacement in experts.py, so it does not equal the param's stripped _debug_name.
+    for entry in nested_values(model_sharded_state_dict):
+        if getattr(entry, 'gtp_source_param', None) is model_param:
+            return entry
+
+    name = _strip_module_prefix(getattr(model_param, '_debug_name', '') or '')
+    if name:
+        for entry in nested_values(model_sharded_state_dict):
+            if isinstance(entry, ShardedTensorFactory) and entry.key == name:
+                return entry
+
+    # Case 3: rebuild. Not expert-parallel aware — an expert param rebuilt here would write
+    # duplicate shards across expert-parallel groups, so refuse loudly rather than corrupt
+    # the checkpoint. (Same guard as _backfill_gtp_sharded_param_map.)
+    if not getattr(model_param, 'allreduce', True):
+        raise ValueError(
+            f"GTP expert-parallel param '{getattr(model_param, '_debug_name', '')}' has no "
+            "matching model ShardedTensor; refusing the EP-unaware rebuild (it would write "
+            "duplicate shards across expert-parallel groups)."
+        )
+    key = getattr(model_param, '_debug_name', None) or '_gtp_optim_param'
+    rebuilt = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+        {key: model_param},
+        prefix='',
+        tensor_parallel_layers_axis_map={key: 0},
+        tp_group=parallel_state.get_tensor_model_parallel_group(),
+        # Required kwarg; unused for GTP-sharded params, whose offsets and replica_id come
+        # from the gtp_remat axis.
+        dp_cp_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+    )
+    return rebuilt[key]
 
 
 class Range:
@@ -210,6 +304,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         data_parallel_rank = param_and_grad_buffer.data_parallel_group.rank()
         data_parallel_world_size = param_and_grad_buffer.data_parallel_group.size()
+
+        # The layout records how many shards it was built for. That count has to match the group
+        # the reduce-scatter and all-gather run over, which is the intra-instance group when
+        # there are several optimizer instances. If the layout was sized by a larger group, the
+        # trailing shards of every bucket belong to no rank: those params are never updated and
+        # drop out of grad-norm, num-zeros and params-norm, which sum over owned shards only.
+        num_optimizer_shards = param_and_grad_buffer.num_optimizer_shards
+        assert num_optimizer_shards is None or num_optimizer_shards == data_parallel_world_size, (
+            f"Parameter layout was built for {num_optimizer_shards} optimizer shards but the "
+            f"buffer's data-parallel group has {data_parallel_world_size} ranks. Size the layout "
+            f"by the group the optimizer shards over."
+        )
 
         bucket = param_and_grad_buffer.buckets[bucket_index]
         gbuf_size = bucket.grad_data.numel()
@@ -423,7 +529,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                         copy_optimizer_param_metadata(shard_model_param, model_param)
+                        shard_model_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
+                            model_param, param_range.start, param_range.end
+                        )
 
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -454,7 +564,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_main_param, model_param)
                         copy_optimizer_param_metadata(shard_main_param, model_param)
+                        shard_main_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
+                            model_param, param_range.start, param_range.end
+                        )
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
                         shard_main_param = None
@@ -470,13 +584,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
+                    shard_model_param = model_param.detach().view(-1)[
+                        param_range.start : param_range.end
+                    ]
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
+                    tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                     copy_optimizer_param_metadata(shard_model_param, model_param)
+                    shard_model_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
+                        model_param, param_range.start, param_range.end
+                    )
 
                 else:
                     raise TypeError(
@@ -589,6 +709,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=data_parallel_world_size,
         )
 
     @staticmethod
@@ -1393,6 +1514,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
                 # Create coalesced tensors for all state related to parameters in this buffer.
+                # These are sized to the compact (bucket-end padding stripped) layout, which is
+                # exactly what the loop below fills and what the load paths read back.
                 world_tensors = {}
                 if data_parallel_rank == 0 or return_on_all_ranks:
                     world_tensors = {
@@ -1609,6 +1732,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Megatron-FSDP custom sharded state dict construction.
             state_dict = self.sharded_param_state_fsdp_dtensor(is_loading)
             return state_dict
+
+        if gtp_api.HAVE_GTP and sharding_type == 'fully_sharded_model_space':
+            # This legacy format has no GTP factory/backlink resolver, unlike fully_reshardable.
+            # Gathered projection factories and dequantized FP8 entries own different tensors.
+            model_param_ids = {
+                id(entry.data)
+                for entry in nested_values(model_sharded_state_dict)
+                if isinstance(entry, (ShardedTensor, ShardedTensorFactory))
+            }
+            for buffer in self.buffers:
+                for param in buffer.param_index_map:
+                    if gtp_api.is_gtp_param(param) and id(param) not in model_param_ids:
+                        raise NotImplementedError(
+                            f"Distributed optimizer format '{sharding_type}' cannot map GTP "
+                            "parameters to gathered or dequantized model checkpoint data. "
+                            "Use 'fully_reshardable' for cross-topology loading or "
+                            "'dp_reshardable' "
+                            "for the existing buffer-based format."
+                        )
 
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':
             log_single_rank(
@@ -1851,24 +1993,68 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # Note: for NVFP4, param_index_map uses unpacked (full numel)
                 # offsets, which is correct here since optimizer states
                 # (fp32_param, exp_avg, exp_avg_sq) are in unpacked space.
+
+                # Compute cumulative bucket-end padding stripped before each bucket.
+                # world_tensors has bucket-end padding stripped, but param_index_map
+                # indices include bucket-end padding. We need to adjust indices.
+                cumulative_padding_stripped = [0]  # For bucket 0, no prior padding stripped
+                for bucket in buffer.buckets[:-1]:  # All but last bucket
+                    bucket_padding = bucket.grad_data.numel() - bucket.numel_unpadded
+                    cumulative_padding_stripped.append(
+                        cumulative_padding_stripped[-1] + bucket_padding
+                    )
+
                 for model_param, (
                     param_world_start,
                     param_world_end,
-                    _,
+                    bucket_id,
                 ) in buffer.param_index_map.items():
-                    try:
-                        sharded_metadata = param_to_sharded_metadata[model_param]
-                    except KeyError as e:
+                    sharded_metadata = param_to_sharded_metadata.get(model_param)
+                    if sharded_metadata is None:
+                        # GTP puts a different tensor in the model entry for two cases;
+                        # resolve those before treating this as an error.
+                        sharded_metadata = _resolve_gtp_sharded_metadata(
+                            model_param, model_sharded_state_dict
+                        )
+                    if sharded_metadata is None:
+                        # Printing the tensor itself dumps values and names neither the
+                        # parameter nor which entry the map does hold, which is what a
+                        # reader needs: the map is keyed by object identity, so a mismatch
+                        # means the model's sharded_state_dict exposed a DIFFERENT tensor
+                        # (a dequantized copy, or a factory's gathered tensor) for this
+                        # parameter.
+                        name = getattr(model_param, '_debug_name', None) or '<unnamed>'
                         raise ValueError(
-                            f"Model param {model_param} not in model_sharded_state_dict."
+                            f"Model param {name} (shape={tuple(model_param.shape)},"
+                            f" type={type(model_param).__name__},"
+                            f" gtp={getattr(model_param, 'is_gtp_weight_remat', False)})"
+                            f" not in model_sharded_state_dict."
                             f" Hint: {KEEP_VARS_HINT}"
-                        ) from e
+                        )
                     assert (
                         sharded_metadata.flattened_range is None
                     ), f"Flattened model tensor not supported ({sharded_metadata})"
 
                     # Note: replica_id is exactly the same as in the model param
                     replica_id = sharded_metadata.replica_id
+
+                    # Adjust indices to account for stripped bucket-end padding.
+                    # param_world_start/end are indices in the buffer (with padding),
+                    # but world_tensors has the bucket-end padding stripped.
+                    padding_adjustment = cumulative_padding_stripped[bucket_id]
+                    adjusted_start = param_world_start - padding_adjustment
+                    adjusted_end = param_world_end - padding_adjustment
+
+                    # A factory whose data is wider than this shard is the gathered+split
+                    # case (GDN / Mamba in_proj): the state tensors below have to be
+                    # gathered across the GTP group before the factory can split them.
+                    gtp_gather_group = None
+                    if (
+                        isinstance(sharded_metadata, ShardedTensorFactory)
+                        and getattr(model_param, 'is_gtp_weight_remat', False)
+                        and sharded_metadata.data.shape[0] != model_param.shape[0]
+                    ):
+                        gtp_gather_group = model_param.group
 
                     tensors = {}
                     for state_key in world_tensor_keys:
@@ -1877,29 +2063,57 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # specifically and is read from param_groups.
                             # Numel unpadded is not needed.
                             continue
-                        state_ten = world_tensors[state_key][param_world_start:param_world_end]
-                        missing_elems_num = (param_world_end - param_world_start) - len(state_ten)
+                        assert adjusted_end <= world_tensors[state_key].numel(), (
+                            f"'{sharded_metadata.key}' range [{adjusted_start}, {adjusted_end})"
+                            f" runs past the coalesced buffer"
+                            f" ({world_tensors[state_key].numel()} elements);"
+                            f" bucket-padding adjustment is wrong."
+                        )
+                        state_ten = world_tensors[state_key][adjusted_start:adjusted_end]
 
-                        if missing_elems_num > 0:
-                            # `state_ten` is shorter than the slice which means the world_tensor
-                            # is shorter than `param_world_end` - this is a bug in the param ranges
-                            # logic. Here we can only pad this with zeros as a workaround.
-                            # TODO: this assert shouldn't hold and indicates a bug, see issue #504
-                            assert param_world_end > buffer.numel_unpadded
-
-                            logger.warning(
-                                f"'{sharded_metadata.key}' param range exceeds"
-                                f" unpadded buffer by {missing_elems_num} elements."
-                                f" It will be padded with zeros which can lead to"
-                                f" data corruption."
-                            )
-                            state_ten = torch.nn.functional.pad(state_ten, (0, missing_elems_num))
-
-                        assert len(state_ten) == param_world_end - param_world_start, (
+                        assert len(state_ten) == (param_world_end - param_world_start), (
                             len(state_ten),
                             param_world_end - param_world_start,
                         )
-                        state_ten = state_ten.reshape(sharded_metadata.data.shape)
+                        if gtp_gather_group is not None:
+                            # Factory-backed GTP weight: the factory splits along boundaries
+                            # that do not align with GTP slices, so it expects the full
+                            # TP-local tensor. Gather this shard's optimizer state across the
+                            # GTP group and strip the alignment pad, mirroring what the model
+                            # side already does for the weight itself.
+                            # These slices come off the DP-gathered world tensors, which live
+                            # on CPU; the GTP group is NCCL, so the collective has to run on
+                            # the parameter's device and come back. mem_efficient is off for
+                            # GTP (arguments.py asserts it), which means the world tensors are
+                            # NCCL all-gathered to EVERY rank — so every member of the GTP
+                            # group reaches this point and the collective is symmetric.
+                            host_device = state_ten.device
+                            state_ten = (
+                                state_ten.reshape(model_param.shape)
+                                .to(model_param.device)
+                                .contiguous()
+                            )
+                            gathered = torch.empty(
+                                (state_ten.shape[0] * gtp_gather_group.size(),)
+                                + tuple(state_ten.shape[1:]),
+                                dtype=state_ten.dtype,
+                                device=state_ten.device,
+                            )
+                            torch.distributed.all_gather_into_tensor(
+                                gathered, state_ten, group=gtp_gather_group
+                            )
+                            want_rows = sharded_metadata.data.shape[0]
+                            if gathered.shape[0] != want_rows:
+                                gathered = gathered[:want_rows]
+                            state_ten = gathered.contiguous().to(host_device)
+                        want_shape = tuple(sharded_metadata.data.shape)
+                        if getattr(
+                            sharded_metadata, 'gtp_pad_src', None
+                        ) is not None and state_ten.numel() > math.prod(want_shape):
+                            # GTP trimmed the alignment-pad rows out of the model entry; the
+                            # flat state still spans the padded shard. Drop the same tail.
+                            state_ten = state_ten.reshape((-1,) + want_shape[1:])[: want_shape[0]]
+                        state_ten = state_ten.reshape(want_shape)
                         replace_kwargs = dict(
                             key=f'{prefix}.{state_key}.{sharded_metadata.key}',
                             data=state_ten,
@@ -2481,6 +2695,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # Handle torch Adam "step" state separately.
                             continue
                         v_flat = v.flatten()
+                        # GTP alignment-pad rows are excluded from the checkpoint (they are
+                        # the trailing rows of the shard and hold no parameter), while the
+                        # flat param ranges below are expressed over the PADDED shard.
+                        # Restore them as zeros -- the same value a freshly built shard has --
+                        # so the ranges line up. Mirrors the trim on the save side.
+                        _want_numel = model_param.numel()
+                        if v_flat.numel() < _want_numel:
+                            v_flat = torch.cat(
+                                [v_flat, v_flat.new_zeros(_want_numel - v_flat.numel())]
+                            )
                         v_flat = v_flat[
                             param_range_map["param"].start : param_range_map["param"].end
                         ]

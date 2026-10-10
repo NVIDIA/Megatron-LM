@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import math
@@ -84,6 +84,7 @@ def build_tokenizer(args, **kwargs):
         tokenizer_library = 'sft'
         tokenizer_path = args.tokenizer_model
         kwargs['prompt_format'] = args.sft_tokenizer_prompt_format
+        kwargs['trust_remote_code'] = args.trust_remote_code
     elif args.tokenizer_type in ['NullTokenizer', 'NullMultimodalTokenizer']:
         tokenizer_library = (
             'null-text' if args.tokenizer_type == 'NullTokenizer' else 'null-multimodal'

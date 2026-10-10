@@ -23,7 +23,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import _split_in_proj_factory, _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -196,7 +196,8 @@ class _GDNBase(MegatronModule):
         # Attributes from config
         self.config = config
         self.hidden_size = config.hidden_size
-        self.act_fn = config.activation_func
+        # GDN-family convolution and output gates use SiLU independently of the FFN activation.
+        self.act_fn = nn.functional.silu
         self.activation = self.act_fn.__name__
         self.conv_kernel_dim = config.linear_conv_kernel_dim
         self.key_head_dim = config.linear_key_head_dim
@@ -240,8 +241,7 @@ class _GDNBase(MegatronModule):
             assert (
                 getattr(self, attr) is not None
             ), f"Attribute {attr} for the GDN-family variant is not set"
-        # Full input projection width: q, k, v, output gate, and variant-specific gate features.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
+        self.in_proj_dim = self._get_in_proj_dim()
 
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -338,12 +338,23 @@ class _GDNBase(MegatronModule):
 
         self.reset_parameters()
 
+    def _get_in_proj_dim(self) -> int:
+        """Return the fused input-projection width for this GDN-family variant.
+
+        The shared GDN layout contains Q, K, V, the output gate, and any
+        variant-specific gate features. Variants with separately parameterized
+        projections can override this hook without encoding a negative
+        ``in_proj_extra_dim``.
+        """
+
+        return self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
+
     def _setup_variant_attrs(self):
         """Set variant projection sections, gate parameter sizes, and kernel callable.
 
         Must set:
-        - ``in_proj_extra_dim`` (the in_proj sections beyond q/k/v/z; the base
-          class derives ``in_proj_dim`` from it)
+        - ``in_proj_extra_dim`` (the in_proj sections beyond q/k/v/z; the default
+          ``_get_in_proj_dim`` implementation derives ``in_proj_dim`` from it)
         - ``in_proj_split_names``
         - ``in_proj_split_sections``
         - ``dt_bias_dim`` / ``a_log_dim`` (sizes of the gate parameters, which the
@@ -572,17 +583,14 @@ class _GDNBase(MegatronModule):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
-
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_in_proj_factory(
             sharded_state_dict[f"{prefix}in_proj.weight"],
             list(self.in_proj_split_sections),
             self.in_proj_split_names,
-            0,
+            weight=self.in_proj.weight,
+            tp_group=tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
+            sharded_offsets=sharded_offsets,
         )
 
         conv_layer_name_list = ["conv1d.weight"]

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from unittest.mock import MagicMock, Mock, patch
 
@@ -33,6 +33,9 @@ def _make_pg():
     pg.pp.size.return_value = 1
     pg.dp_cp.size.return_value = 1
     pg.expt_dp.size.return_value = 1
+    # With a single optimizer instance the intra-instance groups are the full groups.
+    pg.intra_dp_cp.size.return_value = 1
+    pg.intra_expt_dp.size.return_value = 1
     return pg
 
 
@@ -617,6 +620,9 @@ class TestDdpWrapFullParamLayout:
         self.pg = _make_pg()
         self.pg.dp_cp.size.return_value = 4
         self.pg.expt_dp.size.return_value = 2
+        # Single optimizer instance, so the intra-instance groups match the full groups.
+        self.pg.intra_dp_cp.size.return_value = 4
+        self.pg.intra_expt_dp.size.return_value = 2
         self._opt_patcher = patch("megatron.training.models.dist_utils.DistributedOptimizer")
         self._opt = self._opt_patcher.start()
         self._opt.compute_full_param_layout.return_value = "LAYOUT"
@@ -1025,14 +1031,42 @@ class TestUnimodalBuildDistributedModels:
         finally:
             self._stop_patches()
 
-    def test_cuda_not_called_when_use_cpu_initialization(self):
+    def test_cuda_called_when_use_cpu_initialization(self):
         self.transformer_config = _make_transformer_config(use_cpu_initialization=True)
         self._standard_patches()
         try:
             unimodal_build_distributed_models(
                 Mock(), self.transformer_config, self.pg, wrap_with_ddp=False
             )
-            self.mock_model.cuda.assert_not_called()
+            self.mock_model.cuda.assert_called_once_with(0)
+        finally:
+            self._stop_patches()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA placement")
+    def test_cpu_initialized_parameters_are_cuda_before_precision_and_ddp(self):
+        """CPU initialization must not leak CPU model weights to a compact Muon buffer."""
+        self.transformer_config = _make_transformer_config(use_cpu_initialization=True)
+        self.mock_model = nn.Linear(4, 8, device="cpu")
+        expected = {
+            name: param.detach().clone() for name, param in self.mock_model.named_parameters()
+        }
+        mocks = self._standard_patches()
+
+        def check_cuda(model_list, *args, **kwargs):
+            for name, param in model_list[0].named_parameters():
+                assert param.is_cuda, name
+                torch.testing.assert_close(param.cpu(), expected[name])
+            return model_list
+
+        mocks["mp_wrap"].side_effect = check_cuda
+        mocks["ddp"].side_effect = check_cuda
+        try:
+            result = unimodal_build_distributed_models(
+                Mock(), self.transformer_config, self.pg, ddp_config=Mock(), wrap_with_ddp=True
+            )
+            assert result[0] is self.mock_model
+            mocks["mp_wrap"].assert_called_once()
+            mocks["ddp"].assert_called_once()
         finally:
             self._stop_patches()
 

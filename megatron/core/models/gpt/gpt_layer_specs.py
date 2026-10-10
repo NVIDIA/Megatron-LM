@@ -37,6 +37,7 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    AttnResTransformerLayer,
     HyperConnectionTransformerLayer,
     MlpBuilder,
     TransformerLayer,
@@ -370,7 +371,12 @@ def get_gpt_layer_with_transformer_engine_submodules(
 def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training)."""
     enable_hc = kwargs.get('enable_hyper_connection', False)
-    layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
+    enable_attn_res = kwargs.pop('enable_attention_residual', False)
+    if enable_attn_res:
+        assert not enable_hc, "attention residuals and hyper connections are mutually exclusive"
+        layer_module = AttnResTransformerLayer
+    else:
+        layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
     return ModuleSpec(
         module=layer_module,
         submodules=get_gpt_layer_with_transformer_engine_submodules(*args, **kwargs),
@@ -498,7 +504,12 @@ def get_gpt_layer_local_submodules(
 def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core."""
     enable_hc = kwargs.get('enable_hyper_connection', False)
-    layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
+    enable_attn_res = kwargs.pop('enable_attention_residual', False)
+    if enable_attn_res:
+        assert not enable_hc, "attention residuals and hyper connections are mutually exclusive"
+        layer_module = AttnResTransformerLayer
+    else:
+        layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
     return ModuleSpec(
         module=layer_module, submodules=get_gpt_layer_local_submodules(*args, **kwargs)
     )
@@ -621,6 +632,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             enable_hyper_connection=config.enable_hyper_connections,
+            enable_attention_residual=config.enable_attention_residuals,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
@@ -634,6 +646,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             enable_hyper_connection=config.enable_hyper_connections,
+            enable_attention_residual=config.enable_attention_residuals,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
@@ -662,6 +675,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             enable_hyper_connection=config.enable_hyper_connections,
+            enable_attention_residual=config.enable_attention_residuals,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -672,6 +686,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             enable_hyper_connection=config.enable_hyper_connections,
+            enable_attention_residual=config.enable_attention_residuals,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.

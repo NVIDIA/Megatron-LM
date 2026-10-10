@@ -671,6 +671,39 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+def _build_default_pg_collection() -> ProcessGroupCollection:
+    """Build a ``ProcessGroupCollection`` from the global ``parallel_state`` defaults.
+
+    Used by the schedule entry points as the fallback when the caller does not
+    supply a ``pg_collection`` explicitly.
+    """
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
+    pg_collection.cp = parallel_state.get_context_parallel_group()
+    pg_collection.embd = parallel_state.get_embedding_group(check_initialized=False)
+    pg_collection.pos_embd = parallel_state.get_position_embedding_group(check_initialized=False)
+    pg_collection.pp = parallel_state.get_pipeline_model_parallel_group()
+    pg_collection.dp_cp = parallel_state.get_data_parallel_group(
+        with_context_parallel=True, partial_data_parallel=False
+    )
+    pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+        with_context_parallel=True
+    )
+    pg_collection.dp = parallel_state.get_data_parallel_group(
+        with_context_parallel=False, partial_data_parallel=False
+    )
+    # gtp_remat axis: consumers read these with getattr and silently skip the gtp_remat
+    # reduction when absent, so populate them even when GTP_remat is inactive.
+    pg_collection.gtp_remat = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+    pg_collection.expt_gtp_remat = parallel_state.get_expert_gtp_weight_remat_group(
+        check_initialized=False
+    )
+    pg_collection.dp_cp_gtp_remat = parallel_state.get_data_parallel_group(
+        with_context_parallel=True, partial_data_parallel=False
+    )
+    return pg_collection
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -691,23 +724,7 @@ def forward_backward_no_pipelining(
     """Run forward and backward passes with no pipeline parallelism"""
 
     if pg_collection is None:
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.cp = cp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.pp = pp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, partial_data_parallel=False
-        )
-        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-            with_context_parallel=True
-        )
+        pg_collection = _build_default_pg_collection()
 
     elif pg_collection is not None:
         assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
@@ -731,6 +748,10 @@ def forward_backward_no_pipelining(
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
+        if getattr(config, 'enable_attention_residuals', False):
+            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+
+            attn_res_source_cache_reset()
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -1131,25 +1152,10 @@ def forward_backward_pipelining_with_interleaving(
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
         )
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = _build_default_pg_collection()
+        tp_group = pg_collection.tp
+        cp_group = pg_collection.cp
         cp_size = cp_group.size()
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.cp = cp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.pp = pp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, partial_data_parallel=False
-        )
-        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-            with_context_parallel=True
-        )
 
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
@@ -1176,6 +1182,10 @@ def forward_backward_pipelining_with_interleaving(
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
+        if getattr(config, 'enable_attention_residuals', False):
+            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+
+            attn_res_source_cache_reset()
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -1293,6 +1303,16 @@ def forward_backward_pipelining_with_interleaving(
         tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
+
+    # Attention residuals: every boundary carries a delta of depth sources plus
+    # the running partial sum, padded to one uniform slice count so the single
+    # tensor_shape used by all interleaved p2p call sites stays valid. The rest
+    # of the depth prefix is reconstructed from a rank-local source cache (see
+    # attention_residual.AttnResStageSources).
+    if getattr(config, 'enable_attention_residuals', False) and pipeline_parallel_size > 1:
+        from megatron.core.transformer.attention_residual import attn_res_uniform_payload_slices
+
+        tensor_shape[0] = tensor_shape[0] * attn_res_uniform_payload_slices(config)
 
     # Compute number of warmup and remaining microbatches.
     # seems only used for vpp
@@ -2290,6 +2310,25 @@ def get_tensor_shapes(
         if use_nstream:
             hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
 
+    # Attention residuals: intermediate stages exchange all depth sources plus the
+    # running partial sum, concatenated along the sequence dimension. The slice
+    # count is static per boundary and derived from the pipeline layer layout.
+    if getattr(config, 'enable_attention_residuals', False) and pp_group is not None:
+        from megatron.core.transformer.attention_residual import attn_res_payload_slices_for_pp_rank
+
+        pp_rank = pp_group.rank()
+        pp_size = pp_group.size()
+        # The boundary is identified by the rank that RECEIVES the payload.
+        boundary_recv_rank = None
+        if is_recv and pp_rank > 0:
+            boundary_recv_rank = pp_rank
+        elif not is_recv and pp_rank < pp_size - 1:
+            boundary_recv_rank = pp_rank + 1
+        if boundary_recv_rank is not None:
+            effective_seq_length = effective_seq_length * attn_res_payload_slices_for_pp_rank(
+                config, boundary_recv_rank
+            )
+
     tensor_shapes.append((effective_seq_length, effective_micro_batch_size, hidden_size))
     return tensor_shapes
 
@@ -2346,25 +2385,10 @@ def forward_backward_pipelining_without_interleaving(
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
         )
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = _build_default_pg_collection()
+        tp_group = pg_collection.tp
+        cp_group = pg_collection.cp
         cp_size = cp_group.size()
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.pp = pp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.cp = cp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, partial_data_parallel=False
-        )
-        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-            with_context_parallel=True
-        )
 
     elif p2p_communicator is not None and pg_collection is not None:
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
@@ -2419,6 +2443,10 @@ def forward_backward_pipelining_without_interleaving(
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
+        if getattr(config, 'enable_attention_residuals', False):
+            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+
+            attn_res_source_cache_reset()
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func

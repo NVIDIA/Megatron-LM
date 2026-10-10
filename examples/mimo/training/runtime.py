@@ -40,7 +40,7 @@ def configure_module_rng(
     so disjoint modules (and stages) get independent RNG state. Caller invokes once per active
     module on this rank.
     """
-    for _required in ("pp", "dp", "tp", "ep", "expt_tp"):
+    for _required in ("pp", "dp", "tp", "ep", "expt_tp", "gtp_remat", "expt_gtp_remat"):
         assert (
             getattr(pg_collection, _required, None) is not None
         ), f"pg_collection passed to configure_module_rng must define {_required}"
@@ -52,6 +52,8 @@ def configure_module_rng(
         tp_group=pg_collection.tp,
         ep_group=pg_collection.ep,
         etp_group=pg_collection.expt_tp,
+        gtp_remat_group=pg_collection.gtp_remat,
+        egtp_remat_group=pg_collection.expt_gtp_remat,
     )
 
 
