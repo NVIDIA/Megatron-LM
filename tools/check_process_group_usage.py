@@ -196,13 +196,20 @@ def _violations_in(path: pathlib.Path):
             self.scope.pop()
             self.bindings.pop()
 
-        def _expression_bindings(self, names):
+        def _expression_bindings(self, names, position=None):
             _, outer, events = next(
                 binding for binding in reversed(self.bindings) if binding[0] != "class"
             )
             visible = {
                 **outer,
-                **{name: _binding_seen_by_nested_scopes(seen) for name, seen in events.items()},
+                **{
+                    name: (
+                        _binding_at(seen, position)
+                        if position
+                        else _binding_seen_by_nested_scopes(seen)
+                    )
+                    for name, seen in events.items()
+                },
             }
             self.bindings.append(("function", visible, {name: [((0, -1), "")] for name in names}))
 
@@ -232,9 +239,13 @@ def _violations_in(path: pathlib.Path):
                 target.id
                 for generator in node.generators
                 for target in ast.walk(generator.target)
-                if isinstance(target, ast.Name)
+                if isinstance(target, ast.Name) and isinstance(target.ctx, ast.Store)
             ]
-            self._expression_bindings(names)
+            # Only generator expressions defer their body until iteration.
+            position = (
+                None if isinstance(node, ast.GeneratorExp) else (node.lineno, node.col_offset)
+            )
+            self._expression_bindings(names, position)
             for index, generator in enumerate(node.generators):
                 if index:
                     self.visit(generator.iter)
