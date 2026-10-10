@@ -5,7 +5,8 @@
 * ``fused_pad_routing_map`` / ``fused_indices_to_multihot``: integer routing bookkeeping with
   unique stores -- replay and agree with the torch reference.
 * MLA YaRN RoPE (``fused_mla_yarn_rope_apply``): elementwise rotations under a timing-based
-  ``triton.autotune``; forward and backward replay in sbhd and thd layouts.
+  ``triton.autotune``; forward and backward replay in sbhd and thd layouts (the query kernels in
+  both RoPE output layouts).
 * mHC hyper-connection kernels (``fused_mhc_kernels``): Sinkhorn, h-aggregate and h-post-BDA
   contain real ``tl.sum`` reductions under autotune, on the Triton, native (``torch.compile``)
   and, when available, cuTile backends.
@@ -118,7 +119,8 @@ def _yarn_cos_sin(emb_dim, seqlen, dtype):
 @pytest.mark.skipif(fused_mla_rope_out_of_place is None, reason="fused MLA RoPE unavailable")
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("variant", ["out_of_place", "inplace"])
-def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant):
+@pytest.mark.parametrize("remove_interleaving", [False, True])
+def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, remove_interleaving):
     seeded()
     heads, nope_dim, emb_dim = 32, 128, 64
     dtype = torch.bfloat16
@@ -136,9 +138,22 @@ def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant):
     fn = fused_mla_rope_out_of_place if variant == "out_of_place" else fused_mla_rope_inplace
 
     def run(t):
-        return fn(t, cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens)
+        return fn(
+            t,
+            cos,
+            sin,
+            nope_dim,
+            emb_dim,
+            cu_seqlens_q=cu_seqlens,
+            remove_interleaving=remove_interleaving,
+        )
 
-    assert_replays_bit_exact(run, (t,), replays=3, what=f"fused_mla_rope_{variant}[{layout}]")
+    assert_replays_bit_exact(
+        run,
+        (t,),
+        replays=3,
+        what=f"fused_mla_rope_{variant}[{layout}, remove_interleaving={remove_interleaving}]",
+    )
 
 
 @pytest.mark.skipif(fused_mla_rope_kv_split is None, reason="fused MLA RoPE unavailable")
