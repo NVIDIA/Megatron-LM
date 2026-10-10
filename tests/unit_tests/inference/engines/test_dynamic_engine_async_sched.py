@@ -27,7 +27,8 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.engines.dynamic_engine import EngineState, _get_decode_only_log_state
+from megatron.core.inference.engines.dynamic.loop import _get_decode_only_log_state
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
@@ -318,11 +319,9 @@ def test_async_forward_routes_one_controller_iteration(
 
     with (
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.nvtx_range_push"
+            "megatron.core.inference.engines.dynamic.loop.nvtx_range_push"
         ) as nvtx_range_push,
-        mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.nvtx_range_pop"
-        ) as nvtx_range_pop,
+        mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_pop") as nvtx_range_pop,
     ):
         result, context_state, _ = asyncio.run(engine.async_forward())
 
@@ -381,8 +380,8 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(track_paused_re
     }
 
     with (
-        mock.patch("megatron.core.inference.engines.dynamic_engine.nvtx_range_push"),
-        mock.patch("megatron.core.inference.engines.dynamic_engine.nvtx_range_pop"),
+        mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_push"),
+        mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_pop"),
     ):
         asyncio.run(engine.async_bookkeep(step_result, context_state, 0.0))
 
@@ -2033,11 +2032,11 @@ def test_async_reset_clears_pending_logits():
 
     with (
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
+            "megatron.core.inference.engines.dynamic.engine.torch.distributed.get_rank",
             return_value=0,
         ),
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.cuda.Event",
+            "megatron.core.inference.engines.dynamic.engine.torch.cuda.Event",
             return_value=mock.Mock(),
         ),
     ):
@@ -2075,7 +2074,7 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
 
     with (
         mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
-        mock.patch("megatron.core.inference.engines.dynamic_engine.InferenceMode.unset_active"),
+        mock.patch("megatron.core.inference.engines.dynamic.engine.InferenceMode.unset_active"),
     ):
         engine.suspend()
 

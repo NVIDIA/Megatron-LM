@@ -41,7 +41,10 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
-from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
+from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic import coordinator as dynamic_engine_coordinator
+from megatron.core.inference.engines.dynamic import multimodal as dynamic_engine_multimodal
+from megatron.core.inference.engines.dynamic import requests as dynamic_engine_requests
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
@@ -158,7 +161,7 @@ def _make_vision_cache_entry(
 ):
     if imgs is None:
         imgs = torch.empty(0)
-    return dynamic_engine._VisionCacheEntry(
+    return dynamic_engine_multimodal._VisionCacheEntry(
         embedding=embedding,
         modality=modality,
         imgs=imgs,
@@ -373,7 +376,9 @@ def test_build_vlm_request_rejects_unexpected_placeholders_after_expanded_prefix
 
 def test_expanded_prefix_metadata_reports_every_missing_preparer_field():
     with pytest.raises(ValueError) as error:
-        dynamic_engine._take_expanded_prefix_stitching_metadata({PREFIX_MEDIA_COUNT_FIELD: 1})
+        dynamic_engine_multimodal._take_expanded_prefix_stitching_metadata(
+            {PREFIX_MEDIA_COUNT_FIELD: 1}
+        )
 
     message = str(error.value)
     assert PREFIX_EXPANDED_TOKEN_COUNT_FIELD in message
@@ -394,7 +399,7 @@ def test_expanded_prefix_metadata_validates_each_field(field, bad_value):
     metadata[field] = bad_value
 
     with pytest.raises(ValueError, match="nonnegative integer"):
-        dynamic_engine._take_expanded_prefix_stitching_metadata(metadata)
+        dynamic_engine_multimodal._take_expanded_prefix_stitching_metadata(metadata)
 
 
 def test_build_vlm_request_expands_only_new_suffix_media():
@@ -469,7 +474,7 @@ def test_build_vlm_request_offsets_suffix_embeddings_after_multiple_prefix_media
 
 
 def test_slice_suffix_video_metadata_uses_frame_offset_for_image_sizes():
-    result = dynamic_engine._slice_suffix_media_metadata(
+    result = dynamic_engine_multimodal._slice_suffix_media_metadata(
         2,
         num_tiles=None,
         imgs_sizes=torch.tensor([[1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6]]),
@@ -486,7 +491,7 @@ def test_slice_suffix_video_metadata_uses_frame_offset_for_image_sizes():
 
 
 def test_slice_suffix_static_tiling_metadata_uses_logical_media_count():
-    result = dynamic_engine._slice_suffix_media_metadata(
+    result = dynamic_engine_multimodal._slice_suffix_media_metadata(
         1,
         num_tiles=torch.tensor([2, 3]),
         imgs_sizes=None,
@@ -501,7 +506,7 @@ def test_slice_suffix_static_tiling_metadata_uses_logical_media_count():
 
 def test_slice_suffix_metadata_rejects_prefix_media_overcount():
     with pytest.raises(ValueError, match="prefix media count exceeds"):
-        dynamic_engine._slice_suffix_media_metadata(
+        dynamic_engine_multimodal._slice_suffix_media_metadata(
             2,
             num_tiles=None,
             imgs_sizes=torch.tensor([[2, 2]]),
@@ -584,7 +589,7 @@ def test_build_vlm_request_reuses_client_media_cache_key():
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
 
     with mock.patch(
-        "megatron.core.inference.engines.dynamic_engine.compute_media_cache_key"
+        "megatron.core.inference.engines.dynamic.multimodal.compute_media_cache_key"
     ) as compute_key:
         request = _call_build_vlm_request(
             engine,
@@ -605,7 +610,7 @@ def test_build_vlm_request_reuses_cached_preprocessed_media_without_raw_input():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
     cached_imgs = torch.ones(1, 2, 4)
     cached_sizes = torch.tensor([[2, 2]])
-    cached_entry = dynamic_engine._VisionCacheEntry(
+    cached_entry = dynamic_engine_multimodal._VisionCacheEntry(
         embedding=torch.ones(2, 4),
         modality="image",
         imgs=cached_imgs,
@@ -790,7 +795,7 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     engine.requests = {}
     engine.failed_request_ids = []
     engine.add_request = mock.Mock()
-    cached_entry = dynamic_engine._VisionCacheEntry(
+    cached_entry = dynamic_engine_multimodal._VisionCacheEntry(
         embedding=torch.ones(1),
         modality="image",
         imgs=torch.ones(1),
@@ -817,11 +822,11 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     engine.socket_for_receiving_requests = mock.Mock()
     engine.socket_for_receiving_requests.recv_multipart.side_effect = [
         message,
-        dynamic_engine.zmq.Again,
+        dynamic_engine_coordinator.zmq.Again,
     ]
 
     with mock.patch.object(
-        dynamic_engine, "resolve_multimodal_data_for_engine"
+        dynamic_engine_coordinator, "resolve_multimodal_data_for_engine"
     ) as resolve_multimodal_data:
         assert engine.schedule_requests() == 1
 
@@ -1645,16 +1650,18 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     engine.requests = {42: types.SimpleNamespace(record=failed_record, future=failed_future)}
     engine.failed_request_ids = []
     engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
-    submit = dynamic_engine.Headers.SUBMIT_REQUEST.value
+    submit = dynamic_engine_coordinator.Headers.SUBMIT_REQUEST.value
     message = [
-        dynamic_engine.msgpack.packb([submit, 42, params.serialize(), None], use_bin_type=True),
-        dynamic_engine.msgpack.packb([3, 4], use_bin_type=True),
-        dynamic_engine.msgpack.packb(None, use_bin_type=True),
-        dynamic_engine.msgpack.packb(None, use_bin_type=True),
+        dynamic_engine_coordinator.msgpack.packb(
+            [submit, 42, params.serialize(), None], use_bin_type=True
+        ),
+        dynamic_engine_coordinator.msgpack.packb([3, 4], use_bin_type=True),
+        dynamic_engine_coordinator.msgpack.packb(None, use_bin_type=True),
+        dynamic_engine_coordinator.msgpack.packb(None, use_bin_type=True),
     ]
     engine.add_request = lambda *_, **__: engine._handle_failed_request(42)
     socket = engine.socket_for_receiving_requests = mock.Mock()
-    socket.recv_multipart.side_effect = [message, dynamic_engine.zmq.Again]
+    socket.recv_multipart.side_effect = [message, dynamic_engine_coordinator.zmq.Again]
     engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
     engine.local_metadata_ledger_enabled = False
     engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
@@ -1816,7 +1823,7 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
                 sampling_params=SamplingParams(),
                 block_size_tokens=block_size,
                 enable_prefix_caching=True,
-                block_hash_salt=dynamic_engine._weight_scoped_salt(0, "img-a"),
+                block_hash_salt=dynamic_engine_requests._weight_scoped_salt(0, "img-a"),
                 media_cache_key="img-a",
                 num_img_embeddings_per_tile=0,
                 imgs=None,
@@ -1835,7 +1842,7 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
         engine.resume()
         engine.add_request(6, prompt)
 
-    new_salt = dynamic_engine._weight_scoped_salt(1, None)
+    new_salt = dynamic_engine_requests._weight_scoped_salt(1, None)
     for request_id in (3, 4):
         request = engine.get_request(request_id)
         assert request.block_hash_salt == new_salt
@@ -1845,7 +1852,7 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
     # A post-resume arrival hashes identically, so the two can still share KV.
     assert engine.get_request(6).precomputed_block_hashes == hashes(new_salt)
 
-    vlm_salt = dynamic_engine._weight_scoped_salt(1, "img-a")
+    vlm_salt = dynamic_engine_requests._weight_scoped_salt(1, "img-a")
     assert engine.get_request(5).block_hash_salt == vlm_salt
     assert engine.get_request(5).precomputed_block_hashes == hashes(vlm_salt)
 
@@ -1869,7 +1876,7 @@ def test_add_request_defaults_sampling_params():
     tokens = torch.tensor([1, 2], dtype=torch.int64)
 
     with mock.patch(
-        "megatron.core.inference.engines.dynamic_engine.torch.tensor", return_value=tokens
+        "megatron.core.inference.engines.dynamic.engine.torch.tensor", return_value=tokens
     ):
         result = engine.add_request(3, [1, 2])
         engine.add_request(4, [1, 2])
@@ -1931,11 +1938,11 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     pending_signals = engine._pending_signals
     with (
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
+            "megatron.core.inference.engines.dynamic.engine.torch.distributed.get_rank",
             return_value=0,
         ),
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.cuda.Event",
+            "megatron.core.inference.engines.dynamic.engine.torch.cuda.Event",
             return_value=mock.Mock(),
         ),
     ):
@@ -2093,7 +2100,7 @@ def test_vision_state_invalidation_marks_request_local_embeddings_stale():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.allow_stale_multimodal_embeddings = False
     engine._vision_embedding_cache = {
-        "media": dynamic_engine._VisionCacheEntry(
+        "media": dynamic_engine_multimodal._VisionCacheEntry(
             embedding=request.image_embeddings,
             modality="image",
             imgs=request.imgs,
@@ -2590,8 +2597,8 @@ def test_engine_prompt_preparer_materializes_deferred_multimodal_prefix():
 
     prepared = engine._prepare_submit_request_message(message)
     prepared_params = msgpack.unpackb(prepared[3], raw=False)
-    stitching_metadata, remaining = dynamic_engine._take_expanded_prefix_stitching_metadata(
-        prepared_params
+    stitching_metadata, remaining = (
+        dynamic_engine_multimodal._take_expanded_prefix_stitching_metadata(prepared_params)
     )
 
     assert msgpack.unpackb(prepared[1], raw=False) == [100, 99, 99, 101, 200, 2, 30, 42]
@@ -2628,7 +2635,9 @@ def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_outpu
     assert msgpack.unpackb(prepared[1], raw=False) == [3, 4]
     assert prepared[2] is message[2]
     assert offload_params["ng_capture"] == {"rollout_id": "r0"}
-    assert offload_params[dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD].startswith("TypeError: ")
+    assert offload_params[dynamic_engine_requests._PROMPT_PREPARATION_ERROR_FIELD].startswith(
+        "TypeError: "
+    )
 
 
 @pytest.mark.parametrize(
@@ -2669,13 +2678,13 @@ def test_schedule_requests_drops_malformed_submit_request(malformed, caplog):
     engine.add_request = mock.Mock()
     engine._fail_submission = mock.Mock()
     socket = engine.socket_for_receiving_requests = mock.Mock()
-    socket.recv_multipart.side_effect = [malformed, good, dynamic_engine.zmq.Again]
+    socket.recv_multipart.side_effect = [malformed, good, dynamic_engine_coordinator.zmq.Again]
     engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
     engine.local_metadata_ledger_enabled = False
     engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
     engine._collect_failed_requests = mock.Mock(return_value=[])
 
-    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine_coordinator.logger.name):
         assert engine.schedule_requests() == 2
 
     assert "dropping malformed SUBMIT_REQUEST" in caplog.text
