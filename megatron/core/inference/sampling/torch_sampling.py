@@ -33,14 +33,13 @@ class TorchSampling(Sampling):
     @staticmethod
     def _modify_logits_for_top_p_filtering(logits: Tensor, top_p: float) -> None:
         """In-place: set logits outside the top-p (nucleus) set to -inf."""
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        # Match the low-probability-tail convention used by NeMo-RL policy
+        # recomputation and vLLM. Descending cumulative mass with a shifted
+        # cutoff disagrees at exact thresholds and chooses different tied tokens.
+        sorted_logits, sorted_indices = torch.sort(logits, descending=False)
         cumulative_probs = sorted_logits.softmax(dim=-1, dtype=torch.float32).cumsum(dim=-1)
-
-        filter_ = cumulative_probs > top_p
-        # Clone needed: filter_[:, 1:] and filter_[:, :-1] are overlapping views;
-        # without clone, each write would corrupt the next read during the shift.
-        filter_[:, 1:] = filter_[:, :-1].clone()
-        filter_[..., 0] = 0
+        filter_ = cumulative_probs <= 1.0 - top_p
+        filter_[..., -1] = False
 
         filter_ = filter_.scatter(1, sorted_indices, filter_)
         logits.masked_fill_(filter_, float("-Inf"))
