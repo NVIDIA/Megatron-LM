@@ -249,7 +249,7 @@ def rotate_schedule(repo_owner, dry_run=False):
 
     # 1. Rotate (Remove past week)
     # Only if schedule is not empty.
-    if schedule:
+    while schedule:
         # Check date of first entry
         first_entry = schedule[0]
         try:
@@ -269,6 +269,7 @@ def rotate_schedule(repo_owner, dry_run=False):
                 print(
                     f"First entry {first_entry} has not ended yet (Ends {end_date}). Not removing."
                 )
+                break
         except ValueError:
             # Fallback if date is invalid, rotate anyway
             removed = schedule.pop(0)
