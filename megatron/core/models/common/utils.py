@@ -338,10 +338,13 @@ class TransformerLayerNode(ScheduleNode):
         # produced by *this* slot's wgrad callables. The hook must run on the
         # same stream right after the wgrad it depends on; collecting on the
         # first invocation makes the per-iteration hook order deterministic.
+        # ``parameters()`` over-reaches for a callable that computes only some of its own
+        # parameters' wgrads; ``wgrad_parameters()`` lets such a callable declare the subset.
         if self.post_wgrad_grad_acc_hooks is None:
             self.post_wgrad_grad_acc_hooks = []
             for module in self.bwd_dw_callables:
-                for param in module.parameters():
+                get_wgrad_params = getattr(module, "wgrad_parameters", module.parameters)
+                for param in get_wgrad_params():
                     if (
                         getattr(param, "post_wgrad_grad_acc_hook", False)
                         and param.requires_grad
@@ -405,6 +408,11 @@ class _BackwardDWWrapper:
             )
             if layer.mlp.use_shared_expert:
                 self.submodules.append(layer.mlp.shared_experts)
+            # The shared-expert half of MoELayer.backward_dw also computes the fc1 latent
+            # projection's wgrad, so this slot owns its post-wgrad hooks too.
+            config = layer.config
+            if config.moe_latent_size and config.overlap_moe_expert_parallel_comm:
+                self.submodules.append(layer.mlp.fc1_latent_proj)
         else:
             self.shared_expert_dw_callable = None
         self.cuda_graph_modules = layer.config.cuda_graph_modules
