@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional
 
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import get_attr_wrapped_model, log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -61,7 +61,7 @@ from ..fp8_utils import (
     is_grouped_tensor_with_quantized_storage,
     quantize_param_shard,
 )
-from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
+from ..transformer.fsdp_dtensor_checkpoint import get_ep_rank_and_size, handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
@@ -1566,7 +1566,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
                 name_to_param.update(_name_to_param)
             num_experts = self.model_chunks[0].config.num_moe_experts if self.model_chunks else None
-            name_to_param = handle_experts_in_state_dict(name_to_param, num_experts)
+            # The model's own expert-parallel layout gives its local experts their global names.
+            ep_rank = ep_size = None
+            if num_experts:
+                ep_rank, ep_size = get_ep_rank_and_size(
+                    get_attr_wrapped_model(self.model_chunks[0], "pg_collection")
+                )
+            name_to_param = handle_experts_in_state_dict(
+                name_to_param, num_experts, ep_rank=ep_rank, ep_size=ep_size
+            )
             self.param_to_name = {param: name for name, param in name_to_param.items()}
         assert (
             param in self.param_to_name
