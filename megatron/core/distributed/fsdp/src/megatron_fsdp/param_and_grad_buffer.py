@@ -2589,6 +2589,30 @@ class ParamAndGradBuffer:
         # Set ParameterGroup.grad_dtype.
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
+
+        if self.ddp_config.gradient_reduce_div_fusion:
+            # PyTorch uses the first bucket's ReduceOp for the entire coalesced call.
+            # Mixing BF16 (pre-scaled SUM) with other dtypes (PREMUL_SUM) is unsafe.
+            requires_grad_only = (
+                self.only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad
+            )
+            for bucket_id, bucket_group in self.bucket_to_bucket_group.items():
+                if bucket_id != bucket_group[0]:
+                    continue
+                grad_comm_dtypes = {
+                    self.mp_policy.grad_comm_dtype or self.parameter_groups[i].grad_dtype
+                    for i in bucket_group
+                    if self.parameter_groups[i].requires_grad or not requires_grad_only
+                }
+                if len(grad_comm_dtypes) > 1:
+                    raise ValueError(
+                        "[Megatron-FSDP] gradient_reduce_div_fusion=True is not supported with "
+                        "mixed gradient communication dtypes in a coalesced bucket group "
+                        f"({', '.join(sorted(str(dtype) for dtype in grad_comm_dtypes))}). "
+                        "Set gradient_reduce_div_fusion=False "
+                        "(--no-gradient-reduce-div-fusion) or use a single grad_comm_dtype."
+                    )
+
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             # Double Buffering
             UB_BUFFER_NUM = 2

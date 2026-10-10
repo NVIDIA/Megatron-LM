@@ -57,7 +57,8 @@ class DistributedDataParallelConfig:
       None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
     gradient_reduce_div_fusion: bool = True
-    """If true, perform gradient reduce and division fusion."""
+    """If true, perform gradient reduce and division fusion. Requires a single gradient
+    communication dtype per coalesced bucket group when enabled."""
 
     suggested_communication_unit_size: int = None
     """Specifies the number of elements to communicate at once during
