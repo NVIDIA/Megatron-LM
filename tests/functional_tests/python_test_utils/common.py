@@ -168,7 +168,7 @@ def read_tb_logs_as_list(
         logger.error(f"File not found matching: {path}/events* || {path}/results/events*")
         return None
 
-    files.sort(key=lambda x: os.path.getmtime(os.path.join(path, pathlib.Path(x).name)))
+    files.sort(key=os.path.getmtime)
 
     accumulators = _load_event_accumulators_with_scalars(files)
 
