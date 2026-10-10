@@ -6,17 +6,17 @@ Test files instantiate ``BitExactRunner`` once with their model-specific
 factory + input-builder + base-config, then call
 ``runner.run(cfg_overrides, parallelism)`` from a parametrized test. Adding
 a new parallelism config means appending a single entry to
-``configs.PARALLELISM_CONFIGS`` — no test-file edits required.
+the model's matrix in ``configs.py`` — no test-file edits required.
 
 For any parallelism dict the runner performs two forward+backward passes
 under the same restored RNG state and asserts that outputs and gradients
 are bit-identical. It handles:
 
 * TP, PP, VPP, CP, EP via ``Utils.initialize_model_parallel``.
-* FSDP via ``fully_shard_model`` wrap.
+* FSDP via the Megatron-FSDP v1 adapter with full parameter/gradient sharding.
 * MoE auto-enable when ``EP > 1`` (merges ``configs.moe_overrides(tp, ep)``).
 * num_layers auto-bump when ``PP * VPP`` exceeds the preset's layer count.
-* sequence_parallel + tensor_model_parallel_size propagation when MoE+TP.
+* TP/PP/CP/EP configuration propagation, plus sequence parallelism for MoE+TP.
 * Pipeline schedule (``get_forward_backward_func``) when ``PP > 1``;
   naive ``model(**inputs)`` fwd+bwd otherwise.
 """
@@ -46,6 +46,8 @@ from tests.unit_tests.determinism.utils import (
     zero_grads,
 )
 from tests.unit_tests.test_utilities import Utils
+from tools.determinism.coverage import replay_configuration
+from tools.determinism.parallelism import normalize_parallelism
 
 
 class BitExactRunner:
@@ -64,6 +66,8 @@ class BitExactRunner:
         seq_len, micro_batch, dtype: defaults used by the pipeline schedule
             when ``PP > 1``.
         default_tp: TP size used in ``setup_method`` before the test re-inits.
+        supports_cp: True only when make_inputs shards its sequence using the
+            initialized context-parallel group.
     """
 
     def __init__(
@@ -76,6 +80,7 @@ class BitExactRunner:
         micro_batch: int = 4,
         dtype: torch.dtype = torch.bfloat16,
         default_tp: int = 2,
+        supports_cp: bool = False,
     ):
         self.build_model = build_model
         self.make_inputs = make_inputs
@@ -85,6 +90,7 @@ class BitExactRunner:
         self.micro_batch = micro_batch
         self.dtype = dtype
         self.default_tp = default_tp
+        self.supports_cp = supports_cp
 
     # ------------------------------------------------------------------
     # Setup / teardown helpers — call from pytest setup/teardown methods.
@@ -111,15 +117,22 @@ class BitExactRunner:
     # Main entry point — called by the parametrized test.
     # ------------------------------------------------------------------
     def run(self, cfg_overrides: dict, parallelism: dict):
+        parallelism = normalize_parallelism(parallelism)
         required = required_world_size(parallelism)
-        if Utils.world_size < required:
-            pytest.skip(f"Requires {required} GPUs for {parallelism}")
+        if Utils.world_size < required or Utils.world_size % required:
+            pytest.skip(f"Requires a multiple of {required} GPUs for {parallelism}")
+        if parallelism.get("FSDP", 1) > 1 and Utils.world_size != required:
+            pytest.skip(f"FSDP geometry {parallelism} requires exactly {required} GPUs")
 
         pp = parallelism.get("PP", 1)
         if pp > 1 and not self.supports_pp:
             pytest.skip("PP not supported by this test fixture")
+        if parallelism["CP"] > 1 and not self.supports_cp:
+            pytest.skip("CP input sharding not supported by this test fixture")
+        if parallelism["FSDP"] > 1 and (pp > 1 or parallelism["CP"] > 1):
+            pytest.skip("Combined FSDP with PP/CP is not supported by this replay fixture")
 
-        init_kwargs, _needs_fsdp, needs_moe = apply_parallelism(parallelism)
+        init_kwargs, needs_fsdp, needs_moe = apply_parallelism(parallelism)
         if needs_moe:
             tp = init_kwargs.get("tensor_model_parallel_size", 1)
             ep = init_kwargs.get("expert_model_parallel_size", 1)
@@ -128,13 +141,30 @@ class BitExactRunner:
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(**init_kwargs)
 
+        # Read initialized groups instead of echoing the requested test label.
+        actual = {
+            "TP": parallel_state.get_tensor_model_parallel_world_size(),
+            "PP": parallel_state.get_pipeline_model_parallel_world_size(),
+            "VPP": parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1,
+            "CP": parallel_state.get_context_parallel_world_size(),
+            "EP": parallel_state.get_expert_model_parallel_world_size(),
+            "FSDP": parallel_state.get_data_parallel_world_size() if needs_fsdp else 1,
+        }
+        cfg_overrides = {
+            **cfg_overrides,
+            "tensor_model_parallel_size": actual["TP"],
+            "pipeline_model_parallel_size": actual["PP"],
+            "context_parallel_size": actual["CP"],
+            "expert_model_parallel_size": actual["EP"],
+        }
         torch.manual_seed(42)
         model_parallel_cuda_manual_seed(123)
 
-        if pp > 1:
-            self._run_pipeline(cfg_overrides, parallelism)
-        else:
-            self._run_naive(cfg_overrides, parallelism)
+        with replay_configuration({"parallelism": actual}):
+            if pp > 1:
+                self._run_pipeline(cfg_overrides, parallelism)
+            else:
+                self._run_naive(cfg_overrides, parallelism)
 
     # ------------------------------------------------------------------
     # Single bit-exact driver — both naive and PP paths share the same
@@ -142,6 +172,8 @@ class BitExactRunner:
     # and the set of modules differ.
     # ------------------------------------------------------------------
     def _two_runs(self, modules: list, fwd_bwd: Callable[[], tuple]) -> None:
+        for module in modules:
+            zero_grads(module)
         state = capture_rng_state()
         out_a, grads_a = fwd_bwd()
         # Drain pending TP collectives / autograd post-hooks / P2P from
@@ -171,7 +203,19 @@ class BitExactRunner:
             tensor.float().pow(2).mean().backward()
             return tensor.detach().clone(), collect_grads([model])
 
-        self._two_runs([model], fwd_bwd)
+        fsdp = {}
+        if parallelism.get("FSDP", 1) > 1:
+            config = model.ddp_config
+            fsdp = {
+                "version": config.megatron_fsdp_version,
+                "sharding_strategy": config.data_parallel_sharding_strategy,
+                "overlap_grad_reduce": config.overlap_grad_reduce,
+                "overlap_param_gather": config.overlap_param_gather,
+            }
+            if fsdp["sharding_strategy"] != "optim_grads_params":
+                raise ValueError("FSDP replay requires parameter and gradient sharding")
+        with replay_configuration({"fsdp": fsdp}):
+            self._two_runs([model], fwd_bwd)
 
     # Pipeline-schedule path (PP > 1). Builds chunks per rank/VPP-rank,
     # runs forward_backward_func twice, compares per-chunk grads.

@@ -32,6 +32,7 @@ _HYBRID_PARALLELISM_CONFIGS = [
     pytest.param({"PP": 4}, id="pp4"),
     pytest.param({"TP": 2, "PP": 2}, id="tp2-pp2"),
     pytest.param({"PP": 2, "VPP": 2}, id="pp2-vpp2"),
+    pytest.param({"FSDP": 4}, id="fsdp4"),
     pytest.param({"FSDP": 8}, id="fsdp8"),
 ]
 
@@ -68,6 +69,7 @@ _LIFECYCLE = BitExactRunner(
 )
 
 
+@pytest.mark.determinism_model(model_id="hybrid")
 class TestHybridModelDeterminism:
 
     def setup_method(self, method):
