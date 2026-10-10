@@ -714,11 +714,13 @@ _ASYNC_PAIR_SCENARIOS = (
         atol=5.0e-3,
         parity="reproducible",
     ),
+    # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
+    # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
     _pair_scenario(
         "flashinfer-fused-rope",
         "kernel:flashinfer-fused-rope",
         config={
-            "hidden_size": 64,
+            "hidden_size": 256,
             "position_embedding_type": "rope",
             "use_flashinfer_fused_rope": True,
         },
@@ -1751,7 +1753,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-recipe-forwards"] > 0
         if "fused-rope" in signals:
             assert context.use_flashinfer_fused_rope
-            assert model_config.hidden_size // model_config.num_attention_heads == 16
+            assert model_config.hidden_size // model_config.num_attention_heads == 64
             model = controller.inference_wrapped_model.model
             assert model.rotary_pos_emb.inv_freq.is_cuda
             assert model.rotary_pos_emb_cache[context.max_sequence_length].is_cuda

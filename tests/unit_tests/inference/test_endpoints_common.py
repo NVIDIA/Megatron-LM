@@ -456,6 +456,7 @@ async def test_sampling_params_are_parsed_from_the_request(path, body, app_confi
 
 # Fields the HTTP layer sets from the request body (chat also reads add_BOS) ...
 _REQUEST_CONTROLLED_FIELDS = {
+    "seed",
     "temperature",
     "top_k",
     "top_p",
@@ -486,6 +487,7 @@ _ENGINE_OWNED_FIELDS = {
     "do_kv_handoff",
 }
 _EVERY_FIELD_REQUEST = {
+    "seed": 42,
     "temperature": 0.5,
     "top_p": 0.9,
     "top_k": 40,

@@ -221,6 +221,12 @@ class TextGenerationControllerTestBase:
                 ),
             )
 
+        if not static:
+            # Direct controller tests bypass request admission, which normally writes
+            # the unseeded sentinel into these otherwise uninitialized buffers.
+            inference_context.request_metadata["seed"].fill_(-1)
+            inference_context.active_request_metadata["seed"].fill_(-1)
+
         inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
 
         inference_wrapped_model.model_is_pipeline_parallel = not (
@@ -838,7 +844,14 @@ def test_run_async_sched_sample_reuses_gpu_buffer(logits_dtype):
     assert n == 3
     assert called_context is context
     sample_kwargs = controller._sampling.sample_kernel.call_args.kwargs
-    assert set(sample_kwargs) == {"gather_indices", "no_top_k", "no_top_p", "output"}
+    assert set(sample_kwargs) == {
+        "gather_indices",
+        "no_top_k",
+        "no_top_p",
+        "output",
+        "sequence_lengths",
+    }
+    assert sample_kwargs["sequence_lengths"] is None
     assert sample_kwargs["gather_indices"] is None
     assert not sample_kwargs["no_top_k"]
     assert sample_kwargs["no_top_p"]
@@ -1242,7 +1255,7 @@ def test_async_sched_step_overlap_order():
         side_effect=lambda: call_order.append("prepare") or (input_ids, position_ids)
     )
     controller._run_async_sched_sample = mock.Mock(
-        side_effect=lambda: call_order.append("sample")
+        side_effect=lambda **_kwargs: call_order.append("sample")
         or SimpleNamespace(
             sampled_tokens_gpu=sample_tokens,
             sampled_tokens_cpu_view=sampled_tokens_cpu,
@@ -1384,6 +1397,54 @@ def test_async_sched_step_wires_sampling_through_resolution(
     assert context.resolve_requests.call_args.args[0].tolist() == expected_mask
     assert context.async_sched_step_count == 1
     assert context.async_sched_compaction_step_count == expected_compaction_count
+
+
+@pytest.mark.internal
+def test_async_overlap_seed_uses_pending_logits_positions():
+    """Preparing the next forward must not change the pending token's RNG draw."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.config.num_speculative_tokens = 0
+    context.active_request_metadata["seed"] = torch.tensor([91, 92, 93])
+    context.active_request_metadata["top_k"].zero_()
+    context.get_active_sequence_lengths = lambda: (
+        context.request_kv_length_offsets + context.request_query_lengths
+    )
+    pending_positions = context.get_active_sequence_lengths().clone()
+    controller = _make_async_sched_controller(context)
+    controller._all_logits_cuda = torch.randn(
+        1, 3, 97, device="cuda", generator=torch.Generator(device="cuda").manual_seed(17)
+    )
+    controller._sampled_tokens_cuda = torch.empty(3, dtype=torch.int64, device="cuda")
+    controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
+        3, dtype=torch.int64, pin_memory=True
+    )
+    controller._async_sched_sample_gpu_ready_event = torch.cuda.Event()
+    controller._async_sched_sample_cpu_ready_event = torch.cuda.Event()
+    controller._async_sched_copy_stream = torch.cuda.Stream()
+    sampler = TorchSampling.__new__(TorchSampling)
+    sampler._rng = torch.Generator(device="cuda").manual_seed(18)
+    sampler._vocab_size = 97
+    controller._sampling = sampler
+    expected = sampler.sample_kernel(
+        controller._all_logits_cuda[0], 3, context, no_top_k=True, no_top_p=True
+    )
+    sampler.sample_kernel = mock.Mock(wraps=sampler.sample_kernel)
+
+    def prepare_successor():
+        context.request_kv_length_offsets.add_(context.request_query_lengths)
+        return torch.empty(3, dtype=torch.int64), torch.empty(3, dtype=torch.int64)
+
+    controller._run_async_sched_prepare = mock.Mock(side_effect=prepare_successor)
+    controller._run_async_sched_publish_bookkeeping = mock.Mock(return_value=None)
+    controller._run_async_sched_forward = mock.Mock()
+
+    result = asyncio.run(controller._run_async_sched_step_overlap())
+
+    assert torch.equal(context.get_active_sequence_lengths(), pending_positions + 1)
+    assert torch.equal(
+        sampler.sample_kernel.call_args.kwargs["sequence_lengths"], pending_positions
+    )
+    assert torch.equal(result.output["sample"], expected.cpu())
 
 
 def test_async_sched_step_yields_after_resolution_outside_inference_mode():

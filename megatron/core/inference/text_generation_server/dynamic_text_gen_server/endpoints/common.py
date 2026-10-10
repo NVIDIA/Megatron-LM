@@ -2,12 +2,14 @@
 
 import logging
 import threading
+from dataclasses import replace
 from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from megatron.core.inference.inference_client import InferenceClient
+    from megatron.core.inference.sampling_params import SamplingParams
 
 GENERATE_NUM = 0
 LOCK = threading.Lock()
@@ -184,3 +186,10 @@ def log_sampling_defaults_once(tokenizer, resolved):
         resolved.get("top_p"),
         resolved.get("top_k"),
     )
+
+
+def sampling_params_for_choice(params: "SamplingParams", index: int) -> "SamplingParams":
+    """Assign stable distinct seeds to choices without mutating shared parameters."""
+    if params.seed is None:
+        return params
+    return replace(params, seed=(params.seed + index) % (2**63), return_prompt_top_n_logprobs=False)
