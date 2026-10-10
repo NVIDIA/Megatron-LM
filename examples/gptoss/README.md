@@ -121,7 +121,7 @@ docker run --rm --gpus all --ipc=host --ulimit memlock=-1 \
 ```
 **Note:** If you run into issues generating mock data one solution might be to reduce the number of GPUs to 1 and try to generate the data again.
 
-If using real data with with the `HOST_TOKENIZER_MODEL_PATH` and `HOST_DATA_PREFIX` environment variables set, run the following command instead:
+If using real data with the `HOST_TOKENIZER_MODEL_PATH` and `HOST_DATA_PREFIX` environment variables set, run the following command instead:
 
 ```bash
 PYTORCH_IMAGE="nvcr.io/nvidia/pytorch:25.12-py3"
