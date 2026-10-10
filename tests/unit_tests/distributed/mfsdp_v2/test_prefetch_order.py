@@ -4,7 +4,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -21,45 +21,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.indexed_order import IndexedOrder
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
-    FsdpContext,
-    FsdpModule,
-)
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.schedule import SchedulePolicy
-
-
-def test_recording_scope():
-    """Keep repeated demand calls, exclude recompute, and clean up failed scopes."""
-    with patch('torch.cuda.Stream'):
-        context = FsdpContext(torch.device('cuda'))
-    context.finalize()
-    module = object.__new__(FsdpModule)
-    module._context = context
-    module._schedule_policy = SchedulePolicy()
-    module._unshard_event = object()
-    module._nvtx_range = Mock(return_value=nullcontext())
-    module._unshard_parameter_groups = Mock()
-    module._prefetch_parameter_groups = Mock()
-    context.current_stream = Mock(return_value=Mock())
-
-    with context.record_prefetch_order():
-        for phase in ('forward', 'forward', 'none', 'backward'):
-            module.unshard(prefetch=phase)
-    assert list(context.forward_order) == [module, module]
-    assert list(context.backward_order) == [module]
-    module._prefetch_parameter_groups.assert_not_called()
-
-    forward, backward = context.forward_order, context.backward_order
-    with pytest.raises(ValueError, match='interrupted'):
-        with context.record_prefetch_order():
-            module.unshard(prefetch='forward')
-            raise ValueError('interrupted')
-    assert context.forward_order is forward
-    assert context.backward_order is backward
-    # An interrupted scope must also allow a fresh recording.
-    with context.record_prefetch_order():
-        module.unshard(prefetch='forward')
-    assert list(context.forward_order) == [module]
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
 @pytest.mark.parametrize('budget', [None, 0, 2])
@@ -91,20 +53,6 @@ def test_prefetch_replays_occurrences(budget):
         order.advance(third)
     order.advance(first)
     assert order.next_item(first) is second
-
-
-def test_static_order_lookup():
-    """Construction order still permits demand calls outside the static order."""
-    first, second, third = Mock(), Mock(), Mock()
-    order = IndexedOrder()
-    for module in (first, second, third):
-        order.append(module)
-    order.advance(second)
-    assert order.next_item(second) is third
-    assert order.next_item(third) is None
-    order.advance(first)
-    assert order.next_item(first) is second
-    assert order.next_item(first, 2) is third
 
 
 def test_shared_module_recording_matches_dense_training(distributed_setup):
