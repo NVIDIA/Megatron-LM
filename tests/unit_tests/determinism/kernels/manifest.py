@@ -447,7 +447,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
         ),
-        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
+        tests=(
+            K + "test_ssm_kernels.py",
+            K + "test_gated_norm.py",
+            C + "test_hybrid_model.py",
+            "tests/unit_tests/ssm/test_gated_delta_net_offloading.py",
+        ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
     ),

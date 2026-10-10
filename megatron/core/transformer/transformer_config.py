@@ -1512,7 +1512,7 @@ class TransformerConfig(ModelParallelConfig):
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
              "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv",
-             "shortcut_post_norm".
+             "shortcut_post_norm", "gdn_core_attn".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1525,6 +1525,8 @@ class TransformerConfig(ModelParallelConfig):
                GatedDeltaProduct mixer.
     "shortcut_post_norm": offload the input of the shortcut output normalization.
             Requires moe_shortcut_connection=True.
+    "gdn_core_attn": offload tensors saved by the FLA GatedDeltaNet recurrence.
+            Initial support is BF16 GDN with no CUDA graphs or full recomputation.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -2639,12 +2641,30 @@ class TransformerConfig(ModelParallelConfig):
                 "qkv_linear",
                 "gdp_qkv",
                 "shortcut_post_norm",
+                "gdn_core_attn",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
+            if "gdn_core_attn" in self.offload_modules:
+                if self.experimental_attention_variant != "gdn":
+                    raise ValueError("gdn_core_attn offloading only supports GDN (gdn).")
+                if not self.bf16 or self.fp8 or self.fp4:
+                    raise ValueError("gdn_core_attn offloading requires BF16 without FP8 or FP4.")
+                if self.deterministic_mode:
+                    raise ValueError("gdn_core_attn offloading requires the FLA recurrence.")
+                if self.recompute_granularity == "full":
+                    raise ValueError(
+                        "gdn_core_attn offloading does not support full recomputation."
+                    )
+                if (
+                    self.cuda_graph_impl != "none"
+                    or self.enable_cuda_graph
+                    or self.external_cuda_graph
+                ):
+                    raise ValueError("gdn_core_attn offloading does not yet support CUDA graphs.")
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "

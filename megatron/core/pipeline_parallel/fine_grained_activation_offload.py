@@ -548,8 +548,13 @@ class PipelineOffloadManager:
             group_hook(name, forced_released_tensors)
         self._delayed_offload_groups = []
 
-    def reset(self, process_group: Optional[torch.distributed.ProcessGroup] = None):
-        """Reset manager state for a new training iteration."""
+    def reset(
+        self,
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
+        *,
+        forward_only: bool = False,
+    ):
+        """Reset iteration state, preserving training warmup after forward-only passes."""
         self._inside_context = False
         self._cur_forward_chunk = None
         self._cur_backward_chunk = None
@@ -557,9 +562,20 @@ class PipelineOffloadManager:
         if hasattr(self, '_cpu_tensor_pool'):
             self._cpu_tensor_pool.reset()
 
-        # Call post_warmup_callback after warmup to collect the offload information.
+        # Forward-only evaluation cannot establish the training offload policy.
+        # Initial evaluation creates chunks in model preprocessing, but GDN
+        # bypasses its scopes; caching those chunks would disable later training.
+        # Use the scheduler's phase flag so every rank makes the same decision
+        # about entering the post-warmup reporting collective.
         if self._is_warmup and len(self._cached_chunks_forward) > 0:
-            self.post_warmup_callback(process_group=process_group)
+            if forward_only:
+                self._cached_chunks_forward.clear()
+                self._cached_chunks_backward.clear()
+                self._queue.clear()
+                for stage in self._stages:
+                    stage.clear()
+            else:
+                self.post_warmup_callback(process_group=process_group)
         self._cached_chunks_index_backward = 0
         self._cached_chunks_index_forward = 0
 
@@ -648,6 +664,12 @@ class PipelineOffloadManager:
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
         for chunk in self._cached_chunks_backward:
+            # An empty warmup group may gain eligible tensors when sequence
+            # lengths grow. Fraction zero must keep even those groups on GPU.
+            if self._activation_offload_fraction == 0:
+                for group in chunk.offload_groups:
+                    group.offload = False
+                continue
             eligible_offload_groups = [
                 group
                 for group in chunk.offload_groups
@@ -1008,20 +1030,13 @@ class ChunkOffloadHandler:
             return self.find_group_with_name(self.offload_groups, name) is None
         return self._max_group_size == 0
 
-    def finish_all_groups(self, name=None) -> bool:
-        """Finish all groups."""
+    def finish_all_groups(self, name: str) -> bool:
+        """Return whether this chunk has no remaining forward group of this name."""
         debug_rank(
             f"------finish_all_groups {self} {self._max_group_size} {self._offloaded_group_index}"
         )
-        # TODO: check if this is correct
-        # Mark it as finished when there are no groups to offload or reload
-        if (
-            len(self._groups_to_reload) == 0
-            and len(self._groups_to_offload) == 0
-            and self._offloaded_group_index > 0
-        ):
-            return True
-        assert name is not None, "Name is required"
+        # Forward progress depends on scheduled groups, not pending transfers:
+        # fraction zero can keep every group on GPU before the chunk is complete.
         return (
             self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index)
             is None
@@ -1067,9 +1082,15 @@ class ChunkOffloadHandler:
             return tensor_tag
         debug_rank(f"--------tensor_pop {tensor_tag}")
         group_id, idx = tensor_tag
-        tensor = self.offload_groups[group_id - 1].pop_tensor(tensor_tag)
+        group = self.offload_groups[group_id - 1]
+        tensor = group.pop_tensor(tensor_tag)
         # If tensor is offloaded (stored as tuple), reload it
         if isinstance(tensor, tuple):
+            # Warmup and inputs without a group-start gradient can reach this
+            # fallback before prefetch runs. Order H2D after the group's D2H
+            # writes, just as bulk_reload_group does on the prefetch stream.
+            if not is_graph_capturing():
+                group.wait_offload_event(torch.cuda.current_stream())
             tensor = self.reload(tensor)
         debug_rank(f"--------tensor_pop {tensor.shape}")
         return tensor
@@ -1096,6 +1117,10 @@ class ChunkOffloadHandler:
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
+            # Reload returns pooled buffers as soon as H2D is queued. A later
+            # forward must finish those reads before D2H reuses the buffers.
+            if group_to_offload.use_cpu_pool and not is_graph_capturing():
+                self.d2h_stream.wait_stream(self.h2d_stream)
             # Warmup-only accounting local to this offload group. Every tensor in
             # the group is alive here, so device + data_ptr identifies its storage.
             storage_records = (
@@ -1575,9 +1600,15 @@ class FineGrainedActivationOffloadingInterface:
         return FineGrainedOffloadingBackwardRecordFunction.apply(tensor)
 
     @staticmethod
-    def reset(process_group: Optional[torch.distributed.ProcessGroup] = None):
-        """Reset the chunk handler."""
-        PipelineOffloadManager.get_instance().reset(process_group=process_group)
+    def reset(
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
+        *,
+        forward_only: bool = False,
+    ):
+        """Reset iteration state; pass forward_only=True for evaluation passes."""
+        PipelineOffloadManager.get_instance().reset(
+            process_group=process_group, forward_only=forward_only
+        )
 
     @staticmethod
     def reset_instance():

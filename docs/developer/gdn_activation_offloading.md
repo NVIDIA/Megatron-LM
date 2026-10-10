@@ -1,0 +1,292 @@
+# BF16/FLA GDN activation offloading
+
+## Contribution scope
+
+The GDN activation-offload item in [roadmap #6757](https://github.com/NVIDIA/Megatron-LM/issues/6757)
+targets memory-constrained training. BestJuly confirmed that saved-tensor offloading
+would complement the existing recomputation approaches and that either current
+`main` or `dev` is an acceptable starting point in
+[the follow-up reply](https://github.com/NVIDIA/Megatron-LM/issues/6757#issuecomment-6008766114).
+This implementation uses `main` at `d6316eb45`.
+
+The later [PR #7852](https://github.com/NVIDIA/Megatron-LM/pull/7852) implements
+input-projection and conv/QKV selective recomputation plus convolution-input offload.
+The scope here is deliberately separate: `gdn_core_attn` captures the saves inside
+FLA's recurrence, without changing the shared GDN/GDN2 preparation code or adding a
+second offload manager. The two PRs touch the same forward, so their integration
+should preserve the recurrence boundary when merging.
+
+## Saved-tensor lifetimes
+
+FLA 0.5.1's `ChunkGatedDeltaRuleFunction` saves Q, K, V, cumulative log decay,
+beta, and the WY matrix A for backward. Its default path saves beta twice, once as
+`beta_raw` and once as `beta`; they reference the same storage. It recomputes other
+recurrence intermediates in backward, so offloadable activation size is smaller than
+the total forward working set.
+
+A real BF16/FLA forward/backward on an RTX A6000, with batch 1, sequence 2048,
+16 recurrence heads and key/value head dimension 128, produced:
+
+| Save | Shape | Type | Tensor bytes (MiB) | Lifetime |
+| --- | --- | --- | ---: | --- |
+| Q | `[1, 2048, 16, 128]` | BF16 | 8 | Forward to recurrence backward |
+| K | `[1, 2048, 16, 128]` | BF16 | 8 | Forward to recurrence backward |
+| V | `[1, 2048, 16, 128]` | BF16 | 8 | Forward to recurrence backward |
+| Cumulative decay | `[1, 2048, 16]` | FP32 | 0.125 | Forward to recurrence backward |
+| beta_raw | `[1, 2048, 16]` | FP32 | 0.125 | Forward to recurrence backward |
+| beta (same storage) | `[1, 2048, 16]` | FP32 | 0.125 | Forward to recurrence backward |
+| WY A | `[1, 2048, 16, 64]` | BF16 | 4 | Forward to recurrence backward |
+
+The seven slots total **28.375 MiB**; distinct saved storage totals **28.25 MiB**.
+Every slot was first unpacked after the synchronized forward had completed. These
+are recurrence-only measurements, not a claimed reduction in model peak memory.
+
+In a complete GDN layer, some saves also have owners outside the recurrence. For
+example, FLA's L2 norm saves its normalized output, and the sigmoid producing beta
+saves beta. The fused pre-GDR path can also return views into a common projection.
+The implementation therefore does not resize or forcibly release input storage.
+Only allocations whose final GPU references disappear are freed by ordinary tensor
+lifetime management. A small tensor-size threshold may copy beta twice without
+freeing its upstream save; the existing manager reports duplicate-transfer bytes.
+
+The profiling tool records all saves in the GDN stack and labels saves inside each
+recurrence. It reports slot bytes, unique storage bytes, and storage referenced only
+by recurrence save sites. It records the first/last unpack and unpack count per slot.
+These identify saved-tensor use, not the time its final storage owner releases it.
+Its timestamps are host save/unpack observations, not CUDA
+execution timestamps. Profiling hooks are not enabled during timed comparisons.
+
+The four-layer stack used below has 32 recurrence heads after Q/K head expansion.
+Its eager profile finds **225 MiB** of storage held exclusively by recurrence saves
+(56.25 MiB per layer). Q/K/V use 16 MiB each and WY A uses 8 MiB per layer;
+cumulative decay uses 0.25 MiB. The two beta saves share an upstream sigmoid owner
+and do not contribute to that 225 MiB. All recurrence slots are first unpacked
+after forward. The default 1M-element threshold excludes the small FP32 saves,
+leaving 56 MiB per eligible layer. With the last group resident, fraction 0.5
+selects two of three eligible groups (112 MiB), and fraction 1 selects three
+(168 MiB). Models without Q/K head expansion may retain normalized Q/K upstream
+and therefore realize smaller memory savings.
+
+A separate fused pre-GDR profile uses three layers, sequence 128, hidden size 256,
+four key heads, eight value heads and head dimension 64. It records seven saves per
+recurrence, all first unpacked after forward. Q and K each cover half of one
+262,144-byte storage. The manager's covering-view policy can copy that full storage
+twice, so logical slot sizes alone understate transfer bytes. The profile reports
+1,597,440 bytes held only by recurrence save sites across the three layers; this is
+a saved-storage measurement, not a peak-memory result or a fused runtime claim.
+
+## Offload boundary and policy
+
+The existing `FineGrainedActivationOffloadingInterface` adds the group-start identity
+to the first differentiable recurrence input (normally Q), captures saved tensors
+only during `gated_delta_rule`, and commits on the raw recurrence output.
+Backward crosses the commit before reading FLA's saved tensors;
+the group-start backward lets the existing manager prefetch the preceding group.
+The output norm and its optional `gdn_norm_out` checkpoint remain outside this scope.
+
+The option is disabled by default. It requires BF16 GDN1 and the FLA recurrence;
+configuration rejects GDN2, FP8/FP4, deterministic reference execution, full-layer
+recomputation, and CUDA graphs. Eval, no-grad, and fully frozen recurrence forwards
+do not register groups. A trainable gate is used as the group-start anchor if Q is
+frozen, so the prefetch callback still participates in backward.
+The existing pool, transfer streams, minimum tensor size, group fraction, and
+pipeline lifecycle are reused. The common fallback reload path gains the transfer
+dependency described below.
+
+Warmup offloads every group to learn its size. Steady state retains the final group
+of each name to avoid a reload stall. Fraction is then applied to the eligible
+groups, with integer rounding, rather than to individual tensors or bytes. Nonzero
+fractions use the group eligibility learned during warmup rather than dynamically
+reselecting groups when tensor shapes change. Report the actual number of selected
+groups alongside the requested fraction.
+
+Fraction zero disables all groups after warmup, including groups whose initial
+tensors were below the threshold. Otherwise a later, longer sequence can enable
+copies despite requesting zero offload. Chunk advancement depends on whether any
+forward group with the requested name remains, independently of pending transfers.
+Treating empty transfer queues as completed forward can assign later layers to
+another microbatch and fail backward with a chunk mismatch. Tests
+cover growing sequences and consecutive microbatches, with delayed reloads and no
+transfer synchronization between microbatches.
+
+Forward-only passes cannot establish a training offload policy. The scheduler
+passes `forward_only` into reset; initial evaluation chunks are discarded while
+warmup remains active. This uses the shared phase flag rather than inferring
+training from a rank-local backward callback, preserving collective participation.
+Direct interface callers should also pass `forward_only=True` when resetting an
+initial evaluation pass.
+
+### Fallback transfer ordering
+
+During warmup, or when no group-start gradient schedules prefetch, unpack can find
+a CPU-backed tensor that was not bulk-reloaded. Previously, `tensor_pop` copied that
+backup to GPU without waiting for the group's D2H event. Delaying D2H reproduced
+unchanged forward outputs with incorrect GDN parameter gradients, including the
+first warmup iteration. A forward-boundary synchronization concealed this race.
+
+The fallback now makes the consumer stream wait for the group's offload event
+before enqueueing H2D, matching the dependency in bulk reload. The existing graph
+capture guard is preserved; this patch does not qualify the GDN CUDA-graph path.
+A sentinel-backed pool test covers the transfer itself, and GDN gradient regressions
+delay D2H through warmup and steady state, with both normal and frozen Q paths.
+
+Pooled buffers also need ordering in the other direction. Reload returns a pinned
+buffer to the pool when its H2D copy is queued. A later forward can reuse that
+buffer while prefetch is still reading it, particularly when pipeline microbatches
+have different saved-tensor shapes. A delayed-H2D reproduction restored a value
+of 2 from a buffer originally holding 1 after a new forward reused that slot.
+For pooled groups outside graph capture, D2H now waits for queued H2D reads before
+writing pool slots. The regression requires reuse of the same buffer and exact
+recovery of the original tensor. This reuses the existing streams and pool.
+
+## Reproducing the evidence
+
+Use a CUDA environment with Python 3.12+, PyTorch 2.11/CUDA 13, Transformer Engine
+2.20.2 and flash-linear-attention 0.5.1. The repository's default CI container is the
+preferred environment. An A6000-compatible container with these public packages can
+also run the tool. No model weights or training dataset are needed.
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=1 \
+  tools/ssm/gdn_activation_offload.py --mode profile \
+  --output /tmp/gdn-profile.json
+
+python -m torch.distributed.run --standalone --nproc-per-node=1 \
+  tools/ssm/gdn_activation_offload.py --mode benchmark \
+  --seq-length 2048 --fractions 0 0.5 1 \
+  --warmup 3 --iterations 10 --output /tmp/gdn-benchmark.json
+
+python -m torch.distributed.run --standalone --nproc-per-node=1 -m pytest -q \
+  --confcutdir=tests/unit_tests/ssm \
+  tests/unit_tests/ssm/test_gated_delta_net_offloading.py
+```
+
+The default stack has four GDN layers, hidden size 2048, 16 key heads, 32 value
+heads, and head dimension 128. Timed steps include forward and backward, with
+synchronization before and after each step, and no default synchronization between
+forward and backward. `--sync-forward` enables that optional phase diagnostic in both
+arms and changes transfer overlap. The default end-of-forward allocation is sampled
+when Python submits forward, with transfers potentially in flight; peak allocation
+is measured over the complete step. The tool records all step durations.
+
+Every warmup/measured step uses a different seeded input shared by all arms. Outputs,
+input gradients, and every parameter gradient are compared bitwise against that
+step's independently initialized baseline. Snapshot copies and comparisons occur
+after timing and can affect inter-step idle/clock behavior. Pinned-buffer usage must
+return to zero after each backward. Model construction, warmup, input copies and
+correctness checks are excluded from timing. Optimizer updates, MLPs, and distributed
+training communication are not included, so these are GDN-stack results.
+
+Use `TORCH_COMPILE_DISABLE=1` for an explicitly eager reproduction. The tool records
+that setting in its JSON. It does not silently disable compilation, Triton autotuning,
+or the offload manager's warmup policy. Avoid active GPU sharing for runtime claims;
+record repeat runs and their raw step samples when dedicated GPUs are unavailable.
+
+## A6000 memory/runtime measurements
+
+Measurements on 2026-10-06 used the default compilation setting, the stack above,
+batch size 1, seed 123, the 1M-element threshold, three warmup steps and ten measured
+forward/backward steps per arm. Each sequence length has three independent process
+runs. The default forward synchronization is disabled, and all 13 distinct-input
+steps per enabled arm are checked, including warmup. These runs include the
+fraction-zero policy and chunk-completion fixes. The GPU was not exclusive:
+another process held 23,304 MiB, with no concurrent compute observed during idle checks.
+The host was shared and clocks were not locked.
+These observations establish allocated-memory savings; runtime estimates require
+confirmation on dedicated hardware. The default TE path also has native-op Dynamo
+graph breaks; this is not a claim of full-graph compilation.
+
+The time column is the median of the three run medians, followed by their range.
+The change column is the median of the three within-run changes relative to that
+run's disabled baseline, followed by their range. It is not the ratio of aggregated
+time medians. Peak allocated memory was stable across all 30 measured steps per arm.
+
+| Sequence | Requested fraction | Selected groups | Peak allocated (MiB) | Step time (ms), median [range] | Paired runtime change, median [range] |
+| ---: | --- | ---: | ---: | --- | --- |
+| 2048 | Disabled | 0 | 1274.80 | 31.69 [31.63, 32.14] | Reference |
+| 2048 | 0 | 0 | 1274.80 | 32.71 [32.23, 32.87] | +1.8% [+1.7%, +3.9%] |
+| 2048 | 0.5 | 2 | 1162.80 | 36.80 [36.53, 38.20] | +16.1% [+13.7%, +20.8%] |
+| 2048 | 1 | 3 | 1106.80 | 39.61 [39.47, 41.96] | +25.0% [+22.8%, +32.7%] |
+| 4096 | Disabled | 0 | 2272.34 | 56.73 [56.18, 56.81] | Reference |
+| 4096 | 0 | 0 | 2272.34 | 56.62 [56.60, 56.66] | -0.2% [-0.4%, +0.9%] |
+| 4096 | 0.5 | 2 | 2048.34 | 65.31 [65.17, 65.83] | +15.9% [+14.9%, +16.3%] |
+| 4096 | 1 | 3 | 1936.34 | 77.51 [77.31, 78.14] | +36.6% [+36.1%, +39.1%] |
+
+Fraction 1 reduces peak allocation by approximately **168 MiB (13.2%)** at sequence
+2048 and **336 MiB (14.8%)** at sequence 4096. End-of-forward allocations decrease
+by the same amounts. Fraction 0 adds only 512 allocated bytes, with no steady-state
+transfers. Every enabled arm passed bitwise comparisons of outputs, input gradients
+and all parameter gradients against its disabled baseline. Shared hardware and unlocked clocks limit runtime conclusions; these data do not
+establish a production-training overhead.
+
+These initial stack measurements predate the pooled-buffer H2D/D2H ordering fix.
+The [complete-model measurements](gdn_activation_offload_training.md) report the
+current implementation; the stack numbers above are historical evidence only.
+
+[Raw A6000 step samples](gdn_activation_offloading_a6000.csv) include all 240 measured
+steps, peak allocated/reserved memory, end-of-forward allocation, selected groups,
+selected transfer bytes, and each arm's correctness result. Each enabled arm checks
+all 13 warmup/measured steps, including gradient coverage and pinned-buffer release.
+The CSV records this checked-step count and the forward synchronization setting.
+
+## Acceptance and next steps
+
+On one RTX A6000 with Python 3.12.4, PyTorch 2.11.0+cu130, Transformer Engine
+2.20.2, and FLA 0.5.1, all **65 tests passed** both with `TORCH_COMPILE_DISABLE=1`
+and with the default compilation setting. This includes exact output, input-gradient
+and parameter-gradient comparisons with changing inputs over one warmup and two
+steady-state iterations, fraction 0/0.5/1, threshold skipping, shared and expanded
+Q/K storage, fused/unfused pre-GDR, `gdn_norm_out` recomputation, packed sequences,
+delayed D2H, frozen Q,
+eval/no-grad/fully frozen bypass, growing sequences at fraction zero, and three
+accumulated microbatches per iteration without synchronization between them.
+Initial eval/no-grad passes also preserve training warmup, including output-norm
+recomputation. Pinned-buffer usage returned to zero after backward.
+
+The common-manager subset passed **14 tests**, including the delayed-transfer
+sentinel, pooled-buffer reuse, and fraction-zero growing-microbatch regressions.
+Its aggregation regression also passed on both ranks of a separate two-rank run.
+Four schedule-helper cases cover phase forwarding for single-model and MIMO groups.
+Two existing eight-layer BF16 GPT/MoE cases (`core_attn`, and MLA with
+`core_attn` + `attn_proj`) passed their output/gradient and peak-memory checks,
+covering the shared-manager change outside GDN with both one and two group names.
+
+The existing pre-GDR fusion suite passed **11 cases** with native causal-conv1d
+1.6.1 installed. Existing TransformerConfig tests passed **53 cases**. Data-free SSM
+runs used `--confcutdir=tests/unit_tests/ssm` to omit root dataset-download fixtures;
+configuration-only regression tests used `--noconftest`.
+
+`tools/autoformat.sh` passes its Black, isort, Pylint and Ruff gates, and kernel
+determinism coverage passes. With the common manager, scheduling code and their tests included, the non-blocking
+mypy step reports 44 existing diagnostics; checking an isolated original `main`
+worktree reproduces the same 44. The new tool and GDN offload test file pass
+a separate mypy check.
+
+The measured first slice meets these acceptance criteria: outputs and all gradients
+agree through warmup and multiple steady iterations, pinned buffers return to the
+pool, fraction zero and threshold skipping work, packed metadata and output-norm
+recomputation remain correct, and multi-layer A6000 comparisons show reduced
+allocated memory with an explicit runtime cost. A speedup is not required for a
+memory option. This does not replace the upstream CI or full-model qualification.
+
+Complete pretrained training and several parallel configurations have since been
+qualified in [complete-model GDN offload validation](gdn_activation_offload_training.md).
+The remaining follow-up work is:
+
+1. Confirm the scope/name and integration boundary with #7852. Keep recurrence saves
+   independently selectable when combining projection/QKV recomputation and offload.
+2. Finish the unqualified configurations in that status table. Require matching
+   outputs/gradients and clean manager/pool lifecycle before advertising additional
+   combinations.
+3. Extend the DP memory/runtime comparison to other parallel configurations, using
+   complete optimizer steps and raw per-rank samples separately from correctness.
+4. Treat GDN2, quantized training and CUDA graphs as later extensions with separate
+   implementation and acceptance evidence.
+
+Each expansion needs its own correctness and memory/runtime measurements; reuse of
+the manager alone does not establish support.
+
+The prepared complete-model integration cases and multi-rank run commands are
+described in [complete-model GDN offload validation](gdn_activation_offload_training.md).
+That document records completed pretrained Qwen training and A6000 measurements,
+qualified parallel configurations, and the remaining validation gaps.

@@ -20,6 +20,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
@@ -72,6 +75,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     # pylint: disable=missing-class-docstring
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
+        self.offload_core_attention = self.config.fine_grained_activation_offloading and (
+            "gdn_core_attn" in self.config.offload_modules
+        )
         self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
         if self.config.deterministic_mode and self.gdn_pre_gated_delta_rule_fusion:
             raise ValueError(
@@ -291,14 +297,33 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            **kernel_inputs,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
+        # The group-start input must participate in backward to trigger prefetch.
+        # Frozen projections can leave only a gate differentiable; a completely
+        # frozen recurrence has no saved tensors to offload.
+        offload_input_name = None
+        if self.offload_core_attention and self.training and torch.is_grad_enabled():
+            offload_input_name = next(
+                (name for name, tensor in kernel_inputs.items() if tensor.requires_grad), None
+            )
+        core_attn_manager = off_interface(
+            offload_input_name is not None,
+            kernel_inputs[offload_input_name or "q"],
+            "gdn_core_attn",
         )
+        with core_attn_manager as offload_input:
+            kernel_inputs[offload_input_name or "q"] = offload_input
+            core_attn_out, _ = self.gated_delta_rule(
+                **kernel_inputs,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=cu_seqlens_q,
+            )
         nvtx_range_pop(suffix="gated_delta_rule")
+        # Commit before the output norm so backward reloads precede the FLA kernel.
+        # Do not force-release inputs: gates and normalized Q/K can share storage
+        # with saves outside this scope, including the fused pre-GDR path.
+        core_attn_out = core_attn_manager.group_offload(core_attn_out)
 
         if self.recompute_norm_out:
             self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()

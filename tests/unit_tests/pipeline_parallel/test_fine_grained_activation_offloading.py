@@ -195,6 +195,103 @@ def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandle
     return handler
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_tensor_pop_waits_for_delayed_offload() -> None:
+    """A non-prefetched tensor cannot read its CPU backup before D2H finishes."""
+    source = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+    tag = (1, 0)
+    group = OffloadTensorGroup("gdn_core_attn")
+    group.push_tensor(tag, source)
+    chunk = _make_warmup_chunk([group])
+    # Initialize the pool slot with a sentinel so an early H2D read is observable.
+    backup = chunk.cpu_tensor_pool.allocate(source.shape, dtype=source.dtype)
+    backup.fill_(-100)
+    chunk.cpu_tensor_pool.free(backup)
+    chunk.d2h_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(chunk.d2h_stream):
+        torch.cuda._sleep(150_000_000)
+    chunk.bulk_offload_group(group)
+
+    result = chunk.tensor_pop(tag)
+    torch.cuda.synchronize()
+    assert torch.equal(result, source)
+    assert chunk.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_zero_fraction_with_growing_microbatches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty warmup saves cannot enable copies or advance chunks between later layers."""
+    Utils.initialize_model_parallel()
+    off_interface.reset_instance()
+
+    def unexpected_transfer(*args: object, **kwargs: object) -> None:
+        pytest.fail("Fraction zero must not copy tensors after an empty warmup.")
+
+    monkeypatch.setattr(ChunkOffloadHandler, "offload", unexpected_transfer)
+    snapshots = []
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        # Forward-only preprocessing must not consume the training warmup,
+        # even when other module scopes still create empty offload groups.
+        off_interface.init_chunk_handler(0, None, None, 1024, 0, 0.0)
+        with torch.no_grad():
+            result = torch.randn(512, device="cuda")
+            for _ in range(3):
+                group = off_interface(True, result, "core_attn")
+                with group as group_input:
+                    result = (group_input * 2).sin()
+                result = group.group_offload(result)
+        off_interface.reset(process_group=torch.distributed.group.WORLD, forward_only=True)
+        assert manager._is_warmup
+        assert not manager._cached_chunks_forward
+        assert not manager._cached_chunks_backward
+
+        for size in (512, 4096, 2048):
+            for _ in range(2):
+                source = torch.randn(size, device="cuda")
+                reference_input = source.detach().clone().requires_grad_()
+                reference = reference_input
+                for _ in range(3):
+                    reference = (reference * 2).sin()
+                reference.sum().backward()
+
+                off_interface.init_chunk_handler(0, None, None, 1024, 0, 0.0)
+                offloaded_input = source.detach().clone().requires_grad_()
+                result = offloaded_input
+                for _ in range(3):
+                    group = off_interface(True, result, "core_attn")
+                    with group as group_input:
+                        result = (group_input * 2).sin()
+                    result = group.group_offload(result)
+                result.sum().backward()
+                snapshots.append(
+                    (
+                        reference.detach(),
+                        result.detach(),
+                        reference_input.grad,
+                        offloaded_input.grad,
+                    )
+                )
+                assert (
+                    manager.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
+                )
+            assert len(manager._cached_chunks_forward) == 2
+            assert all(
+                chunk._offloaded_group_index == 3 for chunk in manager._cached_chunks_forward
+            )
+            off_interface.reset(process_group=torch.distributed.group.WORLD)
+
+        torch.cuda.synchronize()
+        for reference, result, reference_grad, result_grad in snapshots:
+            assert torch.equal(reference, result)
+            assert reference_grad is not None and result_grad is not None
+            assert torch.equal(reference_grad, result_grad)
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
 def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
     """Drive post_warmup_callback over a single hand-built chunk."""
     manager = PipelineOffloadManager.__new__(PipelineOffloadManager)
@@ -206,6 +303,36 @@ def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
     manager._delta_offload_bytes_across_pp_ranks = 0
     manager._activation_offload_fraction = 1.0
     manager.post_warmup_callback()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_bulk_offload_waits_for_pooled_h2d() -> None:
+    """A later forward cannot overwrite a pooled buffer still read by prefetch."""
+    off_interface.reset_instance()
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        handler = ChunkOffloadHandler(1024, manager.cpu_tensor_pool)
+        handler.is_warmup = False
+        source = torch.ones(1_048_576, device="cuda", dtype=torch.bfloat16)
+        next_source = torch.full_like(source, 2)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(handler.d2h_stream):
+            state = handler.offload(source)
+        with torch.cuda.stream(handler.h2d_stream):
+            handler.h2d_stream.wait_stream(handler.d2h_stream)
+            torch.cuda._sleep(100_000_000)
+            recovered = handler.reload(state)
+
+        group = OffloadTensorGroup("gdn_core_attn")
+        group.push_tensor((1, 0), next_source)
+        handler._groups_to_offload.append(group)
+        handler.on_group_commit_forward("gdn_core_attn", [])
+        assert state[1] is group._tensors[(1, 0)][1]
+        torch.cuda.synchronize()
+        assert torch.equal(recovered, source)
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
