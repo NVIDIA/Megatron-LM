@@ -215,6 +215,24 @@ def test_group_limited_topk_replays():
     )
 
 
+def test_updated_expert_bias_zero_rate_replays():
+    """The disabled bias-update fast path must return a stable tensor without collectives."""
+    seeded()
+    tokens_per_expert = torch.tensor([17, 3, 11, 0, 5, 9, 2, 7], device="cuda", dtype=torch.int64)
+    expert_bias = torch.randn(8, device="cuda", dtype=torch.float32)
+
+    def update(tokens, bias):
+        return moe_utils.get_updated_expert_bias(tokens, bias, 0.0)
+
+    with deterministic_algorithms(True):
+        assert_replays_bit_exact(
+            update,
+            (tokens_per_expert, expert_bias),
+            backward=False,
+            what="get_updated_expert_bias[zero-rate]",
+        )
+
+
 @pytest.mark.parametrize(
     "fused",
     [
