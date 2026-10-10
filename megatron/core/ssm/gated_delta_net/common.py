@@ -109,6 +109,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     A_log: nn.Parameter
 
     gated_delta_rule: GatedDeltaRuleInterface
+    _supports_chunkwise_cp = False
 
     def __init__(
         self,
@@ -171,6 +172,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
+        self.chunkwise_context_parallel = config.linear_cp_mode == "chunkwise" and self.cp_size > 1
+        if self.chunkwise_context_parallel and not self._supports_chunkwise_cp:
+            raise ValueError(f"{type(self).__name__} does not support chunkwise CP")
+        self.head_partition_cp_size = 1 if self.chunkwise_context_parallel else self.cp_size
 
         # Attributes from config
         self.config = config
@@ -392,6 +397,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
         norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
 
+        if self.chunkwise_context_parallel:
+            return norm_out_hp
         return a2a_hp_to_cp(
             norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
         )
@@ -434,7 +441,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         # Split qkv into query_key and value
         query_key, value = torch.split(
             qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
+            [
+                2 * self.qk_dim_local_tp // self.head_partition_cp_size,
+                self.v_dim_local_tp // self.head_partition_cp_size,
+            ],
             dim=-1,
         )
 
@@ -447,7 +457,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             query_key = l2norm(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // self.head_partition_cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)

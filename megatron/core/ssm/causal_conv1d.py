@@ -6,6 +6,7 @@ guard the SSM mixers apply to the causal_conv1d backward."""
 import os
 
 import torch
+import torch.nn.functional as F
 
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.utils import is_causal_conv1d_min_version
@@ -163,9 +164,32 @@ def causal_conv1d_cp(
             previous_seq_idx = global_seq_idx[:, shard_start - state_len : shard_start]
             initial_state_mask = previous_seq_idx == local_seq_idx[:, :1]
 
+    if state_len == 0:
+        # The CUDA extension only implements widths 2..4. Width one has no
+        # causal boundary and is a pointwise operation, including its gradients.
+        output = x.float() * weight[:, 0].float()
+        if bias is not None:
+            output = output + bias.float()
+        if activation in ("silu", "swish"):
+            output = F.silu(output)
+        elif activation is not None:
+            raise ValueError(f"Unsupported causal-conv activation: {activation}")
+        return output.to(x.dtype)
+
     initial_states = _exchange_initial_states(
         x=x, state_len=state_len, cp_group=cp_group, initial_state_mask=initial_state_mask
     )
+    prefix_length = 0
+    if local_seq_idx is not None and initial_states is not None:
+        # causal-conv1d disallows seq_idx together with initial_states. Materialize
+        # the differentiable halo as a prefix in the first local sequence instead.
+        # The exchange already zeroed tokens belonging to a different sequence.
+        prefix_length = state_len
+        x = torch.cat((initial_states.transpose(1, 2), x), dim=1)
+        local_seq_idx = torch.cat(
+            (local_seq_idx[:, :1].expand(-1, state_len), local_seq_idx), dim=1
+        ).contiguous()
+        initial_states = None
     output = causal_conv1d_fn(
         x=x.transpose(1, 2),
         weight=weight,
@@ -174,4 +198,4 @@ def causal_conv1d_cp(
         initial_states=initial_states,
         activation=activation,
     )
-    return output.transpose(1, 2)
+    return output[:, :, prefix_length:].transpose(1, 2)

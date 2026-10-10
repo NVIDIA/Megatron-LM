@@ -379,7 +379,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_causal_conv1d",
         sources=("megatron/core/ssm/causal_conv1d.py",),
-        tests=(C + "test_ssm_conv1d.py",),
+        tests=(C + "test_ssm_conv1d.py", K + "test_recurrent_gdn_cp_replay.py"),
         kind="external-lib",
         notes="Dao-AILab causal_conv1d; channel-last backward reduces dweight/dbias with "
         "atomicAdd unless CAUSAL_CONV1D_DETERMINISTIC (>=1.6.0) picks the workspace path.",
@@ -441,13 +441,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "recurrence also writes per-draft-token state snapshots for rollback.",
     ),
     KernelEntry(
+        name="gdn_recurrent_context_parallel",
+        sources=("megatron/core/ssm/context_parallel/gdn_recurrent.py",),
+        tests=("tests/unit_tests/determinism/kernels/test_recurrent_gdn_cp_replay.py",),
+        kind="dispatch",
+        notes="Native FLA chunk kernels with ordered P2P boundary states and adjoints; unpacked only.",
+    ),
+    KernelEntry(
         name="gated_delta_net",
         sources=(
             "megatron/core/ssm/gated_delta_net/common.py",
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
         ),
-        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
+        tests=(
+            K + "test_ssm_kernels.py",
+            K + "test_gated_norm.py",
+            C + "test_hybrid_model.py",
+            K + "test_recurrent_gdn_cp_replay.py",
+        ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
     ),

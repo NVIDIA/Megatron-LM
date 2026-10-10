@@ -1157,6 +1157,13 @@ class TransformerConfig(ModelParallelConfig):
     linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
     """Context-parallel algorithm for recurrent and linear-attention layers."""
 
+    gdn_chunkwise_cp_state_mode: Literal["parallel", "recurrent"] = "parallel"
+    """GDN chunkwise CP state propagation. ``parallel`` uses affine summaries;
+    ``recurrent`` preserves native FLA 64-token chunks and communicates actual
+    boundary states/adjoints between adjacent ranks. The recurrent mode supports
+    unpacked training only and adds a sequential state dependency across CP ranks.
+    """
+
     linear_cp_layout: CPLayout = "zigzag"
     """CP layout for linear-attention layers."""
 
@@ -1588,6 +1595,8 @@ class TransformerConfig(ModelParallelConfig):
 
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
+        if self.gdn_chunkwise_cp_state_mode not in ("parallel", "recurrent"):
+            raise ValueError("gdn_chunkwise_cp_state_mode must be 'parallel' or 'recurrent'")
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
         if (
@@ -1759,6 +1768,8 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
+            if self.linear_cp_mode == "chunkwise" and self.experimental_attention_variant == "gdn2":
+                raise ValueError("GDN2 does not support linear_cp_mode='chunkwise'")
             # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
             # symbol 'G', where linear_attention_freq is unused; the GPT experimental
             # attention route raises a clear error downstream if it is missing.
@@ -1789,14 +1800,15 @@ class TransformerConfig(ModelParallelConfig):
             )
 
             # Check tensor parallelism compatibility
-            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+            head_cp_size = 1 if self.linear_cp_mode == "chunkwise" else self.context_parallel_size
+            tp_cp_size = self.tensor_model_parallel_size * head_cp_size
             assert self.linear_num_key_heads % tp_cp_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                f"TP times head-partition CP size ({tp_cp_size})."
             )
             assert self.linear_num_value_heads % tp_cp_size == 0, (
                 f"{self.linear_num_value_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                f"TP times head-partition CP size ({tp_cp_size})."
             )
         elif self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
