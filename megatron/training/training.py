@@ -1675,6 +1675,7 @@ def pretrain(
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
+        training=True,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
@@ -3081,8 +3082,10 @@ def setup_model_and_optimizer(
                 'model': dense_model_for_upcycling,
                 'optimizer': None,
                 'opt_param_scheduler': None,
+                'restore_training_state': True,
             },
         )
+        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         args.iteration = 1
         save_checkpoint(
             args.iteration, model, None, None, args.num_floating_point_operations_so_far
@@ -3108,6 +3111,7 @@ def setup_model_and_optimizer(
                 optimizer,
                 opt_param_scheduler,
                 checkpointing_context=checkpointing_context,
+                restore_training_state=True,
                 skip_load_to_model_and_opt=HAVE_FSDP2
                 and getattr(args, "use_torch_fsdp2", False)
                 and args.ckpt_format == "torch_dist",
@@ -3120,6 +3124,8 @@ def setup_model_and_optimizer(
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
             )
+            # Checkpoint loading restores progress; training owns the runtime calculator.
+            update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         # Barrier + min/max all-reduce right after the load. Unlike the checkpoint
         # SAVE (ragged writers -> cross-rank skew at timers.log), the fully-parallel
         # LOAD is uniform across ranks (~ms spread), so no meaningful skew
@@ -4700,6 +4706,7 @@ def train(
                     None,  # Don't load optimizer state
                     None,  # Don't load scheduler state
                     checkpointing_context=checkpointing_context,
+                    restore_training_state=True,
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
@@ -4715,10 +4722,12 @@ def train(
                     None,
                     None,
                     checkpointing_context=checkpointing_context,
+                    restore_training_state=True,
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
+            update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
 
             args.no_load_optim = no_load_optim
 
