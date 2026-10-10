@@ -285,10 +285,7 @@ def filter_by_environment(workload_manifests: List[dotdict], environment: str) -
     workload_manifests_copy = list(
         workload_manifest
         for workload_manifest in workload_manifests.copy()
-        if (
-            hasattr(dotdict(**workload_manifest["spec"]), "environment")
-            and workload_manifest["spec"]["environment"] == environment
-        )
+        if workload_manifest["spec"].get("environment") == environment
     )
 
     if len(workload_manifests_copy) == 0:
@@ -302,10 +299,7 @@ def filter_by_platform(workload_manifests: List[dotdict], platform: str) -> List
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
-        if (
-            hasattr(dotdict(**workload_manifest["spec"]), "platforms")
-            and workload_manifest.spec["platforms"] == platform
-        )
+        if workload_manifest.spec.get("platforms") == platform
     )
 
     if len(workload_manifests) == 0:
@@ -335,8 +329,7 @@ def filter_by_tag(workload_manifests: List[dotdict], tag: str) -> List[dotdict]:
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
-        if hasattr(dotdict(**workload_manifest["spec"]), "tag")
-        and workload_manifest["spec"]["tag"] == tag
+        if workload_manifest["spec"].get("tag") == tag
     )
 
     if len(workload_manifests) == 0:
