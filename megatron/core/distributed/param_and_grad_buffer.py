@@ -320,6 +320,10 @@ class _ParamAndGradBucketGroup:
         # bucket group early-drain its predecessor without the end-of-step finalize loop
         # double-waiting. Reset by `reset()`.
         self.grad_reduce_finished = False
+        # Set by DistributedDataParallel with overlap_wgrad_compute (a WgradStream): the stream
+        # the weight gradients of this bucket group's layers run on; start_grad_sync issues
+        # from it.
+        self.wgrad_stream = None
 
         # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
         # introduces some CPU overheads. We use these two lists to cache the created local
@@ -657,6 +661,20 @@ class _ParamAndGradBucketGroup:
         if self.is_first_batch and self.grad_reduce_handle is not None:
             # Make this start_grad_sync call a no-op if in first batch and collective has
             # already been dispatched.
+            return
+
+        if (
+            self.wgrad_stream is not None
+            and torch.cuda.current_stream() != self.wgrad_stream.stream
+        ):
+            # Weight gradients of this bucket group may still be in flight on the wgrad stream:
+            # scale and reduce the gradients from there, once it has caught up with the current
+            # stream's. The collective stays asynchronous; finish_grad_sync waits on its handle.
+            compute_stream = torch.cuda.current_stream()
+            self.wgrad_stream.stream.wait_stream(compute_stream)
+            with torch.cuda.stream(self.wgrad_stream.stream):
+                self.start_grad_sync(force_all_reduce=force_all_reduce)
+            self.wgrad_stream.limit_backlog(compute_stream)
             return
 
         # Drain the predecessor bucket group's reduce-scatter before allocating ours. Only

@@ -4,6 +4,7 @@
 
 import gc
 import logging
+from typing import Optional
 
 import torch
 
@@ -21,14 +22,21 @@ _shared_graph_pool = None
 _shared_capture_stream = None
 
 
-def get_shared_capture_stream():
+def get_shared_capture_stream(priority: Optional[int] = None):
     """Return one `torch.cuda.Stream` for all full-iter and optimizer graph captures.
 
-    Call after the target CUDA device is selected.
+    Call after the target CUDA device is selected. `priority` (lower is higher; captured
+    kernels keep it at replay) applies when the stream is created here; a later caller asking
+    for a different priority than the existing stream's gets an error.
     """
     global _shared_capture_stream
     if _shared_capture_stream is None:
-        _shared_capture_stream = torch.cuda.Stream()
+        _shared_capture_stream = torch.cuda.Stream(priority=priority or 0)
+    elif priority is not None and priority != _shared_capture_stream.priority:
+        raise RuntimeError(
+            f"The shared capture stream exists with priority {_shared_capture_stream.priority}; "
+            f"request priority {priority} before the first get_shared_capture_stream() call."
+        )
     return _shared_capture_stream
 
 
