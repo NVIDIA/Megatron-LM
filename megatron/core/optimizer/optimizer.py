@@ -2008,7 +2008,7 @@ class ChainedOptimizer(MegatronOptimizer):
         Parameters in a registered grad_norm_group are excluded from the main gradient
         norm and clipped independently using their group norm.
         """
-        if self.config is not None and self.config.overlap_optimizer_step_with_forward:
+        if getattr(self.config, 'overlap_optimizer_step_with_forward', False):
             return self._step_overlapped()
         self.grad_norms_by_group = {}
         found_inf_flag = self.prepare_grads()
