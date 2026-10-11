@@ -1877,7 +1877,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         request_id = request.request_id
-
         if is_resume:
             if request_id not in self.requests or self.get_request(request_id) is not request:
                 raise ValueError(f"Cannot resume unknown request ID {request_id}.")
@@ -1898,6 +1897,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+
+        seed_error = None
+        if request.sampling_params.seed is not None:
+            if self.context.config.sampling_backend != "torch":
+                seed_error = "Request-local seeds require sampling_backend='torch'"
+            elif self.context.config.num_speculative_tokens:
+                seed_error = "Request-local seeds do not yet support speculative decoding"
+            elif "seed" not in self.context.request_metadata:
+                seed_error = "Request-local seeds require seed in request metadata"
+        if seed_error is not None:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(ValueError(seed_error))
 
         assert (
             request.sampling_params.num_tokens_to_generate is None
