@@ -575,6 +575,8 @@ def linear_with_frozen_weight(
     wgrad_deferral_limit: None = None,
     gtp_remat_size: int = 1,
     output_dtype: Optional[torch.dtype] = None,
+    wgrad_store: None = None,
+    wgrad_chunks: int = 1,
 ) -> torch.Tensor:
     """Linear layer execution with weight.requires_grad == False.
 
@@ -618,6 +620,9 @@ def linear_with_frozen_weight(
 
     output_dtype (torch.dtype optional): Optional GEMM output dtype. A dtype different from
         the input dtype requires Transformer Engine ``general_gemm``.
+
+    wgrad_store, wgrad_chunks: dummy arguments, used to keep the API unified between all
+    forward implementation functions.
     """
 
     assert grad_output_buffer is None, (
@@ -628,6 +633,10 @@ def linear_with_frozen_weight(
     assert wgrad_deferral_limit is None, (
         "This arg is only supported with " "linear_with_grad_accumulation_and_async_allreduce"
     )
+
+    assert (
+        wgrad_store is None
+    ), "wgrad_store is only supported with linear_with_grad_accumulation_and_async_allreduce"
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
 
@@ -678,6 +687,29 @@ def _wgrad_gemm(out, grad_output, total_input, accumulate=False):
     return out
 
 
+def _accumulate_wgrad_chunk(main_grad, start, end, total_input, grad_output):
+    """main_grad[start:end] += grad_output[:, start:end]^T @ total_input."""
+    main_grad = main_grad[start:end]
+    grad_output = grad_output[:, start:end]
+    if main_grad.dtype == total_input.dtype:
+        main_grad.addmm_(grad_output.t(), total_input)
+    else:
+        _wgrad_gemm(main_grad, grad_output.contiguous(), total_input, accumulate=True)
+
+
+def _defer_wgrad_accumulation(wgrad_store, num_chunks, main_grad, grad_output, total_input):
+    """Store the fused wgrad accumulation as ``num_chunks`` output-row chunks (64-row aligned),
+    each popped as one computation (see ColumnParallelLinear.backward_dw)."""
+    rows = main_grad.shape[0]
+    chunk_rows = -(-rows // num_chunks)
+    chunk_rows = -(-chunk_rows // 64) * 64
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        wgrad_store.put(
+            [total_input, grad_output], partial(_accumulate_wgrad_chunk, main_grad, start, end)
+        )
+
+
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
@@ -696,6 +728,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         tp_group,
         gtp_remat_size,
         output_dtype,
+        wgrad_store,
+        wgrad_chunks,
     ):
         """Forward."""
         if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
@@ -703,6 +737,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             main_grad = None
         ctx.save_for_backward(input, weight)
+        ctx.wgrad_store = wgrad_store
+        ctx.wgrad_chunks = wgrad_chunks
 
         if gtp_remat_size > 1:
             weight = weight.all_gather_and_prefetch(fwd=True)
@@ -817,6 +853,14 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 if hasattr(weight, "__fsdp_param__"):
                     weight.main_grad = weight.get_main_grad()
                     _wgrad_gemm(weight.main_grad, grad_output, total_input)
+                elif ctx.wgrad_store is not None:
+                    _defer_wgrad_accumulation(
+                        ctx.wgrad_store,
+                        ctx.wgrad_chunks,
+                        weight.main_grad,
+                        grad_output,
+                        total_input,
+                    )
                 else:
                     if weight.main_grad.dtype == torch.float32:
                         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
@@ -919,7 +963,21 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.allreduce_dgrad:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, None
+        return (
+            grad_input,
+            grad_weight,
+            grad_bias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def linear_with_grad_accumulation_and_async_allreduce(
@@ -934,6 +992,8 @@ def linear_with_grad_accumulation_and_async_allreduce(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     gtp_remat_size: int = 1,
     output_dtype: Optional[torch.dtype] = None,
+    wgrad_store=None,
+    wgrad_chunks: int = 1,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -999,6 +1059,10 @@ def linear_with_grad_accumulation_and_async_allreduce(
 
         output_dtype (torch.dtype optional): Optional GEMM output dtype. A dtype different from
             the input dtype requires Transformer Engine ``general_gemm``.
+
+        wgrad_store (WeightGradStore optional): With gradient_accumulation_fusion, defer the
+            fused wgrad accumulation to this store as ``wgrad_chunks`` output-row chunks, each
+            popped as one computation (overlap_wgrad_compute). Defaults to None (inline).
     """
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
@@ -1015,6 +1079,8 @@ def linear_with_grad_accumulation_and_async_allreduce(
         tp_group,
         gtp_remat_size,
         output_dtype,
+        wgrad_store,
+        wgrad_chunks,
     ]
 
     if not linear_with_grad_accumulation_and_async_allreduce.warned:
@@ -1274,12 +1340,35 @@ class ColumnParallelLinear(torch.nn.Module):
                 "`allreduce_dgrad` and `sequence_parallel` cannot be enabled at the same time."
             )
 
+        # See defer_wgrad_compute.
+        self.wgrad_store = None
+        self.wgrad_chunks = 1
+        self.wgrad_accumulation_and_reduce_hooks = []
+
         # Hook adding a default empty _extra_state for state dict
         self._register_load_state_dict_pre_hook(
             lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
                 f"{prefix}_extra_state"
             )
         )
+
+    def defer_wgrad_compute(self, num_chunks: int = 1) -> None:
+        """Defer the fused wgrad accumulation of the backward pass to backward_dw(), which
+        issues it one output-row chunk (of ``num_chunks``) per call (overlap_wgrad_compute).
+
+        Uses the Transformer Engine WeightGradStore and the DDP hook protocol of its layers.
+        """
+        from transformer_engine.pytorch.module._common import WeightGradStore
+
+        assert self.gradient_accumulation_fusion, "deferred wgrad accumulation needs fusion"
+        assert self.weight is not None, "deferred wgrad accumulation needs the layer's weight"
+        self.wgrad_store = WeightGradStore(delay_wgrad_compute=True)
+        self.wgrad_chunks = num_chunks
+        self.weight.skip_backward_post_hook = True
+
+    def register_wgrad_accumulation_and_reduce_hooks(self, hook):
+        """Register a hook to run once the deferred wgrad accumulation is complete."""
+        self.wgrad_accumulation_and_reduce_hooks.append(hook)
 
     def _forward_impl(self, input, weight, *args, **kwargs):
         if not weight.requires_grad:
@@ -1384,6 +1473,8 @@ class ColumnParallelLinear(torch.nn.Module):
             tp_group=self.tp_group,
             gtp_remat_size=self.gtp_remat_size,
             output_dtype=self.output_dtype,
+            wgrad_store=self.wgrad_store,
+            wgrad_chunks=self.wgrad_chunks,
         )
 
         gather_output = self.gather_output
@@ -1423,12 +1514,17 @@ class ColumnParallelLinear(torch.nn.Module):
             )
         return gather_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
 
-    def backward_dw(self) -> None:
-        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled.
-
-        Not supported - does nothing.
-        """
-        pass
+    def backward_dw(self, all_chunks: bool = False) -> None:
+        """Issue one chunk (or all) of the wgrad accumulation deferred by defer_wgrad_compute;
+        the registered hooks run once the last chunk has been issued. No-op otherwise."""
+        if self.wgrad_store is None or self.wgrad_store.context.empty():
+            return
+        self.wgrad_store.pop()
+        while all_chunks and not self.wgrad_store.context.empty():
+            self.wgrad_store.pop()
+        if self.wgrad_store.context.empty():
+            for hook in self.wgrad_accumulation_and_reduce_hooks:
+                hook()
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""

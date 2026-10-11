@@ -3,6 +3,7 @@
 import logging
 from collections import OrderedDict
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -41,6 +42,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wgrad_overlap import release_deferred_wgrads_after
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
@@ -253,6 +255,12 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         # Cache for RoPE tensors which do not change between iterations.
         self.rotary_pos_emb_cache = {}
 
+        if self.post_process and self.config.overlap_wgrad_compute:
+            # Registered before the decoder: DDP buckets the parameters in reverse registration
+            # order, and the output weight's gradient, spread over the layers' backward passes,
+            # completes with the first layer's, next to the embedding's.
+            self._build_output_layer()
+
         # Transformer.
         self.decoder = TransformerBlock(
             config=self.config,
@@ -277,52 +285,13 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
             self._setup_mtp_cuda_graphs()
 
-        # Output
-        if self.post_process:
-
-            if self.config.defer_embedding_wgrad_compute:
-                # The embedding activation buffer preserves a reference to the input activations
-                # of the final embedding projection layer GEMM. It will hold the activations for
-                # all the micro-batches of a global batch for the last pipeline stage. Once we are
-                # done with all the back props for all the microbatches for the last pipeline stage,
-                # it will be in the pipeline flush stage. During this pipeline flush we use the
-                # input activations stored in embedding activation buffer and gradient outputs
-                # stored in gradient buffer to calculate the weight gradients for the embedding
-                # final linear layer.
-                self.embedding_activation_buffer = []
-                self.grad_output_buffer = []
-            else:
-                self.embedding_activation_buffer = None
-                self.grad_output_buffer = None
-
-            output_layer_cls = (
-                TELMHeadColumnParallelLinear
-                if is_mxfp8_output_proj_active(config)
-                else tensor_parallel.ColumnParallelLinear
-            )
-            self.output_layer = output_layer_cls(
-                config.hidden_size,
-                self.vocab_size,
-                config=config,
-                init_method=(
-                    config.embedding_init_method
-                    if config.use_mup and not self.share_embeddings_and_output_weights
-                    else config.init_method
-                ),
-                bias=False,
-                skip_bias_add=False,
-                gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
-                and self.share_embeddings_and_output_weights,
-                embedding_activation_buffer=self.embedding_activation_buffer,
-                grad_output_buffer=self.grad_output_buffer,
-                tp_group=self.pg_collection.tp,
-                pg_collection=self.pg_collection,
-                output_dtype=self.logit_dtype,
-            )
+        if self.post_process and not self.config.overlap_wgrad_compute:
+            self._build_output_layer()
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
+        if self.post_process and self.config.overlap_wgrad_compute:
+            self._overlap_output_layer_wgrad()
 
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
@@ -332,6 +301,69 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+    def _build_output_layer(self) -> None:
+        """Build the output layer (last pipeline stage)."""
+        if self.config.defer_embedding_wgrad_compute:
+            # The embedding activation buffer preserves a reference to the input activations
+            # of the final embedding projection layer GEMM. It will hold the activations for
+            # all the micro-batches of a global batch for the last pipeline stage. Once we are
+            # done with all the back props for all the microbatches for the last pipeline stage,
+            # it will be in the pipeline flush stage. During this pipeline flush we use the
+            # input activations stored in embedding activation buffer and gradient outputs
+            # stored in gradient buffer to calculate the weight gradients for the embedding
+            # final linear layer.
+            self.embedding_activation_buffer = []
+            self.grad_output_buffer = []
+        else:
+            self.embedding_activation_buffer = None
+            self.grad_output_buffer = None
+
+        output_layer_cls = (
+            TELMHeadColumnParallelLinear
+            if is_mxfp8_output_proj_active(self.config)
+            else tensor_parallel.ColumnParallelLinear
+        )
+        self.output_layer = output_layer_cls(
+            self.config.hidden_size,
+            self.vocab_size,
+            config=self.config,
+            init_method=(
+                self.config.embedding_init_method
+                if self.config.use_mup and not self.share_embeddings_and_output_weights
+                else self.config.init_method
+            ),
+            bias=False,
+            skip_bias_add=False,
+            gather_output=not self.parallel_output,
+            skip_weight_param_allocation=self.pre_process
+            and self.share_embeddings_and_output_weights,
+            embedding_activation_buffer=self.embedding_activation_buffer,
+            grad_output_buffer=self.grad_output_buffer,
+            tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
+            output_dtype=self.logit_dtype,
+        )
+
+    def _overlap_output_layer_wgrad(self) -> None:
+        """overlap_wgrad_compute: defer the output layer's weight gradient to the side stream in
+        chunks, one issued after each decoder layer's backward pass, the rest after the first
+        layer's. Not applied to a weight shared with the embedding, whose gradient the embedding
+        accumulates on the compute stream."""
+        layers = self.decoder.layers
+        if (
+            self.share_embeddings_and_output_weights
+            or not isinstance(self.output_layer, tensor_parallel.ColumnParallelLinear)
+            or len(layers) == 0
+        ):
+            return
+        self.output_layer.defer_wgrad_compute(
+            self.config.overlap_wgrad_compute_output_layer_chunks or len(layers)
+        )
+        for layer in layers:
+            release_deferred_wgrads_after(
+                layer, partial(self.output_layer.backward_dw, all_chunks=layer is layers[0])
+            )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
