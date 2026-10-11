@@ -735,9 +735,14 @@ class DistributedDataParallel(_BaseDataParallel):
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
         bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
-        # With the overlapped optimizer step, each bucket's grads are zeroed right after its
-        # update, before its param all-gather.
-        if not any(bucket_group.overlapped_step is not None for bucket_group in bucket_groups):
+        # With the overlapped optimizer step, grads of a scheduled update stay until the update
+        # consumed them: each bucket is zeroed right after its update, before its all-gather.
+        grads_pending_update = any(
+            bucket_group.overlapped_step is not None
+            and bucket_group.overlapped_step.grads_pending_update
+            for bucket_group in bucket_groups
+        )
+        if not grads_pending_update:
             for buffer in self.buffers + self.expert_parallel_buffers:
                 buffer.reset()
         for bucket_group in bucket_groups:

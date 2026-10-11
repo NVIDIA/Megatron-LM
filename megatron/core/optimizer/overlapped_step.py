@@ -120,6 +120,7 @@ class OverlappedOptimizerStep:
         self._dispatched = set()
         self._norm_done = set()
         self._update_scheduled = False
+        self.grads_pending_update = False
         self._captured_hparams: Optional[List[HParams]] = None
 
     def _check_supported(self):
@@ -322,6 +323,10 @@ class OverlappedOptimizerStep:
             torch.clamp(self.config.clip_grad / (grad_norm + 1.0e-6), max=1.0, out=self.inv_scale)
         self.noop.fill_(0)
         self._update_scheduled = True
+        # Read by DistributedDataParallel.zero_grad_buffer: the grads stay until the update
+        # consumed them (each bucket is zeroed right after its Adam), or until the update is
+        # applied or discarded here.
+        self.grads_pending_update = True
 
     def apply_scheduled_update(self):
         """Apply a scheduled update now, on the current stream (before a forced param sync)."""
@@ -332,6 +337,7 @@ class OverlappedOptimizerStep:
             self._launch_update(bucket_group)
         self.noop.fill_(1)
         self._update_scheduled = False
+        self.grads_pending_update = False
 
     def discard_scheduled_update(self):
         """Drop a scheduled update; parameters and optimizer state stay as they are."""
@@ -341,6 +347,7 @@ class OverlappedOptimizerStep:
             group['step'] -= 1
         self.noop.fill_(1)
         self._update_scheduled = False
+        self.grads_pending_update = False
 
     # ------------------------------------------------------------------ captured, from DDP
 
