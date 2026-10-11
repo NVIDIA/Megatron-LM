@@ -11,12 +11,10 @@ from torch.distributed.tensor import DTensor, Shard
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental import init_optimizer_state
-from ..distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import (
-    parameter_layouts,
-    wrap_optimizer_state,
-)
+from ..distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import wrap_optimizer_state
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     get_containing_parameter_group,
+    get_fsdp_parameter,
     sync_model_weights_from_main_weights,
 )
 from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
@@ -358,16 +356,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             for param, param_state in self.optimizer.state.items()
         }
 
-        layouts = {
-            param: layout
-            for chunk in self.model_chunks
-            for param, layout in parameter_layouts(chunk).items()
-        }
         packed_state: dict[str, Any] = {}
         for param in self._trainable_parameters():
             fqn = self._param_to_fqn[param]
+            fsdp_parameter = get_fsdp_parameter(param)
             if fqn in state_by_fqn:
-                packed_state[fqn] = wrap_optimizer_state(state_by_fqn[fqn], *layouts[param])
+                packed_state[fqn] = wrap_optimizer_state(state_by_fqn[fqn], fsdp_parameter)
             elif fqn in state_keys_by_fqn:
                 # Filtered out of this rank's optimizer because its local shard is empty. The
                 # rank owning a non-empty shard saves the real state; this placeholder has the
@@ -384,8 +378,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 # rather than version-gated so there is one keyspace to reason about
                 # instead of two.
                 packed_state[fqn] = wrap_optimizer_state(
-                    {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]},
-                    *layouts[param],
+                    {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]}, fsdp_parameter
                 )
             # A parameter absent from the gathered keyspace has no state on any rank, because
             # nothing has stepped yet. Emitting it as an empty mapping would be rank-consistent

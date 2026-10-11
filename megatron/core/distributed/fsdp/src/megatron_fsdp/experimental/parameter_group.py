@@ -23,7 +23,7 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Partial, Replicate
+from torch.distributed.tensor import DTensor, Partial, Replicate
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
@@ -45,7 +45,7 @@ else:
         return tensor.dtype
 
 
-_CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
+_FSDP_PARAMETER_ATTR = "_mfsdp_parameter"
 
 
 def _contains_any_placement_type(
@@ -59,14 +59,16 @@ def _contains_any_placement_type(
     return False
 
 
+def get_fsdp_parameter(parameter: nn.Parameter) -> "FsdpParameter | None":
+    """Return the FSDP record for either runtime representation of a parameter."""
+    fsdp_parameter_ref = getattr(parameter, _FSDP_PARAMETER_ATTR, None)
+    return fsdp_parameter_ref() if fsdp_parameter_ref is not None else None
+
+
 def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
     """Return the FSDP parameter group that owns ``parameter``, if any."""
-    # This parameter-owned backedge must be weak; otherwise it forms a reference
-    # cycle with the parameter group and delays releasing its CUDA storage.
-    parameter_group_ref = getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
-    if parameter_group_ref is None:
-        return None
-    return parameter_group_ref()
+    fsdp_parameter = get_fsdp_parameter(parameter)
+    return fsdp_parameter._group() if fsdp_parameter is not None else None
 
 
 def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> None:
@@ -94,6 +96,15 @@ class FsdpParameter:
     fqns: tuple[str, ...]
     sharded: nn.Parameter
     unsharded: nn.Parameter
+    _group: ReferenceType["FsdpParameterGroup"]
+    _index: int
+
+    def get_dtensor(self, *, local_tensor: torch.Tensor | None = None) -> DTensor:
+        """View this parameter, or its elementwise optimizer state, for checkpointing."""
+        group = self._group()
+        if group is None:
+            raise RuntimeError("FSDP parameter outlived its owning group.")
+        return group.main_weight.get_dtensor(self._index, local_tensor=local_tensor)
 
 
 class FsdpParameterGroup:
@@ -394,8 +405,6 @@ class FsdpParameterGroup:
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
-            # Parameter-owned markers must not retain their FSDP module tree.
-            setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_tensor_view(index), requires_grad=parameter.requires_grad
@@ -403,10 +412,18 @@ class FsdpParameterGroup:
             copy_parameter_attributes(parameter, sharded_parameter)
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
-            setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
-            fsdp_parameters.append(
-                FsdpParameter(fqns=tuple(fqns), sharded=sharded_parameter, unsharded=parameter)
+            fsdp_parameter = FsdpParameter(
+                fqns=tuple(fqns),
+                sharded=sharded_parameter,
+                unsharded=parameter,
+                _group=ref(self),
+                _index=index,
             )
+            # The group owns the record; runtime tensors must not form a reference cycle
+            # through it or keep the module tree's CUDA storage alive.
+            setattr(parameter, _FSDP_PARAMETER_ATTR, ref(fsdp_parameter))
+            setattr(sharded_parameter, _FSDP_PARAMETER_ATTR, ref(fsdp_parameter))
+            fsdp_parameters.append(fsdp_parameter)
         return tuple(fsdp_parameters)
 
     def _symmetric_memory_context(self):

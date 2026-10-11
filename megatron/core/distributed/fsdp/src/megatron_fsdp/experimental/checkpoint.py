@@ -36,32 +36,18 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.tensor import DTensor
 
-from .dbuffer import DBuffer
-from .module import FsdpModule
 from .optimizer import init_optimizer_state
-from .parameter_group import sync_model_weights_from_main_weights
+from .parameter_group import FsdpParameter, get_fsdp_parameter, sync_model_weights_from_main_weights
 from .uneven_dtensor import attach_uneven_dtensor_metadata
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
 
 
-def parameter_layouts(model: torch.nn.Module) -> dict[torch.nn.Parameter, tuple[DBuffer, int]]:
-    """Map each local runtime parameter to its main-weight buffer and logical index."""
-    layouts = {}
-    for module in model.modules():
-        if not isinstance(module, FsdpModule):
-            continue
-        for group in module.parameter_groups:
-            for index, parameter in enumerate(group.fsdp_parameters):
-                layouts[parameter.sharded] = (group.main_weight, index)
-    return layouts
-
-
-def wrap_optimizer_state(state: dict[str, Any], buffer: DBuffer, index: int) -> dict[str, Any]:
+def wrap_optimizer_state(state: dict[str, Any], parameter: FsdpParameter) -> dict[str, Any]:
     """Wrap elementwise state without changing the optimizer's live state dictionary."""
     return {
         key: (
-            buffer.get_dtensor(index, local_tensor=value)
+            parameter.get_dtensor(local_tensor=value)
             if isinstance(value, torch.Tensor) and value.ndim > 0
             else value
         )
@@ -85,20 +71,19 @@ class CheckpointState:
         """Build checkpoint dictionaries with global shapes and uneven-shard metadata."""
         model_state_dict = get_model_state_dict(self.model)
         optimizer_state_dict = get_optimizer_state_dict(self.model, self.optimizer)
-        layouts = parameter_layouts(self.model)
         self._local_fqns = set()
         # Optimizer.state_dict() can share nested dictionaries with live state.
         optimizer_state_dict["state"] = dict(optimizer_state_dict.get("state", {}))
         for fqn, parameter in self.model.named_parameters(remove_duplicate=False):
-            if parameter not in layouts:
+            fsdp_parameter = get_fsdp_parameter(parameter)
+            if fsdp_parameter is None:
                 continue
-            buffer, index = layouts[parameter]
             if fqn in model_state_dict:
-                model_state_dict[fqn] = buffer.get_dtensor(index)
+                model_state_dict[fqn] = fsdp_parameter.get_dtensor()
                 self._local_fqns.add(fqn)
             if fqn in optimizer_state_dict["state"]:
                 optimizer_state_dict["state"][fqn] = wrap_optimizer_state(
-                    optimizer_state_dict["state"][fqn], buffer, index
+                    optimizer_state_dict["state"][fqn], fsdp_parameter
                 )
         attach_uneven_dtensor_metadata(self.model, model_state_dict, optimizer_state_dict)
         return {"model": model_state_dict, "optimizer": optimizer_state_dict}
