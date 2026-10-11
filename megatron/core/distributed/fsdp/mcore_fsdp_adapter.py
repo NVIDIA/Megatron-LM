@@ -61,14 +61,14 @@ try:
         fully_shard_context,
         microbatch,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import (
+        named_checkpoint_parameters,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
         current_fully_shard_context,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
         copy_parameter_attributes,
-    )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-        get_fsdp_parameter,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         all_sharding_strategies_in,
@@ -742,11 +742,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """Expose global DTensor views only at the checkpoint boundary."""
         state_dict = super().state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
-        for name, parameter in self.module.named_parameters(remove_duplicate=False):
+        for name, parameter in named_checkpoint_parameters(self.module):
             key = prefix + name
-            fsdp_parameter = get_fsdp_parameter(parameter)
-            if key in state_dict and fsdp_parameter is not None:
-                state_dict[key] = fsdp_parameter.get_dtensor()
+            if key in state_dict:
+                state_dict[key] = parameter
         return state_dict
 
     def load_state_dict(self, state_dict, strict=True):

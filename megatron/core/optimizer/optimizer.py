@@ -406,7 +406,7 @@ class MegatronOptimizer(ABC):
 
     def _uses_decoupled_grad(self, param_list) -> bool:
         """Whether clip_grad_norm/count_zeros should read `.decoupled_grad` instead of `.grad`."""
-        if hasattr(param_list[0], "_mfsdp_parameter"):
+        if hasattr(param_list[0], "_mfsdp_parameter_group"):
             # MFSDP v2 always reduces directly into `.grad`.
             return False
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:

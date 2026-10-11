@@ -12,9 +12,10 @@ from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental import init_optimizer_state
 from ..distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import wrap_optimizer_state
+from ..distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    FsdpParameterGroup,
     get_containing_parameter_group,
-    get_fsdp_parameter,
     sync_model_weights_from_main_weights,
 )
 from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
@@ -135,6 +136,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             "(--ckpt-format fsdp_dtensor)."
         )
 
+    def _parameter_groups(self) -> Iterator[FsdpParameterGroup]:
+        """Yield the FSDP parameter groups owned by the model chunks."""
+        for model_chunk in self.model_chunks:
+            for module in model_chunk.modules():
+                if isinstance(module, FsdpModule):
+                    yield from module.parameter_groups
+
     def _trainable_parameters(self) -> Iterator[torch.nn.Parameter]:
         """Yield the parameters the base optimizer owns before the empty-shard filter.
 
@@ -163,10 +171,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 is what expert parallelism produces. Not yet supported rather than refused
                 on principle; training under expert parallelism is unaffected.
         """
-        buffers = {
-            get_containing_parameter_group(param).main_weight
-            for param in self._trainable_parameters()
-        }
+        buffers = {group.main_weight for group in self._parameter_groups() if group.requires_grad}
         if len({buffer.mesh for buffer in buffers}) > 1:
             # MFSDP v2 shards expert parameters over the expert-DP mesh and everything else
             # over the DP mesh (see FullyShardedDataParallelV2). Expert parallelism also gives
@@ -357,35 +362,31 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         }
 
         packed_state: dict[str, Any] = {}
-        for param in self._trainable_parameters():
-            fqn = self._param_to_fqn[param]
-            fsdp_parameter = get_fsdp_parameter(param)
-            if fqn in state_by_fqn:
-                packed_state[fqn] = wrap_optimizer_state(state_by_fqn[fqn], fsdp_parameter)
-            elif fqn in state_keys_by_fqn:
-                # Filtered out of this rank's optimizer because its local shard is empty. The
-                # rank owning a non-empty shard saves the real state; this placeholder has the
-                # same global shape and dtype but no local rows, so it contributes no data and
-                # only keeps the DTensor keyspace identical on every rank.
-                # TODO: delete this branch, together with _gather_state_keys_by_fqn and the
-                # owned_fqns filter in load_state_dict, once MFSDP v2 drops support for
-                # TE < 2.18. The filter that makes them necessary is applied only there
-                # (see get_megatron_optimizer), working around
-                # https://github.com/NVIDIA/TransformerEngine/issues/3207, which
-                # https://github.com/NVIDIA/TransformerEngine/pull/3212 fixed in 2.18. On a
-                # newer TE every rank already holds every parameter, so no placeholder is
-                # ever synthesized and this branch is dead -- it is left unconditional
-                # rather than version-gated so there is one keyspace to reason about
-                # instead of two.
+        for group in self._parameter_groups():
+            if not group.requires_grad:
+                continue
+            for index, parameter in enumerate(group.fsdp_parameters):
+                param = parameter.sharded
+                fqn = self._param_to_fqn[param]
+                if fqn in state_by_fqn:
+                    state = state_by_fqn[fqn]
+                elif fqn in state_keys_by_fqn:
+                    # Filtered out of this rank's optimizer because its local shard is empty.
+                    # The owning rank saves the real state; this placeholder contributes no
+                    # data and keeps the DTensor keyspace identical on every rank.
+                    # TODO: remove this branch, _gather_state_keys_by_fqn and the owned_fqns
+                    # filter in load_state_dict when MFSDP v2 drops TE < 2.18 support.
+                    # get_megatron_optimizer filters empty shards only for those versions:
+                    # https://github.com/NVIDIA/TransformerEngine/issues/3207 was fixed by
+                    # https://github.com/NVIDIA/TransformerEngine/pull/3212 in TE 2.18.
+                    state = {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]}
+                else:
+                    # No rank has state for this parameter yet. The checkpoint handlers
+                    # expect an empty state dict, not entries with empty per-parameter dicts.
+                    continue
                 packed_state[fqn] = wrap_optimizer_state(
-                    {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]}, fsdp_parameter
+                    state, group.main_weight.get_dtensor(index)
                 )
-            # A parameter absent from the gathered keyspace has no state on any rank, because
-            # nothing has stepped yet. Emitting it as an empty mapping would be rank-consistent
-            # but wrong in a subtler way: the fsdp_dtensor handlers in fsdp_dtensor_checkpoint
-            # test ``state`` for emptiness as a whole and then index ``exp_avg`` per entry, so
-            # a dict of empty dicts raises where an empty dict is handled. v1 emits nothing
-            # here for the same reason, so nothing is emitted here either.
 
         return {"state": packed_state, "param_to_group_meta": self._param_to_group_meta()}
 
