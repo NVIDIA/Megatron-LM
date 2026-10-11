@@ -79,6 +79,12 @@ def _get_field(obj, key, default=None):
     return getattr(obj, key, default)
 
 
+def _get_non_none(obj, key, default):
+    """Returns the value from the object or default if the key is missing or None."""
+    val = obj.get(key)
+    return default if val is None else val
+
+
 def _try_parse_jsonish(value):
     if not isinstance(value, str):
         return value

@@ -129,9 +129,7 @@ def model_provider(
         )
 
     vision_config = deepcopy(base_config)
-    vision_config = get_vision_model_config(
-        vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling
-    )
+    vision_config = get_vision_model_config(vision_config)
     if vision_model_type.startswith("hf://"):
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert (

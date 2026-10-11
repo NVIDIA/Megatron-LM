@@ -113,8 +113,6 @@ class FsdpParameterGroup:
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
-        if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
-            raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
@@ -324,13 +322,17 @@ class FsdpParameterGroup:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
             grads.append(fsdp_parameter.unsharded.grad)
         with self._symmetric_memory_context():
-            return DBuffer(
+            partial_grad = DBuffer(
                 mesh=self.mesh,
                 placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
             )
+        # Lets DBuffer.reduce_scatter select the symmetric-memory SUM path on PyTorch builds
+        # without symm_mem.is_symm_mem_tensor.
+        partial_grad.allocated_from_symm_mem = self._symm_mem_pool is not None
+        return partial_grad
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""

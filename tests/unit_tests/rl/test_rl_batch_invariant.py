@@ -102,7 +102,10 @@ def test_moe_batch_invariant_permute_unpermute_cuda_graph_non_padded():
             torch.cuda.current_stream().wait_stream(stream)
 
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            # Capture on the test's own stream: without stream=, torch lazily creates the
+            # process-wide default capture stream on the current device (cuda:0 here, before
+            # distributed init sets each rank's device), and later captures inherit it.
+            with torch.cuda.graph(graph, stream=stream):
                 graph_out = _run()
             graph.replay()
     finally:

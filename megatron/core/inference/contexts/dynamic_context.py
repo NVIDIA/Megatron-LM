@@ -653,6 +653,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Initialize context state.
         self.params_dtype = model_config.params_dtype
+        self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.max_sequence_length = inference_config.max_sequence_length
 
         # Block ids. With speculative decoding, blocks are pre-allocated when the

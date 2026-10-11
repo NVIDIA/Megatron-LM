@@ -54,7 +54,7 @@ def unimodal_build_distributed_models(
     pre_wrap_hook: Callable[[list[MegatronModule]], list[MegatronModule]] | None = None,
     model_type: ModelType = ModelType.encoder_or_decoder,
     use_layer_wise_distributed_optimizer: bool = False,
-    use_layer_wise_param_layout: bool = True,
+    use_layer_wise_param_layout: bool | None = None,
 ) -> list[MegatronModule]:
     """Build model stages and wrap for distributed training.
 
@@ -85,9 +85,11 @@ def unimodal_build_distributed_models(
         model_type: Deprecated flag, only used for backwards compatibility.
         use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
             parameters for the layer-wise distributed optimizer.
-        use_layer_wise_param_layout: Accepted for API parity with main's ModelBuilder
-            path; the padded vs compact LayerWise layout is selected inside
-            ``compute_full_param_layout`` from ``ddp_config.use_layer_wise_param_layout``.
+        use_layer_wise_param_layout: Optional LayerWise layout request kept for API
+            parity with main's ModelBuilder path. ``ddp_config.use_layer_wise_param_layout``
+            is the single layout source (True: padded, False: compact). ``None`` defers to
+            it; with DDP and the layer-wise distributed optimizer, an explicit value that
+            disagrees with it raises ``ValueError``.
 
     Returns:
         List of model stages, wrapped and ready for distributed training.
@@ -145,7 +147,7 @@ def prepare_existing_model_chunks_for_distributed_training(
     data_parallel_random_init: bool = False,
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     use_layer_wise_distributed_optimizer: bool = False,
-    use_layer_wise_param_layout: bool = True,
+    use_layer_wise_param_layout: bool | None = None,
 ) -> list[MegatronModule]:
     """Apply the shared post-build distributed lifecycle to already-built model chunks.
 
@@ -166,9 +168,11 @@ def prepare_existing_model_chunks_for_distributed_training(
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
             parameters for the layer-wise distributed optimizer.
-        use_layer_wise_param_layout: Accepted for API parity with main's ModelBuilder
-            path; the padded vs compact LayerWise layout is selected inside
-            ``compute_full_param_layout`` from ``ddp_config.use_layer_wise_param_layout``.
+        use_layer_wise_param_layout: Optional LayerWise layout request kept for API
+            parity with main's ModelBuilder path. ``ddp_config.use_layer_wise_param_layout``
+            is the single layout source (True: padded, False: compact). ``None`` defers to
+            it; with DDP and the layer-wise distributed optimizer, an explicit value that
+            disagrees with it raises ``ValueError``.
 
     Returns:
         List of model chunks, wrapped and ready for distributed training.
@@ -272,6 +276,28 @@ def _wrap_with_mp_wrapper(
     return model_list
 
 
+def _check_layer_wise_param_layout_arg(
+    use_layer_wise_param_layout: bool | None, ddp_config: DistributedDataParallelConfig
+) -> None:
+    """Reject an explicit LayerWise layout request that disagrees with ``ddp_config``.
+
+    ``ddp_config.use_layer_wise_param_layout`` selects the padded (True) or compact (False)
+    LayerWise layout inside ``compute_full_param_layout``. Main's ModelBuilder path selects it
+    with the ``use_layer_wise_param_layout`` argument instead, so a caller ported from main
+    must not silently receive the other layout.
+    """
+    if use_layer_wise_param_layout is None:
+        return
+    configured = ddp_config.use_layer_wise_param_layout
+    if bool(use_layer_wise_param_layout) != bool(configured):
+        raise ValueError(
+            f"use_layer_wise_param_layout={use_layer_wise_param_layout} disagrees with "
+            f"ddp_config.use_layer_wise_param_layout={configured}. The LayerWise parameter "
+            "layout is selected only by ddp_config.use_layer_wise_param_layout "
+            "(--use-layer-wise-param-layout); set it there or leave this argument as None."
+        )
+
+
 def _ddp_wrap(
     model: list[MegatronModule],
     data_parallel_random_init: bool,
@@ -282,7 +308,7 @@ def _ddp_wrap(
     *,
     pg_collection: ProcessGroupCollection,
     use_layer_wise_distributed_optimizer: bool = False,
-    use_layer_wise_param_layout: bool = True,
+    use_layer_wise_param_layout: bool | None = None,
 ) -> list[MegatronModule]:
     """Wrap model with Distributed Data Parallel (DDP) or Fully Sharded Data Parallel (FSDP).
 
@@ -297,9 +323,11 @@ def _ddp_wrap(
         pg_collection: Model communication process groups.
         use_layer_wise_distributed_optimizer: Whether to use the layer-wise
             distributed optimizer parameter routing and layout.
-        use_layer_wise_param_layout: Accepted for API parity with main's ModelBuilder
-            path; the padded vs compact LayerWise layout is selected inside
-            ``compute_full_param_layout`` from ``ddp_config.use_layer_wise_param_layout``.
+        use_layer_wise_param_layout: Optional LayerWise layout request kept for API
+            parity with main's ModelBuilder path. ``ddp_config.use_layer_wise_param_layout``
+            is the single layout source (True: padded, False: compact). ``None`` defers to
+            it; with DDP and the layer-wise distributed optimizer, an explicit value that
+            disagrees with it raises ``ValueError``.
 
     Returns:
         list[MegatronModule]: List of DDP/FSDP wrapped model modules
@@ -319,6 +347,7 @@ def _ddp_wrap(
     compute_layout = None
     if DP is DistributedDataParallel:
         if use_layer_wise_distributed_optimizer:
+            _check_layer_wise_param_layout_arg(use_layer_wise_param_layout, ddp_config)
             # LayerWise (Muon) manages matrix parameters as whole tensors while
             # sibling Adam parameters use byte-sharded DistOpt buffers. Tag before
             # DDP groups parameters into buffers and force reduce-scatter for the

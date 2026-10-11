@@ -67,6 +67,9 @@ class DBuffer:
     layout: GlobalLayout
     offset: int
     local_buffer: torch.Tensor
+    # Set by owners that allocate ``local_buffer`` from the NCCL symmetric-memory pool. Only
+    # consulted on PyTorch builds without ``symm_mem.is_symm_mem_tensor``.
+    allocated_from_symm_mem: bool = False
 
     def __init__(
         self,
@@ -397,11 +400,13 @@ class DBuffer:
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
         reduce_op = partial_placement.reduce_op
-        # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
-        # reductions remain supported on older PyTorch versions that lack it.
-        is_symm_mem = hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
-            self.local_buffer
-        )
+        # PyTorch builds that predate symm_mem.is_symm_mem_tensor (such as dev's 2.12
+        # pre-release) cannot report whether the buffer is symmetric, so fall back to the
+        # allocation-time flag. Ordinary buffers leave it False and keep the plain path.
+        if hasattr(symm_mem, "is_symm_mem_tensor"):
+            is_symm_mem = symm_mem.is_symm_mem_tensor(self.local_buffer)
+        else:
+            is_symm_mem = self.allocated_from_symm_mem
         if is_symm_mem:
             self.rendezvous(axis)
             # NCCL symmetric-memory reduce-scatter selects its symmetric kernel

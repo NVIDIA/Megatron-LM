@@ -210,7 +210,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        use_layer_wise_param_layout: bool = True,
+        use_layer_wise_param_layout: bool | None = None,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -227,9 +227,11 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
                 parameters for the layer-wise distributed optimizer.
-            use_layer_wise_param_layout: Accepted for API parity with main's ModelBuilder
-                path; the padded vs compact LayerWise layout is selected inside
-                ``compute_full_param_layout`` from ``ddp_config.use_layer_wise_param_layout``.
+            use_layer_wise_param_layout: Optional LayerWise layout request kept for API
+                parity with main's ModelBuilder path. ``ddp_config.use_layer_wise_param_layout``
+                is the single layout source (True: padded, False: compact). ``None`` defers to
+                it; with DDP and the layer-wise distributed optimizer, an explicit value that
+                disagrees with it raises ``ValueError``.
 
         Returns:
             List of model stages.

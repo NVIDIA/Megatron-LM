@@ -3113,8 +3113,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Each TP rank writes one row, but block graphs retain a max-token-sized
         # allocation. Poisoning the tail mirrors stale data from an earlier replay.
-        context.mtp_decoder_hidden_states = torch.full((8, 1, 32), -1.0, device='cuda')
-        context.mtp_decoder_hidden_states[0] = parallel_state.get_tensor_model_parallel_rank()
+        hidden_states_cache = torch.full((8, 1, 32), -1.0, device='cuda')
+        hidden_states_cache[0] = parallel_state.get_tensor_model_parallel_rank()
+        controller._unwrapped_model._decoder_hidden_states_cache = hidden_states_cache
 
         gathered_inputs = []
 
@@ -3339,7 +3340,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         full_hidden = torch.randn(s_total, 1, self.hidden_size, device='cuda', dtype=dtype)
         torch.distributed.broadcast(full_hidden, src=0)
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        ctx.mtp_decoder_hidden_states = full_hidden.chunk(tp_size)[tp_rank].contiguous()
+        ctrl._unwrapped_model._decoder_hidden_states_cache = full_hidden.chunk(tp_size)[
+            tp_rank
+        ].contiguous()
 
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
         ctx.active_request_metadata["temperature"][:active_request_count] = 1.0

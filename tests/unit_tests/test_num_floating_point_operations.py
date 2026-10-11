@@ -540,6 +540,7 @@ class TestHybridMatchesStandard:
         hybrid.mamba_head_dim = 64
         hybrid.mamba_num_groups = 8
         hybrid.mamba_num_heads = 128
+        hybrid.gdp_num_householder = 3
         # Match the standard model's attention implementation explicitly:
         # '*' is regular attention and '+' is dense MLA in the hybrid grammar.
         attention_symbol = "+" if hybrid.multi_latent_attention else "*"
@@ -1635,6 +1636,7 @@ def _make_dsv4_pair(*, ratios, mtp, moe):
     hybrid.mamba_head_dim = 64
     hybrid.mamba_num_groups = 8
     hybrid.mamba_num_heads = 128
+    hybrid.gdp_num_householder = 3
     main_pattern = "".join(_RATIO_TO_SYMBOL[r] + ffn_symbol for r in ratios)
     mtp_pattern = ("/" + "W" + ffn_symbol) * mtp  # MTP layer = Window attention
     hybrid.hybrid_layer_pattern = main_pattern + mtp_pattern
