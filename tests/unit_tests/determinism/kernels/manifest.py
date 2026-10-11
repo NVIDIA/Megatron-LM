@@ -213,6 +213,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Copy with unique stores; bit-identical to Tensor.contiguous.",
     ),
     KernelEntry(
+        name="fused_moe_residual_add",
+        sources=("megatron/core/fusions/fused_moe_residual_add.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Elementwise with unique stores; bit-identical to the two unfused adds it replaces.",
+    ),
+    KernelEntry(
         name="fused_mla_yarn_rope",
         sources=("megatron/core/fusions/fused_mla_yarn_rope_apply.py",),
         tests=(K + "test_fused_triton_kernels.py",),
