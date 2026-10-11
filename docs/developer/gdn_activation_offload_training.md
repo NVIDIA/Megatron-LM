@@ -7,7 +7,7 @@ are listed below. Configuration checks on CPU do not qualify a parallel topology
 
 ## GPU validation status
 
-The 2026-10-06/07/08/10 runs use RTX A6000 GPUs, PyTorch 2.11.0+cu130, Transformer
+The 2026-10-06/07/08/10/11 runs use RTX A6000 GPUs, PyTorch 2.11.0+cu130, Transformer
 Engine 2.20.2, FLA 0.5.1 and cuDNN 9.19.0. These public-package container runs
 do not replace upstream CI.
 
@@ -27,6 +27,12 @@ variants, before and after training warmup. The expanded recurrence suite passes
 replay cases and 14 shared-manager cases. The single-rank invocation skips one
 multi-rank summary-aggregation case. Ten separate argument-boundary cases pass;
 those parser tests do not qualify a GPU topology.
+
+On 2026-10-11, all 12 expanded evaluation-switching cases pass in eager mode on
+each of four ranks, together with the shared-manager summary-aggregation case:
+13 passed and zero skipped per rank, launcher exit code 0. This invocation sets
+`TORCH_COMPILE_DISABLE=1`; it reruns the expanded lifecycle cases, rather than
+the entire 71-case recurrence suite.
 
 The previously skipped shared-manager aggregation regression and existing GDN
 fused CP-local parameter test pass on both ranks of a two-rank run. The latter
@@ -50,8 +56,9 @@ from pretrained CP, which remains unqualified.
 | Pretrained Qwen, PP+VPP on two ranks | All 8 arms passed on each rank with native unbatched P2P, including across norm recomputation settings |
 | Pretrained Qwen, fused pre-GDR on two ranks | DP, TP, TP+SP, PP and PP+VPP: all 8 arms per topology passed on each rank; every pre-reset pool count is zero |
 | Pretrained Qwen, unfused TP+SP+PP on four ranks | All 8 arms passed, including across norm settings; 32 rank files and 96 exact complete rank-step states; every pre-reset pool count is zero |
-| Pretrained Qwen, fused TP+SP+PP on four ranks | Partial: norm-off disabled/0/0.5 passed; 12 rank files and 36 exact complete rank-step states; remaining 5 arms paused at user request |
+| Pretrained Qwen, fused TP+SP+PP on four ranks | All 8 arms passed, including across norm settings; 32 rank files and 96 exact complete rank-step states; fresh disabled control also matches; every pre-reset pool count is zero |
 | Pretrained Qwen, CP on two ranks | Disabled baseline cannot select an attention backend for head dimension 256 on A6000; unqualified |
+| Pretrained Qwen, TP+SP+CP on four ranks | Disabled baseline executed on all four ranks; each fails native attention backend selection at head dimension 256; unqualified |
 | Pretrained Qwen, unfused pre-GDR at sequence lengths 2048/4096 | Baseline and fraction 1 passed with norm recomputation off/on; all 3 step states also match across recomputation settings |
 | Pretrained Qwen, fused pre-GDR at sequence lengths 2048/4096 | Disabled/fraction-1 with norm recomputation off/on: all 24 complete step states match, including across norm settings |
 | Pretrained Qwen, unfused pre-GDR memory/runtime | All 48 processes completed; 480 measured samples across 2 lengths × 2 norm settings × 4 arms × 3 repeats |
@@ -98,6 +105,12 @@ change external backend checks or relax the comparison's determinism setting.
 Native backend queries also reject all nine combinations of `p2p`, `all_gather`
 and `a2a` communication with sequence lengths 128, 2048 and 4096 at the original
 256-dimensional heads on this A6000 environment.
+The 2026-10-11 complete pretrained TP=2/SP/CP=2 disabled baseline reproduces
+this failure on all four ranks at sequence length 128. Its native attention uses
+four heads and one GQA group per TP rank, with the original head dimension 256.
+Every rank reports all three backends unavailable and raises
+`No dot product attention backend is available for the provided inputs`.
+No optimizer step completes, so this run does not qualify pretrained CP.
 
 The reduced-model suite checks pinned-buffer ownership immediately before every
 native schedule reset. A deliberate omission of one pool return fails this check;
@@ -230,14 +243,33 @@ zero selects none, and all completed runs have zero pinned buffers in use before
 each schedule reset. Each fusion variant uses its own fresh disabled baseline.
 
 GPU work was paused at the user's request during the fused norm-off fraction-1
-arm. That arm and all four fused norm-on arms remain unqualified. The four-rank
-pretrained TP+SP+CP disabled baseline has not run. These correctness runs produce
-no timed samples and establish no four-rank throughput result.
+arm, then resumed on 2026-10-11 using idle physical GPUs 0/1/3/4. A fresh fused
+norm-off disabled baseline matches the prior baseline exactly on every rank.
+The five pending arms then pass against that fresh control: norm-off fraction 1
+and norm-on disabled/0/0.5/1. Independent verification of the completed matrix
+confirms all eight arms for each fusion variant: 64 rank files and 192 complete
+rank-step states. The additional disabled control contributes four files and
+12 matching states, for 17 successful four-rank runs and 204 states overall.
+Every completed run has zero pinned-buffer ownership before each schedule reset.
+Fraction zero selects no transfers; positive fractions select transfers on all
+ranks. These correctness runs produce no timed samples and establish no
+four-rank throughput result.
+
 The checkout adds two input checks to the Qwen tool and extends evaluation-switch
-tests; core runtime files remain identical to `2f1ee4f2e`. Completed results and
-their source/data hashes are independently verified in the local artifact
-`deep-review-20261010/qwen-completed-validation.json`; the review and regression
-logs are indexed by `deep-review-20261010/review.json`.
+tests; core runtime files remain identical to `2f1ee4f2e`. The resumed runs use
+checkout `f83613e7fa4e3e34731faef1ba579b4cdea2e65f`, whose runtime and test sources
+are unchanged. Completed results and source/data hashes are independently
+verified in `four-gpu-completion-20261011/qwen-validation.json`; regression and
+CP-baseline logs are indexed by `four-gpu-completion-20261011/acceptance.json`.
+The earlier paused-session evidence remains in
+`deep-review-20261010/qwen-completed-validation.json`.
+
+Pretrained CP remains unqualified after the actual four-rank disabled-baseline
+failure described above. A read-only GitHub check on 2026-10-11 finds no upstream
+GPU CI run: the public draft PR has the earlier `b3434091b` head, and the current
+account has read-only access to `NVIDIA/Megatron-LM`. Publishing the signed local
+changes and obtaining upstream approval/dispatch are external steps. Local
+results do not replace upstream CI.
 
 ## Complete-Qwen A6000 measurements
 
@@ -633,10 +665,9 @@ The same entry point accepts `--tp 2`, `--tp 2 --sp`, `--cp 2`, `--pp 2`,
 counts in the table above. Use four or more microbatches for PP/VPP. DP is the
 remaining world-size factor. The status table lists the GPU-qualified
 configurations, including plain TP and plain PP. Pretrained four-rank TP+SP+PP
-is qualified for unfused correctness; the fused comparison remains partial.
-Pretrained CP combinations remain unqualified. The reduced-model four-rank
-matrix passes all 96 cases per rank; its results do not qualify the pretrained
-architecture.
+is qualified for both fused and unfused correctness. Pretrained CP combinations
+remain unqualified. The reduced-model four-rank matrix passes all 96 cases per
+rank; its results do not qualify the pretrained architecture.
 
 ## Acceptance for additional pretrained configurations
 
