@@ -134,6 +134,15 @@ try:
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
+try:
+    from transformer_engine.pytorch.attention.fused_qkv_rope_quantize import (
+        fused_qkv_rope_quantize_supported,
+    )
+
+    HAVE_FUSED_QKV_ROPE_QUANTIZE = True
+except ImportError:
+    HAVE_FUSED_QKV_ROPE_QUANTIZE = False
+
 
 class LinearQkvInterface(Protocol):
     """Interface for linear_qkv modules."""
@@ -497,6 +506,35 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         return hidden_states
 
+    def _fused_qkv_rope_quantizers(
+        self, mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list, qkv_bias
+    ):
+        """The (q/k/v, qkv gradient) quantizers of the fused RoPE + quantize path, or None when
+        this call takes the plain fused RoPE: linear_qkv or core_attention outside FP8, or
+        inputs the kernel does not support."""
+        get_qkv_quantizer = getattr(self.core_attention, "get_qkv_quantizer", None)
+        get_grad_output_quantizer = getattr(
+            getattr(self, "linear_qkv", None), "get_grad_output_quantizer", None
+        )
+        if get_qkv_quantizer is None or get_grad_output_quantizer is None:
+            return None
+        qkv_quantizer = get_qkv_quantizer()
+        grad_qkv_quantizer = get_grad_output_quantizer()
+        if qkv_quantizer is None or grad_qkv_quantizer is None:
+            return None
+        if not fused_qkv_rope_quantize_supported(
+            mixed_qkv,
+            q_pos_emb,
+            k_pos_emb,
+            qkv_split_arg_list,
+            qkv_quantizer,
+            grad_qkv_quantizer,
+            qkv_bias,
+            interleaved=self.config.rotary_interleaved,
+        ):
+            return None
+        return qkv_quantizer, grad_qkv_quantizer
+
     def _run_core_attention(
         self,
         query,
@@ -749,7 +787,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     ) -> (
         tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
-        | tuple[Tensor, list[int]]
+        | tuple[Tensor, list[int], Tensor | None]
     ):
         """
         This method needs to be implemented based on whether the derived class
@@ -1461,17 +1499,18 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
+        core_attention_extra_kwargs = {}
         if split_qkv:
             if self.config.attention_output_gate:
                 query, key, value, gate = qkv_output
             else:
                 query, key, value = qkv_output
-            mixed_qkv = qkv_split_arg_list = None
+            mixed_qkv = qkv_split_arg_list = qkv_bias = None
         else:
             assert (
                 not self.config.attention_output_gate
             ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
-            mixed_qkv, qkv_split_arg_list = qkv_output
+            mixed_qkv, qkv_split_arg_list, qkv_bias = qkv_output
         nvtx_range_pop(suffix="qkv")
 
         # ===================================================
@@ -1599,9 +1638,36 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         max_seqlen=rope_freqs_max_seqlen,
                     )
             else:
-                query, key, value = apply_fused_qkv_rotary_pos_emb(
-                    mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
+                quantizers = (
+                    self._fused_qkv_rope_quantizers(
+                        mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list, qkv_bias
+                    )
+                    if self.config.fused_single_qkv_rope_quantize
+                    else None
                 )
+                if quantizers is not None:
+                    query, key, value = apply_fused_qkv_rotary_pos_emb(
+                        mixed_qkv,
+                        q_pos_emb,
+                        k_pos_emb,
+                        qkv_split_arg_list,
+                        bias=qkv_bias,
+                        qkv_quantizer=quantizers[0],
+                        grad_qkv_quantizer=quantizers[1],
+                    )
+                    # q/k/v are FP8: attention returns bf16 gradients for the RoPE backward
+                    core_attention_extra_kwargs["bf16_backward"] = True
+                else:
+                    if self.config.fused_single_qkv_rope_quantize:
+                        # linear_qkv's output was kept flat, its bias left out, for the fused path
+                        if qkv_bias is not None:
+                            mixed_qkv = mixed_qkv + qkv_bias
+                        mixed_qkv = mixed_qkv.view(
+                            *mixed_qkv.shape[:2], self.num_query_groups_per_partition, -1
+                        )
+                    query, key, value = apply_fused_qkv_rotary_pos_emb(
+                        mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
+                    )
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
@@ -1626,12 +1692,13 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
                 with core_attn_manager as query:
-                    core_attn_out = apply_module(self.core_attention)(
+                    core_attn_out = self._run_core_attention(
                         query,
                         key,
                         value,
@@ -1639,6 +1706,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
+                        **core_attention_extra_kwargs,
                     )
 
             else:
@@ -1769,7 +1837,8 @@ class SelfAttention(Attention):
             init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
-            skip_bias_add=False,
+            # the fused RoPE + quantize path adds the bias itself
+            skip_bias_add=self.config.fused_single_qkv_rope_quantize,
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
@@ -1903,16 +1972,21 @@ class SelfAttention(Attention):
     ) -> (
         tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
-        | tuple[Tensor, list[int]]
+        | tuple[Tensor, list[int], Tensor | None]
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         If `output_gate` is True, then also derives `gate` tensor.
-        If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
+        If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned with its split sizes
+        and the qkv bias when linear_qkv left it out (fused_single_qkv_rope_quantize).
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        mixed_qkv, qkv_bias = apply_module(self.linear_qkv)(hidden_states)
+        quantized_rope = not split_qkv and self.config.fused_single_qkv_rope_quantize
+        if qkv_bias is not None and not quantized_rope:
+            # linear_qkv leaves its bias to the fused RoPE + quantize path; add it here otherwise
+            mixed_qkv = mixed_qkv + qkv_bias
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
@@ -1949,6 +2023,7 @@ class SelfAttention(Attention):
             self.num_query_groups_per_partition,
             num_qkv_heads_per_group * self.hidden_size_per_attention_head,
         )
+        qkv_linear_output = mixed_qkv
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
 
         # Split the tensor into query, gate, key, and value.
@@ -1980,7 +2055,11 @@ class SelfAttention(Attention):
 
             # Return unsplit mixed_qkv and split_arg_list
             if not split_qkv:
-                return mixed_qkv, split_arg_list
+                if quantized_rope:
+                    # [sq, b, hp] as linear_qkv produced it, with the bias it left out: the fused
+                    # RoPE adds the bias and hands the MXFP8 qkv gradient straight to linear_qkv
+                    return qkv_linear_output, split_arg_list, qkv_bias
+                return mixed_qkv, split_arg_list, None
 
             if SplitAlongDim is not None:
                 query, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)

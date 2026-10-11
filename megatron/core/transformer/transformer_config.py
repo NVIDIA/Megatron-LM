@@ -576,6 +576,14 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    fused_single_qkv_rope_quantize: bool = False
+    """If True, the fused single-QKV RoPE (fused_single_qkv_rope) also adds the qkv bias,
+    quantizes q/k/v to FP8 for the attention and returns the qkv gradient quantized to MXFP8 for
+    the linear_qkv backward (Transformer Engine's fused RoPE + quantize kernel). Requires fp8 with
+    fp8_recipe='mxfp8', fp8_dot_product_attention=True with the Float8CurrentScaling attention
+    recipe (NVTE_DPA_FP8_RECIPE), kv_channels=64, non-interleaved RoPE and no context parallelism;
+    layers and calls the kernel does not take fall back to the plain fused RoPE."""
+
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
@@ -3021,6 +3029,36 @@ class TransformerConfig(ModelParallelConfig):
         if self.fused_single_qkv_rope:
             if self.attention_output_gate:
                 raise ValueError("fused_single_qkv_rope does not support gated attention for now.")
+
+        if self.fused_single_qkv_rope_quantize:
+            if not self.fused_single_qkv_rope:
+                raise ValueError("fused_single_qkv_rope_quantize requires fused_single_qkv_rope.")
+            if (
+                self.fp8 is None
+                or self.fp8_recipe != Fp8Recipe.mxfp8
+                or not self.fp8_dot_product_attention
+            ):
+                raise ValueError(
+                    "fused_single_qkv_rope_quantize requires FP8 with fp8_recipe='mxfp8' and "
+                    "fp8_dot_product_attention=True."
+                )
+            if (
+                self.kv_channels != 64
+                or self.rotary_interleaved
+                or self.context_parallel_size > 1
+                or self.num_query_groups < self.tensor_model_parallel_size
+            ):
+                raise ValueError(
+                    "fused_single_qkv_rope_quantize requires kv_channels=64, "
+                    "rotary_interleaved=False, context_parallel_size=1 and "
+                    "num_query_groups >= tensor_model_parallel_size."
+                )
+            from megatron.core.transformer.attention import HAVE_FUSED_QKV_ROPE_QUANTIZE
+
+            if not HAVE_FUSED_QKV_ROPE_QUANTIZE:
+                raise ValueError(
+                    "fused_single_qkv_rope_quantize is not available in this Transformer Engine."
+                )
 
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
