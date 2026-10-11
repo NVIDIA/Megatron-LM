@@ -536,14 +536,21 @@ class MegatronOptimizer(ABC):
 
         indexer_clip_grad = self.config.dsa_indexer_clip_grad
 
-        use_decoupled_grad = self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        # Per group: _uses_decoupled_grad reads param_list[0], so the answer belongs to the
+        # parameters rather than to the config alone.
         if non_indexer_params and clip_grad > 0.0:
             clip_grad_by_total_norm_fp32(
-                non_indexer_params, clip_grad, non_indexer_grad_norm, use_decoupled_grad
+                non_indexer_params,
+                clip_grad,
+                non_indexer_grad_norm,
+                self._uses_decoupled_grad(non_indexer_params),
             )
         if indexer_params and indexer_clip_grad > 0.0:
             clip_grad_by_total_norm_fp32(
-                indexer_params, indexer_clip_grad, indexer_grad_norm, use_decoupled_grad
+                indexer_params,
+                indexer_clip_grad,
+                indexer_grad_norm,
+                self._uses_decoupled_grad(indexer_params),
             )
 
         return math.sqrt(indexer_grad_norm**2 + non_indexer_grad_norm**2)
