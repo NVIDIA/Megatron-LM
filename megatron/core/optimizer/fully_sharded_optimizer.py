@@ -84,11 +84,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             if self.ddp_config != model_chunk.ddp_config:
                 raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
-        self._parameter_layouts = {
-            param: layout
-            for chunk in model_chunks
-            for param, layout in parameter_layouts(chunk).items()
-        }
         self.is_stub_optimizer = optimizer is None
         self._casted_grads = []
         # Each parameter's globally unique checkpoint name, mirroring
@@ -170,7 +165,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 is what expert parallelism produces. Not yet supported rather than refused
                 on principle; training under expert parallelism is unaffected.
         """
-        buffers = [self._parameter_layouts[param][0] for param in self._trainable_parameters()]
+        buffers = {
+            get_containing_parameter_group(param).main_weight
+            for param in self._trainable_parameters()
+        }
         if len({buffer.mesh for buffer in buffers}) > 1:
             # MFSDP v2 shards expert parameters over the expert-DP mesh and everything else
             # over the DP mesh (see FullyShardedDataParallelV2). Expert parallelism also gives
@@ -188,7 +186,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         # Union over every parameter rather than reading the first one's layout: a mesh
         # dimension that one parameter replicates and another sharded still has to be gathered
         # over, or the rank that solely describes an FQN never reaches the ranks that need it.
-        mesh = buffers[0].mesh
+        mesh = next(iter(buffers)).mesh
         sharded_dims = set()
         for buffer in buffers:
             for mesh_dim, placement in enumerate(buffer.placements):
@@ -360,13 +358,16 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             for param, param_state in self.optimizer.state.items()
         }
 
+        layouts = {
+            param: layout
+            for chunk in self.model_chunks
+            for param, layout in parameter_layouts(chunk).items()
+        }
         packed_state: dict[str, Any] = {}
         for param in self._trainable_parameters():
             fqn = self._param_to_fqn[param]
             if fqn in state_by_fqn:
-                packed_state[fqn] = wrap_optimizer_state(
-                    state_by_fqn[fqn], *self._parameter_layouts[param]
-                )
+                packed_state[fqn] = wrap_optimizer_state(state_by_fqn[fqn], *layouts[param])
             elif fqn in state_keys_by_fqn:
                 # Filtered out of this rank's optimizer because its local shard is empty. The
                 # rank owning a non-empty shard saves the real state; this placeholder has the
@@ -384,7 +385,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 # instead of two.
                 packed_state[fqn] = wrap_optimizer_state(
                     {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]},
-                    *self._parameter_layouts[param],
+                    *layouts[param],
                 )
             # A parameter absent from the gathered keyspace has no state on any rank, because
             # nothing has stepped yet. Emitting it as an empty mapping would be rank-consistent

@@ -604,9 +604,17 @@ class DBuffer:
             0, owned_range.buffer_relative_offset, owned_range.numel
         ).view(local_shape)
 
-    def get_dtensor(self, index: int) -> DTensor:
-        """Return logical tensor ``index`` as a DTensor."""
-        local_tensor = self.get_tensor_view(index)
+    def get_dtensor(self, index: int, *, local_tensor: torch.Tensor | None = None) -> DTensor:
+        """Return a DTensor view using logical tensor ``index``'s layout.
+
+        ``local_tensor`` can supply an optimizer state shard with the same local shape
+        and device as the parameter. Its dtype and storage are preserved.
+        """
+        parameter_view = self.get_tensor_view(index)
+        if local_tensor is None:
+            local_tensor = parameter_view
+        elif local_tensor.shape != parameter_view.shape or local_tensor.device != self.device:
+            raise ValueError("DTensor state must match the parameter shard's shape and device.")
         tensor_shape = self.layout.tensor_shapes[index]
         # Keep internal storage details (e.g. RowAtomic and BlockAtomic) out of DTensor placements.
         dtensor_placements = tuple(
