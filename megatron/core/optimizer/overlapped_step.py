@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from .. import tensor_parallel
+from ..full_cuda_graph import get_shared_capture_stream
 from ..transformer.module import param_is_not_shared
 from ..utils import get_attr_wrapped_model
 from .clip_grads import l2_norm_impl, multi_tensor_applier
@@ -85,8 +86,16 @@ class OverlappedOptimizerStep:
 
         # Same priority as the compute stream: the update yields to the forward through its
         # dispatch points; a lower priority starves it behind the forward's kernels and exposes
-        # the all-gathers it precedes.
-        self.stream = torch.cuda.Stream()
+        # the all-gathers it precedes. Under a full-iteration CUDA graph the compute stream is
+        # the shared capture stream, whose priority may be raised (overlap_wgrad_compute).
+        model_config = optimizer.model_chunks[0].config
+        self.stream = torch.cuda.Stream(
+            priority=(
+                get_shared_capture_stream().priority
+                if model_config.cuda_graph_impl == "full_iteration"
+                else 0
+            )
+        )
         self.noop = torch.ones(1, dtype=torch.int32, device='cuda')
         self.inv_scale = torch.ones(1, dtype=torch.float32, device='cuda')
         self._dummy_overflow_buf = torch.zeros(1, dtype=torch.int32, device='cuda')
