@@ -1332,8 +1332,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         optim_state_to_sharding_state(
             state_dict['optimizer'], id_to_sharded_param_map, exclude_keys="step"
         )
-        if common_step is not None:
-            state_dict['optimizer']['state']['common_step'] = common_step
+        # save step as a shared step among all parameters. Separate per-parameter
+        # steps are not supported
+        if step is not None:
+            state_dict['optimizer']['state']['common_step'] = step
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -1524,8 +1526,10 @@ class FP32Optimizer(MegatronOptimizer):
         # expected to have the same shape as the model parameters,
         # so we save the step separately and ignore it here
         optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
-        if common_step is not None:
-            state_dict['state']['common_step'] = common_step
+        # save step as a shared step among all parameters. Separate per-parameter
+        # steps are not supported
+        if step is not None:
+            state_dict['state']['common_step'] = step
         return state_dict
 
 
