@@ -1822,11 +1822,13 @@ class TransformerConfig(ModelParallelConfig):
         if (
             self.dsa_indexer_weights_proj_output_dtype == "fp32"
             and self.dsa_kernel_backend == "cudnn"
+            and self.dsa_indexer_kpool <= 1
         ):
             raise ValueError(
                 "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
-                "dsa_kernel_backend='cudnn', which requires a BF16 indexer weights tensor. "
-                "Use dsa_kernel_backend='tilelang' or 'none'."
+                "dsa_kernel_backend='cudnn' for per-token DSA, which requires a BF16 indexer "
+                "weights tensor. KPool selection bypasses the cuDNN top-k path; use KPool or "
+                "dsa_kernel_backend='tilelang'/'none'."
             )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
