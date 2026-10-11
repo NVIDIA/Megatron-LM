@@ -21,6 +21,7 @@ def _make_unshard_backward_hook(owner: FsdpModule):
     backward."""
 
     def hook(submodule, _grad_output):
+        owner.context.register_post_backward_hook()
         owner.unshard()
 
     return hook
