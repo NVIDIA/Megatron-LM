@@ -208,17 +208,28 @@ def _worker_grouped_weight_list(rank, world_size, port):
 
 class TestWrapModuleParams:
     @pytest.mark.parametrize('weight_name', ['weight0', 'weight64'])
-    def test_rejects_egtp_grouped_gated_fc1(self, weight_name):
-        model = nn.Module()
+    def test_egtp_grouped_gated_fc1_rejects_checkpoint_only(self, weight_name):
+        from megatron.core.transformer.moe.experts import TEGroupedMLP
+
+        model = TEGroupedMLP.__new__(TEGroupedMLP)
+        nn.Module.__init__(model)
+        model.config = SimpleNamespace(gated_linear_unit=True)
+        model.tp_group = parallel_state.get_tensor_model_parallel_group()
         model.linear_fc1 = nn.Module()
-        model.linear_fc1.config = SimpleNamespace(gated_linear_unit=True)
-        model.linear_fc1.register_parameter(
-            weight_name, GTPShardedParam(torch.ones(4, 4, device="cuda"))
-        )
-        with pytest.raises(NotImplementedError, match="gated_linear_unit with EGTP-sharded"):
-            gtp_module.tag_gtp_params_with_names(model)
-        model.linear_fc1.config.gated_linear_unit = False
+        weight = GTPShardedParam(torch.ones(4, 4, device="cuda"))
+        weight.group = dist.group.WORLD
+        weight.gtp_replica_group = model.tp_group
+        model.linear_fc1.register_parameter(weight_name, weight)
+
+        # Tagging is also used by training runs that never construct a checkpoint.
         gtp_module.tag_gtp_params_with_names(model)
+        assert weight._debug_name == f"linear_fc1.{weight_name}"
+        with pytest.raises(NotImplementedError, match="checkpointing EGTP-sharded grouped gated"):
+            model.sharded_state_dict()
+
+        model.config.gated_linear_unit = False
+        state = model.sharded_state_dict(metadata={'dp_cp_group': model.tp_group})
+        assert f"linear_fc1.{weight_name}" in state
 
     def test_linear_weight_replaced(self):
         _requires_multi_gpu(4)
