@@ -805,6 +805,8 @@ class MoELayer(BaseMoELayer):
                 comm_stream = get_comm_stream()
                 with torch.cuda.stream(comm_stream):
                     self.fc2_latent_proj.backward_dw()
+                # Callers fire post-wgrad hooks on their own stream; keep them behind this wgrad.
+                torch.cuda.current_stream().wait_stream(comm_stream)
         if shared_experts:
             if self.use_shared_expert and not self.shared_expert_overlap:
                 self.shared_experts.backward_dw()

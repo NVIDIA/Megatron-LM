@@ -6,6 +6,9 @@ its own slot's wgrad callables. ``MoELayer.backward_dw`` computes only half of t
 wgrads, so the mlp and pre-dispatch slots have to partition the delayed-wgrad parameters
 between them; a slot that claims more than it computes reduces a gradient that does not exist
 yet.
+
+``fc2_latent_proj`` is the one wgrad computed off the slot stream (on the comm stream), so its
+hook must also be stream-ordered behind that wgrad, not just issued after it on the host.
 """
 
 from collections import Counter
@@ -31,6 +34,8 @@ NUM_EXPERTS = 4
 HIDDEN_SIZE = 64
 LATENT_SIZE = 32
 SHARED_EXPERT_SIZE = 64
+# Comm-stream stall (~0.1 s) dwarfing the host time to enqueue the hook, so a race always loses.
+SLEEP_CYCLES = 200_000_000
 
 # Submodules whose ``backward_dw`` produces the wgrads of every parameter they own.
 _WGRAD_LEAF_PATHS = (
@@ -42,7 +47,7 @@ _WGRAD_LEAF_PATHS = (
 )
 
 
-def _build_config(moe_latent_size=None, shared_expert_size=None):
+def _build_config(moe_latent_size=None, shared_expert_size=None, overlap=True):
     """Smallest config that reaches the delayed-wgrad fine-grained schedule."""
     kwargs = dict(
         num_layers=1,
@@ -55,8 +60,8 @@ def _build_config(moe_latent_size=None, shared_expert_size=None):
         moe_grouped_gemm=True,
         moe_token_dispatcher_type="alltoall",
         expert_model_parallel_size=EXPERT_PARALLEL_SIZE,
-        overlap_moe_expert_parallel_comm=True,
-        delay_wgrad_compute=True,
+        overlap_moe_expert_parallel_comm=overlap,
+        delay_wgrad_compute=overlap,
         bf16=True,
         params_dtype=torch.bfloat16,
         add_bias_linear=False,
@@ -161,10 +166,7 @@ class _WgradRecorder:
         )
 
 
-@pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
-class TestDelayedWgradHookScope:
-    """The two delayed-wgrad slots must claim exactly the parameters they compute."""
-
+class _EpOverlapTestBase:
     def setup_method(self, method):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
@@ -181,6 +183,11 @@ class TestDelayedWgradHookScope:
         return TransformerLayerSchedulePlan(
             layer, torch.cuda.Event(), DummyState(), get_comp_stream, get_comm_stream, extra_args={}
         )
+
+
+@pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
+class TestDelayedWgradHookScope(_EpOverlapTestBase):
+    """The two delayed-wgrad slots must claim exactly the parameters they compute."""
 
     @pytest.mark.parametrize("moe_latent_size", [None, LATENT_SIZE])
     @pytest.mark.parametrize("shared_expert_size", [None, SHARED_EXPERT_SIZE])
@@ -249,3 +256,69 @@ class TestDelayedWgradHookScope:
 
         recorder.assert_hooks_follow_their_wgrad()
         recorder.assert_every_hook_fired_once()
+
+
+@pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
+class TestFc2LatentProjWgradStreamOrder(_EpOverlapTestBase):
+    """``fc2_latent_proj``'s comm-stream wgrad must be stream-ordered before its hook."""
+
+    def test_hook_observes_comm_stream_wgrad(self):
+        """A hook fired by the mlp slot sees the gradient even when its wgrad is slow."""
+        layer = _build_layer(_build_config(moe_latent_size=LATENT_SIZE), NUM_EXPERTS)
+        mlp = layer.mlp
+        grad_stand_in = torch.zeros(1, device="cuda")
+        wgrad_streams, hook_streams, observed = [], [], []
+
+        def slow_wgrad():
+            wgrad_streams.append(torch.cuda.current_stream())
+            torch.cuda._sleep(SLEEP_CYCLES)
+            grad_stand_in.fill_(1.0)
+
+        def hook():
+            hook_streams.append(torch.cuda.current_stream())
+            observed.append(grad_stand_in.clone())
+
+        mlp.experts.backward_dw = lambda: None
+        mlp.fc2_latent_proj.backward_dw = slow_wgrad
+        for param in mlp.fc2_latent_proj.parameters():
+            param.grad = torch.zeros_like(param)
+            param.post_wgrad_grad_acc_hook = hook
+
+        self._build_plan(layer).mlp.backward_dw()
+        torch.cuda.synchronize()
+
+        assert wgrad_streams == [get_comm_stream()]
+        assert hook_streams and all(s == get_comp_stream() for s in hook_streams)
+        assert all(
+            t.item() == 1.0 for t in observed
+        ), "fc2_latent_proj's post-wgrad hook ran before its comm-stream wgrad finished"
+
+    @pytest.mark.parametrize(
+        "moe_latent_size,overlap,expected_waits",
+        [(None, True, 0), (LATENT_SIZE, False, 0), (LATENT_SIZE, True, 1)],
+        ids=["no-latent", "no-overlap", "latent-overlap"],
+    )
+    def test_sync_only_on_comm_stream_path(
+        self, monkeypatch, moe_latent_size, overlap, expected_waits
+    ):
+        """Only the latent + EP-overlap path, which uses the comm stream, adds a stream wait."""
+        layer = _build_layer(_build_config(moe_latent_size, overlap=overlap), NUM_EXPERTS)
+        mlp = layer.mlp
+        mlp.experts.backward_dw = lambda: None
+        if moe_latent_size is not None:
+            mlp.fc2_latent_proj.backward_dw = lambda: None
+
+        waits = []
+        wait_stream = torch.cuda.Stream.wait_stream
+
+        def recording_wait_stream(stream, other):
+            waits.append((stream, other))
+            wait_stream(stream, other)
+
+        monkeypatch.setattr(torch.cuda.Stream, "wait_stream", recording_wait_stream)
+        mlp.backward_dw()
+        monkeypatch.undo()
+
+        assert len(waits) == expected_waits
+        if expected_waits:
+            assert waits == [(torch.cuda.current_stream(), get_comm_stream())]
