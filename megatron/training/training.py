@@ -2726,9 +2726,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         if config.cuda_graph_impl == "full_iteration":
             # DDP initialization must use the full-iteration capture stream so its retained
             # AccumulateGrad nodes do not reference a different, non-capturing stream.
-            ddp_stream = get_shared_capture_stream(
-                priority=-1 if config.overlap_wgrad_compute else None
-            )
+            ddp_stream = get_shared_capture_stream()
         elif config.cuda_graph_impl == "none":
             # Eager initialization is serialized with the current stream. A one-shot side stream
             # can leave cached blocks unavailable to later allocations on the current stream.

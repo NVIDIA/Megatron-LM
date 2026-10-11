@@ -9,7 +9,6 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..full_cuda_graph import get_shared_capture_stream
 from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
@@ -488,12 +487,11 @@ class DistributedDataParallel(_BaseDataParallel):
         # overlap_wgrad_compute: the weight gradients deferred by the Transformer Engine layers,
         # the MoE routers and the output layer run on this stream, at the lowest priority so they
         # fill what the backward pass leaves free; the backward pass must outrank them, which the
-        # default stream cannot, the full-iteration graph's capture stream does. Each bucket
-        # group reduces its gradients from this stream (see _ParamAndGradBucketGroup).
+        # default stream cannot, the full-iteration graph's capture stream does (raised by the
+        # config, see TransformerConfig). Each bucket group reduces its gradients from this
+        # stream (see _ParamAndGradBucketGroup).
         self.wgrad_stream = None
         if config.overlap_wgrad_compute:
-            if config.cuda_graph_impl == "full_iteration":
-                get_shared_capture_stream(priority=-1)
             self.wgrad_stream = WgradStream()
             for module in self.module.modules():
                 wgrad_store = getattr(module, 'wgrad_store', None)

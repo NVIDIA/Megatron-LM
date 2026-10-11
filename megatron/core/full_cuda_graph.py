@@ -4,7 +4,6 @@
 
 import gc
 import logging
-from typing import Optional
 
 import torch
 
@@ -20,23 +19,32 @@ logger = logging.getLogger(__name__)
 # tools/debug_cuda_graph_pool_memory*.py).
 _shared_graph_pool = None
 _shared_capture_stream = None
+_shared_capture_stream_priority = 0
 
 
-def get_shared_capture_stream(priority: Optional[int] = None):
+def set_shared_capture_stream_priority(priority: int) -> None:
+    """Set the priority the shared capture stream is created with (lower is higher; the
+    captured kernels keep it at replay). Call before the stream is first created, from
+    wherever the configuration is validated; a different priority than that of an existing
+    stream is an error.
+    """
+    global _shared_capture_stream_priority
+    if _shared_capture_stream is not None and _shared_capture_stream.priority != priority:
+        raise RuntimeError(
+            f"The shared capture stream exists with priority {_shared_capture_stream.priority}, "
+            f"priority {priority} can no longer be set."
+        )
+    _shared_capture_stream_priority = priority
+
+
+def get_shared_capture_stream():
     """Return one `torch.cuda.Stream` for all full-iter and optimizer graph captures.
 
-    Call after the target CUDA device is selected. `priority` (lower is higher; captured
-    kernels keep it at replay) applies when the stream is created here; a later caller asking
-    for a different priority than the existing stream's gets an error.
+    Call after the target CUDA device is selected.
     """
     global _shared_capture_stream
     if _shared_capture_stream is None:
-        _shared_capture_stream = torch.cuda.Stream(priority=priority or 0)
-    elif priority is not None and priority != _shared_capture_stream.priority:
-        raise RuntimeError(
-            f"The shared capture stream exists with priority {_shared_capture_stream.priority}; "
-            f"request priority {priority} before the first get_shared_capture_stream() call."
-        )
+        _shared_capture_stream = torch.cuda.Stream(priority=_shared_capture_stream_priority)
     return _shared_capture_stream
 
 

@@ -1637,6 +1637,13 @@ class TransformerConfig(ModelParallelConfig):
         unmet = [name for name, satisfied in requirements.items() if not satisfied]
         if unmet:
             raise ValueError("overlap_wgrad_compute requires " + ", ".join(unmet) + ".")
+        if self.cuda_graph_impl == "full_iteration":
+            # The backward pass must outrank the side stream the weight gradients run on; the
+            # lowest priority is the default one, so the capture stream (which the DDP wrapping,
+            # the capture and the optimizer side stream all create or follow) is raised.
+            from megatron.core.full_cuda_graph import set_shared_capture_stream_priority
+
+            set_shared_capture_stream_priority(-1)
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

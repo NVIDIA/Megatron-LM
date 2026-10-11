@@ -7,6 +7,7 @@ import pytest
 import torch
 from pytest_mock import mocker
 
+import megatron.core.full_cuda_graph as full_cuda_graph
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
@@ -20,6 +21,21 @@ from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+def test_shared_capture_stream_priority_is_set_before_the_stream_exists(monkeypatch):
+    """The priority applies to the stream created later; an existing stream of another
+    priority rejects a change."""
+    monkeypatch.setattr(full_cuda_graph, "_shared_capture_stream", None)
+    monkeypatch.setattr(full_cuda_graph, "_shared_capture_stream_priority", 0)
+
+    full_cuda_graph.set_shared_capture_stream_priority(-1)
+
+    assert full_cuda_graph._shared_capture_stream_priority == -1
+    monkeypatch.setattr(full_cuda_graph, "_shared_capture_stream", Mock(priority=-1))
+    full_cuda_graph.set_shared_capture_stream_priority(-1)
+    with pytest.raises(RuntimeError, match="exists with priority -1"):
+        full_cuda_graph.set_shared_capture_stream_priority(0)
 
 
 def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
