@@ -228,6 +228,11 @@ class MegatronOptimizer(ABC):
         """Stage optimizer-owned model params before an explicit DDP param sync."""
         return
 
+    def discard_scheduled_update(self) -> None:
+        """Drop an update that step() scheduled for the next forward pass but that has not been
+        applied yet (see OptimizerConfig.overlap_optimizer_step_with_forward)."""
+        return
+
     def _stage_model_params_from_main_params(self) -> None:
         """Re-derive this optimizer's model params from its FP32 main params.
 
@@ -1968,6 +1973,34 @@ class ChainedOptimizer(MegatronOptimizer):
                 self.grad_norms_by_group[grad_norm_group] = group_grad_norm
         return self.grad_norms_by_group
 
+    def discard_scheduled_update(self) -> None:
+        for optimizer in self.chained_optimizers:
+            optimizer.discard_scheduled_update()
+
+    @torch.no_grad()
+    def _step_overlapped(self):
+        """Reduce the gradient norm from the bucket-wise partials and schedule every
+        optimizer's update for the next forward pass (overlap_optimizer_step_with_forward)."""
+        optimizers = [
+            o for o in self.chained_optimizers if getattr(o, 'overlapped_step', None) is not None
+        ]
+        grad_norm_sq = torch.zeros(1, dtype=torch.float32, device='cuda')
+        if self.grads_states_parallel_group_is_shared():
+            for optimizer in optimizers:
+                grad_norm_sq += optimizer.overlapped_step.local_grad_norm_sq()
+            torch.distributed.all_reduce(grad_norm_sq, group=self.get_grad_stats_parallel_group())
+        else:
+            for optimizer in optimizers:
+                local_grad_norm_sq = optimizer.overlapped_step.local_grad_norm_sq()
+                torch.distributed.all_reduce(
+                    local_grad_norm_sq, group=optimizer.get_grad_stats_parallel_group()
+                )
+                grad_norm_sq += local_grad_norm_sq
+        grad_norm = grad_norm_sq.sqrt()
+        for optimizer in optimizers:
+            optimizer.overlapped_step.schedule_update(grad_norm)
+        return True, grad_norm, None
+
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one.
@@ -1975,6 +2008,8 @@ class ChainedOptimizer(MegatronOptimizer):
         Parameters in a registered grad_norm_group are excluded from the main gradient
         norm and clipped independently using their group norm.
         """
+        if self.config is not None and self.config.overlap_optimizer_step_with_forward:
+            return self._step_overlapped()
         self.grad_norms_by_group = {}
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
