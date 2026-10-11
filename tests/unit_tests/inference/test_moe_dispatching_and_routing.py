@@ -284,18 +284,20 @@ class TestNCCLAllGatherDispatcher:
         assert dispatcher.topk == NANOV3_BASE["moe_router_topk"]
         assert dispatcher.ep_size == Utils.world_size
 
-    def test_init_rejects_batch_invariant_ep(self):
-        """Batch-invariant MoE on the inference EP path is NVLS-only on this branch."""
+    @pytest.mark.parametrize("collective", ["ordered", "multimem"])
+    def test_init_rejects_batch_invariant_ep(self, collective):
+        """Both BI collectives require the NVLS MoE dispatcher when EP > 1."""
         if Utils.world_size == 1:
             pytest.skip("NCCL batch-invariant rejection is only relevant with expert parallelism.")
 
         with pytest.raises(ValueError, match="requires inference_moe_token_dispatcher_type"):
             self._make_dispatcher(
                 batch_invariant_mode=True,
+                batch_invariant_collective=collective,
                 attention_backend=AttnBackend.flash,
                 flash_attention_version=4,
                 attention_dropout=0.0,
-                inference_grouped_gemm_backend="torch",
+                inference_grouped_gemm_backend="vllm",
                 inference_moe_token_dispatcher_type="nccl",
             )
 
@@ -364,6 +366,154 @@ class TestNCCLAllGatherDispatcher:
         assert combined.shape == (local_tokens, hidden_size)
         expected = (global_hidden[offset : offset + local_tokens].float() * ep_size).bfloat16()
         torch.testing.assert_close(combined, expected)
+
+    @pytest.mark.parametrize("use_allgather_v", [False, True])
+    def test_dispatch_packs_tensors_into_one_all_gather(self, use_allgather_v, monkeypatch):
+        """Without gradients, hidden states, probs and routing travel in one all-gather."""
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if Utils.world_size == 1:
+            pytest.skip("The packed all-gather requires EP > 1.")
+        dispatcher = self._make_dispatcher()
+        ep_size, rank = dispatcher.ep_size, torch.distributed.get_rank()
+        tokens_per_rank = [r + 1 for r in range(ep_size)] if use_allgather_v else [3] * ep_size
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", use_allgather_v)
+        hidden_size, topk = NANOV3_BASE["hidden_size"], NANOV3_BASE["moe_router_topk"]
+        total = sum(tokens_per_rank)
+        global_hidden = torch.randn(total, hidden_size, device="cuda").to(torch.bfloat16)
+        global_probs = torch.randn(total, topk, device="cuda")
+        global_routing = torch.randint(
+            -1, NANOV3_BASE["num_moe_experts"], (total, topk), device="cuda"
+        )
+        for t in (global_hidden, global_probs, global_routing):
+            torch.distributed.broadcast(t, src=0)
+        start = sum(tokens_per_rank[:rank])
+        local = slice(start, start + tokens_per_rank[rank])
+        dispatcher.routing_map = global_routing[local].clone()
+
+        calls = []
+        all_gather = torch.distributed.all_gather_into_tensor
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_into_tensor",
+            lambda out, inp, *a, **k: calls.append(inp.dtype) or all_gather(out, inp, *a, **k),
+        )
+        with torch.no_grad():
+            d_hidden, d_probs = dispatcher.token_dispatch(
+                global_hidden[local].clone(), global_probs[local].clone()
+            )
+        # One packed gather (plus the per-step token-count gather on the prefill path).
+        assert calls == ([torch.int32] if use_allgather_v else []) + [torch.uint8]
+        assert d_hidden.is_contiguous() and d_probs.is_contiguous()
+        assert dispatcher.routing_map.is_contiguous()
+        assert torch.equal(d_hidden.view(torch.int16), global_hidden.view(torch.int16))
+        assert torch.equal(d_probs.view(torch.int32), global_probs.view(torch.int32))
+        assert torch.equal(dispatcher.routing_map, global_routing)
+
+    @pytest.mark.parametrize("use_allgather_v", [False, True])
+    @pytest.mark.parametrize("grad_input", ["hidden", "probs"])
+    def test_dispatch_protocol_with_rank_local_gradients(
+        self, use_allgather_v, grad_input, monkeypatch
+    ):
+        """Detached ranks must issue the same collectives as ranks requiring gradients."""
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if Utils.world_size < 2:
+            pytest.skip("Rank-local gradient flags require EP > 1.")
+        dispatcher = self._make_dispatcher()
+        ep_size, rank = dispatcher.ep_size, torch.distributed.get_rank()
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", use_allgather_v)
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_local_tokens_per_rank", [4] * ep_size)
+        dispatcher._runs_metadata_sync = False
+        hidden = torch.full(
+            (4, NANOV3_BASE["hidden_size"]), rank, device="cuda", dtype=torch.bfloat16
+        )
+        probs = torch.full(
+            (4, NANOV3_BASE["moe_router_topk"]), rank, device="cuda", dtype=torch.float32
+        )
+        routing = torch.full_like(probs, rank, dtype=torch.int64)
+        (hidden if grad_input == "hidden" else probs).requires_grad_(bool(rank % 2))
+        calls = []
+
+        def gather_local(tensor, **kwargs):
+            calls.append(tensor.dtype)
+            return tensor.repeat(ep_size, 1)
+
+        def gather_into_local(output, tensor, **kwargs):
+            output.copy_(gather_local(tensor))
+
+        # Inspect every rank's protocol before issuing real collectives. This makes
+        # a regression fail with an assertion instead of hanging mismatched NCCL calls.
+        with torch.enable_grad():
+            with monkeypatch.context() as patch:
+                patch.setattr(torch.distributed, "all_gather_into_tensor", gather_into_local)
+                patch.setattr(
+                    "megatron.core.transformer.moe.token_dispatcher_inference."
+                    "gather_from_sequence_parallel_region",
+                    gather_local,
+                )
+                dispatcher.routing_map = routing
+                dispatcher.token_dispatch(hidden, probs)
+            protocols = [None] * ep_size
+            torch.distributed.all_gather_object(protocols, calls, group=dispatcher.ep_group)
+            expected = [torch.bfloat16, torch.float32, torch.int64]
+            if not use_allgather_v:
+                expected.reverse()
+            assert all(protocol == expected for protocol in protocols), protocols
+
+            dispatcher.routing_map = routing
+            gathered_hidden, gathered_probs = dispatcher.token_dispatch(hidden, probs)
+        for gathered in (gathered_hidden, gathered_probs, dispatcher.routing_map):
+            expected_rows = torch.arange(ep_size, device="cuda", dtype=gathered.dtype)
+            expected_rows = expected_rows.repeat_interleave(4)[:, None].expand_as(gathered)
+            torch.testing.assert_close(gathered, expected_rows, atol=0, rtol=0)
+
+    def test_dispatch_keeps_autograd_with_gradients(self, monkeypatch):
+        """With gradients enabled, the gathers stay differentiable (no packed raw collective)."""
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if Utils.world_size == 1:
+            pytest.skip("The packed all-gather requires EP > 1.")
+        dispatcher = self._make_dispatcher()
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", False)
+        hidden_size, topk = NANOV3_BASE["hidden_size"], NANOV3_BASE["moe_router_topk"]
+        hidden = torch.randn(
+            4, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        probs = torch.rand(4, topk, device="cuda")
+        dispatcher.routing_map = torch.zeros(4, topk, device="cuda", dtype=torch.int64)
+        d_hidden, _ = dispatcher.token_dispatch(hidden, probs)
+        assert d_hidden.requires_grad
+        d_hidden.float().sum().backward()
+        expected = torch.full_like(hidden, dispatcher.ep_size)
+        torch.testing.assert_close(hidden.grad, expected, atol=0, rtol=0)
+
+
+def test_packed_row_layout_keeps_alignment():
+    """Rows pack widest-first; a layout that would misalign a segment is refused."""
+    from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+    hidden = torch.randn(5, 2688).to(torch.bfloat16)
+    probs = torch.randn(5, 6)
+    routing = torch.randint(0, 128, (5, 6))
+    order, offsets, row_bytes = NCCLAllGatherDispatcher._packed_row_layout((hidden, probs, routing))
+    assert order == [2, 1, 0] and offsets == [72, 48, 0] and row_bytes == 5448
+    layout = (order, offsets, row_bytes)
+    unpacked = NCCLAllGatherDispatcher._unpack_rows(
+        NCCLAllGatherDispatcher._pack_rows((hidden, probs, routing), layout),
+        (hidden, probs, routing),
+        layout,
+    )
+    for got, want in zip(unpacked, (hidden, probs, routing)):
+        assert got.dtype == want.dtype and got.is_contiguous() and torch.equal(got, want)
+    # 5 bf16 + 3 fp32 + 3 int64 = 46-byte rows: the next row's int64 would be misaligned.
+    assert (
+        NCCLAllGatherDispatcher._packed_row_layout((hidden[:, :5], probs[:, :3], routing[:, :3]))
+        is None
+    )
+    assert (
+        NCCLAllGatherDispatcher._packed_row_layout((hidden.view(5, 2, -1), probs, routing)) is None
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -515,6 +665,418 @@ class TestNVLSAllGatherVDispatcher:
 
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("max_rank_tokens", [1, 7, 17, 64, 256])
+    def test_cuda_graph_dispatch_masks_routing_padding(self, max_rank_tokens, monkeypatch):
+        """The AGV gathers rows at or past the real token count as -1 routing entries.
+
+        Matches mask_routing_padding applied to every rank's local routing map
+        before the gather, for a real token count that changes between replays.
+        Hidden states and probabilities are gathered unchanged.
+        """
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        torch.manual_seed(max_rank_tokens)
+        dispatcher = self._make_dispatcher()
+        ep_size = dispatcher.ep_size
+        if ep_size < 2:
+            pytest.skip("The AGV routing mask runs only at expert-parallel world_size > 1.")
+        hidden_size = NANOV3_BASE["hidden_size"]
+        topk = NANOV3_BASE["moe_router_topk"]
+        rank = torch.distributed.get_rank()
+
+        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
+        start = sum(tokens_per_rank[:rank])
+        global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
+        global_routing_map = torch.randint(0, 128, (total_tokens, topk), device="cuda")
+        torch.distributed.broadcast(global_hidden, src=0)
+        torch.distributed.broadcast(global_probs, src=0)
+        torch.distributed.broadcast(global_routing_map, src=0)
+        static_hidden = global_hidden[start : start + local_tokens].contiguous()
+        static_probs = global_probs[start : start + local_tokens].contiguous()
+        static_routing_map = global_routing_map[start : start + local_tokens].contiguous()
+
+        # mask_routing_padding's frame: local row i of rank r is row i + sp_rank_r * rows_r.
+        row_offsets = [torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(ep_size)]
+        torch.distributed.all_gather(
+            row_offsets,
+            torch.tensor([dispatcher.sp_rank * local_tokens], dtype=torch.int64, device="cuda"),
+        )
+        frame_rows = torch.cat(
+            [
+                torch.arange(n, device="cuda") + offset
+                for n, offset in zip(tokens_per_rank, row_offsets)
+            ]
+        )
+
+        real_token_count = torch.full((1,), total_tokens, dtype=torch.int32, device="cuda")
+        monkeypatch.setattr(NVLSAllGatherVDispatcher, "_real_token_count_tensor", real_token_count)
+
+        def run():
+            dispatcher.routing_map = static_routing_map
+            dispatcher._local_tokens = local_tokens
+            d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
+            return (
+                d_hidden[:total_tokens].clone(),
+                d_probs[:total_tokens].clone(),
+                dispatcher.routing_map[:total_tokens].clone(),
+            )
+
+        with torch.no_grad():
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    run()
+            torch.cuda.current_stream().wait_stream(s)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_hidden, graph_probs, graph_routing = run()
+
+        # Large -> small -> large, including no real tokens and no padding.
+        for count in sorted({total_tokens, max(total_tokens // 2, 1), 1, 0, total_tokens}):
+            for value in (count, total_tokens, count):
+                real_token_count.fill_(value)
+                graph.replay()
+                expected = torch.where((frame_rows >= value)[:, None], -1, global_routing_map)
+                torch.testing.assert_close(graph_routing, expected, atol=0, rtol=0)
+                assert torch.equal(graph_hidden.view(torch.int16), global_hidden.view(torch.int16))
+                assert torch.equal(graph_probs.view(torch.int32), global_probs.view(torch.int32))
+
+    @pytest.mark.parametrize("with_shared", [True, False])
+    @pytest.mark.parametrize("max_rank_tokens", [1, 7, 64, 256])
+    def test_cuda_graph_combine_fuses_cast_and_shared_add(
+        self, max_rank_tokens, with_shared, monkeypatch
+    ):
+        """The bf16 RSV output (+ shared expert) is bitwise the unfused combine.
+
+        Reference: the same NVLS reduction into fp32, cast to bf16, then the
+        bf16 + bf16 shared-expert addition from combine_postprocess. Inputs change
+        between graph replays and include round-to-nearest-even ties, values that
+        overflow bf16, cancellation to zero and mixed magnitudes.
+        """
+        from megatron.core.inference.communication.torch_symm_triton import (
+            multimem_reduce_scatter_v,
+        )
+        from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        dispatcher = self._make_dispatcher()
+        ep_size = dispatcher.ep_size
+        if ep_size < 2:
+            pytest.skip("The NVLS reduce-scatter runs only at expert-parallel world_size > 1.")
+        if SharedExpertMLP.stream is None:
+            monkeypatch.setattr(SharedExpertMLP, "stream", torch.cuda.Stream())
+        hidden_size = NANOV3_BASE["hidden_size"]
+        topk = NANOV3_BASE["moe_router_topk"]
+        rank = torch.distributed.get_rank()
+        rsv = NVLSAllGatherVDispatcher._symm_rsv
+
+        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
+        start = sum(tokens_per_rank[:rank])
+        static_hidden = torch.zeros(local_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        static_probs = torch.zeros(local_tokens, topk, device="cuda", dtype=torch.float32)
+        static_routing_map = torch.zeros(local_tokens, topk, dtype=torch.int64, device="cuda")
+        shared = torch.zeros(local_tokens, 1, hidden_size, device="cuda", dtype=torch.bfloat16)
+
+        def fill_inputs(seed):
+            """This rank's fp32 partials for all tokens, and its tokens' shared output."""
+            gen = torch.Generator(device="cuda").manual_seed(seed * 131 + rank)
+            partial = torch.randn(total_tokens, hidden_size, generator=gen, device="cuda")
+            scale = torch.pow(
+                10.0, torch.randint(-4, 5, (total_tokens, 1), generator=gen, device="cuda")
+            )
+            partial = partial * scale
+            # Row 0: rank 0 alone holds exact bf16 ties (half-way between bf16 values,
+            # both even and odd lower neighbours) and huge values; others add zero.
+            ties = (torch.arange(hidden_size, device="cuda", dtype=torch.int32) << 16) | 0x8000
+            partial[0] = ties.view(torch.float32) if rank == 0 else 0.0
+            if rank == 0:
+                partial[0, :4] = torch.tensor([3.4e38, -3.4e38, 1e-40, -0.0])
+            rsv["tensor"][:total_tokens].copy_(partial)
+            g = torch.Generator(device="cuda").manual_seed(seed * 7 + rank)
+            shared.copy_(
+                (torch.randn(local_tokens, 1, hidden_size, generator=g, device="cuda") * 4).to(
+                    torch.bfloat16
+                )
+            )
+
+        def unfused_reference(add_shared=with_shared):
+            out = torch.empty(local_tokens, hidden_size, device="cuda", dtype=torch.float32)
+            multimem_reduce_scatter_v(
+                out,
+                rsv["tensor"],
+                rsv["handle"],
+                rank_token_offset=dispatcher._rank_token_offset(),
+                ep_max_tokens=dispatcher._ep_max_tokens(),
+                per_rank_max_tokens=dispatcher._per_rank_worst_case_token_count,
+            )
+            out = out.to(torch.bfloat16).view(shared.shape)
+            return out + shared if add_shared else out
+
+        def run():
+            dispatcher.routing_map = static_routing_map
+            dispatcher._local_tokens = local_tokens
+            dispatcher.hidden_shape = shared.shape
+            dispatcher.token_dispatch(static_hidden, static_probs)
+            if with_shared:
+                SharedExpertMLP.stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(SharedExpertMLP.stream):
+                    dispatcher._shared_expert_output = shared.clone()
+            combined = dispatcher.token_combine(rsv["tensor"])
+            assert dispatcher._shared_expert_output is None
+            return dispatcher.combine_postprocess(combined)
+
+        def sync_ranks():
+            # Partials are rewritten in place: no rank may overwrite its buffer while
+            # a peer's reduce-scatter could still be reading it.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+
+        with torch.no_grad():
+            fill_inputs(seed=0)
+            sync_ranks()
+            eager = run()
+            reference = unfused_reference()
+            torch.cuda.synchronize()
+            assert eager.dtype == torch.bfloat16 and eager.shape == shared.shape
+            assert torch.equal(eager.view(torch.int16), reference.view(torch.int16))
+
+            sync_ranks()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_out = run()
+            for seed in (1, 2, 3):
+                sync_ranks()
+                fill_inputs(seed)
+                if with_shared and seed == 2:
+                    # Cancellation: the shared output negates the routed result.
+                    sync_ranks()
+                    shared.copy_(-unfused_reference(add_shared=False))
+                sync_ranks()
+                graph.replay()
+                reference = unfused_reference()
+                torch.cuda.synchronize()
+                assert torch.equal(graph_out.view(torch.int16), reference.view(torch.int16)), seed
+
+    @pytest.mark.parametrize("grad_enabled", [False, True])
+    def test_shared_output_preserves_autograd(self, grad_enabled, monkeypatch):
+        """Use the fused add without gradients and retain the shared-output edge otherwise."""
+        from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        dispatcher = self._make_dispatcher()
+        if dispatcher.ep_size < 2:
+            pytest.skip("The fused NVLS add requires EP > 1.")
+        if SharedExpertMLP.stream is None:
+            monkeypatch.setattr(SharedExpertMLP, "stream", torch.cuda.Stream())
+        hidden = torch.zeros(3, 1, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16)
+        routes = torch.zeros(3, NANOV3_BASE["moe_router_topk"], device="cuda", dtype=torch.int64)
+        probs = torch.zeros_like(routes, dtype=torch.float32)
+        with torch.no_grad():
+            dispatched, probs = dispatcher.dispatch_preprocess(hidden, routes, probs)
+            dispatcher.token_dispatch(dispatched, probs)
+            partials = NVLSAllGatherVDispatcher._symm_rsv["tensor"]
+            partials.zero_()
+        with torch.set_grad_enabled(grad_enabled):
+            shared = torch.ones_like(hidden, requires_grad=True)
+            dispatcher._shared_expert_output = shared
+            combined = dispatcher.token_combine(partials)
+            assert (dispatcher._shared_expert_output is shared) == grad_enabled
+            output = dispatcher.combine_postprocess(combined)
+            torch.testing.assert_close(output, shared, atol=0, rtol=0)
+            assert output.requires_grad == grad_enabled
+            if grad_enabled:
+                output.sum().backward()
+                torch.testing.assert_close(shared.grad, torch.ones_like(shared), atol=0, rtol=0)
+
+    def test_moe_layer_launches_shared_expert_between_router_and_agv(self, monkeypatch):
+        """The overlapped shared expert is enqueued after routing and right before the AGV.
+
+        Its TP all-gather and reduce-scatter spin until every TP peer joins, as the AGV
+        does for every EP peer. Enqueued before routing, a rank can spin in the shared
+        expert's reduce-scatter while its router kernels and AGV are not yet scheduled,
+        as a peer spins in the AGV with its reduce-scatter not yet started: a hang.
+        """
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("The NVLS dispatcher overlaps the shared expert only at EP > 1.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvls",
+            moe_shared_expert_overlap=True,
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            ep_group=get_expert_model_parallel_group(),
+        )
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        dispatcher = layer._inference_token_dispatcher
+        assert dispatcher.shared_experts is layer.shared_experts
+        calls = []
+
+        def record(name, method):
+            def wrapper(*args, **kwargs):
+                calls.append(name)
+                return method(*args, **kwargs)
+
+            return wrapper
+
+        monkeypatch.setattr(layer, "route", record("route", layer.route))
+        monkeypatch.setattr(
+            dispatcher, "launch_shared_expert", record("shared", dispatcher.launch_shared_expert)
+        )
+        monkeypatch.setattr(dispatcher, "token_dispatch", record("agv", dispatcher.token_dispatch))
+        hidden = torch.randn(7, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), InferenceMode.active():
+            layer(hidden)
+        torch.cuda.synchronize()
+        assert calls == ["route", "shared", "agv"]
+        assert dispatcher._shared_expert_output is None
+
+    def test_moe_layer_replaces_stale_shared_expert_output(self):
+        """A shared-expert output left by an interrupted forward is never added later.
+
+        Every forward launches the overlapped shared expert anew and replaces
+        _shared_expert_output, so a value left behind by a forward that raised
+        between dispatch and combine cannot reach the next reduce-scatter.
+        """
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("The NVLS dispatcher overlaps the shared expert only at EP > 1.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvls",
+            moe_shared_expert_overlap=True,
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            ep_group=get_expert_model_parallel_group(),
+        )
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        dispatcher = layer._inference_token_dispatcher
+        assert dispatcher.shared_experts is layer.shared_experts
+        hidden = torch.randn(7, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), InferenceMode.active():
+            expected, _ = layer(hidden)
+            dispatcher._shared_expert_output = torch.full_like(hidden, float("nan"))
+            output, _ = layer(hidden)
+        torch.cuda.synchronize()
+        assert dispatcher._shared_expert_output is None
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("local_tokens", [1, 7, 64])
+    def test_moe_layer_overlapped_shared_expert_matches_sequential(self, local_tokens):
+        """An NVLS MoE layer's overlapped shared expert is bitwise its sequential form.
+
+        Overlapped, the shared expert starts on its stream after routing and is added
+        inside the reduce-scatter; sequentially, it runs before routing on the main
+        stream and is added after the combine. Checked eagerly and over CUDA Graph
+        replays with new inputs.
+        """
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("The NVLS dispatcher overlaps the shared expert only at EP > 1.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+
+        torch.manual_seed(2029)
+        torch.cuda.manual_seed(2029)
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvls",
+            moe_shared_expert_overlap=True,
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            ep_group=get_expert_model_parallel_group(),
+        )
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        dispatcher = layer._inference_token_dispatcher
+        assert dispatcher.shared_experts is layer.shared_experts
+        rank = torch.distributed.get_rank()
+        static_hidden = torch.empty(
+            local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+
+        def forward(overlap):
+            # The layer re-reads shared_expert_overlap from its dispatcher every forward.
+            dispatcher.shared_experts = layer.shared_experts if overlap else None
+            output, _ = layer(static_hidden)
+            assert layer.shared_expert_overlap == overlap
+            assert dispatcher._shared_expert_output is None
+            return output
+
+        def new_inputs(seed):
+            gen = torch.Generator(device="cuda").manual_seed(seed * 17 + rank)
+            static_hidden.copy_(
+                torch.randn(static_hidden.shape, generator=gen, device="cuda").to(torch.bfloat16)
+            )
+
+        with torch.no_grad(), InferenceMode.active():
+            new_inputs(0)
+            reference = forward(overlap=False).clone()
+            overlapped = forward(overlap=True).clone()
+            assert torch.equal(overlapped.view(torch.int16), reference.view(torch.int16))
+
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(2):
+                    forward(overlap=True)
+            torch.cuda.current_stream().wait_stream(s)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = forward(overlap=True)
+            for seed in (1, 2, 3):
+                new_inputs(seed)
+                graph.replay()
+                replayed = graph_output.clone()
+                reference = forward(overlap=False)
+                torch.cuda.synchronize()
+                assert torch.equal(replayed.view(torch.int16), reference.view(torch.int16)), seed
+            dispatcher.shared_experts = layer.shared_experts
 
     def test_cuda_graph_batch_invariant_combine_uses_ordered_symmetric_memory(self, monkeypatch):
         """Batch-invariant mode should use ordered peer loads on NVLS dispatcher.

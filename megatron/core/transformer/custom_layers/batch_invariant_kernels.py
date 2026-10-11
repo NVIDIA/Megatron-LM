@@ -613,6 +613,36 @@ _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GROUPED_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_APPLY_NORM_ORIGS: Dict[str, Any] = {}
+_TE_REDUCE_SCATTER_ORIGS: Dict[str, Any] = {}
+
+
+def _te_reduce_scatter_batch_invariant(inp, tp_group, async_op=False, output=None):
+    """Use the same ordered reduction in TE training and optimized inference.
+
+    Completing on the caller's CUDA stream and returning no Work is supported
+    by TE's collective contract. Deliberately forgo asynchronous overlap in this
+    correctness mode: accumulation must follow the all-to-all transfer.
+    """
+    from megatron.core.tensor_parallel.mappings import _reduce_scatter_along_first_dim_ordered
+
+    # Preserve TE's identity path, including its treatment of an output buffer.
+    if not torch.distributed.is_initialized() or torch.distributed.get_world_size(tp_group) == 1:
+        return inp, None
+    # Compatibility with TE's public helper: None denotes the default group.
+    # The ordered primitive itself always receives an explicit process group.
+    if tp_group is None:
+        tp_group = torch.distributed.group.WORLD
+    result = _reduce_scatter_along_first_dim_ordered(inp, tp_group)
+    if output is not None:
+        if (
+            output.shape != result.shape
+            or output.dtype != result.dtype
+            or output.device != result.device
+        ):
+            raise ValueError("reduce-scatter output must match the result shape, dtype and device")
+        output.copy_(result)
+        result = output
+    return result, None
 
 
 def _import_module_if_available(name: str):
@@ -647,6 +677,21 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
     import transformer_engine.pytorch as te
     import transformer_engine.pytorch.cpp_extensions as te_cpp
+
+    # Patch both the public helper and its imported aliases. Leaving TE's BF16
+    # NCCL reduction in training would break parity with ordered inference.
+    for module_name in (
+        "distributed",
+        "module.linear",
+        "module.layernorm_linear",
+        "module.layernorm_mlp",
+        "ops.basic.basic_linear",
+    ):
+        module = _import_module_if_available(f"transformer_engine.pytorch.{module_name}")
+        if module is not None and hasattr(module, "reduce_scatter_along_first_dim"):
+            if module_name not in _TE_REDUCE_SCATTER_ORIGS:
+                _TE_REDUCE_SCATTER_ORIGS[module_name] = module.reduce_scatter_along_first_dim
+                module.reduce_scatter_along_first_dim = _te_reduce_scatter_batch_invariant
 
     if not skip_gemm:
         # Patch general_gemm once
@@ -992,6 +1037,11 @@ def _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate)
 def _te_unpatch_for_batch_invariant():
     """Restore original Transformer Engine functions if they were patched."""
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
+    for module_name, original in list(_TE_REDUCE_SCATTER_ORIGS.items()):
+        module = _import_module_if_available(f"transformer_engine.pytorch.{module_name}")
+        if module is not None:
+            module.reduce_scatter_along_first_dim = original
+        del _TE_REDUCE_SCATTER_ORIGS[module_name]
     te_cpp = _import_module_if_available("transformer_engine.pytorch.cpp_extensions")
     te = _import_module_if_available("transformer_engine.pytorch")
     if te_cpp is None or te is None:

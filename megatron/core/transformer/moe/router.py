@@ -7,6 +7,8 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID_TOPK_KERNEL
+from megatron.core.inference.moe.sigmoid_topk import sigmoid_topk_routing
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
@@ -1284,6 +1286,36 @@ class InferenceTopKRouter(TopKRouter):
             precomputed_indices=precomputed_indices,
         )
 
+    def _uses_sigmoid_topk_kernel(
+        self, logits: torch.Tensor, precomputed_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether sigmoid_topk_routing reproduces the compiled routing for this call.
+
+        It covers sigmoid scores with an expert bias, fp32 logits and 1 < top-k < 8,
+        with gradients disabled, without group-limited routing, router replay,
+        precomputed indices or TE's
+        fused router; batch-invariant mode keeps its uncompiled reference path. Below
+        inductor's small-reduction unroll threshold (8) the compiled path sums the k
+        scores left to right in slot order, as the kernel does; at top-k 8 it reduces
+        in another order (measured on GB300: bit-identical for top-k 2-7, not 8).
+        """
+        return (
+            HAVE_SIGMOID_TOPK_KERNEL
+            and logits.is_cuda
+            and logits.dtype == torch.float32
+            # InferenceMode is independent of autograd. With gradients enabled,
+            # the reference uses sorted top-k and retains probability gradients.
+            and not torch.is_grad_enabled()
+            and self.score_function == "sigmoid"
+            and self.expert_bias is not None
+            and 1 < self.topk < 8
+            and precomputed_indices is None
+            and self.config.moe_router_group_topk is None
+            and not self.config.moe_router_fusion
+            and self.router_replay is None
+            and not is_batch_invariant_mode_enabled()
+        )
+
     def _forward(
         self,
         input: torch.Tensor,
@@ -1307,6 +1339,16 @@ class InferenceTopKRouter(TopKRouter):
         precomputed_indices = None
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
+
+        if self._uses_sigmoid_topk_kernel(logits, precomputed_indices):
+            # One launch with the same bits as the compiled no-grad path below.
+            probs, top_indices = sigmoid_topk_routing(
+                logits.contiguous(),
+                self.expert_bias.float(),
+                self.topk,
+                self.config.moe_router_topk_scaling_factor,
+            )
+            return probs, top_indices
 
         routing = (
             topk_routing_with_score_function

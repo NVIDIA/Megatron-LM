@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
@@ -31,7 +32,7 @@ from megatron.core.transformer.moe.experts import (
     _te_supports_scaled_tanh_srelu,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -371,6 +372,35 @@ class TestMoEModules:
             grad_output=grad_output,
             contention=hash_routing,
             what=f"TopKRouter[{balancing}, hash={hash_routing}]",
+        )
+
+    def test_inference_topk_router_replays(self):
+        """Inference router, sigmoid scores with expert bias: the single-kernel top-k path."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=128,
+            moe_router_topk=6,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0.0,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_topk_scaling_factor=2.5,
+        )
+        router = InferenceTopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        with torch.no_grad():
+            router.expert_bias.uniform_(-0.05, 0.05)
+        hidden = torch.randn(512, 1, 1024, device="cuda", dtype=torch.bfloat16)
+
+        def route(h):
+            with InferenceMode.active(), torch.inference_mode():
+                return router(h)
+
+        assert_replays_bit_exact(
+            route, (hidden,), replays=3, backward=False, what="InferenceTopKRouter[sigmoid+bias]"
         )
 
     @pytest.mark.skipif(

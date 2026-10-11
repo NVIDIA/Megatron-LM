@@ -510,6 +510,45 @@ def test_vllm_fused_moe_and_moe_sum_replay():
         fn, (hidden_states, probs), replays=4, backward=False, what="vllm_fused_moe"
     )
 
+    # Decode-sized steps at Nemotron 3.5 Lightning expert shapes: the multi-CTA
+    # indirection-table builder with 2 (8 tokens) and 24 (128 tokens) working
+    # CTAs, an 8-token hint for 256 valid tokens and, on GB300, the measured
+    # launch configs.
+    decode_hidden, decode_ffn, decode_topk = 2688, 1856, 6
+    decode_routing = torch.rand(256, 128, device="cuda").topk(decode_topk, dim=1).indices
+    decode_hidden_states = torch.randn(256, decode_hidden, device="cuda", dtype=torch.bfloat16)
+    decode_probs = torch.rand(256, decode_topk, device="cuda")
+    decode_fc1 = torch.randn(experts, decode_ffn, decode_hidden, device="cuda").bfloat16() * 0.02
+    decode_fc2 = torch.randn(experts, decode_hidden, decode_ffn, device="cuda").bfloat16() * 0.02
+    # Overestimated prefill hints on either side of the multi-CTA builder's pair
+    # limit: both use 128-row tiles and the multi-kernel builder, with the same
+    # valid prefix and reusable buffers.
+    for decode_tokens, hint in ((8, 8), (128, 128), (256, 8), (256, 1025), (256, 2049)):
+        decode_valid = _dev_scalar(decode_tokens)
+
+        def decode_fn(h, p, decode_valid=decode_valid, decode_tokens=decode_tokens, hint=hint):
+            out = vllm_fused_moe(
+                h,
+                p,
+                decode_fc1,
+                decode_fc2,
+                ActivationType.SQUARED_RELU,
+                experts,
+                0,
+                decode_valid,
+                decode_routing,
+                num_tokens_hint=hint,
+            )
+            return out[:decode_tokens]
+
+        assert_replays_bit_exact(
+            decode_fn,
+            (decode_hidden_states, decode_probs),
+            replays=4,
+            backward=False,
+            what=f"vllm_fused_moe (decode, {decode_tokens} tokens, hint {hint})",
+        )
+
     inp = torch.randn(max_tokens * topk, 2688, device="cuda", dtype=torch.bfloat16)
 
     def moe_sum(inp, p):
@@ -517,6 +556,21 @@ def test_vllm_fused_moe_and_moe_sum_replay():
         return out[: max_tokens - 100]
 
     assert_replays_bit_exact(moe_sum, (inp, probs), replays=4, backward=False, what="_moe_sum")
+
+
+def test_sigmoid_topk_routing_replay():
+    from megatron.core.inference.moe.sigmoid_topk import sigmoid_topk_routing
+
+    seeded()
+    logits = torch.randn(2048, 128, device="cuda")
+    expert_bias = torch.randn(128, device="cuda") * 0.05
+    assert_replays_bit_exact(
+        lambda lg, b: sigmoid_topk_routing(lg, b, 6, 2.5),
+        (logits, expert_bias),
+        replays=4,
+        backward=False,
+        what="sigmoid_topk_routing",
+    )
 
 
 # --- batch-invariant kernels -----------------------------------------------------------------

@@ -202,6 +202,47 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
     return output
 
 
+def _reduce_scatter_along_first_dim_ordered(
+    input_: torch.Tensor, group: torch.distributed.ProcessGroup
+) -> torch.Tensor:
+    """Reduce dim 0 in group-rank order, independently of the output's owner.
+
+    NCCL's low-precision reduction order can depend on the destination rank and
+    message size. Changing the batch can therefore change even an unchanged
+    token's result. Transfer the contributions without arithmetic, accumulate
+    them in a fixed rank order in FP32 (FP64 for FP64 inputs), then cast once.
+
+    This is a synchronous, non-autograd primitive for inference and the explicit
+    forward/backward implementations in Transformer Engine. The caller must
+    provide the process group. Unlike a native reduce-scatter, it retains every
+    incoming contribution until accumulation; batch invariance has a memory and
+    communication cost. It supports CUDA graph capture after collective warmup.
+    """
+    if group is None:
+        raise ValueError(
+            "_reduce_scatter_along_first_dim_ordered requires an explicit process group"
+        )
+    world_size = torch.distributed.get_world_size(group)
+    if world_size == 1:
+        return input_
+    if input_.ndim == 0 or input_.size(0) % world_size:
+        raise ValueError("First dimension must be divisible by the process group size")
+    if input_.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise TypeError("_reduce_scatter_along_first_dim_ordered requires floating-point input")
+
+    shape = (input_.size(0) // world_size, *input_.shape[1:])
+    if input_.numel() == 0:
+        return input_.new_empty(shape)
+    received = torch.empty_like(input_, memory_format=torch.contiguous_format)
+    torch.distributed.all_to_all_single(received, input_.contiguous(), group=group)
+    contributions = received.reshape(world_size, *shape)
+    accumulation_dtype = torch.float64 if input_.dtype == torch.float64 else torch.float32
+    output = torch.zeros_like(contributions[0], dtype=accumulation_dtype)
+    for source_rank in range(world_size):
+        output = output + contributions[source_rank].to(accumulation_dtype)
+    return output.to(input_.dtype)
+
+
 class _CopyToModelParallelRegion(torch.autograd.Function):
     """Pass the input to the model parallel region."""
 

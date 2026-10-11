@@ -268,9 +268,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="tensor_parallel_mappings",
         sources=("megatron/core/tensor_parallel/mappings.py",),
-        tests=(C + "test_transformer_layer.py", C + "test_gpt_model.py"),
+        tests=(
+            C + "test_transformer_layer.py",
+            C + "test_gpt_model.py",
+            K + "test_tp_batch_invariant.py",
+        ),
         kind="external-lib",
-        notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite.",
+        notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite. "
+        "Ordered BI reduction is tested for shape/owner invariance, CUDA graph replay, and shared TE training/inference reduction.",
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",
@@ -526,6 +531,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/activations.py",
             "megatron/core/inference/moe/batch_invariant.py",
             "megatron/core/inference/moe/permute.py",
+            "megatron/core/inference/moe/sigmoid_topk.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
@@ -534,6 +540,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
+        "vLLM MoE covers decode and prefill table selection, including overestimated hints. "
         "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
     ),
     KernelEntry(
@@ -543,6 +550,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_inference_kernels.py",
             K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
+            K + "test_tp_batch_invariant.py",
         ),
         kind="triton",
     ),
@@ -680,13 +688,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "container and is tracked as a follow-up.",
     ),
     KernelEntry(
-        name="inference_tp_layers",
-        sources=("megatron/core/tensor_parallel/inference_layers.py",),
+        name="inference_moe_dispatchers",
+        sources=("megatron/core/transformer/moe/token_dispatcher_inference.py",),
+        tests=("tests/unit_tests/inference/test_moe_dispatching_and_routing.py",),
         kind="dispatch",
         training_path=False,
-        exempt_reason="Inference-only TP layers composing tex.rmsnorm_fwd (the TE norm kernel is "
-        "replayed in test_te_wrappers.py), FlashInfer MXFP8 GEMM (Blackwell only) and TE "
-        "gather / reduce-scatter collectives.",
+        notes="Packed NCCL all-gather and fused NVLS dispatch/combine are tested with CUDA graph replay. "
+        "BI EP combine uses ordered NVLS; NCCL is tested for rejecting BI with EP > 1.",
+    ),
+    KernelEntry(
+        name="inference_tp_layers",
+        sources=("megatron/core/tensor_parallel/inference_layers.py",),
+        tests=(K + "test_tp_batch_invariant.py",),
+        kind="dispatch",
+        training_path=False,
+        notes="Ordered batch-invariant TP reduction is replayed across shapes and graphs. "
+        "The TE norm is covered in test_te_wrappers.py; other inference dispatch paths are not covered here.",
     ),
     KernelEntry(
         name="te_tp_collectives",

@@ -137,6 +137,40 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         )
         self.topk = config.moe_router_topk
 
+    @staticmethod
+    def _packed_row_layout(tensors) -> Optional[tuple]:
+        """Byte layout that packs each token's rows of several 2-D tensors into one uint8 row.
+
+        Segments are ordered by decreasing element size so each keeps its natural
+        alignment. Returns (order, byte offsets, row bytes), or None when a segment would
+        be misaligned; the caller then gathers the tensors separately.
+        """
+        order = sorted(range(len(tensors)), key=lambda i: -tensors[i].element_size())
+        offsets, row_bytes = [0] * len(tensors), 0
+        for i in order:
+            if tensors[i].dim() != 2 or row_bytes % tensors[i].element_size():
+                return None
+            offsets[i] = row_bytes
+            row_bytes += tensors[i].shape[1] * tensors[i].element_size()
+        if any(row_bytes % t.element_size() for t in tensors):
+            return None
+        return order, offsets, row_bytes
+
+    @staticmethod
+    def _pack_rows(tensors, layout) -> torch.Tensor:
+        """[tokens, row_bytes] uint8 rows holding every tensor's row for each token."""
+        order, _, _ = layout
+        return torch.cat([tensors[i].contiguous().view(torch.uint8) for i in order], dim=1)
+
+    @staticmethod
+    def _unpack_rows(packed, tensors, layout) -> List[torch.Tensor]:
+        """Contiguous [rows, *] tensors shaped and typed like ``tensors``, read from ``packed``."""
+        _, offsets, _ = layout
+        return [
+            packed[:, offset : offset + t.shape[1] * t.element_size()].view(t.dtype).contiguous()
+            for t, offset in zip(tensors, offsets)
+        ]
+
     @classmethod
     def allocate_buffers(cls) -> None:
         """Allocate the per-step valid-tokens tensor read by mcore_fused_moe.
@@ -204,8 +238,27 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         if self._runs_metadata_sync:
             self.update_metadata(hidden_states.shape[0])
 
+        # Without gradients, the three tensors travel as one packed all-gather:
+        # each collective here is latency-bound, so one costs about as much as each
+        # of three. The raw collective has no autograd edge, hence the guard.
+        # Grad mode must agree across ranks. Do not consult requires_grad here:
+        # a detached input on one rank must not change its collective protocol.
+        tensors = (hidden_states, probs, self.routing_map)
+        layout = None
+        if not torch.is_grad_enabled():
+            layout = self._packed_row_layout(tensors)
+
         if not self.__class__._use_allgather_v:
             # CG path: equal token counts, standard gather.
+            if layout is not None:
+                packed = self._pack_rows(tensors, layout)
+                world = get_pg_size(self.tp_ep_group)
+                gathered = packed.new_empty((world * packed.shape[0], packed.shape[1]))
+                dist.all_gather_into_tensor(gathered, packed, group=self.tp_ep_group)
+                hidden_states, probs, self.routing_map = self._unpack_rows(
+                    gathered, tensors, layout
+                )
+                return hidden_states, probs
             with torch.no_grad():
                 self.routing_map = gather_from_sequence_parallel_region(
                     self.routing_map, group=self.tp_ep_group
@@ -233,11 +286,6 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             dist.all_gather_into_tensor(gathered, padded_tensor, group=self.ep_group)
             return gathered
 
-        hidden_gathered = allgather(pad_to_max(hidden_states))
-        probs_gathered = allgather(pad_to_max(probs))
-        with torch.no_grad():
-            routing_gathered = allgather(pad_to_max(self.routing_map))
-
         def compact(gathered_tensor):
             return torch.cat(
                 [
@@ -246,6 +294,16 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
                 ],
                 dim=0,
             )
+
+        if layout is not None:
+            packed = compact(allgather(pad_to_max(self._pack_rows(tensors, layout))))
+            hidden_states, probs, self.routing_map = self._unpack_rows(packed, tensors, layout)
+            return hidden_states, probs
+
+        hidden_gathered = allgather(pad_to_max(hidden_states))
+        probs_gathered = allgather(pad_to_max(probs))
+        with torch.no_grad():
+            routing_gathered = allgather(pad_to_max(self.routing_map))
 
         hidden_states = compact(hidden_gathered)
         probs = compact(probs_gathered)
@@ -513,7 +571,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
         # When shared_expert_overlap is enabled, the shared expert forward is launched
-        # on SharedExpertMLP.stream in dispatch_preprocess and joined in combine_postprocess.
+        # on SharedExpertMLP.stream in dispatch_preprocess and joined in token_combine
+        # (added inside the RSV) or, when that is not possible, in combine_postprocess.
         self._shared_expert_output: Optional[torch.Tensor] = None
         # When True, the layer (not the dispatcher) is responsible for launching the
         # shared expert and adding its output. Used for the latent-MoE inference path
@@ -531,23 +590,40 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         If shared_expert_overlap is enabled (set_shared_experts has been called)
         AND _external_shared_expert_launch is False, launch the entire shared-
         expert forward on SharedExpertMLP.stream so it runs concurrently with
-        AGV dispatch, expert GEMMs, and RSV combine.
+        AGV dispatch and the expert GEMMs. The combine waits for it before the RSV.
 
         When _external_shared_expert_launch is True (latent-MoE inference path),
         the layer launches the shared expert before its fc1_latent_proj on the
         full hidden_states; the dispatcher does not launch it here.
         """
         self.hidden_shape = hidden_states.shape
-        if self.shared_experts is not None and not self._external_shared_expert_launch:
-            stream = SharedExpertMLP.stream
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                self._shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+        self.launch_shared_expert(hidden_states)
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self._local_tokens = hidden_states.shape[0]
         self.routing_map = routing_map
         return hidden_states, probs
+
+    def launch_shared_expert(self, hidden_states):
+        """Launch the overlapped shared expert on SharedExpertMLP.stream.
+
+        Called from dispatch_preprocess, after routing, so the AGV is the next kernel
+        on the current stream. Do not launch it before routing: the shared expert's TP
+        all-gather and reduce-scatter spin until every TP peer joins, and the AGV spins
+        until every EP peer joins. With the router's kernels queued between the two
+        launches, a rank can spin in the shared expert's reduce-scatter while its own
+        router kernels and AGV are not yet scheduled, as a peer spins in the AGV with
+        its reduce-scatter not yet started: neither collective ever completes.
+        No-op without shared-expert overlap or with _external_shared_expert_launch.
+        Always launches anew, so an output left by an interrupted forward is replaced,
+        never added to a later step.
+        """
+        if self.shared_experts is None or self._external_shared_expert_launch:
+            return
+        stream = SharedExpertMLP.stream
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            self._shared_expert_output = apply_module(self.shared_experts)(hidden_states)
 
     def token_dispatch(self, hidden_states, probs):
         """AllGather-V: gather hidden_states, probs, and routing_map from all EP ranks.
@@ -574,10 +650,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # discarded downstream -- but it scales the MoE cost with the CUDA-graph
         # bucket rather than the live batch, which is most of the bucket
         # whenever the batch is draining.
-        if self.__class__._real_token_count_tensor is not None:
-            mask_routing_padding(
-                self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
-            )
+        #
+        # At ep_size > 1 the AGV below applies the same mask while gathering
+        # (the local routing map is not read again), saving a launch per layer.
+        real_token_count = self.__class__._real_token_count_tensor
+        if self.ep_size == 1 and real_token_count is not None:
+            mask_routing_padding(self.routing_map, real_token_count, self.sp_rank)
 
         if self.ep_size == 1:
             if self._runs_metadata_sync:
@@ -617,6 +695,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             per_rank_max_tokens=per_rank_max,
+            # mask_routing_padding's frame: local row r is global row r + sp_rank * rows.
+            mask_rows_from=real_token_count,
+            mask_row_offset=self.sp_rank * self.routing_map.shape[0],
         )
 
         topk = probs.shape[1]
@@ -657,37 +738,70 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         if hidden_states is not rsv["tensor"]:
             rsv["tensor"].copy_(hidden_states)
-        output = torch.empty(
-            self._local_tokens,
-            hidden_states.shape[1],
-            dtype=rsv["tensor"].dtype,
-            device=hidden_states.device,
-        )
-        use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
         # Under batch-invariant mode the "multimem" option keeps the native
         # NVLS in-switch reduce: measured correctly-rounded (exact fp32 sum,
         # bitwise-equal to an fp64 reference), deterministic and
         # batch-invariant; "ordered" (default) uses the explicit fixed
         # rank-order fp32 kernel, deterministic by construction anywhere.
-        reduce_scatter_v = (
-            batch_invariant.ordered_reduce_scatter_v if use_ordered else multimem_reduce_scatter_v
+        if batch_invariant.enabled() and get_batch_invariant_collective() == "ordered":
+            output = torch.empty(
+                self._local_tokens,
+                hidden_states.shape[1],
+                dtype=rsv["tensor"].dtype,
+                device=hidden_states.device,
+            )
+            batch_invariant.ordered_reduce_scatter_v(
+                output,
+                rsv["tensor"],
+                rsv["handle"],
+                rank_token_offset=self._rank_token_offset(),
+                ep_max_tokens=self._ep_max_tokens(),
+                per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            )
+            return output.to(torch.bfloat16)
+
+        # The multimem RSV writes bf16 directly and adds the overlapped shared-expert
+        # output, bitwise identical to an fp32 output cast to bf16 and the bf16 add
+        # in combine_postprocess. The shared expert, launched before the AGV (see
+        # launch_shared_expert), has normally finished before the routed experts.
+        output = torch.empty(
+            self._local_tokens,
+            hidden_states.shape[1],
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
         )
-        reduce_scatter_v(
+        shared = self._shared_expert_output
+        addend = None
+        if (
+            shared is not None
+            # The raw NVLS kernel has no autograd edge for its addend. Preserve
+            # the separate addition when the shared expert needs gradients.
+            and not (torch.is_grad_enabled() and shared.requires_grad)
+            and shared.dtype == torch.bfloat16
+            and shared.is_contiguous()
+            and shared.numel() == output.numel()
+        ):
+            torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
+            addend = shared.view(output.shape)
+            self._shared_expert_output = None
+        multimem_reduce_scatter_v(
             output,
             rsv["tensor"],
             rsv["handle"],
             rank_token_offset=self._rank_token_offset(),
             ep_max_tokens=self._ep_max_tokens(),
             per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            addend=addend,
         )
-        return output.to(torch.bfloat16)
+        return output
 
     def combine_postprocess(self, hidden_states):
         """Restore original input shape (e.g. [S/TP, B, H] from [S*B/TP, H]).
 
         If shared_expert_overlap is enabled AND _external_shared_expert_launch
         is False, join SharedExpertMLP.stream and add the shared-expert output
-        produced concurrently during dispatch+combine.
+        produced concurrently during dispatch+combine, unless token_combine
+        already added it inside the reduce-scatter.
 
         When _external_shared_expert_launch is True (latent-MoE inference path),
         the join+add happens in the layer's postprocess after fc2_latent_proj,

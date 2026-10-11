@@ -22,6 +22,7 @@ from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.tensor_parallel.mappings import (
+    _reduce_scatter_along_first_dim_ordered,
     gather_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
@@ -461,10 +462,16 @@ class InferenceRowParallelLinear(TERowParallelLinear):
     def _matmul_reduce_scatter(self, x, residual=None):
         """
         Multiplies x by the weight matrix and performs a reduce-scatter.
-        It will first try to write the matmul output to symmetric memory
+        Batch-invariant mode uses fixed-rank-order FP32 accumulation.
+        Otherwise, it will first try to write the matmul output to symmetric memory
         and perform an NVLS multicast reduce-scatter. If that is not possible,
         it will revert to torch.dist (NCCL) reduce-scatter.
         """
+        if is_batch_invariant_mode_enabled():
+            return _reduce_scatter_along_first_dim_ordered(
+                _apply_linear(x, self.weight, self.config), self.tp_group
+            )
+
         use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
         symm_mem_buffer_dims = list(x.size())
         if use_mxfp8:
@@ -477,14 +484,11 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
         # (world_size times smaller on dim 0) is too.
-        # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
-        # the training reduction path. This does not affect MoE EP NVLS.
         can_use_nvls = (
             self.triton_nvls_kernels_allowed
             and x.dtype == torch.bfloat16
             and are_tensors_nvls_eligible(x)
             and symm_mem_buffer["handle"] is not None
-            and not is_batch_invariant_mode_enabled()
         )
 
         if can_use_nvls:
@@ -620,6 +624,7 @@ def inference_reduce_scatter_to_sequence_parallel_region(
 
     Replaces `reduce_scatter_to_sequence_parallel_region` in inference paths
     where autograd is not needed and NVLS symmetric-memory is available.
+    Batch-invariant mode instead uses fixed-rank-order FP32 accumulation.
     """
     # TODO(ksanthanam): Refactor InferenceRowParallelLinear._matmul_reduce_scatter
     # to use this function for its non-fused NVLS reduce-scatter path.
@@ -627,17 +632,14 @@ def inference_reduce_scatter_to_sequence_parallel_region(
     if tp_size == 1:
         return x
 
+    if is_batch_invariant_mode_enabled():
+        return _reduce_scatter_along_first_dim_ordered(x, tp_group)
+
     triton_nvls_kernels_allowed = not getattr(
         config, 'inference_disable_triton_nvls_kernels', False
     )
 
-    # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
-    # training. This does not affect MoE EP NVLS.
-    if (
-        triton_nvls_kernels_allowed
-        and SymmetricMemoryManager.is_initialized("tp")
-        and not is_batch_invariant_mode_enabled()
-    ):
+    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
         symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
 
