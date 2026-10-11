@@ -3158,6 +3158,16 @@ def _add_distributed_args(parser):
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
     group.add_argument('--overlap-param-gather-with-optimizer-step', action='store_true',
                        default=False, help='If set, overlap param all-gather of first bucket with optimizer step.')
+    group.add_argument('--overlap-optimizer-step-with-forward', action='store_true',
+                       default=False, help='If set, issue the distributed optimizer step bucket group by '
+                       'bucket group on a side stream, each update right before its param all-gather, '
+                       'overlapped with the next iteration\'s forward pass (and captured by the '
+                       'full-iteration CUDA graph). The update of an iteration is applied during the '
+                       'next iteration\'s forward pass.')
+    group.add_argument('--overlap-optimizer-step-prefetch', type=int, default=2,
+                       help='With --overlap-optimizer-step-with-forward, number of bucket groups beyond '
+                       'the one the forward pass is waiting for whose update and all-gather are issued '
+                       'at that point.')
     group.add_argument('--no-align-param-gather', action='store_false',
                        help='If not set, all PP stages will launch param all-gathers simultaneously. '
                        'Otherwise, each PP stage will independently launch as needed.',
