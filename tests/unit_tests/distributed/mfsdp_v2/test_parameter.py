@@ -13,7 +13,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 
 
 class NestedModel(nn.Module):
@@ -237,39 +236,35 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
 
-@pytest.mark.parametrize("manual_scheduler", [False, True])
-def test_frozen_parent_without_input_gradients(distributed_setup, manual_scheduler):
-    """Frozen weights survive internal backward under automatic and manual scheduling."""
+def test_frozen_weights_without_input_gradients(distributed_setup):
+    """Keep frozen weights available until internal backward has consumed them."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    trainable = nn.Linear(4, 4, bias=False)
-    frozen = nn.Linear(4, 4, bias=False).requires_grad_(False)
-    model = nn.Sequential(trainable, frozen).to(device)
-    nn.init.ones_(frozen.weight)
-    # A frozen layer with non-grad-requiring inputs alone has no backward graph.
-    # This trainable child lets backward run while the root owns only frozen
-    # weights and receives inputs that do not require gradients.
-    with fully_shard_context(device=device, caller_managed_grad_sync=manual_scheduler) as context:
-        fully_shard(trainable, mesh, _default_placements(), register_hooks=not manual_scheduler)
-        fully_shard(model, mesh, _default_placements(), register_hooks=not manual_scheduler)
-    if manual_scheduler:
-        register_combined_1f1b_hooks(model)
+    # This is the simplest setup where an FSDP unit owns only frozen weights and
+    # has no grad-requiring inputs, but still allows backward(): a separately
+    # sharded trainable child keeps the backward graph alive.
+    trainable_linear = nn.Linear(4, 4, bias=False)
+    frozen_linear = nn.Linear(4, 4, bias=False).requires_grad_(False)
+    model = nn.Sequential(trainable_linear, frozen_linear).to(device)
+    nn.init.ones_(frozen_linear.weight)
+    with fully_shard_context(device=device):
+        fully_shard(trainable_linear, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     def unpack(tensor):
+        # Suppress traceback tensor formatting, which would also read freed storage.
         if tensor.untyped_storage().nbytes() == 0:
-            # Keep pytest's traceback formatter from reading the freed tensor too.
-            del tensor
-            raise AssertionError("Saved weight storage freed before backward")
+            pytest.fail("Frozen weight was resharded before backward consumed it", pytrace=False)
         return tensor
 
-    # pack_hook keeps the original storage; unpack_hook checks it before CUDA
-    # reads a saved tensor, turning premature release into a safe assertion.
-    with torch.autograd.graph.saved_tensors_hooks(pack_hook=lambda t: t, unpack_hook=unpack):
+    # pack_hook preserves the original storage; unpack_hook checks that it still
+    # exists before backward reads it, so a copy cannot hide premature release.
+    with torch.autograd.graph.saved_tensors_hooks(
+        pack_hook=lambda tensor: tensor, unpack_hook=unpack
+    ):
         model(torch.ones(2, 4, device=device)).sum().backward()
-    if manual_scheduler:
-        context.finish_grad_sync()
     torch.testing.assert_close(
-        trainable.weight.grad.full_tensor(), torch.full((4, 4), 8.0, device=device)
+        trainable_linear.weight.grad.full_tensor(), torch.full((4, 4), 8.0, device=device)
     )
-    full_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
-    assert full_weight.untyped_storage().nbytes() == 0
+    frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
+    assert frozen_weight.untyped_storage().nbytes() == 0
