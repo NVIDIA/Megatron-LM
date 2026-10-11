@@ -19,6 +19,22 @@ logger = logging.getLogger(__name__)
 # tools/debug_cuda_graph_pool_memory*.py).
 _shared_graph_pool = None
 _shared_capture_stream = None
+_shared_capture_stream_priority = 0
+
+
+def set_shared_capture_stream_priority(priority: int) -> None:
+    """Set the priority the shared capture stream is created with (lower is higher; the
+    captured kernels keep it at replay). Call before the stream is first created, from
+    wherever the configuration is validated; a different priority than that of an existing
+    stream is an error.
+    """
+    global _shared_capture_stream_priority
+    if _shared_capture_stream is not None and _shared_capture_stream.priority != priority:
+        raise RuntimeError(
+            f"The shared capture stream exists with priority {_shared_capture_stream.priority}, "
+            f"priority {priority} can no longer be set."
+        )
+    _shared_capture_stream_priority = priority
 
 
 def get_shared_capture_stream():
@@ -28,7 +44,7 @@ def get_shared_capture_stream():
     """
     global _shared_capture_stream
     if _shared_capture_stream is None:
-        _shared_capture_stream = torch.cuda.Stream()
+        _shared_capture_stream = torch.cuda.Stream(priority=_shared_capture_stream_priority)
     return _shared_capture_stream
 
 

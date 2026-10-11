@@ -147,6 +147,10 @@ class RouterInterface(Protocol):
         """
         ...
 
+    def backward_dw(self) -> None:
+        """Compute the weight gradient the router's backward pass deferred, if any."""
+        ...
+
 
 class RouterBuilder(Protocol):
     """Protocol for building a Router."""
@@ -778,6 +782,7 @@ class MoELayer(BaseMoELayer):
         # or use scanning to decide which backward_dw should be called.
         if routed_experts:
             self.experts.backward_dw()
+            self.router.backward_dw()
             if self.config.moe_latent_size and self.config.overlap_moe_expert_parallel_comm:
                 # TODO(Wohox): fc2_latent_proj forward and backward are executed in comm stream,
                 # so we execute its backward_dw in the comm stream too. But this may harm the
@@ -785,10 +790,16 @@ class MoELayer(BaseMoELayer):
                 comm_stream = get_comm_stream()
                 with torch.cuda.stream(comm_stream):
                     self.fc2_latent_proj.backward_dw()
+            elif self.config.moe_latent_size and self.config.overlap_wgrad_compute:
+                self.fc2_latent_proj.backward_dw()
         if shared_experts:
-            if self.use_shared_expert and not self.shared_expert_overlap:
+            if self.use_shared_expert and (
+                not self.shared_expert_overlap or self.config.overlap_wgrad_compute
+            ):
                 self.shared_experts.backward_dw()
-            if self.config.moe_latent_size and self.config.overlap_moe_expert_parallel_comm:
+            if self.config.moe_latent_size and (
+                self.config.overlap_moe_expert_parallel_comm or self.config.overlap_wgrad_compute
+            ):
                 self.fc1_latent_proj.backward_dw()
 
     def set_for_recompute_pre_mlp_layernorm(self):

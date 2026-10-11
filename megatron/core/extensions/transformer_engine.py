@@ -1273,9 +1273,9 @@ class TELinear(te.pytorch.Linear):
 
         extra_kwargs = _get_extra_te_kwargs(config)
 
-        if self.config.delay_wgrad_compute:
+        if self.config.delay_wgrad_compute or self.config.overlap_wgrad_compute:
             if is_te_min_version("2.3.0"):
-                extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+                extra_kwargs["delay_wgrad_compute"] = True
             else:
                 raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
 
@@ -1477,7 +1477,7 @@ class TELinear(te.pytorch.Linear):
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
-        if self.config.delay_wgrad_compute:
+        if self.config.delay_wgrad_compute or self.config.overlap_wgrad_compute:
             super().backward_dw()
 
 
@@ -1544,9 +1544,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.tp_size = get_pg_size(tp_group)
         self.tp_rank = get_pg_rank(tp_group)
 
-        if self.config.delay_wgrad_compute:
+        if self.config.delay_wgrad_compute or self.config.overlap_wgrad_compute:
             if is_te_min_version("2.3.0"):
-                extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+                extra_kwargs["delay_wgrad_compute"] = True
             else:
                 raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
 
@@ -1744,7 +1744,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
-        if self.config.delay_wgrad_compute:
+        if self.config.delay_wgrad_compute or self.config.overlap_wgrad_compute:
             super().backward_dw()
 
 
@@ -1879,7 +1879,7 @@ class TEColumnParallelLinear(TELinear):
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
-        if self.config.delay_wgrad_compute:
+        if self.config.delay_wgrad_compute or self.config.overlap_wgrad_compute:
             super().backward_dw()
 
 
@@ -1944,6 +1944,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         # Match ColumnParallelLinear.backward_dw's no-op so the LM head keeps
         # the same wgrad-timing behavior it had before this subclass existed.
         te_config.delay_wgrad_compute = False
+        te_config.overlap_wgrad_compute = False
 
         super().__init__(
             input_size=input_size,
@@ -2142,7 +2143,7 @@ class TERowParallelLinear(TELinear):
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
-        if self.config.delay_wgrad_compute:
+        if self.config.delay_wgrad_compute or self.config.overlap_wgrad_compute:
             super().backward_dw()
 
 
@@ -2602,6 +2603,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.delay_wgrad_compute = (
                 self.config.delay_wgrad_compute
                 or self.config.overlap_dispatch_backward_with_experts_wgrad
+                or self.config.overlap_wgrad_compute
             )
             if self.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):

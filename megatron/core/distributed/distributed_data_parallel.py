@@ -2,6 +2,7 @@
 
 import logging
 import weakref
+from collections import deque
 from contextlib import contextmanager
 from typing import Optional
 
@@ -24,6 +25,39 @@ from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
 
 logger = logging.getLogger(__name__)
+
+
+class WgradStream:
+    """The low-priority stream the weight gradients deferred by overlap_wgrad_compute run on.
+
+    The compute stream never waits for it during the backward pass except through
+    ``limit_backlog``: after a bucket group's reduce-scatter was issued from the stream, the
+    compute stream waits for the weight gradients issued before the reduce-scatter two bucket
+    groups earlier. This bounds how far the compute stream runs ahead, and so the memory of
+    the tensors the deferred weight gradients still read (released to the allocator only once
+    a dependency on their completion exists on the compute stream). The events never cross an
+    iteration (``reset``) nor a CUDA graph capture boundary: a capturing stream may only wait
+    on captured events, and eager work only on eagerly recorded ones.
+    """
+
+    BACKLOG_BUCKET_GROUPS = 2
+
+    def __init__(self):
+        self.stream = torch.cuda.Stream(priority=0)
+        self._dispatch_events = deque()
+
+    def reset(self) -> None:
+        """Start of an iteration: forget the previous iteration's events."""
+        self._dispatch_events.clear()
+
+    def limit_backlog(self, compute_stream: torch.cuda.Stream) -> None:
+        """Called by a bucket group after it issued its reduce-scatter from the stream."""
+        capturing = torch.cuda.is_current_stream_capturing()
+        self._dispatch_events.append((self.stream.record_event(), capturing))
+        if len(self._dispatch_events) > self.BACKLOG_BUCKET_GROUPS:
+            event, recorded_while_capturing = self._dispatch_events.popleft()
+            if recorded_while_capturing == capturing:
+                compute_stream.wait_event(event)
 
 
 class _BucketParamReadyCallback:
@@ -459,6 +493,22 @@ class DistributedDataParallel(_BaseDataParallel):
 
             self.module.apply(unmap_weight_tensor)
 
+        # overlap_wgrad_compute: the weight gradients deferred by the Transformer Engine layers,
+        # the MoE routers and the output layer run on this stream, at the lowest priority so they
+        # fill what the backward pass leaves free; the backward pass must outrank them, which the
+        # default stream cannot, the full-iteration graph's capture stream does (raised by the
+        # config, see TransformerConfig). Each bucket group reduces its gradients from this
+        # stream (see _ParamAndGradBucketGroup).
+        self.wgrad_stream = None
+        if config.overlap_wgrad_compute:
+            self.wgrad_stream = WgradStream()
+            for module in self.module.modules():
+                wgrad_store = getattr(module, 'wgrad_store', None)
+                if wgrad_store is not None and wgrad_store.delay_wgrad_compute():
+                    wgrad_store.set_stream(self.wgrad_stream.stream)
+            for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+                bucket_group.wgrad_stream = self.wgrad_stream
+
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
         # don't go out of scope.
@@ -470,9 +520,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 # instead of the param so that the wgrad accumulation and reduce will be performed
                 # in backward_dw() method of the module instead of the hook of backward() method.
                 # Otherwise, register the backward post hook for the param.
-                if self.ddp_config.delay_wgrad_compute and getattr(
-                    param, 'skip_backward_post_hook', False
-                ):
+                if (
+                    self.ddp_config.delay_wgrad_compute or config.overlap_wgrad_compute
+                ) and getattr(param, 'skip_backward_post_hook', False):
                     for module in self.module.modules():
                         if hasattr(module, "register_wgrad_accumulation_and_reduce_hooks"):
                             for param_value in module.parameters():
@@ -603,7 +653,18 @@ class DistributedDataParallel(_BaseDataParallel):
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
-                    param.main_grad.add_(param.grad.data)
+                    if self.wgrad_stream is not None and getattr(
+                        param, 'skip_backward_post_hook', False
+                    ):
+                        # A gradient of a layer whose wgrads run on the wgrad stream (a bias
+                        # gradient the deferred GEMM produced there, or one computed inline):
+                        # accumulate it there, in order with the deferred wgrads.
+                        self.wgrad_stream.stream.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(self.wgrad_stream.stream):
+                            param.main_grad.add_(param.grad.data)
+                        param.grad.record_stream(self.wgrad_stream.stream)
+                    else:
+                        param.main_grad.add_(param.grad.data)
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
@@ -720,6 +781,8 @@ class DistributedDataParallel(_BaseDataParallel):
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
+        if self.wgrad_stream is not None:
+            self.wgrad_stream.reset()
         if getattr(self.config, 'cuda_graph_impl', 'none') != 'transformer_engine':
             # Don't reset grad_added_to_main_grad when CUDA Graph is used.
             # Because in CUDA Graph it no longer has the opportunity to set it back
