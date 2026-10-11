@@ -16,9 +16,7 @@ ROOT = Path(__file__).parents[2]
 
 def _step(workflow: str, job: str, step_id: str) -> dict:
     document = yaml.safe_load((ROOT / ".github/workflows" / workflow).read_text())
-    return next(
-        step for step in document["jobs"][job]["steps"] if step.get("id") == step_id
-    )
+    return next(step for step in document["jobs"][job]["steps"] if step.get("id") == step_id)
 
 
 def _run(
@@ -88,9 +86,7 @@ def test_producer_consumes_the_actual_build_matrix(
     gb_enabled: str,
     expected_platforms: set[str],
 ) -> None:
-    build_step = _step(
-        "_build_ci_container.yml", "cicd-compute-build-matrix", "compute"
-    )
+    build_step = _step("_build_ci_container.yml", "cicd-compute-build-matrix", "compute")
     build, build_outputs = _run(
         build_step["run"],
         tmp_path,
@@ -134,13 +130,10 @@ def test_producer_consumes_the_actual_build_matrix(
                 / "unit-tests.yaml"
             ).read_text()
         )
-        buckets = [
-            case for product in recipe["products"] for case in product["test_case"]
-        ]
+        buckets = [case for product in recipe["products"] for case in product["test_case"]]
         assert [entry["bucket"] for entry in entries] == buckets
         assert all(
-            entry["runner"] == runner
-            and entry["image"] == f"{registry}/megatron-lm:{sha}-{cloud}"
+            entry["runner"] == runner and entry["image"] == f"{registry}/megatron-lm:{sha}-{cloud}"
             for entry in entries
         )
 
@@ -165,9 +158,7 @@ def test_producer_rejects_an_unsupported_built_platform(
 def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
     tmp_path: Path, shell_environment: dict[str, str]
 ) -> None:
-    build_step = _step(
-        "_build_ci_container.yml", "cicd-compute-build-matrix", "compute"
-    )
+    build_step = _step("_build_ci_container.yml", "cicd-compute-build-matrix", "compute")
     build, build_outputs = _run(
         build_step["run"],
         tmp_path,
@@ -208,13 +199,9 @@ def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
         ("dgx_gb200", "gb200", "gb-gpu", "gb200.example.test/team", "gb200-runner"),
     ):
         recipe = yaml.safe_load(
-            (
-                ROOT / "tests/test_utils/recipes" / bucket_file / "unit-tests.yaml"
-            ).read_text()
+            (ROOT / "tests/test_utils/recipes" / bucket_file / "unit-tests.yaml").read_text()
         )
-        expected_buckets = [
-            case for product in recipe["products"] for case in product["test_case"]
-        ]
+        expected_buckets = [case for product in recipe["products"] for case in product["test_case"]]
         entries = [entry for entry in matrix if entry["platform"] == platform]
         assert [entry["bucket"] for entry in entries] == expected_buckets
         assert all(
@@ -228,18 +215,14 @@ def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
     "source_ref", ["refs/heads/main", "refs/heads/pull-request/6934", "refs/tags/main"]
 )
 def test_producer_requires_the_main_branch(tmp_path: Path, source_ref: str) -> None:
-    workflow = yaml.safe_load(
-        (ROOT / ".github/workflows/populate-build-cache.yml").read_text()
-    )
+    workflow = yaml.safe_load((ROOT / ".github/workflows/populate-build-cache.yml").read_text())
     guard = workflow["jobs"]["validate-source"]["steps"][0]["run"]
     result, _ = _run(guard, tmp_path, {"SOURCE_REF": source_ref})
     assert (result.returncode == 0) == (source_ref == "refs/heads/main")
 
 
 @pytest.fixture
-def pr_files_environment(
-    tmp_path: Path, shell_environment: dict[str, str]
-) -> dict[str, str]:
+def pr_files_environment(tmp_path: Path, shell_environment: dict[str, str]) -> dict[str, str]:
     gh = tmp_path / "bin/gh"
     gh.write_text(
         '#!/bin/sh\n[ "$1" = "api" ] || exit 2\n'
@@ -249,7 +232,7 @@ def pr_files_environment(
         '  echo files >> "$GH_LOG"\n'
         '  cat "$TEST_PR_RESPONSE"\n'
         '  exit "$TEST_API_EXIT"\n'
-        "fi\n"
+        'fi\n'
         '[ "$#" -eq 4 ] && [ "$2" = "repos/NVIDIA/Megatron-LM/pulls/7824" ] && '
         '[ "$3" = "--jq" ] && [ "$4" = ".merge_commit_sha" ] || exit 2\n'
         'echo sha >> "$GH_LOG"\n'
@@ -288,10 +271,7 @@ def pr_files_environment(
 def _assert_pr_files_artifact(tmp_path, outputs, record_count, paths):
     assert outputs == {"ready": "true"}
     artifact = tmp_path / "runner/unit-test-pr-files"
-    assert {path.name for path in artifact.iterdir()} == {
-        "changed-files",
-        "metadata.json",
-    }
+    assert {path.name for path in artifact.iterdir()} == {"changed-files", "metadata.json"}
     expected_paths = sorted(set(paths))
     assert (artifact / "changed-files").read_text().splitlines() == expected_paths
     assert json.loads((artifact / "metadata.json").read_text()) == {
@@ -361,11 +341,7 @@ def test_pr_files_producer_requires_complete_data_for_the_tested_commit(
         paths = (
             []
             if scenario == "empty"
-            else [
-                "megatron/core/z.py",
-                "tests/unit_tests/test_a.py",
-                "megatron/core/removed.py",
-            ]
+            else ["megatron/core/z.py", "tests/unit_tests/test_a.py", "megatron/core/removed.py"]
         )
         _assert_pr_files_artifact(tmp_path, outputs, len(paths), paths)
     else:
@@ -397,11 +373,7 @@ def test_pr_rename_endpoints_trigger_mandatory_selection(
     if direction == "within":
         # One rename's old path is another's new path: publish each path only once.
         records.append(
-            {
-                "status": "renamed",
-                "filename": f"{source}/other.py",
-                "previous_filename": new,
-            }
+            {"status": "renamed", "filename": f"{source}/other.py", "previous_filename": new}
         )
     Path(pr_files_environment["TEST_PR_RESPONSE"]).write_text(json.dumps(records))
     pr_files_environment["PR_CHANGED_FILES"] = str(len(records))
@@ -409,9 +381,7 @@ def test_pr_rename_endpoints_trigger_mandatory_selection(
     result, outputs = _run(step["run"], tmp_path, pr_files_environment)
     assert result.returncode == 0, result.stderr
     paths = [
-        path
-        for record in records
-        for path in (record["filename"], record["previous_filename"])
+        path for record in records for path in (record["filename"], record["previous_filename"])
     ]
     _assert_pr_files_artifact(tmp_path, outputs, len(records), paths)
 
@@ -421,11 +391,7 @@ def test_pr_rename_endpoints_trigger_mandatory_selection(
     config = tmp_path / "mandatory.yaml"
     config.write_text(
         yaml.safe_dump(
-            {
-                "mappings": [
-                    {"source_dirs": [source], "test_buckets": {"dgx_h100": [test_file]}}
-                ]
-            }
+            {"mappings": [{"source_dirs": [source], "test_buckets": {"dgx_h100": [test_file]}}]}
         )
     )
     selection = tmp_path / "selected-tests"
@@ -459,26 +425,18 @@ def test_pr_files_producer_accepts_3000_renames_with_6000_paths(
     tmp_path: Path, pr_files_environment: dict[str, str]
 ) -> None:
     records = [
-        {
-            "status": "renamed",
-            "filename": f"new/{i:04}.py",
-            "previous_filename": f"old/{i:04}.py",
-        }
+        {"status": "renamed", "filename": f"new/{i:04}.py", "previous_filename": f"old/{i:04}.py"}
         for i in range(3000)
     ]
     Path(pr_files_environment["TEST_PR_RESPONSE"]).write_text(
-        "\n".join(
-            json.dumps(records[start : start + 100]) for start in range(0, 3000, 100)
-        )
+        "\n".join(json.dumps(records[start : start + 100]) for start in range(0, 3000, 100))
     )
     pr_files_environment["PR_CHANGED_FILES"] = "3000"
     step = _step("cicd-main.yml", "configure", "unit-test-pr-files")
     result, outputs = _run(step["run"], tmp_path, pr_files_environment)
     assert result.returncode == 0, result.stderr
     paths = [
-        path
-        for record in records
-        for path in (record["filename"], record["previous_filename"])
+        path for record in records for path in (record["filename"], record["previous_filename"])
     ]
     _assert_pr_files_artifact(tmp_path, outputs, 3000, paths)
 
@@ -490,8 +448,7 @@ def configure_environment(
     monkeypatch.delenv("ENABLE_SELECTIVE_UNIT_TESTS", raising=False)
     gh = tmp_path / "bin/gh"
     gh.write_text(
-        '#!/bin/sh\nprintf "%s\\n" "$TEST_PR_LABELS"\n'
-        'exit "$TEST_PR_LABEL_LOOKUP_EXIT"\n'
+        '#!/bin/sh\nprintf "%s\\n" "$TEST_PR_LABELS"\n' 'exit "$TEST_PR_LABEL_LOOKUP_EXIT"\n'
     )
     gh.chmod(0o755)
     return {
@@ -542,99 +499,50 @@ def _run_configure(
 
 
 @pytest.mark.parametrize(
-    (
-        "overrides",
-        "random_seed",
-        "cloud",
-        "build_runner",
-        "gpu_runner",
-        "registry",
-        "use_gcp",
-    ),
+    ("overrides", "random_seed", "cloud", "build_runner", "gpu_runner", "registry", "use_gcp"),
     [
         pytest.param(
-            {},
-            None,
-            "aws-h100",
-            "nvidia-ci-aws-cpu",
+            {}, None, "aws-h100", "nvidia-ci-aws-cpu",
             {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
-            "h100.example.test/team",
-            "false",
-            id="member-pr-aws",
+            "h100.example.test/team", "false", id="member-pr-aws",
         ),
         pytest.param(
-            {"H100_TRAFFIC_MODE": "gcp"},
-            None,
-            "gcp-h100",
-            "nvidia-ci-gcp-cpu-h100",
+            {"H100_TRAFFIC_MODE": "gcp"}, None, "gcp-h100", "nvidia-ci-gcp-cpu-h100",
             {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-gcp-h100-x8"},
-            "gcp.example.test/team",
-            "true",
-            id="member-pr-gcp",
+            "gcp.example.test/team", "true", id="member-pr-gcp",
         ),
         pytest.param(
-            {"H100_TRAFFIC_MODE": "50-50"},
-            3,
-            "gcp-h100",
-            "nvidia-ci-gcp-cpu-h100",
+            {"H100_TRAFFIC_MODE": "50-50"}, 3, "gcp-h100", "nvidia-ci-gcp-cpu-h100",
             {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-gcp-h100-x8"},
-            "gcp.example.test/team",
-            "true",
-            id="member-pr-50-50-gcp",
+            "gcp.example.test/team", "true", id="member-pr-50-50-gcp",
         ),
         pytest.param(
-            {"H100_TRAFFIC_MODE": "50-50"},
-            2,
-            "aws-h100",
-            "nvidia-ci-aws-cpu",
+            {"H100_TRAFFIC_MODE": "50-50"}, 2, "aws-h100", "nvidia-ci-aws-cpu",
             {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
-            "h100.example.test/team",
-            "false",
-            id="member-pr-50-50-aws",
+            "h100.example.test/team", "false", id="member-pr-50-50-aws",
         ),
         pytest.param(
             {
-                "PREFLIGHT_IS_MEMBER": "false",
-                "IS_MAINTAINER": "false",
-                "H100_TRAFFIC_MODE": "gcp",
-                "EPHEMERAL_RUNNER": "ephe-v2-example",
+                "PREFLIGHT_IS_MEMBER": "false", "IS_MAINTAINER": "false",
+                "H100_TRAFFIC_MODE": "gcp", "EPHEMERAL_RUNNER": "ephe-v2-example",
                 "RUN_ATTEMPT": "2",
-            },
-            None,
-            "aws-h100",
-            "ephe-v2-example-a2",
-            "ephe-v2-example-a2",
-            "h100.example.test/team",
-            "false",
-            id="external-pr-ephemeral-aws",
+            }, None, "aws-h100", "ephe-v2-example-a2", "ephe-v2-example-a2",
+            "h100.example.test/team", "false", id="external-pr-ephemeral-aws",
         ),
         pytest.param(
             {
                 "EVENT_NAME": "merge_group",
                 "REF": "refs/heads/gh-readonly-queue/main/pr-6934-abc",
                 "H100_TRAFFIC_MODE": "gcp",
-            },
-            None,
-            "aws-h100",
-            "nvidia-ci-aws-cpu",
+            }, None, "aws-h100", "nvidia-ci-aws-cpu",
             {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
-            "h100.example.test/team",
-            "false",
-            id="merge-queue-stays-aws",
+            "h100.example.test/team", "false", id="merge-queue-stays-aws",
         ),
         pytest.param(
-            {
-                "EVENT_NAME": "workflow_dispatch",
-                "REF": "refs/heads/main",
-                "H100_TRAFFIC_MODE": "gcp",
-            },
-            None,
-            "aws-h100",
-            "nvidia-ci-aws-cpu",
+            {"EVENT_NAME": "workflow_dispatch", "REF": "refs/heads/main", "H100_TRAFFIC_MODE": "gcp"},
+            None, "aws-h100", "nvidia-ci-aws-cpu",
             {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
-            "h100.example.test/team",
-            "false",
-            id="dispatch-stays-aws",
+            "h100.example.test/team", "false", id="dispatch-stays-aws",
         ),
     ],
 )
@@ -667,24 +575,15 @@ def test_nemo_cicd_validator_declares_every_needs_reference_directly() -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
     job = workflow["jobs"]["Nemo_CICD_Test"]
     direct_dependencies = set(job["needs"])
-    referenced_dependencies = set(
-        re.findall(r"needs\.([A-Za-z0-9_-]+)", yaml.safe_dump(job))
-    )
+    referenced_dependencies = set(re.findall(r"needs\.([A-Za-z0-9_-]+)", yaml.safe_dump(job)))
     assert "configure" in direct_dependencies
-    assert (
-        job["steps"][-1]["env"]["RUN_H100_FUNCTIONAL"]
-        == "${{ needs.configure.outputs.run_h100_functional }}"
-    )
+    assert job["steps"][-1]["env"]["RUN_H100_FUNCTIONAL"] == "${{ needs.configure.outputs.run_h100_functional }}"
     assert referenced_dependencies <= direct_dependencies
 
 
 @pytest.mark.parametrize(
     ("run_h100_functional", "h100_result", "expected_success"),
-    [
-        ("true", "skipped", False),
-        ("false", "skipped", True),
-        ("true", "success", True),
-    ],
+    [("true", "skipped", False), ("false", "skipped", True), ("true", "success", True)],
 )
 def test_nemo_cicd_validator_checks_h100_functional_result(
     tmp_path: Path,
@@ -723,10 +622,7 @@ def test_nemo_cicd_validator_checks_h100_functional_result(
 
 def test_selective_default_uses_the_repository_variable() -> None:
     step = _step("cicd-main.yml", "configure", "configure")
-    assert (
-        step["env"]["ENABLE_SELECTIVE_UNIT_TESTS"]
-        == "${{ vars.ENABLE_SELECTIVE_UNIT_TESTS }}"
-    )
+    assert step["env"]["ENABLE_SELECTIVE_UNIT_TESTS"] == "${{ vars.ENABLE_SELECTIVE_UNIT_TESTS }}"
 
 
 @pytest.mark.parametrize(
@@ -739,31 +635,13 @@ def test_selective_default_uses_the_repository_variable() -> None:
         pytest.param("TRUE", [], False, False, id="uppercase-is-not-enabled"),
         pytest.param("true ", [], False, False, id="whitespace-is-not-enabled"),
         pytest.param("1", [], False, False, id="numeric-is-not-enabled"),
+        pytest.param(None, ["Run selective unit tests"], False, True, id="label-without-default"),
+        pytest.param("false", ["Run selective unit tests"], False, True, id="label-enables"),
+        pytest.param("invalid", ["Run selective unit tests"], False, True, id="label-with-invalid"),
+        pytest.param("true", ["Run selective unit tests"], True, True, id="both-enable"),
+        pytest.param("true", ["Disable selective unit tests"], True, False, id="label-disables"),
         pytest.param(
-            None, ["Run selective unit tests"], False, True, id="label-without-default"
-        ),
-        pytest.param(
-            "false", ["Run selective unit tests"], False, True, id="label-enables"
-        ),
-        pytest.param(
-            "invalid",
-            ["Run selective unit tests"],
-            False,
-            True,
-            id="label-with-invalid",
-        ),
-        pytest.param(
-            "true", ["Run selective unit tests"], True, True, id="both-enable"
-        ),
-        pytest.param(
-            "true", ["Disable selective unit tests"], True, False, id="label-disables"
-        ),
-        pytest.param(
-            "false",
-            ["Disable selective unit tests"],
-            False,
-            False,
-            id="already-disabled",
+            "false", ["Disable selective unit tests"], False, False, id="already-disabled"
         ),
         pytest.param(
             "true",
@@ -816,14 +694,10 @@ def test_selective_variable_and_label_precedence(
         pytest.param([], {"FORCE_RUN_ALL": "true"}, id="preflight-forces-full"),
         pytest.param([], {"TEST_PR_LABEL_LOOKUP_EXIT": "1"}, id="label-lookup-fails"),
         pytest.param([], {"REF": "refs/heads/main"}, id="main-push"),
-        pytest.param(
-            [], {"REF": "refs/heads/pull-request/not-a-number"}, id="non-pr-branch"
-        ),
+        pytest.param([], {"REF": "refs/heads/pull-request/not-a-number"}, id="non-pr-branch"),
         pytest.param([], {"REF": "refs/heads/deploy-release/1.0"}, id="release-push"),
         pytest.param([], {"EVENT_NAME": "workflow_dispatch"}, id="manual-dispatch"),
-        pytest.param(
-            [], {"EVENT_NAME": "schedule", "IS_CI_WORKLOAD": "true"}, id="schedule"
-        ),
+        pytest.param([], {"EVENT_NAME": "schedule", "IS_CI_WORKLOAD": "true"}, id="schedule"),
         pytest.param([], {"IS_MERGE_GROUP": "true"}, id="preflight-merge-group"),
         pytest.param(
             [],
@@ -847,17 +721,12 @@ def test_full_test_guards_override_selective_requests(
         configure_environment["ENABLE_SELECTIVE_UNIT_TESTS"] = "true"
     else:
         labels = [*labels, "Run selective unit tests"]
-    result, outputs = _run_configure(
-        tmp_path, {**configure_environment, **environment}, labels
-    )
+    result, outputs = _run_configure(tmp_path, {**configure_environment, **environment}, labels)
     assert result.returncode == 0, result.stderr
     assert outputs["unit_testmon_eligible"] == "false"
     # Eligibility guards must not obscure a requested selection in the summary.
     # If label lookup failed, only the repository default can establish a request.
-    requested = (
-        request_source == "default"
-        or environment.get("TEST_PR_LABEL_LOOKUP_EXIT") != "1"
-    )
+    requested = request_source == "default" or environment.get("TEST_PR_LABEL_LOOKUP_EXIT") != "1"
     summary = (tmp_path / "summary").read_text()
     assert f"| `unit_testmon_requested` | `{str(requested).lower()}` |" in summary
     assert "| `unit_testmon_eligible` | `false` |" in summary
