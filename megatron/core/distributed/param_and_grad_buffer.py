@@ -264,6 +264,9 @@ class _ParamAndGradBucketGroup:
                 self.params.add(param)
 
         self.next_param_gather_bucket_group = None
+        # Set by megatron.core.optimizer.overlapped_step.OverlappedOptimizerStep when the
+        # optimizer issues this bucket group's update, grad zeroing and param all-gather itself.
+        self.overlapped_step = None
         # Set in DistributedDataParallel.__init__ when reduce_scatter_with_fp32_accumulation is on:
         # points to the bucket group whose grad-reduce was dispatched immediately before mine in
         # the backward pass. start_grad_sync drains this predecessor before dispatching its own

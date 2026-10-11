@@ -569,13 +569,19 @@ class DistributedDataParallel(_BaseDataParallel):
 
     def _finish_param_sync_for_bucket_group(self, bucket_group):
         """Drain one bucket group's param all-gather and run its post-all-gather processing."""
-        # If aligning param all-gather across pipeline stages, all-gather is dispatched
-        # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
-        # If overlapping param all-gather with optimizer step, then all-gather has
-        # already been dispatched in optimizer step.
-        skip_next_bucket_dispatch = (
-            self.ddp_config.align_param_gather or self.overlap_param_gather_with_optimizer_step
-        )
+        if bucket_group.overlapped_step is not None:
+            # The optimizer updates the bucket group and starts its all-gather (and those of the
+            # next bucket groups) itself, so the next-bucket dispatch below is not ours to make.
+            bucket_group.overlapped_step.dispatch_param_gather(bucket_group)
+            skip_next_bucket_dispatch = True
+        else:
+            # If aligning param all-gather across pipeline stages, all-gather is dispatched
+            # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
+            # If overlapping param all-gather with optimizer step, then all-gather has
+            # already been dispatched in optimizer step.
+            skip_next_bucket_dispatch = (
+                self.ddp_config.align_param_gather or self.overlap_param_gather_with_optimizer_step
+            )
         bucket_group.finish_param_sync(skip_next_bucket_dispatch=skip_next_bucket_dispatch)
 
     def _make_backward_post_hook(self, param: torch.nn.Parameter):
@@ -704,6 +710,8 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
+            if bucket_group.overlapped_step is not None:
+                bucket_group.overlapped_step.grad_reduce_finished(bucket_group)
 
     def free_overlap_buffers(self):
         """Free overlap param-gather GPU buffers across all bucket groups."""
@@ -726,9 +734,13 @@ class DistributedDataParallel(_BaseDataParallel):
             # to True, and there will be a double-GA.
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
-        for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.reset()
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+        # With the overlapped optimizer step, each bucket's grads are zeroed right after its
+        # update, before its param all-gather.
+        if not any(bucket_group.overlapped_step is not None for bucket_group in bucket_groups):
+            for buffer in self.buffers + self.expert_parallel_buffers:
+                buffer.reset()
+        for bucket_group in bucket_groups:
             bucket_group.reset()
 
     def broadcast_params(self):
