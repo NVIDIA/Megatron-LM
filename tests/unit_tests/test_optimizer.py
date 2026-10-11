@@ -295,9 +295,12 @@ def test_separate_dsa_clipping_uses_independent_norms_and_thresholds(monkeypatch
                 {
                     'dsa_indexer_clip_grad': 0.5,
                     'use_precision_aware_optimizer_no_fp8_or_ds_fp8': False,
+                    'use_precision_aware_optimizer': False,
                 },
             )(),
             '_last_dsa_split_grad_norms': None,
+            # The real helper, so the harness exercises the same decision production makes.
+            '_uses_decoupled_grad': MegatronOptimizer._uses_decoupled_grad,
         },
     )()
 
@@ -310,6 +313,56 @@ def test_separate_dsa_clipping_uses_independent_norms_and_thresholds(monkeypatch
     assert calls[0][1:] == (1.0, 2.0, False)
     assert calls[1][0][0] is indexer_param
     assert calls[1][1:] == (0.5, 4.0, False)
+
+
+def test_separate_dsa_clipping_reads_decoupled_grad_under_mfsdp_v1(monkeypatch):
+    """The split clip must ask the parameters, not the config, where the gradient lives.
+
+    Megatron-FSDP v1 with a precision-aware optimizer keeps gradients in `.decoupled_grad`
+    while `use_precision_aware_optimizer_no_fp8_or_ds_fp8` is False. Deciding from that flag
+    alone passed use_decoupled_grad=False, and clip_grad_by_total_norm_fp32 skips any parameter
+    whose chosen attribute is absent -- so clipping silently did nothing.
+    """
+    import megatron.core.optimizer.optimizer as optimizer_module
+
+    main_param = torch.nn.Parameter(torch.ones(2))
+    indexer_param = torch.nn.Parameter(torch.ones(3))
+    for param in (main_param, indexer_param):
+        param.__fsdp_param__ = True
+
+    calls = []
+    monkeypatch.setattr(
+        optimizer_module,
+        'clip_grad_by_total_norm_fp32',
+        lambda params, max_norm, total_norm, use_decoupled_grad: calls.append(
+            (list(params), max_norm, total_norm, use_decoupled_grad)
+        ),
+    )
+    optimizer = type(
+        '_OptimizerHarness',
+        (),
+        {
+            'get_dsa_split_parameters': lambda self: ([indexer_param], [main_param]),
+            'get_dsa_split_grad_norms': lambda self: (4.0, 2.0),
+            'config': type(
+                '_Config',
+                (),
+                {
+                    'dsa_indexer_clip_grad': 0.5,
+                    'use_precision_aware_optimizer_no_fp8_or_ds_fp8': False,
+                    'use_precision_aware_optimizer': True,
+                },
+            )(),
+            '_last_dsa_split_grad_norms': None,
+            '_uses_decoupled_grad': MegatronOptimizer._uses_decoupled_grad,
+        },
+    )()
+
+    MegatronOptimizer.clip_grad_norm_separate_dsa_indexer(optimizer, clip_grad=1.0)
+
+    assert len(calls) == 2
+    assert calls[0][3] is True, "non-indexer group must read .decoupled_grad under MFSDP v1"
+    assert calls[1][3] is True, "indexer group must read .decoupled_grad under MFSDP v1"
 
 
 def test_dsa_split_parameters_follow_param_group_metadata():
