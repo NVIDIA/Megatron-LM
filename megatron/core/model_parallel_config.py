@@ -363,6 +363,23 @@ class ModelParallelConfig:
     This requires transformer_engine with GroupedLinear support (TE >= 2.3.0).
     """
 
+    overlap_wgrad_compute: bool = False
+    """Run the weight-gradient GEMMs of the backward pass on a low-priority side stream, each
+    released once the data-gradient computation that produces its inputs is done, instead of
+    inline between the data gradients. Covers the Transformer Engine linear layers of the
+    transformer layers, the MoE router and the output layer (its weight gradient is split into
+    overlap_wgrad_compute_output_layer_chunks spread over the layers' backward passes); each DDP
+    bucket's reduce-scatter waits for the weight gradients that fill it. Requires the Transformer
+    Engine implementation with gradient_accumulation_fusion and the Megatron DDP with
+    overlap_grad_reduce. With a full-iteration CUDA graph, capture with
+    PYTORCH_CUDA_ALLOC_CONF=graph_capture_record_stream_reuse:True so the memory the side stream
+    reads is reused within the graph.
+    """
+
+    overlap_wgrad_compute_output_layer_chunks: Optional[int] = None
+    """With overlap_wgrad_compute: number of vocabulary chunks the output layer's weight gradient
+    is split into, one issued per transformer layer backward pass. None: one per layer."""
+
     ep_overlap_early_attn_memory_release: bool = False
     """Enable early memory release of attention activations during EP overlap.
     EP overlap can increase peak memory usage when the overlapped forward module allocates 

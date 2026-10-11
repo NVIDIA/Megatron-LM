@@ -1988,6 +1988,12 @@ def validate_args(args, defaults={}):
                 "when enabling delay_wgrad_compute"
             )
 
+    if args.overlap_wgrad_compute:
+        assert args.transformer_impl == 'transformer_engine', \
+            "overlap_wgrad_compute is only supported with the transformer_engine implementation"
+        assert args.overlap_grad_reduce and not args.use_megatron_fsdp and not args.use_torch_fsdp2, \
+            "overlap_wgrad_compute requires the Megatron DDP with overlap_grad_reduce"
+
     if args.fine_grained_activation_offloading:
         assert args.transformer_impl == 'transformer_engine', \
             "Fine-grained activation offloading is only supported with transformer_engine implementation"

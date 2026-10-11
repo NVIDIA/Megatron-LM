@@ -1609,6 +1609,35 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def _validate_overlap_wgrad_compute(self) -> None:
+        """Validate the settings overlap_wgrad_compute depends on."""
+        try:
+            from transformer_engine.pytorch.module._common import WeightGradStore
+        except ImportError:
+            WeightGradStore = None
+        requirements = {
+            'Transformer Engine with WeightGradStore.set_stream': hasattr(
+                WeightGradStore, 'set_stream'
+            ),
+            'gradient_accumulation_fusion': self.gradient_accumulation_fusion,
+            'not delay_wgrad_compute': not self.delay_wgrad_compute,
+            'not overlap_dispatch_backward_with_experts_wgrad': (
+                not self.overlap_dispatch_backward_with_experts_wgrad
+            ),
+            'not overlap_moe_expert_parallel_comm': not self.overlap_moe_expert_parallel_comm,
+            'not defer_embedding_wgrad_compute': not self.defer_embedding_wgrad_compute,
+            'no MTP layers': not self.mtp_num_layers,
+            "cuda_graph_impl 'none' or 'full_iteration'": self.cuda_graph_impl
+            in ('none', 'full_iteration'),
+            'overlap_wgrad_compute_output_layer_chunks None or >= 1': (
+                self.overlap_wgrad_compute_output_layer_chunks is None
+                or self.overlap_wgrad_compute_output_layer_chunks >= 1
+            ),
+        }
+        unmet = [name for name, satisfied in requirements.items() if not satisfied]
+        if unmet:
+            raise ValueError("overlap_wgrad_compute requires " + ", ".join(unmet) + ".")
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -3628,6 +3657,9 @@ class TransformerConfig(ModelParallelConfig):
                 'delay_wgrad_compute and overlap_dispatch_backward_with_experts_wgrad '
                 'are mutually exclusive; use only one'
             )
+
+        if self.overlap_wgrad_compute:
+            self._validate_overlap_wgrad_compute()
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (

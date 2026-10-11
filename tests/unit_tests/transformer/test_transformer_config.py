@@ -34,6 +34,39 @@ def test_ep_a2a_overlap_rejects_unsupported_mtp_layer_counts(mtp_num_layers: int
         _make_overlap_config(mtp_num_layers)
 
 
+def _make_overlap_wgrad_config(**kwargs) -> TransformerConfig:
+    kwargs = {"gradient_accumulation_fusion": True, **kwargs}
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        bf16=True,
+        overlap_wgrad_compute=True,
+        **kwargs,
+    )
+
+
+def test_overlap_wgrad_compute_rejects_conflicting_options():
+    with pytest.raises(ValueError, match="overlap_wgrad_compute requires .*gradient_accumulation"):
+        _make_overlap_wgrad_config(gradient_accumulation_fusion=False)
+    with pytest.raises(ValueError, match="overlap_wgrad_compute requires .*no MTP layers"):
+        _make_overlap_wgrad_config(mtp_num_layers=1)
+    with pytest.raises(ValueError, match="overlap_wgrad_compute requires .*cuda_graph_impl"):
+        _make_overlap_wgrad_config(cuda_graph_impl="local")
+    with pytest.raises(ValueError, match="overlap_wgrad_compute requires .*output_layer_chunks"):
+        _make_overlap_wgrad_config(overlap_wgrad_compute_output_layer_chunks=0)
+
+
+def test_overlap_wgrad_compute_accepts_supported_options():
+    te_common = pytest.importorskip("transformer_engine.pytorch.module._common")
+    if not hasattr(te_common.WeightGradStore, "set_stream"):
+        pytest.skip("Transformer Engine without WeightGradStore.set_stream")
+
+    config = _make_overlap_wgrad_config(overlap_wgrad_compute_output_layer_chunks=8)
+
+    assert config.overlap_wgrad_compute_output_layer_chunks == 8
+
+
 def test_batch_invariant_backend_rejects_unknown_value_at_construction():
     # Programmatic construction bypasses argparse's Literal choices, so
     # __post_init__ must catch typos before model init.
