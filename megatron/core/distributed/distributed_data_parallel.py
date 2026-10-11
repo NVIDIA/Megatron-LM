@@ -35,7 +35,9 @@ class WgradStream:
     compute stream waits for the weight gradients issued before the reduce-scatter two bucket
     groups earlier. This bounds how far the compute stream runs ahead, and so the memory of
     the tensors the deferred weight gradients still read (released to the allocator only once
-    a dependency on their completion exists on the compute stream).
+    a dependency on their completion exists on the compute stream). The events never cross an
+    iteration (``reset``) nor a CUDA graph capture boundary: a capturing stream may only wait
+    on captured events, and eager work only on eagerly recorded ones.
     """
 
     BACKLOG_BUCKET_GROUPS = 2
@@ -44,11 +46,18 @@ class WgradStream:
         self.stream = torch.cuda.Stream(priority=0)
         self._dispatch_events = deque()
 
+    def reset(self) -> None:
+        """Start of an iteration: forget the previous iteration's events."""
+        self._dispatch_events.clear()
+
     def limit_backlog(self, compute_stream: torch.cuda.Stream) -> None:
         """Called by a bucket group after it issued its reduce-scatter from the stream."""
-        self._dispatch_events.append(self.stream.record_event())
+        capturing = torch.cuda.is_current_stream_capturing()
+        self._dispatch_events.append((self.stream.record_event(), capturing))
         if len(self._dispatch_events) > self.BACKLOG_BUCKET_GROUPS:
-            compute_stream.wait_event(self._dispatch_events.popleft())
+            event, recorded_while_capturing = self._dispatch_events.popleft()
+            if recorded_while_capturing == capturing:
+                compute_stream.wait_event(event)
 
 
 class _BucketParamReadyCallback:
@@ -772,6 +781,8 @@ class DistributedDataParallel(_BaseDataParallel):
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
+        if self.wgrad_stream is not None:
+            self.wgrad_stream.reset()
         if getattr(self.config, 'cuda_graph_impl', 'none') != 'transformer_engine':
             # Don't reset grad_added_to_main_grad when CUDA Graph is used.
             # Because in CUDA Graph it no longer has the opportunity to set it back

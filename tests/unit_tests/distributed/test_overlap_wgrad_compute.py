@@ -3,8 +3,10 @@
 import pytest
 import torch
 
+import megatron.core.full_cuda_graph as full_cuda_graph
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -23,7 +25,9 @@ SEQ_LEN = 64
 VOCAB_SIZE = 256
 
 
-def _build_ddp_model(overlap_wgrad_compute: bool, num_moe_experts, output_layer_chunks=None):
+def _build_ddp_model(
+    overlap_wgrad_compute: bool, num_moe_experts, output_layer_chunks=None, cuda_graph_impl="none"
+):
     config = TransformerConfig(
         num_layers=2,
         hidden_size=64,
@@ -39,6 +43,7 @@ def _build_ddp_model(overlap_wgrad_compute: bool, num_moe_experts, output_layer_
         gradient_accumulation_fusion=True,
         overlap_wgrad_compute=overlap_wgrad_compute,
         overlap_wgrad_compute_output_layer_chunks=output_layer_chunks,
+        cuda_graph_impl=cuda_graph_impl,
         use_cpu_initialization=True,
     )
     model_parallel_cuda_manual_seed(123)
@@ -126,3 +131,41 @@ class TestOverlapWgradCompute:
         _, second = _grads_after_one_step(model, data)
         for name, grad in first.items():
             torch.testing.assert_close(second[name], grad, rtol=0, atol=0, msg=name)
+
+    def test_full_iteration_cuda_graph_after_eager_warmup(self, monkeypatch):
+        """Two eager iterations, then the forward/backward captured into a CUDA graph and
+        replayed: the events and streams of the deferred weight gradients must not cross the
+        eager -> capture -> replay boundaries, and the captured gradients match the eager ones."""
+        # A fresh shared capture stream, created at the priority the config sets.
+        monkeypatch.setattr(full_cuda_graph, "_shared_capture_stream", None)
+        monkeypatch.setattr(full_cuda_graph, "_shared_capture_stream_priority", 0)
+        torch.manual_seed(0)
+        data = {
+            "input_ids": torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN), device="cuda"),
+            "position_ids": torch.arange(SEQ_LEN, device="cuda").unsqueeze(0),
+            "attention_mask": None,
+        }
+        data["labels"] = data["input_ids"].clone()
+        model = _build_ddp_model(True, 4, cuda_graph_impl="full_iteration")
+        assert get_shared_capture_stream().priority == -1
+
+        _, eager = _grads_after_one_step(model, data)
+        _grads_after_one_step(model, data)
+
+        model.zero_grad_buffer()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=get_shared_capture_stream()):
+            model(**data).sum().backward()
+            model.finish_grad_sync()
+        torch.cuda.synchronize()
+        captured = {name: p.main_grad.clone() for name, p in model.named_parameters()}
+
+        model.zero_grad_buffer()
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = {name: p.main_grad.clone() for name, p in model.named_parameters()}
+
+        for name, grad in eager.items():
+            torch.testing.assert_close(captured[name], grad, rtol=0, atol=0, msg=name)
+            torch.testing.assert_close(replayed[name], grad, rtol=0, atol=0, msg=name)
