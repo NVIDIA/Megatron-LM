@@ -4045,9 +4045,10 @@ class MLATransformerConfig(TransformerConfig):
     multi_latent_attention: bool = True
     """Whether to use Multi-Latent Attention."""
 
-    mla_proj_disable_quantization: bool = False
-    """Disable FP8/FP4 initialization and GEMMs for absorbed-MLA projections, using
-    the configured unquantized dtype (e.g. BF16). Core-attention precision is unchanged.
+    mla_proj_use_quantization: bool = True
+    """Whether absorbed-MLA projections use the enclosing FP8/FP4 context.
+    When disabled, they use the configured unquantized dtype (e.g. BF16). Core-attention
+    precision is unchanged.
     """
 
     use_fused_mla_q_uproj: bool = False

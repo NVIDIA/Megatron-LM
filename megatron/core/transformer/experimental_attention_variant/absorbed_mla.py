@@ -142,7 +142,7 @@ class AbsorbedMLASelfAttention(Attention):
 
     def _mla_projection_context(self, *, is_init: bool = False):
         """Use high precision for MLA projections only when explicitly requested."""
-        if self.config.mla_proj_disable_quantization:
+        if not self.config.mla_proj_use_quantization:
             return get_fp8_disabled_context(self.config, is_init=is_init)
         return nullcontext()
 
@@ -246,7 +246,7 @@ class AbsorbedMLASelfAttention(Attention):
         # Output.
         linear_proj_config = self.config
         linear_proj_buffer = "proj"
-        if self.config.mla_proj_disable_quantization:
+        if not self.config.mla_proj_use_quantization:
             # FP8 userbuffers are not registered for this BF16/FP32 projection.  Build the
             # layer with overlap disabled rather than passing a stale ``proj`` buffer name.
             linear_proj_config = copy.copy(self.config)
