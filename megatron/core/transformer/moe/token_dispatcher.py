@@ -1060,6 +1060,14 @@ class _HybridEPManager(_DispatchManager):
 
         self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+        # The permute of a single-rank group is a self-permutation that can quantize its rows
+        # for the grouped MLP on the way; a larger group keeps HybridEP's BF16 permute.
+        self.permute_quantize = self.config.moe_permute_quantize_fusion and self.group.size() == 1
+        if self.config.moe_permute_quantize_fusion and not self.permute_quantize:
+            logger.warning(
+                "moe_permute_quantize_fusion needs a single-rank expert group "
+                f"(got {self.group.size()} ranks); HybridEP permutes in BF16."
+            )
         # HybridEP dispatch expects equal per-rank input sizes. When requested,
         # variable token counts are padded to the group-wide max and trimmed in combine.
         self._original_num_tokens: Optional[int] = None
@@ -1162,6 +1170,7 @@ class _HybridEPManager(_DispatchManager):
                 pad_multiple=self.pad_multiple,
                 fused=self.config.moe_permute_fusion_into_hybridep,
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
+                permute_quantize=self.permute_quantize,
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
