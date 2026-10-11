@@ -11,6 +11,10 @@ from torch.distributed.tensor import DTensor, Shard
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental import init_optimizer_state
+from ..distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import (
+    parameter_layouts,
+    wrap_optimizer_state,
+)
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     get_containing_parameter_group,
     sync_model_weights_from_main_weights,
@@ -80,6 +84,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             if self.ddp_config != model_chunk.ddp_config:
                 raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
+        self._parameter_layouts = {
+            param: layout
+            for chunk in model_chunks
+            for param, layout in parameter_layouts(chunk).items()
+        }
         self.is_stub_optimizer = optimizer is None
         self._casted_grads = []
         # Each parameter's globally unique checkpoint name, mirroring
@@ -161,10 +170,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 is what expert parallelism produces. Not yet supported rather than refused
                 on principle; training under expert parallelism is unaffected.
         """
-        sharded_parameters = [
-            param for param in self._trainable_parameters() if isinstance(param, DTensor)
-        ]
-        if len({param.device_mesh for param in sharded_parameters}) > 1:
+        buffers = [self._parameter_layouts[param][0] for param in self._trainable_parameters()]
+        if len({buffer.mesh for buffer in buffers}) > 1:
             # MFSDP v2 shards expert parameters over the expert-DP mesh and everything else
             # over the DP mesh (see FullyShardedDataParallelV2). Expert parallelism also gives
             # each rank a different set of expert FQNs, so the DTensor keyspace this method
@@ -175,22 +182,22 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 "MFSDP v2 optimizer checkpointing does not support expert parallelism yet: "
                 "its parameters span more than one device mesh."
             )
-        if not sharded_parameters:
+        if not buffers:
             return []
 
         # Union over every parameter rather than reading the first one's layout: a mesh
         # dimension that one parameter replicates and another sharded still has to be gathered
         # over, or the rank that solely describes an FQN never reaches the ranks that need it.
-        mesh = sharded_parameters[0].device_mesh
+        mesh = buffers[0].mesh
         sharded_dims = set()
-        for param in sharded_parameters:
-            for mesh_dim, placement in enumerate(param.placements):
+        for buffer in buffers:
+            for mesh_dim, placement in enumerate(buffer.placements):
                 if isinstance(placement, Shard) and mesh.size(mesh_dim) > 1:
                     sharded_dims.add(mesh_dim)
         return [mesh.get_group(mesh_dim) for mesh_dim in sorted(sharded_dims)]
 
     def _gather_state_keys_by_fqn(self) -> dict[str, list[str]]:
-        """Map every parameter's FQN to the keys of its ``DTensor`` optimizer state entries.
+        """Map every parameter's FQN to the keys of its elementwise optimizer state entries.
 
         The keys are read off live state (``exp_avg``/``exp_avg_sq`` for Adam) rather than
         hard-coded, so any base optimizer works. They are gathered because a parameter that
@@ -207,7 +214,9 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """
         state_keys_by_fqn = {
             self._param_to_fqn[param]: sorted(
-                key for key, value in state.items() if isinstance(value, DTensor)
+                key
+                for key, value in state.items()
+                if isinstance(value, torch.Tensor) and value.ndim > 0
             )
             for param, state in self.optimizer.state.items()
         }
@@ -277,10 +286,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Load optimizer state produced by :meth:`sharded_state_dict`.
 
         By the time this runs DCP has already written the checkpoint's tensors into the
-        resting optimizer-state DTensors in place, since ``sharded_state_dict(is_loading=True)``
-        exposed them as the load destinations. What is left is to restore the param-group
-        hyperparameters (including the group-level ``step``) and re-bind the FQN-keyed state
-        to the current parameters, mirroring the Megatron-FSDP branch of
+        checkpoint DTensor views of the local optimizer state in place, since
+        ``sharded_state_dict(is_loading=True)`` exposed them as the load destinations.
+        Unwrap those views before reinstalling the state, restore the param-group
+        hyperparameters (including the group-level ``step``), and re-bind the FQN-keyed
+        state to the current parameters, mirroring the Megatron-FSDP branch of
         :meth:`DistributedOptimizer.load_state_dict`.
         """
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
@@ -290,7 +300,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 # Drop the empty-local placeholders synthesized for save-time rank
                 # consistency; keep only what this rank's optimizer owns.
                 "state": {
-                    fqn: param_state
+                    fqn: {
+                        key: value.to_local() if isinstance(value, DTensor) else value
+                        for key, value in param_state.items()
+                    }
                     for fqn, param_state in state_dict["state"].items()
                     if fqn in owned_fqns
                 },
@@ -351,7 +364,9 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         for param in self._trainable_parameters():
             fqn = self._param_to_fqn[param]
             if fqn in state_by_fqn:
-                packed_state[fqn] = state_by_fqn[fqn]
+                packed_state[fqn] = wrap_optimizer_state(
+                    state_by_fqn[fqn], *self._parameter_layouts[param]
+                )
             elif fqn in state_keys_by_fqn:
                 # Filtered out of this rank's optimizer because its local shard is empty. The
                 # rank owning a non-empty shard saves the real state; this placeholder has the
@@ -367,7 +382,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 # ever synthesized and this branch is dead -- it is left unconditional
                 # rather than version-gated so there is one keyspace to reason about
                 # instead of two.
-                packed_state[fqn] = {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]}
+                packed_state[fqn] = wrap_optimizer_state(
+                    {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]},
+                    *self._parameter_layouts[param],
+                )
             # A parameter absent from the gathered keyspace has no state on any rank, because
             # nothing has stepped yet. Emitting it as an empty mapping would be rank-consistent
             # but wrong in a subtler way: the fsdp_dtensor handlers in fsdp_dtensor_checkpoint

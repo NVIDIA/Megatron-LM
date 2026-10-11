@@ -36,12 +36,62 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.tensor import DTensor, Shard
 
+from .dbuffer import DBuffer
 from .module import FsdpModule
 from .optimizer import init_optimizer_state
 from .parameter_group import sync_model_weights_from_main_weights
 from .uneven_dtensor import attach_uneven_dtensor_metadata
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
+
+
+def parameter_layouts(model: torch.nn.Module) -> dict[torch.nn.Parameter, tuple[DBuffer, int]]:
+    """Map each local runtime parameter to its main-weight buffer and logical index."""
+    return {
+        parameter.sharded: (group.main_weight, index)
+        for module in model.modules()
+        if isinstance(module, FsdpModule)
+        for group in module.parameter_groups
+        for index, parameter in enumerate(group.fsdp_parameters)
+    }
+
+
+def wrap_model_state(
+    model: torch.nn.Module, state_dict: dict[str, Any], *, prefix: str = ""
+) -> set[str]:
+    """Replace local parameter entries with checkpoint-only DTensor views in place."""
+    layouts = parameter_layouts(model)
+    local_fqns = set()
+    for fqn, parameter in model.named_parameters(remove_duplicate=False):
+        if parameter in layouts:
+            buffer, index = layouts[parameter]
+            key = prefix + fqn
+            state_dict[key] = buffer.get_dtensor(index)
+            local_fqns.add(key)
+    return local_fqns
+
+
+def wrap_optimizer_state(state: dict[str, Any], buffer: DBuffer, index: int) -> dict[str, Any]:
+    """Wrap elementwise state without changing the optimizer's live state dictionary."""
+    result = dict(state)
+    local_shape = buffer.get_tensor_view(index).shape
+    shape = buffer.layout.tensor_shapes[index]
+    for key, value in state.items():
+        if not isinstance(value, torch.Tensor) or value.ndim == 0:
+            continue
+        if value.shape != local_shape:
+            raise NotImplementedError(
+                "Local-tensor checkpoints require parameter-shaped optimizer state."
+            )
+        result[key] = DTensor.from_local(
+            value,
+            buffer.mesh,
+            tuple(Shard(p.dim) if isinstance(p, Shard) else p for p in buffer.placements),
+            run_check=False,
+            shape=shape,
+            stride=torch.empty(shape, device="meta").stride(),
+        )
+    return result
 
 
 class CheckpointState:
@@ -60,38 +110,14 @@ class CheckpointState:
         """Build checkpoint dictionaries with global shapes and uneven-shard metadata."""
         model_state_dict = get_model_state_dict(self.model)
         optimizer_state_dict = get_optimizer_state_dict(self.model, self.optimizer)
-        # Optimizer.state_dict() can share these nested dictionaries with live state.
-        optimizer_state_dict["state"] = {
-            fqn: dict(state) for fqn, state in optimizer_state_dict.get("state", {}).items()
-        }
-        layouts = {}
-        for module in self.model.modules():
-            if isinstance(module, FsdpModule):
-                for group in module.parameter_groups:
-                    for index, parameter in enumerate(group.fsdp_parameters):
-                        layouts[parameter.sharded] = (group.main_weight, index)
-        self._local_fqns = set()
+        self._local_fqns = wrap_model_state(self.model, model_state_dict)
+        layouts = parameter_layouts(self.model)
+        # Optimizer.state_dict() can share nested dictionaries with live state.
+        optimizer_state_dict["state"] = dict(optimizer_state_dict.get("state", {}))
         for fqn, parameter in self.model.named_parameters(remove_duplicate=False):
-            if parameter not in layouts:
-                continue
-            buffer, index = layouts[parameter]
-            self._local_fqns.add(fqn)
-            model_state_dict[fqn] = buffer.get_dtensor(index)
-            for key, value in optimizer_state_dict.get("state", {}).get(fqn, {}).items():
-                if not isinstance(value, torch.Tensor) or value.ndim == 0:
-                    continue
-                if value.shape != parameter.shape:
-                    raise NotImplementedError(
-                        "Local-tensor checkpoints require parameter-shaped optimizer state."
-                    )
-                shape = buffer.layout.tensor_shapes[index]
-                optimizer_state_dict["state"][fqn][key] = DTensor.from_local(
-                    value,
-                    buffer.mesh,
-                    tuple(Shard(p.dim) if isinstance(p, Shard) else p for p in buffer.placements),
-                    run_check=False,
-                    shape=shape,
-                    stride=torch.empty(shape, device="meta").stride(),
+            if parameter in layouts and fqn in optimizer_state_dict["state"]:
+                optimizer_state_dict["state"][fqn] = wrap_optimizer_state(
+                    optimizer_state_dict["state"][fqn], *layouts[parameter]
                 )
         attach_uneven_dtensor_metadata(self.model, model_state_dict, optimizer_state_dict)
         return {"model": model_state_dict, "optimizer": optimizer_state_dict}
