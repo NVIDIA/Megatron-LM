@@ -44,6 +44,16 @@ try:
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
+try:
+    import transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention as te_dpa
+    from transformer_engine.pytorch.attention.fused_qkv_rope_quantize import (
+        fused_qkv_rope_quantize_supported,
+    )
+
+    HAVE_FUSED_QKV_ROPE_QUANTIZE = True
+except ImportError:
+    HAVE_FUSED_QKV_ROPE_QUANTIZE = False
+
 
 @pytest.mark.parametrize("output_gate", [False, True])
 class TestParallelAttention:
@@ -151,6 +161,76 @@ class TestParallelAttention:
         assert bias.shape[0] == config.hidden_size
         self.parallel_attention.config.apply_rope_fusion = False
         self.parallel_attention.config.rotary_interleaved = False
+
+    @pytest.mark.skipif(
+        not HAVE_FUSED_QKV_ROPE_QUANTIZE, reason="Fused QKV RoPE + quantize requires a newer TE."
+    )
+    def test_fused_qkv_rope_quantize_gpu_forward_backward(self, monkeypatch):
+        """The fused RoPE + quantize path against the fused RoPE with FP8 attention."""
+        if self.transformer_config.attention_output_gate:
+            pytest.skip("Fused QKV RoPE does not support gated attention for now.")
+        from megatron.core.fp8_utils import get_fp8_context
+        from megatron.core.transformer import attention as attention_module
+
+        # Float8CurrentScaling attention on cuDNN (TE reads NVTE_DPA_FP8_RECIPE when imported)
+        monkeypatch.setattr(te_dpa, "_dpa_fp8_recipe", "Float8CurrentScaling")
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
+        sequence_length, micro_batch_size = 128, 1
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=512,
+            num_attention_heads=8,
+            num_query_groups=2,
+            kv_channels=64,
+            add_qkv_bias=True,
+            attention_dropout=0.0,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_dot_product_attention=True,
+            apply_rope_fusion=True,
+            fused_single_qkv_rope=True,
+            fused_single_qkv_rope_quantize=True,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+        fused = SelfAttention(config, submodules, layer_number=1).cuda()
+        plain_config = copy.deepcopy(config)
+        plain_config.fused_single_qkv_rope_quantize = False
+        plain = SelfAttention(plain_config, submodules, layer_number=1).cuda()
+        plain.load_state_dict(fused.state_dict())
+
+        hidden_states = torch.randn(
+            (sequence_length, micro_batch_size, config.hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
+        rotary_pos_emb = torch.rand(sequence_length, 1, 1, config.kv_channels).cuda()
+        outputs = []
+        for module in (fused, plain):
+            inputs = hidden_states.clone().requires_grad_()
+            with (
+                mock.patch.object(
+                    attention_module,
+                    "apply_fused_qkv_rotary_pos_emb",
+                    wraps=attention_module.apply_fused_qkv_rotary_pos_emb,
+                ) as rope,
+                get_fp8_context(module.config),
+            ):
+                output, bias = module(inputs, attention_mask, rotary_pos_emb=rotary_pos_emb)
+            quantized = rope.call_args.kwargs.get("qkv_quantizer") is not None
+            assert quantized == module.config.fused_single_qkv_rope_quantize
+            (output + bias).float().square().mean().backward()
+            outputs.append((output, inputs.grad, module.linear_qkv.bias.grad))
+
+        for fused_tensor, plain_tensor in zip(*outputs):
+            assert torch.isfinite(fused_tensor).all()
+            # the fused path adds the qkv bias after the GEMM's bf16 rounding and sums the bias
+            # gradient in another order; q/k/v and d(qkv) see the same quantization recipes
+            torch.testing.assert_close(fused_tensor, plain_tensor, rtol=5e-2, atol=5e-2)
 
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
