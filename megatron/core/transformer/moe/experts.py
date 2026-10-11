@@ -626,6 +626,8 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
         )
+        if self.config.overlap_wgrad_compute:
+            op.wgrad_store.set_stream(self.linear_fc1.wgrad_store.stream)
         # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
         # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
         # grouped view at the op boundary.
@@ -735,6 +737,8 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
+        if self.config.overlap_wgrad_compute:
+            op.wgrad_store.set_stream(self.linear_fc2.wgrad_store.stream)
         # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
         # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
         # view at the op boundary.

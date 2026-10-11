@@ -36,6 +36,11 @@ from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_single_rank
 
+try:
+    from transformer_engine.pytorch.module._common import WeightGradStore
+except ImportError:
+    WeightGradStore = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -84,6 +89,13 @@ class Router(ABC, MegatronModule):
             setattr(self.weight, 'use_muon', False)
             if self.bias is not None:
                 setattr(self.bias, 'use_muon', False)
+        # overlap_wgrad_compute: the weight gradient is deferred to backward_dw() like the
+        # Transformer Engine layers' (same store, same DDP hook protocol).
+        self.wgrad_store = None
+        self.wgrad_accumulation_and_reduce_hooks = []
+        if self.config.overlap_wgrad_compute:
+            self.wgrad_store = WeightGradStore(delay_wgrad_compute=True)
+            self.weight.skip_backward_post_hook = True
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
@@ -100,6 +112,18 @@ class Router(ABC, MegatronModule):
         if self.bias is not None:
             self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
             setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
+
+    def register_wgrad_accumulation_and_reduce_hooks(self, hook):
+        """Register a hook to run after the deferred weight gradient computation."""
+        self.wgrad_accumulation_and_reduce_hooks.append(hook)
+
+    def backward_dw(self) -> None:
+        """Compute the weight gradient the backward pass deferred (overlap_wgrad_compute)."""
+        if self.wgrad_store is None or self.wgrad_store.context.empty():
+            return
+        self.wgrad_store.pop()
+        for hook in self.wgrad_accumulation_and_reduce_hooks:
+            hook()
 
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
@@ -122,7 +146,7 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
+        logits = router_gating_linear(input, self.weight, self.bias, router_dtype, self.wgrad_store)
         return logits
 
     @abstractmethod

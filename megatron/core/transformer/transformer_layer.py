@@ -41,6 +41,7 @@ from megatron.core.transformer.residual_recompute import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wgrad_overlap import release_deferred_wgrads_after
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -494,6 +495,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.mlp_bda = build_module(submodules.mlp_bda)
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
+        if self.config.overlap_wgrad_compute:
+            if hasattr(self.self_attention, 'backward_dw'):
+                release_deferred_wgrads_after(
+                    self.self_attention, self.self_attention.backward_dw
+                )
+            if hasattr(self.mlp, 'backward_dw'):
+                release_deferred_wgrads_after(self.mlp, self._release_mlp_wgrads)
 
         # Split Hybrid mHC runs these base-layer norms through the wrapper's recompute manager.
         self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
@@ -590,6 +598,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if "_forward_post_mlp" in vars(klass):
                 self._legacy_forward_post_mlp = klass._forward_post_mlp
                 break
+
+    def _release_mlp_wgrads(self) -> None:
+        """Issue every weight gradient the MLP's backward pass deferred."""
+        if self.is_moe_layer:
+            self.mlp.backward_dw(routed_experts=True, shared_experts=True)
+        else:
+            self.mlp.backward_dw()
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained layer execution."""
