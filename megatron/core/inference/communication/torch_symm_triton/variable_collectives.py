@@ -121,7 +121,7 @@ def _multimem_all_gather_v_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 # Each 64-bit pack is exactly 1 uint64, so offsets index directly (no * 2 stride).
@@ -131,7 +131,7 @@ def _multimem_all_gather_v_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
     sync_threads()
@@ -238,9 +238,7 @@ def _multimem_reduce_scatter_v_kernel(
             )
             local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
 
-            (x, y, z, w) = ld_128(
-                multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32
-            )
+            x, y, z, w = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
             st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
 
 
@@ -439,7 +437,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr_0.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 multicast_ptrs = (
@@ -448,7 +446,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr_0.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
         # --- Tensor 1 ---
@@ -463,7 +461,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 multicast_ptrs = (
@@ -472,7 +470,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
         # --- Tensor 2 ---
@@ -487,7 +485,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr_2.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 multicast_ptrs = (
@@ -496,7 +494,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr_2.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
     sync_threads()
