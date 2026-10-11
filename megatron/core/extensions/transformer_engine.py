@@ -310,6 +310,19 @@ def _get_global_layer_fqn(module_name: str, named_modules: Dict[str, torch.nn.Mo
     return module_name
 
 
+def _parse_ptq_calibration_buffer_name(buffer_name: str) -> Tuple[str, str, str]:
+    """Parse a TransformerEngine PTQ calibration buffer name."""
+    match = re.fullmatch(
+        r"(?P<tensor_name>.+)_"
+        r"(?P<metadata_name>amax(?:_rowwise)?|scale_inv)_"
+        r"(?P<recipe_name>.+)_te_ptq_calibrated",
+        buffer_name,
+    )
+    if match is None:
+        raise ValueError(f"Malformed TransformerEngine PTQ calibration buffer {buffer_name!r}")
+    return (match.group("tensor_name"), match.group("metadata_name"), match.group("recipe_name"))
+
+
 def add_ptq_calibration_metadata_to_state_dict(
     state_dict: Dict[str, Any], model: List[torch.nn.Module]
 ) -> None:
@@ -341,22 +354,21 @@ def add_ptq_calibration_metadata_to_state_dict(
                 continue
             processed_buffers = []
             for key, data in sorted(calibration_buffers):
+                tensor_name, metadata_name, recipe_name = _parse_ptq_calibration_buffer_name(key)
                 metadata = data.detach()
                 if metadata.numel() > 1:
                     # Only global FP32 per-tensor scales are checkpointed.
                     metadata = metadata.amax().reshape(1)
 
-                if "_scale_inv_" in key:
+                if metadata_name == "scale_inv":
                     # Inverted scaling factor, i.e. absmax / quantmax.
-                    scale_inv = metadata
+                    scale_inv = metadata.clone()
                 else:
                     # Convert absmax to a dequantization scaling factor.
-                    if "nvfp4" in key:
+                    if recipe_name == "nvfp4":
                         # E2M1_MAX * E4M3_MAX
                         quant_max = 6.0 * 448.0
-                    elif any(
-                        recipe in key for recipe in ("fp8_delayed_scaling", "fp8_current_scaling")
-                    ):
+                    elif recipe_name == "fp8_delayed_scaling":
                         quant_max = 448.0
                     else:
                         raise ValueError(f"Unsupported amax calibration buffer {key!r}")
@@ -370,25 +382,22 @@ def add_ptq_calibration_metadata_to_state_dict(
                         scale_inv, op=torch.distributed.ReduceOp.MAX, group=reduction_group
                     )
 
-                tensor_name = re.split(
-                    r"_tensor_(?:amax(?:_rowwise)?|scale_inv)_", key, maxsplit=1
-                )[0]
                 gemm_match = re.fullmatch(r"(input|weight)_gemm(\d+)", tensor_name)
-                processed_buffers.append((key, scale_inv, gemm_match))
+                processed_buffers.append((tensor_name, recipe_name, scale_inv, gemm_match))
 
             expert_buffers = [
                 entry
                 for entry in processed_buffers
-                if hasattr(module, "_pg_collection") and entry[2] is not None
+                if hasattr(module, "_pg_collection") and entry[3] is not None
             ]
             non_expert_buffers = [
                 entry
                 for entry in processed_buffers
-                if not (hasattr(module, "_pg_collection") and entry[2] is not None)
+                if not (hasattr(module, "_pg_collection") and entry[3] is not None)
             ]
             if expert_buffers:
                 # Gather every local GEMM's input and weight scales in one EP collective.
-                local_scales = torch.cat([scale for _, scale, _ in expert_buffers])
+                local_scales = torch.cat([scale for _, _, scale, _ in expert_buffers])
                 ep_group = module._pg_collection.ep
                 ep_size = get_pg_size(ep_group)
                 num_local_scales = local_scales.numel()
@@ -402,24 +411,27 @@ def add_ptq_calibration_metadata_to_state_dict(
                 gathered_scales = gathered_scales.cpu()
 
                 for ep_rank in range(ep_size):
-                    for scale_idx, (key, _, gemm_match) in enumerate(expert_buffers):
+                    for scale_idx, (_, recipe_name, _, gemm_match) in enumerate(expert_buffers):
                         tensor_kind = gemm_match.group(1)
                         local_gemm_idx = int(gemm_match.group(2))
                         global_expert_idx = ep_rank * module.num_gemms + local_gemm_idx
                         expert_fqn = _get_grouped_linear_expert_fqn(export_name, global_expert_idx)
                         # Rename dense keys to match vLLM, TensorRT-LLM, and other PTQ formats.
                         # NOTE(@cspades): I don't like this but these are the conventional names.
-                        scale_suffix = "_2" if tensor_kind == "weight" and "nvfp4" in key else ""
+                        scale_suffix = (
+                            "_2" if tensor_kind == "weight" and recipe_name == "nvfp4" else ""
+                        )
                         local_calibration_state[
                             f"{expert_fqn}.{tensor_kind}_scale{scale_suffix}"
                         ] = gathered_scales[ep_rank * num_local_scales + scale_idx]
 
-            for key, scale_inv, _ in non_expert_buffers:
+            for tensor_name, recipe_name, scale_inv, _ in non_expert_buffers:
                 # Rename dense keys to match vLLM, TensorRT-LLM, and other PTQ formats.
                 # NOTE(@cspades): I don't like this but these are the conventional names.
-                scale_prefix = "input_" if "input" in key else "weight_"
-                scale_suffix = "_2" if "weight" in key and "nvfp4" in key else ""
-                local_calibration_state[f"{export_name}.{scale_prefix}scale{scale_suffix}"] = (
+                scale_suffix = (
+                    "_2" if tensor_name.endswith("weight") and recipe_name == "nvfp4" else ""
+                )
+                local_calibration_state[f"{export_name}.{tensor_name}_scale{scale_suffix}"] = (
                     scale_inv.cpu()
                 )
 

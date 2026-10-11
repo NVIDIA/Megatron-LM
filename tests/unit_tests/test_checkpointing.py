@@ -683,12 +683,15 @@ def test_save_checkpoint(
 
         # Text-only checkpoint saves still bypass dataloader state, while passing CP through.
         cp_group = mock.sentinel.cp_group
-        with mock.patch(
-            "megatron.training.checkpointing.maybe_save_dataloader_state",
-            wraps=maybe_save_dataloader_state,
-        ) as save_dataloader_state, mock.patch(
-            "megatron.training.checkpointing.add_ptq_calibration_metadata_to_state_dict"
-        ) as export_calibration_metadata:
+        with (
+            mock.patch(
+                "megatron.training.checkpointing.maybe_save_dataloader_state",
+                wraps=maybe_save_dataloader_state,
+            ) as save_dataloader_state,
+            mock.patch(
+                "megatron.training.checkpointing.add_ptq_calibration_metadata_to_state_dict"
+            ) as export_calibration_metadata,
+        ):
             save_checkpoint(
                 iteration,
                 [model],

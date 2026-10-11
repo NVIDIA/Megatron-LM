@@ -30,8 +30,7 @@ def test_calibration_options_default_to_disabled():
 
 def test_disabled_megatron_option_returns_no_te_calibration_config():
     config = SimpleNamespace(
-        ckpt_transformer_engine_calibration=False,
-        transformer_engine_calibration_decay=0.5,
+        ckpt_transformer_engine_calibration=False, transformer_engine_calibration_decay=0.5
     )
 
     assert fp8_utils.get_te_calibration_config(config) is None
@@ -39,8 +38,7 @@ def test_disabled_megatron_option_returns_no_te_calibration_config():
 
 def test_calibration_option_requires_te_config_support(monkeypatch):
     config = SimpleNamespace(
-        ckpt_transformer_engine_calibration=True,
-        transformer_engine_calibration_decay=0.123,
+        ckpt_transformer_engine_calibration=True, transformer_engine_calibration_decay=0.123
     )
     monkeypatch.setattr(fp8_utils.transformer_engine.pytorch, "QuantizationCalibrationConfig", None)
     fp8_utils._make_te_calibration_config.cache_clear()
@@ -51,8 +49,7 @@ def test_calibration_option_requires_te_config_support(monkeypatch):
 
 def test_megatron_options_create_te_calibration_config():
     config = SimpleNamespace(
-        ckpt_transformer_engine_calibration=True,
-        transformer_engine_calibration_decay=0.5,
+        ckpt_transformer_engine_calibration=True, transformer_engine_calibration_decay=0.5
     )
 
     calibration_config = fp8_utils.get_te_calibration_config(config)
@@ -109,8 +106,7 @@ def test_fp8_context_reports_unsupported_te_calibration_autocast(monkeypatch):
     monkeypatch.setattr(fp8_utils.transformer_engine.pytorch, "fp8_autocast", legacy_fp8_autocast)
 
     with pytest.raises(
-        RuntimeError,
-        match="--ckpt-transformer-engine-calibration.*accepts calibration_config",
+        RuntimeError, match="--ckpt-transformer-engine-calibration.*accepts calibration_config"
     ):
         fp8_utils.get_fp8_context(config)
 
@@ -233,10 +229,10 @@ def test_calibration_amax_conversion_and_scale_inv_passthrough(monkeypatch):
     _disable_scale_collectives(monkeypatch)
     linear = torch.nn.Module()
     linear.register_buffer(
-        "input_tensor_amax_fp8_delayed_scaling_te_ptq_calibrated", torch.tensor([896.0])
+        "input_amax_fp8_delayed_scaling_te_ptq_calibrated", torch.tensor([896.0])
     )
     linear.register_buffer(
-        "weight_tensor_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.25])
+        "weight_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.25])
     )
     model = torch.nn.Module()
     model.add_module("linear", linear)
@@ -253,7 +249,7 @@ def test_calibration_amax_conversion_and_scale_inv_passthrough(monkeypatch):
 def test_nvfp4_weight_amax_exports_secondary_weight_scale(monkeypatch):
     _disable_scale_collectives(monkeypatch)
     linear = torch.nn.Module()
-    linear.register_buffer("weight_tensor_amax_nvfp4_te_ptq_calibrated", torch.tensor([2688.0]))
+    linear.register_buffer("weight_amax_nvfp4_te_ptq_calibrated", torch.tensor([2688.0]))
     model = torch.nn.Module()
     model.add_module("linear", linear)
     state_dict = {"model": {}}
@@ -261,6 +257,25 @@ def test_nvfp4_weight_amax_exports_secondary_weight_scale(monkeypatch):
     te_ext.add_ptq_calibration_metadata_to_state_dict(state_dict, [model])
 
     torch.testing.assert_close(state_dict["model"]["linear.weight_scale_2"], torch.ones(1))
+
+
+def test_fused_module_tensor_names_export_distinct_scales(monkeypatch):
+    _disable_scale_collectives(monkeypatch)
+    mlp = torch.nn.Module()
+    mlp.register_buffer(
+        "fc1_input_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.25])
+    )
+    mlp.register_buffer(
+        "fc2_input_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.5])
+    )
+    model = torch.nn.Module()
+    model.add_module("mlp", mlp)
+    state_dict = {"model": {}}
+
+    te_ext.add_ptq_calibration_metadata_to_state_dict(state_dict, [model])
+
+    torch.testing.assert_close(state_dict["model"]["mlp.fc1_input_scale"], torch.tensor([0.25]))
+    torch.testing.assert_close(state_dict["model"]["mlp.fc2_input_scale"], torch.tensor([0.5]))
 
 
 def test_global_layer_fqn_uses_layer_number():
@@ -284,10 +299,10 @@ def test_expert_parallel_calibration_scales_are_gathered(monkeypatch):
     grouped_linear.num_gemms = 2
     grouped_linear._pg_collection = SimpleNamespace(ep=ep_group)
     grouped_linear.register_buffer(
-        "input_gemm0_tensor_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.25])
+        "input_gemm0_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.25])
     )
     grouped_linear.register_buffer(
-        "input_gemm1_tensor_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.5])
+        "input_gemm1_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.5])
     )
     mlp = torch.nn.Module()
     mlp.add_module("linear_fc1", grouped_linear)
@@ -321,7 +336,7 @@ def test_pipeline_parallel_calibration_states_are_merged(monkeypatch):
     model.pg_collection = SimpleNamespace(pp=pp_group)
     linear = torch.nn.Module()
     linear.register_buffer(
-        "input_tensor_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.25])
+        "input_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.25])
     )
     model.add_module("linear", linear)
 
@@ -352,7 +367,7 @@ def test_pipeline_parallel_conflicting_calibration_states_are_rejected(monkeypat
     model.pg_collection = SimpleNamespace(pp=pp_group)
     linear = torch.nn.Module()
     linear.register_buffer(
-        "input_tensor_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.25])
+        "input_scale_inv_fp8_current_scaling_te_ptq_calibrated", torch.tensor([0.25])
     )
     model.add_module("linear", linear)
 

@@ -107,8 +107,7 @@ def _make_te_calibration_config(transformer_engine_calibration_decay: float = 0.
     """Construct an immutable TE calibration config once per decay value."""
     if not HAVE_TE:
         raise RuntimeError(
-            "ckpt_transformer_engine_calibration requires Transformer Engine "
-            "to be installed"
+            "ckpt_transformer_engine_calibration requires Transformer Engine to be installed"
         )
     calibration_config_cls = getattr(
         transformer_engine.pytorch, "QuantizationCalibrationConfig", None
