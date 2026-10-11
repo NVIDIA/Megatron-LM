@@ -1365,11 +1365,11 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         accumulation and reduction behavior for numerical stability.
         """
         x, weight, rsigma = ctx.saved_tensors
-        w_eff = (weight + 1.0) if ctx.zero_centered_gamma else weight
-
         go_fp32 = grad_output.float()
         x_fp32 = x.float()
-        w_fp32 = w_eff.to(device=x.device, dtype=torch.float32)
+        w_fp32 = weight.to(device=x.device, dtype=torch.float32)
+        if ctx.zero_centered_gamma:
+            w_fp32 = w_fp32 + 1.0
         r = rsigma
         r3 = r * r * r
         D = x.shape[-1]
