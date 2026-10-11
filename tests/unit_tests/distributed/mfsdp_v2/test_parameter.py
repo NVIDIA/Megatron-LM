@@ -256,7 +256,10 @@ def test_frozen_parent_without_input_gradients(distributed_setup, manual_schedul
         register_combined_1f1b_hooks(model)
 
     def unpack(tensor):
-        assert tensor.untyped_storage().nbytes() > 0, "Saved weight storage freed before backward"
+        if tensor.untyped_storage().nbytes() == 0:
+            # Keep pytest's traceback formatter from reading the freed tensor too.
+            del tensor
+            raise AssertionError("Saved weight storage freed before backward")
         return tensor
 
     # pack_hook keeps the original storage; unpack_hook checks it before CUDA
