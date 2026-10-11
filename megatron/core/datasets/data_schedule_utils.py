@@ -191,7 +191,11 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
         subsample_seqlens_padded = torch.cat(
             [
                 subsample_seqlens,
-                torch.zeros(max_sub_samples - num_local_subsamples, dtype=torch.int32).cuda(),
+                torch.zeros(
+                    (max_sub_samples - num_local_subsamples, *subsample_seqlens.shape[1:]),
+                    dtype=torch.int32,
+                    device=subsample_seqlens.device,
+                ),
             ],
             dim=0,
         )
@@ -580,7 +584,9 @@ def build_packed_microbatches(
     return new_samples
 
 
-def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
+def get_batch_and_global_seqlens(
+    data_iterator, num_microbatches, dp_group, include_original_seqlens=False
+):
     """
     Get the batch and global sequence lengths.
     Each DP rank loads the same number of sequences, so we need to gather the sequence
@@ -601,9 +607,9 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     batch = []
     for item in batch_list:
         if isinstance(item, dict):
-            batch.append(item)
+            batch.append(dict(item))
         elif isinstance(item, list):
-            batch.extend(item)
+            batch.extend(dict(sample) for sample in item)
         else:
             raise ValueError(f"Invalid item type: {type(item)}")
 
@@ -617,10 +623,19 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     subsample_seqlens = torch.cat([sample["padded_seq_len"] for sample in batch]).to(
         dtype=torch.int32, device=torch.cuda.current_device()
     )
+    if include_original_seqlens:
+        original = torch.cat([sample['original_seq_len'] for sample in batch]).to(
+            dtype=torch.int32, device=subsample_seqlens.device
+        )
+        subsample_seqlens = torch.stack((subsample_seqlens, original), dim=1)
 
     global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
         _get_global_seqlens_and_ids(subsample_seqlens, dp_group)
     )
+
+    if include_original_seqlens:
+        padded, original = map(list, zip(*seqlens_gathered))
+        return batch, list(enumerate(padded)), global_ids_this_rank, offsets, padded, original
 
     return batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
 

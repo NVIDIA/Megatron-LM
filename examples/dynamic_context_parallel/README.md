@@ -1,5 +1,66 @@
 # Dynamic Context Parallel Benchmark
 
+## Bounded CPU runtime planner (PP1/VPP1)
+
+The optional runtime planner replaces the native arbitrary-CP heuristic with the
+reviewed `dcp-scheduler` lightweight planner. Install the audited source revision:
+
+```bash
+pip install 'dcp-scheduler[acceleration] @ git+https://github.com/xiaoyao0115/dcp-scheduler.git@a55b345f20462182b2c4bb00fbc488a414dd5961'
+```
+
+For the provisional Qwen3.5 cost adapter, use:
+
+```bash
+--dynamic-cp-runtime-model dcp_scheduler.adapters:qwen35_new_core_model \
+--dynamic-cp-runtime-model-options /path/to/model-options.json \
+--dynamic-cp-runtime-solver-options /path/to/solver-options.json \
+--dynamic-cp-runtime-trace-dir /path/to/telemetry
+```
+
+`model-options.json` contains `{"fa_remainder": <contents of fa_remainder.json>,
+"kernel_backend": "numba"}`. The model is specific to W32/EP4/local16K and the
+Qwen3.5 4+1 proxy; do not use it as a universal predictor or treat mixed-stack
+predictions as GPU measurements. Other models can supply the same pure-CPU
+factory contract. The solver retains the original powers packing as its incumbent,
+uses a cooperative 0.8-second budget and scores at most four candidates. This is
+not a hard deadline: mandatory scoring can overrun, and late plans wait at consumption.
+`solver-options.json` configures `LightweightOptions`, e.g. `time_budget_s`,
+`max_scored_candidates`, `max_guide_candidates` and `cp_floors`.
+`--dynamic-cp-runtime-solver module:factory` can instead inject a CPU planner
+factory called as `factory(geometry, model, **solver_options)`. It must provide
+`geometry`, `plan_padded(padded, logical_lengths=..., incumbent_rows=...)` and
+`last_statistics`. Physical dataset padding and logical costs remain separate.
+
+The existing DataLoader keeps each DP rank's sample stream. `wrap_data_iterator`
+buffers one future global batch on the host and gathers its logical/physical lengths
+on the training thread, using the existing DP collective. A persistent CPU executable
+on the DPxCP leader solves it while the current batch trains. Only lengths, options
+and incumbent rows enter the worker; CUDA visibility is disabled. It does not import
+the training entry point or call CUDA/NCCL. An I/O-only thread handles the worker
+protocol; the training thread broadcasts the completed rows when consumed. No new
+process group is created, and the rerun iterator retains its original consumption order.
+
+`--no-dynamic-cp-runtime-async` is a same-solver synchronous control;
+`--dynamic-cp-runtime-force-powers` selects the configured powers packing. To compare
+against a particular historical revision, set `--dynamic-cp-runtime-baseline
+module:factory`; this factory takes the geometry dictionary and returns a
+`padded_pairs -> rank_rows` callable. Without it the baseline is the current
+checkout's non-arbitrary scheduler, **not** an authenticated historical dev SHA. Legacy
+transport and configurations without a runtime model keep their existing path.
+The runtime requires PP1/no VPP and sequence-parallel size one. The injected cost
+model must match the model's layouts, including contiguous or zigzag partitioning. Training
+lookahead is enabled for the in-tree Varlen path or worker-backed loaders; external
+iterators and evaluation do not read ahead. Stochastic transforms must run in
+DataLoader workers so speculative reads do not change training-process RNG state.
+
+Per-rank JSONL includes submit/solve-start/solve-end/consume monotonic and wall
+timestamps, global logical/physical length digest, rows, residual CPU wait,
+worker CUDA/distributed initialization status, and queue depth (at most one). Global
+IDs are step-local in DP-rank order, **not dataset indices**. Compare leader monotonic
+timestamps on the same host and use GPU traces to establish compute overlap. The
+first step waits for initialization; subsequent steps wait only for unfinished work.
+
 This example compares regular DP-balanced packed-sequence training against
 Dynamic Context Parallelism (DCP) on the same variable-length mock workload.
 

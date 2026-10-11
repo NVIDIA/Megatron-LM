@@ -321,9 +321,12 @@ class DpBalancedScheduler(BasePackingScheduler):
             assert tp_group.rank() == 0, "Only TP rank 0 should have data_iterator"
 
             # Step 1: Fetch batches and gather global sequence lengths
-            batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
-                get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group)
-            )
+            runtime = getattr(self, 'runtime', None)
+            if runtime is None:
+                prepared = get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group)
+            else:
+                prepared, sample_id_groups = runtime.consume(num_microbatches)
+            batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = prepared
 
             # Step 2: Check required sample keys
             for key in self.get_required_sample_keys():
@@ -347,7 +350,8 @@ class DpBalancedScheduler(BasePackingScheduler):
                         del sample[key]
 
             # Step 4: Schedule samples into groups
-            sample_id_groups = self.get_groups_and_subsamples(global_id_seqlens)
+            if runtime is None:
+                sample_id_groups = self.get_groups_and_subsamples(global_id_seqlens)
 
             # Validate scheduling result
             set_gbs = set()
@@ -414,6 +418,9 @@ class DpBalancedScheduler(BasePackingScheduler):
         new_data_iterator = create_data_iterator(
             new_samples, tp_group, config, vpp_needs_data, self.is_dynamic_cp
         )
+
+        if data_iterator is not None and getattr(self, 'prefetch_next', False):
+            self.runtime.prefetch(num_microbatches)
 
         return (
             new_data_iterator,
@@ -587,7 +594,12 @@ def _get_dynamic_cp_nvlink_domains(
 
 
 def wrap_data_iterator(
-    data_iterator, config, num_microbatches, pg_collection: Optional[ProcessGroupCollection] = None
+    data_iterator,
+    config,
+    num_microbatches,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    *,
+    prefetch_next: bool = False,
 ):
     """
     A wrapper function that wraps around an existing data_iterator
@@ -676,6 +688,35 @@ def wrap_data_iterator(
         max_num_seqs=scheduler_max_num_seqs,
         **scheduler_kwargs,
     )
+
+    if (
+        scheduler_type == 'default_dynamic_cp'
+        and getattr(config, 'use_native_cp_transport', False)
+        and getattr(config, 'dynamic_cp_runtime_model', None) is not None
+    ):
+        from megatron.core.datasets.dcp_schedule_prefetch import DcpSchedulePrefetcher, runtime_spec
+
+        if pp_group.size() != 1 or config.virtual_pipeline_model_parallel_size is not None:
+            raise ValueError('The lightweight runtime planner currently supports PP1/VPP1 only')
+        if config.sequence_parallel and config.tensor_model_parallel_size != 1:
+            raise ValueError('Runtime planner storage currently requires sequence_parallel_size=1')
+        if data_iterator is not None:
+            runtime = getattr(data_iterator, '_dcp_schedule_prefetcher', None)
+            spec = runtime_spec(config, dp_cp_group.size(), max_num_seqs=scheduler_max_num_seqs)
+            if runtime is None:
+                runtime = DcpSchedulePrefetcher(
+                    data_iterator,
+                    dp_group,
+                    dp_cp_group,
+                    spec,
+                    getattr(config, 'dynamic_cp_runtime_async', True),
+                    getattr(config, 'dynamic_cp_runtime_trace_dir', None),
+                )
+                data_iterator._dcp_schedule_prefetcher = runtime
+            elif runtime.spec != spec:
+                raise ValueError('Runtime DCP geometry/model cannot change on an active iterator')
+            scheduler.runtime = runtime
+            scheduler.prefetch_next = prefetch_next
 
     (
         new_data_iterator,

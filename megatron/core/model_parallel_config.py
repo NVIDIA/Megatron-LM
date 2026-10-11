@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import argparse
 import warnings
 from dataclasses import dataclass, field
 from math import isfinite
@@ -109,6 +110,45 @@ class ModelParallelConfig:
     Requires dynamic_cp_nvlink_domain_size. Values must be finite, nonnegative, and ordered.
     None uses [1024, 2304], a configurable H100/Qwen attention reference, not a native calibration.
     """
+
+    dynamic_cp_runtime_model: Optional[str] = None
+    """CPU cost-model factory ('package.module:factory') for the bounded runtime DCP solver.
+    Replaces the native arbitrary-CP heuristic when set. Requires dcp-scheduler; PP1/VPP1 only.
+    """
+
+    dynamic_cp_runtime_model_options: Optional[str] = None
+    """JSON object, or JSON file path, passed as keywords to the cost-model factory."""
+
+    dynamic_cp_runtime_solver: Optional[str] = None
+    """Optional CPU planner factory ('module:factory'), called with geometry, model and
+    solver-options keyword arguments. None uses dcp-scheduler's lightweight planner.
+    """
+
+    dynamic_cp_runtime_solver_options: Optional[str] = None
+    """JSON object/file passed to the planner factory, or to LightweightOptions by default."""
+
+    dynamic_cp_runtime_baseline: Optional[str] = None
+    """Optional baseline factory ('module:factory'), called with the geometry dictionary.
+    Returns a callable taking padded (sample_id, length) pairs and returning P2 rank rows.
+    Use a source-pinned factory when comparing against a historical scheduler revision.
+    """
+
+    dynamic_cp_runtime_async: bool = field(
+        default=True,
+        metadata={
+            'argparse_meta': {
+                'arg_names': ['--dynamic-cp-runtime-async'],
+                'action': argparse.BooleanOptionalAction,
+            }
+        },
+    )
+    """Prepare/solve one future batch while the current batch trains. False is the sync control."""
+
+    dynamic_cp_runtime_force_powers: bool = False
+    """Use the configured P2 baseline rows without arbitrary-CP search."""
+
+    dynamic_cp_runtime_trace_dir: Optional[str] = None
+    """Optional per-rank JSONL scheduling timestamps, input digests and executed rank rows."""
 
     hybrid_context_parallel: bool = False
     """Deprecated. Use ``dynamic_context_parallel`` instead."""
