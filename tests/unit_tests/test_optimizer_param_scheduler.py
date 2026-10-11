@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
+    get_indexer_lr_for_logging,
 )
 
 
@@ -348,3 +350,20 @@ class TestGetCanonicalLrForLogging:
         """lr=0.0 is a legitimate value, not to be confused with None."""
         param_groups = [{'lr': 0.0, 'default_config': True}]
         assert get_canonical_lr_for_logging(param_groups) == 0.0
+
+    def test_skips_indexer_default_group(self):
+        param_groups = [
+            {'lr': 0.002, 'default_config': True, 'is_dsa_indexer': True},
+            {'lr': 0.05, 'default_config': True, 'is_dsa_indexer': False},
+        ]
+        assert get_canonical_lr_for_logging(param_groups) == 0.05
+
+
+def test_get_indexer_lr_for_logging_uses_first_indexer_group():
+    param_groups = [
+        {'lr': 0.05, 'default_config': True},
+        {'lr': 0.003, 'is_dsa_indexer': True, 'wd_mult': 1.0},
+        {'lr': 0.004, 'is_dsa_indexer': True, 'wd_mult': 0.0},
+    ]
+    assert get_indexer_lr_for_logging(param_groups) == 0.003
+    assert get_indexer_lr_for_logging(param_groups[:1]) is None
