@@ -289,6 +289,8 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
+        # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
+        # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
         self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
