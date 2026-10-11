@@ -397,42 +397,52 @@ def test_gdn_offload_delayed_d2h(
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize("training,grad_enabled", [(False, False), (False, True), (True, False)])
 @pytest.mark.parametrize("recompute_norm", [False, True])
-def test_gdn_offload_training_after_initial_eval(
+@pytest.mark.parametrize("fused_pre_gdr", [False, True], ids=["unfused_pre_gdr", "fused_pre_gdr"])
+def test_gdn_offload_training_after_eval(
     gdn_offload_groups: ProcessGroupCollection,
     training: bool,
     grad_enabled: bool,
     recompute_norm: bool,
+    fused_pre_gdr: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An initial forward-only pass must not consume the training warmup."""
+    """Evaluation preserves training warmup initially and the learned policy afterward."""
+    if fused_pre_gdr:
+        pytest.importorskip("causal_conv1d", minversion="1.6.1")
+        monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
     config = _config(
+        gdn_pre_gated_delta_rule_fusion=fused_pre_gdr,
         recompute_granularity="selective" if recompute_norm else None,
         recompute_modules=["gdn_norm_out"] if recompute_norm else [],
     )
     baseline, offloaded = _build_pair(config, gdn_offload_groups)
-    offloaded.train(training)
     source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
-    # Model wrappers preprocess the chunk even when the GDN scopes bypass eval.
-    off_interface.init_chunk_handler(0, None, None, 1024, 0, 1.0)
-    with torch.set_grad_enabled(grad_enabled):
-        output = source
-        for layer in offloaded:
-            y, _ = layer(output, None)
-            output = output + y
-    del output, y
-    off_interface.reset(process_group=torch.distributed.group.WORLD, forward_only=True)
     manager = PipelineOffloadManager.get_instance()
-    assert manager._is_warmup
-    assert not manager._cached_chunks_forward
-    assert not manager._cached_chunks_backward
+    for initial_eval in (True, False):
+        offloaded.train(training)
+        # Model wrappers preprocess the chunk even when the GDN scopes bypass eval.
+        off_interface.init_chunk_handler(0, None, None, 1024, 0, 1.0)
+        with torch.set_grad_enabled(grad_enabled):
+            output = source
+            for layer in offloaded:
+                y, _ = layer(output, None)
+                output = output + y
+        del output, y
+        off_interface.reset(process_group=torch.distributed.group.WORLD, forward_only=True)
+        assert manager._is_warmup is initial_eval
+        if initial_eval:
+            assert not manager._cached_chunks_forward
+            assert not manager._cached_chunks_backward
 
-    offloaded.train()
-    reference = _run(baseline, source)
-    result = _run(offloaded, source, offload=True)
-    _assert_step_equal(reference, result)
-    assert len(manager._cached_chunks_forward[0].offload_groups) == config.num_layers
-    off_interface.reset(process_group=torch.distributed.group.WORLD)
-    assert not manager._is_warmup
-    assert manager.offload_summary_total_bytes > 0
+        offloaded.train()
+        reference = _run(baseline, source)
+        result = _run(offloaded, source, offload=True)
+        _assert_step_equal(reference, result)
+        assert len(manager._cached_chunks_forward[0].offload_groups) == config.num_layers
+        assert manager.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
+        off_interface.reset(process_group=torch.distributed.group.WORLD)
+        assert not manager._is_warmup
+        assert manager.offload_summary_total_bytes > 0
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")

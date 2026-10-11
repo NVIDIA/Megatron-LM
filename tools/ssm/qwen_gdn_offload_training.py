@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import AutoTokenizer
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_outplace
@@ -94,6 +93,10 @@ def _arguments() -> argparse.Namespace:
         parser.error("--vp requires a positive chunk count and --pp greater than one")
     if args.cp > 1 and args.seq_length % (2 * args.cp):
         parser.error("--seq-length must be divisible by twice --cp for zigzag partitioning")
+    if args.sp and args.seq_length % (args.tp * args.cp):
+        parser.error("--seq-length must be divisible by TP * CP when using --sp")
+    if args.vp is not None and args.microbatches % args.pp:
+        parser.error("--microbatches must be divisible by --pp when using --vp")
     if not args.dry_run and int(os.environ.get("WORLD_SIZE", "1")) % (args.tp * args.cp * args.pp):
         parser.error("WORLD_SIZE must be divisible by TP * CP * PP")
     return args
@@ -149,6 +152,8 @@ def _provider(args: argparse.Namespace) -> Any:
 
 def _tokenize(args: argparse.Namespace) -> torch.Tensor:
     """Render existing text conversations and concatenate them for causal-LM training."""
+    from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(str(args.weights), local_files_only=True)
     tokens = []
     with args.data.open() as source:
