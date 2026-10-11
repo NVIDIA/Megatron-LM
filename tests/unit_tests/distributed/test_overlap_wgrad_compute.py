@@ -62,6 +62,9 @@ def _grads_after_one_step(model: DistributedDataParallel, data):
     model.zero_grad_buffer()
     loss = model(**data).sum()
     loss.backward()
+    # Every deferred weight gradient was released and registered with its bucket group.
+    for bucket_group in model.bucket_groups + model.expert_parallel_bucket_groups:
+        assert set(bucket_group.per_param_grad_ready_counts) == bucket_group.params
     model.finish_grad_sync()
     torch.cuda.synchronize()
     return loss.detach(), {name: p.main_grad.clone() for name, p in model.named_parameters()}

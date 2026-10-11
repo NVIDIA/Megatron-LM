@@ -27,15 +27,22 @@ class _RunAfterBackward(torch.autograd.Function):
 
 def release_deferred_wgrads_after(module: torch.nn.Module, callback: Callable[[], None]) -> None:
     """Run ``callback`` right after ``module``'s backward pass, by a forward pre-hook that wraps
-    the module's first tensor input.
+    the module's input (its first positional argument or ``hidden_states``).
 
     The callback issues the weight gradient computations the module's backward pass deferred
     (``backward_dw``), so they run behind the data gradients that produced their inputs.
     """
 
-    def pre_hook(_, args):
-        if not args or not isinstance(args[0], torch.Tensor) or not args[0].requires_grad:
-            return None
-        return (_RunAfterBackward.apply(callback, args[0]),) + tuple(args[1:])
+    def wrap(tensor):
+        if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
+            return _RunAfterBackward.apply(callback, tensor)
+        return tensor
 
-    module.register_forward_pre_hook(pre_hook)
+    def pre_hook(_, args, kwargs):
+        if args:
+            return (wrap(args[0]),) + tuple(args[1:]), kwargs
+        if 'hidden_states' in kwargs:
+            kwargs = {**kwargs, 'hidden_states': wrap(kwargs['hidden_states'])}
+        return args, kwargs
+
+    module.register_forward_pre_hook(pre_hook, with_kwargs=True)
