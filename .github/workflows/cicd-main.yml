@@ -1387,6 +1387,7 @@ jobs:
   Nemo_CICD_Test:
     needs:
       - pre-flight
+      - configure
       - is-not-external-contributor
       - cicd-unit-tests-latest
       - cicd-unit-tests-latest-gb200
