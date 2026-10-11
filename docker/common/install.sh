@@ -86,7 +86,8 @@ main() {
     
     # Install tools
     apt-get update
-    apt-get install -y wget curl git cmake
+    # DeepGEMM/DeepJIT requires elfutils/libdwfl.h for its exception support.
+    apt-get install -y wget curl git cmake libdw-dev
 
     # Install CUDA
     if [[ "$BASE_IMAGE" == "ubuntu" ]]; then
