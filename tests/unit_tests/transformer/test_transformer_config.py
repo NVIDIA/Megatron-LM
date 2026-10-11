@@ -461,3 +461,48 @@ class TestTransformerConfig:
         # num_query_groups then defaults to 0 and the check is skipped.
         config = TransformerConfig(num_layers=1, kv_channels=1)
         assert config.num_query_groups == 0
+
+
+class TestFusedSingleQkvRopeQuantize:
+    @staticmethod
+    def _config(**overrides):
+        kwargs = dict(
+            num_layers=1,
+            hidden_size=512,
+            num_attention_heads=8,
+            num_query_groups=2,
+            kv_channels=64,
+            bf16=True,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_dot_product_attention=True,
+            fused_single_qkv_rope=True,
+            fused_single_qkv_rope_quantize=True,
+        )
+        kwargs.update(overrides)
+        return TransformerConfig(**kwargs)
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            ({"fused_single_qkv_rope": False}, "requires fused_single_qkv_rope"),
+            ({"fp8": None}, "fp8_recipe='mxfp8'"),
+            ({"fp8_recipe": "tensorwise"}, "fp8_recipe='mxfp8'"),
+            ({"fp8_dot_product_attention": False}, "fp8_recipe='mxfp8'"),
+            ({"kv_channels": 128}, "kv_channels=64"),
+            ({"rotary_interleaved": True}, "kv_channels=64"),
+            ({"context_parallel_size": 2}, "kv_channels=64"),
+        ],
+    )
+    def test_rejects_unsupported_config(self, overrides, match):
+        with pytest.raises(ValueError, match=match):
+            self._config(**overrides)
+
+    def test_requires_transformer_engine_support(self):
+        from megatron.core.transformer.attention import HAVE_FUSED_QKV_ROPE_QUANTIZE
+
+        if HAVE_FUSED_QKV_ROPE_QUANTIZE:
+            assert self._config().fused_single_qkv_rope_quantize
+        else:
+            with pytest.raises(ValueError, match="not available"):
+                self._config()

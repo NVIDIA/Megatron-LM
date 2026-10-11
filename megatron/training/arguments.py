@@ -2429,6 +2429,7 @@ def _add_network_size_args(parser):
         "test_mode",
         "memory_efficient_layer_norm",
         "fused_single_qkv_rope",
+        "fused_single_qkv_rope_quantize",
         "fp8_dot_product_attention",
         "fp8_multi_head_attention",
         "tp_only_amax_red",
