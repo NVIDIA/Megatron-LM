@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity, pad_routing_map
+from megatron.core.transformer.moe import token_dispatcher
 from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -674,9 +676,8 @@ def test_hybridep_combine_adds_residual(monkeypatch, group_size):
     """The residual is fused into the combine of a single-rank group and added after it
     otherwise."""
     manager = object.__new__(_HybridEPManager)
-    manager.config = SimpleNamespace(moe_permute_fusion_into_hybridep=False)
+    manager.config = SimpleNamespace(moe_permute_fusion_into_hybridep=False, moe_router_topk=2)
     manager.group = SimpleNamespace(size=lambda: group_size)
-    manager.router_topk = 2
     manager.drop_and_pad = False
     manager.num_permuted_tokens = 8
     manager.pad_multiple = None
