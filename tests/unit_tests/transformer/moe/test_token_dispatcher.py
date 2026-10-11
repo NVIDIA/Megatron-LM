@@ -27,6 +27,7 @@ from tests.unit_tests.test_utilities import (
     is_nccl_ep_fp8_dispatch_available,
     is_nccl_ep_zero_copy_available,
     is_op_fuser_available,
+    is_permute_quantize_fusion_available,
 )
 
 
@@ -266,6 +267,36 @@ class MoEModelTestContainer:
         assert not torch.isnan(out_var).any() and not torch.isnan(grad_var).any()
         torch.testing.assert_close(out_var, out_ref, rtol=rtol, atol=atol)
         torch.testing.assert_close(grad_var, grad_ref, rtol=rtol, atol=atol)
+
+    @pytest.mark.internal
+    def moe_layer_permute_quantize_parity_test(self):
+        """Full MoE-layer fwd+bwd with moe_permute_quantize_fusion off then on (identical weights):
+        the fused permute hands the grouped MLP the same MXFP8 operands it would quantize itself and
+        the bias gradient the same BF16 rows, so outputs and gradients match bit for bit."""
+        from megatron.core.transformer.moe import fused_a2a
+
+        torch.manual_seed(42)
+        x = torch.randn((32, 8, self.config.hidden_size), dtype=self.test_dtype).cuda()
+
+        def run(layer):
+            inp = x.clone().detach().requires_grad_(True)
+            with get_fp8_context(layer.config):
+                out, _ = layer(inp)
+            out.sum().backward()
+            grads = [inp.grad.detach()] + [p.grad.detach().clone() for p in layer.parameters()]
+            return out.detach(), grads
+
+        ref_layer = self.new_moe_layer()
+        out_ref, grads_ref = run(ref_layer)
+        reset_hybrid_ep_buffer()  # the fused permute needs its own kind of buffer
+        var_layer = self.new_moe_layer(moe_permute_quantize_fusion=True)
+        var_layer.load_state_dict(ref_layer.state_dict())
+        out_var, grads_var = run(var_layer)
+        assert isinstance(fused_a2a._hybrid_ep_buffer, fused_a2a.HybridEPQuantizePermuteBuffer)
+
+        torch.testing.assert_close(out_var, out_ref, rtol=0, atol=0)
+        for grad_var, grad_ref in zip(grads_var, grads_ref):
+            torch.testing.assert_close(grad_var, grad_ref, rtol=0, atol=0)
 
     @pytest.mark.internal
     def dispatcher_capacity_test(self):
@@ -626,6 +657,40 @@ class TestFlexDispatcher:
         container.dispatcher_dropless_test()
         # reset experimental flag to False
         config.ENABLE_EXPERIMENTAL = False
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not is_op_fuser_available(), reason="the fused grouped MLP needs TE>=2.14")
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.timeout(120)
+    def test_hybridep_permute_quantize_fusion_parity(self):
+        # A single-rank expert group (tp=1, ep=1) is the self-permutation the fusion applies to; the
+        # MXFP8 op-fuser grouped MLP needs Blackwell.
+        if not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
+        if not is_permute_quantize_fusion_available():
+            pytest.skip("Transformer Engine has no gather_quantize_mxfp8")
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=1,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            add_bias_linear=True,
+            moe_expert_rank_capacity_factor=2.0,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            hidden_size=1024,
+            test_dtype=torch.bfloat16,
+        )
+        container.moe_layer_permute_quantize_parity_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.skipif(

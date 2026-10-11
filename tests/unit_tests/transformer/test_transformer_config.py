@@ -383,6 +383,69 @@ def test_mxfp8_wire_dtypes_require_op_fuser_grouped_gemm(overrides):
         _make_mxfp8_wire_config(**overrides)
 
 
+def _make_permute_quantize_config(**overrides) -> TransformerConfig:
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        moe_expert_rank_capacity_factor=1.0,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        bf16=True,
+        moe_permute_quantize_fusion=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def _te_has_gather_quantize_mxfp8() -> bool:
+    try:
+        from transformer_engine.pytorch.triton.gather_quantize_mxfp8 import (  # noqa: F401
+            gather_quantize_mxfp8,
+        )
+    except ImportError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(
+    not _te_has_gather_quantize_mxfp8(),
+    reason="needs a Transformer Engine with gather_quantize_mxfp8",
+)
+def test_permute_quantize_fusion_accepts_hybridep_mxfp8_op_fuser_config():
+    config = _make_permute_quantize_config()
+
+    assert config.moe_permute_quantize_fusion
+    assert config.moe_use_grouped_tensor
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (dict(moe_flex_dispatcher_backend="ncclep"), "'hybridep' flex dispatcher"),
+        (
+            dict(moe_token_dispatcher_type="alltoall", moe_flex_dispatcher_backend=None),
+            "'hybridep' flex dispatcher",
+        ),
+        (dict(moe_permute_fusion_into_hybridep=True), "moe_permute_fusion_into_hybridep"),
+        (dict(fp8="hybrid"), "fp8='e4m3'"),
+        (dict(fp8_recipe="tensorwise"), "fp8_recipe='mxfp8'"),
+        (dict(use_transformer_engine_op_fuser=False), "use_transformer_engine_op_fuser"),
+        (dict(moe_grouped_gemm=False), "moe_grouped_gemm"),
+        (dict(moe_expert_rank_capacity_factor=None), "moe_expert_rank_capacity_factor"),
+    ],
+)
+def test_permute_quantize_fusion_rejects_unsupported_configs(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _make_permute_quantize_config(**overrides)
+
+
 requires_te_2_9 = pytest.mark.skipif(
     not is_te_min_version("2.9.0"), reason="sequence packing requires Transformer Engine >= 2.9.0"
 )
