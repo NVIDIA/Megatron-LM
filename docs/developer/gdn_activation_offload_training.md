@@ -7,7 +7,7 @@ are listed below. Configuration checks on CPU do not qualify a parallel topology
 
 ## GPU validation status
 
-The 2026-10-06/07/08 runs use RTX A6000 GPUs, PyTorch 2.11.0+cu130, Transformer
+The 2026-10-06/07/08/10 runs use RTX A6000 GPUs, PyTorch 2.11.0+cu130, Transformer
 Engine 2.20.2, FLA 0.5.1 and cuDNN 9.19.0. These public-package container runs
 do not replace upstream CI.
 
@@ -20,6 +20,14 @@ The existing pre-GDR fusion suite passes all 11 cases. A new kernel test passes
 16 cases with byte-exact FP32 gradient replays under side-stream contention.
 Fused and unfused offload comparisons use separate disabled baselines; they do
 not require the two pre-GDR implementations to produce identical bits.
+
+The 2026-10-10 review expands the evaluation-switching coverage to both pre-GDR
+variants, before and after training warmup. The expanded recurrence suite passes
+71 cases with default compilation; the same run also passes all 16 gate-backward
+replay cases and 14 shared-manager cases. The single-rank invocation skips one
+multi-rank summary-aggregation case. Ten separate argument-boundary cases pass;
+those parser tests do not qualify a GPU topology.
+
 The previously skipped shared-manager aggregation regression and existing GDN
 fused CP-local parameter test pass on both ranks of a two-rank run. The latter
 checks parameter partitioning; the reduced-model training qualification is separate
@@ -41,6 +49,8 @@ from pretrained CP, which remains unqualified.
 | Pretrained Qwen, PP on two ranks | All 8 arms passed on each rank, including across norm recomputation settings |
 | Pretrained Qwen, PP+VPP on two ranks | All 8 arms passed on each rank with native unbatched P2P, including across norm recomputation settings |
 | Pretrained Qwen, fused pre-GDR on two ranks | DP, TP, TP+SP, PP and PP+VPP: all 8 arms per topology passed on each rank; every pre-reset pool count is zero |
+| Pretrained Qwen, unfused TP+SP+PP on four ranks | All 8 arms passed, including across norm settings; 32 rank files and 96 exact complete rank-step states; every pre-reset pool count is zero |
+| Pretrained Qwen, fused TP+SP+PP on four ranks | Partial: norm-off disabled/0/0.5 passed; 12 rank files and 36 exact complete rank-step states; remaining 5 arms paused at user request |
 | Pretrained Qwen, CP on two ranks | Disabled baseline cannot select an attention backend for head dimension 256 on A6000; unqualified |
 | Pretrained Qwen, unfused pre-GDR at sequence lengths 2048/4096 | Baseline and fraction 1 passed with norm recomputation off/on; all 3 step states also match across recomputation settings |
 | Pretrained Qwen, fused pre-GDR at sequence lengths 2048/4096 | Disabled/fraction-1 with norm recomputation off/on: all 24 complete step states match, including across norm settings |
@@ -207,7 +217,27 @@ zero skips. The launcher returns 0 after explicit process-group cleanup.
 These are correctness comparisons, with all pre-reset pool counts zero; they
 provide no four-rank memory/runtime measurements. Other jobs began using the
 selected GPUs during the run, and the pretrained four-rank comparisons could
-not start after the reduced-model run released its devices.
+not start in that session after the reduced-model run released its devices.
+
+The 2026-10-10 pretrained TP+SP+PP comparison uses physical GPUs 0/1/2/3 at
+checkout `c8ceb3b8a7067827aa6246affa8413c6bf04b9cc`, with TP=2, SP enabled and
+PP=2. It uses the same complete checkpoint, dataset, short sequence and optimizer
+settings described above. All eight unfused arms pass, including comparisons
+across norm settings: 32 rank files contain 96 byte-identical complete rank-step
+states. The fused norm-off disabled/0/0.5 arms also pass: 12 rank files and 36
+complete states. Positive fractions select transfers on every rank, fraction
+zero selects none, and all completed runs have zero pinned buffers in use before
+each schedule reset. Each fusion variant uses its own fresh disabled baseline.
+
+GPU work was paused at the user's request during the fused norm-off fraction-1
+arm. That arm and all four fused norm-on arms remain unqualified. The four-rank
+pretrained TP+SP+CP disabled baseline has not run. These correctness runs produce
+no timed samples and establish no four-rank throughput result.
+The checkout adds two input checks to the Qwen tool and extends evaluation-switch
+tests; core runtime files remain identical to `2f1ee4f2e`. Completed results and
+their source/data hashes are independently verified in the local artifact
+`deep-review-20261010/qwen-completed-validation.json`; the review and regression
+logs are indexed by `deep-review-20261010/review.json`.
 
 ## Complete-Qwen A6000 measurements
 
@@ -514,6 +544,13 @@ Transformers 5.15.0 and Tokenizers 0.22.2, with the local Megatron-LM checkout o
 `PYTHONPATH`. Bridge is an optional dependency of this tool, not a new core runtime
 dependency. Only the configurations reported above are qualified by these runs.
 
+The tool rejects incompatible partitions before checkpoint loading or distributed
+setup. With SP, sequence length must be divisible by TP times CP so each CP-local
+sequence can be split across TP ranks. CP also requires divisibility by twice CP
+for zigzag partitioning. With VPP, microbatch count must be divisible by PP because
+the tool uses the native default of PP-sized microbatch groups. The tokenizer is
+imported only when reading the dataset.
+
 The input is local JSONL containing text conversations:
 
 ```json
@@ -595,9 +632,11 @@ The same entry point accepts `--tp 2`, `--tp 2 --sp`, `--cp 2`, `--pp 2`,
 `--pp 2 --vp 2`, `--tp 2 --sp --cp 2` and `--tp 2 --sp --pp 2` with the rank
 counts in the table above. Use four or more microbatches for PP/VPP. DP is the
 remaining world-size factor. The status table lists the GPU-qualified
-configurations, including plain TP and plain PP. Pretrained CP and four-rank
-combinations remain unqualified. The reduced-model four-rank matrix passes all
-96 cases per rank; its results do not qualify the pretrained architecture.
+configurations, including plain TP and plain PP. Pretrained four-rank TP+SP+PP
+is qualified for unfused correctness; the fused comparison remains partial.
+Pretrained CP combinations remain unqualified. The reduced-model four-rank
+matrix passes all 96 cases per rank; its results do not qualify the pretrained
+architecture.
 
 ## Acceptance for additional pretrained configurations
 
