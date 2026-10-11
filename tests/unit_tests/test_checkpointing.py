@@ -849,10 +849,10 @@ def test_strict_load_idle_rerun_checkpoint(
 ):
     """Load an idle rerun shard without treating it as a pending rerun."""
     args = create_ckpt_load_args
-    args.ckpt_format = 'torch_dist'
+    args.ckpt_format = "torch_dist"
     args.use_dist_ckpt = True
     args.use_distributed_optimizer = False
-    args.dist_ckpt_strictness = 'raise_all'
+    args.dist_ckpt_strictness = "raise_all"
     args.no_save_rng = True
     args.no_load_rng = True
     args.no_save_optim = True
@@ -870,7 +870,7 @@ def test_strict_load_idle_rerun_checkpoint(
         args.load = ckpt_dir
         set_args(args)
         with mock.patch(
-            'megatron.training.checkpointing.get_rerun_state_machine', return_value=saved_machine
+            "megatron.training.checkpointing.get_rerun_state_machine", return_value=saved_machine
         ):
             save_checkpoint(123, [model], None, None, 456)
 
@@ -879,7 +879,7 @@ def test_strict_load_idle_rerun_checkpoint(
             loaded_model.l.weight.zero_()
         loaded_machine = RerunStateMachine(mode=load_rerun_mode)
         with mock.patch(
-            'megatron.training.checkpointing.get_rerun_state_machine', return_value=loaded_machine
+            "megatron.training.checkpointing.get_rerun_state_machine", return_value=loaded_machine
         ):
             iteration, flops = load_checkpoint([loaded_model], None, None, strict=True)
 

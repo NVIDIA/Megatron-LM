@@ -2909,11 +2909,11 @@ def load_checkpoint(
             and 'rerun_state_machine' in state_dict
         ):
             rerun_state_machine = get_rerun_state_machine()
-            saved_rerun_state = state_dict['rerun_state_machine']
+            saved_rerun_state = state_dict["rerun_state_machine"]
             restore_rerun_state = rerun_state_machine.validate_state_dict(saved_rerun_state)
             idle_rerun_state = (
                 isinstance(saved_rerun_state, dict)
-                and saved_rerun_state.get('state') == RerunState.NOT_RUNNING_YET
+                and saved_rerun_state.get("state") == RerunState.NOT_RUNNING_YET
             )
             # Idle checkpoints still contain a rerun shard for cached save plans.
             # Include it in strict load requests without resuming a rerun.
