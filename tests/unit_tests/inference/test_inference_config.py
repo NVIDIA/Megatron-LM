@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+import sys
+import types
 from argparse import ArgumentParser
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +14,7 @@ from megatron.core.inference.config import (
     AsyncScheduleMode,
     ImageProcessingConfig,
     InferenceConfig,
+    KVCacheManagementMode,
     MambaInferenceStateConfig,
     MediaCacheCoordinatorPolicy,
     MediaPromptSpec,
@@ -23,6 +27,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
@@ -280,6 +285,7 @@ class TestInferenceConfig:
             max_sequence_length=4096,
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
         )
         kwargs = (
             {}
@@ -288,13 +294,7 @@ class TestInferenceConfig:
         )
         setup_config = InferenceSetupConfig(**kwargs)
 
-        inference_config = setup_config.to_inference_config(
-            model=model,
-            kv_cache_management_mode="persist",
-            static_kv_memory_pointers=False,
-            enable_cuda_graphs=False,
-            verbose=False,
-        )
+        inference_config = setup_config.to_inference_config(model=model, verbose=False)
 
         assert inference_config.async_sched_mode == expected
 
@@ -305,6 +305,7 @@ class TestInferenceConfig:
             max_sequence_length=4096,
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
         )
         setup_config = InferenceSetupConfig(
             inference_dynamic_batching_async_sched_mode="async",
@@ -314,13 +315,7 @@ class TestInferenceConfig:
             inference_dynamic_batching_allow_stale_multimodal_embeddings=True,
         )
 
-        inference_config = setup_config.to_inference_config(
-            model=model,
-            kv_cache_management_mode="persist",
-            static_kv_memory_pointers=False,
-            enable_cuda_graphs=False,
-            verbose=False,
-        )
+        inference_config = setup_config.to_inference_config(model=model, verbose=False)
 
         assert inference_config.async_sched_mode == AsyncScheduleMode.ASYNC
         assert (
@@ -347,18 +342,104 @@ class TestInferenceConfig:
             max_sequence_length=4096,
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
         )
         setup_config = InferenceSetupConfig(offset_sampling_seed_by_dp_rank=False)
 
-        inference_config = setup_config.to_inference_config(
-            model=model,
-            kv_cache_management_mode="persist",
-            static_kv_memory_pointers=False,
-            enable_cuda_graphs=False,
-            verbose=False,
-        )
+        inference_config = setup_config.to_inference_config(model=model, verbose=False)
 
         assert inference_config.offset_sampling_seed_by_dp_rank is False
+
+    def test_kv_cache_policy_is_an_inference_setting(self, monkeypatch):
+        """Both flag spellings fill the section; the policy and the CUDA-graph gate come from the
+        section and the model, not from the caller."""
+        parser = _add_inference_args(ArgumentParser())
+        default_args = parser.parse_args([])
+        assert default_args.kv_cache_management_mode == "persist"
+        assert default_args.static_kv_memory_pointers is False
+        for argv in (
+            [
+                "--inference-kv-cache-management-mode",
+                "offload",
+                "--inference-static-kv-memory-pointers",
+            ],
+            ["--rl-kv-cache-management-mode", "offload", "--rl-persist-cuda-graphs"],
+        ):
+            args = parser.parse_args(argv)
+            assert (args.kv_cache_management_mode, args.static_kv_memory_pointers) == (
+                "offload",
+                True,
+            )
+        for negation in ("--no-inference-static-kv-memory-pointers", "--no-rl-persist-cuda-graphs"):
+            assert parser.parse_args([negation]).static_kv_memory_pointers is False
+
+        monkeypatch.setitem(
+            sys.modules, "torch_memory_saver", types.ModuleType("torch_memory_saver")
+        )
+        setup_config = InferenceSetupConfig(
+            kv_cache_management_mode="offload",
+            static_kv_memory_pointers=True,
+            inference_dynamic_batching_num_cuda_graphs=4,
+        )
+        for scope, expected_num_cuda_graphs in (
+            (InferenceCudaGraphScope.none, None),
+            (InferenceCudaGraphScope.block, 4),
+        ):
+            model = SimpleNamespace(
+                position_embedding_type="rope",
+                max_sequence_length=4096,
+                pg_collection="pg",
+                decoder=SimpleNamespace(layer_type_list=None),
+                config=SimpleNamespace(inference_cuda_graph_scope=scope),
+            )
+            inference_config = setup_config.to_inference_config(model=model, verbose=False)
+            assert inference_config.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+            assert inference_config.static_kv_memory_pointers is True
+            assert inference_config.num_cuda_graphs == expected_num_cuda_graphs
+
+    @pytest.mark.parametrize(
+        "kwargs, saver_installed, match",
+        [
+            ({}, False, None),
+            (dict(kv_cache_management_mode="recompute"), False, None),
+            (
+                dict(
+                    kv_cache_management_mode="recompute",
+                    static_kv_memory_pointers=True,
+                    inference_dynamic_batching_unified_memory_level=1,
+                ),
+                False,
+                None,
+            ),
+            (dict(kv_cache_management_mode="offload", static_kv_memory_pointers=True), True, None),
+            (
+                dict(kv_cache_management_mode="offload"),
+                True,
+                "requires --inference-static-kv-memory-pointers",
+            ),
+            (
+                dict(
+                    kv_cache_management_mode="offload",
+                    static_kv_memory_pointers=True,
+                    inference_dynamic_batching_unified_memory_level=1,
+                ),
+                True,
+                "incompatible with UVM",
+            ),
+            (
+                dict(kv_cache_management_mode="recompute", static_kv_memory_pointers=True),
+                False,
+                "torch_memory_saver",
+            ),
+        ],
+    )
+    def test_kv_cache_policy_validation(self, monkeypatch, kwargs, saver_installed, match):
+        """Offload needs fixed addresses, UVM makes offload pointless, and fixed addresses for a
+        cache that leaves GPU memory need UVM or torch_memory_saver."""
+        saver = types.ModuleType("torch_memory_saver") if saver_installed else None
+        monkeypatch.setitem(sys.modules, "torch_memory_saver", saver)
+        with pytest.raises(ValueError, match=match) if match else nullcontext():
+            InferenceSetupConfig(**kwargs).validate()
 
 
 def _ssm_model(mixers):

@@ -13,6 +13,8 @@ import yaml
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
@@ -635,8 +637,9 @@ def test_load_base_checkpoint(
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])
+@pytest.mark.parametrize("iteration", [0, 123])
 def test_save_checkpoint(
-    init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format, run_config
+    init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format, iteration, run_config
 ):
     """Test save_checkpoint."""
     args = create_args
@@ -656,7 +659,6 @@ def test_save_checkpoint(
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
 
-    iteration = 123
     config = TransformerConfig(num_layers=1, kv_channels=1)
     model = MockModel(config)
     optimizer = MockState({"optimizer": "optimizer_state"})
@@ -696,7 +698,7 @@ def test_save_checkpoint(
         with open(args.save / "latest_checkpointed_iteration.txt", "r") as f:
             assert iteration == int(f.read())
 
-        ckpt_dir = args.save / "iter_0000123"
+        ckpt_dir = args.save / f"iter_{iteration:07d}"
 
         expected_ckpt_path = None
         if ckpt_format == "torch":
@@ -718,14 +720,40 @@ def test_save_checkpoint(
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
+@pytest.mark.parametrize("owned_rng", [False, True])
+@pytest.mark.parametrize("iteration", [0, 123])
+@pytest.mark.parametrize(
+    "load_kwargs", [{}, {"restore_training_state": False}, {"restore_training_state": True}]
+)
 def test_load_checkpoint(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
+    init_model_parallel,
+    create_ckpt_load_args,
+    tmp_path_dist_ckpt,
+    ckpt_format,
+    owned_rng,
+    iteration,
+    run_config,
+    load_kwargs,
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
+    args.fp16 = False
+    args.bf16 = False
+    rng_config = run_config.rng
+    if owned_rng:
+        rng_config.seed = 987
+        rng_config.data_parallel_random_init = True
+        for name in (
+            "seed",
+            "te_rng_tracker",
+            "inference_rng_tracker",
+            "data_parallel_random_init",
+        ):
+            if hasattr(args, name):
+                delattr(args, name)
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
@@ -737,7 +765,6 @@ def test_load_checkpoint(
         set_args(args)
 
         # Create and save a checkpoint first.
-        iteration = 123
         config = TransformerConfig(num_layers=1, kv_channels=1)
         model = MockModel(config)
 
@@ -745,9 +772,25 @@ def test_load_checkpoint(
         opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
         num_floating_point_operations_so_far = 456
 
-        save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
-        )
+        # Match the save policy: one shared stream unless DP RNG is rank-specific.
+        torch.manual_seed(rng_config.seed + (torch.distributed.get_rank() if owned_rng else 0))
+        expected_cpu_rng = torch.get_rng_state().clone()
+        with mock.patch("torch.save", wraps=torch.save) as serialized:
+            save_checkpoint(
+                iteration,
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
+            )
+        # With TP=PP=1, rank 0 writes the checkpoint. Other ranks can still call
+        # torch.save internally while serializing RNG tensors for all_gather_object.
+        if torch.distributed.get_rank() == 0:
+            assert serialized.call_args.args[0]["args"] is args
+        with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
+            saved_config = yaml.safe_load(f)
+        for field in fields(rng_config):
+            assert saved_config["rng"][field.name] == getattr(rng_config, field.name)
 
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
@@ -756,17 +799,25 @@ def test_load_checkpoint(
 
         # Load checkpoint
         loaded_iter, loaded_flops = load_checkpoint(
-            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+            [new_model], new_optimizer, new_opt_param_scheduler, strict=True, **load_kwargs
         )
 
+        assert torch.equal(torch.get_rng_state(), expected_cpu_rng)
+        if owned_rng:
+            assert not hasattr(args, "seed")
+            assert not hasattr(args, "data_parallel_random_init")
         assert loaded_iter == iteration
         assert loaded_flops == num_floating_point_operations_so_far
 
         for k in model.state_dict():
             assert torch.equal(model.state_dict()[k], new_model.state_dict()[k])
 
-        assert new_optimizer.state_dict() == optimizer.state_dict()
-        assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
+        if load_kwargs.get("restore_training_state", False):
+            assert new_optimizer.state_dict() == optimizer.state_dict()
+            assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
+        else:
+            assert new_optimizer.state_dict() == {"optimizer": "dummy1"}
+            assert new_opt_param_scheduler.state_dict() == {"opt_param_scheduler": "dummy2"}
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
@@ -825,7 +876,11 @@ def test_load_checkpoint_override_opt_param_scheduler(
 
         # Load checkpoint and verify runtime overrides are restored.
         loaded_iter, loaded_flops = load_checkpoint(
-            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+            [new_model],
+            new_optimizer,
+            new_opt_param_scheduler,
+            strict=True,
+            restore_training_state=True,
         )
         assert loaded_iter == iteration
         assert loaded_flops == num_floating_point_operations_so_far
@@ -837,7 +892,9 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
         # Ensure loading without optimizer/scheduler remains safe.
-        loaded_iter_none, loaded_flops_none = load_checkpoint([new_model], None, None, strict=True)
+        loaded_iter_none, loaded_flops_none = load_checkpoint(
+            [new_model], None, None, strict=True, restore_training_state=True
+        )
         assert loaded_iter_none == iteration
         assert loaded_flops_none == num_floating_point_operations_so_far
 
@@ -908,7 +965,9 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             return_value=second_job_mock_metadata,
         ):
             # Load checkpoint (into the same model, we don't check load correctness here)
-            load_checkpoint([model], optimizer, opt_param_scheduler, strict=True)
+            load_checkpoint(
+                [model], optimizer, opt_param_scheduler, strict=True, restore_training_state=True
+            )
             assert optimizer._called_metadata[-1] == expected_loaded_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
@@ -921,6 +980,107 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             expected_loaded_metadata,
             second_job_mock_metadata,
         ]
+
+
+@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist"])
+@pytest.mark.parametrize("no_load_rng", [False, True])
+@pytest.mark.parametrize("load_mode", ["default", "inference", "resume", "override"])
+def test_checkpoint_load_without_microbatch_calculator(
+    init_model_parallel,
+    create_ckpt_load_args,
+    tmp_path_dist_ckpt,
+    ckpt_format,
+    no_load_rng,
+    load_mode,
+):
+    """Checkpoint loading restores data, not the training runtime calculator."""
+    args = create_ckpt_load_args
+    args.ckpt_format = ckpt_format
+    args.use_distributed_optimizer = False
+    args.use_dist_ckpt = ckpt_format != "torch"
+    args.world_size = torch.distributed.get_world_size()
+    args.data_parallel_size = args.world_size
+    args.global_batch_size = args.world_size
+    args.micro_batch_size = 1
+    args.fp16 = False
+    args.bf16 = False
+    args.hidden_size = 32
+    args.num_attention_heads = 4
+    args.consumed_train_samples = 123 * args.global_batch_size
+    with TempNamedDir(tmp_path_dist_ckpt / "inference_checkpoint", sync=True) as ckpt_dir:
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        args.save_tokenizer_assets = False
+        set_args(args)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=32, num_attention_heads=4, use_cpu_initialization=True
+        )
+
+        def build_model():
+            return (
+                GPTModel(
+                    config=config,
+                    transformer_layer_spec=get_gpt_layer_local_spec(),
+                    vocab_size=32,
+                    max_sequence_length=16,
+                )
+                .cuda()
+                .eval()
+            )
+
+        model = build_model()
+        save_checkpoint(123, [model], None, None, 456)
+        saved_rng = torch.get_rng_state().clone()
+        saved_cuda_rng = torch.cuda.get_rng_state().clone()
+
+        restored = build_model()
+        with torch.no_grad():
+            for parameter in restored.parameters():
+                parameter.zero_()
+        torch.manual_seed(987)
+        before_load_rng = torch.get_rng_state().clone()
+        before_load_cuda_rng = torch.cuda.get_rng_state().clone()
+        args.no_load_rng = no_load_rng
+        # These training options must not influence an inference load.
+        args.override_ckpt_iteration = None if load_mode == "resume" else 7
+        is_inference = load_mode in ("default", "inference")
+        args.phase_transition_iterations = [100] if is_inference else None
+        args.no_load_optim = True
+        args.consumed_train_samples = 0
+        if is_inference:
+            for name in (
+                "global_batch_size",
+                "micro_batch_size",
+                "consumed_train_samples",
+                "skipped_train_samples",
+                "consumed_valid_samples",
+            ):
+                delattr(args, name)
+        unset_num_microbatches_calculator()
+        if is_inference:
+            with mock.patch(
+                "megatron.training.checkpointing.get_rerun_state_machine",
+                side_effect=AssertionError("Inference must not restore training rerun state"),
+            ):
+                load_kwargs = {} if load_mode == "default" else {"restore_training_state": False}
+                metadata = load_checkpoint([restored], None, None, **load_kwargs)
+            assert not hasattr(args, "consumed_train_samples")
+            assert not hasattr(args, "skipped_train_samples")
+            assert not hasattr(args, "consumed_valid_samples")
+        else:
+            metadata = load_checkpoint([restored], None, None, restore_training_state=True)
+            expected_iteration = 7 if load_mode == "override" else 123
+            assert args.consumed_train_samples == expected_iteration * args.global_batch_size
+        assert metadata == (7 if load_mode == "override" else 123, 456)
+        for expected, actual in zip(model.parameters(), restored.parameters()):
+            assert torch.equal(expected, actual)
+        assert torch.equal(torch.get_rng_state(), before_load_rng if no_load_rng else saved_rng)
+        assert torch.equal(
+            torch.cuda.get_rng_state(), before_load_cuda_rng if no_load_rng else saved_cuda_rng
+        )
+        tokens = torch.arange(8, device="cuda").unsqueeze(0)
+        with torch.inference_mode():
+            assert torch.equal(model(tokens, tokens, None), restored(tokens, tokens, None))
 
 
 @pytest.mark.parametrize(

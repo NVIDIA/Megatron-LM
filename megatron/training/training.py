@@ -129,6 +129,7 @@ from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.tuning import maybe_verify_choices
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
@@ -1675,6 +1676,7 @@ def pretrain(
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
+        training=True,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
@@ -1963,68 +1965,68 @@ def pretrain(
 
     # Build a separate inference model for RL if requested.
     inference_model = None
-    if args.perform_rl_step:
+    if cfg_container.rl.perform_rl_step:
         # RL inference doesn't support CP; when training uses CP>1, always build a
         # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
         force_cp1_inference_model = args.context_parallel_size > 1
         if (
-            args.rl_inference_tensor_model_parallel_size is not None
-            or args.rl_inference_pipeline_model_parallel_size is not None
-            or args.rl_inference_expert_model_parallel_size is not None
-            or args.rl_inference_expert_tensor_model_parallel_size is not None
+            cfg_container.rl.rl_inference_tensor_model_parallel_size is not None
+            or cfg_container.rl.rl_inference_pipeline_model_parallel_size is not None
+            or cfg_container.rl.rl_inference_expert_model_parallel_size is not None
+            or cfg_container.rl.rl_inference_expert_tensor_model_parallel_size is not None
             or force_cp1_inference_model
         ):
             from megatron.core.inference.shards import build_inference_pg_collection
 
             print_rank_0(
                 "Building separate RL inference model with custom parallelism: "
-                f"TP={args.rl_inference_tensor_model_parallel_size}, "
-                f"PP={args.rl_inference_pipeline_model_parallel_size}, "
+                f"TP={cfg_container.rl.rl_inference_tensor_model_parallel_size}, "
+                f"PP={cfg_container.rl.rl_inference_pipeline_model_parallel_size}, "
                 f"CP={1 if force_cp1_inference_model else None}, "
-                f"EP={args.rl_inference_expert_model_parallel_size}, "
-                f"ExptTP={args.rl_inference_expert_tensor_model_parallel_size}"
+                f"EP={cfg_container.rl.rl_inference_expert_model_parallel_size}, "
+                f"ExptTP={cfg_container.rl.rl_inference_expert_tensor_model_parallel_size}"
             )
             inference_pg_collection = build_inference_pg_collection(
                 args.world_size,
-                tp_size=args.rl_inference_tensor_model_parallel_size,
-                pp_size=args.rl_inference_pipeline_model_parallel_size,
+                tp_size=cfg_container.rl.rl_inference_tensor_model_parallel_size,
+                pp_size=cfg_container.rl.rl_inference_pipeline_model_parallel_size,
                 cp_size=1 if force_cp1_inference_model else None,
-                ep_size=args.rl_inference_expert_model_parallel_size,
-                expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
+                ep_size=cfg_container.rl.rl_inference_expert_model_parallel_size,
+                expt_tp_size=cfg_container.rl.rl_inference_expert_tensor_model_parallel_size,
                 use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
             )
 
             # Build an isolated inference config so training config remains unchanged
             inference_config = copy.deepcopy(model_cfg)
-            if args.rl_inference_tensor_model_parallel_size is not None:
-                inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
-            if args.rl_inference_pipeline_model_parallel_size is not None:
+            if cfg_container.rl.rl_inference_tensor_model_parallel_size is not None:
+                inference_config.tensor_model_parallel_size = cfg_container.rl.rl_inference_tensor_model_parallel_size
+            if cfg_container.rl.rl_inference_pipeline_model_parallel_size is not None:
                 inference_config.pipeline_model_parallel_size = (
-                    args.rl_inference_pipeline_model_parallel_size
+                    cfg_container.rl.rl_inference_pipeline_model_parallel_size
                 )
             if force_cp1_inference_model:
                 inference_config.context_parallel_size = 1
-            if args.rl_inference_expert_model_parallel_size is not None:
+            if cfg_container.rl.rl_inference_expert_model_parallel_size is not None:
                 inference_config.expert_model_parallel_size = (
-                    args.rl_inference_expert_model_parallel_size
+                    cfg_container.rl.rl_inference_expert_model_parallel_size
                 )
-            if args.rl_inference_expert_tensor_model_parallel_size is not None:
+            if cfg_container.rl.rl_inference_expert_tensor_model_parallel_size is not None:
                 inference_config.expert_tensor_parallel_size = (
-                    args.rl_inference_expert_tensor_model_parallel_size
+                    cfg_container.rl.rl_inference_expert_tensor_model_parallel_size
                 )
 
             # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
             # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
             # Alternatively, use torch_memory_saver to offload the weights to CPU when idle.
             uvm_mempool = None
-            uvm_level = args.rl_inference_model_unified_memory_level
+            uvm_level = cfg_container.rl.rl_inference_model_unified_memory_level
             if uvm_level and uvm_level > 0:
                 uvm_mempool = create_unified_mempool()
 
             # Determine which context manager to use for model allocation
             # Use torch_memory_saver if offloading is requested but UVM is not enabled
             use_torch_saver_for_inference_model = (
-                args.rl_offload_inference_model_weights
+                cfg_container.rl.rl_offload_inference_model_weights
                 and uvm_level == 0
                 and HAVE_TORCH_MEMORY_SAVER
             )
@@ -2049,7 +2051,7 @@ def pretrain(
             inference_model[0].eval()
 
         # Validate: offloading flag requires a separate inference model
-        if args.rl_offload_inference_model_weights and inference_model is None:
+        if cfg_container.rl.rl_offload_inference_model_weights and inference_model is None:
             raise ValueError(
                 "--rl-offload-inference-model-weights requires a separate inference model. "
                 "This flag is only useful when doing refit since the weights are shared with the training model."
@@ -2117,9 +2119,9 @@ def pretrain(
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
     # Initialize RL profiler if enabled
-    if args.rl_profile:
+    if cfg_container.rl.rl_profile:
         # Determine output directory: use rl_profile_dir, or save/profiles, or ./profiles
-        profile_dir = getattr(args, 'rl_profile_dir', None)
+        profile_dir = cfg_container.rl.rl_profile_dir
         if profile_dir is None:
             if args.save:
                 profile_dir = os.path.join(args.save, 'profiles')
@@ -2147,7 +2149,9 @@ def pretrain(
     # (do_train False), _end_otel_job_spans() ends startup as an idempotent
     # fallback.
 
-    if not cfg_container.validation.skip_train or (args.perform_rl_step and args.do_train):
+    if not cfg_container.validation.skip_train or (
+        cfg_container.rl.perform_rl_step and args.do_train
+    ):
         if cfg_container.validation.skip_train:
             print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
         else:
@@ -2210,7 +2214,7 @@ def pretrain(
 
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
-        if args.perform_rl_step:
+        if cfg_container.rl.perform_rl_step:
             rl_eval_model = model
             rl_training_model = None
             if inference_model is not None:
@@ -2221,8 +2225,8 @@ def pretrain(
                 swap_model_weights(
                     model,
                     inference_model,
-                    args.refit_method,
-                    execution_batch_bytes=args.refit_execution_batch_bytes,
+                    cfg_container.rl.refit_method,
+                    execution_batch_bytes=cfg_container.rl.refit_execution_batch_bytes,
                 )
                 rl_eval_model = inference_model
                 rl_training_model = model
@@ -2277,7 +2281,7 @@ def pretrain(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
 
-    if args.perform_rl_step:
+    if cfg_container.rl.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
     if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
@@ -2466,7 +2470,7 @@ def wrap_model_chunks_with_ddp(
         DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
     ) and ddp_config.megatron_fsdp_version == 2
     construction_context = (
-        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub)
+        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True)
         if is_mfsdp_v2
         else nullcontext()
     )
@@ -2562,6 +2566,7 @@ def _forward_backward_grad_context(args):
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
+    cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
@@ -2757,7 +2762,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
-        if args.data_parallel_random_init:
+        if cfg.rng.data_parallel_random_init:
             for model_module in model:
                 model_module.broadcast_params()
 
@@ -2908,7 +2913,9 @@ def setup_model_and_optimizer(
     # Typically, --skip-train is the only thing needed to disable the optimizer.
     has_normal_optimizer = not args.skip_train
     # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
-    has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
+    # RL is only reachable through pretrain(), which passes the container: no container, no RL step.
+    perform_rl_step = cfg_container is not None and cfg_container.rl.perform_rl_step
+    has_rl_optimizer = perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
 
@@ -3012,7 +3019,7 @@ def setup_model_and_optimizer(
     if skip_optimizer:
         optimizer, opt_param_scheduler = None, None
         # In RL inference-only mode, train_iters must still be set despite having no optimizer.
-        if args.perform_rl_step:
+        if perform_rl_step:
             update_train_iters(args)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
@@ -3076,8 +3083,10 @@ def setup_model_and_optimizer(
                 'model': dense_model_for_upcycling,
                 'optimizer': None,
                 'opt_param_scheduler': None,
+                'restore_training_state': True,
             },
         )
+        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         args.iteration = 1
         save_checkpoint(
             args.iteration, model, None, None, args.num_floating_point_operations_so_far
@@ -3103,6 +3112,7 @@ def setup_model_and_optimizer(
                 optimizer,
                 opt_param_scheduler,
                 checkpointing_context=checkpointing_context,
+                restore_training_state=True,
                 skip_load_to_model_and_opt=HAVE_FSDP2
                 and getattr(args, "use_torch_fsdp2", False)
                 and args.ckpt_format == "torch_dist",
@@ -3115,6 +3125,8 @@ def setup_model_and_optimizer(
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
             )
+            # Checkpoint loading restores progress; training owns the runtime calculator.
+            update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         # Barrier + min/max all-reduce right after the load. Unlike the checkpoint
         # SAVE (ragged writers -> cross-rank skew at timers.log), the fully-parallel
         # LOAD is uniform across ranks (~ms spread), so no meaningful skew
@@ -3746,7 +3758,7 @@ def training_log(
             'forward-backward-send-forward-backward-recv',
         ])
     # Add timers from RL loop if needed.
-    if args.perform_rl_step:
+    if cfg.rl.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
     # Calculate batch size. data_parallel_size excludes the GTP-remat axis (it's folded into
@@ -3791,7 +3803,7 @@ def training_log(
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
         # Log bins for packed mode
-        if has_rl_utils and args.rl_use_sequence_packing:
+        if has_rl_utils and cfg.rl.rl_use_sequence_packing:
             packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(args)
             for metric_name, metric_value in packing_metrics.items():
                 writer.add_scalar(metric_name, metric_value, iteration)
@@ -3829,8 +3841,8 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if args.perform_rl_step:
-            grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
+        if cfg.rl.perform_rl_step:
+            grpo_collection_iteration = iteration // (cfg.rl.grpo_iterations * (cfg.rl.grpo_samples_per_iteration // args.global_batch_size))
             writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
@@ -4001,7 +4013,7 @@ def training_log(
             )
         else:
             log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
-        if has_rl_utils and args.rl_use_sequence_packing:
+        if has_rl_utils and cfg.rl.rl_use_sequence_packing:
             log_string += rl_utils.get_sequence_packing_log_info(args)
         if args.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(args.skipped_train_samples)
@@ -4075,7 +4087,7 @@ def training_log(
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
 
         # RL token throughput metrics.
-        if args.perform_rl_step:
+        if cfg.rl.perform_rl_step:
             log_string += rl_utils.log_rl_throughput_metrics(
                 args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
             )
@@ -4138,7 +4150,7 @@ def training_log(
             )
         # Log RL profiling data if enabled (must be before timers.log which resets timers).
         # Token throughput metrics are read from RLRuntimeState automatically.
-        if args.rl_profile:
+        if cfg.rl.rl_profile:
             log_iteration_profile(
                 iteration=iteration,
                 timers=timers,
@@ -4671,11 +4683,11 @@ def train(
         if should_setup_fault_injection_at_start(fault_injector_config):
             setup_fault_injection(fault_injector_config)
 
-    if args.perform_rl_step:
+    if cfg.rl.perform_rl_step:
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
 
     # Additional variable initialization for RL training
-    if args.perform_rl_step:
+    if cfg.rl.perform_rl_step:
         if args.skip_train:
             # In inference-only mode, use current weights as reference.
             print_rank_0("> RL inference-only: using current weights as reference.")
@@ -4695,6 +4707,7 @@ def train(
                     None,  # Don't load optimizer state
                     None,  # Don't load scheduler state
                     checkpointing_context=checkpointing_context,
+                    restore_training_state=True,
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
@@ -4710,10 +4723,12 @@ def train(
                     None,
                     None,
                     checkpointing_context=checkpointing_context,
+                    restore_training_state=True,
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
+            update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
 
             args.no_load_optim = no_load_optim
 
@@ -4736,7 +4751,7 @@ def train(
         return args.data_parallel_size * gtp_remat
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
-    if args.perform_rl_step:
+    if cfg.rl.perform_rl_step:
         print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
         from megatron.core.num_microbatches_calculator import (
             destroy_num_microbatches_calculator,
@@ -5086,7 +5101,7 @@ def train(
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
         # as it intentionally reconfigures microbatches
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            if args.rl_use_sequence_packing:
+            if cfg.rl.rl_use_sequence_packing:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
@@ -5160,21 +5175,21 @@ def train(
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
-        if args.perform_rl_step:
+        if cfg.rl.perform_rl_step:
             if optimizer is None:
                 # Release stale CUDA cached memory before inference.
                 torch.cuda.empty_cache()
             with torch.no_grad():
                 train_data_iterator = rl_utils.get_grpo_data_iterator(
                     model, inference_model, optimizer, iteration, ref_state_dict,
-                    grpo_iterations=args.grpo_iterations,
-                    grpo_prompts_per_step=args.grpo_prompts_per_step,
-                    grpo_group_size=args.grpo_group_size,
+                    grpo_iterations=cfg.rl.grpo_iterations,
+                    grpo_prompts_per_step=cfg.rl.grpo_prompts_per_step,
+                    grpo_group_size=cfg.rl.grpo_group_size,
                     global_batch_size=args.global_batch_size,
-                    sequence_packing=args.rl_use_sequence_packing,
+                    sequence_packing=cfg.rl.rl_use_sequence_packing,
                     buffered_rollouts=buffered_rollouts,
-                    is_correction=args.rl_inference_logprobs_is_correction,
-                    optimizer_is_on_cpu=args.rl_offload_optimizer_during_inference,
+                    is_correction=cfg.rl.rl_inference_logprobs_is_correction,
+                    optimizer_is_on_cpu=cfg.rl.rl_offload_optimizer_during_inference,
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
@@ -5294,6 +5309,11 @@ def train(
         iteration += 1
         train_state.iteration += 1
 
+        # Cross-rank agreement on Triton autotune choices, at the cadence
+        # AutotunePolicy.verify_every asks for. Off by default; a step boundary
+        # is where every rank arrives, which the collective inside requires.
+        maybe_verify_choices(iteration)
+
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
             getattr(args, "fsdp_manual_registration", False)
@@ -5311,7 +5331,7 @@ def train(
                     if param_and_grad_buffer is not None:
                         param_and_grad_buffer.manual_buffer_registration()
 
-        if args.perform_rl_step and args.rl_use_sequence_packing:
+        if cfg.rl.perform_rl_step and cfg.rl.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
             bin_count = (
@@ -5447,7 +5467,7 @@ def train(
                 gc.collect()
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
-            if args.perform_rl_step:
+            if cfg.rl.perform_rl_step:
                 rl_eval_model = model
                 rl_training_model = None
                 # If separate inference and training models, swap training weights
@@ -5460,8 +5480,8 @@ def train(
                     swap_model_weights(
                         model,
                         inference_model,
-                        args.refit_method,
-                        execution_batch_bytes=args.refit_execution_batch_bytes,
+                        cfg.rl.refit_method,
+                        execution_batch_bytes=cfg.rl.refit_execution_batch_bytes,
                     )
                     rl_eval_model = inference_model
                     rl_training_model = model
@@ -5567,7 +5587,7 @@ def train(
         energy_monitor.shutdown()
 
     # Shutdown RL profiler and export summary
-    if args.rl_profile:
+    if cfg.rl.rl_profile:
         shutdown_rl_profiler()
 
     callback_manager.trigger("on_train_end")
@@ -5599,7 +5619,7 @@ def train(
             wandb_writer.finish()
         ft_integration.shutdown()
         one_logger_utils.finish()
-        if args.perform_rl_step:
+        if cfg.rl.perform_rl_step:
             rl_utils.rl_inference_interface_shutdown()
         # This sys.exit() bypasses the rest of pretrain() -- including its normal
         # _end_otel_job_spans() call -- so the open megatron.train interval block (and
@@ -6030,6 +6050,9 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     """Build pretraining data loaders."""
 
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
 
     (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
 
@@ -6066,7 +6089,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets and dataloders.
-        if args.perform_rl_step:
+        if cfg.rl.perform_rl_step:
             # we don't need to build any dataloaders for RL training
             train_dataloader = None
             valid_dataloaders = None
@@ -6206,10 +6229,11 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
 def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
+    cfg = get_run_config()
     # Typically, --skip-train is the only thing needed to disable the optimizer.
     has_normal_optimizer = not args.skip_train
     # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
-    has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
+    has_rl_optimizer = cfg.rl.perform_rl_step and not args.no_load_optim
     # The forward pre-hooks are part of the distributed optimizer's overlapped param-gather;
     # so in order to disable them, we must check that the optimizer actually exists.
     has_optimizer = has_normal_optimizer or has_rl_optimizer
