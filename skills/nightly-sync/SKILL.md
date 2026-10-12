@@ -200,23 +200,25 @@ continue to diverge:
 
 ### Special Handling: data_schedule.py
 
-Main and dev have completely different classes in this file:
-- Main: `HybridCPDataLoaderWrapper` (imported by main's `training.py`)
-- Dev: `BasePackingScheduler`, `DpBalancedScheduler`,
-  `DefaultDynamicCPScheduler`, `wrap_data_iterator`,
-  `get_batch_on_this_rank_for_sequence_packing` (imported by `pretrain_gpt.py`
-  and tests)
+Dev replaced the legacy hybrid-CP implementation with sequence-packing
+schedulers in PR #2000, after renaming hybrid CP to dynamic CP in PR #3405.
+Preserve dev's `BasePackingScheduler`, `DpBalancedScheduler`,
+`DefaultDynamicCPScheduler`, `wrap_data_iterator`, and
+`get_batch_on_this_rank_for_sequence_packing` when merging changes from main.
 
-**Do NOT take either version wholesale.** Keep dev's file and append main's
-`HybridCPDataLoaderWrapper` class (plus any missing imports like
-`BalancedCPScheduler`, `Any`, `List`) at the end.
+**Do NOT restore `HybridCPDataLoaderWrapper`, `BalancedCPScheduler`, or
+`hybrid_cp_schedule.py` from main.** PR #4716 restored this obsolete code even
+though dev had removed its training call sites. If incoming code references
+the legacy implementation, adapt it to dev's sequence-packing path instead
+of restoring the old wrapper, scheduler, or tests. Audit both training and
+evaluation call sites after resolving the merge.
 
 ### Restore Deleted Files
 
 Compare `git ls-tree` between `origin/main` and HEAD to find files in main
 that are missing from the merged tree. For each:
-- **Restore** if main's code imports/references it and would break without it
-  (e.g. `hybrid_cp_schedule.py` if `data_schedule.py` imports from it)
+- **Restore** if the merged code imports/references it and would break without
+  it, provided dev did not intentionally delete or replace it
 - **Do NOT restore** if dev intentionally deleted it — check
   `git log origin/dev -- <file>` for the deletion commit to understand intent
 - When in doubt, check whether any file in the merged tree imports from the

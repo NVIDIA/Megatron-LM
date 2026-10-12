@@ -25,7 +25,6 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
-from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -63,6 +62,7 @@ from megatron.training.utils import (
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
+    prepare_packed_seq_params,
 )
 from model_provider import model_provider
 
@@ -146,7 +146,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
         )
-        finalize_packed_seq_params(batch[5])
+        prepare_packed_seq_params(batch[5], config)
         return batch
 
     # TODO: this is pretty hacky, find a better way
@@ -189,7 +189,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             max_seqlen_kv=int(max_seqlen[0].item()),
             qkv_format='thd',
         )
-        finalize_packed_seq_params(packed_seq_params)
+        # Middle stages receive raw boundaries for physically padded hidden states.
+        prepare_packed_seq_params(packed_seq_params, config, capacity=args.seq_length)
         return (None, None, None, None, None, packed_seq_params, None)
 
     thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
@@ -241,7 +242,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
 
-    finalize_packed_seq_params(packed_seq_params)
+    prepare_packed_seq_params(packed_seq_params, config)
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (

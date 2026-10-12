@@ -59,6 +59,15 @@ def validate_moe_cuda_graph_support(config) -> None:
     )
 
 
+def cuda_graph_captures_attention(config) -> bool:
+    """Return whether the normalized training graph scope includes attention."""
+    impl = getattr(config, "cuda_graph_impl", "none")
+    modules = getattr(config, "cuda_graph_modules", None)
+    return impl == "full_iteration" or (
+        impl in ("local", "transformer_engine") and (not modules or CudaGraphModule.attn in modules)
+    )
+
+
 def normalize_cuda_graph_modules(
     scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]],
 ) -> Tuple[List[CudaGraphModule], List[Tuple[str, str, object]], bool]:

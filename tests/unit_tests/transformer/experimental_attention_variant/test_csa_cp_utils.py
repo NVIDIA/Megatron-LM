@@ -50,6 +50,32 @@ def _sequence_positions(cu_seqlens, rows):
     return torch.where((rows >= starts) & (rows < ends), rows - starts, 0)
 
 
+def test_apply_thd_cp_local_rope_fused_defers_position_mapping_to_kernel(monkeypatch):
+    calls = []
+
+    def fail_position_materialization(*_args, **_kwargs):
+        raise AssertionError("fused RoPE must not materialize THD position ids")
+
+    def fake_fused(rope_input, *_args, **kwargs):
+        calls.append(kwargs)
+        return rope_input
+
+    monkeypatch.setattr(csa_cp_utils, "_thd_cp_position_ids", fail_position_materialization)
+    monkeypatch.setattr(csa_cp_utils, "fused_mla_rope_inplace", fake_fused)
+
+    x = torch.randn(4, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 12], dtype=torch.int32)
+    output = apply_thd_cp_local_rope_fused(
+        x, torch.empty(0), torch.empty(0), 4, 4, cu_seqlens, global_start=3
+    )
+
+    assert output is x
+    assert len(calls) == 1
+    assert calls[0]["cu_seqlens_q"] is cu_seqlens
+    assert calls[0]["thd_global_start"] == 3
+    assert "position_ids" not in calls[0]
+
+
 def test_thd_cp_left_boundary_exchange_forward_backward():
     """Validate distributed CP boundary exchange forward/backward.
 
@@ -178,51 +204,86 @@ def test_apply_thd_cp_local_rope_unfused_matches_explicit_positions(inverse):
 def test_prepare_cp_compressor_input_builds_rank_row_map(monkeypatch):
     calls = []
 
-    def fake_apply(hidden, boundary, cu, global_start, ratio, d_comp, c_cap):
-        calls.append((int(global_start), hidden.shape[0], int(c_cap), tuple(boundary.shape)))
+    def fake_apply(hidden, boundary, cu, global_start, ratio, d_comp, c_cap, cp_size):
+        calls.append(
+            (int(global_start), hidden.shape[0], int(c_cap), int(cp_size), tuple(boundary.shape))
+        )
         marker = len(calls)
         hidden_compact = torch.full((int(c_cap) * int(ratio), 1), marker, dtype=hidden.dtype)
         comp_ids = torch.arange(int(c_cap), dtype=torch.int32) + marker * 10
-        return hidden_compact, comp_ids
+        position_ids = comp_ids * int(ratio)
+        local_cu = torch.tensor([0, 32], dtype=torch.int32)
+        local_cuc = torch.tensor([0, 8], dtype=torch.int32)
+        global_cuc = torch.tensor([0, 8], dtype=torch.int32)
+        rank_rows = torch.tensor([0, 1, 2, 3, 10, 11, 12, 13], dtype=torch.int32)
+        return (hidden_compact, comp_ids, position_ids, local_cu, local_cuc, global_cuc, rank_rows)
 
     monkeypatch.setattr(
-        csa_cp_utils.cp_layout_kernels.CompressorInputCompact, "apply", staticmethod(fake_apply)
+        csa_cp_utils.thd_layout_kernels.CompressorInputCompact, "apply", staticmethod(fake_apply)
     )
     hidden = torch.arange(16, dtype=torch.float32).reshape(16, 1)
     boundary = torch.arange(2, dtype=torch.float32).reshape(2, 1)
     cu = torch.tensor([0, 32], dtype=torch.int32)
-    cu_comp = torch.tensor([0, 8], dtype=torch.int32)
+    result = prepare_cp_compressor_input(hidden, boundary, cu, 0, cp_size=2, ratio=4)
+    hidden_compact, comp_ids, position_ids, local_cu, local_cuc, global_cuc, rank_rows = result
 
-    hidden_compact, comp_ids, rank_rows = prepare_cp_compressor_input(
-        hidden, boundary, cu, cu_comp, 0, cp_size=2, ratio=4
-    )
-
-    assert calls == [(0, 16, 8, (2, 1))]
+    assert calls == [(0, 16, 8, 2, (2, 1))]
     assert hidden_compact.shape == (32, 1)
     assert torch.equal(comp_ids, torch.arange(10, 18, dtype=torch.int32))
+    assert torch.equal(position_ids, comp_ids * 4)
+    assert torch.equal(local_cu, torch.tensor([0, 32], dtype=torch.int32))
+    assert torch.equal(local_cuc, torch.tensor([0, 8], dtype=torch.int32))
+    assert torch.equal(global_cuc, torch.tensor([0, 8], dtype=torch.int32))
     assert torch.equal(rank_rows, torch.tensor([0, 1, 2, 3, 10, 11, 12, 13], dtype=torch.int32))
 
 
-def test_compute_cp_indexer_topk_passes_offsets_without_repacking_k(monkeypatch):
+def test_compute_cp_indexer_topk_pads_compact_k_contract(monkeypatch):
     topk_calls = []
 
     def fake_indexer_topk(
-        q, k, _weights, *, topk, cu_seqlens_q, cu_seqlens_kv, q_causal_offsets, **_
+        q,
+        k,
+        _weights,
+        *,
+        topk,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        q_causal_offsets,
+        deterministic,
+        precision,
+        compact_workspace,
+        return_softmax,
+        **_,
     ):
         topk_calls.append(
-            (k.clone(), cu_seqlens_q.clone(), cu_seqlens_kv.clone(), q_causal_offsets.clone())
+            {
+                "k": k.clone(),
+                "cu_q": cu_seqlens_q.clone(),
+                "cu_k": cu_seqlens_kv.clone(),
+                "offsets": q_causal_offsets.clone(),
+                "deterministic": deterministic,
+                "precision": precision,
+                "workspace": compact_workspace,
+                "return_softmax": return_softmax,
+            }
         )
-        return torch.full((q.shape[0], int(topk)), len(topk_calls), dtype=torch.int32), None
+        indices = torch.full((q.shape[0], int(topk)), len(topk_calls), dtype=torch.int32)
+        if return_softmax:
+            predict = torch.full((q.shape[0], int(topk)), 0.5, dtype=torch.float32)
+            return indices, None, predict
+        return indices, None
 
     monkeypatch.setattr(csa_cp_utils, "indexer_topk", fake_indexer_topk)
 
     q = torch.randn(8, 2)
     weights = torch.randn(8, 1)
-    k_seq = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    # The final row models fixed CP capacity beyond the valid compressed rows.
+    k_seq = torch.arange(10, dtype=torch.float32).reshape(5, 2)
     cu_q = torch.tensor([0, 5, 13, 20], dtype=torch.int32)
     cu_comp = torch.tensor([0, 1, 3, 4], dtype=torch.int32)
+    workspace = object()
 
-    out, metadata = compute_cp_indexer_topk(
+    out, metadata, compact_predict = compute_cp_indexer_topk(
         q,
         weights,
         k_seq,
@@ -234,23 +295,36 @@ def test_compute_cp_indexer_topk_passes_offsets_without_repacking_k(monkeypatch)
         indexer_softmax_scale=0.5,
         max_seqlen_q=8,
         use_fused=True,
+        deterministic=True,
+        precision="mxfp8",
+        compact_workspace=workspace,
+        return_softmax=True,
     )
 
+    call = topk_calls[0]
     assert torch.equal(out, torch.ones(8, 2, dtype=torch.int32))
-    assert torch.equal(topk_calls[0][0], k_seq)
-    assert torch.equal(topk_calls[0][1], torch.tensor([0, 0, 6, 8, 8], dtype=torch.int32))
-    assert torch.equal(topk_calls[0][2], torch.tensor([0, 1, 3, 4, 4], dtype=torch.int32))
-    assert torch.equal(topk_calls[0][3], torch.tensor([0, 2, 0, 0], dtype=torch.int32))
+    torch.testing.assert_close(compact_predict, torch.full((8, 2), 0.5))
+    expected_k = torch.tensor(
+        [[0, 1], [0, 0], [0, 0], [2, 3], [4, 5], [0, 0], [6, 7], [0, 0]], dtype=torch.float32
+    )
+    assert torch.equal(call["k"], expected_k)
+    assert torch.equal(call["cu_q"], torch.tensor([0, 0, 6, 8, 8], dtype=torch.int32))
+    assert torch.equal(call["cu_k"], torch.tensor([0, 3, 6, 8, 8], dtype=torch.int32))
+    assert torch.equal(call["offsets"], torch.tensor([0, 2, 0, 0], dtype=torch.int32))
+    assert call["deterministic"] is True
+    assert call["precision"] == "mxfp8"
+    assert call["workspace"] is workspace
+    assert call["return_softmax"] is True
     metadata_q, metadata_k, metadata_offsets = metadata
-    assert torch.equal(metadata_q, topk_calls[0][1])
-    assert torch.equal(metadata_k, topk_calls[0][2])
-    assert torch.equal(metadata_offsets, topk_calls[0][3])
+    assert torch.equal(metadata_q, call["cu_q"])
+    assert torch.equal(metadata_k, torch.tensor([0, 1, 3, 4, 5], dtype=torch.int32))
+    assert torch.equal(metadata_offsets, call["offsets"])
     assert compute_cp_indexer_topk(
         q, weights, k_seq[:0], cu_q, cu_comp, 2, 4, 2, 1.0, 10, True
-    ) == (None, None)
+    ) == (None, None, None)
     assert compute_cp_indexer_topk(
         q, weights, k_seq, cu_q, torch.zeros_like(cu_comp), 2, 4, 2, 1.0, 3, True
-    ) == (None, None)
+    ) == (None, None, None)
     assert len(topk_calls) == 1
 
 
@@ -269,7 +343,7 @@ def test_compute_cp_indexer_topk_unfused_uses_exact_global_positions(monkeypatch
     topk_width = 3
     scale = 0.7
 
-    actual, _ = compute_cp_indexer_topk(
+    actual, _, compact_predict = compute_cp_indexer_topk(
         q,
         weights,
         k,
@@ -282,6 +356,7 @@ def test_compute_cp_indexer_topk_unfused_uses_exact_global_positions(monkeypatch
         max_seqlen_q=8,
         use_fused=False,
     )
+    assert compact_predict is None
 
     expected = torch.full((q.shape[0], topk_width), -1, dtype=torch.int32)
     for local_row, global_row in enumerate(range(7, 15)):
