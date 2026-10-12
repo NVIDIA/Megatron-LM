@@ -38,7 +38,7 @@ class TestMuonMXFP8ParamGather:
     ):
         """MXFP8 gather ON/OFF must agree for both layouts and overlap modes.
 
-        Compact keeps scalar Adam inside LayerWise; padded retains a separate Adam DistOpt.
+        Both layouts retain separate Adam DistOpt sharding and MXFP8 staging.
         Real GDP exclusions and grouped-MoE weights exercise mixed ownership and DP sync.
         Disable GTP for ON/OFF parity and check the first post-update loss for master initialization.
         """

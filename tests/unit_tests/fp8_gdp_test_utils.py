@@ -136,7 +136,6 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         assert args.fp8_recipe in ("blockwise", "mxfp8")
         assert args.fp8 is not None
         if blockwise:
-            assert use_param_layout is True
             assert args.gtp_weight_remat_size == 1
             assert (
                 not args.reuse_grad_buf_for_mxfp8_param_ag
@@ -205,50 +204,20 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
                 f"{label} storage does not match fp8_param_gather={args.fp8_param_gather}"
             )
 
-        if use_param_layout:
-            layerwise_optimizers = [
-                child
-                for child in optimizer.chained_optimizers
-                if isinstance(child, LayerWiseDistributedOptimizer)
-            ]
-            distributed_optimizers = [
-                child
-                for child in optimizer.chained_optimizers
-                if isinstance(child, DistributedOptimizer)
-            ]
-            assert len(layerwise_optimizers) == 1
-            assert len(distributed_optimizers) == 1
-            layerwise_optimizer = layerwise_optimizers[0]
-            distributed_optimizer = distributed_optimizers[0]
-            assert any(
-                param is in_proj
-                for group in distributed_optimizer.model_float16_groups
-                for param in group
-            ), "Padded GDP in_proj must be owned by the scalar AdamW DistributedOptimizer"
-            in_proj_group_index, in_proj_group_order = (
-                distributed_optimizer.model_param_group_index_map[in_proj]
-            )
-            in_proj_main = distributed_optimizer.optimizer.param_groups[in_proj_group_index][
-                "params"
-            ][in_proj_group_order]
-        else:
-            assert isinstance(optimizer, LayerWiseDistributedOptimizer)
-            assert not any(
-                isinstance(child, DistributedOptimizer) for child in optimizer.chained_optimizers
-            )
-            layerwise_optimizer = optimizer
-            assert any(
-                param is in_proj
-                for owner_params in layerwise_optimizer.dp_cp_params_list
-                for param in owner_params
-            ), "Compact GDP in_proj must remain inside LayerWise with scalar AdamW"
-            # Compact Adam assigns a whole parameter to one rank, so only its owner has a master.
-            in_proj_main = getattr(in_proj, "main_param", None)
-            owns_in_proj = any(
-                param is in_proj
-                for param in layerwise_optimizer.dp_cp_params_list[layerwise_optimizer.dp_cp.rank()]
-            )
-            assert (in_proj_main is not None) == owns_in_proj
+        layerwise_optimizer, distributed_optimizer = optimizer.chained_optimizers
+        assert isinstance(layerwise_optimizer, LayerWiseDistributedOptimizer)
+        assert isinstance(distributed_optimizer, DistributedOptimizer)
+        assert any(
+            param is in_proj
+            for group in distributed_optimizer.model_float16_groups
+            for param in group
+        ), "GDP in_proj must be owned by the scalar AdamW DistributedOptimizer"
+        in_proj_group_index, in_proj_group_order = (
+            distributed_optimizer.model_param_group_index_map[in_proj]
+        )
+        in_proj_main = distributed_optimizer.optimizer.param_groups[in_proj_group_index]["params"][
+            in_proj_group_order
+        ]
 
         assert any(
             param is out_proj
@@ -270,8 +239,10 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         expected_muon_dtype = expected_buffer_dtype if use_param_layout else torch.bfloat16
         assert out_proj_buffer.param_dtype == expected_muon_dtype
         assert expert_buffer.param_dtype == expected_muon_dtype
-        for buffer in (in_proj_buffer, out_proj_buffer, expert_buffer):
+        assert in_proj_buffer.ddp_config.use_distributed_optimizer
+        for buffer in (out_proj_buffer, expert_buffer):
             assert buffer.ddp_config.use_distributed_optimizer is use_param_layout
+        for buffer in (in_proj_buffer, out_proj_buffer, expert_buffer):
             if not blockwise:
                 assert buffer.reuse_grad_buffer_for_param_ag is native_fp8
         assert (
@@ -340,11 +311,9 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         self._tracked_params = [
             (label, param, buffer, self._dequantize(param)) for label, param, buffer in tracked
         ]
-        self._tracked_masters = []
-        if blockwise or in_proj_main is not None:
-            self._tracked_masters.append(
-                ("GDP in_proj AdamW master", in_proj_main, in_proj_main.detach().clone())
-            )
+        self._tracked_masters = [
+            ("GDP in_proj AdamW master", in_proj_main, in_proj_main.detach().clone())
+        ]
         for label, param, _ in tracked[1:]:
             if blockwise and param in distributed_optimizer.model_param_group_index_map:
                 group_index, group_order = distributed_optimizer.model_param_group_index_map[param]

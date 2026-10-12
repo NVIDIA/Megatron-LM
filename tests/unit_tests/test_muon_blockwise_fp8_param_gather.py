@@ -29,11 +29,14 @@ class TestMuonBlockwiseFP8ParamGather:
         ),
     )
     @pytest.mark.parametrize("overlap", [False, True])
-    def test_gdp_adamw_moe_muon_blockwise_param_gather(self, overlap, monkeypatch):
+    @pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
+    def test_gdp_adamw_moe_muon_blockwise_param_gather(
+        self, overlap, use_layer_wise_param_layout, monkeypatch
+    ):
         """Blockwise gather ON/OFF must preserve GDP-AdamW + grouped-MoE Muon losses.
 
-        Padded layout uses native Adam FP8 transport and implicit Muon gradient reuse without
+        Both layouts use native Adam FP8 transport and implicit Muon gradient reuse without
         the MXFP8 flag. Check the BF16 Muon router and fused convolution's actual parameter
         reads; the first post-update loss guards master initialization from high-precision values.
         """
-        run_gdp_gather_parity("blockwise", overlap, True, monkeypatch)
+        run_gdp_gather_parity("blockwise", overlap, use_layer_wise_param_layout, monkeypatch)

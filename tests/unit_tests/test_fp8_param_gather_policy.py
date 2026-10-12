@@ -113,9 +113,7 @@ def assert_param_storage_policy(ddp, args):
             }
             assert len(owners) == 1, "A bucket must not mix optimizer ownership"
             owner = owners.pop()
-            # The tag selects Muon staging, not whole-parameter ownership: compact
-            # LayerWise also owns the scalar Adam fallback, as on main.
-            assert buffer.ddp_config.use_distributed_optimizer is (not compact_layerwise)
+            assert buffer.ddp_config.use_distributed_optimizer is not (compact_layerwise and owner)
             reused = [
                 p
                 for p in bucket.params
@@ -412,17 +410,18 @@ def test_layerwise_ddp_preserves_resolved_bucket_config(layout, num_buckets):
         assert config.bucket_size == resolved_bucket_size
         assert module.weight.is_managed_by_layer_wise_optimizer
         assert not module.bias.is_managed_by_layer_wise_optimizer
-        assert (ddp.full_param_layout is not None) is layout
+        assert ddp.full_param_layout is not None
         assert len(ddp.buffers) == 2
         for buffer in ddp.buffers:
-            assert buffer.ddp_config.use_distributed_optimizer is layout
+            compact_muon = not layout and buffer.params[0].is_managed_by_layer_wise_optimizer
+            assert buffer.ddp_config.use_distributed_optimizer is not compact_muon
             assert buffer.ddp_config.bucket_size == resolved_bucket_size
-            if layout:
-                assert buffer.param_data is not None
-            else:
-                assert ddp.ddp_config is not config
+            if compact_muon:
+                assert buffer.ddp_config is not config
                 assert buffer.ddp_config.num_buckets is None
                 assert buffer.numel == buffer.numel_unpadded
                 assert buffer.param_data is None
+            else:
+                assert buffer.param_data is not None
     finally:
         Utils.destroy_model_parallel()

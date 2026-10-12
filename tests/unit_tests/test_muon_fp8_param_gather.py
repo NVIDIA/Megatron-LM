@@ -66,14 +66,9 @@ def _assert_equal(actual, expected, msg):
 
 
 def _snapshot_masters(model, optimizer):
-    # FP8 storage grouping can change padded whole-matrix ownership. Compact
-    # LayerWise also owns Adam's whole parameters, so reconstruct every LayerWise
-    # master by name instead of comparing whichever parameters this rank owns.
-    layerwise = (
-        optimizer
-        if isinstance(optimizer, LayerWiseDistributedOptimizer)
-        else optimizer.chained_optimizers[0]
-    )
+    # FP8 storage grouping can change whole-matrix ownership, so reconstruct
+    # each Muon master by name rather than comparing rank-local owner sets.
+    layerwise = optimizer.chained_optimizers[0]
     local_layerwise_masters = {}
     for child in layerwise.chained_optimizers:
         for model_group, main_group in zip(child.float16_groups, child.fp32_from_float16_groups):
@@ -86,9 +81,7 @@ def _snapshot_masters(model, optimizer):
     result = {}
     for name, param in model.named_parameters():
         main = getattr(param, "main_param", None)
-        if not param_buffers[param].ddp_config.use_distributed_optimizer or getattr(
-            param, "is_managed_by_layer_wise_optimizer", False
-        ):
+        if getattr(param, "is_managed_by_layer_wise_optimizer", False):
             main = local_layerwise_masters.get(param)
             value = torch.zeros(param.shape, dtype=torch.float32, device=param.device)
             owner_count = torch.tensor(int(main is not None), device=param.device)
@@ -306,15 +299,8 @@ class TestMuonFP8ParamGather:
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert len(model) == 1
-        if self.use_param_layout:
-            assert not isinstance(optimizer, LayerWiseDistributedOptimizer)
-            assert len(optimizer.chained_optimizers) == 2
-            assert isinstance(optimizer.chained_optimizers[0], LayerWiseDistributedOptimizer)
-        else:
-            assert isinstance(optimizer, LayerWiseDistributedOptimizer), (
-                "Compact Muon and scalar Adam must share LayerWiseDistributedOptimizer; "
-                f"got {type(optimizer).__name__}"
-            )
+        assert len(optimizer.chained_optimizers) == 2
+        assert isinstance(optimizer.chained_optimizers[0], LayerWiseDistributedOptimizer)
         counts = assert_param_storage_policy(model[0], args)
         if fp8_param_gather:
             assert counts["muon_fp8"], "No native Muon FP8 parameters were exercised"
