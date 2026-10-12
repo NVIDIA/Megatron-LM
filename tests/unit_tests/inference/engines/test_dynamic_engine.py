@@ -5732,6 +5732,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         finished_requests = []
         while engine.has_unfinished_requests():
             finished_requests.extend(engine.step_modern()["finished_requests"])
+        # Staging runs in a task off the engine loop; step_modern() only runs the loop
+        # during a step, so wait for the staged reply as shutdown() would.
+        engine._run_coroutine_sync(engine._drain_staging_tasks())
         finished = finished_requests[0]
 
         # The staged payload is the exact per-token data of the request, keyed by its uid.

@@ -1708,7 +1708,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.sampling_params, "streaming", False
             ):
                 task = asyncio.get_running_loop().create_task(
-                    self._stage_and_reply(request, finished_metadata)
+                    self._stage_and_reply(self.payload_stager, request, finished_metadata)
                 )
                 self._staging_tasks.add(task)
                 task.add_done_callback(self._staging_tasks.discard)
@@ -1719,7 +1719,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
 
     async def _stage_and_reply(
-        self, request: DynamicInferenceRequest, finished_metadata: FinishedRequestRecord
+        self,
+        stager: RequestPayloadStager,
+        request: DynamicInferenceRequest,
+        finished_metadata: FinishedRequestRecord,
     ) -> None:
         """Stage one completed payload on a worker thread, then send its reply.
 
@@ -1734,7 +1737,7 @@ class DynamicInferenceEngine(AbstractEngine):
         payload = OffloadedRequestPayload.from_request(request)
         try:
             stage_result = await asyncio.to_thread(
-                self.payload_stager.stage,
+                stager.stage,
                 request.uid,
                 payload,
                 finished_metadata=finished_metadata,
