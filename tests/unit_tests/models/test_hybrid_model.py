@@ -36,6 +36,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
+from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -108,7 +109,9 @@ class _DummyHybridLayer(MegatronModule):
     def __init__(self, config: TransformerConfig, layer_number: int, **_kwargs):
         super().__init__(config=config)
         self.layer_number = layer_number
-        self.proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.proj = torch.nn.Linear(
+            config.hidden_size, config.hidden_size, bias=False, dtype=config.params_dtype
+        )
         self.seen_hidden_shapes = []
 
     def forward(
@@ -347,6 +350,55 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == divide(model.vocab_size, tp_size)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    get_device_arch_version() != 10,
+    reason="fused linear cross-entropy requires GPU architecture 10",
+)
+def test_hybrid_fused_linear_cross_entropy_matches_plain_loss_under_mup():
+    """``--cross-entropy-fusion-impl linear`` never materialises the logits, so muP's output scaling
+    has to reach the fused kernel through the output layer's input; the loss must match the plain
+    (logits, then ``_scale_logits``) path."""
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,  # the fused kernel needs a 128-byte aligned hidden dimension
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_mup=True,
+            mup_base_hidden_size=64,
+            cross_entropy_loss_fusion=True,
+            cross_entropy_fusion_impl="linear",
+        )
+        assert config.mup_output_mult == 0.5
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=_get_dummy_hybrid_stack_spec(),
+            vocab_size=64,
+            max_sequence_length=8,
+            hybrid_layer_pattern="M-",
+        ).cuda()
+        tokens = torch.arange(model.max_sequence_length, device="cuda").repeat(2, 1)
+        labels = torch.roll(tokens, -1, dims=-1)
+
+        fused_loss = model(
+            input_ids=tokens, position_ids=tokens, attention_mask=None, labels=labels
+        )
+        config.cross_entropy_loss_fusion = False
+        config.cross_entropy_fusion_impl = "native"
+        plain_loss = model(
+            input_ids=tokens, position_ids=tokens, attention_mask=None, labels=labels
+        )
+
+        torch.testing.assert_close(fused_loss.float(), plain_loss.float(), rtol=2e-2, atol=2e-2)
     finally:
         Utils.destroy_model_parallel()
 

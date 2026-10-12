@@ -656,7 +656,7 @@ class KimiDeltaAttention(_GDNBase):
             )
         # torch.equal synchronises with the device, which a CUDA graph capture forbids; the
         # boundaries were validated during the eager warm-up steps and the captured graph's static
-        # cu_seqlens are identical by construction (same guard as GatedDeltaNet).
+        # cu_seqlens are identical by construction.
         if cu_seqlens_q.shape != cu_seqlens_kv.shape or (
             not torch.cuda.is_current_stream_capturing()
             and not torch.equal(cu_seqlens_q, cu_seqlens_kv)

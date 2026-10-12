@@ -835,10 +835,13 @@ class GPTModel(LanguageModule):
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
         else:
+            # Training with labels: the logits are produced (and muP-scaled) below, either by
+            # the fused linear + cross-entropy kernel or by the output layer.
             logits = None
 
-        # Apply MuP output scaling to logits
-        logits = self._scale_logits(logits)
+        if logits is not None:
+            # Apply MuP output scaling to logits
+            logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -866,17 +869,20 @@ class GPTModel(LanguageModule):
             return logits.transpose(0, 1).contiguous()
 
         output_layer_kwargs = dict(
-            input_=hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            weight=output_weight, runtime_gather_output=runtime_gather_output
         )
         if self.fuse_linear_cross_entropy:
+            # The fused kernel never materialises the logits, so muP's output scaling goes on
+            # the layer input (the layer has no bias).
             loss = self.output_layer(
+                input_=self._scale_fused_cross_entropy_input(hidden_states),
                 output_cross_entropy_loss=self.fuse_linear_cross_entropy,
                 labels=labels,
                 **output_layer_kwargs,
             )
         else:
-            logits, _ = self.output_layer(**output_layer_kwargs)
-            loss = self.compute_language_model_loss(labels, logits)
+            logits, _ = self.output_layer(input_=hidden_states, **output_layer_kwargs)
+            loss = self.compute_language_model_loss(labels, self._scale_logits(logits))
 
         return loss
 

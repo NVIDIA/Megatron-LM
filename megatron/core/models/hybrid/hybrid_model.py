@@ -785,10 +785,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and self.config.cross_entropy_fusion_impl == "linear"
         ):
             # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are never
-            # materialised, so the loss comes straight out of the output layer. muP logit scaling
-            # does not apply on this path, as in GPTModel.
+            # materialised, so the loss comes straight out of the output layer and muP's output
+            # scaling is applied to the layer input instead (the layer has no bias).
             return self.output_layer(
-                hidden_states,
+                self._scale_fused_cross_entropy_input(hidden_states),
                 weight=output_weight,
                 runtime_gather_output=runtime_gather_output,
                 output_cross_entropy_loss=True,
