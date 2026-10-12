@@ -80,7 +80,7 @@ def get_checkpoint_train_state_filename(checkpoints_path: str, prefix: Optional[
         return join_paths(checkpoints_path, f"{prefix}_{TRAIN_STATE_FILE}")
 
 
-def read_train_state(train_state_filename: str) -> Optional[TrainState]:
+def read_train_state(train_state_filename: str) -> TrainState:
     """Read the train state metadata from a .pt file (rank 0 only).
 
     Reads the file on rank 0 and broadcasts the result to other ranks if
@@ -90,8 +90,7 @@ def read_train_state(train_state_filename: str) -> Optional[TrainState]:
         train_state_filename: Path to the train state .pt file.
 
     Returns:
-        An initialized TrainState object, or None for old/unversioned metadata
-        whose progress counters are not reliable. Callers should use legacy metadata instead.
+        An initialized TrainState object.
     """
     if torch.distributed.is_initialized():
         state_obj = [None]
@@ -102,10 +101,9 @@ def read_train_state(train_state_filename: str) -> Optional[TrainState]:
                     state_dict = msc.torch.load(train_state_filename, map_location="cpu", weights_only=True)
                 else:
                     state_dict = torch.load(train_state_filename, map_location="cpu", weights_only=True)
-                if TrainState.is_supported_state_dict(state_dict):
-                    ts = TrainState()
-                    ts.load_state_dict(state_dict)
-                    state_obj[0] = ts
+                ts = TrainState()
+                ts.load_state_dict(state_dict)
+                state_obj[0] = ts
             except Exception as e:
                 error_msg = f"ERROR: Unable to load train state file {train_state_filename}: {e}"
                 sys.stderr.write(error_msg + "\n")
@@ -125,8 +123,6 @@ def read_train_state(train_state_filename: str) -> Optional[TrainState]:
             state_dict = msc.torch.load(train_state_filename, map_location="cpu", weights_only=True)
         else:
             state_dict = torch.load(train_state_filename, map_location="cpu", weights_only=True)
-        if not TrainState.is_supported_state_dict(state_dict):
-            return None
         ts = TrainState()
         ts.load_state_dict(state_dict)
         return ts
