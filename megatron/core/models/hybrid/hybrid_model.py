@@ -531,6 +531,69 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
             self.cudagraph_manager = CudaGraphManager(config)
+            # Logits output shared by every block-scope graph; see
+            # `_copy_to_cuda_graph_logits_buffer`.
+            self._cuda_graph_logits_buffer = None
+
+    def _uses_cuda_graph_logits_buffer(
+        self, in_inference_mode: bool, inference_context: Optional[BaseInferenceContext]
+    ) -> bool:
+        """Whether this forward runs inside a dynamic-batching block-scope CUDA graph."""
+        return (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.is_dynamic_batching()
+            and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+            and inference_context.using_cuda_graph_this_step()
+        )
+
+    def _copy_to_cuda_graph_logits_buffer(
+        self, logits: Tensor, inference_context: BaseInferenceContext
+    ) -> Tensor:
+        """Return `logits` ([1, tokens, vocab]) as a view of one buffer shared by all graphs.
+
+        A block-scope graph keeps its output tensor alive for replay, so returning a fresh
+        logits tensor pins a `tokens x vocab` allocation in the graph pool for every
+        captured batch dimension, which with full prompt logits and a large vocabulary adds
+        up to GiBs per graph. Writing every graph's logits into one buffer bounds that to a
+        single `max_tokens x vocab` allocation.
+
+        Reusing the buffer across replays is safe because the dynamic text generation
+        controller copies the logits into its own buffer on the current stream right after
+        the forward (`_dynamic_step_forward_logits`) and never reads the returned tensor
+        again, including under async scheduling. The next replay that overwrites this buffer
+        is enqueued after that copy, and a side-stream replay waits on the current stream
+        first (`_CudagraphReplayNode.forward`).
+        """
+        buffer = self._cuda_graph_logits_buffer
+        if buffer is None:
+            # Allocated during the eager warmup that precedes the first capture, so the
+            # buffer comes from the regular allocator rather than a graph's private pool
+            # and keeps a fixed address for every later capture and replay.
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "The shared CUDA graph logits buffer must be allocated before graph capture; "
+                "enable CUDA graph warmup steps."
+            )
+            max_rows = max(
+                inference_context.max_tokens,
+                inference_context.max_requests * (inference_context.num_speculative_tokens + 1),
+            )
+            buffer = torch.empty(
+                (1, max_rows, logits.shape[-1]), dtype=logits.dtype, device=logits.device
+            )
+            self._cuda_graph_logits_buffer = buffer
+        assert buffer.shape[-1] == logits.shape[-1] and buffer.dtype == logits.dtype, (
+            f"Logits {tuple(logits.shape)} {logits.dtype} do not match the shared CUDA graph "
+            f"logits buffer {tuple(buffer.shape)} {buffer.dtype}"
+        )
+        num_tokens = logits.shape[1]
+        assert num_tokens <= buffer.shape[1], (
+            f"{num_tokens} logit rows exceed the shared CUDA graph logits buffer "
+            f"({buffer.shape[1]} rows)"
+        )
+        shared_logits = buffer[:, :num_tokens]
+        shared_logits.copy_(logits)
+        return shared_logits
 
     def forward(
         self,
@@ -864,7 +927,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if labels is None:
             # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
+            logits = logits.transpose(0, 1)
+            if self._uses_cuda_graph_logits_buffer(in_inference_mode, inference_context):
+                return self._copy_to_cuda_graph_logits_buffer(logits, inference_context)
+            return logits.contiguous()
 
         loss = self.compute_language_model_loss(labels, logits)
 

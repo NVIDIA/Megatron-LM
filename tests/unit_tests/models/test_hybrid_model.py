@@ -33,7 +33,7 @@ from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -644,6 +644,82 @@ class TestHybridModel:
         model = self.model
         for expected, layer in enumerate(model.decoder.layers, start=1):
             assert expected == layer.layer_number, "layer numbers are incorrect"
+
+
+def _logits_buffer_model(scope=InferenceCudaGraphScope.block):
+    """A bare HybridModel carrying only the state the shared-logits helpers read."""
+    model = HybridModel.__new__(HybridModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(inference_cuda_graph_scope=scope)
+    model._cuda_graph_logits_buffer = None
+    return model
+
+
+def _logits_buffer_context(dynamic=True, graphed=True):
+    return SimpleNamespace(
+        is_dynamic_batching=lambda: dynamic,
+        using_cuda_graph_this_step=lambda: graphed,
+        max_tokens=16,
+        max_requests=4,
+        num_speculative_tokens=4,
+    )
+
+
+class TestHybridCudaGraphLogitsBuffer:
+    """Block-scope CUDA graphs share one logits output buffer instead of pinning one each."""
+
+    @pytest.mark.parametrize(
+        "in_inference_mode, dynamic, graphed, scope, expected",
+        [
+            (True, True, True, InferenceCudaGraphScope.block, True),
+            (False, True, True, InferenceCudaGraphScope.block, False),
+            (True, False, True, InferenceCudaGraphScope.block, False),
+            (True, True, False, InferenceCudaGraphScope.block, False),
+            (True, True, True, InferenceCudaGraphScope.none, False),
+        ],
+    )
+    def test_uses_buffer_only_for_graphed_dynamic_block_scope(
+        self, in_inference_mode, dynamic, graphed, scope, expected
+    ):
+        model = _logits_buffer_model(scope)
+        context = _logits_buffer_context(dynamic=dynamic, graphed=graphed)
+        assert model._uses_cuda_graph_logits_buffer(in_inference_mode, context) is expected
+        assert model._uses_cuda_graph_logits_buffer(in_inference_mode, None) is False
+
+    def test_graphs_of_different_sizes_share_one_buffer(self):
+        model = _logits_buffer_model()
+        context = _logits_buffer_context()
+        vocab = 32
+
+        small = torch.randn(1, 5, vocab, device="cuda", dtype=torch.bfloat16)
+        large = torch.randn(1, 20, vocab, device="cuda", dtype=torch.bfloat16)
+        small_out = model._copy_to_cuda_graph_logits_buffer(small, context)
+        large_out = model._copy_to_cuda_graph_logits_buffer(large, context)
+
+        buffer = model._cuda_graph_logits_buffer
+        # Rows cover the larger of max_tokens and every request's speculative tokens: 4 * (4 + 1).
+        assert buffer.shape == (1, 20, vocab) and buffer.dtype == torch.bfloat16
+        assert small_out.data_ptr() == large_out.data_ptr() == buffer.data_ptr()
+        assert small_out.shape == small.shape and large_out.shape == large.shape
+        assert torch.equal(large_out, large)
+
+    def test_rejects_more_rows_than_the_buffer(self):
+        model = _logits_buffer_model()
+        context = _logits_buffer_context()
+        model._copy_to_cuda_graph_logits_buffer(torch.zeros(1, 1, 8, device="cuda"), context)
+        with pytest.raises(AssertionError, match="exceed the shared CUDA graph logits buffer"):
+            model._copy_to_cuda_graph_logits_buffer(torch.zeros(1, 21, 8, device="cuda"), context)
+
+    def test_rejects_a_different_vocab_or_dtype(self):
+        model = _logits_buffer_model()
+        context = _logits_buffer_context()
+        model._copy_to_cuda_graph_logits_buffer(torch.zeros(1, 1, 8, device="cuda"), context)
+        with pytest.raises(AssertionError, match="do not match the shared CUDA graph"):
+            model._copy_to_cuda_graph_logits_buffer(torch.zeros(1, 1, 16, device="cuda"), context)
+        with pytest.raises(AssertionError, match="do not match the shared CUDA graph"):
+            model._copy_to_cuda_graph_logits_buffer(
+                torch.zeros(1, 1, 8, device="cuda", dtype=torch.bfloat16), context
+            )
 
 
 class TestHybridQKLayernorm:
