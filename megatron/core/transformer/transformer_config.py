@@ -1395,7 +1395,8 @@ class TransformerConfig(ModelParallelConfig):
     produces H_pre and H_post (2n outputs instead of n^2 + 2n), and the Sinkhorn-Knopp projection,
     alpha_res and the H_res bias are dropped. The downstream H_res / H_post / BDA kernels are
     unchanged and consume the identity matrix as-is. Requires enable_hyper_connections=True;
-    mhc_sinkhorn_iterations has no effect.
+    mhc_sinkhorn_iterations has no effect. mHC and iHC checkpoints are not interchangeable
+    because the hyper-connection parameter shapes differ.
     """
 
     mhc_sinkhorn_iterations: int = 20
