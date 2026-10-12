@@ -58,6 +58,7 @@ class TokenRollout(AgentBaseModel):
         env_id: str,
         failure_reason: str = 'unknown',
         rollout_status: str = 'placeholder',
+        problem_id: str | None = 'placeholder',
         **fields,
     ) -> 'TokenRollout':
         """Empty-trajectory rollout padding a failed episode."""
@@ -67,7 +68,7 @@ class TokenRollout(AgentBaseModel):
             reward=0.0,
             logprobs=[],
             env_id=env_id,
-            problem_id='placeholder',
+            problem_id=problem_id,
             rollout_status=rollout_status,
             failure_reason=failure_reason,
             **fields,
