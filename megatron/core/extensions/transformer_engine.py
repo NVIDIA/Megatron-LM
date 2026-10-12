@@ -1108,6 +1108,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         Forward pass returns: (normalized_output, residual)
         """
 
+        # Emit the input's gradient quantized under the active FP8 recipe (its values before
+        # quantization kept with the tensor) for a preceding TE linear that consumes it so, in
+        # place of that linear's own cast. Set before the first forward pass.
+        quantize_grad_input: bool = False
+
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """
             Construct fused ops pipeline that shares parameters with base RMSNorm.
@@ -1117,6 +1122,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             """
 
             fused_impl = te.pytorch.ops.Sequential()
+
+            if self.quantize_grad_input:
+                # Op 0: Quantize in the backward pass only; the fused backward of the two ops
+                # below emits the gradient in its format directly
+                fused_impl.append(te.pytorch.ops.Quantize(forward=False, backward=True))
 
             # Op 1: MakeExtraOutput - forks the residual
             fused_impl.append(te.pytorch.ops.MakeExtraOutput())
@@ -2056,6 +2066,15 @@ class TERowParallelLinear(TELinear):
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
         gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
+
+        # Without TP there is no reduction to wait for, so TE can add the bias in the GEMM epilogue.
+        if (
+            config.row_parallel_bias_gemm_fusion
+            and skip_bias_add
+            and not is_expert
+            and get_pg_size(tp_group) == 1
+        ):
+            skip_bias_add = False
 
         super().__init__(
             input_size=input_size,

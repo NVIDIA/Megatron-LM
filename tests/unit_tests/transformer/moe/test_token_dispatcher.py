@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +13,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.transformer.moe import fused_a2a, token_dispatcher
 from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity, pad_routing_map
@@ -667,3 +669,141 @@ class TestFlexDispatcher:
             test_dtype=torch.bfloat16,
         )
         container.moe_layer_variant_parity_test(variant)
+
+
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_hybridep_combine_adds_residual(monkeypatch, group_size):
+    """The residual is fused into the combine of a single-rank group and added after it
+    otherwise."""
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(moe_permute_fusion_into_hybridep=False, moe_router_topk=2)
+    manager.group = SimpleNamespace(size=lambda: group_size)
+    manager.drop_and_pad = False
+    manager.num_permuted_tokens = 8
+    manager.pad_multiple = None
+    manager._original_num_tokens = None
+    manager._padded_num_tokens = None
+    dense_chunk_layout = torch.tensor([4], dtype=torch.int32)
+    dense_to_expert_map = torch.zeros(4, 3, dtype=torch.int32)
+    manager.handle = (None,) * 5 + (dense_chunk_layout, dense_to_expert_map) + (None,) * 5
+
+    combined = torch.randn(4, 6)
+    residual = torch.randn(2, 2, 6)
+    calls = []
+
+    def fake_combine(x, handle, num_permuted_tokens, pad_multiple, fused):
+        calls.append("combine")
+        return combined
+
+    def fake_local_combine_add(x, residual, handle, num_permuted_tokens, pad_multiple, topk):
+        calls.append("local_combine_add")
+        assert handle[6] is dense_to_expert_map and topk == 2
+        return combined + residual.reshape(combined.shape)
+
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_combine", fake_combine)
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_local_combine_add", fake_local_combine_add)
+
+    out = manager.combine(torch.randn(8, 6), residual=residual)
+
+    assert calls == (["local_combine_add"] if group_size == 1 else ["combine"])
+    torch.testing.assert_close(out, combined + residual.reshape(combined.shape))
+
+
+def _fan_in_handle(dense_to_expert_map, num_dense):
+    """HybridEP handle entries 5 and 6 of a dense layout."""
+    return (None,) * 5 + (torch.tensor([num_dense], dtype=torch.int32), dense_to_expert_map)
+
+
+def _unpermute_add_reference(permuted, dense_map, num_dense, topk, add):
+    out = add.float().clone()
+    for t in range(min(num_dense.item(), add.shape[0])):
+        for src in dense_map[t].tolist():
+            if src >= 0:
+                out[t] += permuted[src].float()
+    return out.to(add.dtype)
+
+
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_hybridep_dispatch_grad_fan_in(monkeypatch, group_size):
+    """A single-rank group dispatches through the gradient fan-in when given one."""
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", lambda **kwargs: None)
+    monkeypatch.setattr(
+        token_dispatcher, "hybrid_ep_dispatch_grad_fan_in", lambda fan_in, **kwargs: None
+    )
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(moe_permute_fusion_into_hybridep=False)
+    manager.group = SimpleNamespace(size=lambda: group_size)
+    manager.drop_and_pad = False
+    manager._original_num_tokens = None
+    manager._padded_num_tokens = None
+    fan_in = fused_a2a.DispatchGradFanIn(topk=2)
+
+    dispatch_fn = manager._hybrid_ep_dispatch_fn(fan_in)
+
+    assert manager._hybrid_ep_dispatch_fn(None) is token_dispatcher.hybrid_ep_dispatch
+    if group_size == 1:
+        assert dispatch_fn.func is token_dispatcher.hybrid_ep_dispatch_grad_fan_in
+        assert dispatch_fn.args == (fan_in,)
+    else:
+        assert dispatch_fn is token_dispatcher.hybrid_ep_dispatch
+
+
+def test_router_input_grad_fan_in(monkeypatch):
+    """The fan-in's backward adds the parked expert-input gradient, unpermuted, to the router's
+    input gradient; without parked rows it is the identity."""
+    dense_map = torch.tensor([[0, -1, 3], [1, 2, -1], [-1, -1, -1], [4, 5, 6]], dtype=torch.int32)
+    rows = torch.randn(8, 6).to(torch.bfloat16)
+    monkeypatch.setattr(fused_a2a, "fused_unpermute_add", _unpermute_add_reference)
+
+    x = torch.randn(2, 2, 6, requires_grad=True).to(torch.bfloat16).detach().requires_grad_()
+    weight = torch.randn(2, 2, 6).to(torch.bfloat16)
+    fan_in = fused_a2a.DispatchGradFanIn(topk=2)
+    fan_in.grad_rows = rows
+    fan_in.handle = _fan_in_handle(dense_map, num_dense=3)
+    y = fused_a2a.RouterInputGradFanIn.apply(x, fan_in)
+    (y * weight).sum().backward()
+
+    ref = _unpermute_add_reference(rows, dense_map, torch.tensor(3), 2, weight.view(4, 6))
+    torch.testing.assert_close(x.grad, ref.view(2, 2, 6), rtol=0, atol=0)
+    assert fan_in.grad_rows is None and fan_in.handle is None
+
+    x.grad = None
+    y = fused_a2a.RouterInputGradFanIn.apply(x, fan_in)
+    (y * weight).sum().backward()
+    torch.testing.assert_close(x.grad, weight, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_hybridep_dispatch_grad_fan_in_backward(monkeypatch, fused):
+    """The dispatch backward parks the expert-input gradient and returns the probability
+    gradient alone, or falls back to HybridEP's backward."""
+    dense_map = torch.tensor([[0, -1, 3], [1, 2, -1], [-1, -1, -1], [4, 5, 6]], dtype=torch.int32)
+    fan_in = fused_a2a.DispatchGradFanIn(topk=2)
+    ctx = SimpleNamespace(
+        fan_in=fan_in,
+        handle=_fan_in_handle(dense_map, num_dense=3),
+        fused=fused,
+        num_dispatch_inputs=13,
+        num_tokens=4,
+        pad_multiple=None,
+    )
+    grad_x = torch.randn(8, 6)
+    grad_probs = torch.randn(8)
+    gathered = torch.zeros(4, 3)
+    monkeypatch.setattr(
+        fused_a2a, "fused_probs_grad_gather", lambda grad, dmap, num_dense, num_tokens: gathered
+    )
+    monkeypatch.setattr(
+        fused_a2a.HybridEPDispatch,
+        "backward",
+        staticmethod(lambda ctx, *grads: ("hybridep",) + (None,) * 12),
+    )
+
+    grads = fused_a2a.HybridEPDispatchGradFanIn.backward(ctx, grad_x, grad_probs, None, None, None)
+
+    assert len(grads) == 14
+    if fused:
+        assert grads[0] is None and grads[1] == "hybridep" and fan_in.grad_rows is None
+    else:
+        assert grads[:3] == (None, None, None) and grads[3] is gathered
+        assert fan_in.grad_rows is grad_x and fan_in.handle is ctx.handle

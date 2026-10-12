@@ -6,6 +6,7 @@
 import inspect
 from typing import Optional
 
+from megatron.core.fusions.fused_unpermute_add import fused_probs_grad_gather, fused_unpermute_add
 from megatron.core.utils import internal_api
 
 try:
@@ -515,6 +516,136 @@ class HybridEPCombine(torch.autograd.Function):
         return dispatched_hidden, None, None, None, None
 
 
+@internal_api
+class HybridEPLocalCombineAdd(torch.autograd.Function):
+    '''
+    HybridEP combine of a single-rank group (a local unpermute) fused with a residual add
+    '''
+
+    @staticmethod
+    def forward(ctx, x, residual, handle, num_permuted_tokens, pad_multiple, topk):
+        '''
+        Forward pass: sum the expert outputs of every token on top of its residual row
+        '''
+        # handle[5] / handle[6]: HybridEP's dense_chunk_layout / dense_to_expert_map.
+        out = fused_unpermute_add(
+            x, handle[6], handle[5][-1:], topk, add=residual.reshape(-1, x.shape[-1])
+        )
+        ctx.handle = handle
+        ctx.pad_multiple = pad_multiple
+        ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.residual_shape = residual.shape
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        '''
+        Backward pass: HybridEP's combine backward; the residual gradient passes through
+        '''
+        grad_out = grad_out.contiguous()
+        dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
+            hidden=grad_out,
+            scaling_factor=None,
+            handle=ctx.handle,
+            pad_multiple=ctx.pad_multiple,
+            num_permuted_tokens=ctx.num_permuted_tokens,
+        )
+        return dispatched_hidden, grad_out.view(ctx.residual_shape), None, None, None, None
+
+
+@internal_api
+class DispatchGradFanIn:
+    '''
+    Hands the expert-input gradient of a HybridEP dispatch backward (permuted rows) to the
+    backward of ``RouterInputGradFanIn`` on the router input, which unpermutes it on top of the
+    router's input gradient in one pass
+    '''
+
+    def __init__(self, topk: int):
+        self.topk = topk
+        self.grad_rows = None
+        self.handle = None
+
+
+@internal_api
+class RouterInputGradFanIn(torch.autograd.Function):
+    '''
+    Identity on the MoE router input; the backward pass adds the expert-input gradient parked in
+    its ``DispatchGradFanIn``, unpermuted, to the router's input gradient in one pass
+    '''
+
+    @staticmethod
+    def forward(ctx, hidden_states, fan_in):
+        '''
+        Forward pass: a view of the input
+        '''
+        ctx.fan_in = fan_in
+        return hidden_states.view_as(hidden_states)
+
+    @staticmethod
+    def backward(ctx, grad):
+        '''
+        Backward pass: the router's input gradient plus the unpermuted expert-input gradient
+        '''
+        fan_in = ctx.fan_in
+        grad_rows, handle = fan_in.grad_rows, fan_in.handle
+        fan_in.grad_rows = fan_in.handle = None
+        if grad_rows is None:
+            return grad, None
+        # handle[5] / handle[6]: HybridEP's dense_chunk_layout / dense_to_expert_map.
+        out = fused_unpermute_add(
+            grad_rows,
+            handle[6],
+            handle[5][-1:],
+            fan_in.topk,
+            add=grad.reshape(-1, grad.shape[-1]).contiguous(),
+        )
+        return out.view(grad.shape), None
+
+
+@internal_api
+class HybridEPDispatchGradFanIn(HybridEPDispatch):
+    '''
+    HybridEP dispatch of a single-rank group whose backward pass hands the expert-input gradient
+    to a ``DispatchGradFanIn`` instead of unpermuting it, and unpermutes the probability
+    gradient alone
+    '''
+
+    @staticmethod
+    def forward(ctx, fan_in, *args):
+        '''
+        Forward pass: ``HybridEPDispatch.forward`` with its positional arguments
+        '''
+        outputs = HybridEPDispatch.forward(ctx, *args)
+        ctx.fan_in = fan_in
+        ctx.num_dispatch_inputs = len(args)
+        ctx.num_tokens = args[0].shape[0]
+        return outputs
+
+    @staticmethod
+    def backward(ctx, grad_x, grad_probs, *grads):
+        '''
+        Backward pass: the probability gradient; the expert-input gradient goes to the fan-in
+        '''
+        handle = ctx.handle
+        # handle[5] / handle[6]: HybridEP's dense_chunk_layout / dense_to_expert_map.
+        dense_to_expert_map = handle[6]
+        if (
+            ctx.fused
+            or not torch.is_tensor(dense_to_expert_map)
+            or dense_to_expert_map.dtype != torch.int32
+            or dense_to_expert_map.dim() != 2
+            or dense_to_expert_map.shape[0] < ctx.num_tokens
+        ):
+            return (None,) + HybridEPDispatch.backward(ctx, grad_x, grad_probs, *grads)
+        ctx.fan_in.grad_rows = grad_x.contiguous()
+        ctx.fan_in.handle = handle
+        combined_probs = fused_probs_grad_gather(
+            grad_probs.reshape(-1), dense_to_expert_map, handle[5][-1:], ctx.num_tokens
+        )
+        return (None, None, None, combined_probs) + (None,) * (ctx.num_dispatch_inputs - 3)
+
+
 if HAVE_HYBRIDEP:
 
     @internal_api
@@ -602,9 +733,40 @@ if HAVE_HYBRIDEP:
         '''
         return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
 
+    @internal_api
+    def hybrid_ep_local_combine_add(x, residual, handle, num_permuted_tokens, pad_multiple, topk):
+        '''
+        HybridEP combine for a single-rank group fused with a residual add: returns
+        ``hybrid_ep_combine(x, ...) + residual`` with one rounding.
+
+        args:
+            x (torch.Tensor): Permuted expert outputs.
+            residual (torch.Tensor): Rows added to the combined tokens, one per token.
+            handle (EventHandle): Communication handle from dispatch operation.
+            num_permuted_tokens (int): As in ``hybrid_ep_combine``.
+            pad_multiple (int): As in ``hybrid_ep_combine``.
+            topk (int): Maximum number of experts a token is routed to.
+        '''
+        return HybridEPLocalCombineAdd.apply(
+            x, residual, handle, num_permuted_tokens, pad_multiple, topk
+        )
+
+    @internal_api
+    def hybrid_ep_dispatch_grad_fan_in(fan_in, **kwargs):
+        '''
+        ``hybrid_ep_dispatch`` (keyword arguments as there) whose backward pass hands the
+        expert-input gradient to ``fan_in``, a ``DispatchGradFanIn``, for the router input's
+        gradient fan-in instead of unpermuting it.
+        '''
+        bound = inspect.signature(hybrid_ep_dispatch).bind(**kwargs)
+        bound.apply_defaults()
+        return HybridEPDispatchGradFanIn.apply(fan_in, *bound.arguments.values())
+
 else:
     hybrid_ep_dispatch = None
     hybrid_ep_combine = None
+    hybrid_ep_local_combine_add = None
+    hybrid_ep_dispatch_grad_fan_in = None
 
 
 try:

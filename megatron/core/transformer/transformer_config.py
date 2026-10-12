@@ -565,6 +565,10 @@ class TransformerConfig(ModelParallelConfig):
     bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
     """If True, uses bias dropout fusion."""
 
+    row_parallel_bias_gemm_fusion: bool = False
+    """If True and the tensor parallel size is 1, row-parallel TE linear layers add their bias in
+    the GEMM epilogue instead of returning it for the bias-dropout-add."""
+
     apply_rope_fusion: bool = False
     """If True, use fused RoPE kernel."""
 
@@ -582,6 +586,13 @@ class TransformerConfig(ModelParallelConfig):
     use_transformer_engine_op_fuser: bool = False
     """If True, submodules may use Transformer Engine's operation fuser
     API to enable advanced fusions."""
+
+    fused_residual_rmsnorm_quantize_grad: bool = False
+    """With fused_residual_rmsnorm, the pre-MLP norm's backward pass emits the gradient of its
+    input, the residual stream after the attention, already quantized for the attention output
+    projection (a TE linear under the MXFP8 recipe), which then skips its own cast; the values
+    before quantization stay with the tensor for the projection's bias gradient and for the
+    residual stream. Requires fp8 with fp8_recipe='mxfp8' and bias_dropout_fusion=False."""
 
     ####################
     # activation recomputation
@@ -995,6 +1006,16 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
+
+    moe_combine_residual_fusion: bool = False
+    """Add the residual of MoE layers in the MoE layer instead of the MLP bias-dropout-add (requires
+    no hidden dropout in training). With the HybridEP flex dispatcher and a single-rank expert
+    group the add is fused into the combine, rounding once instead of twice."""
+
+    moe_router_grad_fusion: bool = False
+    """In the backward pass of an MoE layer with the HybridEP flex dispatcher and a single-rank
+    expert group, add the router's input gradient inside the unpermute of the expert-input gradient
+    (one pass, one rounding) instead of a separate add of the two [tokens, hidden] gradients."""
 
     moe_hybridep_pad_uneven_dispatch_inputs: bool = False
     """Pad uneven HybridEP dispatch inputs to the group maximum before dispatch.
@@ -2906,6 +2927,46 @@ class TransformerConfig(ModelParallelConfig):
             if self.normalization != "RMSNorm":
                 raise ValueError(
                     "fused_residual_rmsnorm is only supported when normalization is RMSNorm."
+                )
+
+        if self.fused_residual_rmsnorm_quantize_grad:
+            if not self.fused_residual_rmsnorm:
+                raise ValueError(
+                    "fused_residual_rmsnorm_quantize_grad requires fused_residual_rmsnorm."
+                )
+            if not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "fused_residual_rmsnorm_quantize_grad requires fp8 with fp8_recipe='mxfp8': "
+                    "only an MXFP8 gradient keeps its values before quantization."
+                )
+            if self.bias_dropout_fusion:
+                raise ValueError(
+                    "fused_residual_rmsnorm_quantize_grad requires bias_dropout_fusion=False: the "
+                    "compiled bias-dropout-add cannot take the quantized gradient as its tangent."
+                )
+            if self.fp32_residual_connection:
+                raise ValueError(
+                    "fused_residual_rmsnorm_quantize_grad is incompatible with "
+                    "fp32_residual_connection."
+                )
+
+        if self.moe_router_grad_fusion:
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend != "hybridep"
+            ):
+                raise ValueError(
+                    "moe_router_grad_fusion requires the 'hybridep' flex dispatcher backend."
+                )
+            if self.moe_latent_size:
+                raise ValueError(
+                    "moe_router_grad_fusion is incompatible with moe_latent_size: the dispatch "
+                    "backward's gradient is in the latent dimension."
+                )
+            if self.overlap_dispatch_backward_with_experts_wgrad:
+                raise ValueError(
+                    "moe_router_grad_fusion is incompatible with "
+                    "overlap_dispatch_backward_with_experts_wgrad."
                 )
 
         if self.use_te_activation_func:
