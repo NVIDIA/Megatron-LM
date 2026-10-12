@@ -161,7 +161,8 @@ class InferenceSetupConfig:
         "raw_logprobs"
     )
     """How returned inference log-probs are computed engine-wide. "raw_logprobs" (default) uses the
-    unmodified model logits; "processed_logprobs" uses temperature and filters by top-k/top-p."""
+    unmodified model logits; "processed_logprobs" applies temperature and top-k/top-p to sampled
+    tokens. Prompt log-probs are always raw."""
 
     # ---------------- CUDA graphs ----------------
 
