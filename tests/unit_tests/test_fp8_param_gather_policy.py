@@ -375,7 +375,7 @@ def test_nested_optimizer_staging_and_deferred_gather(native_sibling):
 @pytest.mark.parametrize("layout", [False, True])
 @pytest.mark.parametrize("num_buckets", [None, 2])
 def test_layerwise_ddp_preserves_resolved_bucket_config(layout, num_buckets):
-    """Compact all-reduce and padded sharding keep the resolved bucket size."""
+    """Both Muon layouts and Adam buffers keep the resolved bucket size."""
     from megatron.core.distributed import DistributedDataParallelConfig
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.transformer import TransformerConfig

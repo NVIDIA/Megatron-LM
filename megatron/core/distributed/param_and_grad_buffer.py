@@ -1815,8 +1815,8 @@ def partition_buckets(
     overlap of communication kernels with computation kernels.
 
     Before applying a grouping strategy that could merge buckets, buffers are partitioned by
-    the Muon routing tag. Padded LayerWise and DistributedOptimizer synchronize separate
-    groups; compact LayerWise binds both partitions to its whole-parameter owners.
+    the Muon routing tag so LayerWise and DistributedOptimizer synchronize separate groups
+    in both layouts.
 
     The grouping strategy within each routing partition is:
     1. If force_single_bucket_group is True, put all buckets across all buffers into a single
