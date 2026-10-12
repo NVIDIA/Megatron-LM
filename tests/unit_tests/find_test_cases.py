@@ -9,14 +9,9 @@ from pathlib import Path
 # by the full recipe bucket. Only files carrying the marker are launched.
 PLATFORM_MARKERS = {"gb200": "launch_on_gb200"}
 
-# These buckets are scheduled exclusively on GB200. Keep them out of H100 catch-all
+# This bucket is scheduled exclusively on GB200. Keep it out of H100 catch-all
 # buckets without changing the additive behavior of launch_on_gb200 elsewhere.
-PLATFORM_EXCLUSIONS = {
-    "h100": {
-        "tests/unit_tests/ssm/test_gated_delta_net.py",
-        "tests/unit_tests/ssm/test_gated_delta_net_correctness.py",
-    }
-}
+PLATFORM_EXCLUSIONS = {"h100": {"tests/unit_tests/ssm/test_gated_delta_net.py"}}
 
 
 def file_has_marker(filepath, marker):
