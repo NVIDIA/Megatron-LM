@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+import transformer_engine.pytorch as te
 from transformer_engine.pytorch import RMSNorm
 
 from megatron.core.extensions.transformer_engine import TEFusedResidualRMSNorm
@@ -44,3 +45,44 @@ def test_rmsnorm_residual_fusion(input_dtype, normalized_shape):
     assert torch.allclose(fused_residual, baseline_residual, **tols)
     assert x_fused.grad.dtype == x_baseline.grad.dtype
     assert torch.allclose(x_baseline.grad, x_fused.grad, **tols)
+
+
+class _GradSpy(torch.autograd.Function):
+    """Identity that records the gradient it passes on."""
+
+    @staticmethod
+    def forward(ctx, x, grads):
+        ctx.grads = grads
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        ctx.grads.append(grad)
+        return grad, None
+
+
+@pytest.mark.skipif(not te.is_mxfp8_available(), reason="MXFP8 required")
+def test_rmsnorm_residual_fusion_quantize_grad(monkeypatch):
+    """With quantize_grad_input the input's gradient leaves the fused norm as an MXFP8 tensor
+    carrying its high-precision values, so it accumulates exactly with another gradient of the
+    same tensor."""
+    monkeypatch.setenv("NVTE_RMSNORM_BWD_USE_TRITON", "1")
+    recipe = te.fp8.MXFP8BlockScaling()
+    x = torch.randn(16, 32, 256, dtype=torch.bfloat16, device="cuda")
+    other = torch.randn_like(x)
+    grads = {}
+    seen = []
+    for quantize in (False, True):
+        torch.manual_seed(0)
+        norm = TEFusedResidualRMSNorm(normalized_shape=256, dtype=torch.bfloat16).cuda()
+        norm.quantize_grad_input = quantize
+        x_test = x.clone().requires_grad_()
+        x_norm = _GradSpy.apply(x_test, seen) if quantize else x_test
+        with te.autocast(enabled=True, recipe=recipe):
+            y, residual = norm(x_norm)
+        loss = y.sum() + residual.sum() + (x_test * other).sum()
+        loss.backward()
+        grads[quantize] = x_test.grad
+    assert isinstance(seen[0], te.MXFP8Tensor)
+    assert torch.equal(seen[0].dequantize(), seen[0]._high_precision_data)
+    assert torch.equal(grads[True], grads[False])

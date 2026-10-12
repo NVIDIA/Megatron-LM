@@ -458,6 +458,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self._pre_mlp_layernorm_returns_residual = getattr(
             self.pre_mlp_layernorm, 'returns_residual', False
         )
+        if self.config.fused_residual_rmsnorm_quantize_grad and hasattr(
+            self.pre_mlp_layernorm, 'quantize_grad_input'
+        ):
+            # import here to avoid circular import
+            from megatron.core.extensions.transformer_engine import TELinear
+
+            # The pre-MLP norm's input gradient goes to the attention output projection
+            self.pre_mlp_layernorm.quantize_grad_input = isinstance(
+                getattr(self.self_attention, 'linear_proj', None), TELinear
+            )
         # [Module 8: MLP block]
         # import here to avoid circular import
         from megatron.core.extensions.transformer_engine import TEFusedMLP

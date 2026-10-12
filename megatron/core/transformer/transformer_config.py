@@ -587,6 +587,13 @@ class TransformerConfig(ModelParallelConfig):
     """If True, submodules may use Transformer Engine's operation fuser
     API to enable advanced fusions."""
 
+    fused_residual_rmsnorm_quantize_grad: bool = False
+    """With fused_residual_rmsnorm, the pre-MLP norm's backward pass emits the gradient of its
+    input, the residual stream after the attention, already quantized for the attention output
+    projection (a TE linear under the MXFP8 recipe), which then skips its own cast; the values
+    before quantization stay with the tensor for the projection's bias gradient and for the
+    residual stream. Requires fp8 with fp8_recipe='mxfp8' and bias_dropout_fusion=False."""
+
     ####################
     # activation recomputation
     ####################
@@ -2915,6 +2922,27 @@ class TransformerConfig(ModelParallelConfig):
             if self.normalization != "RMSNorm":
                 raise ValueError(
                     "fused_residual_rmsnorm is only supported when normalization is RMSNorm."
+                )
+
+        if self.fused_residual_rmsnorm_quantize_grad:
+            if not self.fused_residual_rmsnorm:
+                raise ValueError(
+                    "fused_residual_rmsnorm_quantize_grad requires fused_residual_rmsnorm."
+                )
+            if not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "fused_residual_rmsnorm_quantize_grad requires fp8 with fp8_recipe='mxfp8': "
+                    "only an MXFP8 gradient keeps its values before quantization."
+                )
+            if self.bias_dropout_fusion:
+                raise ValueError(
+                    "fused_residual_rmsnorm_quantize_grad requires bias_dropout_fusion=False: the "
+                    "compiled bias-dropout-add cannot take the quantized gradient as its tangent."
+                )
+            if self.fp32_residual_connection:
+                raise ValueError(
+                    "fused_residual_rmsnorm_quantize_grad is incompatible with "
+                    "fp32_residual_connection."
                 )
 
         if self.use_te_activation_func:

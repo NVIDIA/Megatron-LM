@@ -329,6 +329,43 @@ def test_squared_relu_tanh_clamp_allows_te_op_fuser():
     assert config.use_transformer_engine_op_fuser is True
 
 
+def _make_fused_residual_quantize_grad_config(**overrides) -> TransformerConfig:
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        normalization="RMSNorm",
+        fused_residual_rmsnorm=True,
+        fused_residual_rmsnorm_quantize_grad=True,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        bf16=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def test_fused_residual_rmsnorm_quantize_grad_accepts_mxfp8_config():
+    config = _make_fused_residual_quantize_grad_config()
+
+    assert config.fused_residual_rmsnorm_quantize_grad
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (dict(fused_residual_rmsnorm=False), "requires fused_residual_rmsnorm"),
+        (dict(fp8=None), "fp8_recipe='mxfp8'"),
+        (dict(fp8_recipe="tensorwise"), "fp8_recipe='mxfp8'"),
+        (dict(bias_dropout_fusion=True), "bias_dropout_fusion=False"),
+        (dict(fp32_residual_connection=True), "fp32_residual_connection"),
+    ],
+)
+def test_fused_residual_rmsnorm_quantize_grad_rejects_unsupported_configs(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _make_fused_residual_quantize_grad_config(**overrides)
+
+
 def _make_mxfp8_wire_config(**overrides) -> TransformerConfig:
     kwargs = dict(
         num_layers=1,
