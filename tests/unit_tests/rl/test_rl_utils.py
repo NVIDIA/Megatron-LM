@@ -59,6 +59,7 @@ from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import RLConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.state import TrainState
+from megatron.training.training import _pop_samples_seen
 from tests.unit_tests.test_utilities import Utils
 
 BATCH = 2
@@ -1102,6 +1103,66 @@ class TestRLUtils:
         )
         torch.testing.assert_close(truncated_from_above, expected_above)
         torch.testing.assert_close(truncated_from_below, expected_below)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="train_rl.py's loss_func runs on CUDA"
+    )
+    @pytest.mark.parametrize("packing", [False, True])
+    def test_forward_step_reports_samples_seen(self, monkeypatch, packing):
+        """train_rl.py's loss function reports the microbatch's sequence count as _samples_seen:
+        the sequences packed into the bin, or the batch size; the loop sums the reports."""
+        with patch("logging.basicConfig"):  # train_rl.py reconfigures the root logger on import
+            import train_rl
+
+        class Timer:  # the straggler detector: a context manager that also takes bdata=
+            def __call__(self, **kwargs):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        tokens = torch.zeros(3, SEQ + 1, dtype=torch.long, device="cuda")
+        values = torch.zeros(3, SEQ, device="cuda")
+        monkeypatch.setattr(train_rl, "stimer", Timer())
+        monkeypatch.setattr(train_rl, "get_timers", MagicMock)
+        monkeypatch.setattr(train_rl, "get_rerun_state_machine", MagicMock)
+        monkeypatch.setattr(train_rl, "get_rl_runtime_state", rl_utils.RLRuntimeState)
+        monkeypatch.setattr(train_rl, "is_pipeline_last_stage", lambda: True)
+        monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
+        monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
+        monkeypatch.setattr(
+            train_rl,
+            "get_run_config",
+            lambda: SimpleNamespace(rl=RLConfig(rl_use_sequence_packing=packing)),
+        )
+        monkeypatch.setattr(
+            train_rl,
+            "get_args",
+            lambda: SimpleNamespace(
+                check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
+            ),
+        )
+        if packing:
+            seq_indices = [11, 12, 13, 14, 15]
+            monkeypatch.setattr(
+                train_rl,
+                "load_packed_data_by_index",
+                lambda *a: (tokens, values, values, values, tokens, values, None, [0], [SEQ])
+                + (seq_indices, MagicMock()),
+            )
+            batch, expected = (torch.tensor(0),), len(seq_indices)
+        else:
+            mask = torch.zeros(3, SEQ + 1, device="cuda")  # forward_step drops its first column
+            batch, expected = (tokens, values, values, mask, tokens, values, values), 3
+
+        _, loss_fn = train_rl.forward_step(iter([batch]), MagicMock())
+        report = loss_fn(values)[2]
+
+        assert report["_samples_seen"].item() == expected
+        assert _pop_samples_seen([report, dict(report)]).item() == 2 * expected
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
