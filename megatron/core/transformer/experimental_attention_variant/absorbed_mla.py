@@ -165,6 +165,8 @@ class AbsorbedMLASelfAttention(Attention):
             name=name,
         )
 
+        # Resolve which classes to use for Q and KV linear up projections and norms, based on
+        # QK-norm selection.
         layer_classes = QKNormConfigResolver(self.config, submodules).resolve()
 
         assert not config.add_bias_linear, "add_bias_linear is not supported for AbsorbedMLA"

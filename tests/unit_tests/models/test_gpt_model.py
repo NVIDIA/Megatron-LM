@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import inspect
+import logging
 import os
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
@@ -47,18 +48,29 @@ class TestGPTModel:
             use_cpu_initialization=True,
             embedding_init_method_std=1.0,  # Test that we can initialize the embedding weights to something else.
         )
-        self.gpt_model = GPTModel(
-            config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-            vocab_size=100,
-            max_sequence_length=4,
-        )
+        with patch('megatron.core.models.gpt.gpt_model.log_single_rank') as mock_log_single_rank:
+            self.gpt_model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+        self.mock_log_single_rank = mock_log_single_rank
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
     def test_constructor(self):
+        self.mock_log_single_rank.assert_called_once()
+        _, level, message = self.mock_log_single_rank.call_args.args
+        assert level == logging.WARNING
+        assert message == (
+            "GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new "
+            "features. Please reference the migration guide "
+            "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`"
+        )
+
         assert isinstance(self.gpt_model, GPTModel)
 
         assert self.gpt_model.max_sequence_length == 4

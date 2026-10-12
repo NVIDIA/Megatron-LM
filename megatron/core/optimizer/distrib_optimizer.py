@@ -211,6 +211,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_rank = param_and_grad_buffer.data_parallel_group.rank()
         data_parallel_world_size = param_and_grad_buffer.data_parallel_group.size()
 
+        # The layout records how many shards it was built for. That count has to match the group
+        # the reduce-scatter and all-gather run over, which is the intra-instance group when
+        # there are several optimizer instances. If the layout was sized by a larger group, the
+        # trailing shards of every bucket belong to no rank: those params are never updated and
+        # drop out of grad-norm, num-zeros and params-norm, which sum over owned shards only.
+        num_optimizer_shards = param_and_grad_buffer.num_optimizer_shards
+        assert num_optimizer_shards is None or num_optimizer_shards == data_parallel_world_size, (
+            f"Parameter layout was built for {num_optimizer_shards} optimizer shards but the "
+            f"buffer's data-parallel group has {data_parallel_world_size} ranks. Size the layout "
+            f"by the group the optimizer shards over."
+        )
+
         bucket = param_and_grad_buffer.buckets[bucket_index]
         gbuf_size = bucket.grad_data.numel()
         assert (
@@ -423,6 +435,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                         copy_optimizer_param_metadata(shard_model_param, model_param)
 
                     # Generate main param.
@@ -454,6 +467,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_main_param, model_param)
                         copy_optimizer_param_metadata(shard_main_param, model_param)
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
@@ -476,6 +490,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
+                    tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                     copy_optimizer_param_metadata(shard_model_param, model_param)
 
                 else:
@@ -589,6 +604,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=data_parallel_world_size,
         )
 
     @staticmethod
