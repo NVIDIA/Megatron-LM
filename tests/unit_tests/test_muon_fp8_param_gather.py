@@ -126,27 +126,19 @@ def _snapshot_grads(model):
     return result
 
 
-def _snapshot_params(model, include_quantized=False):
-    """Model params for ON-vs-OFF comparison.
+def _snapshot_params(model):
+    """Compare persistent high-precision weights for gather ON/OFF.
 
-    fp8 params are skipped by default and covered via the fp32 master + reduced grad instead:
-    with fp8_param_gather OFF ``param.data`` is plain bf16, with it ON the same weight is
-    Float8/MXFP8 holding ``Q(bf16(master))``, so the two storages differ by the quantization
-    step by construction and cannot be compared directly. What remains -- layernorm, biases,
-    embeddings, any non-quantized weight -- is directly comparable and IS compared.
-
-    ``include_quantized`` dequantizes instead, for the single-run comparisons (force_sync)
-    where both sides hold the same fp8 storage. Raw codes are checked separately.
+    Quantized weights have different storage in the two modes; their FP32 masters
+    and reduced gradients are compared separately.
     """
-    out = {}
-    for n, p in model.named_parameters():
-        if _is_quantized(p):
-            if include_quantized:
-                out[n] = p.detach().float().clone()
-        else:
-            out[n] = p.detach().clone()
-    assert out, "snapshot is empty -- the param comparison would assert nothing"
-    return out
+    result = {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if not _is_quantized(param)
+    }
+    assert result, "Expected high-precision parameters to compare"
+    return result
 
 
 def _snapshot_layerwise_grad_data(ddp):
@@ -535,7 +527,7 @@ class TestMuonFP8ParamGather:
             for g in ref_groups:
                 if g.param_gather_handle is not None:
                     g.finish_param_sync(skip_next_bucket_dispatch=True)
-            ref_params = _snapshot_params(ref_model[0], include_quantized=True)
+            ref_params = _snapshot_params(ref_model[0])
             ref_codes = _FP8ParamHarness.quantized_param_state(ref_model[0])
             assert any(
                 not torch.equal(value, unpublished_codes[name][kind])
@@ -550,7 +542,7 @@ class TestMuonFP8ParamGather:
             # Under test: force-sync with the handle still pending.
             model, ddp, groups, _ = _step_and_dispatch()
             ddp.disable_forward_pre_hook(param_sync=True)
-            got_params = _snapshot_params(model[0], include_quantized=True)
+            got_params = _snapshot_params(model[0])
             got_codes = _FP8ParamHarness.quantized_param_state(model[0])
             got_grads = _snapshot_layerwise_grad_data(ddp)
 

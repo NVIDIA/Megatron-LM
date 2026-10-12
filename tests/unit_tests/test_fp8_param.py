@@ -883,20 +883,25 @@ class TestFP8Param:
                 "scale",
             )
         assert torch.is_tensor(getattr(param, attributes[0]))
-        before = {}
-        for name in attributes:
-            tensor = getattr(param, name)
-            before[name] = (
-                None
-                if tensor is None
-                else (
-                    tensor.data_ptr(),
-                    tensor.dtype,
-                    tensor.shape,
-                    tensor.stride(),
-                    tensor.detach().contiguous().reshape(-1).view(torch.uint8).clone(),
+
+        def snapshot_storage():
+            state = {}
+            for name in attributes:
+                tensor = getattr(param, name)
+                state[name] = (
+                    None
+                    if tensor is None
+                    else (
+                        tensor.data_ptr(),
+                        tensor.dtype,
+                        tensor.shape,
+                        tensor.stride(),
+                        tensor.detach().contiguous().reshape(-1).view(torch.uint8).clone(),
+                    )
                 )
-            )
+            return state
+
+        before = snapshot_storage()
         with pytest.raises(TypeError) as error:
             DDP(
                 TransformerConfig(
@@ -912,21 +917,7 @@ class TestFP8Param:
             f"got {type(param).__name__}. GroupedTensor is not supported."
         )
         assert config.use_distributed_optimizer  # The shared configuration was not changed.
-        for name, original in before.items():
-            tensor = getattr(param, name)
-            if original is None:
-                assert tensor is None, name
-                continue
-            pointer, dtype, shape, stride, values = original
-            assert (tensor.data_ptr(), tensor.dtype, tensor.shape, tensor.stride()) == (
-                pointer,
-                dtype,
-                shape,
-                stride,
-            ), name
-            assert torch.equal(
-                tensor.detach().contiguous().reshape(-1).view(torch.uint8), values
-            ), name
+        self.assert_state_equal(snapshot_storage(), before, "rejected_storage")
 
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)

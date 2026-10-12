@@ -20,6 +20,7 @@ from megatron.core.optimizer.optimizer import ChainedOptimizer, Float16Optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training.training import wrap_model_chunks_with_ddp
+from tests.unit_tests.test_fp8_param import TestFP8Param as _FP8ParamHarness
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = [
@@ -133,6 +134,8 @@ def _assert_compact_ownership(ddp, optimizer, pg):
     )
     assert not ddp.ddp_config.use_distributed_optimizer
     assert ddp.full_param_layout is None
+    for buffer in ddp.buffers + ddp.expert_parallel_buffers:
+        assert not buffer.ddp_config.use_distributed_optimizer
     local_params = [
         param
         for child in optimizer.chained_optimizers
@@ -157,13 +160,15 @@ def _assert_compact_ownership(ddp, optimizer, pg):
             assert bucket.param_data is None
 
 
-@pytest.mark.parametrize("layout", [False, True])
+@pytest.mark.parametrize("layout, direct_core", [(False, False), (False, True), (True, False)])
 @pytest.mark.parametrize("expert_bias", [False, True])
-def test_layerwise_optimizer_preserves_main_ownership(layout, expert_bias):
+def test_layerwise_optimizer_preserves_main_ownership(layout, direct_core, expert_bias):
     """Compact owns all parameters; padded retains main's scalar DistOpt restrictions."""
     Utils.initialize_model_parallel(expert_model_parallel_size=2, expert_tensor_parallel_size=1)
     try:
-        ddp, config, pg = _build_model_and_config(layout, expert_bias, True, 1234)
+        ddp, config, pg = _build_model_and_config(
+            layout, expert_bias, True, 1234, direct_core=direct_core
+        )
         if layout and expert_bias:
             with pytest.raises(AssertionError, match="Non-emerging expert-parallel param groups"):
                 _make_optimizer(ddp, config, pg)
@@ -189,20 +194,6 @@ def test_layerwise_optimizer_preserves_main_ownership(layout, expert_bias):
         }
         assert {param for buffer in adam.buffers for param in buffer.params} == scalar_params
         assert adam.data_parallel_group is pg.dp_cp
-    finally:
-        Utils.destroy_model_parallel()
-
-
-@pytest.mark.parametrize("expert_bias", [False, True])
-def test_compact_core_api_preserves_layerwise_ownership(expert_bias):
-    """Direct DDP construction uses the same compact ownership as the training entry point."""
-    Utils.initialize_model_parallel(expert_model_parallel_size=2, expert_tensor_parallel_size=1)
-    try:
-        ddp, config, pg = _build_model_and_config(False, expert_bias, True, 1234, direct_core=True)
-        optimizer = _make_optimizer(ddp, config, pg)
-        _assert_compact_ownership(ddp, optimizer, pg)
-        for buffer in ddp.buffers + ddp.expert_parallel_buffers:
-            assert not buffer.ddp_config.use_distributed_optimizer
     finally:
         Utils.destroy_model_parallel()
 
@@ -239,21 +230,6 @@ def _local_parameter_names(ddp, optimizer):
         [[names[param] for param in group] for group in child.float16_groups]
         for child in optimizer.chained_optimizers
     ]
-
-
-def _assert_equal(actual, expected):
-    if isinstance(expected, torch.Tensor):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    elif isinstance(expected, dict):
-        assert actual.keys() == expected.keys()
-        for key in expected:
-            _assert_equal(actual[key], expected[key])
-    elif isinstance(expected, (tuple, list)):
-        assert len(actual) == len(expected)
-        for actual_item, expected_item in zip(actual, expected):
-            _assert_equal(actual_item, expected_item)
-    else:
-        assert actual == expected
 
 
 def _step(ddp, optimizer, step):
@@ -307,7 +283,7 @@ def test_compact_main_torch_checkpoint_restores_next_update(
             assert torch.count_nonzero(adam.optimizer.state[master]["exp_avg_sq"]) > 0
         path = tmp_path / f"layer_wise_optimizer_{torch.distributed.get_rank()}.pt"
         optimizer.save_state_dict_to_file(path)
-        _assert_equal(torch.load(path, weights_only=False), saved_optimizer)
+        _FP8ParamHarness.assert_state_equal(torch.load(path, weights_only=False), saved_optimizer)
         _step(ddp, optimizer, 3)
         expected_optimizer = deepcopy(optimizer.state_dict())
         expected_model = deepcopy(ddp.module.state_dict())
@@ -317,9 +293,9 @@ def test_compact_main_torch_checkpoint_restores_next_update(
         assert _local_parameter_names(resumed, resumed_optimizer) == saved_owner_names
         resumed.module.load_state_dict(saved_model)
         resumed_optimizer.load_state_dict_from_file(path)
-        _assert_equal(resumed_optimizer.state_dict(), saved_optimizer)
+        _FP8ParamHarness.assert_state_equal(resumed_optimizer.state_dict(), saved_optimizer)
         _step(resumed, resumed_optimizer, 3)
-        _assert_equal(resumed_optimizer.state_dict(), expected_optimizer)
-        _assert_equal(resumed.module.state_dict(), expected_model)
+        _FP8ParamHarness.assert_state_equal(resumed_optimizer.state_dict(), expected_optimizer)
+        _FP8ParamHarness.assert_state_equal(resumed.module.state_dict(), expected_model)
     finally:
         Utils.destroy_model_parallel()

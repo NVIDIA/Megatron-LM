@@ -22,17 +22,17 @@ if not HAVE_GTP:
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.utils import is_te_min_version
 from megatron.training.utils import get_device_arch_version
-
-# Non-"Test*" alias so pytest does not re-collect the whole TestFP8Param suite here (wrong
-# world/DP config + global-state pollution); reused by composition only.
-from tests.unit_tests.test_fp8_param import TestFP8Param as _FP8ParamHarness
-from tests.unit_tests.test_fp8_param import fp8_available, reason_for_no_fp8
-from tests.unit_tests.test_muon_mxfp8_param_gather import (
+from tests.unit_tests.fp8_gdp_test_utils import (
     FLA_SEQUENCE_PACKING_REASON,
     HAVE_GDP_DEPS,
     _gdp_moe_test_args,
     _GDPAdamWMuonHarness,
 )
+
+# Non-"Test*" alias so pytest does not re-collect the whole TestFP8Param suite here (wrong
+# world/DP config + global-state pollution); reused by composition only.
+from tests.unit_tests.test_fp8_param import TestFP8Param as _FP8ParamHarness
+from tests.unit_tests.test_fp8_param import fp8_available, reason_for_no_fp8
 from tests.unit_tests.test_utilities import Utils
 
 
