@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 from torch.distributed.checkpoint.stateful import Stateful
@@ -14,6 +15,9 @@ class TrainState(Stateful):
     Tracks iteration count, consumed samples, flags for train/valid/test phases,
     and floating-point operations.
     """
+
+    # Version 0 (including unversioned files) predates authoritative TrainState tracking.
+    version: ClassVar[int] = 1
 
     iteration: int = 0  # tracks iters as train progresses, whereas args.iteration only updated on resume
     resume_iteration: int = 0  # during training might need to know which iter was resumed, but this does not need to be ckpt'd
@@ -38,6 +42,7 @@ class TrainState(Stateful):
             their corresponding tensor representations.
         """
         return {
+            "version": torch.tensor(self.version, dtype=torch.int64),
             # TrainState comes from Megatron-Bridge, however that repo used 'step' instead of 'iteration'
             # for both the state dict and the dataclass attribute. 'iteration' is more consistent with
             # Megatron-LM, but using 'step' for the state dict will allow pre-unification Bridge checkpoints
@@ -57,6 +62,17 @@ class TrainState(Stateful):
             "do_test": torch.tensor(self.do_test, dtype=torch.bool),
             "release": torch.tensor(self.release, dtype=torch.bool),
         }
+
+    @classmethod
+    def is_supported_state_dict(cls, state_dict: dict[str, torch.Tensor]) -> bool:
+        """Reject old, unreliable progress metadata and fail on unknown newer versions."""
+        saved_version = state_dict.get("version")
+        version = saved_version.item() if saved_version is not None else 0
+        if version > cls.version:
+            raise ValueError(
+                f"Unsupported TrainState version {version}; this code supports version {cls.version}."
+            )
+        return version == cls.version
 
     def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
         """Load the training state from a state dictionary.

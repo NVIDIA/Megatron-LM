@@ -2220,8 +2220,10 @@ def _load_base_checkpoint(
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
         latest_state_filename = get_checkpoint_train_state_filename(load_dir, prefix="latest")
+        latest_ckpt_state = None
         if file_exists(latest_state_filename):
             latest_ckpt_state = read_train_state(latest_state_filename)
+        if latest_ckpt_state is not None:
             iteration = latest_ckpt_state.iteration
             release = latest_ckpt_state.release
         else:
@@ -3136,8 +3138,10 @@ def load_checkpoint(
         # Local checkpoints carry TrainState in their common payload, not a sidecar.
         # Older local checkpoints fall back to the legacy state_dict/args path below.
         if 'train_state_metadata' in state_dict:
-            ckpt_train_state = TrainState()
-            ckpt_train_state.load_state_dict(state_dict['train_state_metadata'])
+            train_state_metadata = state_dict['train_state_metadata']
+            if TrainState.is_supported_state_dict(train_state_metadata):
+                ckpt_train_state = TrainState()
+                ckpt_train_state.load_state_dict(train_state_metadata)
 
         checkpoint_config = state_dict.get('run_config')
     else:
