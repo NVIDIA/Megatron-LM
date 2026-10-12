@@ -25,6 +25,8 @@ class TestGatedDeltaNet(GatedDeltaNetModuleTestCases):
     """GDN2 module correctness across the original parallel layouts."""
 
 
+# Intermittent compilation/teardown hangs (#7742).
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
