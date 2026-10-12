@@ -359,25 +359,26 @@ class WideResidualTransformerLayer(TransformerLayer):
                 "WideResidualTransformerLayer does not support cross-attention branches."
             )
 
-        for suffix, branch_name in (("self_attn", "self_attention"), ("mlp", "mlp")):
-            self.add_module("residual_read_" + suffix, None)
-            self.add_module("residual_write_" + suffix, None)
-            if isinstance(getattr(self, branch_name), IdentityOp):
-                continue
-            setattr(
-                self,
-                "residual_read_" + suffix,
-                StreamwiseSigmoidWideResidualConnection(
-                    config, self.layer_number, branch_name, mode="read"
-                ),
+        self.residual_read_self_attn = None
+        self.residual_write_self_attn = None
+        if not isinstance(self.self_attention, IdentityOp):
+            self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnection(
+                config, self.layer_number, "self_attention", mode="read"
             )
-            setattr(
-                self,
-                "residual_write_" + suffix,
-                StreamwiseSigmoidWideResidualConnection(
-                    config, self.layer_number, branch_name, mode="write"
-                ),
+            self.residual_write_self_attn = StreamwiseSigmoidWideResidualConnection(
+                config, self.layer_number, "self_attention", mode="write"
             )
+
+        self.residual_read_mlp = None
+        self.residual_write_mlp = None
+        if not isinstance(self.mlp, IdentityOp):
+            self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
+                config, self.layer_number, "mlp", mode="read"
+            )
+            self.residual_write_mlp = StreamwiseSigmoidWideResidualConnection(
+                config, self.layer_number, "mlp", mode="write"
+            )
+
         self.register_load_state_dict_pre_hook(load_residual_state)
         residual_connections = [
             reader
