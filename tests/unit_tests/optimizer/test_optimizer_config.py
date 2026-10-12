@@ -78,3 +78,14 @@ def test_overlap_optimizer_step_with_forward_requirements():
             OptimizerConfig(overlap_optimizer_step_with_forward=True, **{**ok, **bad})
     # Off by default: none of the above is checked.
     OptimizerConfig(**{**ok, 'optimizer_cuda_graph': True})
+
+
+def test_overlap_optimizer_step_flat_adam_requires_overlapped_step():
+    ok = dict(
+        optimizer='adam', bf16=True, use_distributed_optimizer=True, overlap_param_gather=True
+    )
+    OptimizerConfig(
+        overlap_optimizer_step_with_forward=True, overlap_optimizer_step_flat_adam=True, **ok
+    )
+    with pytest.raises(ValueError, match="overlap_optimizer_step_flat_adam requires"):
+        OptimizerConfig(overlap_optimizer_step_flat_adam=True, **ok)
