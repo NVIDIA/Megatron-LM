@@ -40,7 +40,7 @@ spec:
     GPUS_PER_NODE=4 bash ./tests/performance_tests/shell_test_utils/run_perf_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [gpt_583m_perf_gb200_4gpu]
+  - test_case: [gpt_583m_perf_gb200_4gpu, gpt_583m_perf_async_sched_gb200_4gpu]
     products:
       - environment: [dev]
         scope: [mr]

@@ -123,6 +123,12 @@ class _GDNBase(MegatronModule):
 
     gated_delta_rule: GatedDeltaRuleInterface
 
+    uses_attention_mask: bool = False
+    """GDN occupies the ``self_attention`` slot but is a linear-attention variant: it
+    accepts ``attention_mask`` only for signature compatibility with
+    ``TransformerLayer`` and never reads it, and it has no ``attn_mask_type``. See
+    ``Attention.uses_attention_mask`` for the contract."""
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -435,7 +441,17 @@ class _GDNBase(MegatronModule):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            query_key = query_key.contiguous()
+            if self.config.deterministic_mode:
+                # FLA's L2 norm is outside PyTorch's deterministic-algorithm checks.
+                # Use PyTorch ops with the same FP32 accumulation and additive epsilon
+                # to preserve normalization behavior for small-norm inputs.
+                qk32 = query_key.float()
+                query_key = (qk32 * torch.rsqrt(qk32.pow(2).sum(-1, keepdim=True) + 1e-6)).to(
+                    query_key.dtype
+                )
+            else:
+                query_key = l2norm(query_key)
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size

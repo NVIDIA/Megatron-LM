@@ -9,8 +9,10 @@
 #   MODEL_VARIANT: proxy (default), 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
 #   CKPT_LOAD: path to a pre-converted checkpoint to load (enables --load + --finetune)
 #   CKPT_FORMAT: checkpoint format override (e.g. torch_dist); auto-detected when empty
-#   TP, EP, PP: parallelism sizes (PP must stay 1; multimodal_dev does not
-#               support pipeline parallelism)
+#   TP, EP, PP: parallelism sizes (FSDP and PP are mutually exclusive on the
+#               standard path, so PP>1 defaults USE_FSDP to 0; an explicit
+#               USE_FSDP=1 with PP>1 is rejected rather than downgraded)
+#   SAVE_CHECKPOINT: set to 0 to skip --save/--save-interval (default 1)
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
 #   ATTN_CADENCE: one period of the decoder attention layout, one symbol per
@@ -315,11 +317,10 @@ fi
 
 # --- Logging & Checkpointing ---
 SAVE_INTERVAL=${SAVE_INTERVAL:-500}
+SAVE_CHECKPOINT=${SAVE_CHECKPOINT:-1}
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
-    --save-interval "$SAVE_INTERVAL"
     --eval-interval 500
-    --save "$CHECKPOINT_STORE_PATH"
     --eval-iters 10
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
     --wandb-project "$WANDB_PROJECT"
@@ -329,6 +330,13 @@ EVAL_AND_LOGGING_ARGS=(
     --log-timers-to-tensorboard
     --log-params-norm
 )
+# Smoke / perf runs do not need the end-of-training checkpoint write.
+if [ "$SAVE_CHECKPOINT" -eq 1 ]; then
+    EVAL_AND_LOGGING_ARGS+=(
+        --save-interval "$SAVE_INTERVAL"
+        --save "$CHECKPOINT_STORE_PATH"
+    )
+fi
 
 # --- Tokenizer ---
 TOKENIZER_MODEL=${TOKENIZER_MODEL:-Qwen/Qwen3.5-397B-A17B}
@@ -522,7 +530,31 @@ if [ -n "$CKPT_LOAD" ]; then
 fi
 
 # --- FSDP ---
+# Probe with ':+' rather than '+' so that USE_FSDP= (empty) is treated the same
+# way the ':-' default below treats it -- as "not set" -- instead of counting as
+# an explicit request for FSDP and hard-failing.
+USE_FSDP_WAS_SET=${USE_FSDP:+x}
 USE_FSDP=${USE_FSDP:-1}
+# FSDP and PP are mutually exclusive on Megatron's standard path. Downgrading an
+# explicit USE_FSDP=1 would drop --use-megatron-fsdp,
+# --data-parallel-sharding-strategy, --init-model-with-meta-device and
+# --ckpt-format fsdp_dtensor, so the job would still run but would no longer be
+# the FSDP configuration the caller asked to validate -- fail instead of
+# silently rewriting the requested mode. The implicit default (USE_FSDP unset)
+# is still auto-downgraded so that plain PP smoke runs work out of the box.
+if [ "$PP" -gt 1 ] && [ "$USE_FSDP" -eq 1 ]; then
+    if [ -n "$USE_FSDP_WAS_SET" ]; then
+        echo "[run_qwen35_vl] ERROR: USE_FSDP=1 was explicitly requested with PP=${PP} > 1." >&2
+        echo "  FSDP and PP are mutually exclusive on the standard path; continuing would" >&2
+        echo "  drop --use-megatron-fsdp, --data-parallel-sharding-strategy," >&2
+        echo "  --init-model-with-meta-device and --ckpt-format fsdp_dtensor, so the run" >&2
+        echo "  would not be the FSDP configuration you asked for." >&2
+        echo "  Set USE_FSDP=0 (or leave it unset) to run with PP>1." >&2
+        exit 1
+    fi
+    echo "[run_qwen35_vl] PP=${PP} > 1 -> defaulting USE_FSDP=0"
+    USE_FSDP=0
+fi
 if [ "$USE_FSDP" -eq 1 ]; then
     FSDP_ARGS=(
         --use-megatron-fsdp

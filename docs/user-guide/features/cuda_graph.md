@@ -109,6 +109,37 @@ but custom training scripts must do the same work themselves.
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
+### mHC Attention Split
+
+For mHC selective recompute, `--mhc-recompute-attn-cuda-graph-split` keeps mHC aggregation and
+BDA eager and captures only the input norm and attention. The producer writes directly into
+the graph's single-stream `[s, b, C]` input, including during backward recomputation, instead
+of capturing the whole mHC attention range with an `[s, b, n*C]` input.
+
+This supports GPT mHC layers and HybridStack attention-only mHC wrappers. Hybrid MLP/MoE
+and Mamba layers remain eager under the required `attn`-only scope. On MLA models,
+`mla_up_proj` recompute can be combined with `mhc`; its checkpoint stays inside the
+attention graph:
+
+```bash
+--enable-hyper-connections \
+--recompute-granularity selective \
+--recompute-modules mhc mla_up_proj \
+--cuda-graph-impl transformer_engine \
+--cuda-graph-modules attn \
+--mhc-recompute-attn-cuda-graph-split
+```
+
+Omit `mla_up_proj` for non-MLA models or when only mHC recompute is needed. Packed (THD)
+sequences are supported with the ordinary TE graph packing configuration: a
+`sequence_packing_scheduler`, `max_seqlen_per_dp_cp_rank`, `thd_max_packed_sequences`, and
+fixed padding via `pad_packed_seq_alignment=max`. The split forwards the packed sequence
+tensors and padding mask on every replay; eager MLP/MoE still receives the original metadata.
+
+The split does not support cross-attention or fine-grained offloading of `qkv_linear`,
+`core_attn`, and `attn_proj`. Hybrid wrappers must not combine attention and MLP in the same
+inner layer. Graph capacities and the attention backend's existing THD/CP constraints still apply.
+
 ---
 
 ## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)

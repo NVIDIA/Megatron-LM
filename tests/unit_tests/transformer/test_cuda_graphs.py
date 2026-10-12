@@ -29,8 +29,12 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -40,10 +44,22 @@ from megatron.core.transformer.cuda_graph_config import validate_moe_cuda_graph_
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
+    VisionTECudaGraphHelper,
     _CudagraphGlobalRecord,
     _layer_is_graphable,
+    create_cudagraphs,
 )
-from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
+from megatron.core.transformer.enums import (
+    AttnBackend,
+    CudaGraphModule,
+    CudaGraphScope,
+    InferenceCudaGraphScope,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
+    DSAIndexerLossLoggingHelper,
+    get_dsa_metric_tracker_size,
+    initialize_dsa_metric_tracker,
+)
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
@@ -117,6 +133,284 @@ def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
 
 
 class TestCudaGraphConfigAndArguments:
+    def test_initialize_dsa_tracker_finalizes_pp_agreed_capacity(self, monkeypatch):
+        class MetricModule(torch.nn.Module):
+            logs_dsa_indexer_loss = True
+
+            def __init__(self):
+                super().__init__()
+                self.layer_number = 5
+                self.config = SimpleNamespace(
+                    dsa_indexer_loss_coeff=0.1, num_layers=2, mtp_num_layers=1
+                )
+
+        model = torch.nn.Module()
+        model.add_module("metric", MetricModule())
+        pp_group = object()
+        model_pg_collection = SimpleNamespace(pp=pp_group)
+        schedule_pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"language": model_pg_collection}, language_model_module_name="language"
+        )
+        calls = []
+        tracker = {}
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+        def pp_max(tensor, op=None, group=None):
+            calls.append((op, group))
+            tensor.fill_(7)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", pp_max)
+
+        assert initialize_dsa_metric_tracker([model], schedule_pg_collection) == 7
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert tracker["values"].shape == (7,)
+        assert tracker["agreed_size"] == 7
+
+        fixed_storage = tracker["values"]
+        assert initialize_dsa_metric_tracker([model], schedule_pg_collection) == 7
+        assert tracker["values"] is fixed_storage
+        assert len(calls) == 1
+
+        with pytest.raises(RuntimeError, match="different PP group"):
+            initialize_dsa_metric_tracker([model], SimpleNamespace(pp=object()))
+
+        with pytest.raises(RuntimeError):
+            DSAIndexerLossLoggingHelper.ensure_tracker_size(8)
+        assert tracker["values"] is fixed_storage
+        assert tracker["values"].shape == (7,)
+
+    def test_initialize_dsa_tracker_skips_multi_module_rank_without_language_model(
+        self, monkeypatch
+    ):
+        """An encoder-only MIMO rank neither scans nor joins the language PP collective."""
+        values = torch.ones(2)
+        tracker = {"values": values, "agreed_size": 2, "agreed_size_pp_group": object()}
+        pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"encoder": SimpleNamespace(pp=object())}, language_model_module_name=None
+        )
+
+        class UnexpectedModel:
+            def modules(self):
+                pytest.fail("encoder-only rank scanned a model for DSA writers")
+
+        original_tracker = tracker.copy()
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_reduce",
+            lambda *args, **kwargs: pytest.fail("encoder-only rank joined DSA initialization"),
+        )
+
+        assert initialize_dsa_metric_tracker(UnexpectedModel(), pg_collection) == 0
+        assert tracker.keys() == original_tracker.keys()
+        assert all(tracker[key] is value for key, value in original_tracker.items())
+        assert tracker["values"] is values
+
+    def test_initialize_dsa_tracker_caches_zero_capacity(self, monkeypatch):
+        """A writer-free language PP group finalizes zero without allocating storage."""
+        pp_group = object()
+        tracker = {}
+        calls = []
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_reduce",
+            lambda tensor, op=None, group=None: calls.append((op, group)),
+        )
+
+        pg_collection = SimpleNamespace(pp=pp_group)
+        assert initialize_dsa_metric_tracker(torch.nn.Module(), pg_collection) == 0
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert tracker["agreed_size"] == 0
+        assert "values" not in tracker
+
+        assert initialize_dsa_metric_tracker(torch.nn.Module(), pg_collection) == 0
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert "values" not in tracker
+
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(num_layers=17, pp_group=pp_group)
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert "values" not in tracker
+
+    def test_initialize_dsa_tracker_rejects_existing_zero_length_storage(self, monkeypatch):
+        """Even empty lazy storage means a metric write preceded lifecycle initialization."""
+        pp_group = object()
+        tracker = {"values": torch.zeros(0)}
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+        with pytest.raises(RuntimeError, match="before its first metric write"):
+            initialize_dsa_metric_tracker(torch.nn.Module(), SimpleNamespace(pp=pp_group))
+
+        assert tracker["values"].shape == (0,)
+        assert "agreed_size" not in tracker
+
+    def test_initialize_dsa_tracker_empty_pp_stage_uses_peer_writer_size(self, monkeypatch):
+        """A language PP stage without a local writer allocates the peer-agreed capacity."""
+        pp_group = object()
+        tracker = {}
+        calls = []
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+        def pp_max(tensor, op=None, group=None):
+            calls.append((op, group))
+            tensor.fill_(4)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", pp_max)
+
+        assert initialize_dsa_metric_tracker(torch.nn.Module(), SimpleNamespace(pp=pp_group)) == 4
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert tracker["values"].shape == (4,)
+        assert tracker["agreed_size"] == 4
+
+    def test_dsa_tracker_size_ignores_disabled_metric_writers(self):
+        """A DSA/CSA module with loss logging disabled cannot write tracker storage."""
+
+        class DisabledMetricModule(torch.nn.Module):
+            logs_dsa_indexer_loss = True
+
+            def __init__(self):
+                super().__init__()
+                self.layer_number = 3
+                self.config = SimpleNamespace(
+                    dsa_indexer_loss_coeff=0.0, num_layers=4, mtp_num_layers=1
+                )
+
+        assert get_dsa_metric_tracker_size(DisabledMetricModule()) == 0
+
+    @pytest.mark.parametrize(
+        ("cuda_graph_modules", "expected"),
+        [([], True), ([CudaGraphModule.attn], True), ([CudaGraphModule.mlp], False)],
+    )
+    def test_te_dsa_tracker_capture_follows_attention_scope(
+        self, monkeypatch, cuda_graph_modules, expected
+    ):
+        """TE requires an initialized tracker only when its graph records DSA metric writes."""
+
+        class MetricModule(torch.nn.Module):
+            logs_dsa_indexer_loss = True
+
+            def __init__(self):
+                super().__init__()
+                self.layer_number = 1
+                self.config = SimpleNamespace(
+                    dsa_indexer_loss_coeff=0.1, num_layers=1, mtp_num_layers=None
+                )
+
+        metric_module = MetricModule()
+
+        def discover_layers(helper):
+            helper.flattened_callables = [metric_module]
+
+        from megatron.core.pipeline_parallel import p2p_communication
+
+        monkeypatch.setattr(cuda_graphs_module, "HAVE_TE_GRAPHS", True)
+        monkeypatch.setattr(TECudaGraphHelper, "_discover_layers", discover_layers)
+        monkeypatch.setattr(p2p_communication, "P2PCommunicator", lambda **_kwargs: object())
+
+        helper = TECudaGraphHelper(
+            model=[torch.nn.Module()],
+            config=SimpleNamespace(
+                cuda_graph_impl="transformer_engine", cuda_graph_modules=cuda_graph_modules
+            ),
+            seq_length=1,
+            micro_batch_size=1,
+            pg_collection=SimpleNamespace(tp=object(), dp=object(), dp_cp=object(), pp=object()),
+        )
+
+        assert helper._captures_dsa_metric_writes is expected
+
+    def test_te_reset_after_capture_cleans_dsa_tracker_in_place(self, monkeypatch):
+        from importlib import import_module
+
+        from megatron.core.transformer.moe import moe_logging
+
+        finalize_model_grads_module = import_module(
+            "megatron.core.distributed.finalize_model_grads"
+        )
+
+        reduce_group = object()
+        avg_group = object()
+        values = torch.tensor([7.0, 11.0])
+        dsa_tracker = {
+            'values': values,
+            'reduce_group': reduce_group,
+            'avg_group': avg_group,
+            'agreed_size': 2,
+        }
+        calls = []
+
+        class FakeModelChunk:
+            @staticmethod
+            def zero_grad_buffer():
+                calls.append('zero_grad_buffer')
+
+        class FakeOptimizer:
+            @staticmethod
+            def zero_grad():
+                calls.append('zero_grad')
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.model = [FakeModelChunk()]
+        helper.optimizers = [FakeOptimizer()]
+        helper.config = SimpleNamespace()
+
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, 'tracker', dsa_tracker)
+        monkeypatch.setattr(
+            moe_logging,
+            'get_moe_metrics_tracker',
+            lambda: SimpleNamespace(clear=lambda: calls.append('clear_moe_tracker')),
+        )
+        monkeypatch.setattr(
+            finalize_model_grads_module,
+            'reset_model_temporary_tensors',
+            lambda config, model: calls.append(('reset_model_temporary_tensors', config, model)),
+        )
+
+        helper._reset_after_capture()
+
+        assert calls[:3] == ['zero_grad_buffer', 'zero_grad', 'clear_moe_tracker']
+        assert calls[3] == ('reset_model_temporary_tensors', helper.config, helper.model)
+        assert dsa_tracker['values'] is values
+        assert torch.equal(dsa_tracker['values'], torch.zeros(2))
+        assert dsa_tracker['reduce_group'] is reduce_group
+        assert dsa_tracker['avg_group'] is avg_group
+        assert dsa_tracker['agreed_size'] == 2
+
+    def test_te_capture_requires_initialized_dsa_tracker(self, monkeypatch):
+        """A custom TE caller cannot lazily allocate tracker storage during capture."""
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace()
+        helper._captures_dsa_metric_writes = True
+        helper._start_capturing = lambda: pytest.fail("capture started before validation")
+
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", {})
+        monkeypatch.setattr(
+            cuda_graphs_module, "validate_moe_cuda_graph_support", lambda _cfg: None
+        )
+
+        with pytest.raises(RuntimeError, match="initialized before CUDA Graph capture"):
+            helper.create_cudagraphs()
+
+    def test_vision_te_reset_does_not_clear_language_dsa_tracker(self, monkeypatch):
+        """Vision capture leaves cleanup to the language-model TE helper."""
+        reduce_group = object()
+        values = torch.tensor([7.0, 11.0])
+        tracker = {"values": values, "reduce_group": reduce_group, "agreed_size": 2}
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+
+        helper = object.__new__(VisionTECudaGraphHelper)
+        helper._reset_after_capture()
+
+        assert tracker["values"] is values
+        assert torch.equal(tracker["values"], torch.tensor([7.0, 11.0]))
+        assert tracker["reduce_group"] is reduce_group
+        assert tracker["agreed_size"] == 2
+
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
@@ -623,6 +917,191 @@ class TestParallelTransformerBlockCudagraphs:
                 .cudagraph_manager.cudagraph_runners[0]
                 .fwd_graph
             )
+
+
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+)
+class TestPackedSeqCudagraphs:
+    """Training CUDA graphs over thd input with padding between sequences.
+
+    The padded cu_seqlens describe a slot layout that differs from the actual lengths,
+    and pad_between_seqs is set explicitly so TE does spend a GPU sync inferring it.
+    cp_size == 2 additionally captures TE's ring-P2P context-parallel attention inside the graphs.
+    """
+
+    SEQ_LENGTHS = [7, 5]
+    SLOT_STARTS = [0, 8, 16]  # slot layout aligned to 2 * cp_size for every cp_size tested
+    BIN_SIZE = 32
+    NVTE_ENV_VARS = (
+        "NVTE_FLASH_ATTN",
+        "NVTE_FUSED_ATTN",
+        "NVTE_UNFUSED_ATTN",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+    )
+
+    def setup_method(self, method):
+        self.original_nvte_env = {name: os.environ.get(name) for name in self.NVTE_ENV_VARS}
+        os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+
+    def teardown_method(self, method):
+        try:
+            Utils.destroy_model_parallel()
+            _CudagraphGlobalRecord.cudagraph_created = False
+            _CudagraphGlobalRecord.cudagraph_record = []
+            CudaGraphManager.global_mempool = None
+        finally:
+            for name, value in self.original_nvte_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def _build_packed_seq_params(self, device):
+        # Actual boundaries: each sequence's real tokens inside its slot; the trailing bin
+        # padding [SLOT_STARTS[-1], BIN_SIZE) forms a ghost slot of pad tokens.
+        boundaries = [0]
+        for length in self.SEQ_LENGTHS:
+            boundaries.append(boundaries[-1] + length)
+        boundaries.append(boundaries[-1] + self.BIN_SIZE - self.SLOT_STARTS[-1])
+        cu_seqlens = torch.tensor(boundaries, dtype=torch.int32, device=device)
+        cu_seqlens_padded = torch.tensor(
+            self.SLOT_STARTS + [self.BIN_SIZE], dtype=torch.int32, device=device
+        )
+        return PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=self.BIN_SIZE,
+            max_seqlen_kv=self.BIN_SIZE,
+            pad_between_seqs=True,
+        )
+
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    def test_thd_capture_with_pad_between_seqs(self, cp_size):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(context_parallel_size=cp_size)
+        model_parallel_cuda_manual_seed(123)
+        os.environ["NVTE_FLASH_ATTN"] = "0"
+        os.environ["NVTE_FUSED_ATTN"] = "1"
+        os.environ["NVTE_UNFUSED_ATTN"] = "0"
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            context_parallel_size=cp_size,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            attention_backend=AttnBackend.fused,
+            deterministic_mode=True,
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=1,
+            use_cpu_initialization=True,
+        )
+        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
+        block.train()
+        # CUDA-graphed backward assumes DDP-style grad accumulation buffers.
+        for param in block.parameters():
+            param.main_grad = torch.zeros_like(param)
+
+        packed_seq_params = self._build_packed_seq_params(torch.device('cuda'))
+        # Each CP rank holds its 1/cp_size share of the bin's tokens.
+        hidden_states = torch.randn(
+            (self.BIN_SIZE // cp_size, 1, config.hidden_size),
+            dtype=torch.bfloat16,
+            device='cuda',
+            requires_grad=True,
+        )
+
+        eager_out = block(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        hidden_states_metadata = hidden_states.cg_buffer_metadata
+        assert hidden_states_metadata.is_cudagraph_input
+        assert hidden_states_metadata.is_saved_for_backward
+
+        # The second layer's TE input layernorm saves the first layer's output for backward.
+        # This naturally exercises a CUDA graph output whose pool buffer must stay alive until
+        # backward capture.
+        first_runner = block.layers[0].cudagraph_manager.cudagraph_runners[0]
+        first_runner_record = next(
+            record
+            for record in _CudagraphGlobalRecord.cudagraph_record
+            if record[0] is first_runner and record[1] == "fwd"
+        )
+        recorded_outputs = first_runner_record[4]
+        output_metadata = first_runner.get_arg_metas(recorded_outputs)[0].cg_buffer_metadata
+        output_metadata_state = (
+            f"input={output_metadata.is_cudagraph_input}, "
+            f"output={output_metadata.is_cudagraph_output}, "
+            f"saved={output_metadata.is_saved_for_backward}"
+        )
+        assert output_metadata.is_cudagraph_input, output_metadata_state
+        assert output_metadata.is_cudagraph_output, output_metadata_state
+        assert output_metadata.is_saved_for_backward, output_metadata_state
+
+        # The q/kv aliases for each offsets tensor must share one metadata object while recording
+        # every graph-input use for replay-buffer sharing.
+        actual_cu_seqlens_metadata = packed_seq_params.cu_seqlens_q.cg_buffer_metadata
+        padded_cu_seqlens_metadata = packed_seq_params.cu_seqlens_q_padded.cg_buffer_metadata
+        assert packed_seq_params.cu_seqlens_kv.cg_buffer_metadata is actual_cu_seqlens_metadata
+        assert (
+            packed_seq_params.cu_seqlens_kv_padded.cg_buffer_metadata is padded_cu_seqlens_metadata
+        )
+        assert actual_cu_seqlens_metadata.is_cudagraph_input
+        assert padded_cu_seqlens_metadata.is_cudagraph_input
+        eager_out.sum().backward()
+
+        # This is the primary function under test.
+        create_cudagraphs()
+
+        runners = []
+        for layer in block.layers:
+            layer_runners = layer.cudagraph_manager.cudagraph_runners
+            assert len(layer_runners) == 1
+            assert layer_runners[0].fwd_graph is not None
+            runners.extend(layer_runners)
+
+        # There are four cu_seqlens arguments per layer: q/kv pairs for the real and padded
+        # offsets. Each pair and every later layer should alias one of two shared buffers. Within
+        # each buffer group, only its first graph-input occurrence performs the replay copy.
+        cu_seqlens_buffers = [
+            tensor
+            for runner in runners
+            for tensor in runner.fwd_graph_input_surface[: runner.num_dgrads]
+            if tensor.dtype == torch.int32 and tensor.shape == packed_seq_params.cu_seqlens_q.shape
+        ]
+        assert len(cu_seqlens_buffers) == 4 * len(runners)
+        buffers_by_ptr = {}
+        for tensor in cu_seqlens_buffers:
+            buffers_by_ptr.setdefault(tensor.data_ptr(), []).append(tensor)
+        assert len(buffers_by_ptr) == 2
+        for shared_buffers in buffers_by_ptr.values():
+            assert sum(not tensor.can_skip_replay_copy for tensor in shared_buffers) == 1
+
+        graphed_out = block(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        assert torch.equal(graphed_out, eager_out), (
+            "CUDA graph replay output is not bitwise equal to eager output: "
+            f"max_abs_diff={(graphed_out.float() - eager_out.float()).abs().max().item()}"
+        )
+        graphed_out.sum().backward()
+
+        # Destroy captured graphs deterministically before parallel-state teardown.
+        for layer in block.layers:
+            for runner in layer.cudagraph_manager.cudagraph_runners:
+                if hasattr(runner, "fwd_graph"):
+                    del runner.fwd_graph
+                if hasattr(runner, "bwd_graph"):
+                    del runner.bwd_graph
+        torch.cuda.synchronize()
 
 
 @pytest.mark.skipif(
@@ -1701,7 +2180,11 @@ class TestTECudaGraphHelper:
 
         helper = object.__new__(TECudaGraphHelper)
         helper.config = _te_whole_moe_paged_stash_config(cuda_graph_modules=cuda_graph_modules)
+        helper.model = []
+        helper.pg_collection = SimpleNamespace(pp=object())
+        helper.pp_group = object()
         helper.flattened_callables = [layer]
+        helper._captures_dsa_metric_writes = False
         helper.callables_per_chunk = []
         helper.num_microbatches = 1
         helper._start_capturing = lambda: 0.0

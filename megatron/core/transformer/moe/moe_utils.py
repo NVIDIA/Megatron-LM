@@ -26,6 +26,7 @@ from megatron.core.transformer.moe.moe_logging import (
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
+from megatron.core.utils import maybe_move_tensor_to_cpu as _maybe_move_tensor_to_cpu
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -1341,26 +1342,8 @@ def get_updated_expert_bias_with_quantile(
 def maybe_move_tensor_to_cpu(
     tensor: torch.Tensor, as_numpy: bool = False, record_stream: bool = False
 ) -> torch.Tensor:
-    """Move a tensor to CPU if it is on GPU.
-    Args:
-        tensor (torch.Tensor): The tensor to move to CPU.
-        as_numpy (bool, optional): Whether to convert the tensor to a numpy array.
-                                   Defaults to False.
-        record_stream (bool, optional): Whether to record the stream of the tensor, to prevent
-                                        memory leak when the DtoH data transfer is on a side
-                                        stream. Defaults to False.
-
-    Returns:
-        torch.Tensor: The tensor moved to CPU.
-    """
-    if torch.is_tensor(tensor) and tensor.is_cuda:
-        cpu_tensor = tensor.to(torch.device("cpu"), non_blocking=True)
-        if as_numpy:
-            cpu_tensor = cpu_tensor.numpy()
-        if record_stream:
-            tensor.record_stream(torch.cuda.current_stream())
-        tensor = cpu_tensor
-    return tensor
+    """Compatibility wrapper for :func:`megatron.core.utils.maybe_move_tensor_to_cpu`."""
+    return _maybe_move_tensor_to_cpu(tensor, as_numpy=as_numpy, record_stream=record_stream)
 
 
 @internal_api
@@ -1634,7 +1617,10 @@ def get_default_pg_collection() -> ProcessGroupCollection:
     pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
     pg_collection.cp = parallel_state.get_context_parallel_group()
     pg_collection.expt_tp = parallel_state.get_expert_tensor_parallel_group()
-    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group(with_gtp_remat=False)
+    pg_collection.expt_dp_gtp_remat = parallel_state.get_expert_data_parallel_group(
+        check_initialized=False
+    )
     pg_collection.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
     pg_collection.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
     pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(

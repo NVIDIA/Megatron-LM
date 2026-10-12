@@ -16,6 +16,10 @@ Coverage:
   ``cudnn.DSA`` kernels so the data-marshalling logic (shape conversions,
   TopK padding, predict/target/KL composition, autograd plumbing) is
   validated without requiring the real CUDA kernels.
+* Autograd-boundary TopK width alignment so cuDNN sparse-attention backward
+  inherits a stable compile key from the forward save.
+* Triton JIT compile-key stability for sparse-loss preparation and fused
+  teacher-LSE under packed-THD geometries.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant import dsa_fused_safety
+from megatron.core.transformer.experimental_attention_variant.csa_utils import csa_teacher_lse
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     fused_sparse_attention as dk,
 )
@@ -866,6 +871,108 @@ class TestGetTopkAlignment:
 
 
 # ---------------------------------------------------------------------------
+# CSASparseAttnFunc TopK width alignment (forward save → backward compile key)
+# ---------------------------------------------------------------------------
+#
+# FlashMLA pads TopK only inside ``_csa_fwd_flash_mla`` for the forward call.
+# Without aligning before ``save_for_backward``, cuDNN sparse-attention bwd still
+# sees the raw data-dependent width and recompiles. ``_align_topk_width`` runs at
+# the autograd boundary so the saved tensor (and therefore backward) inherits a
+# stable architecture-dependent bucket width (64 on SM100+, 128 on older GPUs).
+# Backward itself is unchanged.
+
+
+def _padded_topk_width(width: int) -> int:
+    """Round ``width`` up to the current GPU's FlashMLA TopK alignment."""
+    align = _get_topk_alignment()
+    return (width + align - 1) // align * align
+
+
+def _aligned_topk_make_inputs(width: int, n: int = 64, h: int = 8, d: int = 64):
+    """Build synthetic CSASparseAttnFunc inputs with ``width`` topk slots per row."""
+    torch.manual_seed(width)
+    q = torch.randn(n, h, d, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(n + 16, d, dtype=torch.bfloat16, requires_grad=True)
+    sink = torch.full((h,), float("-inf"), dtype=torch.float32)
+    topk_idxs = torch.randint(0, n + 16, (n, width), dtype=torch.int32)
+    return q, kv, sink, topk_idxs
+
+
+class _RecordingDSATopkWidth:
+    """Stub DSA namespace that records the topk tensor handed to backward."""
+
+    def __init__(self):
+        self.calls = []
+
+    def sparse_attention_backward_wrapper(
+        self, q, kv, out, dout, lse, attn_sink, topk_idxs, softmax_scale, topk_length
+    ):
+        self.calls.append(topk_idxs.clone())
+        return {
+            "dq": torch.zeros_like(q),
+            "dkv": torch.zeros_like(kv),
+            "d_sink": torch.zeros_like(attn_sink),
+        }
+
+
+def _aligned_topk_fake_fwd(
+    q, kv, topk_idxs, softmax_scale, attn_sink=None, topk_length=None, indexer_topk=0
+):
+    """Stub FlashMLA forward; these tests only care about saved topk width."""
+    out = torch.zeros_like(q)
+    lse = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32)
+    return out, lse, None
+
+
+def _run_aligned_topk_fwd_bwd(recorder, topk_length, width):
+    q, kv, sink, topk_idxs = _aligned_topk_make_inputs(width)
+    with (
+        patch.object(dk, "_csa_fwd_flash_mla", _aligned_topk_fake_fwd),
+        patch.object(dk, "_ensure_dsa_namespace", lambda: setattr(dk, "_DSA", recorder)),
+        patch.object(dk, "_DSA", recorder),
+    ):
+        out, _, _ = CSASparseAttnFunc.apply(q, kv, sink, topk_idxs, topk_length, 1.0 / 8.0, 0)
+        out.backward(torch.ones_like(out))
+    return q, topk_idxs
+
+
+@pytest.mark.parametrize("topk_length", [None, torch.full((64,), 100, dtype=torch.int32)])
+def test_backward_topk_widths_collapse_to_aligned_buckets(topk_length):
+    """Distinct raw widths collapse to one architecture-aligned compile key."""
+    expected = _padded_topk_width(130)
+    assert _padded_topk_width(189) == expected
+    recorder = _RecordingDSATopkWidth()
+    for width in (130, 189, 130):
+        _run_aligned_topk_fwd_bwd(recorder, topk_length, width)
+    assert len(recorder.calls) == 3
+    seen_widths = [t.shape[-1] for t in recorder.calls]
+    assert seen_widths == [expected, expected, expected], (
+        f"backward topk widths must collapse to {_get_topk_alignment()}-aligned "
+        f"stable buckets, got {seen_widths}"
+    )
+
+
+def test_backward_topk_aligned_width_unchanged():
+    """Already-aligned widths are passed through untouched."""
+    recorder = _RecordingDSATopkWidth()
+    _, topk_idxs = _run_aligned_topk_fwd_bwd(recorder, None, 256)
+    (seen,) = recorder.calls
+    assert seen.shape[-1] == 256
+    assert torch.equal(seen, topk_idxs)
+
+
+@pytest.mark.parametrize("topk_length", [None, torch.full((64,), 100, dtype=torch.int32)])
+def test_backward_topk_padding_values(topk_length):
+    """Original entries are preserved; padded suffix is the -1 invalid sentinel."""
+    recorder = _RecordingDSATopkWidth()
+    _, topk_idxs = _run_aligned_topk_fwd_bwd(recorder, topk_length, 130)
+    (seen,) = recorder.calls
+    assert seen.shape[-1] == _padded_topk_width(130)
+    assert torch.equal(seen[:, :130], topk_idxs)
+    assert (seen[:, 130:] == -1).all()
+
+
+# ---------------------------------------------------------------------------
 # Sparse-loss preparation
 # ---------------------------------------------------------------------------
 
@@ -927,6 +1034,103 @@ def test_sparse_loss_preparation_triton_matches_eager():
     assert torch.equal(actual[2], expected[2])
     assert actual[0][0, 1].item() == 0.0
     torch.testing.assert_close(actual[0][2], torch.full((5,), 0.2, device="cuda"))
+
+
+def _compiled_triton_variants(kernel) -> int:
+    """Count in-memory compiled variants of a ``triton.jit`` function."""
+    return sum(len(entry[0]) for entry in kernel.device_caches.values())
+
+
+def _reset_triton_kernels(*kernels):
+    for kernel in kernels:
+        kernel.device_caches.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_prepare_sparse_loss_compiles_once_across_score_widths():
+    """Packed-THD score widths must stay off the Triton JIT key."""
+    if not dk.csa_indexer_loss_kernels._TRITON_AVAILABLE:
+        pytest.skip("Triton is not available")
+    kernel = dk.csa_indexer_loss_kernels._prepare_sparse_loss_kernel
+    _reset_triton_kernels(kernel)
+
+    topk_width = 33
+    for rows, score_width in ((104, 50), (124, 54), (200, 58)):
+        scores = torch.randn(rows, score_width, dtype=torch.float32, device="cuda")
+        topk = torch.randint(-1, score_width, (rows, topk_width), dtype=torch.int32, device="cuda")
+        physical = torch.where(topk >= 0, topk + 1000, topk)
+        padding = torch.zeros(rows, dtype=torch.bool, device="cuda")
+        padding[::7] = True
+
+        predict, sanitized_topk, sanitized_physical = (
+            dk.csa_indexer_loss_kernels.prepare_sparse_loss(scores, topk, padding, physical)
+        )
+        expected = dk.csa_indexer_loss_kernels._prepare_sparse_loss_fallback(
+            scores, topk, padding, physical
+        )
+        torch.testing.assert_close(predict, expected[0])
+        assert torch.equal(sanitized_topk, expected[1])
+        assert torch.equal(sanitized_physical, expected[2])
+
+    assert _compiled_triton_variants(kernel) == 1
+
+
+# Segment layouts with distinct segment counts / maxima at ratio 4. No derived
+# value is 1 or a multiple of 16, so Triton divisibility specialization cannot
+# collapse distinct keys and mask a JIT-key regression.
+_TEACHER_LSE_SEGMENT_LAYOUTS = ([68, 36], [52, 52, 20], [100, 44, 36, 20])
+_TEACHER_LSE_RATIO = 4
+
+
+def _teacher_lse_cu_seqlens(lengths):
+    cumulative = [0]
+    for length in lengths:
+        cumulative.append(cumulative[-1] + length)
+    return torch.tensor(cumulative, dtype=torch.int32, device="cuda")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_teacher_lse_compiles_once_across_packed_geometries():
+    """Packed segment count and maxima must stay runtime scalars for teacher LSE."""
+    if not hasattr(csa_teacher_lse, "_csa_window_lse_kernel"):
+        pytest.skip("Triton CSA teacher-LSE kernels are unavailable")
+    window_kernel = csa_teacher_lse._csa_window_lse_kernel
+    compressed_kernel = csa_teacher_lse._csa_compressed_lse_thd_kernel
+    _reset_triton_kernels(window_kernel, compressed_kernel)
+
+    num_heads, head_dim, window_width = 8, 64, 16
+    for lengths in _TEACHER_LSE_SEGMENT_LAYOUTS:
+        total_q = sum(lengths)
+        compressed_lengths = [length // _TEACHER_LSE_RATIO for length in lengths]
+        total_compressed = sum(compressed_lengths)
+        total_kv = total_q + total_compressed
+
+        query = torch.randn(total_q, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        full_kv = torch.randn(total_kv, head_dim, dtype=torch.bfloat16, device="cuda")
+        compressed_kv = full_kv[total_q:]
+        attn_sink = torch.zeros(num_heads, dtype=torch.float32, device="cuda")
+        window_indices = torch.randint(
+            -1, total_q, (total_q, window_width), dtype=torch.int32, device="cuda"
+        )
+
+        lse = fused_csa_teacher_lse(
+            query,
+            full_kv,
+            compressed_kv,
+            attn_sink,
+            window_indices,
+            softmax_scale=head_dim**-0.5,
+            ratio=_TEACHER_LSE_RATIO,
+            cu_seqlens_q=_teacher_lse_cu_seqlens(lengths),
+            cu_seqlens_k=_teacher_lse_cu_seqlens(compressed_lengths),
+            max_seqlen_q=max(lengths),
+            max_seqlen_k=max(compressed_lengths),
+        )
+        assert lse.shape == (total_q, num_heads)
+        assert torch.isfinite(lse).all()
+
+    assert _compiled_triton_variants(window_kernel) == 1
+    assert _compiled_triton_variants(compressed_kernel) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2792,7 +2996,6 @@ class TestFusedIndexerSparseAttnFromTopk:
 
     def test_backward_reuses_compact_indices_and_length(self, monkeypatch):
         inputs = self._inputs()
-        inputs['topk_idxs'][1] = -1
         for name in ('query', 'kv_full', 'attn_sink', 'q_indexer', 'k_indexer', 'weights'):
             inputs[name].requires_grad_(True)
 
@@ -2800,8 +3003,10 @@ class TestFusedIndexerSparseAttnFromTopk:
         q_padding_mask = torch.tensor([False, True, False, False])
         seen = {}
 
-        def fake_flash(query, *args, **kwargs):
-            del args, kwargs
+        def fake_flash(query, kv_full, topk_idxs, softmax_scale, **kwargs):
+            del kv_full, softmax_scale
+            seen['forward_topk'] = topk_idxs.detach().clone()
+            seen['forward_topk_length'] = kwargs['topk_length'].detach().clone()
             return torch.zeros_like(query), torch.full((total_q, num_heads), 3.0), None
 
         class FakeDSA:
@@ -2852,6 +3057,13 @@ class TestFusedIndexerSparseAttnFromTopk:
         )
         (output.sum() + loss).backward()
 
+        torch.testing.assert_close(
+            seen['forward_topk'],
+            torch.tensor([[4, 0], [-1, -1], [5, 2], [5, 3]], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            seen['forward_topk_length'], torch.tensor([2, 0, 2, 2], dtype=torch.int32)
+        )
         torch.testing.assert_close(
             seen['topk'], torch.tensor([[4, 0], [0, 0], [5, 2], [5, 3]], dtype=torch.int32)
         )
@@ -4311,7 +4523,7 @@ class TestThdWrapperDispatchAndValidation:
                 max_seqlen_q=3,
                 max_seqlen_kv=2,
                 q_causal_offsets=q_causal_offsets,
-                deterministic=True,
+                deterministic=False,
             )
         # THD return shape: (total_q, topk) + (total_q,).
         assert topk_idxs.shape == (total_q, 2)
@@ -4320,6 +4532,50 @@ class TestThdWrapperDispatchAndValidation:
         fake_dsa.indexer_forward_wrapper.assert_called_once()
         seq_lens = fake_dsa.indexer_top_k_wrapper.call_args.args[1]
         assert torch.equal(seq_lens, torch.tensor([1, 1, 2, 0, 0], device=q.device))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_indexer_topk_thd_deterministic_fallback_skips_radix_kernel(
+        self, reset_lazy_kernel_state
+    ):
+        """Without a compact wrapper, ``deterministic=True`` selects ids from the
+        dense scores with a fixed tie order instead of the radix Top-K kernel."""
+        q, k, w, cu_q, cu_kv = self._make_indexer_topk_thd_inputs()
+        total_q = q.shape[0]
+        q_causal_offsets = torch.tensor([5, 0], dtype=torch.int32, device=q.device)
+
+        fake_dsa = MagicMock(name='_DSA_thd_deterministic_stub')
+        fake_dsa.indexer_forward_top_k_wrapper = None
+        # Causal lengths are [1, 1, 2, 0, 0]. Row 0 scores its out-of-range key
+        # highest, row 2 has two valid keys with equal scores, rows 3/4 have none.
+        scores = torch.zeros(total_q, 2, dtype=torch.float32, device=q.device)
+        scores[0, 1] = 1.0
+        scores[3:] = float('-inf')
+        fake_dsa.indexer_forward_wrapper.return_value = {'scores': scores}
+        dk._DSA = fake_dsa
+
+        with pytest.warns(RuntimeWarning, match="Compact indexer.*falling back"):
+            topk_idxs, topk_len = indexer_topk(
+                q,
+                k,
+                w,
+                topk=2,
+                ratio=4,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_kv,
+                max_seqlen_q=3,
+                max_seqlen_kv=2,
+                q_causal_offsets=q_causal_offsets,
+                deterministic=True,
+            )
+
+        fake_dsa.indexer_top_k_wrapper.assert_not_called()
+        expected = torch.tensor(
+            [[0, -1], [0, -1], [0, 1], [-1, -1], [-1, -1]], dtype=torch.int32, device=q.device
+        )
+        assert torch.equal(topk_idxs, expected)
+        assert torch.equal(
+            topk_len, torch.tensor([1, 1, 2, 0, 0], dtype=torch.int32, device=q.device)
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_indexer_topk_thd_compact_dispatch(self, reset_lazy_kernel_state):
@@ -4828,11 +5084,12 @@ class TestRealKernelFusedIndexerSparseAttnThd:
     def test_raw_thd_tail_padding_backward_uses_dummy_tile(self, reset_lazy_kernel_state):
         """Raw THD tail padding supplies a harmless tile to DSA backward.
 
-        CUDA graphs keep Q-side tensors at a static capacity, which may leave
-        physical rows beyond the last packed-sequence endpoint. Raw THD
-        lowering emits all ``-1`` indices for those rows, so FlashMLA forward
-        sees ``topk_length == 0``. DSA backward instead requires at least one
-        tile; the fused wrapper must pass length 1 after sanitizing the index.
+        CUDA graphs keep Q-side tensors at a static capacity. Physical sequence
+        lengths include the padding; unpadded lengths identify the real rows.
+        Raw THD lowering emits all ``-1`` indices for padding, so FlashMLA
+        forward sees ``topk_length == 0``. DSA backward instead requires at
+        least one tile; the fused wrapper must pass length 1 after sanitizing
+        the index.
         """
         _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
@@ -4856,8 +5113,8 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         k_indexer = torch.randn(n_comp, s['idx_hd'], dtype=torch.bfloat16, device=dev)
         weights = torch.randn(total_q, s['idx_nh'], dtype=torch.bfloat16, device=dev)
 
-        cu_q = _make_cu_seqlens([real_q], device=dev)
-        cu_q_unpadded = cu_q.clone()
+        cu_q = _make_cu_seqlens([total_q], device=dev)
+        cu_q_unpadded = _make_cu_seqlens([real_q], device=dev)
         cu_kv = _make_cu_seqlens([kv_offset], device=dev)
         cu_comp_idx = _make_cu_seqlens([n_comp], device=dev)
         compressed_kv = kv_full.detach()[kv_offset:]
@@ -4903,7 +5160,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
                 cu_seqlens_q=cu_q,
                 cu_seqlens_kv=cu_kv,
                 cu_seqlens_compressed_idx=cu_comp_idx,
-                max_seqlen_q=real_q,
+                max_seqlen_q=total_q,
                 max_seqlen_compressed_idx=n_comp,
                 compressed_kv=compressed_kv,
                 cu_seqlens_q_unpadded=cu_q_unpadded,
@@ -5974,3 +6231,39 @@ class TestPublicApi:
         assert issubclass(CSASparseAttnFunc, torch.autograd.Function)
         assert issubclass(FusedCSAIndexerSparseAttnFunc, torch.autograd.Function)
         assert issubclass(FusedCSAIndexerSparseAttnFromTopkFunc, torch.autograd.Function)
+
+
+# ---------------------------------------------------------------------------
+# _stable_topk_indices — deterministic fallback for the standalone Top-K
+# ---------------------------------------------------------------------------
+
+
+class TestStableTopkIndices:
+    """``_stable_topk_indices`` orders exact ties toward the smallest key id and
+    pads rows that run out of valid keys with ``-1``."""
+
+    def test_ties_resolve_toward_smallest_index(self):
+        scores = torch.tensor([[0.0, 3.0, 0.0, 3.0, 1.0, 0.0]])
+        seq_lens = torch.tensor([6], dtype=torch.int32)
+        out = dk._stable_topk_indices(scores, seq_lens, topk_k=4)
+        assert torch.equal(out, torch.tensor([[1, 3, 4, 0]], dtype=torch.int32))
+
+    def test_seq_lens_mask_and_padding(self):
+        scores = torch.tensor([[5.0, 4.0, 3.0, 2.0], [5.0, 4.0, 3.0, 2.0], [5.0, 4.0, 3.0, 2.0]])
+        seq_lens = torch.tensor([4, 2, 0], dtype=torch.int32)
+        out = dk._stable_topk_indices(scores, seq_lens, topk_k=3)
+        expected = torch.tensor([[0, 1, 2], [0, 1, -1], [-1, -1, -1]], dtype=torch.int32)
+        assert torch.equal(out, expected)
+
+    def test_masked_scores_are_never_selected(self):
+        scores = torch.tensor([[float('-inf'), 0.0, float('-inf'), 0.0]])
+        seq_lens = torch.tensor([4], dtype=torch.int32)
+        out = dk._stable_topk_indices(scores, seq_lens, topk_k=3)
+        assert torch.equal(out, torch.tensor([[1, 3, -1]], dtype=torch.int32))
+
+    def test_row_slabs_match_one_sort(self, monkeypatch):
+        scores = torch.relu(torch.randn(7, 12, generator=torch.Generator().manual_seed(0)))
+        seq_lens = torch.tensor([12, 5, 0, 12, 9, 1, 12], dtype=torch.int32)
+        whole = dk._stable_topk_indices(scores, seq_lens, topk_k=4)
+        monkeypatch.setattr(dk, "_STABLE_TOPK_SORT_BYTES", 1)
+        assert torch.equal(dk._stable_topk_indices(scores, seq_lens, topk_k=4), whole)

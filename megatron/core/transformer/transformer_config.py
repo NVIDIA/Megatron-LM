@@ -15,8 +15,10 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    PACKED_DSA_CP_CUDA_GRAPH_WARNING,
     cuda_graph_captures_attention,
     get_deprecated_cuda_graph_modules_migration,
+    is_packed_dsa_cp_cuda_graph_experimental,
     is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -87,6 +89,14 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_loss_type: str = "cross_entropy"
+    """Training objective for Multi-Token Prediction (MTP) heads.
+
+    Supported values are ``cross_entropy`` and ``e2e_tv``. The end-to-end total
+    variation objective directly optimizes the normalized expected acceptance
+    length under rejection-sampling verification.
+    """
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
@@ -154,6 +164,16 @@ class TransformerConfig(ModelParallelConfig):
     decide the best backend to run (except in the case of local).
     If attention backend is local we use the local pytorch implementation in mcore.
     Users can specify exact backend by changing this config. """
+
+    flash_attention_version: Optional[Literal[2, 3, 4]] = None
+    """Pin the FlashAttention generation (2, 3, or 4) used by both the training
+    (TransformerEngine) and inference (mcore dynamic-batching) attention paths. When
+    None, each path selects a version automatically based on what is installed. Pinning
+    is required for batch-invariant mode: the training-side logprob recompute and the
+    inference engine must run the same kernel, since different FlashAttention
+    generations use different tile sizes and softmax accumulation orders and therefore
+    differ bitwise. On the training side this is enforced via TransformerEngine's
+    NVTE_FLASH_ATTN_V2/V3/V4 selection environment variables."""
 
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
@@ -1169,11 +1189,11 @@ class TransformerConfig(ModelParallelConfig):
     later); the dispatcher asserts this. On older GPUs leave it False (dynamic shape). Defaults to
     False (narrow to the received tokens)."""
 
-    moe_ncclep_use_symm_mem: bool = False
+    moe_ncclep_zero_copy: bool = False
     """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
     (ep_bootstrap zero_copy + symm-mem-backed receive/combine buffers) instead of the default HBM
-    staged-copy path. NOT SUPPORTED YET -- the dispatcher rejects this if set; the cross-stream
-    reuse ordering for the persistent symm-mem buffer is not implemented. Leave False."""
+    staged-copy path, saving one copy on the wire. Requires moe_ncclep_static_shape and the fused op
+    (use_transformer_engine_op_fuser). Defaults to False."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
@@ -1238,7 +1258,9 @@ class TransformerConfig(ModelParallelConfig):
     more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
 
     cuda_graph_warmup_steps: int = 3
-    """Number of warmup steps for CUDA graphs"""
+    """Number of warmup steps for CUDA graphs. Note: GTP (``gtp_weight_remat_size > 1``) forces a
+    minimum of 2 per-graph warmup steps regardless of this value, because the first warmup builds
+    the weight-prefetch chain and the second exercises the prefetch path before capture."""
 
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
@@ -1402,6 +1424,12 @@ class TransformerConfig(ModelParallelConfig):
     group is outside the attention graph either way and is unaffected. The split additionally
     constrains the configuration (see ``__post_init__``), which is why it is opt-in rather than
     implied by ``recompute_modules=[mhc]``.
+
+    Supported for GPT mHC layers and HybridStack attention-only mHC wrappers. Other HybridStack
+    layer families remain eager with the attention-only graph scope. ``mla_up_proj`` may also
+    be included in ``recompute_modules``; its checkpoint stays inside the attention consumer,
+    independently of the eager mHC recompute group. Packed (THD) sequences use the same
+    fixed-capacity sequence metadata inputs as ordinary attention CUDA graphs.
     """
 
     ####################
@@ -1623,12 +1651,31 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        # Dynamic CP can assign a multi-rank group even when configured CP is one.
+        has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 
         # Imported lazily because the module-spec module imports TransformerConfig.
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             is_gated_delta_net_variant,
             normalize_experimental_attention_variant,
         )
+
+        if self.mtp_loss_type not in ("cross_entropy", "e2e_tv"):
+            raise ValueError(
+                "mtp_loss_type must be one of 'cross_entropy' or 'e2e_tv', "
+                f"got {self.mtp_loss_type!r}."
+            )
+        if self.mtp_loss_type == "e2e_tv":
+            if not self.mtp_detach_heads:
+                warnings.warn(
+                    "mtp_loss_type='e2e_tv' requires detached MTP inputs "
+                    "and shared output weights; "
+                    "setting mtp_detach_heads=True automatically to prevent MTP loss "
+                    "gradients from flowing into the main model.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.mtp_detach_heads = True
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
@@ -1771,7 +1818,7 @@ class TransformerConfig(ModelParallelConfig):
                     "follow-up change."
                 )
 
-        if self.context_parallel_size > 1:
+        if has_context_parallelism:
             if self.cp_partition_mode == "contiguous":
                 if (
                     self.multi_latent_attention
@@ -1946,7 +1993,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
             )
             if (
-                self.experimental_attention_variant == "kda" or self.context_parallel_size > 1
+                self.experimental_attention_variant == "kda" or has_context_parallelism
             ) and self.linear_cp_mode not in ("headwise", "chunkwise"):
                 raise ValueError(
                     f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
@@ -1958,11 +2005,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"got {self.gdn_conv_pad_alignment}."
                 )
 
-            if self.context_parallel_size > 1:
+            if has_context_parallelism:
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
-                        "linear_cp_mode='chunkwise' when context_parallel_size > 1. "
+                        "linear_cp_mode='chunkwise' with context parallelism. "
                         "Padding chunk-local GDN causal-conv inputs can change later "
                         "chunk numerics."
                     )
@@ -1995,7 +2042,7 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
-            if self.context_parallel_size > 1:
+            if has_context_parallelism:
                 cp_comm_types = (
                     self.cp_comm_type
                     if isinstance(self.cp_comm_type, list)
@@ -2483,8 +2530,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
             if self.moe_shared_expert_intermediate_size is None:
                 raise ValueError("MOK requires a shared expert")
-            if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
-                raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
+            if self.moe_shared_expert_overlap:
+                raise ValueError("MOK does not support MCore shared-expert overlap")
             if self.moe_latent_size is not None:
                 raise ValueError("MOK does not support latent MoE")
             if self.recompute_modules and "shared_experts" in self.recompute_modules:
@@ -2978,9 +3025,14 @@ class TransformerConfig(ModelParallelConfig):
                 self.virtual_pipeline_model_parallel_size = detected_vpp_size
 
             # Check whether the layout is valid.
+            mtp_was_standalone = self.mtp_standalone
             self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
                 num_layers=self.num_layers, mtp_num_layers=self.mtp_num_layers
             )
+            if self.mtp_standalone and not mtp_was_standalone:
+                # The base config cannot see layout-derived standalone MTP. Warn once when this
+                # post-layout transition makes the fixed-shape flag a no-op.
+                self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
 
         # Uneven PP
         elif (
@@ -3662,12 +3714,10 @@ class TransformerConfig(ModelParallelConfig):
         if (
             use_mhc_recompute
             and not self.mhc_recompute_attn_cuda_graph_split
-            and not self.is_hybrid_model  # hybrid cannot take the switch this
-            # message recommends (rejected above); hybrid_block emits its own
-            # capture-scope warning instead
+            and not self.is_hybrid_model  # hybrid_block emits its own capture-scope warning
             and self.cuda_graph_impl == "transformer_engine"
             and list(self.cuda_graph_modules or []) == [CudaGraphModule.attn]
-            and list(self.recompute_modules) == ["mhc"]
+            and set(self.recompute_modules) <= {"mhc", "mla_up_proj"}
         ):
             # Exactly the shape that ran the #5841 split implicitly: such configs
             # hit this branch when they omit the new switch, and whole-attention
@@ -3675,18 +3725,14 @@ class TransformerConfig(ModelParallelConfig):
             # captured (its checkpoint no longer pays) and the static hidden input
             # grows from [s, b, C] to [s, b, n*C]. Say so once at config time,
             # since the alternative is a silent memory regression relative to the
-            # split. Deliberately narrow: broader attn-containing shapes (extra
-            # graph scopes, extra recompute modules) never ran the split, and the
-            # switch this message recommends is rejected for them.
+            # split. Only recommend the switch for supported recompute modules.
             warnings.warn(
                 "mHC recompute with an attn-scope Transformer Engine CUDA Graph is "
                 "capturing the whole attention range: the captured mHC producer's "
                 "checkpoint is not recovered and the static graph input is "
                 "[s, b, n*C]. Set mhc_recompute_attn_cuda_graph_split=True for the "
                 "attention-only split, which keeps the producer eager and shrinks "
-                "the captured input to [s, b, C]. (The split's replay does not yet "
-                "forward THD captured kwargs; on packed sequences keep the switch "
-                "off.)",
+                "the captured input to [s, b, C].",
                 UserWarning,
                 stacklevel=2,
             )
@@ -3706,16 +3752,6 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if use_mhc_recompute and self.mhc_recompute_attn_cuda_graph_split:
-            if self.is_hybrid_model:
-                raise ValueError(
-                    "mhc_recompute_attn_cuda_graph_split is not implemented for "
-                    "HybridStack mHC layers: HyperConnectionHybridLayer always "
-                    "captures the whole wrapper (mHC aggregate included) with an "
-                    "[s, b, n*C] static input and has no attention-consumer split "
-                    "path, so the switch would silently change nothing while the "
-                    "config claims the split is on. Keep the switch off for "
-                    "hybrid models."
-                )
             if self.cuda_graph_impl != "transformer_engine":
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "
@@ -3723,25 +3759,17 @@ class TransformerConfig(ModelParallelConfig):
                     f"{self.cuda_graph_impl!r}: the split is a Transformer Engine "
                     "per-layer capture."
                 )
-            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or set(
                 self.recompute_modules
-            ) != ["mhc"]:
+            ) - {"mhc", "mla_up_proj"}:
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "
-                    "cuda_graph_modules=[attn] with recompute_modules=[mhc]: the split "
+                    "cuda_graph_modules=[attn] with recompute_modules=[mhc] or "
+                    "[mhc, mla_up_proj]: the split "
                     "captures input-layernorm plus self-attention only, so the eager mHC "
                     "producer stays outside the captured consumer. Clear "
                     "mhc_recompute_attn_cuda_graph_split to capture the whole attention "
                     "range instead."
-                )
-            if self.sequence_packing_scheduler is not None:
-                raise ValueError(
-                    "mhc_recompute_attn_cuda_graph_split does not support packed "
-                    "(THD) sequences: THD capture takes cu_seqlens_*/padding_mask "
-                    "as captured kwargs and the split's replay does not forward "
-                    "them, so the first replay fails at the Transformer Engine "
-                    "boundary. Keep the switch off on packed-sequence runs to "
-                    "capture the whole attention range instead."
                 )
             if self.fine_grained_activation_offloading:
                 # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
@@ -3840,6 +3868,15 @@ class TransformerConfig(ModelParallelConfig):
                 "sequence_packing_scheduler='dp_balanced'. Use those settings, disable "
                 "attention capture, or disable pipeline parallelism."
             )
+
+        if is_packed_dsa_cp_cuda_graph_experimental(
+            experimental_attention_variant=self.experimental_attention_variant,
+            sequence_packing_scheduler=self.sequence_packing_scheduler,
+            dynamic_context_parallel=self.dynamic_context_parallel,
+            context_parallel_size=self.context_parallel_size,
+            cuda_graph_impl=self.cuda_graph_impl,
+        ):
+            warnings.warn(PACKED_DSA_CP_CUDA_GRAPH_WARNING, stacklevel=2)
 
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
@@ -3998,6 +4035,27 @@ class TransformerConfig(ModelParallelConfig):
                             "moe_input_jitter_eps is not supported with graphed moe recomputation."
                         )
 
+                    if (
+                        self.gtp_weight_remat_size > 1
+                        and self.cuda_graph_impl == "local"
+                        and (self.fp8 is not None or self.fp4 is not None)
+                        and self.moe_shared_expert_intermediate_size is not None
+                        and not self.moe_shared_expert_overlap
+                        and (
+                            full_cudagraph
+                            or CudaGraphModule.moe in self.cuda_graph_modules
+                            or CudaGraphModule.moe_router in self.cuda_graph_modules
+                        )
+                    ):
+                        assert "shared_experts" not in self.recompute_modules, (
+                            "GTP + local CUDA graphs that capture shared_experts "
+                            "(moe_router/moe scope) cannot recompute it under fp8/fp4: "
+                            "te_checkpoint requires .backward(), but the local fwd-graph "
+                            "warmup uses .grad(). Drop 'shared_experts' from "
+                            "--recompute-modules (GTP-shard + offload instead), or use "
+                            "--cuda-graph-impl full_iteration."
+                        )
+
             if self.fine_grained_activation_offloading:
                 offload_modules = set(self.offload_modules or [])
                 if self.cuda_graph_impl == "local":
@@ -4152,9 +4210,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_shared_expert_overlap
             ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.mtp_num_layers is None or self.mtp_num_layers == 1
-            ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            assert self.mtp_num_layers in (
+                None,
+                0,
+                1,
+            ), 'MTP supports at most one layer when enabling overlap_moe_expert_parallel_comm.'
 
             # NCCL EP (ncclep flex backend) mirrors hybridep's comm/compute overlap, but a few
             # configs are not yet safe under the 1F1B split and are gated here.
@@ -4226,7 +4286,21 @@ class TransformerConfig(ModelParallelConfig):
                 'ep_overlap_early_attn_memory_release'
             )
 
-        if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+        if self.ep_overlap_use_scheduled_tensor_release:
+            if self.moe_ncclep_zero_copy:
+                # NCCL-EP zero-copy routes persistent symmetric-memory buffers through the 1F1B
+                # schedule nodes. Scheduled release would take ownership of those shared buffers
+                # and empty their storage, bypassing ScheduleNode's symmetric-memory exemption.
+                raise ValueError(
+                    'moe_ncclep_zero_copy is not supported with '
+                    'ep_overlap_use_scheduled_tensor_release'
+                )
+            assert self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be enabled when enabling '
+                'ep_overlap_use_scheduled_tensor_release'
+            )
+
+        if has_context_parallelism and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (
                     f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal to "
@@ -4295,7 +4369,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.fallback_to_eager_attn or self.transformer_impl == "local":
-            if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+            if has_context_parallelism and self.cp_comm_type is not None:
                 all_cp_comm_types_are_all_gather = (
                     all(item == "all_gather" for item in self.cp_comm_type)
                     if isinstance(self.cp_comm_type, list)
@@ -4329,10 +4403,33 @@ class TransformerConfig(ModelParallelConfig):
                 "for inference_optimized transformer implementation."
             )
 
+        if self.flash_attention_version is not None:
+            assert self.flash_attention_version in (2, 3, 4), (
+                "flash_attention_version must be one of 2, 3, or 4, got "
+                f"{self.flash_attention_version}"
+            )
+
         if self.batch_invariant_mode:
             assert (
                 self.attention_backend == AttnBackend.flash
-            ), "Batch invariant mode only supports FlashAttention"
+            ), "Batch invariant mode only supports FlashAttention (--attention-backend flash)"
+            # The training (TransformerEngine) and inference attention paths must run
+            # the same FlashAttention kernel, so the version cannot be left to each
+            # path's autodetection. FlashAttention-2 is excluded because it does not
+            # expose the fixed num_splits schedule the batch-invariant kernels require.
+            assert self.flash_attention_version in (3, 4), (
+                "Batch invariant mode requires --flash-attention-version 3 or 4 so the "
+                "training and inference attention paths run the same batch-invariant "
+                f"FlashAttention kernel (got {self.flash_attention_version})."
+            )
+            # Context parallelism routes through TE's FA2 fwd/bwd kernels directly, which
+            # cannot be pinned to another version; dropout is not batch-invariant.
+            assert (
+                self.context_parallel_size == 1
+            ), "Batch invariant mode does not support context parallelism"
+            assert (
+                self.attention_dropout == 0.0
+            ), "Batch invariant mode does not support attention dropout"
 
         if self.cuda_graph_impl != "none" and (
             self.sequence_packing_scheduler is not None or self.dynamic_context_parallel

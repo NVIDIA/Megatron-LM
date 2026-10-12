@@ -373,6 +373,75 @@ def test_sanitize_indexer_topk_matches_native():
     assert torch.equal(actual[1], expected[1])
 
 
+def _compiled_triton_variants(kernel) -> int:
+    """Count in-memory compiled variants of a ``triton.jit`` function."""
+    return sum(len(entry[0]) for entry in kernel.device_caches.values())
+
+
+def _reset_triton_kernels(*kernels):
+    for kernel in kernels:
+        kernel.device_caches.clear()
+
+
+def _cu_seqlens_from_lengths(lengths):
+    cumulative = [0]
+    for length in lengths:
+        cumulative.append(cumulative[-1] + length)
+    return torch.tensor(cumulative, dtype=torch.int32, device="cuda")
+
+
+# Distinct packed geometries at ratio 4. Avoid 1 and multiples of 16 so Triton
+# divisibility specialization cannot collapse keys and hide a regression.
+_JIT_SEGMENT_LAYOUTS = ([68, 36], [52, 52, 20], [100, 44, 36, 20])
+_JIT_RATIO = 4
+
+
+def test_build_seq_lens_compiles_once_across_packed_geometries():
+    """Packed segment count must not enter the Triton JIT key."""
+    _require_triton_cuda()
+    kernel = thd_indexer_kernels._dsv4_thd_build_seq_lens_kernel
+    _reset_triton_kernels(kernel)
+
+    for lengths in _JIT_SEGMENT_LAYOUTS:
+        cu_seqlens_q = _cu_seqlens_from_lengths(lengths)
+        cu_seqlens_kv = _cu_seqlens_from_lengths([length // _JIT_RATIO for length in lengths])
+        total_q = sum(lengths)
+
+        seq_lens = thd_indexer_kernels.build_seq_lens(
+            cu_seqlens_q, cu_seqlens_kv, total_q, _JIT_RATIO
+        )
+        expected = thd_indexer_kernels._build_seq_lens_fallback(
+            cu_seqlens_q, cu_seqlens_kv, total_q, _JIT_RATIO, None
+        )
+        assert torch.equal(seq_lens, expected)
+
+    assert _compiled_triton_variants(kernel) == 1
+
+
+def test_sanitize_topk_compiles_once_across_score_widths():
+    """Per-microbatch score/candidate widths must stay off the Triton JIT key."""
+    _require_triton_cuda()
+    kernel = thd_indexer_kernels._dsv4_thd_sanitize_topk_kernel
+    _reset_triton_kernels(kernel)
+
+    # Widths share a power-of-two bucket so ``BLOCK_TOPK`` stays fixed.
+    for rows, width, score_width in ((104, 33, 50), (124, 37, 54), (200, 41, 58)):
+        candidates = torch.randint(
+            -1, score_width + 4, (rows, width), dtype=torch.int32, device="cuda"
+        )
+        scores = torch.randn(rows, score_width, dtype=torch.float32, device="cuda")
+        seq_lens = torch.randint(0, score_width, (rows,), dtype=torch.int32, device="cuda")
+
+        sanitized, topk_length = thd_indexer_kernels.sanitize_topk(candidates, scores, seq_lens)
+        expected_sanitized, expected_length = thd_indexer_kernels._sanitize_topk_fallback(
+            candidates, scores, seq_lens
+        )
+        assert torch.equal(sanitized, expected_sanitized)
+        assert torch.equal(topk_length, expected_length)
+
+    assert _compiled_triton_variants(kernel) == 1
+
+
 def test_compressor_input_compact_matches_native_forward_backward():
     _require_cute_cuda()
     cu = _make_e2e_like_cu_seqlens()
@@ -421,6 +490,101 @@ def test_compressor_input_compact_matches_native_forward_backward():
         assert torch.equal(actual, expected)
     assert torch.equal(hidden.grad, ref_hidden_grad)
     assert torch.equal(boundary.grad, ref_boundary_grad)
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("rank", [0, 1, 3])
+@pytest.mark.parametrize(
+    "width,dtype", [(7, torch.float32), (7, torch.bfloat16), (256, torch.bfloat16)]
+)
+def test_projected_compressor_layout_matches_hidden_compaction(ratio, rank, width, dtype):
+    """The reused maps preserve exact payload bits and zero every unused gradient row."""
+    _require_cute_cuda()
+    cu = _make_e2e_like_cu_seqlens()
+    local_rows = 1024
+    start = rank * local_rows
+    boundary_rows = 128
+    values = [
+        torch.randn(rows, 1, width, dtype=dtype, device="cuda", requires_grad=True)
+        for rows in (local_rows, local_rows, boundary_rows, boundary_rows)
+    ]
+    local_kv, local_score, boundary_kv, boundary_score = values
+    reference = [
+        prepare_cp_compressor_input(local, boundary, cu, start, _E2E_CP_SIZE, ratio)
+        for local, boundary in ((local_kv, boundary_kv), (local_score, boundary_score))
+    ]
+    layout = thd_layout_kernels.build_cp_compressor_layout(
+        cu, start, local_rows, _E2E_CP_SIZE, ratio
+    )
+    for actual, expected in zip(layout[2:8], reference[0][1:]):
+        assert torch.equal(actual, expected)
+    actual = thd_layout_kernels.CompressorProjectionCompact.apply(
+        local_kv,
+        local_score,
+        boundary_kv[-layout.boundary_rows :],
+        boundary_score[-layout.boundary_rows :],
+        layout,
+    )
+    for output, ref in zip(actual, reference):
+        assert torch.equal(output, ref[0])
+    grads = [torch.randn_like(output) for output in actual]
+    expected_grads = torch.autograd.grad([ref[0] for ref in reference], values, grads)
+    actual_grads = torch.autograd.grad(actual, values, grads)
+    for result, expected in zip(actual_grads, expected_grads):
+        assert torch.equal(result, expected)
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_projected_compressor_graph_replay_updates_maps_and_backward(ratio):
+    """Pack contents change under capture without stale maps or unwritten gradients."""
+    _require_cute_cuda()
+    local_rows, width, cp_size = 1024, 128, 4
+    cu = _make_e2e_like_cu_seqlens()
+    boundary_rows = 8 if ratio == 4 else ratio
+    values = [
+        torch.randn(rows, 1, width, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        for rows in (local_rows, local_rows, boundary_rows, boundary_rows)
+    ]
+
+    def run():
+        layout = thd_layout_kernels.build_cp_compressor_layout(
+            cu, local_rows, local_rows, cp_size, ratio
+        )
+        outputs = thd_layout_kernels.CompressorProjectionCompact.apply(*values, layout)
+        # Consume only KV to exercise the unused score gradient as well.
+        grads = torch.autograd.grad(outputs[0].sum(), values)
+        return layout, outputs, grads
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_layout, captured_outputs, captured_grads = run()
+
+    for lengths in (
+        _E2E_RAGGED_PADDED_SEG_LENS,
+        (3, 9, 130, 129, 7, 2001, 256, 127, 65, 10, 511, 848),
+        # No complete compression groups in this rank, with fixed tensor shapes.
+        (1024,) + (0,) * 11,
+        (4096,) + (0,) * 11,
+    ):
+        assert sum(lengths) <= cp_size * local_rows
+        cu.copy_(torch.tensor([0] + list(torch.tensor(lengths).cumsum(0)), device="cuda"))
+        with torch.no_grad():
+            for value in values:
+                value.normal_()
+        expected_layout, expected_outputs, expected_grads = run()
+        graph.replay()
+        for actual, expected in zip(captured_layout[:8], expected_layout[:8]):
+            assert torch.equal(actual, expected)
+        for actual, expected in zip(
+            captured_outputs + captured_grads, expected_outputs + expected_grads
+        ):
+            assert torch.equal(actual, expected)
 
 
 def test_build_attention_indices_matches_native():
@@ -499,6 +663,47 @@ def test_build_attention_indices_matches_native():
         padded[0][8:10], torch.tensor([[0, -1], [0, -1]], dtype=torch.int32, device="cuda")
     )
     assert torch.equal(padded[1][8:10], torch.tensor([1, 1], dtype=torch.int32, device="cuda"))
+
+
+def test_attention_indices_cache_reuses_shapes_and_separates_broadcasts(monkeypatch):
+    _require_cute_cuda()
+    monkeypatch.setattr(thd_layout_kernels, "_COMPILED_LAUNCH_CACHE", {})
+    compile_calls = []
+    original_compile = thd_layout_kernels.cute.compile
+
+    def record_compile(*args, **kwargs):
+        compile_calls.append(args[0])
+        return original_compile(*args, **kwargs)
+
+    monkeypatch.setattr(thd_layout_kernels.cute, "compile", record_compile)
+    for lengths, width in [([32, 32], 8), ([16, 32, 48], 12), ([64, 64], 16)]:
+        cu = torch.tensor(
+            [0] + torch.tensor(lengths).cumsum(0).tolist(), dtype=torch.int32, device="cuda"
+        )
+        cu_comp = _compressed_cu_seqlens(cu, 4)
+        mapping = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda")
+        rows = sum(lengths)
+        expanded = torch.arange(width, dtype=torch.int32, device="cuda").expand(rows, -1)
+        for logical_ids in (expanded, expanded.contiguous()):
+            actual = thd_layout_kernels.build_attention_indices(
+                cu,
+                0,
+                rows,
+                0,
+                16,
+                4,
+                width,
+                logical_ids,
+                cu_seqlens_compressed=cu_comp,
+                seq_to_rank_row=mapping,
+                compressed_rows=mapping.numel(),
+            )
+            expected = _native_attention_indices(
+                cu, cu_comp, 0, rows, 0, 16, 4, width, mapping, rows, logical_ids
+            )
+            assert torch.equal(actual[0], expected[0])
+            assert torch.equal(actual[1], expected[1])
+        assert len(compile_calls) == 2
 
 
 def test_build_attention_indices_writes_aligned_width():

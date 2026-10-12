@@ -121,6 +121,8 @@ def test_native_cp_custom_transformer_config_is_not_inferred(native_cp_args):
         ("cp_comm_type", "all_gather"),
         ("cp_comm_type", ["p2p", "all_gather"]),
         ("max_seqlen_per_dp_cp_rank", None),
+        ("gtp_weight_remat_size", 2),
+        ("expert_gtp_weight_remat_size", 2),
     ],
 )
 def test_native_cp_unsupported_attention_uses_legacy(native_cp_args, field, value):

@@ -21,7 +21,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup, make_weakref
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import (
     AttnMaskType,
     CudaGraphModule,
@@ -371,7 +371,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         attention_optional_kwargs = {}
-        if config.context_parallel_size > 1 and config.cp_comm_type is not None:
+        if (
+            config.context_parallel_size > 1 or config.dynamic_context_parallel
+        ) and config.cp_comm_type is not None:
             if isinstance(config.cp_comm_type, list):
                 # layer_number is 1-indexed, so we need to subtract 1 to get the correct index
                 attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[
@@ -1281,6 +1283,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
         )
+        # Linear-attention variants (e.g. GatedDeltaNet) sit in the self_attention slot but
+        # accept `attention_mask` only for signature compatibility and never read it, and
+        # they have no `attn_mask_type`. Building a mask for them costs a persistent
+        # [mbs, 1, slen, seq] buffer that is discarded, and probing attn_mask_type raises
+        # AttributeError. Note this must not fold into attn_in_graph: those layers still
+        # need the THD cu_seqlens static inputs below. Defaults to True so third-party
+        # attention modules keep the softmax-attention behaviour.
+        attn_uses_mask = getattr(self.self_attention, "uses_attention_mask", True)
 
         if self._is_thd_cuda_graph():
             if attn_in_graph:
@@ -1313,7 +1323,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             static_inputs["padding_mask"] = torch.zeros(
                 1, slen_for_mask, dtype=torch.bool, device=device
             )
-        elif attn_in_graph:
+        elif attn_in_graph and attn_uses_mask:
             if not self.config.create_attention_mask_in_dataloader:
                 if self.self_attention.attn_mask_type not in (
                     AttnMaskType.causal,
@@ -1822,7 +1832,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # If the dataloader never creates masks, the TE CUDA graph was captured without
                 # this kwarg. Preserve that signature instead of allocating a synthetic
                 # [local_seq, global_seq] zero mask.
-                if not self.config.create_attention_mask_in_dataloader:
+                if self._is_thd_cuda_graph() or not self.config.create_attention_mask_in_dataloader:
+                    # THD captures sequence boundaries instead of a dense mask, regardless
+                    # of the dataloader setting. Do not allocate an unused quadratic mask.
                     cudagraph_kwargs.pop("attention_mask")
                 else:
                     # The graph was captured with an attention_mask tensor, so replay needs a
@@ -2265,16 +2277,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             return super()._te_cuda_graph_capture(*args, **kwargs)
 
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
-        # Backstop for packed inputs the config gate cannot see (the gate keys
-        # on sequence_packing_scheduler): fail with a clear message instead of
-        # the TE TypeError a replay with missing captured kwargs would raise.
-        if kwargs.get("packed_seq_params") is not None:
-            raise NotImplementedError(
-                "mhc_recompute_attn_cuda_graph_split does not support packed "
-                "(THD) sequences: the split's replay does not forward the THD "
-                "captured kwargs (cu_seqlens_*, padding_mask). Disable the "
-                "switch to capture the whole attention range instead."
-            )
         return self._forward_mhc_attention_cuda_graph_consumer(*args, **kwargs)
 
     def _forward_mhc_attention_post_cuda_graph(
@@ -2623,6 +2625,27 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return output
 
+    def _te_cuda_graph_replay(self, *args, **kwargs):
+        """Keep packed metadata intact for the split's eager continuation.
+
+        The parent decomposes PackedSeqParams before dispatching replay. The split instead
+        decomposes a separate copy for the attention graph, retaining the original object
+        (including CP route metadata) for the eager MLP. Preserve the parent's offload lifecycle.
+        """
+        if not self._uses_mhc_recompute_attn_cuda_graph_split():
+            return super()._te_cuda_graph_replay(*args, **kwargs)
+        assert (
+            kwargs.get("inference_context") is None
+        ), "mHC attention-only TE CUDA Graphs do not support inference_context"
+        if self.config.delay_offload_until_cuda_graph:
+            self.off_interface.enter_replay()
+        try:
+            return self._te_cuda_graph_replay_impl(args, kwargs, None)
+        finally:
+            self._te_cuda_graph_route_replay_state = None
+            if self.config.delay_offload_until_cuda_graph:
+                self.off_interface.exit_replay()
+
     def _replay_mhc_attention_consumer(self, args, kwargs, context):
         """Eager mHC aggregate -> captured attention replay -> eager post-BDA.
 
@@ -2646,6 +2669,34 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         else:
             hidden_states = kwargs.pop("hidden_states")
 
+        # Forward only the tensor arguments consumed by the captured attention
+        # callable. Include unused static kwargs such as padding_mask: TE requires
+        # every captured kwarg on replay. Keep the originals for the eager continuation.
+        graph_kwargs = {}
+        graph_tensor_kwargs = (
+            "rotary_pos_emb",
+            "rotary_pos_cos",
+            "rotary_pos_sin",
+            "rotary_pos_cos_sin",
+            "attention_bias",
+            "sequence_len_offset",
+            "padding_mask",
+            "input_ids",
+        )
+        if "attention_mask" in kwargs:
+            # TransformerLayer's replay-argument helper turns a None mask into
+            # the capture-compatible representation when necessary.
+            graph_kwargs["attention_mask"] = kwargs["attention_mask"]
+        for name in graph_tensor_kwargs:
+            value = kwargs.get(name)
+            if value is not None:
+                graph_kwargs[name] = value
+        if kwargs.get("packed_seq_params") is not None:
+            graph_kwargs["packed_seq_params"] = kwargs["packed_seq_params"]
+            self._decompose_packed_seq_params_to_kwargs(graph_kwargs)
+
+        # Decomposition also pins graph-dynamic CP route replay to its retained slot.
+        # Select the mHC direct-write buffer only after that slot has been resolved.
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
         output_slot = None
         if mhc_recompute_manager is not None:
@@ -2661,29 +2712,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
-
-        # Forward only the tensor arguments consumed by the captured attention
-        # callable.  Keep the original kwargs intact for the eager continuation.
-        graph_kwargs = {}
-        graph_tensor_kwargs = (
-            "rotary_pos_emb",
-            "rotary_pos_cos",
-            "rotary_pos_sin",
-            "rotary_pos_cos_sin",
-            "attention_bias",
-            "sequence_len_offset",
-        )
-        if "attention_mask" in kwargs:
-            # TransformerLayer's replay-argument helper turns a None mask into
-            # the capture-compatible representation when necessary.
-            graph_kwargs["attention_mask"] = kwargs["attention_mask"]
-        for name in graph_tensor_kwargs:
-            value = kwargs.get(name)
-            if value is not None:
-                graph_kwargs[name] = value
-        if kwargs.get("packed_seq_params") is not None:
-            graph_kwargs["packed_seq_params"] = kwargs["packed_seq_params"]
-            self._decompose_packed_seq_params_to_kwargs(graph_kwargs)
 
         cuda_graph_output = GraphableMegatronModule._te_cuda_graph_replay(
             self, aggregated, **graph_kwargs
@@ -2806,9 +2834,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay with hyper connection support.
 
-        Overrides the parent's _te_cuda_graph_replay_impl so that the
-        delay_offload_until_cuda_graph lifecycle (enter_replay/exit_replay) in
-        the parent's _te_cuda_graph_replay is preserved.
+        The caller owns the delay_offload_until_cuda_graph lifecycle
+        (enter_replay/exit_replay), including on the attention-only split path.
 
         During MoE partial CUDA graph capture, the graph outputs include HC state
         (mlp_hc_h_post, mlp_h_res) in addition to the base class outputs. This method
@@ -2999,7 +3026,7 @@ class MoETransformerLayer(TransformerLayer):
         self.is_moe_layer = True
         self.use_partial_cudagraphs = False
         self.moe_layer_recompute = False
-        self.token_dispatcher_attrs = {}
+        self._local_cudagraph_attr_names = None
 
         super().__init__(*args, **kwargs)
 
@@ -3091,10 +3118,23 @@ class MoETransformerLayer(TransformerLayer):
             obj = getattr(obj, parent_name)
         return obj, leaf_attr_name or attr_name
 
-    def _restore_token_dispatcher_attrs(self):
-        for attr_name, attr in self.token_dispatcher_attrs.items():
+    def _restore_token_dispatcher_attrs(self, attr_outputs):
+        assert len(attr_outputs) == len(self._local_cudagraph_attr_names)
+        for attr_name, attr in zip(self._local_cudagraph_attr_names, attr_outputs):
             obj, name = self._resolve_token_dispatcher_attr(attr_name)
             setattr(obj, name, attr)
+
+    def _get_token_dispatcher_attrs(self):
+        attr_names = []
+        token_dispatcher_attr_outputs = []
+        for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
+            obj, name = self._resolve_token_dispatcher_attr(attr_name)
+            attr = getattr(obj, name)
+            if torch.is_tensor(attr):
+                attr_names.append(attr_name)
+                token_dispatcher_attr_outputs.append(attr)
+
+        return tuple(attr_names), token_dispatcher_attr_outputs
 
     def _forward_mlp_router(
         self, hidden_states, padding_mask=None, input_ids=None, packed_seq_params=None
@@ -3122,7 +3162,7 @@ class MoETransformerLayer(TransformerLayer):
         if self.config.fp32_residual_connection:
             residual = residual.float()
 
-        router_outputs = apply_module(self.mlp)(
+        hidden_states, probs, shared_expert_output = apply_module(self.mlp)(
             pre_mlp_layernorm_output,
             intermediate_tensors=(),
             padding_mask=padding_mask,
@@ -3130,17 +3170,25 @@ class MoETransformerLayer(TransformerLayer):
             packed_seq_params=packed_seq_params,
         )
 
-        if is_graph_capturing() and not is_graph_warmup():
-            for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
-                obj, name = self._resolve_token_dispatcher_attr(attr_name)
-                attr = getattr(obj, name)
-                if torch.is_tensor(attr):
-                    attr.is_from_global_mempool = True
-                    self.token_dispatcher_attrs[attr_name] = attr
+        if self.use_partial_cudagraphs:
+            attr_names, token_dispatcher_attr_outputs = self._get_token_dispatcher_attrs()
+            if self._local_cudagraph_attr_names is None:
+                self._local_cudagraph_attr_names = attr_names
+            else:
+                assert attr_names == self._local_cudagraph_attr_names
+        else:
+            # For eager mode, no need to pass the token_dispatcher attributes
+            token_dispatcher_attr_outputs = []
 
-        return residual, *router_outputs
+        return (
+            residual,
+            hidden_states,
+            probs,
+            shared_expert_output,
+            *token_dispatcher_attr_outputs,
+        )
 
-    def _forward_mlp_expert_compute(self, hidden_states, probs):
+    def _forward_mlp_expert_compute(self, hidden_states, probs, token_dispatcher_attr_outputs):
         """
         Executes the actual computation of the experts.
 
@@ -3149,12 +3197,9 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
-        # During partial CUDA graph replay, use the probs returned from the graph in order
-        # to retain the router autograd edge. Rebinding it to the live router output ensures
-        # the backward DDP hook of router.weight is properly triggered.
-        if '_comm_manager.token_probs' in self.token_dispatcher_attrs:
-            self.token_dispatcher_attrs['_comm_manager.token_probs'] = probs
-        self._restore_token_dispatcher_attrs()
+        if self.use_partial_cudagraphs:
+            # Restore the token dispatcher attrs returned on the router graph's output surface.
+            self._restore_token_dispatcher_attrs(token_dispatcher_attr_outputs)
 
         self.mlp.fwd_execution_map = "expert_compute"
         return apply_module(self.mlp)(None, intermediate_tensors=(hidden_states, probs))
@@ -3171,16 +3216,7 @@ class MoETransformerLayer(TransformerLayer):
 
         self.mlp.fwd_execution_map = "postprocess"
         output = apply_module(self.mlp)(None, intermediate_tensors=(output, shared_expert_output))
-        out = self._forward_post_mlp((output, mlp_bias), residual)
-
-        if is_graph_capturing() and not is_graph_warmup():
-            for attr_name, attr in self.token_dispatcher_attrs.items():
-                weak_ref = make_weakref(attr, inplace=False)
-                self.token_dispatcher_attrs[attr_name] = weak_ref
-                obj, name = self._resolve_token_dispatcher_attr(attr_name)
-                setattr(obj, name, weak_ref)
-
-        return out
+        return self._forward_post_mlp((output, mlp_bias), residual)
 
     def _forward_mlp(
         self,
@@ -3211,21 +3247,30 @@ class MoETransformerLayer(TransformerLayer):
             input_ids=None,
             packed_seq_params=None,
         ):
-            residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
+            router_outputs = self._forward_mlp_router(
                 hidden_states,
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 packed_seq_params=packed_seq_params,
             )
+            (
+                residual,
+                hidden_states,
+                probs,
+                shared_expert_output,
+                *token_dispatcher_attr_outputs,
+            ) = router_outputs
 
             # After the router graph replays, the captured .copy_() operations that update
-            # self.token_dispatcher_attrs via `_maybe_dtoh_and_synchronize` are queued on the
-            # current stream but may not have completed. Record an event after the router
+            # the returned dispatcher tensors via `_maybe_dtoh_and_synchronize` are queued on
+            # the current stream but may not have completed. Record an event after the router
             # graph and wait on it, so we block only until the router's D2H copies complete.
             self._router_dtoh_event.record()
             self._router_dtoh_event.synchronize()
 
-            expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs)
+            expert_output, mlp_bias = self._forward_mlp_expert_compute(
+                hidden_states, probs, token_dispatcher_attr_outputs
+            )
             return self._forward_mlp_postprocess(
                 residual, expert_output, shared_expert_output, mlp_bias
             )

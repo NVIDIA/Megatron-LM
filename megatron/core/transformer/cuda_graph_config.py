@@ -59,6 +59,38 @@ def validate_moe_cuda_graph_support(config) -> None:
     )
 
 
+PACKED_DSA_CP_CUDA_GRAPH_WARNING = (
+    "CUDA graph capture for packed DSA with context parallelism is experimental and not "
+    "fully supported. Some capture paths may fail during warmup or replay; set "
+    "cuda_graph_impl='none' to use the supported eager path."
+)
+
+
+def is_packed_dsa_cp_cuda_graph_experimental(
+    *,
+    experimental_attention_variant: Optional[str],
+    sequence_packing_scheduler: Optional[str],
+    dynamic_context_parallel: bool,
+    context_parallel_size: int,
+    cuda_graph_impl: str,
+) -> bool:
+    """Whether packed DSA context parallelism is combined with CUDA graphs."""
+
+    static_packing = (
+        sequence_packing_scheduler == "dp_balanced"
+        and not dynamic_context_parallel
+        and context_parallel_size > 1
+    )
+    dynamic_packing = (
+        sequence_packing_scheduler == "default_dynamic_cp" and dynamic_context_parallel
+    )
+    return (
+        experimental_attention_variant == "dsa"
+        and cuda_graph_impl != "none"
+        and (static_packing or dynamic_packing)
+    )
+
+
 def cuda_graph_captures_attention(config) -> bool:
     """Return whether the normalized training graph scope includes attention."""
     impl = getattr(config, "cuda_graph_impl", "none")

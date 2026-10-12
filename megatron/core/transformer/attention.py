@@ -143,6 +143,52 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+@dataclass(frozen=True)
+class QKVLayout:
+    """Logical row layout for a packed attention projection weight.
+
+    ``projection_split_shapes`` describes the projection slices repeated in every group.
+    ``per_head_split_shapes`` describes the independently orthogonalizable head slices in the
+    same group. Standard fused QKV has one group per query group, while MLA up-projections have
+    one group per attention head. ``is_mla`` marks MLA-style up-projection layouts, which Muon
+    only splits when ``muon_split_mla_qkv`` is enabled.
+    """
+
+    num_groups: int
+    projection_split_shapes: tuple[int, ...]
+    per_head_split_shapes: tuple[int, ...]
+    is_mla: bool = False
+
+    @classmethod
+    def from_transformer_config(cls, config: TransformerConfig) -> 'QKVLayout':
+        """Build the fused QKV row layout described by a transformer config."""
+        assert config.num_query_groups is not None
+        assert config.kv_channels is not None
+        num_query_heads_per_group = config.num_attention_heads // config.num_query_groups
+        projection_split_shapes = [num_query_heads_per_group * config.kv_channels]
+        per_head_split_shapes = [config.kv_channels] * num_query_heads_per_group
+        if config.attention_output_gate:
+            projection_split_shapes.append(num_query_heads_per_group * config.kv_channels)
+            per_head_split_shapes += [config.kv_channels] * num_query_heads_per_group
+        projection_split_shapes += [config.kv_channels, config.kv_channels]
+        per_head_split_shapes += [config.kv_channels, config.kv_channels]
+        return cls(
+            num_groups=config.num_query_groups,
+            projection_split_shapes=tuple(projection_split_shapes),
+            per_head_split_shapes=tuple(per_head_split_shapes),
+        )
+
+    @classmethod
+    def from_splits(cls, num_groups: int, split_shapes: tuple[int, ...]) -> 'QKVLayout':
+        """Build an MLA-style layout whose projection slices repeat once per attention head."""
+        return cls(
+            num_groups=num_groups,
+            projection_split_shapes=split_shapes,
+            per_head_split_shapes=split_shapes,
+            is_mla=True,
+        )
+
+
 class LinearQkvInterface(Protocol):
     """Interface for linear_qkv modules."""
 
@@ -300,6 +346,14 @@ class Attention(MegatronModule, ABC):
     "cross attn" specializations.
     """
 
+    uses_attention_mask: bool = True
+    """Whether this module consumes the ``attention_mask`` argument and exposes
+    ``attn_mask_type``. Softmax attention does; linear-attention variants that occupy the
+    same ``self_attention`` slot (e.g. ``GatedDeltaNet``) do not, and set this to ``False``
+    so callers can skip building an attention mask they would only discard. Callers should
+    read it with ``getattr(module, "uses_attention_mask", True)`` so third-party attention
+    modules keep the softmax-attention behaviour by default."""
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -327,6 +381,7 @@ class Attention(MegatronModule, ABC):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
+        self.flash_attention_version = config.flash_attention_version
 
         # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
         # which is a pure function of the config and is reused on every forward
@@ -1076,6 +1131,29 @@ class Attention(MegatronModule, ABC):
         )
         return output_total, softmax_lse
 
+    def _resolve_flash_version(self) -> Tuple[bool, bool]:
+        """Resolve which FlashAttention generation this attention should run.
+
+        Honors ``config.flash_attention_version`` when pinned, otherwise falls back
+        to the auto preference order (FA4 > FA3 > FA2). Returns ``(use_fa4, use_fa3)``;
+        when both are False the FA2 kernel is used.
+        """
+        pinned = self.flash_attention_version
+        if pinned == 4:
+            assert (
+                HAVE_FA4
+            ), "flash_attention_version=4 requested but FlashAttention-4 is not installed"
+            return True, False
+        if pinned == 3:
+            assert (
+                HAVE_FA3
+            ), "flash_attention_version=3 requested but FlashAttention-3 is not installed"
+            return False, True
+        if pinned == 2:
+            return False, False
+        # Auto: prefer the newest available generation.
+        return HAVE_FA4, (HAVE_FA3 and not HAVE_FA4)
+
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -1134,6 +1212,8 @@ class Attention(MegatronModule, ABC):
         # the sink (off-by-one / learnable) softmax correction post-hoc.
         need_lse = softmax_offset is not None
 
+        use_fa4, use_fa3 = self._resolve_flash_version()
+
         # Flash attn kernel.
         if not is_decode_only:
             q = q.squeeze(1)
@@ -1141,7 +1221,7 @@ class Attention(MegatronModule, ABC):
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            if HAVE_FA4:
+            if use_fa4:
                 output_total, softmax_lse = flash_attn4_varlen_func(
                     q,
                     k,
@@ -1156,7 +1236,7 @@ class Attention(MegatronModule, ABC):
                     window_size=window_size,
                     num_splits=0 if not self.batch_invariant_mode else 1,
                 )
-            elif HAVE_FA3:
+            elif use_fa3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
                 fa3_ret = self._flash_attention_3_forward_wrapper(
@@ -1257,7 +1337,7 @@ class Attention(MegatronModule, ABC):
                         output_total, softmax_lse, softmax_offset
                     )
             else:
-                if HAVE_FA4:
+                if use_fa4:
                     if getattr(self, "softmax_scale", None) is not None:
                         softmax_scale = self.softmax_scale
                     else:
@@ -1300,12 +1380,12 @@ class Attention(MegatronModule, ABC):
                         "softmax_scale": softmax_scale,
                         "causal": True,
                         "window_size": window_size,
-                        "page_table" if HAVE_FA3 else "block_table": block_table,
+                        "page_table" if use_fa3 else "block_table": block_table,
                         "num_splits": 0 if not self.batch_invariant_mode else 1,
                     }
                     if need_lse:
                         flash_attn_args["return_softmax_lse"] = True
-                    if HAVE_FA3:
+                    if use_fa3:
                         kvcache_ret = flash_attn3_with_kvcache(**flash_attn_args)
                     else:
                         assert (
@@ -1831,6 +1911,11 @@ class SelfAttention(Attention):
             tp_group=self.pg_collection.tp,
             name=(name + ".linear_qkv") if name is not None else None,
         )
+        if not self.config.head_wise_attn_gate:
+            # head_wise_attn_gate appends one gate scalar row per head, which the
+            # grouped QKV layout cannot describe; leave the weight unannotated so
+            # Muon QKV splitting keeps treating it as a whole matrix.
+            self.linear_qkv.weight.qkv_layout = QKVLayout.from_transformer_config(self.config)
 
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.

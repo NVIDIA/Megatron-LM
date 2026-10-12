@@ -178,3 +178,8 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_async_sched]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]

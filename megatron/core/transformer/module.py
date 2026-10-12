@@ -555,7 +555,14 @@ class GraphableMegatronModule(MegatronModule):
             raise RuntimeError("TE CUDA Graph static hidden inputs have not been attached")
 
         if microbatch_idx is None:
-            microbatch_idx = getattr(self, 'current_microbatch', 0)
+            # Match replay's retained slot when a checkpointed packed invocation is
+            # revisited after current_microbatch has advanced.
+            replay_state = getattr(self, "_te_cuda_graph_route_replay_state", None)
+            microbatch_idx = (
+                replay_state[0]
+                if replay_state is not None
+                else getattr(self, 'current_microbatch', 0)
+            )
         graph_index = microbatch_idx % len(self._te_cuda_graph_static_hidden_inputs)
         tensor = self._te_cuda_graph_static_hidden_inputs[graph_index]
         expected_ptr = self._te_cuda_graph_static_hidden_input_ptrs[graph_index]
