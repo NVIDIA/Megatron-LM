@@ -1,53 +1,24 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import asyncio
-import functools
-import time
-import traceback
-from typing import Callable, Coroutine
+"""Megatron RL utilities with independently importable packing primitives.
 
-from pydantic import BaseModel, ConfigDict, Field
-from typing_extensions import Self, Type
+Packing modules do not load Pydantic generation APIs or the model runtime.
+Historical generation request types remain available here on first access.
+"""
 
+from typing import TYPE_CHECKING
 
-class TypeLookupable(BaseModel, extra='allow'):
-    """Supports 'unwrapping' of base class into subclasses."""
+if TYPE_CHECKING:
+    from megatron.rl.generation_api import GenericGenerationArgs, Request, TypeLookupable
 
-    type_name: str = Field('Null', frozen=True)
-
-    def unwrap(self) -> Self:
-        """Turn instance of base class into registered subclass."""
-        return type(self).Library.type_names[self.type_name](**self.model_dump())
-
-    @classmethod
-    def register_subclass(cls, register_type: Type[Self]) -> Type[Self]:
-        """Register subclass for unwrapping."""
-        if 'Library' not in cls.__dict__:
-
-            class Library:
-                type_names = {}
-
-            cls.Library = Library
-        cls.Library.type_names[register_type.__fields__['type_name'].default] = register_type
-        return register_type
+__all__ = ["GenericGenerationArgs", "Request", "TypeLookupable"]
 
 
-class GenericGenerationArgs(BaseModel):
-    """Generic generation arguments."""
+def __getattr__(name: str):
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
 
-    model_config = ConfigDict(frozen=True)
-    temperature: float | None = None
-    top_k: int | None = None
-    top_p: float | None = None
-    max_tokens: int | None = None
-
-    def add(self, generation_args: 'GenericGenerationArgs') -> 'GenericGenerationArgs':
-        return GenericGenerationArgs.model_validate(
-            {**self.model_dump(), **generation_args.model_dump(exclude_unset=True)}
-        )
-
-
-class Request(BaseModel):
-    """Generation Request."""
-
-    generation_args: GenericGenerationArgs = GenericGenerationArgs()
+    value = getattr(import_module("megatron.rl.generation_api"), name)
+    globals()[name] = value
+    return value
