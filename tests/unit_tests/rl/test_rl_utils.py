@@ -1565,7 +1565,7 @@ class TestRLUtils:
             pytest.param((1, 1), id="tp1-pp1"),
             pytest.param((2, 1), id="tp2-pp1"),
             pytest.param((1, 2), id="tp1-pp2"),
-            pytest.param((1, 1, 2), id="tp1-pp1-cp2", marks=pytest.mark.flaky_in_dev),
+            pytest.param((1, 1, 2), id="tp1-pp1-cp2"),
         ],
         indirect=["initialize_model_parallel"],
     )
