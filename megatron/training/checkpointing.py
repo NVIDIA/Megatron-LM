@@ -3205,7 +3205,9 @@ def load_checkpoint(
         # Load samples trackers from checkpoint
         if not args.finetune:
             if ckpt_train_state is not None:
-                current_train_state.load_state_dict(ckpt_train_state.state_dict())
+                current_train_state.consumed_train_samples = ckpt_train_state.consumed_train_samples
+                current_train_state.skipped_train_samples = ckpt_train_state.skipped_train_samples
+                current_train_state.consumed_valid_samples = ckpt_train_state.consumed_valid_samples
             else:
                 # Legacy format with mutable train state tracked through args.
                 if 'args' in state_dict:
