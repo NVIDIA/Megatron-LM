@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core import utils as core_utils
 from megatron.core.datasets import data_schedule
 from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler, DpBalancedScheduler
 from megatron.core.datasets.data_schedule_utils import (
@@ -60,12 +61,15 @@ def cpu_batch_communication(monkeypatch, no_global_process_groups):
     monkeypatch.setattr(data_schedule, "broadcast_scalars", lambda values, *args, **kwargs: values)
 
     def partition(boundaries, total_tokens, cp_size, cp_rank):
+        # Transformer Engine rejects cu_seqlens that are not 1-D.
+        assert boundaries.dim() == 1, f"cu_seqlens must be 1-D, got {tuple(boundaries.shape)}"
         chunks = torch.arange(total_tokens).reshape(2 * cp_size, -1)
         return torch.cat((chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]))
 
-    monkeypatch.setattr(
-        data_schedule, "tex", SimpleNamespace(thd_get_partitioned_indices=partition)
-    )
+    tex = SimpleNamespace(thd_get_partitioned_indices=partition)
+    monkeypatch.setattr(data_schedule, "tex", tex)
+    # Static zigzag CP batches are partitioned per document in megatron.core.utils.
+    monkeypatch.setattr(core_utils, "tex", tex)
 
 
 @pytest.mark.parametrize("dynamic_cp", [False, True])
@@ -109,9 +113,12 @@ def test_cp_slice_respects_pipeline_field_ownership(
     assert result[-1].shape == (1, 4)
 
 
+@pytest.mark.parametrize("linear_cp_layout", ["contiguous", "zigzag"])
 @pytest.mark.parametrize("cp_size", [1, 2])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
-def test_static_packing_returns_hybrid_layouts(cpu_batch_communication, cp_size, sequence_parallel):
+def test_static_packing_returns_hybrid_layouts(
+    cpu_batch_communication, cp_size, sequence_parallel, linear_cp_layout
+):
     tp = _group(2 if sequence_parallel else 1)
     cp = _group(cp_size, stride=tp.size())
     tp_cp = _group(tp.size() * cp_size)
@@ -121,14 +128,18 @@ def test_static_packing_returns_hybrid_layouts(cpu_batch_communication, cp_size,
         pg_collection=ProcessGroupCollection(tp=tp, pp=_group(1), cp=cp, tp_cp=tp_cp),
         config=SimpleNamespace(
             sequence_parallel=sequence_parallel,
-            linear_cp_layout="contiguous",
+            linear_cp_layout=linear_cp_layout,
             attention_cp_layout="zigzag",
         ),
         return_context_parallel_batch=True,
     )
-    assert set(result.batches_by_layout) == {"contiguous", "zigzag"}
+    assert set(result.batches_by_layout) == {linear_cp_layout, "zigzag"}
+    zigzag_tokens = torch.arange(16).view(2 * cp_size, -1)[[0, -1]].view(1, -1)
+    torch.testing.assert_close(result.get_batch("zigzag")["tokens"], zigzag_tokens)
     for layout in result.batches_by_layout:
-        assert result.get_batch(layout)["tokens"].shape == (1, 16 // cp_size)
+        batch = result.get_batch(layout)
+        assert batch["tokens"].shape == (1, 16 // cp_size)
+        assert batch["cu_seqlens"].shape == batch["cu_seqlens_padded"].shape == (1, 2)
         assert result.get_packed_seq_params(layout).local_cp_size is None
 
 

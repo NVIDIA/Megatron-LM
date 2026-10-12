@@ -164,3 +164,68 @@ def test_packed_schedule_pipeline_cp_and_hybrid_sp(dynamic_cp, cp_size, hybrid):
             )
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_static_packing_default_zigzag_matches_tuple_path():
+    """Default zigzag CP batches use the same TE per-document shards as the tuple path."""
+    Utils.initialize_model_parallel(context_parallel_size=2)
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        config = SimpleNamespace(
+            sequence_packing_scheduler='dp_balanced',
+            max_seqlen_per_dp_cp_rank=32,
+            pad_packed_seq_alignment=4,
+            virtual_pipeline_model_parallel_size=None,
+            pipeline_model_parallel_layout=None,
+            mtp_num_layers=None,
+            sequence_parallel=False,
+            linear_cp_layout='zigzag',
+            attention_cp_layout='zigzag',
+        )
+
+        def packed_iterator():
+            samples = []
+            for length in (6, 10, 3, 13, 8, 5, 12, 7):
+                tokens = torch.arange(length, device='cuda') + 100 * length
+                samples.append(
+                    {
+                        'tokens': tokens,
+                        'labels': tokens + 1,
+                        'position_ids': torch.arange(length, device='cuda'),
+                        'loss_mask': torch.ones(length, device='cuda'),
+                        'cu_seqlens': torch.tensor([0, length], dtype=torch.int32, device='cuda'),
+                    }
+                )
+            iterator, count, _, _ = wrap_data_iterator(
+                iter(samples), config, len(samples), pg_collection=pg
+            )
+            return iterator, count
+
+        tuple_iterator, count = packed_iterator()
+        cp_batch_iterator, _ = packed_iterator()
+        assert count > 0
+        for _ in range(count):
+            tokens, labels, loss_mask, _, position_ids, packed_seq_params, padding_mask = (
+                get_batch_on_this_rank_for_sequence_packing(
+                    tuple_iterator, pg_collection=pg, config=config
+                )
+            )
+            cp_batch = get_batch_on_this_rank_for_sequence_packing(
+                cp_batch_iterator,
+                pg_collection=pg,
+                config=config,
+                return_context_parallel_batch=True,
+            )
+            assert set(cp_batch.batches_by_layout) == {'zigzag'}
+            batch = cp_batch.get_batch()
+            torch.testing.assert_close(batch['tokens'], tokens)
+            torch.testing.assert_close(batch['labels'], labels)
+            torch.testing.assert_close(batch['loss_mask'], loss_mask)
+            torch.testing.assert_close(batch['position_ids'], position_ids)
+            torch.testing.assert_close(batch['padding_mask'], padding_mask)
+            torch.testing.assert_close(
+                cp_batch.get_packed_seq_params().cu_seqlens_q_padded,
+                packed_seq_params.cu_seqlens_q_padded,
+            )
+    finally:
+        Utils.destroy_model_parallel()

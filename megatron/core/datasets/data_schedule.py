@@ -808,6 +808,10 @@ def get_batch_on_this_rank_for_sequence_packing(
             else cp_group
         )
         batch['hybrid_cp_group'] = runtime_cp_group if dynamic_cp else None
+        # The CP batch sharders expect (1, num_seqs + 1) cu_seqlens, as returned by
+        # flatten_batch_for_packed_sequences; the per-document sharder reads row 0.
+        batch['cu_seqlens'] = batch['cu_seqlens'].unsqueeze(0)
+        batch['cu_seqlens_padded'] = batch['cu_seqlens_padded'].unsqueeze(0)
         additional_layouts = set()
         if config.linear_cp_layout != config.attention_cp_layout:
             additional_layouts.add(config.attention_cp_layout)
