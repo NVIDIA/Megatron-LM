@@ -473,7 +473,11 @@ class TestRLUtils:
             rl_offload_optimizer_during_inference=True,
             rl_training_cuda_graphs=False,
         )
-        assert args.grad_buffer_offload
+        cfg = pretrain_cfg_container_from_args(args)
+        assert not cfg.ddp.grad_buffer_offload
+        assert cfg.rl.resolve_ddp_config(cfg.ddp).grad_buffer_offload
+        cfg.rl.rl_offload_optimizer_during_inference = False
+        assert not cfg.rl.resolve_ddp_config(cfg.ddp).grad_buffer_offload
 
     def test_rl_optimizer_offload_rejects_mxfp8_grad_buffer_aliasing(self):
         with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
@@ -1337,6 +1341,30 @@ class TestRLUtils:
         )
         torch.testing.assert_close(aligned, expected, rtol=0, atol=0)
 
+    def test_grad_buffer_offload_deregistration_failure_preserves_storage(self):
+        buffers = [
+            MagicMock(nccl_mem_pool=object(), nccl_grad_pool_is_separate=True) for _ in range(3)
+        ]
+        pools = [buffer.nccl_mem_pool for buffer in buffers]
+        error = RuntimeError("second pool deregistration failed")
+        buffers[1].deregister_grad_pool_for_offload.side_effect = error
+        model = SimpleNamespace(buffers=buffers[:1], expert_parallel_buffers=buffers[1:])
+
+        with pytest.raises(RuntimeError, match="second pool deregistration failed") as exc_info:
+            DistributedDataParallel.offload_grad_buffers(
+                model, synchronize=False, empty_cache=False
+            )
+
+        assert exc_info.value is error
+        assert any("abort this run and do not retry" in note for note in error.__notes__)
+        buffers[0].deregister_grad_pool_for_offload.assert_called_once_with()
+        buffers[1].deregister_grad_pool_for_offload.assert_called_once_with()
+        buffers[2].deregister_grad_pool_for_offload.assert_not_called()
+        for buffer, pool in zip(buffers, pools):
+            buffer.offload_to_cpu.assert_not_called()
+            buffer.release_offloaded_grad_pool.assert_not_called()
+            assert buffer.nccl_mem_pool is pool
+
     @pytest.mark.parametrize(
         "initialize_model_parallel,nccl_ub,grad_buffer_offload,registration_failure",
         [
@@ -1416,10 +1444,12 @@ class TestRLUtils:
                     side_effect=deregister_side_effect,
                 ) as deregister_mock,
             ):
-                with pytest.raises(RuntimeError, match=str(registration_error)):
+                with pytest.raises(RuntimeError, match=str(registration_error)) as exc_info:
                     DistributedDataParallel(
                         transformer_config, ddp_config=ddp_config, module=gpt_model
                     )
+                assert exc_info.value is registration_error
+                assert "Failed to register NCCL memory pool." in exc_info.value.__notes__
             if registration_failure == "parameter":
                 assert register_mock.call_count == 2
                 failed_param_pool = register_mock.call_args_list[1].args[0]
@@ -1470,17 +1500,26 @@ class TestRLUtils:
             assert all(buf.nccl_mem_pool is None for buf in all_buffers)
             assert [buf.param_nccl_mem_pool.id for buf in all_buffers] == initial_param_pool_ids
 
+            restore_error = torch.cuda.OutOfMemoryError("registration failed")
             with (
                 patch(
                     "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
-                    side_effect=RuntimeError("registration failed"),
+                    side_effect=restore_error,
                 ) as register_mock,
                 patch(
                     "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.deregister_mem_pool"
                 ) as deregister_mock,
             ):
-                with pytest.raises(RuntimeError, match="registration failed"):
+                with pytest.raises(
+                    torch.cuda.OutOfMemoryError, match="registration failed"
+                ) as exc_info:
                     ddp_model.restore_grad_buffers()
+                assert exc_info.value is restore_error
+                assert "Failed to register NCCL memory pool." in exc_info.value.__notes__
+                assert (
+                    "Failed to reload gradient buffer into NCCL memory pool."
+                    in exc_info.value.__notes__
+                )
             deregister_mock.assert_called_once_with(
                 register_mock.call_args.args[0], register_mock.call_args.args[1]
             )

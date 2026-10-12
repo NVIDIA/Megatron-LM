@@ -189,13 +189,13 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
     get_wandb_writer,
-    get_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -2704,6 +2704,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = get_model_config(model[0])
 
         ddp_config = get_megatron_ddp_config(args)
+        from megatron.training.argument_utils import _default_config_from_args
+        from megatron.training.config.rl_config import RLConfig
+
+        ddp_config = _default_config_from_args(RLConfig, args).resolve_ddp_config(ddp_config)
         if not getattr(args, "use_torch_fsdp2", False):
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(
@@ -2943,7 +2947,7 @@ def setup_model_and_optimizer(
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
-                ddp_config=cfg.ddp,
+                ddp_config=cfg.rl.resolve_ddp_config(cfg.ddp),
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
                 use_torch_fsdp2=cfg.dist.use_torch_fsdp2,

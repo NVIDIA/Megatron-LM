@@ -318,21 +318,6 @@ def _normalize_cuda_graph_modules_args(args):
     args.cuda_graph_modules = normalized_scopes
 
 
-def _configure_grad_buffer_offload(args: argparse.Namespace) -> None:
-    """Select the DDP buffer layout required by RL optimizer offload."""
-    args.grad_buffer_offload = bool(
-        args.perform_rl_step
-        and args.rl_offload_optimizer_during_inference
-        and not args.rl_training_cuda_graphs
-    )
-    if args.grad_buffer_offload and args.reuse_grad_buf_for_mxfp8_param_ag:
-        raise ValueError(
-            "--rl-offload-optimizer-during-inference is incompatible with "
-            "--reuse-grad-buf-for-mxfp8-param-ag when RL training CUDA graphs are disabled: "
-            "parameters share the gradient-buffer storage that offload releases."
-        )
-
-
 def _normalize_inference_cuda_graph_scope_arg(args):
     """Normalize inference_cuda_graph_scope and apply the impl-derived default."""
     args.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
@@ -1886,7 +1871,9 @@ def validate_args(args, defaults={}):
         exit_interval=args.exit_interval,
     )
 
-    _configure_grad_buffer_offload(args)
+    rl_cfg.resolve_grad_buffer_offload(
+        reuse_grad_buf_for_mxfp8_param_ag=args.reuse_grad_buf_for_mxfp8_param_ag
+    )
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:

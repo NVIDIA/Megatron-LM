@@ -273,6 +273,8 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
+        # Check the effective layout without storing a derived value on the user's config.
+        self.rl.resolve_ddp_config(self.ddp)
         super().validate()
         transformer = getattr(self.model, "transformer", None)
         cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl

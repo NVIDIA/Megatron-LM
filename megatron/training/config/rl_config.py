@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 SubmissionGranularity = Literal["R", "G", "B"]
@@ -246,6 +246,31 @@ class RLConfig:
                     "(--rl-inference-model-unified-memory-level=1), `torch_memory_saver` must be "
                     "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                 )
+
+    def resolve_grad_buffer_offload(self, *, reuse_grad_buf_for_mxfp8_param_ag: bool) -> bool:
+        """Return the DDP gradient-buffer layout required by RL optimizer offload."""
+        grad_buffer_offload = bool(
+            self.perform_rl_step
+            and self.rl_offload_optimizer_during_inference
+            and not self.rl_training_cuda_graphs
+        )
+        if grad_buffer_offload and reuse_grad_buf_for_mxfp8_param_ag:
+            raise ValueError(
+                "--rl-offload-optimizer-during-inference is incompatible with "
+                "--reuse-grad-buf-for-mxfp8-param-ag when RL training CUDA graphs are disabled: "
+                "parameters share the gradient-buffer storage that offload releases."
+            )
+        return grad_buffer_offload
+
+    def resolve_ddp_config(self, ddp_config):
+        """Build a validated DDP config without modifying the user's explicit settings."""
+        if not hasattr(ddp_config, "grad_buffer_offload"):
+            # Torch FSDP uses a different configuration without classic-DDP buffer layouts.
+            return replace(ddp_config)
+        required = self.resolve_grad_buffer_offload(
+            reuse_grad_buf_for_mxfp8_param_ag=ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+        )
+        return replace(ddp_config, grad_buffer_offload=ddp_config.grad_buffer_offload or required)
 
     def validate_run(
         self,

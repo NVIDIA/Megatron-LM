@@ -253,7 +253,40 @@ def test_validate_run_at_every_call_site():
             rl=rl if rl is not None else RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs),
         )
 
-    container(rl_training_cuda_graphs=True).validate()
+    offload_container = container(rl_offload_optimizer_during_inference=True)
+    offload_container.validate()
+    assert not offload_container.ddp.grad_buffer_offload
+    effective_ddp = offload_container.rl.resolve_ddp_config(offload_container.ddp)
+    assert effective_ddp is not offload_container.ddp
+    assert effective_ddp.grad_buffer_offload
+    offload_container.rl.rl_offload_optimizer_during_inference = False
+    offload_container.validate()
+    assert not offload_container.rl.resolve_ddp_config(offload_container.ddp).grad_buffer_offload
+    assert effective_ddp.grad_buffer_offload  # An already constructed config remains unchanged.
+    offload_container.rl.rl_offload_optimizer_during_inference = True
+    offload_container.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
+        offload_container.validate()
+
+    cuda_graph_container = container(
+        rl_offload_optimizer_during_inference=True, rl_training_cuda_graphs=True
+    )
+    cuda_graph_container.validate()
+    assert not cuda_graph_container.ddp.grad_buffer_offload
+    assert not cuda_graph_container.rl.resolve_ddp_config(
+        cuda_graph_container.ddp
+    ).grad_buffer_offload
+    explicit_layout_container = container(rl=RLConfig())
+    explicit_layout_container.ddp.grad_buffer_offload = True
+    explicit_layout_container.validate()
+    assert explicit_layout_container.ddp.grad_buffer_offload
+    assert explicit_layout_container.rl.resolve_ddp_config(
+        explicit_layout_container.ddp
+    ).grad_buffer_offload
+    explicit_layout_container.ddp.fp8_param_gather = True
+    explicit_layout_container.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    with pytest.raises(ValueError, match="parameters share gradient storage"):
+        explicit_layout_container.validate()
     container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
     container(model=TopologyOnlyModelConfig(), rl=RLConfig()).validate()
     with pytest.raises(ValueError, match="no CUDA graphs"):

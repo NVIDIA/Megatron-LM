@@ -1224,13 +1224,12 @@ class _ParamAndGradBuffer:
             self.nccl_mem_pool = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
-            grad_alloc_context = functools.partial(
+            mem_alloc_context = functools.partial(
                 nccl_allocator.nccl_mem,
                 self.nccl_mem_pool,
                 group=self.data_parallel_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
-            param_alloc_context = grad_alloc_context
             # Since nccl communicator group is created lazily, we need to perform a warmup call to
             # initialize NCCL comm buffers for this dp_group before doing buffer registration.
             torch.distributed.barrier()
@@ -1238,14 +1237,13 @@ class _ParamAndGradBuffer:
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
         else:
-            # If nccl_ub is False, allocation contexts are nullcontext.
-            grad_alloc_context = nullcontext
-            param_alloc_context = nullcontext
+            # If nccl_ub is False, the allocation context is nullcontext.
+            mem_alloc_context = nullcontext
 
         if uses_shared_param_grad_buffer:
             # MXFP8 parameter all-gather and gradient reduce-scatter share this storage.
             # Offload-capable layouts reject this case above.
-            with grad_alloc_context():
+            with mem_alloc_context():
                 self.shared_buffer = torch.zeros(
                     self.numel,
                     dtype=self.grad_dtype,
@@ -1306,7 +1304,7 @@ class _ParamAndGradBuffer:
                         self._deregister_nccl_mem_pool_after_error(self.nccl_mem_pool)
                         raise
             else:
-                with grad_alloc_context():
+                with mem_alloc_context():
                     if self.ddp_config.use_distributed_optimizer:
                         allocate_param_buffer()
                     allocate_grad_buffer()
@@ -1730,13 +1728,9 @@ class _ParamAndGradBuffer:
         for grad in self.extra_main_grads:
             grad.zero_()
 
-    def get_nccl_mem_pools(self) -> List["torch.cuda.MemPool"]:
+    def get_nccl_mem_pools(self) -> set["torch.cuda.MemPool"]:
         """Return this buffer's distinct live NCCL memory pools."""
-        pools = []
-        for pool in (self.param_nccl_mem_pool, self.nccl_mem_pool):
-            if pool is not None and all(pool is not existing for existing in pools):
-                pools.append(pool)
-        return pools
+        return {pool for pool in (self.param_nccl_mem_pool, self.nccl_mem_pool) if pool is not None}
 
     def _deregister_nccl_mem_pool_after_error(self, pool: "torch.cuda.MemPool") -> None:
         """Best-effort rollback without replacing the error that triggered cleanup."""
@@ -1753,10 +1747,11 @@ class _ParamAndGradBuffer:
                 self.data_parallel_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
-        except RuntimeError:
+        except RuntimeError as error:
             # ProcessGroupNCCL records the pool before registering its existing segments. If a
             # segment fails, removing that record must precede releasing the pool allocation.
             self._deregister_nccl_mem_pool_after_error(pool)
+            error.add_note("Failed to register NCCL memory pool.")
             raise
 
     def deregister_nccl_mem_pools(self) -> None:
@@ -1795,12 +1790,13 @@ class _ParamAndGradBuffer:
             with torch.cuda.use_mem_pool(pool):
                 self.reload_from_cpu(move_params=False, move_grads=True)
             self._register_nccl_mem_pool(pool)
-        except RuntimeError:
+        except RuntimeError as error:
             # Leave the buffer offloaded so a caller can retry or shut down cleanly.
             try:
                 self.offload_to_cpu(move_params=False, move_grads=True)
             except RuntimeError:
                 pass
+            error.add_note("Failed to reload gradient buffer into NCCL memory pool.")
             raise
         self.nccl_mem_pool = pool
 

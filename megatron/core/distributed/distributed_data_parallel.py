@@ -762,15 +762,20 @@ class DistributedDataParallel(_BaseDataParallel):
 
         Registered gradient storage is deregistered and its private pool is
         destroyed after the storage is released. Parameter pools remain live.
+        If deregistration fails, no gradient storage is released, but earlier
+        deregistrations are not rolled back. Abort the run; do not retry offload
+        or reuse the model with potentially partial registration state.
 
         Raises:
             RuntimeError: If registered gradient storage was not constructed
-                with an offload-capable separate pool.
+                with an offload-capable separate pool, or pool deregistration fails.
         """
         if synchronize:
             torch.cuda.synchronize()
 
         buffers = self.buffers + self.expert_parallel_buffers
+        # Only registered buffers own pools that need collective deregistration and release;
+        # every buffer still offloads its gradient storage in the full buffers loop below.
         registered_buffers = [buffer for buffer in buffers if buffer.nccl_mem_pool is not None]
         if any(not buffer.nccl_grad_pool_is_separate for buffer in registered_buffers):
             raise RuntimeError(
@@ -778,10 +783,18 @@ class DistributedDataParallel(_BaseDataParallel):
                 "DistributedDataParallel with grad_buffer_offload=True."
             )
 
-        # Complete all collective deregistrations before mutating storage so a failure cannot
-        # leave only part of the model offloaded.
-        for buffer in registered_buffers:
-            buffer.deregister_grad_pool_for_offload()
+        # Deregister all pools before releasing any storage. A failure leaves storage intact,
+        # but registration may already be partially removed; this is not a rollback boundary.
+        try:
+            for buffer in registered_buffers:
+                buffer.deregister_grad_pool_for_offload()
+        except RuntimeError as error:
+            error.add_note(
+                "Gradient-buffer offload failed during NCCL pool deregistration. "
+                "Registration state may be partial; abort this run and do not retry "
+                "offload or reuse this model."
+            )
+            raise
 
         for buffer in buffers:
             buffer.offload_to_cpu(move_params=False, move_grads=True)
