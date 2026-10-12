@@ -74,4 +74,4 @@ class TrainState(Stateful):
         self.do_train = state_dict["do_train"].item()
         self.do_valid = state_dict["do_valid"].item()
         self.do_test = state_dict["do_test"].item()
-        self.release = state_dict["release"].item()
+        self.release = state_dict.get("release", torch.tensor(False, dtype=torch.bool)).item()
