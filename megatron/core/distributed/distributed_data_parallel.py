@@ -603,7 +603,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
-                    param.main_grad.add_(param.grad.data)
+                    self.param_to_bucket_group[param].accumulate_grad(param)
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:

@@ -56,6 +56,11 @@ except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
+# batch_grad_accumulation: gradients of at least this many elements are accumulated into
+# .main_grad right away. A plain add_ already runs them at full bandwidth, and holding them
+# until the bucket group's reduction is dispatched would cost memory.
+BATCH_GRAD_ACCUMULATION_MAX_NUMEL = 1 << 20
+
 
 class BufferType(Enum):
     """
@@ -321,6 +326,12 @@ class _ParamAndGradBucketGroup:
         # double-waiting. Reset by `reset()`.
         self.grad_reduce_finished = False
 
+        # batch_grad_accumulation: the (main_grad, grad) pairs whose accumulation the backward
+        # hook deferred to `accumulate_deferred_grads`, keyed by the stream the gradient was
+        # produced on, and the parameters they belong to.
+        self.deferred_grads = {}
+        self.deferred_grad_params = set()
+
         # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
         # introduces some CPU overheads. We use these two lists to cache the created local
         # shards to avoid unnecessary CPU operations. This does not increase GPU memory usage
@@ -341,6 +352,49 @@ class _ParamAndGradBucketGroup:
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
         self.grad_reduce_finished = False
+        # Gradients still deferred belong to an iteration whose buffer is being zeroed.
+        self.deferred_grads = {}
+        self.deferred_grad_params = set()
+
+    def accumulate_grad(self, param: torch.nn.Parameter):
+        """
+        Accumulate param.grad into param.main_grad.
+
+        With ddp_config.batch_grad_accumulation, the accumulation is deferred: the bucket
+        group's deferred gradients are accumulated by one multi-tensor launch per producing
+        stream in `accumulate_deferred_grads`, which `start_grad_sync` calls before the bucket
+        group's gradients are checked, scaled and reduced. Gradients of at least
+        BATCH_GRAD_ACCUMULATION_MAX_NUMEL elements are accumulated right away.
+        """
+        if (
+            not self.ddp_config.batch_grad_accumulation
+            or param.grad.numel() >= BATCH_GRAD_ACCUMULATION_MAX_NUMEL
+        ):
+            param.main_grad.add_(param.grad.data)
+            return
+        if param in self.deferred_grad_params:
+            # An earlier gradient of this parameter (a previous micro-batch's) is still
+            # deferred: accumulate it first, so that every launch writes each main_grad once
+            # and the gradients of a parameter add up in the order they were produced.
+            self.accumulate_deferred_grads()
+        main_grads, grads = self.deferred_grads.setdefault(torch.cuda.current_stream(), ([], []))
+        main_grads.append(param.main_grad)
+        grads.append(param.grad.data)
+        self.deferred_grad_params.add(param)
+
+    def accumulate_deferred_grads(self):
+        """
+        Accumulate the deferred gradients into .main_grad, with one multi-tensor launch per
+        stream they were produced on; the current stream waits for each of those streams.
+        """
+        current_stream = torch.cuda.current_stream()
+        for stream, (main_grads, grads) in self.deferred_grads.items():
+            with torch.cuda.stream(stream):
+                torch._foreach_add_(main_grads, grads)
+            if stream != current_stream:
+                current_stream.wait_stream(stream)
+        self.deferred_grads = {}
+        self.deferred_grad_params = set()
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
@@ -691,6 +745,10 @@ class _ParamAndGradBucketGroup:
                 if event is not None and id(event) not in waited_event_ids:
                     current_stream.wait_event(event)
                     waited_event_ids.add(id(event))
+
+        # batch_grad_accumulation: the gradients the backward hook deferred go into .main_grad
+        # before it is checked, scaled, copied and reduced below.
+        self.accumulate_deferred_grads()
 
         # Copy accumulated .main_grad into communication buffer before collective if
         # .main_grad is not in .grad_data already (e.g., because we want to do local
