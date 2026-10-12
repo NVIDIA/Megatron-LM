@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-""" Unit tests for CUDA-graph-aware admission gating. """
+"""Unit tests for CUDA-graph-aware admission gating."""
 
 import logging
 import types
@@ -627,9 +627,7 @@ class TestChunkedPrefillCgChunkSize:
             num_requests=20,
             max_tokens=256,
             num_steps=3,
-            chunk_fn=lambda eng, length, budget: eng._cg_chunked_prefill_chunk_size(
-                length, budget
-            ),
+            chunk_fn=lambda eng, length, budget: eng._cg_chunked_prefill_chunk_size(length, budget),
         )
         assert [tokens for tokens, _ in packed] == [256, 256, 256]
         assert all(prefills >= 4 for _, prefills in packed)
