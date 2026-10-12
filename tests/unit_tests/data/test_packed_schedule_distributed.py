@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
@@ -100,8 +99,6 @@ def test_packed_schedule_pipeline_cp_and_hybrid_sp(dynamic_cp, cp_size, hybrid):
                 dynamic_cp=dynamic_cp,
                 pg_collection=pg,
                 config=config,
-                dynamic_cp_group_func=parallel_state.get_dynamic_data_context_parallel_groups,
-                dynamic_tp_cp_group_func=parallel_state.get_dynamic_tensor_data_context_parallel_group,
                 return_context_parallel_batch=hybrid,
             )
             if hybrid:

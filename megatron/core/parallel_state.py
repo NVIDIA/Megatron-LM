@@ -442,22 +442,14 @@ def create_hierarchical_groups(
 
 
 def get_valid_dynamic_context_parallel_group_sizes(total_size: int) -> List[int]:
-    """Return runtime CP sizes that can partition a DPxCP rank list exactly.
+    """Compatibility alias for the pure dynamic-CP topology helper."""
+    # Import lazily because context_parallel's layouts depend on tensor_parallel,
+    # which imports parallel_state during its own initialization.
+    from megatron.core.context_parallel.groups import (
+        get_valid_dynamic_context_parallel_group_sizes as get_group_sizes,
+    )
 
-    Power-of-two subgroups are used when they evenly divide the rank list. The
-    full DPxCP group is always valid and reuses the existing communicator.
-    """
-    if total_size < 1:
-        raise ValueError(f"Dynamic CP group size must be positive, got {total_size}")
-
-    group_sizes = []
-    group_size = 1
-    while group_size < total_size:
-        if total_size % group_size == 0:
-            group_sizes.append(group_size)
-        group_size *= 2
-    group_sizes.append(total_size)
-    return group_sizes
+    return get_group_sizes(total_size)
 
 
 def create_dynamic_dp_cp_groups(
@@ -1141,6 +1133,12 @@ def initialize_model_parallel(
                     min_cp_size=min_dynamic_context_parallel_size,
                 )
             )
+
+        # Include the full domain in the snapshot even when min_cp_size selects
+        # only this group. The communicator already exists; no new group is needed.
+        _DYNAMIC_DP_CP_GROUPS[data_parallel_size * context_parallel_size] = (
+            _DATA_PARALLEL_GROUP_WITH_CP
+        )
 
         # A layout conversion after TP sequence scattering must communicate
         # over the Cartesian product of TP and the runtime DPxCP subgroup.
@@ -1985,6 +1983,30 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
     if check_initialized:
         assert _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS is not None
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+
+
+def get_dynamic_data_context_parallel_group_map() -> Dict[int, torch.distributed.ProcessGroup]:
+    """Snapshot local runtime CP groups keyed by CP size.
+
+    The map includes the full DPxCP domain and, when initialized, the singleton
+    CP-off group. It is empty before initialization and when dynamic CP is disabled.
+    """
+    return dict(_DYNAMIC_DP_CP_GROUPS)
+
+
+def get_dynamic_tensor_data_context_parallel_group_map() -> (
+    Dict[int, torch.distributed.ProcessGroup]
+):
+    """Snapshot TP x runtime-CP groups, keyed by the runtime CP size.
+
+    With TP1 these are the runtime CP groups themselves. The returned maps keep
+    the original process-group handles without exposing the global dictionaries.
+    """
+    if not _DYNAMIC_DP_CP_GROUPS:
+        return {}
+    if get_tensor_model_parallel_world_size() == 1:
+        return dict(_DYNAMIC_DP_CP_GROUPS)
+    return dict(_DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS)
 
 
 def get_dynamic_data_context_parallel_groups(

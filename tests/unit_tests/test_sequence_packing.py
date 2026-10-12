@@ -21,6 +21,7 @@ from megatron.core.datasets.data_schedule_utils import (
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -74,7 +75,9 @@ def test_scheduler_builds_runtime_cp_layout_views(local_cp_size, expected_layout
     pp_group = _Group(1)
     static_cp_group = _Group(4)
     runtime_cp_group = _Group(local_cp_size)
-    pg_collection = SimpleNamespace(tp=tp_group, pp=pp_group, cp=static_cp_group)
+    pg_collection = ProcessGroupCollection(
+        tp=tp_group, pp=pp_group, cp=static_cp_group, dynamic_cp={local_cp_size: runtime_cp_group}
+    )
     config = SimpleNamespace(
         linear_cp_layout="contiguous", attention_cp_layout="zigzag", sequence_parallel=False
     )
@@ -101,7 +104,6 @@ def test_scheduler_builds_runtime_cp_layout_views(local_cp_size, expected_layout
             iter([batch]),
             dynamic_cp=True,
             pg_collection=pg_collection,
-            dynamic_cp_group_func=lambda group_size: runtime_cp_group,
             config=config,
             return_context_parallel_batch=True,
         )
@@ -454,6 +456,10 @@ def _gather_tensor_from_all_ranks(tensor):
         (2, 1, 2, False, None),  # TP + CP
         (1, 2, 2, False, None),  # PP + CP
         (1, 4, 1, False, None),  # Has middle pp stage
+        (1, 1, 1, True, 1),
+        (1, 1, 1, True, 2),
+        (1, 1, 2, True, 2),
+        (1, 1, 2, True, 1),
         (1, 1, 4, True, 4),
         (1, 1, 4, True, 2),
         (1, 1, 4, True, 1),
@@ -493,6 +499,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
     )
 
     try:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         # Create mock data iterator with variable-length sequences
         # Only TP rank 0 needs the iterator; other TP ranks pass None
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -521,7 +528,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             mtp_on_this_rank=False,
             vp_stage=None,
             dynamic_cp=dynamic_cp,
-            dynamic_cp_group_func=parallel_state.get_dynamic_data_context_parallel_groups,
+            pg_collection=pg_collection,
         )
 
         # Unpack the result. Scheduler THD always returns padding_mask.
@@ -755,7 +762,12 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             num_micro_batches,
             num_total_tokens_this_global_batch,
             sequence_square_sum_this_global_batch,
-        ) = wrap_data_iterator(data_iterator, config, num_micro_batches_old)
+        ) = wrap_data_iterator(
+            data_iterator,
+            config,
+            num_micro_batches_old,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
 
         # check the result
         assert type(num_micro_batches) is int
