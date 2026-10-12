@@ -1253,6 +1253,106 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
         torch.testing.assert_close(out_padded[:real], out_real, atol=0, rtol=0, equal_nan=True)
         torch.testing.assert_close(state_padded, state_real, atol=0, rtol=0, equal_nan=True)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("headwise_beta", [True, False])
+    def test_nonfinite_padding_rows_store_positive_zero(self, dtype, headwise_beta):
+        """Padding rows store +0.0 even when their stale inputs are NaN or inf."""
+        q, k, v, g, beta, state = _random_inputs(**self.SHAPE, dtype=dtype)
+        if not headwise_beta:
+            beta = torch.rand_like(v).sigmoid()
+        indices = torch.tensor([7, -1, 3, 10, -1, 5], device="cuda", dtype=torch.int32)
+        q[1] = float("nan")
+        v[4] = float("inf")
+        state_before = state.clone()
+
+        out, _ = fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            state=state,
+            g=g,
+            beta=beta,
+            state_indices=indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        real = indices >= 0
+        assert torch.count_nonzero(out[~real].view(torch.uint8)) == 0
+        state_real = state_before.clone()
+        out_real, _ = fused_recurrent_gated_delta_rule_update(
+            q[real],
+            k[real],
+            v[real],
+            state=state_real,
+            g=g[real],
+            beta=beta[real],
+            state_indices=indices[real],
+            use_qk_l2norm_in_kernel=True,
+        )
+        assert torch.equal(out[real].view(torch.uint8), out_real.view(torch.uint8))
+        assert torch.equal(state.view(torch.uint8), state_real.view(torch.uint8))
+
+    def test_padding_follows_slots_across_graph_replays(self):
+        """The padding select reads the slots at replay time, not at capture time."""
+        q, k, v, g, beta, state = _random_inputs(**self.SHAPE)
+        q[1] = float("nan")
+        v[4] = float("inf")
+        initial_state = state.clone()
+        indices = torch.tensor([7, -1, 3, 10, -1, 5], device="cuda", dtype=torch.int32)
+
+        def step():
+            out, _ = fused_recurrent_gated_delta_rule_update(
+                q,
+                k,
+                v,
+                state=state,
+                g=g,
+                beta=beta,
+                state_indices=indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+            return out
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            step()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                graph_out = step()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        for slots in ([7, -1, 3, 10, -1, 5], [-1] * 6, [0, 1, 2, 3, 4, 6], [-1, 8, -1, 2, 9, -1]):
+            indices.copy_(torch.tensor(slots, device="cuda", dtype=torch.int32))
+            state.copy_(initial_state)
+            graph.replay()
+            replayed_out, replayed_state = graph_out.clone(), state.clone()
+            state.copy_(initial_state)
+            eager_out = step()
+
+            padded = indices < 0
+            assert torch.count_nonzero(replayed_out[padded].view(torch.uint8)) == 0
+            assert torch.equal(replayed_out.view(torch.uint8), eager_out.view(torch.uint8))
+            assert torch.equal(replayed_state.view(torch.uint8), state.view(torch.uint8))
+
+    def test_slot_indices_reject_varlen(self):
+        q, k, v, g, beta, state = _random_inputs(B=1, T=2, H=1, HV=1, K=16, V=8, num_slots=2)
+        state_before = state.clone()
+        with pytest.raises(AssertionError, match="cu_seqlens"):
+            fused_recurrent_gated_delta_rule_update(
+                q,
+                k,
+                v,
+                state=state,
+                g=g,
+                beta=beta,
+                state_indices=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+                cu_seqlens=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+            )
+        # The rejection happens before the launch, so the shared cache is untouched.
+        torch.cuda.synchronize()
+        assert torch.equal(state.view(torch.uint8), state_before.view(torch.uint8))
+
     @pytest.mark.skipif(not HAVE_FLA, reason="parity check requires flash-linear-attention")
     def test_matches_upstream_fla(self):
         """Fork parity with the pip FLA kernel the training path still uses."""
