@@ -6,6 +6,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     wide_residual_gated_delta_product_inference_stack_spec,
 )
@@ -13,6 +14,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.inference.engines.test_gdp_cuda_graph_e2e import (
@@ -35,6 +37,14 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
         Utils.initialize_model_parallel(
             expert_model_parallel_size=torch.distributed.get_world_size()
         )
+
+    @classmethod
+    def teardown_class(cls):
+        try:
+            NVLSAllGatherVDispatcher._delete_buffers()
+            SymmetricMemoryManager.destroy()
+        finally:
+            super().teardown_class()
 
     def _create_model(self):
         torch.manual_seed(1234)
