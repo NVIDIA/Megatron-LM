@@ -79,6 +79,16 @@ class DistributedDataParallelConfig:
     """If true, compute average in collective directly, as opposed to dividing by the
        dp_size first and then computing sum in the collective."""
 
+    overwrite_main_grad: bool = False
+    """If true, weight gradients overwrite .main_grad instead of accumulating into it (the
+       `overwrite_main_grad` parameter attribute that Transformer Engine's fused weight-gradient
+       GEMMs honor), so DDP zero-fills only the .main_grads autograd produces (biases, norms,
+       embeddings: the backward hook adds them) instead of the whole grad buffer every iteration.
+       Requires one micro-batch per step (no gradient accumulation across micro-batches) and
+       every parameter's gradient produced once per iteration: no shared parameters, no per-layer
+       CUDA graphs, no deferred embedding wgrad, no Megatron-FSDP, no grad-buffer reuse for the
+       MXFP8 param all-gather, no higher-precision local accumulation."""
+
     fp8_param_gather: bool = False
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
@@ -343,6 +353,18 @@ class DistributedDataParallelConfig:
                 "Only need to explicitly specify param_name patterns for FP32 local accumulation "
                 "if .main_grads aren't already in FP32"
             )
+
+        if self.overwrite_main_grad:
+            requirements = {
+                'not use_megatron_fsdp': not (self.use_megatron_fsdp or self.use_custom_fsdp),
+                'not reuse_grad_buf_for_mxfp8_param_ag': not self.reuse_grad_buf_for_mxfp8_param_ag,
+                'no param_name_patterns_for_fp32_local_accumulation': (
+                    len(self.param_name_patterns_for_fp32_local_accumulation) == 0
+                ),
+            }
+            unmet = [name for name, satisfied in requirements.items() if not satisfied]
+            if unmet:
+                raise ValueError("overwrite_main_grad requires " + ", ".join(unmet) + ".")
 
         if self.num_buckets is not None:
             assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"

@@ -71,6 +71,7 @@ from .optimizer import (
     param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
+from .overlapped_step import OverlappedOptimizerStep
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
@@ -794,6 +795,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
         # Retained only between loading-template creation and load_state_dict().
         self._checkpoint_version_for_load = None
+        self.overlapped_step: Optional[OverlappedOptimizerStep] = None
 
         assert (
             isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
@@ -892,6 +894,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+        if config.overlap_optimizer_step_with_forward:
+            self.overlapped_step = OverlappedOptimizerStep(self)
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -1156,6 +1161,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.optimizer.load_state_dict(
             {"state": state_dict_state, "param_groups": state_dict_param_groups}
         )
+        if self.overlapped_step is not None:
+            self.overlapped_step.invalidate()
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
@@ -2716,6 +2723,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         if self.is_stub_optimizer:
             return
+        if self.overlapped_step is not None:
+            self.overlapped_step.begin_iteration()
         total_groups = [
             self.model_float16_groups,
             self.model_fp32_groups,
@@ -3027,6 +3036,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Stage FP32 master shards into DDP param buffers before explicit param sync."""
         if self.is_stub_optimizer:
             return
+        if self.overlapped_step is not None:
+            self.overlapped_step.apply_scheduled_update()
         if not (self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather):
             return
 
@@ -3357,6 +3368,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 ):
                     continue
                 model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+
+    @torch.no_grad()
+    def step(self):
+        if self.overlapped_step is None:
+            return super().step()
+        # The update itself is issued by the next forward pass (see OverlappedOptimizerStep).
+        grad_norm_sq = self.overlapped_step.local_grad_norm_sq()
+        torch.distributed.all_reduce(grad_norm_sq, group=self.get_grad_stats_parallel_group())
+        grad_norm = grad_norm_sq.sqrt()
+        self.overlapped_step.schedule_update(grad_norm)
+        return True, grad_norm, None
+
+    def discard_scheduled_update(self):
+        if self.overlapped_step is not None:
+            self.overlapped_step.discard_scheduled_update()
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:

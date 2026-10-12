@@ -3152,12 +3152,30 @@ def _add_distributed_args(parser):
                        help='List of param_name patterns (in Python\'s fnmatch format) to match against '
                        'to do local gradient accumulation in FP32. The special pattern \'all\' matches '
                        'every parameter.')
+    group.add_argument('--overwrite-main-grad', action='store_true',
+                       default=False, help='If set, weight gradients overwrite .main_grad instead of '
+                       'accumulating into it, and DDP zero-fills only the gradients autograd produces '
+                       'instead of the whole grad buffer every iteration. Requires one micro-batch per step.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
     group.add_argument('--overlap-param-gather-with-optimizer-step', action='store_true',
                        default=False, help='If set, overlap param all-gather of first bucket with optimizer step.')
+    group.add_argument('--overlap-optimizer-step-with-forward', action='store_true',
+                       default=False, help='If set, issue the distributed optimizer step bucket group by '
+                       'bucket group on a side stream, each update right before its param all-gather, '
+                       'overlapped with the next iteration\'s forward pass (and captured by the '
+                       'full-iteration CUDA graph). The update of an iteration is applied during the '
+                       'next iteration\'s forward pass.')
+    group.add_argument('--overlap-optimizer-step-prefetch', type=int, default=2,
+                       help='With --overlap-optimizer-step-with-forward, number of bucket groups beyond '
+                       'the one the forward pass is waiting for whose update and all-gather are issued '
+                       'at that point.')
+    group.add_argument('--overlap-optimizer-step-flat-adam', action='store_true',
+                       default=False, help='With --overlap-optimizer-step-with-forward, one flat Adam '
+                       'launch per bucket shard over contiguous main params and moments instead of '
+                       'one multi-tensor launch per param group and bucket group.')
     group.add_argument('--no-align-param-gather', action='store_false',
                        help='If not set, all PP stages will launch param all-gathers simultaneously. '
                        'Otherwise, each PP stage will independently launch as needed.',

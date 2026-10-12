@@ -818,7 +818,11 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                     weight.main_grad = weight.get_main_grad()
                     _wgrad_gemm(weight.main_grad, grad_output, total_input)
                 else:
-                    if weight.main_grad.dtype == torch.float32:
+                    if getattr(weight, "overwrite_main_grad", False):
+                        # The iteration's only write of main_grad, which is not zero-filled
+                        # (DistributedDataParallelConfig.overwrite_main_grad).
+                        _wgrad_gemm(weight.main_grad, grad_output, total_input)
+                    elif weight.main_grad.dtype == torch.float32:
                         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
                             total_input, grad_output, weight.main_grad
                         )

@@ -139,11 +139,30 @@ class _ParamAndGradBucket:
             global_start, global_end, _ = param_index_map[param]
             self.param_to_index[param] = (global_start - offset, global_end - offset)
         self.params_with_extra_main_grads = params_with_extra_main_grads
+        # overwrite_main_grad: the .main_grads to zero each iteration, None until recorded.
+        self.main_grads_to_zero: Optional[List[torch.Tensor]] = None
 
         # Layer-wise optimizer attributes for async param gather.
         self.layerwise_params_list = None
         self.layerwise_param_flat_sizes = None
         self.layerwise_gather_list = None
+
+    def record_main_grads_to_zero(self):
+        """
+        overwrite_main_grad: keep the .main_grads the DDP backward hook adds autograd's gradient
+        into (no fused weight-gradient GEMM set grad_added_to_main_grad); zero_grads zeroes only
+        those from now on, the others are overwritten by their producer.
+        """
+        self.main_grads_to_zero = [
+            param.main_grad for param in self.params_list if not param.grad_added_to_main_grad
+        ]
+
+    def zero_grads(self):
+        """Zero the bucket's gradients for the next iteration."""
+        if self.main_grads_to_zero is None:
+            self.grad_data.zero_()
+        elif self.main_grads_to_zero:
+            torch._foreach_zero_(self.main_grads_to_zero)
 
     @torch.no_grad()
     def _stage_layerwise_mxfp8_params(self, local_data_view: torch.Tensor, local_rank: int) -> None:
@@ -264,6 +283,9 @@ class _ParamAndGradBucketGroup:
                 self.params.add(param)
 
         self.next_param_gather_bucket_group = None
+        # Set by megatron.core.optimizer.overlapped_step.OverlappedOptimizerStep when the
+        # optimizer issues this bucket group's update, grad zeroing and param all-gather itself.
+        self.overlapped_step = None
         # Set in DistributedDataParallel.__init__ when reduce_scatter_with_fp32_accumulation is on:
         # points to the bucket group whose grad-reduce was dispatched immediately before mine in
         # the backward pass. start_grad_sync drains this predecessor before dispatching its own
@@ -328,6 +350,11 @@ class _ParamAndGradBucketGroup:
         # or bucket.grad_data.
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
+
+    def zero_grads(self):
+        """Zero the bucket group's gradients for the next iteration."""
+        for bucket in self.buckets:
+            bucket.zero_grads()
 
     def reset(self):
         """
@@ -1193,6 +1220,8 @@ class _ParamAndGradBuffer:
         self.param_data = None
         self.grad_data = None
         self.extra_main_grads = []
+        # overwrite_main_grad: the .main_grads to zero each iteration, None until recorded.
+        self.main_grads_to_zero: Optional[List[torch.Tensor]] = None
         self.nccl_mem_pool = None
 
         if self.nccl_ub:
@@ -1225,6 +1254,11 @@ class _ParamAndGradBuffer:
             if self.ddp_config.use_distributed_optimizer and any(
                 is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
             ):
+                if self.ddp_config.overwrite_main_grad:
+                    raise ValueError(
+                        "overwrite_main_grad is not supported with MXFP8 parameters: their grad "
+                        "buffer doubles as the param all-gather buffer."
+                    )
                 self.shared_buffer = torch.zeros(
                     self.numel,
                     dtype=self.grad_dtype,
@@ -1667,13 +1701,25 @@ class _ParamAndGradBuffer:
 
         return bucket
 
+    def record_main_grads_to_zero(self):
+        """overwrite_main_grad: see _ParamAndGradBucket.record_main_grads_to_zero."""
+        for bucket in self.buckets:
+            bucket.record_main_grads_to_zero()
+        self.main_grads_to_zero = [
+            grad for bucket in self.buckets for grad in bucket.main_grads_to_zero
+        ]
+
     def reset(self):
         """
-        Zero out the underlying grad_buffer.
+        Zero out the underlying grad_buffer, or with overwrite_main_grad only the .main_grads
+        recorded by record_main_grads_to_zero.
         """
-        self.grad_data.zero_()
-        for grad in self.extra_main_grads:
-            grad.zero_()
+        if self.main_grads_to_zero is None:
+            self.grad_data.zero_()
+            for grad in self.extra_main_grads:
+                grad.zero_()
+        elif self.main_grads_to_zero:
+            torch._foreach_zero_(self.main_grads_to_zero)
 
     def offload_to_cpu(self, move_params: bool = True, move_grads: bool = True) -> None:
         """

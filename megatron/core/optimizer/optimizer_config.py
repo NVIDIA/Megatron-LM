@@ -367,6 +367,33 @@ class OptimizerConfig:
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
+    overlap_optimizer_step_with_forward: bool = False
+    """If true, the distributed optimizer step is issued bucket group by bucket group on a side
+    stream and overlapped with the next iteration's forward pass: the gradient-norm partial of
+    each bucket group is taken as its reduce-scatter lands, and each bucket group's update
+    (TransformerEngine's capturable Adam, with the gradient clipping coefficient folded into the
+    kernel's gradient scale) is launched right before its param all-gather, in the order the
+    forward needs the parameters. The update of an iteration is therefore applied during the
+    next iteration's forward pass, also when that forward pass replays a full-iteration CUDA
+    graph; optimizer.step() only reduces the gradient norm and schedules the update, and
+    prepare_model_params_for_param_sync() applies a scheduled update eagerly before a forced
+    param sync (evaluation, checkpointing). Hyperparameters other than the learning rate are
+    arguments of the launched kernels and must not change while a captured graph replays.
+    Requires the distributed optimizer with overlap_grad_reduce and overlap_param_gather,
+    TransformerEngine's FusedAdam and no loss scaling."""
+
+    overlap_optimizer_step_prefetch: int = 2
+    """With overlap_optimizer_step_with_forward: number of bucket groups beyond the one the
+    forward pass is waiting for whose update and param all-gather are issued at that point."""
+
+    overlap_optimizer_step_flat_adam: bool = False
+    """With overlap_optimizer_step_with_forward: one TransformerEngine flat Adam launch per
+    bucket shard (flat_adam_capturable_master) instead of one multi-tensor launch per param
+    group and bucket group, for the float16 params updated through FP32 main params. The main
+    params and moments of a bucket shard are kept in one contiguous buffer each, laid out like
+    the shard; the update is bitwise the multi-tensor kernel's. A bucket shard whose buffers the
+    kernel cannot take keeps the multi-tensor launches, with a warning."""
+
     #######################
     # Optimizer Offload
     #######################
@@ -461,6 +488,37 @@ class OptimizerConfig:
             assert not math.isfinite(
                 self.grad_norm_skip_threshold
             ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
+
+        if self.overlap_optimizer_step_with_forward:
+            requirements = {
+                'use_distributed_optimizer': self.use_distributed_optimizer,
+                "optimizer == 'adam'": self.optimizer == 'adam',
+                'no loss scaling (not fp16, loss_scale is None)': (
+                    not self.fp16 and self.loss_scale is None
+                ),
+                'not use_precision_aware_optimizer': not self.use_precision_aware_optimizer,
+                'not optimizer_cpu_offload': not self.optimizer_cpu_offload,
+                'not optimizer_cuda_graph': not self.optimizer_cuda_graph,
+                'not overlap_param_gather_with_optimizer_step': (
+                    not self.overlap_param_gather_with_optimizer_step
+                ),
+                'not reuse_grad_buf_for_mxfp8_param_ag': not self.reuse_grad_buf_for_mxfp8_param_ag,
+                'not use_layer_wise_distributed_optimizer': (
+                    not self.use_layer_wise_distributed_optimizer
+                ),
+                'not log_num_zeros_in_grad': not self.log_num_zeros_in_grad,
+                'grad_norm_skip_threshold == inf': not math.isfinite(self.grad_norm_skip_threshold),
+                'overlap_optimizer_step_prefetch >= 0': self.overlap_optimizer_step_prefetch >= 0,
+            }
+            unmet = [name for name, satisfied in requirements.items() if not satisfied]
+            if unmet:
+                raise ValueError(
+                    "overlap_optimizer_step_with_forward requires " + ", ".join(unmet) + "."
+                )
+        if self.overlap_optimizer_step_flat_adam and not self.overlap_optimizer_step_with_forward:
+            raise ValueError(
+                "overlap_optimizer_step_flat_adam requires overlap_optimizer_step_with_forward."
+            )
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.
