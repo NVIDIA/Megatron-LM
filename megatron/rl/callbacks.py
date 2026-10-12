@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Any
+from typing import Any, Optional
 
 from megatron.rl import rl_utils
 from megatron.rl.rl_profiling import (
@@ -27,8 +27,17 @@ from megatron.training.utils import print_rank_0
 
 class RLLoggingCallback(Callback):
 
-    def __init__(self, rl_config: Any, *, global_batch_size: int) -> None:
+    def __init__(
+        self,
+        rl_config: Any,
+        *,
+        micro_batch_size: int,
+        global_batch_size: int,
+        save_dir: Optional[str],
+    ) -> None:
         self._rl_config = rl_config
+        self._micro_batch_size = micro_batch_size
+        self._save_dir = save_dir
         # Training iterations served by one rollout collection.
         self._iterations_per_collection = rl_config.grpo_iterations * (
             rl_config.grpo_samples_per_iteration // global_batch_size
@@ -37,7 +46,7 @@ class RLLoggingCallback(Callback):
     def on_train_start(self, context: CallbackContext) -> None:
         profile_dir = maybe_initialize_rl_profiler(
             self._rl_config,
-            get_args().save,
+            self._save_dir,
             log_to_wandb=get_wandb_writer() is not None,
             log_to_tensorboard=get_tensorboard_writer() is not None,
         )
@@ -48,7 +57,7 @@ class RLLoggingCallback(Callback):
         if self._rl_config.rl_use_sequence_packing:
             # Bins consumed by this step; the sequences inside them are counted by the loop.
             rl_utils.get_rl_runtime_state().consumed_train_bins += bin_batch_size(
-                get_args().micro_batch_size
+                self._micro_batch_size
             )
 
     def on_tensorboard_log(self, context: CallbackContext) -> None:
@@ -57,7 +66,7 @@ class RLLoggingCallback(Callback):
         iteration = get_train_state().iteration
         if self._rl_config.rl_use_sequence_packing:
             metrics = get_sequence_packing_tensorboard_metrics(
-                rl_utils.get_rl_runtime_state().consumed_train_bins, get_args().micro_batch_size
+                rl_utils.get_rl_runtime_state().consumed_train_bins, self._micro_batch_size
             )
             for name, value in metrics.items():
                 writer.add_scalar(name, value, iteration)

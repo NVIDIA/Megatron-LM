@@ -438,7 +438,12 @@ if __name__ == "__main__":
         forward_step,
         partial(model_provider, _model_builder),
         callbacks=[
-            RLLoggingCallback(full_config.rl, global_batch_size=args.global_batch_size),
+            RLLoggingCallback(
+                full_config.rl,
+                micro_batch_size=full_config.train.micro_batch_size,
+                global_batch_size=full_config.train.global_batch_size,
+                save_dir=full_config.checkpoint.save,
+            ),
             RLCheckpointCallback(),
         ],
     )

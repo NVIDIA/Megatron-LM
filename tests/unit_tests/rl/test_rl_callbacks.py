@@ -25,7 +25,7 @@ def env(monkeypatch):
         profiles=[],
     )
     monkeypatch.setattr(
-        rl_callbacks, "get_args", lambda: SimpleNamespace(micro_batch_size=2, save="/ckpt")
+        rl_callbacks, "get_args", SimpleNamespace  # only handed on to log_rl_throughput_metrics
     )
     monkeypatch.setattr(rl_callbacks, "get_tensorboard_writer", lambda: env.writer)
     monkeypatch.setattr(rl_callbacks, "get_wandb_writer", lambda: env.wandb_writer)
@@ -54,7 +54,8 @@ def test_logging_callback(env, packing, profile):
         rl_use_sequence_packing=packing,
         rl_profile=profile,
     )
-    callback = RLLoggingCallback(cfg, global_batch_size=6)  # 12 samples -> 2 batches x 2 epochs
+    # 12 samples -> 2 batches x 2 epochs
+    callback = RLLoggingCallback(cfg, micro_batch_size=2, global_batch_size=6, save_dir="/ckpt")
     env.runtime_state.consumed_train_bins = 7
     context = CallbackContext(
         model=None,
@@ -101,7 +102,10 @@ def test_logging_callback_lifecycle(env, monkeypatch, packing, profile):
     monkeypatch.setattr(rl_callbacks, "shutdown_rl_profiler", lambda: stopped.append(True))
     monkeypatch.setattr(rl_callbacks, "print_rank_0", lambda *_: None)
     callback = RLLoggingCallback(
-        RLConfig(rl_use_sequence_packing=packing, rl_profile=profile), global_batch_size=6
+        RLConfig(rl_use_sequence_packing=packing, rl_profile=profile),
+        micro_batch_size=2,
+        global_batch_size=6,
+        save_dir="/ckpt",
     )
     env.runtime_state.consumed_train_bins = 7
     context = CallbackContext(model=None)
