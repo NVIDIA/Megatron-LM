@@ -3152,6 +3152,10 @@ def _add_distributed_args(parser):
                        help='List of param_name patterns (in Python\'s fnmatch format) to match against '
                        'to do local gradient accumulation in FP32. The special pattern \'all\' matches '
                        'every parameter.')
+    group.add_argument('--overwrite-main-grad', action='store_true',
+                       default=False, help='If set, weight gradients overwrite .main_grad instead of '
+                       'accumulating into it, and DDP zero-fills only the gradients autograd produces '
+                       'instead of the whole grad buffer every iteration. Requires one micro-batch per step.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
