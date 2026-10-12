@@ -219,9 +219,7 @@ try:
     from megatron.rl import rl_utils
     from megatron.rl.inference.disagg import build_disagg_inference_model
     from megatron.rl.rl_profiling import (
-        RL_LOGGABLE_TIMER_NAMES,
         initialize_rl_profiler,
-        log_iteration_profile,
         shutdown_rl_profiler,
     )
 
@@ -3750,10 +3748,6 @@ def training_log(
             'backward-send-backward-recv',
             'forward-backward-send-forward-backward-recv',
         ])
-    # Add timers from RL loop if needed.
-    if cfg.rl.perform_rl_step:
-        timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
-
     # Count independent sequences; weight-sharding ranks may share a sequence through CP.
     batch_size = (
         args.micro_batch_size
@@ -3792,15 +3786,6 @@ def training_log(
         writer.add_scalar('batch-size vs samples', batch_size, train_state.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
-        # Log bins for packed mode
-        if has_rl_utils and cfg.rl.rl_use_sequence_packing:
-            packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(
-                rl_utils.get_rl_runtime_state().consumed_train_bins, args.micro_batch_size
-            )
-            for metric_name, metric_value in packing_metrics.items():
-                writer.add_scalar(metric_name, metric_value, iteration)
-            if wandb_writer and packing_metrics:
-                wandb_writer.log(packing_metrics, iteration)
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key], train_state.consumed_train_samples)
@@ -3833,11 +3818,6 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if cfg.rl.perform_rl_step:
-            grpo_collection_iteration = iteration // (cfg.rl.grpo_iterations * (cfg.rl.grpo_samples_per_iteration // args.global_batch_size))
-            writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
-            if wandb_writer:
-                wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
         if cfg.logger.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -4007,10 +3987,6 @@ def training_log(
             )
         else:
             log_string += ' consumed samples: {:12d} |'.format(train_state.consumed_train_samples)
-        if has_rl_utils and cfg.rl.rl_use_sequence_packing:
-            log_string += rl_utils.get_sequence_packing_log_info(
-                rl_utils.get_rl_runtime_state().consumed_train_bins
-            )
         if train_state.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(train_state.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
@@ -4082,12 +4058,6 @@ def training_log(
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
 
-        # RL token throughput metrics.
-        if cfg.rl.perform_rl_step:
-            log_string += rl_utils.log_rl_throughput_metrics(
-                args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
-            )
-
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
@@ -4147,19 +4117,6 @@ def training_log(
                 f'(after {iteration} iterations)',
                 process_group=pg_collection.dp if pg_collection is not None else None,
             )
-        # Log RL profiling data if enabled (must be before timers.log which resets timers).
-        # Token throughput metrics are read from RLRuntimeState automatically.
-        if cfg.rl.rl_profile:
-            log_iteration_profile(
-                iteration=iteration,
-                timers=timers,
-                elapsed_time_ms=elapsed_time_per_iteration * 1000.0,
-                throughput_tflops=throughput if cfg.logger.log_throughput else None,
-                global_batch_size=batch_size,
-                wandb_writer=wandb_writer,
-                tb_writer=writer,
-            )
-
         # Write timers to wandb, don't reset the counts.
         if cfg.logger.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=cfg.logger.log_interval, reset=False)

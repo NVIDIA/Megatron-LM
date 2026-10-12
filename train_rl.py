@@ -14,6 +14,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
+from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
     get_logprobs,
@@ -436,4 +437,8 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         partial(model_provider, _model_builder),
+        callbacks=[
+            RLLoggingCallback(full_config.rl, global_batch_size=args.global_batch_size),
+            RLCheckpointCallback(),
+        ],
     )
