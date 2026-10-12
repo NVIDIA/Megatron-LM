@@ -3129,6 +3129,10 @@ def _add_distributed_args(parser):
                        dest='overlap_p2p_comm')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
+    group.add_argument('--batch-grad-accumulation', action='store_true',
+                       default=False, help='If set, DDP accumulates the gradients autograd produces '
+                       'into .main_grad with one multi-tensor launch per bucket group, right before '
+                       'the bucket group\'s gradient reduction, instead of one launch per parameter.')
     group.add_argument('--ddp-num-buckets', type=int, default=None,
                        help='Number of buckets for data-parallel communication')
     group.add_argument('--ddp-bucket-size', type=int, default=None,

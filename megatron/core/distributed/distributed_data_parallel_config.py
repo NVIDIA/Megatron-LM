@@ -22,6 +22,14 @@ class DistributedDataParallelConfig:
     overlap_grad_reduce: bool = False
     """If true, overlap grad all-reduce / reduce-scatter with backward compute."""
 
+    batch_grad_accumulation: bool = False
+    """If true, accumulate the gradients autograd produces into .main_grad with one multi-tensor
+    launch per bucket group, issued right before the bucket group's gradient reduction, instead
+    of one launch per parameter in the backward hook. Saves launches in models with many small
+    parameters whose weight-gradient GEMMs do not write .main_grad themselves (see
+    gradient_accumulation_fusion). Gradients of at least 2^20 elements are still accumulated
+    right away. Bitwise identical to the per-parameter accumulation."""
+
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute."""
 
