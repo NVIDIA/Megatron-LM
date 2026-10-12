@@ -1100,6 +1100,15 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8', use_transformer_engine_op_fuser with moe_grouped_gemm,
     moe_expert_rank_capacity_factor and a Transformer Engine with gather_quantize_mxfp8."""
 
+    moe_local_routing_metadata_fusion: bool = False
+    """Build the HybridEP routing metadata of a single-rank expert group from the local routing
+    map with one fused kernel (per-expert token counts and padded counts, the dense token and
+    chunk layouts, the permute's row map and permuted probabilities, the overflow flag) instead
+    of HybridEP's cross-rank planner (routing-map all-gather, scan and padding kernels) and the
+    separate row-map and padded-count ops of the quantizing permute; the backward pass reuses
+    the forward's row map. Requires moe_permute_quantize_fusion, a single-rank expert group
+    (expert_model_parallel_size 1 and expert_tensor_parallel_size 1) and Triton."""
+
     moe_ncclep_zero_copy: bool = False
     """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
     (ep_bootstrap zero_copy + symm-mem-backed receive/combine buffers) instead of the default HBM
@@ -2188,6 +2197,22 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_permute_quantize_fusion requires a Transformer Engine with "
                     "gather_quantize_mxfp8."
                 ) from e
+
+        if self.moe_local_routing_metadata_fusion:
+            if not self.moe_permute_quantize_fusion:
+                raise ValueError(
+                    "moe_local_routing_metadata_fusion requires moe_permute_quantize_fusion: it "
+                    "builds the metadata of the quantizing HybridEP permute."
+                )
+            if self.expert_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+                raise ValueError(
+                    "moe_local_routing_metadata_fusion requires a single-rank expert group "
+                    "(expert_model_parallel_size=1 and expert_tensor_parallel_size=1)."
+                )
+            from megatron.core.fusions.fused_local_routing_metadata import HAVE_TRITON
+
+            if not HAVE_TRITON:
+                raise ValueError("moe_local_routing_metadata_fusion requires Triton.")
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")

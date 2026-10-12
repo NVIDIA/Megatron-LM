@@ -269,10 +269,14 @@ class MoEModelTestContainer:
         torch.testing.assert_close(grad_var, grad_ref, rtol=rtol, atol=atol)
 
     @pytest.mark.internal
-    def moe_layer_permute_quantize_parity_test(self):
+    def moe_layer_permute_quantize_parity_test(self, **overrides):
         """Full MoE-layer fwd+bwd with moe_permute_quantize_fusion off then on (identical weights):
         the fused permute hands the grouped MLP the same MXFP8 operands it would quantize itself and
-        the bias gradient the same BF16 rows, so outputs and gradients match bit for bit."""
+        the bias gradient the same BF16 rows, so outputs and gradients match bit for bit. With
+        moe_local_routing_metadata_fusion the metadata comes from the local routing map and the
+        combine and backward run off that handle."""
+        from unittest.mock import patch
+
         from megatron.core.transformer.moe import fused_a2a
 
         torch.manual_seed(42)
@@ -289,10 +293,16 @@ class MoEModelTestContainer:
         ref_layer = self.new_moe_layer()
         out_ref, grads_ref = run(ref_layer)
         reset_hybrid_ep_buffer()  # the fused permute needs its own kind of buffer
-        var_layer = self.new_moe_layer(moe_permute_quantize_fusion=True)
+        var_layer = self.new_moe_layer(moe_permute_quantize_fusion=True, **overrides)
         var_layer.load_state_dict(ref_layer.state_dict())
-        out_var, grads_var = run(var_layer)
+        with patch.object(
+            fused_a2a, "fused_local_routing_metadata", wraps=fused_a2a.fused_local_routing_metadata
+        ) as local_routing_metadata:
+            out_var, grads_var = run(var_layer)
         assert isinstance(fused_a2a._hybrid_ep_buffer, fused_a2a.HybridEPQuantizePermuteBuffer)
+        assert local_routing_metadata.called == bool(
+            overrides.get("moe_local_routing_metadata_fusion", False)
+        )
 
         torch.testing.assert_close(out_var, out_ref, rtol=0, atol=0)
         for grad_var, grad_ref in zip(grads_var, grads_ref):
@@ -663,13 +673,19 @@ class TestFlexDispatcher:
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
     @pytest.mark.timeout(120)
-    def test_hybridep_permute_quantize_fusion_parity(self):
+    @pytest.mark.parametrize("local_routing_metadata", [False, True])
+    def test_hybridep_permute_quantize_fusion_parity(self, local_routing_metadata):
         # A single-rank expert group (tp=1, ep=1) is the self-permutation the fusion applies to; the
         # MXFP8 op-fuser grouped MLP needs Blackwell.
         if not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
         if not is_permute_quantize_fusion_available():
             pytest.skip("Transformer Engine has no gather_quantize_mxfp8")
+        if local_routing_metadata:
+            from megatron.core.fusions.fused_local_routing_metadata import HAVE_TRITON
+
+            if not HAVE_TRITON:
+                pytest.skip("Triton is not available")
         container = MoEModelTestContainer(
             tp_size=1,
             ep_size=1,
@@ -690,7 +706,9 @@ class TestFlexDispatcher:
             hidden_size=1024,
             test_dtype=torch.bfloat16,
         )
-        container.moe_layer_permute_quantize_parity_test()
+        container.moe_layer_permute_quantize_parity_test(
+            **({"moe_local_routing_metadata_fusion": True} if local_routing_metadata else {})
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.skipif(

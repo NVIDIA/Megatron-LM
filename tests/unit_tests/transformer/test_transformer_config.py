@@ -446,6 +446,47 @@ def test_permute_quantize_fusion_rejects_unsupported_configs(overrides, message)
         _make_permute_quantize_config(**overrides)
 
 
+def _has_triton() -> bool:
+    from megatron.core.fusions.fused_local_routing_metadata import HAVE_TRITON
+
+    return bool(HAVE_TRITON)
+
+
+@pytest.mark.skipif(
+    not (_te_has_gather_quantize_mxfp8() and _has_triton()),
+    reason="needs a Transformer Engine with gather_quantize_mxfp8 and Triton",
+)
+def test_local_routing_metadata_fusion_accepts_single_rank_permute_quantize_config():
+    config = _make_permute_quantize_config(moe_local_routing_metadata_fusion=True)
+
+    assert config.moe_local_routing_metadata_fusion
+    assert config.expert_model_parallel_size == 1 and config.expert_tensor_parallel_size == 1
+
+
+def test_local_routing_metadata_fusion_requires_permute_quantize_fusion():
+    with pytest.raises(ValueError, match="moe_permute_quantize_fusion"):
+        _make_permute_quantize_config(
+            moe_permute_quantize_fusion=False, moe_local_routing_metadata_fusion=True
+        )
+
+
+@pytest.mark.skipif(
+    not _te_has_gather_quantize_mxfp8(),
+    reason="needs a Transformer Engine with gather_quantize_mxfp8",
+)
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(expert_model_parallel_size=2),
+        dict(tensor_model_parallel_size=2, expert_tensor_parallel_size=2),
+        dict(tensor_model_parallel_size=2),  # expert TP defaults to TP
+    ],
+)
+def test_local_routing_metadata_fusion_rejects_multi_rank_expert_groups(overrides):
+    with pytest.raises(ValueError, match="single-rank expert group"):
+        _make_permute_quantize_config(moe_local_routing_metadata_fusion=True, **overrides)
+
+
 requires_te_2_9 = pytest.mark.skipif(
     not is_te_min_version("2.9.0"), reason="sequence packing requires Transformer Engine >= 2.9.0"
 )
