@@ -527,3 +527,29 @@ def test_json_safe_helpers_clamp_only_non_finite():
     orjson = pytest.importorskip("orjson")
     assert orjson.dumps(NEG_INF) == b"null"
     assert orjson.loads(orjson.dumps(json_safe_logprob(NEG_INF))) == floor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["stop", "length"])
+async def test_stream_preserves_engine_finish_reason_at_budget(reason):
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.put(
+        {
+            "final": {
+                "prompt_tokens": [9],
+                "generated_tokens": [1, 2],
+                "generated_log_probs": [-0.1, -0.2],
+                "finish_reason": reason,
+                "sampling_params": {"num_tokens_to_generate": 2},
+            }
+        }
+    )
+    stream.finish()
+    records = [
+        record
+        async for record in openai_stream(
+            [stream], _Tokenizer(), [_IncrementalDetokenizer()], chat=False, return_log_probs=False
+        )
+    ]
+    payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
+    assert payloads[-1]["choices"][0]["finish_reason"] == reason
