@@ -726,49 +726,26 @@ def _unpermute_add_reference(permuted, dense_map, num_dense, topk, add):
 @pytest.mark.parametrize("group_size", [1, 2])
 def test_hybridep_dispatch_grad_fan_in(monkeypatch, group_size):
     """A single-rank group dispatches through the gradient fan-in when given one."""
-    manager = object.__new__(_HybridEPManager)
-    manager.config = SimpleNamespace(
-        moe_permute_fusion_into_hybridep=False,
-        moe_flex_dispatcher_num_sms=None,
-        moe_hybridep_num_blocks_permute=None,
-        moe_hybridep_num_blocks_unpermute=None,
-        moe_hybridep_num_sms_preprocessing=108,
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", lambda **kwargs: None)
+    monkeypatch.setattr(
+        token_dispatcher, "hybrid_ep_dispatch_grad_fan_in", lambda fan_in, **kwargs: None
     )
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(moe_permute_fusion_into_hybridep=False)
     manager.group = SimpleNamespace(size=lambda: group_size)
     manager.drop_and_pad = False
-    manager.num_local_experts = 3
-    manager.num_permuted_tokens = 8
-    manager.pad_multiple = None
-    manager.moe_expert_rank_capacity_factor = None
     manager._original_num_tokens = None
     manager._padded_num_tokens = None
-    manager.routing_map = torch.zeros(4, 3, dtype=torch.bool)
-    manager.token_probs = torch.zeros(4, 3)
     fan_in = fused_a2a.DispatchGradFanIn(topk=2)
-    calls = []
 
-    def fake_dispatch(**kwargs):
-        calls.append(("dispatch", kwargs["x"]))
-        return torch.zeros(8, 6), torch.zeros(8), None, torch.tensor([3, 3, 2]), None
+    dispatch_fn = manager._hybrid_ep_dispatch_fn(fan_in)
 
-    def fake_dispatch_grad_fan_in(got_fan_in, **kwargs):
-        assert got_fan_in is fan_in
-        calls.append(("dispatch_grad_fan_in", kwargs["x"]))
-        return torch.zeros(8, 6), torch.zeros(8), None, torch.tensor([3, 3, 2]), None
-
-    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", fake_dispatch)
-    monkeypatch.setattr(
-        token_dispatcher, "hybrid_ep_dispatch_grad_fan_in", fake_dispatch_grad_fan_in
-    )
-    monkeypatch.setattr(token_dispatcher, "get_align_size_for_quantization", lambda config: 0)
-
-    hidden = torch.randn(4, 6)
-    manager.dispatch(hidden, grad_fan_in=fan_in)
-    manager.dispatch(hidden)
-
-    expected = "dispatch_grad_fan_in" if group_size == 1 else "dispatch"
-    assert [name for name, _ in calls] == [expected, "dispatch"]
-    assert all(x is hidden for _, x in calls)
+    assert manager._hybrid_ep_dispatch_fn(None) is token_dispatcher.hybrid_ep_dispatch
+    if group_size == 1:
+        assert dispatch_fn.func is token_dispatcher.hybrid_ep_dispatch_grad_fan_in
+        assert dispatch_fn.args == (fan_in,)
+    else:
+        assert dispatch_fn is token_dispatcher.hybrid_ep_dispatch
 
 
 def test_router_input_grad_fan_in(monkeypatch):

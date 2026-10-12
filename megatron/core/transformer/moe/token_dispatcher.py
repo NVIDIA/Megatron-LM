@@ -1129,15 +1129,19 @@ class _HybridEPManager(_DispatchManager):
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
 
-    def _can_fan_in_dispatch_grad(self) -> bool:
-        """With a single-rank group the dispatch backward is a local unpermute that can add the
-        router's input gradient."""
-        return (
-            self.group.size() == 1
+    def _hybrid_ep_dispatch_fn(self, grad_fan_in):
+        """``hybrid_ep_dispatch``, or its variant handing the expert-input gradient to
+        ``grad_fan_in`` when the dispatch backward of this single-rank group is a local unpermute
+        that can add the router's input gradient."""
+        if (
+            grad_fan_in is not None
+            and self.group.size() == 1
             and not self.config.moe_permute_fusion_into_hybridep
             and not self.drop_and_pad
             and self._padded_num_tokens in (None, self._original_num_tokens)
-        )
+        ):
+            return functools.partial(hybrid_ep_dispatch_grad_fan_in, grad_fan_in)
+        return hybrid_ep_dispatch
 
     def dispatch(
         self,
@@ -1163,9 +1167,7 @@ class _HybridEPManager(_DispatchManager):
             hidden_states = torch.cat(
                 [hidden_states, hidden_states.new_zeros((pad_rows, hidden_states.shape[-1]))], dim=0
             )
-        hybrid_ep_dispatch_fn = hybrid_ep_dispatch
-        if grad_fan_in is not None and self._can_fan_in_dispatch_grad():
-            hybrid_ep_dispatch_fn = functools.partial(hybrid_ep_dispatch_grad_fan_in, grad_fan_in)
+        hybrid_ep_dispatch_fn = self._hybrid_ep_dispatch_fn(grad_fan_in)
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
             hybrid_ep_dispatch_fn(
                 x=hidden_states,
