@@ -1365,6 +1365,11 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         )
         full_k_index = cached_k if cached_k.numel() > 0 else None
         sq, batch_size, num_query_heads, _ = query.shape
+        # Mirror the forward's normalization: sq is this rank's shard, and the indexer loss is a
+        # mean over the whole sequence, so the divisor is the global token count. Dividing by the
+        # local count makes every rank's gradient cp_size too large, which the logged loss never
+        # reveals because only the backward is wrong.
+        total_positions = batch_size * sq * _cp_group_size(ctx.pg_collection)
         if full_k_index is None:
             # Not retained from the forward, so project it once here for the same reason the
             # forward does: the tile loop below would otherwise reproject the causal prefix per
@@ -1595,7 +1600,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             q_start,
                             ctx.pg_collection,
                         )
-                        scale = grad_indexer_loss * (ctx.loss_coeff / (batch_size * sq))
+                        scale = grad_indexer_loss * (ctx.loss_coeff / total_positions)
                         grad_scores = triton_indexer_loss_grad(selected_scores, teacher, scale)
                         if grad_scores is None:
                             student = torch.nn.functional.softmax(
