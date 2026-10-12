@@ -1,18 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Training curves of MiniMax-M3 lite through the real runtime (Magi protocol, dist_opt, bf16), 2 GPUs.
+"""Training curves of MiniMax-M3 lite through the real runtime (Magi protocol, bf16), 2 GPUs.
 
 Every rank sees the same 4096-token stream, so the dp=2 run equals a single-GPU run. Each parallel
-layout (EP2, PP2, CP2) starts from the same HF-format weights and must track the DP baseline loss curve:
-mean relative |delta| over the steps and over the last 10 steps both < 1%. The indexer weights must be
-bitwise unchanged after training on every layout (frozen selector; ``kl_loss_coeff=0`` alone would not
-guarantee this).
+layout (EP2, PP2, CP2) and optimizer backend (dist_opt, fsdp2) starts from the same HF-format weights
+and must track the dist_opt DP baseline loss curve: mean relative |delta| over the steps and over the
+last 10 steps both < 1%. The indexer weights must be bitwise unchanged after training on every layout
+(frozen selector; ``kl_loss_coeff=0`` alone would not guarantee this).
 
 Optional: ``ImplConfig.deterministic=True`` must reproduce loss and grad-norm bitwise across two runs (all-MSA model).
 """
 
 from __future__ import annotations
 
-import gc
 import time
 from types import SimpleNamespace
 
@@ -27,8 +26,12 @@ pytestmark = [
 
 S, STEPS, LR, CHUNK = 4096, 50, 1e-3, 512
 CURVE_REL = 1e-2
-_CASES = [("ep2", dict(tp=1, ep=2, etp=1, pp=1, cp=1), "alltoall"), ("pp2", dict(tp=1, ep=1, etp=1, pp=2, cp=1), "alltoall"),
-          ("cp2", dict(tp=1, ep=1, etp=1, pp=1, cp=2), "alltoall"), ("ep2_hybridep", dict(tp=1, ep=2, etp=1, pp=1, cp=1), "hybridep")]
+_DP2, _EP2, _PP2, _CP2 = (dict(tp=1, ep=1, etp=1, pp=1, cp=1), dict(tp=1, ep=2, etp=1, pp=1, cp=1),
+                          dict(tp=1, ep=1, etp=1, pp=2, cp=1), dict(tp=1, ep=1, etp=1, pp=1, cp=2))
+_CASES = [("ep2", _EP2, "alltoall", "dist_opt"), ("pp2", _PP2, "alltoall", "dist_opt"), ("cp2", _CP2, "alltoall", "dist_opt"),
+          ("ep2_hybridep", _EP2, "hybridep", "dist_opt"),
+          ("fsdp2_dp2", _DP2, "alltoall", "fsdp2"), ("fsdp2_ep2", _EP2, "alltoall", "fsdp2"),
+          ("fsdp2_pp2", _PP2, "alltoall", "fsdp2"), ("fsdp2_cp2", _CP2, "alltoall", "fsdp2")]
 
 
 def _deps(dist):
@@ -48,96 +51,22 @@ def _all_msa_config(magi_hf_kwargs):
     return cfg
 
 
-def _build_handle(cfg, src, parallel, *, load=True, deterministic=False, moe_dispatcher="alltoall"):
-    from megatron.lite.model.minimax_m3.lite import protocol
-    from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
-    from megatron.lite.runtime.contracts.config import OptimizerConfig
-    from megatron.lite.runtime.contracts.handle import ModelHandle
-
-    impl_cfg = protocol.ImplConfig(
-        parallel=parallel,
-        optimizer="dist_opt",
-        optimizer_config=OptimizerConfig(optimizer="adam", lr=LR, weight_decay=0.1, clip_grad=1.0),
-        deterministic=deterministic,
-        magi_chunk_size=CHUNK,
-        moe_dispatcher=moe_dispatcher,
-    )
-    torch.manual_seed(1)
-    bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
-    if load:
-        for chunk in bundle.chunks:
-            protocol.load_hf_weights(unwrap_model(chunk), src, cfg, bundle.parallel_state)
-    reload = getattr(bundle.optimizer, "reload_model_params", None)
-    if callable(reload):
-        reload()
-    extras = dict(bundle.extras)
-    extras.update(model_chunks=bundle.chunks, forward_step=bundle.forward_step, finalize_grads=bundle.finalize_grads,
-                  protocol=protocol, model_cfg=cfg)
-    return ModelHandle(
-        model=bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks,  # as MegatronLiteRuntime.build_model
-        optimizer=bundle.optimizer,
-        parallel_state=bundle.parallel_state,
-        config=SimpleNamespace(parallel=parallel),
-        _extras=extras,
-    )
-
-
-def _batch(cfg, step, seq_len):
-    from megatron.lite.runtime.contracts.data import PackedBatch
-
-    g = torch.Generator(device="cuda").manual_seed(100_000 + step)  # identical stream on every rank
-    ids = torch.randint(0, cfg.vocab_size, (seq_len,), device="cuda", generator=g)
-    labels = torch.randint(0, cfg.vocab_size, (seq_len,), device="cuda", generator=g)
-    return PackedBatch(input_ids=ids, labels=labels, seq_lens=torch.tensor([seq_len], dtype=torch.int64, device="cuda"))
-
-
-def _indexer_weights(handle):
-    from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
-
-    chunks = handle._model if isinstance(handle._model, list) else [handle._model]
-    return {n: p.detach().clone() for c in chunks for n, p in unwrap_model(c).named_parameters() if ".indexer." in n}
-
-
-_PS_GROUP_ATTRS = ("tp_group", "ep_group", "etp_group", "cp_group", "pp_group", "pp_cpu_group", "dp_group", "dp_cp_group",
-                   "tp_ep_group", "ep_dp_group")
-
-
-def _reset_parallel_state(ps):
-    """dist_opt initialises mcore's global parallel state per topology; tear it (and lite's groups) down between cases."""
-    import torch.distributed as dist
-
-    from megatron.core import parallel_state as mpu
-
-    from megatron.lite.primitive.modules.dispatcher import reset_hybridep_buffers
-
-    reset_hybridep_buffers()
-    if mpu.is_initialized():
-        mpu.destroy_model_parallel()
-    gc.collect()
-    for attr in _PS_GROUP_ATTRS:
-        group = getattr(ps, attr, None)
-        if group is not None:
-            try:
-                dist.destroy_process_group(group)
-            except Exception:
-                pass
-    torch.cuda.empty_cache()
-
-
-def _train(cfg, src, parallel, *, steps=STEPS, seq_len=S, load=True, deterministic=False, moe_dispatcher="alltoall"):
+def _train(tools, cfg, src, parallel, *, steps=STEPS, seq_len=S, load=True, deterministic=False, moe_dispatcher="alltoall",
+           optimizer="dist_opt"):
     from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-    handle = _build_handle(cfg, src, parallel, load=load, deterministic=deterministic, moe_dispatcher=moe_dispatcher)
+    handle = tools.build_handle(cfg, src, parallel, optimizer=optimizer, lr=LR, chunk_size=CHUNK, load=load,
+                                deterministic=deterministic, moe_dispatcher=moe_dispatcher)
     ps = handle._parallel_state
-    w0 = _indexer_weights(handle)
+    w0 = tools.indexer_weights(handle)
     losses, norms, step_times = [], [], []
     torch.cuda.reset_peak_memory_stats()
     for step in range(steps):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         runtime.zero_grad(handle)
-        res = runtime.forward_backward(handle, iter([_batch(cfg, step, seq_len)]), None, num_microbatches=1)
+        res = runtime.forward_backward(handle, iter([tools.batch(cfg, step, seq_len)]), None, num_microbatches=1)
         ok, gnorm, _ = runtime.optimizer_step(handle)
         torch.cuda.synchronize()
         step_times.append(time.perf_counter() - t0)
@@ -146,11 +75,11 @@ def _train(cfg, src, parallel, *, steps=STEPS, seq_len=S, load=True, determinist
         losses.append(float(loss.item()) if loss is not None else float("nan"))
         norms.append(gnorm)
     peak_gib = torch.cuda.max_memory_allocated() / 2**30
-    for n, w in _indexer_weights(handle).items():
+    for n, w in tools.indexer_weights(handle).items():
         assert torch.equal(w, w0[n]), f"indexer weight {n} changed during training"
     runtime.zero_grad(handle)
     del handle, runtime
-    _reset_parallel_state(ps)
+    tools.reset_parallel_state(ps)
     stats = SimpleNamespace(step_ms=1e3 * sum(step_times[2:]) / max(len(step_times) - 2, 1), peak_gib=peak_gib)
     return losses, norms, stats
 
@@ -164,11 +93,11 @@ def _curve_delta(losses, base, dist):
 
 
 @pytest.fixture(scope="module")
-def baseline(magi_cfg, magi_source, dist):
+def baseline(magi_cfg, magi_source, dist, runtime_tools):
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
     _deps(dist)
-    losses, norms, st = _train(magi_cfg, magi_source, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1))
+    losses, norms, st = _train(runtime_tools, magi_cfg, magi_source, ParallelConfig(**_DP2))
     if dist.get_rank() == 0:
         print(f"\ntrain_curve baseline dp2: loss[0]={losses[0]:.4f} loss[{STEPS // 2}]={losses[STEPS // 2]:.4f} "
               f"loss[-1]={losses[-1]:.4f} gnorm[0]={norms[0]:.3f} gnorm[-1]={norms[-1]:.3f} | {st.step_ms:.0f} ms/step, "
@@ -177,13 +106,20 @@ def baseline(magi_cfg, magi_source, dist):
     return losses
 
 
-@pytest.mark.parametrize("name,parallel,moe_dispatcher", _CASES, ids=[c[0] for c in _CASES])
-def test_train_curve_tracks_dp_baseline(magi_cfg, magi_source, baseline, dist, name, parallel, moe_dispatcher):
+@pytest.mark.parametrize("name,parallel,moe_dispatcher,optimizer", _CASES, ids=[c[0] for c in _CASES])
+def test_train_curve_tracks_dp_baseline(magi_cfg, magi_source, baseline, dist, runtime_tools, name, parallel, moe_dispatcher,
+                                        optimizer):
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
     if moe_dispatcher == "hybridep":
         pytest.importorskip("deep_ep")
-    losses, norms, st = _train(magi_cfg, magi_source, ParallelConfig(**parallel), moe_dispatcher=moe_dispatcher)
+    if optimizer == "fsdp2":
+        from megatron.lite.primitive.optimizers.fsdp2 import fsdp2_available
+
+        if not fsdp2_available():
+            pytest.skip("torch has no FSDP2 fully_shard")
+    losses, norms, st = _train(runtime_tools, magi_cfg, magi_source, ParallelConfig(**parallel), moe_dispatcher=moe_dispatcher,
+                               optimizer=optimizer)
     mean_rel, tail_rel = _curve_delta(losses, baseline, dist)
     if dist.get_rank() == 0:
         print(f"train_curve {name}: loss[0]={losses[0]:.4f} loss[-1]={losses[-1]:.4f} | mean rel|delta| {mean_rel:.3e} "
@@ -203,13 +139,14 @@ def _first_divergence(a, b):
 
 @pytest.mark.optional
 @pytest.mark.parametrize("cp", [1, 2])
-def test_deterministic_mode_reproduces_bitwise(magi_hf_kwargs, magi_source, dist, cp):
+def test_deterministic_mode_reproduces_bitwise(magi_hf_kwargs, magi_source, dist, runtime_tools, cp):
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
     _deps(dist)
     steps, cfg = 20, _all_msa_config(magi_hf_kwargs)
     (l0, n0, st0), (l1, n1, st1) = [
-        _train(cfg, magi_source, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=cp), steps=steps, load=False, deterministic=True)
+        _train(runtime_tools, cfg, magi_source, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=cp), steps=steps, load=False,
+               deterministic=True)
         for _ in range(2)
     ]
     same = torch.tensor([int(l0 == l1 and n0 == n1)], device="cuda")

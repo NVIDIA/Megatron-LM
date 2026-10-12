@@ -231,3 +231,95 @@ def grad_tools():
         worst=_worst, is_routed_expert=_is_routed_expert, is_routing_coupled=_is_routing_coupled,
         indexer_weights=_indexer_weights, assert_indexer_frozen=_assert_indexer_frozen,
     )
+
+
+def _build_handle(cfg, src, parallel, *, optimizer="dist_opt", lr=1e-3, weight_decay=0.1, chunk_size=512, load=True,
+                  deterministic=False, moe_dispatcher="alltoall"):
+    """Protocol build + HF weight load + (fsdp2) post-load wrap, packaged as the runtime's ModelHandle."""
+    from megatron.lite.model.minimax_m3.lite import protocol
+    from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+    from megatron.lite.runtime.contracts.config import OptimizerConfig
+    from megatron.lite.runtime.contracts.handle import ModelHandle
+
+    impl_cfg = protocol.ImplConfig(
+        parallel=parallel,
+        optimizer=optimizer,
+        optimizer_config=OptimizerConfig(optimizer="adam", lr=lr, weight_decay=weight_decay, clip_grad=1.0),
+        deterministic=deterministic,
+        magi_chunk_size=chunk_size,
+        moe_dispatcher=moe_dispatcher,
+    )
+    torch.manual_seed(1)
+    bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
+    if load:
+        for chunk in bundle.chunks:
+            protocol.load_hf_weights(unwrap_model(chunk), src, cfg, bundle.parallel_state)
+    post_load = bundle.extras.get("post_model_load_hook")
+    if callable(post_load):  # fsdp2 wraps and builds its optimizer after the weights are in place
+        bundle.optimizer = post_load()["optimizer"]
+    reload = getattr(bundle.optimizer, "reload_model_params", None)
+    if callable(reload):
+        reload()
+    extras = dict(bundle.extras)
+    extras.update(model_chunks=bundle.chunks, forward_step=bundle.forward_step, finalize_grads=bundle.finalize_grads,
+                  protocol=protocol, model_cfg=cfg)
+    return ModelHandle(
+        model=bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks,  # as MegatronLiteRuntime.build_model
+        optimizer=bundle.optimizer,
+        parallel_state=bundle.parallel_state,
+        config=SimpleNamespace(parallel=parallel),
+        _extras=extras,
+    )
+
+
+def _packed_batch(cfg, step, seq_len):
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    g = torch.Generator(device="cuda").manual_seed(100_000 + step)  # identical stream on every rank
+    ids = torch.randint(0, cfg.vocab_size, (seq_len,), device="cuda", generator=g)
+    labels = torch.randint(0, cfg.vocab_size, (seq_len,), device="cuda", generator=g)
+    return PackedBatch(input_ids=ids, labels=labels, seq_lens=torch.tensor([seq_len], dtype=torch.int64, device="cuda"))
+
+
+def _handle_indexer_weights(handle):
+    """Local indexer shards (plain tensors for dist_opt, DTensor local shards for fsdp2)."""
+    from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+    from megatron.lite.primitive.optimizers.fsdp2.adamw import to_local_tensor
+
+    chunks = handle._model if isinstance(handle._model, list) else [handle._model]
+    return {n: to_local_tensor(p.detach()).clone() for c in chunks for n, p in unwrap_model(c).named_parameters()
+            if ".indexer." in n}
+
+
+_PS_GROUP_ATTRS = ("tp_group", "ep_group", "etp_group", "cp_group", "pp_group", "pp_cpu_group", "dp_group", "dp_cp_group",
+                   "tp_ep_group", "ep_dp_group")
+
+
+def _reset_parallel_state(ps):
+    """dist_opt initialises mcore's global parallel state per topology; tear it (and lite's groups) down between cases."""
+    import gc
+
+    import torch.distributed as dist
+
+    from megatron.core import parallel_state as mpu
+    from megatron.lite.primitive.modules.dispatcher import reset_hybridep_buffers
+
+    reset_hybridep_buffers()
+    if mpu.is_initialized():
+        mpu.destroy_model_parallel()
+    gc.collect()
+    for attr in _PS_GROUP_ATTRS:
+        group = getattr(ps, attr, None)
+        if group is not None:
+            try:
+                dist.destroy_process_group(group)
+            except Exception:
+                pass
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+def runtime_tools():
+    """Build / batch / teardown helpers shared by the runtime-level smokes (training curve, fsdp2)."""
+    return SimpleNamespace(build_handle=_build_handle, batch=_packed_batch, indexer_weights=_handle_indexer_weights,
+                           reset_parallel_state=_reset_parallel_state)
