@@ -196,7 +196,7 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         pg_collection: ProcessGroupCollection | None = None,
         name: str | None = None,
         *,
-        mode: ResidualConnectionOperation,
+        operation: ResidualConnectionOperation,
     ) -> None:
         del pg_collection, name
         if config.wide_residual is None:
@@ -207,12 +207,12 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         super().__init__(
             residual_stream_hidden_size=wr.num_streams * config.hidden_size,
             branch_hidden_size=config.hidden_size,
-            mode=mode,
+            operation=operation,
         )
         self.layer_number = layer_number
         self.branch_name = branch_name
         self.num_streams = wr.num_streams
-        if mode == "read":
+        if operation == "read":
             self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
         else:
             self.write_map = StreamwiseSigmoidMap(config, map_kind="write")
@@ -220,7 +220,7 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             LearnedWideResidualRetention(
                 config, layer_number, branch_name, num_streams=self.num_streams
             )
-            if mode == "write" and wr.learned_retention
+            if operation == "write" and wr.learned_retention
             else None
         )
 
@@ -363,20 +363,20 @@ class WideResidualTransformerLayer(TransformerLayer):
         self.residual_write_self_attn = None
         if not isinstance(self.self_attention, IdentityOp):
             self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "self_attention", mode="read"
+                config, self.layer_number, "self_attention", operation="read"
             )
             self.residual_write_self_attn = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "self_attention", mode="write"
+                config, self.layer_number, "self_attention", operation="write"
             )
 
         self.residual_read_mlp = None
         self.residual_write_mlp = None
         if not isinstance(self.mlp, IdentityOp):
             self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "mlp", mode="read"
+                config, self.layer_number, "mlp", operation="read"
             )
             self.residual_write_mlp = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "mlp", mode="write"
+                config, self.layer_number, "mlp", operation="write"
             )
 
         self.register_load_state_dict_pre_hook(load_residual_state)
@@ -419,24 +419,30 @@ class WideResidualTransformerLayer(TransformerLayer):
                 )
 
     def _get_self_attention_residual_connection(
-        self,
-    ) -> tuple[ResidualConnection, ResidualConnection] | None:
-        """Return the connection surrounding the self-attention branch."""
+        self, operation: ResidualConnectionOperation
+    ) -> ResidualConnection | None:
+        """Return the reader or writer surrounding the self-attention branch."""
 
-        return (
-            (self.residual_read_self_attn, self.residual_write_self_attn)
-            if self.residual_read_self_attn is not None
-            else None
-        )
+        match operation:
+            case "read":
+                return self.residual_read_self_attn
+            case "write":
+                return self.residual_write_self_attn
+            case _:
+                raise ValueError(f"Unsupported residual connection operation: {operation}.")
 
-    def _get_mlp_residual_connection(self) -> tuple[ResidualConnection, ResidualConnection] | None:
-        """Return the connection surrounding the MLP or MoE branch."""
+    def _get_mlp_residual_connection(
+        self, operation: ResidualConnectionOperation
+    ) -> ResidualConnection | None:
+        """Return the reader or writer surrounding the MLP or MoE branch."""
 
-        return (
-            (self.residual_read_mlp, self.residual_write_mlp)
-            if self.residual_read_mlp is not None
-            else None
-        )
+        match operation:
+            case "read":
+                return self.residual_read_mlp
+            case "write":
+                return self.residual_write_mlp
+            case _:
+                raise ValueError(f"Unsupported residual connection operation: {operation}.")
 
 
 class StreamwiseSigmoidResidualReadout(nn.Module):

@@ -49,9 +49,9 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class _StaticTestConnection(ResidualConnection):
-    def __init__(self, stream_width: int, branch_width: int, *, mode):
-        super().__init__(stream_width, branch_width, mode=mode)
-        if mode == "read":
+    def __init__(self, stream_width: int, branch_width: int, *, operation):
+        super().__init__(stream_width, branch_width, operation=operation)
+        if operation == "read":
             self.read_map = nn.Parameter(
                 torch.randn(stream_width, branch_width) / stream_width**0.5
             )
@@ -95,8 +95,8 @@ class _StaticResidualChain(nn.Module):
             [
                 nn.ModuleList(
                     [
-                        _StaticTestConnection(stream_width, branch_width, mode=mode)
-                        for mode in ("read", "write")
+                        _StaticTestConnection(stream_width, branch_width, operation=operation)
+                        for operation in ("read", "write")
                     ]
                 )
                 for _ in range(2)
@@ -352,7 +352,7 @@ def _assert_matching_gradients(reference: nn.Module, recomputed: nn.Module) -> N
 def test_residual_connection_subclass_honors_requested_branch_dtype():
     """Subclasses inherit the default terminal-cast hook."""
 
-    connection = _StaticTestConnection(stream_width=12, branch_width=6, mode="read")
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, operation="read")
     hidden_states = torch.randn(4, 12, dtype=torch.float32)
 
     branch_input, state = connection(
@@ -368,7 +368,7 @@ def test_residual_connection_subclass_honors_requested_branch_dtype():
 def test_checkpoint_fp32_state_promotion_aliases_an_already_fp32_stream():
     """Replay's defensive FP32 promotion must not allocate for normal FP32 ingress."""
 
-    connection = _StaticTestConnection(stream_width=12, branch_width=6, mode="read")
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, operation="read")
     hidden_states = torch.randn(4, 12, dtype=torch.float32, requires_grad=True)
     context = build_residual_stream_recompute_plan(num_layers=1, block_size=1)[0]
 
@@ -387,7 +387,7 @@ def test_checkpoint_fp32_state_promotion_aliases_an_already_fp32_stream():
 
 @pytest.mark.parametrize("invalid_dtype", ["bfloat16", torch.int32])
 def test_residual_connection_rejects_invalid_branch_dtype(invalid_dtype):
-    connection = _StaticTestConnection(stream_width=12, branch_width=6, mode="read")
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, operation="read")
     hidden_states = torch.randn(4, 12)
 
     with pytest.raises(TypeError, match="branch_input_dtype"):
@@ -395,7 +395,7 @@ def test_residual_connection_rejects_invalid_branch_dtype(invalid_dtype):
 
 
 def test_residual_connection_rejects_branch_dtype_on_write():
-    connection = _StaticTestConnection(stream_width=12, branch_width=6, mode="write")
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, operation="write")
     hidden_states = torch.randn(4, 12)
 
     with pytest.raises(TypeError, match="read-only"):
@@ -919,7 +919,8 @@ class TestResidualStreamRecomputeIntegration:
         assert type(layer) is _RecordingOrdinaryTransformerLayer
         assert layer.is_mtp_layer
         assert not layer.supports_wide_residual_connections
-        assert layer._get_self_attention_residual_connection() is None
-        assert layer._get_mlp_residual_connection() is None
+        for operation in ("read", "write"):
+            assert layer._get_self_attention_residual_connection(operation=operation) is None
+            assert layer._get_mlp_residual_connection(operation=operation) is None
         assert not layer.received_residual_recompute_kwarg
         assert hidden_states.grad is not None

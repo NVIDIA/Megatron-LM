@@ -30,10 +30,10 @@ class _WideResidualHarness(nn.Module):
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__()
         self.reader = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", mode="read"
+            config=config, layer_number=1, branch_name="test", operation="read"
         )
         self.writer = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", mode="write"
+            config=config, layer_number=1, branch_name="test", operation="write"
         )
 
     def forward(self, residual_stream: torch.Tensor) -> torch.Tensor:
@@ -52,9 +52,12 @@ class _WideResidualReplayHarness(nn.Module):
                 nn.ModuleList(
                     [
                         StreamwiseSigmoidWideResidualConnection(
-                            config=config, layer_number=layer_number, branch_name="test", mode=mode
+                            config=config,
+                            layer_number=layer_number,
+                            branch_name="test",
+                            operation=operation,
                         )
-                        for mode in ("read", "write")
+                        for operation in ("read", "write")
                     ]
                 )
                 for layer_number in range(1, 3)

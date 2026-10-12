@@ -87,7 +87,7 @@ def _assert_branchwise_geometry(
     writer = layer.residual_write_mlp
     assert isinstance(reader, StreamwiseSigmoidWideResidualConnection)
     assert isinstance(writer, StreamwiseSigmoidWideResidualConnection)
-    assert (reader.mode, writer.mode) == ("read", "write")
+    assert (reader.operation, writer.operation) == ("read", "write")
     assert layer.residual_stream_hidden_size == wide_hidden_size
     for operation in (reader, writer):
         assert operation.residual_stream_hidden_size == wide_hidden_size

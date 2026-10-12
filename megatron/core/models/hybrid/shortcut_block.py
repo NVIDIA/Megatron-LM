@@ -193,12 +193,11 @@ class ShortcutMoEBlock(MegatronModule):
                 layer_number=moe_layer.layer_number,
                 branch_name="shortcut_routed",
             )
-            outer_connection = moe_layer._get_mlp_residual_connection()
-            if outer_connection is None:
+            outer_read = moe_layer._get_mlp_residual_connection(operation="read")
+            if outer_read is None:
                 raise ValueError(
                     "A wide-residual shortcut read requires an outer MoE residual connection."
                 )
-            outer_read, _ = outer_connection
             if (
                 self.shortcut_residual_read.residual_stream_hidden_size
                 != outer_read.residual_stream_hidden_size

@@ -59,10 +59,10 @@ class WideResidualMambaLayer(MambaLayer):
             )
 
         self.residual_read = StreamwiseSigmoidWideResidualConnection(
-            config, self.layer_number, "mamba", mode="read"
+            config, self.layer_number, "mamba", operation="read"
         )
         self.residual_write = StreamwiseSigmoidWideResidualConnection(
-            config, self.layer_number, "mamba", mode="write"
+            config, self.layer_number, "mamba", operation="write"
         )
         self.register_load_state_dict_pre_hook(load_residual_state)
         self.residual_stream_hidden_size = (

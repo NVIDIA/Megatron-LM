@@ -22,7 +22,7 @@ class ResidualConnection(nn.Module, ABC):
     stream as the first tensor in ``ResidualConnectionState``. Concrete connections
     own bias, dropout, mapping, and residual-update semantics.
 
-    ``mode`` fixes an instance to one operation at construction.
+    ``operation`` fixes an instance to one operation at construction.
     """
 
     def __init__(
@@ -30,12 +30,12 @@ class ResidualConnection(nn.Module, ABC):
         residual_stream_hidden_size: int,
         branch_hidden_size: int,
         *,
-        mode: ResidualConnectionOperation,
+        operation: ResidualConnectionOperation,
     ):
         super().__init__()
-        if mode not in ("read", "write"):
-            raise ValueError(f"Unsupported residual connection mode: {mode}.")
-        self.mode = mode
+        if operation not in ("read", "write"):
+            raise ValueError(f"Unsupported residual connection operation: {operation}.")
+        self.operation = operation
         if residual_stream_hidden_size <= 0:
             raise ValueError("Residual-stream hidden size must be positive.")
         if branch_hidden_size <= 0:
@@ -90,7 +90,7 @@ class ResidualConnection(nn.Module, ABC):
         dtype; otherwise compatible connections may produce that dtype directly in a fused read.
         """
 
-        match self.mode:
+        match self.operation:
             case "read":
                 if not torch.is_tensor(value):
                     raise TypeError("Residual connection read expects a tensor.")
@@ -122,7 +122,7 @@ class ResidualConnection(nn.Module, ABC):
                     value, state, dropout_probability=dropout_probability, training=training
                 )
             case _:
-                raise ValueError(f"Unsupported residual connection mode: {self.mode}.")
+                raise ValueError(f"Unsupported residual connection operation: {self.operation}.")
 
     def _read_with_validation(
         self,

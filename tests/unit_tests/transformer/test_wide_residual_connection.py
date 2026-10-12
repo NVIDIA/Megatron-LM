@@ -295,7 +295,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
                 layer_number=1,
                 branch_name="test",
                 pg_collection=_process_groups(),
-                mode="read",
+                operation="read",
             )
         with pytest.raises(ValueError, match="StreamwiseSigmoidResidualReadout requires"):
             StreamwiseSigmoidResidualReadout(base_config)
@@ -321,7 +321,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
             layer_number=1,
             branch_name="test",
             pg_collection=_process_groups(),
-            mode="read",
+            operation="read",
         )
         residual_stream = torch.randn(
             2, connection.residual_stream_hidden_size, dtype=torch.float32
@@ -341,7 +341,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
             layer_number=1,
             branch_name="test",
             pg_collection=_process_groups(),
-            mode="read",
+            operation="read",
         )
         residual_stream = torch.randn(
             2, connection.residual_stream_hidden_size, dtype=torch.float32
@@ -380,7 +380,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
             layer_number=1,
             branch_name="test",
             pg_collection=_process_groups(),
-            mode="write",
+            operation="write",
         )
         residual_stream = torch.randn(
             2, connection.residual_stream_hidden_size, dtype=torch.float32
@@ -436,7 +436,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
             layer_number=1,
             branch_name="test",
             pg_collection=_process_groups(),
-            mode="write",
+            operation="write",
         )
         residual = torch.randn(
             4, connection.residual_stream_hidden_size, dtype=torch.float32, requires_grad=True
@@ -480,9 +480,9 @@ class TestStreamwiseSigmoidWideResidualConnection:
         config = _wide_config(init_scale=0.0)
         reader, writer = (
             StreamwiseSigmoidWideResidualConnection(
-                config=config, layer_number=1, branch_name="test", mode=mode
+                config=config, layer_number=1, branch_name="test", operation=operation
             )
-            for mode in ("read", "write")
+            for operation in ("read", "write")
         )
         readout = StreamwiseSigmoidResidualReadout(config)
         base = torch.randn(2, config.hidden_size)
@@ -502,9 +502,9 @@ class TestStreamwiseSigmoidWideResidualConnection:
         config.sequence_parallel = sequence_parallel
         reader, writer = (
             StreamwiseSigmoidWideResidualConnection(
-                config=config, layer_number=1, branch_name="test", mode=mode
+                config=config, layer_number=1, branch_name="test", operation=operation
             )
-            for mode in ("read", "write")
+            for operation in ("read", "write")
         )
 
         parameters = (
@@ -523,9 +523,9 @@ class TestStreamwiseSigmoidWideResidualConnection:
         config = _wide_config(learned_retention=True)
         reader, writer = (
             StreamwiseSigmoidWideResidualConnection(
-                config=config, layer_number=1, branch_name="test", mode=mode
+                config=config, layer_number=1, branch_name="test", operation=operation
             )
-            for mode in ("read", "write")
+            for operation in ("read", "write")
         )
         operations = []
         reader.read_map.register_forward_pre_hook(lambda *_: operations.append("read"))
@@ -542,9 +542,9 @@ class TestStreamwiseSigmoidWideResidualConnection:
         config = _wide_config(init_scale=0.01, learned_retention=True)
         reader, writer = (
             StreamwiseSigmoidWideResidualConnection(
-                config=config, layer_number=1, branch_name="test", mode=mode
+                config=config, layer_number=1, branch_name="test", operation=operation
             )
-            for mode in ("read", "write")
+            for operation in ("read", "write")
         )
         residual_stream = torch.randn(4, 3 * config.hidden_size, requires_grad=True)
         branch_input, state = reader(residual_stream)
@@ -563,9 +563,11 @@ class TestStreamwiseSigmoidWideResidualConnection:
 
     def test_checkpoint_round_trip_is_strict(self):
         config = _wide_config(learned_retention=True)
-        for mode in ("read", "write"):
-            source = StreamwiseSigmoidWideResidualConnection(config, 1, "test", mode=mode)
-            destination = StreamwiseSigmoidWideResidualConnection(config, 1, "test", mode=mode)
+        for operation in ("read", "write"):
+            source = StreamwiseSigmoidWideResidualConnection(config, 1, "test", operation=operation)
+            destination = StreamwiseSigmoidWideResidualConnection(
+                config, 1, "test", operation=operation
+            )
             with torch.no_grad():
                 for parameter in source.parameters():
                     parameter[0].add_(0.25)
@@ -574,7 +576,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
             destination.load_state_dict(state, strict=True)
             expected_keys = (
                 {"read_map.logit"}
-                if mode == "read"
+                if operation == "read"
                 else {"write_map.logit", "retention.retention_logit"}
             )
             assert set(state) == expected_keys
@@ -634,17 +636,19 @@ class TestWideResidualStaticConstruction:
 
         assert layer_spec.module is WideResidualTransformerLayer
         assert type(layer) is WideResidualTransformerLayer
-        connections = {
-            "self_attention": layer._get_self_attention_residual_connection(),
-            "mlp": layer._get_mlp_residual_connection(),
-        }
-        for branch_name, connection in connections.items():
-            if branch_name in expected_connections:
-                assert isinstance(connection[0], StreamwiseSigmoidWideResidualConnection)
-                assert isinstance(connection[1], StreamwiseSigmoidWideResidualConnection)
-                assert (connection[0].mode, connection[1].mode) == ("read", "write")
-            else:
-                assert connection is None
+        for operation in ("read", "write"):
+            connections = {
+                "self_attention": layer._get_self_attention_residual_connection(
+                    operation=operation
+                ),
+                "mlp": layer._get_mlp_residual_connection(operation=operation),
+            }
+            for branch_name, connection in connections.items():
+                if branch_name in expected_connections:
+                    assert isinstance(connection, StreamwiseSigmoidWideResidualConnection)
+                    assert connection.operation == operation
+                else:
+                    assert connection is None
         if len(expected_connections) == 2:
             assert layer.residual_read_self_attn is not layer.residual_read_mlp
 

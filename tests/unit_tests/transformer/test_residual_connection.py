@@ -13,13 +13,13 @@ class _ProtocolResidualConnection(ResidualConnection):
     def __init__(
         self,
         *,
-        mode,
+        operation,
         residual_stream_hidden_size=12,
         branch_hidden_size=4,
         read_behavior="valid",
         write_behavior="valid",
     ):
-        super().__init__(residual_stream_hidden_size, branch_hidden_size, mode=mode)
+        super().__init__(residual_stream_hidden_size, branch_hidden_size, operation=operation)
         self.read_behavior = read_behavior
         self.write_behavior = write_behavior
 
@@ -46,16 +46,16 @@ class _ProtocolResidualConnection(ResidualConnection):
 
 
 class TestResidualConnectionContract:
-    def test_construction_mode_dispatches(self):
-        reader = _ProtocolResidualConnection(mode="read")
-        writer = _ProtocolResidualConnection(mode="write")
+    def test_construction_operation_dispatches(self):
+        reader = _ProtocolResidualConnection(operation="read")
+        writer = _ProtocolResidualConnection(operation="write")
         residual = torch.randn(2, 12)
         branch, state = reader(residual)
         assert writer(branch, state=state, dropout_probability=0.0, training=False) is residual
 
     def test_constructor_rejects_invalid_mode(self):
-        with pytest.raises(ValueError, match="Unsupported residual connection mode"):
-            _ProtocolResidualConnection(mode="invalid")
+        with pytest.raises(ValueError, match="Unsupported residual connection operation"):
+            _ProtocolResidualConnection(operation="invalid")
 
     @pytest.mark.parametrize(
         ("residual_stream_hidden_size", "branch_hidden_size"), [(0, 4), (12, 0)]
@@ -65,14 +65,14 @@ class TestResidualConnectionContract:
     ):
         with pytest.raises(ValueError, match="hidden size must be positive"):
             _ProtocolResidualConnection(
-                mode="read",
+                operation="read",
                 residual_stream_hidden_size=residual_stream_hidden_size,
                 branch_hidden_size=branch_hidden_size,
             )
 
     def test_forward_rejects_mode_argument_mismatches(self):
-        reader = _ProtocolResidualConnection(mode="read")
-        writer = _ProtocolResidualConnection(mode="write")
+        reader = _ProtocolResidualConnection(operation="read")
+        writer = _ProtocolResidualConnection(operation="write")
         residual = torch.randn(2, 12)
         branch = torch.randn(2, 4)
 
@@ -106,17 +106,17 @@ class TestResidualConnectionContract:
     def test_read_validates_implementation_outputs(
         self, read_behavior, expected_exception, expected_error
     ):
-        connection = _ProtocolResidualConnection(mode="read", read_behavior=read_behavior)
+        connection = _ProtocolResidualConnection(operation="read", read_behavior=read_behavior)
 
         with pytest.raises(expected_exception, match=expected_error):
             connection(torch.randn(2, 12))
 
     def test_read_validates_input_width(self):
         with pytest.raises(ValueError, match="expected residual-stream hidden size"):
-            _ProtocolResidualConnection(mode="read")(torch.randn(2, 11))
+            _ProtocolResidualConnection(operation="read")(torch.randn(2, 11))
 
     def test_write_validates_state_branch_output_and_implementation_output(self):
-        connection = _ProtocolResidualConnection(mode="write")
+        connection = _ProtocolResidualConnection(operation="write")
         residual = torch.randn(2, 12)
         branch = torch.randn(2, 4)
         write_kwargs = dict(state=(residual,), dropout_probability=0.0, training=False)
@@ -139,7 +139,7 @@ class TestResidualConnectionContract:
             ("wrong_shape", "changed the residual-stream shape"),
         ):
             invalid_connection = _ProtocolResidualConnection(
-                mode="write", write_behavior=write_behavior
+                operation="write", write_behavior=write_behavior
             )
             with pytest.raises(
                 TypeError if write_behavior == "non_tensor" else ValueError, match=expected_error

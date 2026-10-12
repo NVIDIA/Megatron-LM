@@ -99,22 +99,26 @@ class _FakeMoE(torch.nn.Module):
         self.mlp = _FakeMLP()
         if config.wide_residual is not None:
             self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "test", mode="read"
+                config, self.layer_number, "test", operation="read"
             )
             self.residual_write_mlp = StreamwiseSigmoidWideResidualConnection(
-                config, layer_number, "mlp", mode="write"
+                config, layer_number, "mlp", operation="write"
             )
 
     def _pre_mlp_layernorm_and_residual(self, hidden_states):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
-    def _get_mlp_residual_connection(self):
-        return (
-            (self.residual_read_mlp, self.residual_write_mlp)
-            if self.config.wide_residual is not None
-            else None
-        )
+    def _get_mlp_residual_connection(self, operation):
+        if self.config.wide_residual is None:
+            return None
+        match operation:
+            case "read":
+                return self.residual_read_mlp
+            case "write":
+                return self.residual_write_mlp
+            case _:
+                raise ValueError(f"Unsupported residual connection operation: {operation}.")
 
 
 @pytest.mark.parametrize(
