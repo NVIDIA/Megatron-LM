@@ -255,10 +255,12 @@ def test_config_includes_mtp_ratio_and_derives_dimensions():
     assert config.hetereogenous_dist_checkpoint is True
 
 
-def test_config_rejects_context_parallelism():
-    """The SBHD slice should fail early instead of silently accepting unsupported CP."""
-    with pytest.raises(AssertionError, match="does not support context parallelism"):
+def test_config_requires_contiguous_context_parallelism():
+    """Static packed CP uses the main-owned contiguous layout contract."""
+    with pytest.raises(ValueError, match="attention_cp_layout='contiguous'"):
         _make_config(context_parallel_size=2)
+    config = _make_config(context_parallel_size=2, attention_cp_layout="contiguous")
+    assert config.context_parallel_size == 2
 
 
 def test_config_accepts_cudnn_backend_for_fused_sbhd():

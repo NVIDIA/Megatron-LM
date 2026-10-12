@@ -48,30 +48,24 @@ def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
 def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
     """Derive rowwise scales from the layout shared by rowwise_data and columnwise_data."""
     return GlobalLayout(
-        tensor_shapes=tuple(
-            torch.Size((shape[0], shape[1] // _MXFP8_BLOCK_SIZE))
-            for shape in data_layout.tensor_shapes
+        tensor_shapes=(
+            (shape[0], shape[1] // _MXFP8_BLOCK_SIZE) for shape in data_layout.tensor_shapes
         ),
-        tensor_to_offset=tuple(
-            offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
-        ),
+        tensor_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
-        rank_to_offset=tuple(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
+        rank_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
     )
 
 
 def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
     """Derive columnwise scales from the layout shared by rowwise_data and columnwise_data."""
     return GlobalLayout(
-        tensor_shapes=tuple(
-            torch.Size((shape[0] // _MXFP8_BLOCK_SIZE, shape[1]))
-            for shape in data_layout.tensor_shapes
+        tensor_shapes=(
+            (shape[0] // _MXFP8_BLOCK_SIZE, shape[1]) for shape in data_layout.tensor_shapes
         ),
-        tensor_to_offset=tuple(
-            offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
-        ),
+        tensor_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
-        rank_to_offset=tuple(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
+        rank_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
     )
 
 

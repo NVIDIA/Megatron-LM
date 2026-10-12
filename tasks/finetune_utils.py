@@ -9,7 +9,7 @@ import torch
 
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.num_microbatches_calculator import get_num_microbatches, update_num_microbatches
 from megatron.training import get_args, get_timers, get_train_state, print_rank_0
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import get_run_config
@@ -285,7 +285,8 @@ def finetune(train_valid_datasets_provider, model_provider,
         args.load = args.pretrained_checkpoint
         original_rng = args.no_load_rng
         args.no_load_rng = True
-        _ = load_checkpoint(model, None, None)
+        _ = load_checkpoint(model, None, None, restore_training_state=True)
+        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         args.load = original_load
         args.no_load_rng = original_rng
         # This is critical when only model is loaded. We should make sure
