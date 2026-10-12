@@ -6,6 +6,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import _allreduce_word_embedding_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     uneven_dtensor_to_full_tensor,
@@ -17,9 +18,9 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class StageEmbedding(torch.nn.Linear):
-    def __init__(self, value):
+    def __init__(self, value, rows):
         self.value = value
-        super().__init__(16, 17, bias=False, device='meta', dtype=torch.bfloat16)
+        super().__init__(16, rows, bias=False, device='meta', dtype=torch.bfloat16)
         self.weight.shared_embedding = True
         self.weight._tensor_parallel_mode = 'column'
 
@@ -28,13 +29,14 @@ class StageEmbedding(torch.nn.Linear):
 
 
 class EmbeddingStage(torch.nn.Module):
-    def __init__(self, sharing, stage):
+    def __init__(self, sharing, stage, rows):
         super().__init__()
         self.embedding = StageEmbedding(
-            (stage + 1) * 10 + parallel_state.get_tensor_model_parallel_rank()
+            (stage + 1) * 10 + parallel_state.get_tensor_model_parallel_rank(), rows
         )
         self.share_embeddings_and_output_weights = sharing == 'tied'
         self.embd_group = parallel_state.get_embedding_group()
+        self.pre_process = stage == 0
 
     def shared_embedding_or_output_weight(self):
         return self.embedding.weight
@@ -43,12 +45,16 @@ class EmbeddingStage(torch.nn.Module):
         return self.embedding(value)
 
 
+@pytest.mark.parametrize('rows', [1, 17])
 @pytest.mark.parametrize('pp', [1, 2])
 @pytest.mark.parametrize('tp', [1, 2])
 @pytest.mark.parametrize('sharing', ['tied', 'mtp', 'none'])
 @pytest.mark.parametrize('wrapped', [False, True])
-def test_materialized_embedding_replicas_and_compute_weights(pp, tp, sharing, wrapped):
-    """Use the real v1 constructor, master buffers and BF16 forward hooks."""
+@pytest.mark.parametrize('decoupled', [False, True])
+def test_materialized_embedding_replicas_and_compute_weights(
+    pp, tp, sharing, wrapped, decoupled, rows
+):
+    """Use real v1 initialization and BF16 forward/backward with decoupled gradients."""
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
     try:
         model_parallel_cuda_manual_seed(123)
@@ -65,7 +71,7 @@ def test_materialized_embedding_replicas_and_compute_weights(pp, tp, sharing, wr
             params_dtype=torch.bfloat16,
             mtp_num_layers=1 if sharing == 'mtp' else None,
         )
-        module = EmbeddingStage(sharing, stage)
+        module = EmbeddingStage(sharing, stage, rows)
         if wrapped:
             module = Float16Module(config=config, module=module)
         model = FullyShardedDataParallelV1(
@@ -76,6 +82,7 @@ def test_materialized_embedding_replicas_and_compute_weights(pp, tp, sharing, wr
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_use_decoupled_grad=decoupled,
             ),
             module=module,
             fsdp_unit_modules=[StageEmbedding],
@@ -85,12 +92,30 @@ def test_materialized_embedding_replicas_and_compute_weights(pp, tp, sharing, wr
         master = model.param_and_grad_buffer.dist_main_weight[name]
         full = uneven_dtensor_to_full_tensor(master)
         reference = torch.cat(
-            [torch.full((17, 16), expected + i, device='cuda') for i in range(tp)]
+            [torch.full((rows, 16), expected + i, device='cuda') for i in range(tp)]
         )
         torch.testing.assert_close(full, reference, rtol=0, atol=0, check_dtype=False)
         output = model(torch.ones(2, 16, device='cuda', dtype=torch.bfloat16))
         assert torch.all(
             output == (expected + parallel_state.get_tensor_model_parallel_rank()) * 16
         )
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        row_weights = torch.arange(1 + tp_rank * rows, 1 + (tp_rank + 1) * rows, device='cuda')
+        ((output.float() * row_weights).sum() * (stage + 1)).backward()
+        model.finish_grad_sync()
+        _allreduce_word_embedding_grads(
+            [model],
+            config,
+            embd_group=parallel_state.get_embedding_group(),
+            pp_group=parallel_state.get_pipeline_model_parallel_group(),
+        )
+        gradient = model.param_and_grad_buffer.dist_main_grad[name]
+        if rows == 1:
+            empty_shards = torch.tensor(int(gradient._local_tensor.numel() == 0), device='cuda')
+            torch.distributed.all_reduce(empty_shards)
+            assert empty_shards.item() > 0
+        expected_grad = 6 if pp == 2 and sharing != 'none' else 2 * (stage + 1)
+        reference_grad = torch.arange(1, tp * rows + 1, device='cuda').view(-1, 1) * expected_grad
+        assert torch.all(uneven_dtensor_to_full_tensor(gradient) == reference_grad)
     finally:
         Utils.destroy_model_parallel()
