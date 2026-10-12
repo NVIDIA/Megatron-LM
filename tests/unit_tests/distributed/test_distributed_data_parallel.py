@@ -1,4 +1,6 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -35,6 +37,44 @@ class TestDistributedDataParallel:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    def test_zero_grad_buffer_preserves_pending_param_gather(self):
+        """Independent parameter gathers remain pending until parameters are needed."""
+        config = TransformerConfig(num_attention_heads=1, num_layers=1, bf16=True)
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True, overlap_grad_reduce=True, overlap_param_gather=True
+        )
+        model = TestModel(input_dim=4, output_dim=4).cuda().bfloat16()
+        ddp = DistributedDataParallel(config, ddp_config, model)
+        for buffer in ddp.buffers:
+            assert buffer.param_data.data_ptr() != buffer.grad_data.data_ptr()
+            buffer.grad_data.fill_(1)
+            buffer.param_data.fill_(2)
+        param_buffers = [buffer.param_data.clone() for buffer in ddp.buffers]
+
+        ddp.start_param_sync(force_dispatch=True)
+        pending = []
+        for group in ddp.bucket_groups:
+            assert group.param_gather_handle is not None
+            handle = Mock(wraps=group.param_gather_handle)
+            group.param_gather_handle = handle
+            pending.append((group, handle))
+
+        try:
+            ddp.zero_grad_buffer()
+            for group, handle in pending:
+                handle.wait.assert_not_called()
+                assert group.param_gather_handle is handle
+            for buffer in ddp.buffers:
+                assert torch.count_nonzero(buffer.grad_data) == 0
+        finally:
+            ddp.finish_pending_param_sync()
+
+        for group, handle in pending:
+            handle.wait.assert_called_once()
+            assert group.param_gather_handle is None
+        for buffer, expected in zip(ddp.buffers, param_buffers):
+            testing.assert_close(buffer.param_data, expected, rtol=0, atol=0)
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
