@@ -459,6 +459,33 @@ class TestMhcA2AOverlapNumerics:
             )
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("recompute", (False, True), ids=("without-recompute", "recompute"))
+    def test_identity_hyper_connections_schedule_matches_eager(self, recompute):
+        """iHC's H_res is a constant: the schedule's detach bridges must skip it, not
+        hand a tensor without grad_fn to run_backward."""
+        ihc = {"enable_identity_hyper_connections": True}
+        reference_config = _make_mhc_numerical_config(
+            overlap=False, recompute=recompute, extra_config=ihc
+        )
+        overlap_config = _make_mhc_numerical_config(recompute=recompute, extra_config=ihc)
+        with deterministic_mode():
+            data = build_input_data(seq_len=16)
+            reference_model = build_gpt_model(reference_config)
+            initial_parameters = reset_model(reference_model)
+            reference_output, reference_gradients = _run_eager_and_capture(reference_model, data)
+            del reference_model
+
+            overlap_model = build_gpt_model(overlap_config)
+            for layer in overlap_model.decoder.layers:
+                assert layer.mlp_hyper_connection.identity_h_res
+                assert layer.mlp_hyper_connection.alpha_res is None
+            reset_model(overlap_model, initial_parameters)
+            overlap_output, overlap_gradients = _run_schedule_and_capture(overlap_model, data)
+
+        torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
+        _assert_close_grads(overlap_gradients, reference_gradients)
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     def test_two_inflight_plans_keep_recompute_groups_independent(self):
         reference_config = _make_mhc_numerical_config(overlap=False)
         overlap_config = _make_mhc_numerical_config()

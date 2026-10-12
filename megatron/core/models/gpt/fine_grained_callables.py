@@ -404,11 +404,18 @@ class TransformerLayerNode(ScheduleNode):
         self.before_detached = tuple()
 
     def detach(self, t):
-        """Detaches a tensor and stores it for backward computation."""
+        """Detaches a tensor and stores it for backward computation.
+
+        Only tensors that require grad are bridged: ``backward_impl`` hands every
+        recorded tensor to ``run_backward``, which rejects a tensor without a
+        ``grad_fn``. A constant such as the identity ``h_res`` of identity
+        hyper-connections therefore just gets a detached view and no bridge.
+        """
         detached = make_viewless(t).detach()
         detached.requires_grad = t.requires_grad
-        self.before_detached = self.before_detached + (t,)
-        self.detached = self.detached + (detached,)
+        if t.requires_grad:
+            self.before_detached = self.before_detached + (t,)
+            self.detached = self.detached + (detached,)
         return detached
 
     def forward_impl(self, *args):
