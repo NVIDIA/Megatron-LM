@@ -354,6 +354,8 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
                     deterministic=impl_cfg.deterministic,
                     vpp=impl_cfg.parallel.vpp,
                     leaf_module_names=(),
+                    # inputs are int ids; the cast walks kwargs and rebuilds dataclasses (magi_ctx holds init=False fields)
+                    cast_forward_inputs=False,
                 )
             }
 
