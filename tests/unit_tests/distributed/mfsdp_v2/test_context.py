@@ -1,8 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for experimental Megatron-FSDP runtime contexts."""
+"""Unit tests for experimental Megatron-FSDP runtime contexts.
+
+Test prefetch-order construction here; test communication/computation overlap
+in ``test_overlap.py``.
+"""
 
 from unittest.mock import Mock
+from weakref import ref
 
 import pytest
 import torch
@@ -14,7 +19,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
+    microbatch,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContext
 
 
 class NestedModel(nn.Module):
@@ -77,6 +84,19 @@ def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
+def test_context_defaults_to_current_cuda_device(distributed_setup):
+    """Omitting the device should create the stream on the current CUDA device."""
+    assert FsdpContext().allgather_stream.device == torch.device(
+        "cuda", torch.cuda.current_device()
+    )
+
+
+def test_context_rejects_non_cuda_device(distributed_setup):
+    """The context constructor should reject non-CUDA devices."""
+    with pytest.raises(ValueError, match="CUDA device"):
+        FsdpContext(device=torch.device("cpu"))
+
+
 def test_child_then_parent_share_one_context(distributed_setup):
     """Modules constructed together should eagerly share one context."""
     device = distributed_setup.device
@@ -96,6 +116,26 @@ def test_child_then_parent_share_one_context(distributed_setup):
     assert model.inner.context is model.context
     assert model.is_root()
     assert not model.inner.is_root()
+
+
+def test_context_does_not_keep_modules_alive(distributed_setup):
+    """Keeping a finalized context alive must not retain its roots or descendants."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel().to(device)
+
+    with fully_shard_context(device=device) as context:
+        fully_shard(model.inner, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    model_ref = ref(model)
+    child_ref = ref(model.inner)
+    del model
+
+    assert model_ref() is None
+    assert child_ref() is None
+    assert list(context.forward_order) == []
+    assert list(context.backward_order) == []
 
 
 def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
@@ -270,3 +310,20 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
             fully_shard(model, mesh=mesh, placements=_default_placements())
 
     assert model.inner.context is first_context
+
+
+def test_microbatch_scopes_context(distributed_setup):
+    """microbatch() should scope state on the supplied FSDP context."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
+    with fully_shard_context(device=device) as context:
+        for layer in model:
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
+
+    with microbatch(context, is_last=False):
+        assert not context.is_last_microbatch
+
+    assert context.is_last_microbatch

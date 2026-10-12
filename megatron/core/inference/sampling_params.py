@@ -68,6 +68,9 @@ class SamplingParams:
     streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
     do_kv_handoff: bool = False  # Pin KV blocks and expose metadata for peer transfer.
 
+    # Optional request-local RNG; independent of dynamic batch position.
+    seed: Optional[int] = None
+
     def __post_init__(self):
         """Validate parameters and maintain backward compatibility.
 
@@ -81,9 +84,14 @@ class SamplingParams:
             ):
                 raise ValueError("stop_token_ids must be a list of nonnegative integers")
             self.stop_token_ids = sorted(set(self.stop_token_ids))
+        self._validate_seed()
         self._normalize_filters()
         self._sync_prompt_logprobs_fields()
         self._validate_streaming_interval()
+
+    def _validate_seed(self):
+        if self.seed is not None and (type(self.seed) is not int or not 0 <= self.seed < 2**63):
+            raise ValueError("seed must be a nonnegative int64 or null")
 
     def _normalize_filters(self):
         """Map no-op filter values to the disabled sentinels (top_k=0, top_p=0.0)."""
@@ -132,6 +140,7 @@ class SamplingParams:
             setattr(self, key, value)
 
         # Synchronize fields after setting attributes
+        self._validate_seed()
         self._normalize_filters()
         self._sync_prompt_logprobs_fields()
         self._validate_streaming_interval()

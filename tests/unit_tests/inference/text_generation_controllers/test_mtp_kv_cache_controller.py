@@ -203,6 +203,7 @@ def _make_controller(context, model, sp_enabled: bool = False, tp_size: int = 1)
         inference_context=context, tp_group=None, model=model
     )
     controller._unwrapped_model = model
+    controller._language_model = model
     controller._sp_enabled = sp_enabled
     controller._tp_size = tp_size
     controller._is_last_pp_stage = True
