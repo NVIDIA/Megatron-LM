@@ -134,8 +134,13 @@ class RouterInterface(Protocol):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass of the router.
+
+        ``token_multiplicities`` (one logical token count per flattened row) is passed only when
+        a caller sets ``MoELayer._shared_prefix_token_multiplicities``; routers that never see
+        such a caller need not accept it.
 
         Returns:
             A tuple of (probabilities, routing_map).
@@ -233,6 +238,12 @@ class MoELayer(BaseMoELayer):
     subset of experts. This implementation supports different token dispatching
     strategies such as All-to-All and All-Gather.
     """
+
+    # Per-call shared-prefix token multiplicities. A shared-prefix caller sets it on the instance
+    # around one layer call and deletes it afterwards, restoring this default. Only the eager
+    # MoELayer.forward path reads it; paths that call route() directly or replay a CUDA graph
+    # ignore it, so callers must use the eager forward.
+    _shared_prefix_token_multiplicities = None
 
     def __init__(
         self,
@@ -500,18 +511,22 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
     ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping. The input padding mask is batch-first;
         routing consumes it sequence-first to align with ``hidden_states``.
+        ``token_multiplicities`` (one logical token count per flattened sequence-first row) is
+        forwarded to the router only when set, so routers without the argument keep working.
         """
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
-        probs, routing_map = apply_module(self.router)(
-            hidden_states, padding_mask, input_ids=input_ids, packed_seq_params=packed_seq_params
-        )
+        router_kwargs = {"input_ids": input_ids, "packed_seq_params": packed_seq_params}
+        if token_multiplicities is not None:
+            router_kwargs["token_multiplicities"] = token_multiplicities
+        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask, **router_kwargs)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -721,13 +736,21 @@ class MoELayer(BaseMoELayer):
             )
         self.select_token_dispatcher()
 
+        # Keep the tensor in the checkpoint closure: the shared-prefix caller
+        # removes the scoped attribute before selective recomputation in backward.
+        token_multiplicities = self._shared_prefix_token_multiplicities
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(
-                        hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                        hidden_states,
+                        padding_mask,
+                        input_ids=input_ids,
+                        packed_seq_params=packed_seq_params,
+                        token_multiplicities=token_multiplicities,
                     )
                     hidden_states, probs = self.preprocess(
                         hidden_states, probs, routing_map, padding_mask
