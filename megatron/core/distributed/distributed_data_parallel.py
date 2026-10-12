@@ -783,8 +783,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 "DistributedDataParallel with grad_buffer_offload=True."
             )
 
-        # Deregister all pools before releasing any storage. A failure leaves storage intact,
-        # but registration may already be partially removed; this is not a rollback boundary.
+        # Deregister all pools before releasing any storage. If one fails,
+        # storage remains intact, but earlier deregistrations are not undone.
+        # The caller must abort the run rather than retry or reuse the model.
         try:
             for buffer in registered_buffers:
                 buffer.deregister_grad_pool_for_offload()
