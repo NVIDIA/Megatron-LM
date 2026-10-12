@@ -138,6 +138,7 @@ def _provider(args: argparse.Namespace) -> Any:
             "vision_recompute_granularity": None,
             "language_max_sequence_length": args.seq_length,
             "deterministic_mode": False,
+            "gdn_kernel_backend": "fla",
             "gdn_pre_gated_delta_rule_fusion": args.fused_pre_gdr,
             "fine_grained_activation_offloading": args.fraction is not None,
             "offload_modules": ["gdn_core_attn"] if args.fraction is not None else [],

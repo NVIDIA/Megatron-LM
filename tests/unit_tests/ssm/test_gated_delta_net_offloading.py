@@ -62,7 +62,9 @@ def _config(**kwargs: Any) -> TransformerConfig:
         ({"bf16": False, "params_dtype": torch.float32}, "BF16"),
         ({"fp8": "e4m3"}, "BF16"),
         ({"fp4": "e2m1"}, "BF16"),
-        ({"deterministic_mode": True}, "FLA"),
+        ({"gdn_kernel_backend": "torch"}, "FLA"),
+        ({"gdn_kernel_backend": "transformer_engine"}, "FLA"),
+        ({"deterministic_mode": True, "gdn_kernel_backend": "torch"}, "FLA"),
         (
             {
                 "recompute_granularity": "full",

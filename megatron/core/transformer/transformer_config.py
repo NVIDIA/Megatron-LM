@@ -2687,7 +2687,7 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError("gdn_core_attn offloading only supports GDN (gdn).")
                 if not self.bf16 or self.fp8 or self.fp4:
                     raise ValueError("gdn_core_attn offloading requires BF16 without FP8 or FP4.")
-                if self.deterministic_mode:
+                if self.gdn_kernel_backend != "fla":
                     raise ValueError("gdn_core_attn offloading requires the FLA recurrence.")
                 if self.recompute_granularity == "full":
                     raise ValueError(
