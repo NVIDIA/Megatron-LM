@@ -1,6 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Global layer keys must distinguish FSDP pipeline stages in DCP checkpoints."""
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -131,3 +134,20 @@ def test_distributed_checkpoint_retains_every_stage(tmp_path, pp):
             if group != dist.GroupMember.NON_GROUP_MEMBER:
                 dist.destroy_process_group(group)
         Utils.destroy_model_parallel()
+
+
+def test_v2_checkpoint_preprocessing_preserves_global_optimizer_keys():
+    """An uneven stage has overlapping local/global ranges; v2 must not remap twice."""
+    from megatron.training import checkpointing
+
+    model = stage_model([2, 3, 4])
+    values = {f'decoder.layers.{i}.weight': torch.tensor(i) for i in [1, 2, 3]}
+    optimizer = {'state': {key: {'exp_avg': value} for key, value in values.items()}}
+    args = SimpleNamespace(swiglu=False, num_experts=None, megatron_fsdp_version=2)
+    with patch.object(checkpointing, 'preprocess_state_dict_for_uneven_dtensor'):
+        result = checkpointing.preprocess_fsdp_dtensor_state_dict(
+            args, {'model': values, 'optimizer': optimizer}, model
+        )
+    assert list(result['optimizer']['state']) == list(values)
+    for key in values:
+        assert result['optimizer']['state'][key]['exp_avg'] is values[key]

@@ -1930,7 +1930,9 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     # Rename MTP and pipeline layers to their on-disk names last because the handlers
     # above resolve keys against live module paths, which still use the new name.
     apply(handle_mtp_in_state_dict)
-    apply(handle_pipeline_parallel_in_state_dict)
+    # V2 optimizer keys are already global and must not be renamed again.
+    if getattr(args, "megatron_fsdp_version", 1) == 1:
+        apply(handle_pipeline_parallel_in_state_dict)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
