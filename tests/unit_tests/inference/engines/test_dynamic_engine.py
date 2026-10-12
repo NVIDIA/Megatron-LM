@@ -920,6 +920,7 @@ class DynamicEngineTestConfig:
     fp8: bool = False
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
+    flash_attention_version: Optional[int] = 2
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
     # HybridModel, and only the layer pattern and stack spec (and so the
@@ -1191,6 +1192,7 @@ class DynamicInferenceEngineTestBase:
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
+                flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
@@ -1300,6 +1302,7 @@ class DynamicInferenceEngineTestBase:
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
+                flash_attention_version=test_config.flash_attention_version,
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer

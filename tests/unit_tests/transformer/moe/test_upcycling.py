@@ -138,7 +138,7 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     set_run_config(pretrain_cfg_container_from_args(args))
-    initialize_runtime_services(args, build_tokenizer=False)
+    initialize_runtime_services(args, build_tokenizer=False, training=True)
     return args
 
 
