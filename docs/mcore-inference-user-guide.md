@@ -804,27 +804,52 @@ yet covered — notably video, audio, and pipeline parallelism.
 
 ## Disaggregated Prefill and Decode
 
-The building blocks for splitting prefill and decode across separate engines are
-in tree. A prefill engine pins its KV blocks and publishes handoff metadata when
-a request sets `SamplingParams.do_kv_handoff=True`; a decode engine imports that
-state and continues generation. `DisaggDynamicInferenceEngine` is the engine
-subclass for both roles, and `setup_kv_transfer(role, backend)` — with `role` of
-`"prefill"` or `"decode"` and a `nixl` or `nccl` backend — wires up the
-transport. It must be called collectively by every model-parallel rank.
+The native HTTP server can run prefill and decode on separate GPUs; no Dynamo
+deployment or client-side handoff is needed. Enable it with role-tagged
+`--inference-shards` and prefix caching on
+`examples/inference/launch_inference_server.py`.
 
-KV state is resharded across mismatched TP and PP layouts between the two pools,
-and hybrid models additionally hand off their recurrent conv and SSM state.
-`--inference-shards` describes the partitioning, for example
-`"tp=2,role=prefill+tp=1,dp=2,role=decode"`.
+Starting from a working server launch, keep your model, checkpoint, tokenizer,
+and cache-sizing arguments (`MODEL_ARGS` below), and use two GPUs for one
+prefill engine and one decode engine:
 
-Two prerequisites: **prefix caching must be enabled on both the prefill and the
-decode engine**, and a hybrid decode engine must not set
-`prefix_caching_mamba_gb`.
+```bash
+torchrun --standalone --nproc-per-node=2 \
+    examples/inference/launch_inference_server.py \
+    "${MODEL_ARGS[@]}" \
+    --inference-shards 'tp=1,role=prefill+tp=1,role=decode' \
+    --inference-dynamic-batching-enable-prefix-caching \
+    --disagg-kv-transport-backend nccl \
+    --port 5000
+```
 
-> This is transfer plumbing plus a shard-layout spec, driven today by an external
-> control plane (for example Dynamo). Megatron-LM does not yet ship a launcher
-> that stands up a disaggregated deployment end to end, and handoff does not
-> support log-probs.
+`MODEL_ARGS` is your existing shell array of model-specific arguments, not a
+Megatron option. Each engine must have enough memory for its model and cache.
+The shard sizes must cover the entire torchrun world. For example, four GPUs
+can use `tp=2,role=prefill+tp=1,dp=2,role=decode` for one TP=2 prefill engine
+and two TP=1 decode engines. NCCL works within this shared launch; alternatively,
+select `nixl` (the default) with NIXL installed on every engine rank.
+
+Send requests to the same frontend as usual:
+
+```bash
+curl http://localhost:5000/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"EMPTY","prompt":"Hello","max_tokens":32,"temperature":0}'
+```
+
+There is no disaggregation flag in the HTTP request. The native coordinator
+routes prefill, reserves a decode engine, transfers KV state (plus conv/SSM
+state for hybrid models), and returns the response through the same frontend.
+Ordinary clients use `SUBMIT_REQUEST`; the runtime sends
+`SUBMIT_REQUEST_WITH_KV` directly to the selected decode engine.
+
+Prefix caching must remain enabled on both roles. For hybrid models, leave
+`--inference-dynamic-batching-prefix-caching-mamba-gb` unset on the shared launch:
+decode imports recurrent state into live slots, not the prefix-cache state buffer. Native disaggregation
+currently accepts text/token prompts, not multimodal inputs. Generated-token
+log-probs are supported with `skip_prompt_log_probs=True`; prompt and top-N
+log-probs are not.
 
 ---
 
@@ -1032,8 +1057,9 @@ is the opposite of the `MegatronLLM` constructor default.
   and a TE build exposing that constructor argument.
 - **MXFP8 fused quantization supports squared-ReLU only.** SwiGLU uses separate
   BF16 activation and MXFP8 quantization kernels; it does not fall back to BF16 GEMM.
-- **Disaggregated handoff does not support log-probs** (`return_log_probs` or
-  `top_n_logprobs > 0` raises).
+- **Disaggregated handoff supports generated-token log-probs only.** Set
+  `skip_prompt_log_probs=True` when requesting them; prompt log-probs and
+  `top_n_logprobs > 0` are not supported.
 
 **Engine and serving**
 
@@ -1078,9 +1104,6 @@ is the opposite of the `MegatronLLM` constructor default.
 
 **Models and performance:**
 
-- **Turnkey disaggregated inference** — a launcher and control plane on top of
-  the KV and SSM handoff primitives that exist today, plus log-prob support
-  across a handoff.
 - **FlashInfer integration** for attention and Mamba kernels (sampling, fused
   RoPE, and MoE grouped GEMM are already integrated).
 - **All2Allv-based token dispatcher** for MoE.

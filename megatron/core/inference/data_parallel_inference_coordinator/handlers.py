@@ -296,7 +296,8 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
 
     Native disaggregation rejects client-supplied handoffs here: its runtime
     selects and reserves a decode engine, then sends SUBMIT_REQUEST_WITH_KV
-    directly to that engine, bypassing this handler.
+    directly to that engine, bypassing this handler. The header is shared by
+    both paths; only this client-facing handler is external-orchestration-only.
 
     ``metadata``: ``[header, client_request_id, sampling_params, kv_meta]``,
         where ``kv_meta`` is the peer's NIXL agent/layout export. It is bounded
@@ -396,8 +397,9 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
         return
     request_id = int(metadata[1])
     instance_id = metadata[2] if len(metadata) > 2 else None
-    # Two-field releases have no instance fence. Fenced releases may affect only
-    # this coordinator incarnation, never a replacement reusing the request ID.
+    # Two fields: accept the unfenced release without an ACK. Three fields:
+    # release only when the instance ID matches; otherwise ACK a no-op so a
+    # stale retry cannot free a replacement coordinator's reused request ID.
     if len(metadata) == 2 or instance_id == coordinator.instance_id:
         engine = coordinator.handoff_ownership.source_engine(request_id)
         if engine is None:
