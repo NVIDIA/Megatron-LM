@@ -26,6 +26,7 @@ class Sampling(ABC):
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
         output: Optional[Tensor] = None,
+        sequence_lengths: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:
@@ -43,6 +44,8 @@ class Sampling(ABC):
             token_to_request_index: Per-token request mapping; when set, sampling
                 parameters are gathered per-token instead of per-request.
             output: Optional caller-owned destination tensor of shape `[n]`.
+            sequence_lengths: Positions of the pending logits, before async scheduling
+                advances the live context. Used by request-local sampling.
             eager, cache_key: Accepted for API symmetry; ignored (no CUDA graph).
 
         Returns:
