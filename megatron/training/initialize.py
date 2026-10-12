@@ -12,7 +12,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu, tensor_parallel, tuning
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
@@ -41,6 +41,7 @@ from megatron.training import (
     get_tensorboard_writer,
     inprocess_restart,
 )
+from megatron.training.argument_utils import _triton_autotune_config_from_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 from megatron.training.global_vars import get_run_config
@@ -126,6 +127,9 @@ def initialize_megatron(
             f"Enabling batch invariant mode globally (backend={backend}, collective={collective})"
         )
         enable_batch_invariant_mode(backend, collective)
+
+    # Before any Triton kernel runs, including the kernel warm-up before model construction.
+    tuning.install(_triton_autotune_config_from_args(args), deterministic=args.deterministic_mode)
 
     # torch.distributed initialization
     def finish_mpu_init():

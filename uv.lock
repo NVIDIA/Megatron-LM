@@ -35,7 +35,7 @@ version = "1.0.0+9edee0c"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.20.2+6ea2a74a"
+version = "2.20.2+44f31bbe"
 requires-dist = ["pydantic<2.14", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect", "nvidia-cudnn-frontend>=1.29.0"]
 
 [[package]]
@@ -2771,7 +2771,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6.0" },
     { name = "torch-memory-saver", marker = "extra == 'inference'", git = "https://github.com/fzyzcjy/torch_memory_saver.git?rev=9bc9a442e6d108c7b7903def199896a005143aaf" },
     { name = "tqdm", marker = "extra == 'dev'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=6ea2a74a9e98c99e6d7b164a33775cc457520027" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=44f31bbeaf99bd30a67b928000d4b980026debd2" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -6054,8 +6054,8 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.20.2+6ea2a74a"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=6ea2a74a9e98c99e6d7b164a33775cc457520027#6ea2a74a9e98c99e6d7b164a33775cc457520027" }
+version = "2.20.2+44f31bbe"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=44f31bbeaf99bd30a67b928000d4b980026debd2#44f31bbeaf99bd30a67b928000d4b980026debd2" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
