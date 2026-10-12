@@ -265,11 +265,8 @@ The earlier paused-session evidence remains in
 `deep-review-20261010/qwen-completed-validation.json`.
 
 Pretrained CP remains unqualified after the actual four-rank disabled-baseline
-failure described above. A read-only GitHub check on 2026-10-11 finds no upstream
-GPU CI run: the public draft PR has the earlier `b3434091b` head, and the current
-account has read-only access to `NVIDIA/Megatron-LM`. Publishing the signed local
-changes and obtaining upstream approval/dispatch are external steps. Local
-results do not replace upstream CI.
+failure described above. Upstream GPU CI has not run; the PR remains a draft
+pending upstream review and CI approval. Local results do not replace upstream CI.
 
 ## Complete-Qwen A6000 measurements
 
