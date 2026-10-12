@@ -4,6 +4,7 @@
 
 from argparse import ArgumentParser, Namespace
 from copy import deepcopy
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,13 +12,14 @@ import pytest
 
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
-from megatron.training import arguments, global_vars
+from megatron.training import arguments, global_vars, initialize
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
     inference_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
+from megatron.training.config import DistributedInitConfig
 from megatron.training.config.training_config import TokenizerConfig
 
 
@@ -44,6 +46,66 @@ def _runtime_args():
         exit_signal_handler_for_training=False,
         disable_jit_fuser=False,
     )
+
+
+def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_config):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.rank, args.world_size = 0, 4
+    # These topology values are normally resolved by validate_args.
+    args.gtp_weight_remat_size = args.expert_gtp_weight_remat_size = 1
+    args.virtual_pipeline_model_parallel_size = None
+    args.expert_tensor_parallel_size = 1
+    original_args = vars(args).copy()
+    # Keep the legacy defaults different so an accidental args read is detected.
+    run_config.dist = DistributedInitConfig(
+        distributed_backend="gloo",
+        distributed_timeout_minutes=37,
+        local_rank=1,
+        use_sharp=True,
+        sharp_enabled_group="dp_replica",
+        use_gloo_process_groups=False,
+        high_priority_stream_groups=["tp"],
+        use_tp_pp_dp_mapping=True,
+        nccl_communicator_config_path="owned.yaml",
+    )
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(initialize, "print_rank_0", Mock())
+    monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 2)
+    set_device = Mock()
+    monkeypatch.setattr(initialize.torch.cuda, "set_device", set_device)
+    monkeypatch.setattr(initialize.torch.distributed, "is_initialized", lambda: False)
+    init_pg, init_mpu = Mock(), Mock()
+    monkeypatch.setattr(initialize.torch.distributed, "init_process_group", init_pg)
+    monkeypatch.setattr(initialize.inprocess_restart, "maybe_force_nccl_backend_init", Mock())
+    monkeypatch.setattr(initialize.mpu, "model_parallel_is_initialized", lambda: False)
+    monkeypatch.setattr(initialize.mpu, "initialize_model_parallel", init_mpu)
+    for name in (
+        "get_tensor_model_parallel_world_size",
+        "get_pipeline_model_parallel_world_size",
+        "get_gtp_weight_remat_world_size",
+    ):
+        monkeypatch.setattr(initialize.mpu, name, lambda: 1)
+    for name in ("TORCH_FR_DUMP_TEMP_FILE", "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    store = object()
+
+    initialize._initialize_distributed(None, None, store)
+
+    set_device.assert_called_once_with(1)
+    init_pg.assert_called_once_with(
+        backend="gloo", store=store, world_size=4, rank=0, timeout=timedelta(minutes=37)
+    )
+    kwargs = init_mpu.call_args.kwargs
+    assert kwargs["distributed_timeout_minutes"] == 37
+    assert kwargs["nccl_communicator_config_path"] == "owned.yaml"
+    assert kwargs["order"] == "tp-cp-ep-pp-dp"
+    assert kwargs["high_priority_stream_groups"] == ["tp"]
+    assert kwargs["use_sharp"] is True
+    assert kwargs["sharp_enabled_group"] == "dp_replica"
+    assert kwargs["create_gloo_process_groups"] is False
+    assert vars(args) == original_args
 
 
 @pytest.mark.parametrize("experimental", [False, True])

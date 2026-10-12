@@ -1028,6 +1028,8 @@ def test_checkpoint_load_without_microbatch_calculator(
                 .eval()
             )
 
+        # CPU-initialized DP replicas must match; the fixture only seeds CUDA.
+        torch.manual_seed(123)
         model = build_model()
         save_checkpoint(123, [model], None, None, 456)
         saved_rng = torch.get_rng_state().clone()
