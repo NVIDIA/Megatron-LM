@@ -2,11 +2,13 @@
 
 """Distributed optimizer step issued bucket group by bucket group, overlapped with the forward."""
 
+import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
 from .. import tensor_parallel
+from ..distributed.param_and_grad_buffer import shard_buffer
 from ..full_cuda_graph import get_shared_capture_stream
 from ..transformer.module import param_is_not_shared
 from ..utils import get_attr_wrapped_model
@@ -14,12 +16,16 @@ from .clip_grads import l2_norm_impl, multi_tensor_applier
 from .optimizer import _get_param_grad_norm_group
 
 try:
+    import transformer_engine_torch as tex
     from transformer_engine.pytorch.optimizers import FusedAdam
 except ImportError:
+    tex = None
     FusedAdam = None
 
 if TYPE_CHECKING:
     from .distrib_optimizer import DistributedOptimizer
+
+logger = logging.getLogger(__name__)
 
 # Hyperparameters of a param group that are arguments of the Adam kernel, not device tensors.
 HParams = Tuple[float, float, float, float, int]
@@ -34,6 +40,19 @@ class _ParamGroupScalars:
         self.hparams = hparams
 
 
+class _FlatShard:
+    """One bucket shard's buffers as the flat Adam kernel takes them."""
+
+    def __init__(self, grad, param, exp_avg, exp_avg_sq, master_param, seg_starts, seg_groups):
+        self.grad = grad
+        self.param = param
+        self.exp_avg = exp_avg
+        self.exp_avg_sq = exp_avg_sq
+        self.master_param = master_param
+        self.seg_starts = seg_starts
+        self.seg_groups = seg_groups
+
+
 class _BucketGroupWork:
     """The kernels one bucket group's update and grad-norm partial run on."""
 
@@ -43,6 +62,8 @@ class _BucketGroupWork:
         self.norm_grads: List[torch.Tensor] = []
         # (param group index, Adam kernel) -> aligned tensor lists for multi_tensor_applier.
         self.adam_calls: Dict[Tuple[int, object], List[List[torch.Tensor]]] = {}
+        # Bucket shards updated by one flat Adam launch each.
+        self.flat_shards: List[_FlatShard] = []
 
 
 def _hparams(group: dict) -> HParams:
@@ -141,6 +162,10 @@ class OverlappedOptimizerStep:
             unmet.append("TransformerEngine's FusedAdam as the inner optimizer")
         elif optimizer.optimizer.capturable or optimizer.optimizer.master_weights:
             unmet.append("FusedAdam with capturable=False and master_weights=False")
+        if self.config.overlap_optimizer_step_flat_adam and not hasattr(
+            tex, 'flat_adam_capturable_master'
+        ):
+            unmet.append("TransformerEngine with flat_adam_capturable_master")
         if optimizer.grad_scaler is not None:
             unmet.append("no gradient scaler")
         ddp_requirements = {
@@ -207,7 +232,6 @@ class OverlappedOptimizerStep:
     def _ensure_built(self):
         if self._work is not None:
             return
-        import transformer_engine_torch as tex
         from transformer_engine.pytorch.optimizers import fused_adam
 
         self._max_tensors = getattr(fused_adam, '_MAX_TENSORS_PER_MULTI_TENSOR_ADAM_CALL', 1024)
@@ -219,6 +243,8 @@ class OverlappedOptimizerStep:
             bucket_group: _BucketGroupWork(index)
             for index, bucket_group in enumerate(self.bucket_groups)
         }
+        # bucket -> params of the flat Adam launch over its shard
+        flat_pieces: Dict[object, List[Tuple[int, torch.nn.Parameter, List[torch.Tensor]]]] = {}
         for group_index in range(len(inner.param_groups)):
             for model_param, shard_param, main_param in zip(
                 optimizer.model_float16_groups[group_index],
@@ -226,11 +252,16 @@ class OverlappedOptimizerStep:
                 optimizer.shard_fp32_from_float16_groups[group_index],
             ):
                 state = inner.state[main_param]
+                tensors = [shard_param, state['exp_avg'], state['exp_avg_sq'], main_param]
+                if self.config.overlap_optimizer_step_flat_adam:
+                    bucket = self._bucket_of(model_param)
+                    if bucket is not None:
+                        flat_pieces.setdefault(bucket, []).append(
+                            (group_index, model_param, tensors)
+                        )
+                        continue
                 self._add_param(
-                    group_index,
-                    model_param,
-                    tex.multi_tensor_adam_capturable_master,
-                    [shard_param, state['exp_avg'], state['exp_avg_sq'], main_param],
+                    group_index, model_param, tex.multi_tensor_adam_capturable_master, tensors
                 )
             for model_param, shard_param in zip(
                 optimizer.model_fp32_groups[group_index], optimizer.shard_fp32_groups[group_index]
@@ -242,26 +273,124 @@ class OverlappedOptimizerStep:
                     tex.multi_tensor_adam_capturable,
                     [shard_param, state['exp_avg'], state['exp_avg_sq']],
                 )
+        for bucket, pieces in flat_pieces.items():
+            self._add_flat_shard(bucket, pieces)
 
-    def _add_param(self, group_index, model_param, kernel, tensors):
-        """Register a model param's shard: its grad shard view feeds the kernel and the norm."""
+    def _grad_shard(self, model_param):
+        """This rank's view of the model param's reduce-scattered gradient, and its bucket group."""
         param_range = self.optimizer._get_model_param_range_map(model_param)["param"]
         grad_shard = model_param.main_grad.view(-1)[param_range.start : param_range.end]
-        if grad_shard.numel() == 0:
-            return
         bucket_group = next(
             model_chunk.param_to_bucket_group[model_param]
             for model_chunk in self.optimizer.model_chunks
             if model_param in model_chunk.param_to_bucket_group
         )
+        return grad_shard, bucket_group
+
+    def _bucket_of(self, model_param):
+        """The bucket holding the model param's gradient, if this rank owns part of it."""
+        grad_shard, bucket_group = self._grad_shard(model_param)
+        if grad_shard.numel() == 0:
+            return None
+        return next(
+            bucket
+            for bucket in bucket_group.buckets
+            if bucket.grad_data.data_ptr()
+            <= grad_shard.data_ptr()
+            < bucket.grad_data.data_ptr() + bucket.grad_data.nbytes
+        )
+
+    def _add_param(self, group_index, model_param, kernel, tensors):
+        """Register a model param's shard: its grad shard view feeds the kernel and the norm."""
+        grad_shard, bucket_group = self._grad_shard(model_param)
+        if grad_shard.numel() == 0:
+            return
         work = self._work[bucket_group]
         lists = work.adam_calls.setdefault(
             (group_index, kernel), [[] for _ in range(1 + len(tensors))]
         )
         for tensor_list, tensor in zip(lists, [grad_shard] + tensors):
             tensor_list.append(tensor)
+        self._add_norm_grad(work, model_param, grad_shard)
+
+    def _add_norm_grad(self, work, model_param, grad_shard):
         if self._counts_towards_grad_norm(model_param):
             work.norm_grads.append(grad_shard)
+
+    def _add_flat_shard(self, bucket, pieces):
+        """Register one flat Adam launch over this rank's shard of the bucket: the FP32 main
+        params and moments of the shard's params move into one contiguous buffer each, laid out
+        like the shard (the tensors the optimizer holds become views into them). A layout the
+        kernel cannot take keeps the multi-tensor launches for the bucket's params."""
+        from transformer_engine.pytorch.optimizers import flat_adam_segments
+
+        bucket_group = next(
+            bucket_group for bucket_group in self.bucket_groups if bucket in bucket_group.buckets
+        )
+        size = bucket_group.intra_distributed_optimizer_instance_size
+        rank = bucket_group.intra_distributed_optimizer_instance_rank
+        grad = shard_buffer(bucket.grad_data, size)[rank]
+        param = shard_buffer(bucket.param_data, size)[rank]
+        runs = []  # (offset, numel, param group, main param, exp_avg, exp_avg_sq)
+        unmet = None
+        if grad.data_ptr() % 16 or param.data_ptr() % 16:
+            unmet = "the bucket shard is not 16-byte aligned"
+        for group_index, model_param, (shard_param, exp_avg, exp_avg_sq, main_param) in pieces:
+            if unmet is not None:
+                break
+            grad_shard, _ = self._grad_shard(model_param)
+            numel = grad_shard.numel()
+            offset = (grad_shard.data_ptr() - grad.data_ptr()) // grad.element_size()
+            if not 0 <= offset <= grad.numel() - numel:
+                unmet = "a gradient shard lies outside the bucket shard"
+            elif shard_param.data_ptr() != param.data_ptr() + offset * param.element_size():
+                unmet = "a param shard is not at its gradient's offset of the bucket"
+            elif not all(
+                tensor.dtype == torch.float32
+                and tensor.is_contiguous()
+                and tensor.numel() == numel
+                and tensor.dim() == 1
+                for tensor in (main_param, exp_avg, exp_avg_sq)
+            ):
+                unmet = "a main param or moment is not a contiguous FP32 vector of the shard's size"
+            else:
+                runs.append((offset, numel, group_index, main_param, exp_avg, exp_avg_sq))
+        if unmet is None:
+            try:
+                seg_starts, seg_groups = flat_adam_segments(
+                    [(offset, numel, group) for offset, numel, group, *_ in runs],
+                    grad.numel(),
+                    grad.device,
+                )
+            except ValueError as e:
+                unmet = str(e)
+        if unmet is not None:
+            logger.warning(
+                "overlap_optimizer_step_flat_adam: a bucket of %d elements keeps the multi-tensor "
+                "Adam launches: %s.",
+                bucket.grad_data.numel(),
+                unmet,
+            )
+            for group_index, model_param, tensors in pieces:
+                self._add_param(
+                    group_index, model_param, tex.multi_tensor_adam_capturable_master, tensors
+                )
+            return
+        with torch.no_grad():
+            master_param, exp_avg, exp_avg_sq = (
+                torch.zeros_like(grad, dtype=torch.float32) for _ in range(3)
+            )
+            for offset, numel, _, *tensors in runs:
+                for buffer, tensor in zip((master_param, exp_avg, exp_avg_sq), tensors):
+                    view = buffer[offset : offset + numel]
+                    view.copy_(tensor)
+                    tensor.set_(view)
+        work = self._work[bucket_group]
+        work.flat_shards.append(
+            _FlatShard(grad, param, exp_avg, exp_avg_sq, master_param, seg_starts, seg_groups)
+        )
+        for _, model_param, _ in pieces:
+            self._add_norm_grad(work, model_param, self._grad_shard(model_param)[0])
 
     def _counts_towards_grad_norm(self, param) -> bool:
         """Same selection as MegatronOptimizer._filter_grads_for_norm."""
@@ -410,6 +539,31 @@ class OverlappedOptimizerStep:
         """Adam of every shard in the bucket group (a no-op while ``noop`` is set), then zero its
         grads. Runs on the current stream."""
         work = self._work[bucket_group]
+        if work.flat_shards:
+            beta1, beta2, eps, weight_decay, bias_correction = (
+                list(values) for values in zip(*(scalars.hparams for scalars in self._groups))
+            )
+            for shard in work.flat_shards:
+                tex.flat_adam_capturable_master(
+                    shard.grad,
+                    shard.param,
+                    shard.exp_avg,
+                    shard.exp_avg_sq,
+                    shard.master_param,
+                    self.noop,
+                    shard.seg_starts,
+                    shard.seg_groups,
+                    [scalars.lr for scalars in self._groups],
+                    beta1,
+                    beta2,
+                    eps,
+                    [scalars.step for scalars in self._groups],
+                    self._adam_w_mode,
+                    bias_correction,
+                    weight_decay,
+                    self.inv_scale,
+                    False,
+                )
         for (group_index, kernel), lists in work.adam_calls.items():
             scalars = self._groups[group_index]
             beta1, beta2, eps, weight_decay, bias_correction = scalars.hparams
