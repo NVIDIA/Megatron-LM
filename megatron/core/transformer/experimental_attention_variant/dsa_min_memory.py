@@ -732,20 +732,6 @@ class _AllReduceIndexerLoss(torch.autograd.Function):
         return grad_loss, None
 
 
-def _positions_are_contiguous(query_positions: Optional[torch.Tensor]) -> bool:
-    """Whether this rank's global query positions form a single ascending run.
-
-    That is exactly the attention_cp_layout='contiguous' case, where the all-gather already
-    lands in global position order and the zigzag reorder must be skipped. Zigzag gives a rank
-    two disjoint chunks, so the span exceeds the count. Derived from the positions rather than
-    passed down, because the autograd Function does not see the config.
-    """
-    if query_positions is None or query_positions.numel() == 0:
-        return True
-    span = int(query_positions[-1].item()) - int(query_positions[0].item())
-    return span == query_positions.numel() - 1
-
-
 def _tile_global_start(query_positions: Optional[torch.Tensor], q_start: int) -> int:
     """Global position of the first query row in a tile whose local offset is ``q_start``.
 
@@ -1282,6 +1268,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         cache_indexer_k: bool = False,
         use_triton: bool = True,
         query_positions: Optional[torch.Tensor] = None,
+        cp_layout_contiguous: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the sparse forward, streaming index scores so the full score matrix is never held."""
         key_chunk_size = _plan_execution(
@@ -1312,7 +1299,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     use_indexer_rope,
                     simplified_input_norm,
                     pg_collection,
-                    contiguous=_positions_are_contiguous(query_positions),
+                    contiguous=cp_layout_contiguous,
                 )
                 output, indexer_loss = _simplified_sparse_forward_impl(
                     query,
@@ -1728,6 +1715,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            # cp_layout_contiguous
             None,
         )
 
@@ -2303,6 +2292,11 @@ def dsa_min_memory_gqa(
     use_triton: bool = True,
     simplified_input_norm=None,
     query_positions: Optional[torch.Tensor] = None,
+    # Which CP layout the caller gathered K/V under. This cannot be recovered from
+    # query_positions: under zigzag the last rank holds two *adjacent* chunks, so its positions
+    # form one ascending run and look exactly like the contiguous layout. Inferring it locally
+    # made that rank skip the reorder and read its learned-K index in raw all-gather order.
+    cp_layout_contiguous: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the minimum-activation DSA-GQA training backend."""
     _plan = _plan_execution(
@@ -2345,4 +2339,5 @@ def dsa_min_memory_gqa(
             cache_indexer_k,
             use_triton,
             query_positions,
+            cp_layout_contiguous,
         )

@@ -1168,6 +1168,10 @@ class DSGQACoreAttention(MegatronModule):
             cache_selected_scores=_dsa_caches_selected_scores(self.config),
             use_triton=dsa_kernel_backend == "min-memory-triton",
             query_positions=query_positions,
+            # The same layout the K/V gather above used. The kernel's learned-K gather has to
+            # reorder on exactly this rule and cannot recover it from local positions.
+            cp_layout_contiguous=getattr(self.config, "attention_cp_layout", "zigzag")
+            == "contiguous",
         )
         if sparse_fwd_dense_loss:
             indexer_loss = dsa_dense_indexer_loss(
