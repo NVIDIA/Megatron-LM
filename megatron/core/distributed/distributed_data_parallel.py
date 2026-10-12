@@ -117,22 +117,6 @@ class DistributedDataParallel(_BaseDataParallel):
         full_param_layout: Optional[FullParamLayout] = None,
     ):
         super().__init__(config=config, module=module)
-        if (
-            ddp_config.use_distributed_optimizer
-            and not ddp_config.use_layer_wise_param_layout
-            and any(
-                getattr(param, "is_managed_by_layer_wise_optimizer", False)
-                for param in module.parameters()
-                if param.requires_grad
-            )
-        ):
-            # Compact LayerWise owns both Muon and Adam. Normalize direct core callers
-            # before selecting process groups or layouts, without changing their config.
-            ddp_config = dataclasses.replace(
-                ddp_config,
-                use_distributed_optimizer=False,
-                num_buckets=None if ddp_config.bucket_size is not None else ddp_config.num_buckets,
-            )
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -233,7 +217,12 @@ class DistributedDataParallel(_BaseDataParallel):
             )
             from ..optimizer.distrib_optimizer import DistributedOptimizer
 
-            full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            compute_layout = DistributedOptimizer.compute_full_param_layout
+            if any(key.is_managed_by_layer_wise_optimizer for key in buffer_groups):
+                from ..optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+                compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+            full_param_layout = compute_layout(
                 all_params,
                 self.bucket_size,
                 self.intra_dp_cp_group.size(),
@@ -360,9 +349,19 @@ class DistributedDataParallel(_BaseDataParallel):
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
             )
+            buffer_ddp_config = self.ddp_config
+            if (
+                buffer_key.is_managed_by_layer_wise_optimizer
+                and not self.ddp_config.use_layer_wise_param_layout
+            ):
+                # Compact Muon all-reduces whole gradients; Adam keeps DistOpt sharding.
+                # Bucket sizing is already resolved, so do not revalidate num_buckets.
+                buffer_ddp_config = dataclasses.replace(
+                    self.ddp_config, use_distributed_optimizer=False, num_buckets=None
+                )
             params_with_names = [(p, param_to_name[p]) for p in params]
             buffer = _ParamAndGradBuffer(
-                self.ddp_config,
+                buffer_ddp_config,
                 buffer_key.param_dtype,
                 buffer_key.grad_dtype,
                 params_with_names,

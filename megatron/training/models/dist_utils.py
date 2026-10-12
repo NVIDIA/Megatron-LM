@@ -1,6 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import dataclasses
 import logging
 from contextlib import nullcontext
 from typing import Any, Callable
@@ -89,8 +88,8 @@ def unimodal_build_distributed_models(
         model_type: Deprecated flag, only used for backwards compatibility.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            selects padded Muon plus sharded Adam (True), or compact LayerWise
-            ownership for both Muon and Adam (False).
+            selects padded (True) or compact (False) Muon parameter layouts.
+            Adam parameters remain sharded by DistributedOptimizer in both layouts.
 
     Returns:
         List of model stages, wrapped and ready for distributed training.
@@ -165,8 +164,8 @@ def prepare_existing_model_chunks_for_distributed_training(
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            selects padded Muon plus sharded Adam (True), or compact LayerWise
-            ownership for both Muon and Adam (False).
+            selects padded (True) or compact (False) Muon parameter layouts.
+            Adam parameters remain sharded by DistributedOptimizer in both layouts.
 
     Returns:
         List of model chunks, wrapped and ready for distributed training.
@@ -295,8 +294,8 @@ def _ddp_wrap(
         pg_collection: Model communication process groups.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            selects padded Muon plus sharded Adam (True), or compact LayerWise
-            ownership for both Muon and Adam (False).
+            selects padded (True) or compact (False) Muon parameter layouts.
+            Adam parameters remain sharded by DistributedOptimizer in both layouts.
 
     Returns:
         list[MegatronModule]: List of DDP/FSDP wrapped model modules
@@ -330,22 +329,15 @@ def _ddp_wrap(
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 
-    # Mirror wrap_model_chunks_with_ddp(): only padded LayerWise uses a separate
-    # Adam DistributedOptimizer; compact keeps both raw optimizers inside LayerWise.
+    # Argument validation clears use_distributed_optimizer for LayerWise. Re-enable
+    # it for Adam sharding in both layouts, as in wrap_model_chunks_with_ddp().
     compute_full_param_layout = DistributedOptimizer.compute_full_param_layout
     if DP is DistributedDataParallel and use_layer_wise_distributed_optimizer:
-        if use_layer_wise_param_layout:
-            ddp_config.use_layer_wise_param_layout = True
-            ddp_config.use_distributed_optimizer = True
-            compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-        else:
-            ddp_config = dataclasses.replace(
-                ddp_config,
-                use_distributed_optimizer=False,
-                use_layer_wise_param_layout=False,
-                num_buckets=None,
-            )
-        # Tags select Muon's FP8 staging policy, including inside the compact container.
+        ddp_config.use_distributed_optimizer = True
+        ddp_config.use_layer_wise_param_layout = use_layer_wise_param_layout
+        compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+        # Tag Muon matrices for the selected LayerWise layout, and keep scalar
+        # parameters (embeddings, biases, layernorm) in DistOpt-style buffers.
         tag_params_for_buffer_routing(model)
 
     cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl

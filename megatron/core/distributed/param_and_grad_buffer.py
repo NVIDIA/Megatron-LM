@@ -1895,10 +1895,6 @@ def partition_buckets(
             assert fp8_buffer is None
             fp8_buffer = buffer
 
-    # A bucket group runs a single collective type: reduce-scatter for DistOpt buffers,
-    # all-reduce otherwise. Compact LayerWise uses all-reduce for both Muon and Adam;
-    # padded buffers use reduce-scatter. Validate each buffer's effective config below.
-
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
     if force_single_bucket_group:
         buckets = []

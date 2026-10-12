@@ -10,7 +10,10 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
-from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
+from megatron.core.distributed.param_and_grad_buffer import (
+    _compute_default_per_buffer_param_layout,
+    group_params_for_buffers,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
@@ -505,10 +508,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     ) -> 'FullParamLayout':
         """Compute parameter layouts for all buffer groups.
 
-        Groups parameters by :class:`BufferKey` via :func:`group_params_for_buffers`
-        and produces a layerwise shard-aligned size-matching layout per buffer.
-        Every parameter stays within a single shard so the local optimizer step
-        (e.g. Newton-Schulz iteration for Muon) can run on whole tensors.
+        Groups parameters by :class:`BufferKey` and
+        keeps Adam on its byte-level sharded layout. Muon uses either compact
+        unpadded buffers or a shard-aligned layout that keeps each matrix whole.
 
         Args:
             params: All parameters to lay out.
@@ -524,7 +526,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Avoid a circular import: DistributedOptimizer imports LayerWise indirectly.
         from .distrib_optimizer import DistributedOptimizer
 
-        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
+        buffer_groups = group_params_for_buffers(
+            params,
+            ddp_config.grad_reduce_in_fp32,
+            merge_layerwise_fp8_grads=not ddp_config.use_layer_wise_param_layout,
+        )
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
@@ -536,10 +542,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             else:
                 dp_world_size = data_parallel_world_size
 
-            # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
+            # Dispatch per buffer: LayerWise (Muon) params follow the selected
             # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
             # get DistOpt's byte-level layout.
             if buffer_key.is_managed_by_layer_wise_optimizer:
+                if not ddp_config.use_layer_wise_param_layout:
+                    layout = _compute_default_per_buffer_param_layout(group_params, bucket_size)
+                    layout.param_indices = param_indices
+                    layouts[buffer_key] = layout
+                    continue
                 compute_per_buffer_layout = (
                     LayerWiseDistributedOptimizer._compute_per_buffer_param_layout
                 )
@@ -933,7 +944,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for optimizer in optimizers:
             param_groups += optimizer.param_groups
 
-        # Keep equal-size parameters in optimizer-group order, as in existing checkpoints.
+        # Sort param in all groups by param numel and assign to each rank evenly.
         param_list = []
         for group_index, group in enumerate(param_groups):
             for p in group["params"]:
@@ -959,7 +970,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             groups["params"] = params
 
         # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
+        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
 
     def set_bucket_layerwise_params_list(self, model_chunks):
@@ -973,29 +984,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         For each bucket in each model chunk's bucket groups, build per-rank param lists
         by cross-referencing the layer-wise sharded param lists with the bucket's params.
-        Compact LayerWise owns both Muon and Adam parameters; the Muon routing tag only
-        filters ownership for the padded layout, which has a separate Adam DistOpt.
 
         Args:
             model_chunks: DDP-wrapped model chunks with bucket_groups.
         """
-
-        def enable_compact_param_sync(group):
-            # A high-precision Adam bucket may have neither overlap nor FP8 reuse.
-            # Binding its whole-parameter owners makes it a compact sync group too.
-            if not self.use_layer_wise_param_layout and not group.param_sync_via_bucket_group:
-                group.param_sync_via_bucket_group = True
-                group.intra_distributed_optimizer_instance_group = group.data_parallel_group
-                group.intra_distributed_optimizer_instance_size = group.data_parallel_group.size()
-                group.intra_distributed_optimizer_instance_rank = group.data_parallel_group.rank()
-
         for model_chunk in model_chunks:
             for group in model_chunk.bucket_groups:
-                enable_compact_param_sync(group)
                 for bucket in group.buckets:
-                    if self.use_layer_wise_param_layout and not (
-                        _bucket_is_managed_by_layer_wise_optimizer(bucket)
-                    ):
+                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
                     if self.dp_cp_params_list is not None:
                         bucket_params_list = [[] for _ in range(get_pg_size(self.dp_cp))]
@@ -1012,11 +1008,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     bucket.set_layerwise_params_list(bucket_params_list)
             # Do the same for expert parallel bucket groups.
             for group in model_chunk.expert_parallel_bucket_groups:
-                enable_compact_param_sync(group)
                 for bucket in group.buckets:
-                    if self.use_layer_wise_param_layout and not (
-                        _bucket_is_managed_by_layer_wise_optimizer(bucket)
-                    ):
+                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
                     if self.expt_dp_params_list is not None:
                         bucket_params_list = [[] for _ in range(get_pg_size(self.expt_dp))]
@@ -1182,9 +1175,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def start_param_sync_for_bucket_group_subset(self) -> None:
         """Trigger ``start_param_sync`` on LayerWise-managed bucket groups only.
 
-        Compact LayerWise owns all dense and expert-parallel bucket groups, including
-        Adam parameters. Padded LayerWise skips non-Muon groups so its sibling
-        :class:`DistributedOptimizer` does not double-sync the same buckets. Uses
+        Walks each model chunk's dense + expert-parallel bucket groups and
+        skips any group not managed by LayerWise, so a sibling
+        :class:`DistributedOptimizer`'s own ``start_param_sync`` call does not
+        double-sync the same buckets. Uses
         :meth:`DistributedDataParallel._start_bucket_group_param_sync` so FP8
         post-all-gather processing (and MXFP8 copy) still runs.
         """
@@ -1192,9 +1186,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             for bucket_group in (
                 model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
             ):
-                if bucket_group.buckets and (
-                    not self.use_layer_wise_param_layout
-                    or _bucket_is_managed_by_layer_wise_optimizer(bucket_group.buckets[0])
+                if bucket_group.buckets and _bucket_is_managed_by_layer_wise_optimizer(
+                    bucket_group.buckets[0]
                 ):
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 

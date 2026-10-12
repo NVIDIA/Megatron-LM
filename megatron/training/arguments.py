@@ -3124,9 +3124,9 @@ def _add_distributed_args(parser):
                        action='store_false',
                        dest='use_layer_wise_param_layout',
                        help='Use compact LayerWise buffers instead of shard-aligned padding. '
-                       'Muon and Adam remain inside LayerWise, with all-reduce gradients and '
-                       'whole-parameter ownership. The padded layout keeps Adam in '
-                       'DistributedOptimizer. FP8 gather staging is independent of this toggle. '
+                       'Muon uses all-reduce gradients and whole-parameter ownership; '
+                       'Adam uses DistributedOptimizer in both layouts. '
+                       'FP8 gather staging is independent of this toggle. '
                        'The layouts can produce different reduction ordering and are not '
                        'guaranteed to match loss curves bit-for-bit.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
