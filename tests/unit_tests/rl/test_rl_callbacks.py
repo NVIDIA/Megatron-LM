@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from megatron.rl import callbacks as rl_callbacks
-from megatron.rl import rl_utils
+from megatron.rl import rl_profiling, rl_utils
 from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
 from megatron.rl.rl_profiling import RL_LOGGABLE_TIMER_NAMES
 from megatron.training.callbacks import CallbackContext
@@ -24,7 +24,9 @@ def env(monkeypatch):
         train_state=SimpleNamespace(iteration=9),
         profiles=[],
     )
-    monkeypatch.setattr(rl_callbacks, "get_args", lambda: SimpleNamespace(micro_batch_size=2))
+    monkeypatch.setattr(
+        rl_callbacks, "get_args", lambda: SimpleNamespace(micro_batch_size=2, save="/ckpt")
+    )
     monkeypatch.setattr(rl_callbacks, "get_tensorboard_writer", lambda: env.writer)
     monkeypatch.setattr(rl_callbacks, "get_wandb_writer", lambda: env.wandb_writer)
     monkeypatch.setattr(rl_callbacks, "get_timers", lambda: env.timers)
@@ -83,6 +85,55 @@ def test_logging_callback(env, packing, profile):
     packing_metrics = {"bin-batch-size": 4 * 2 * 3, "consumed-bins": 7} if packing else {}
     assert scalars == {"grpo_collection_iteration": 9 // 4, **packing_metrics}
     assert all(c.args[1] == 9 for c in env.wandb_writer.log.call_args_list)
+
+
+@pytest.mark.parametrize("profile", [False, True])
+@pytest.mark.parametrize("packing", [False, True])
+def test_logging_callback_lifecycle(env, monkeypatch, packing, profile):
+    """on_train_start starts the profiler when enabled and on_train_end stops it;
+    on_train_step_end advances the bin counter under packing (4 dp x 2 mbs x 3 microbatches)."""
+    started, stopped = [], []
+    monkeypatch.setattr(
+        rl_callbacks,
+        "maybe_initialize_rl_profiler",
+        lambda cfg, save_dir, **kw: started.append((save_dir, kw)) or ("/p" if profile else None),
+    )
+    monkeypatch.setattr(rl_callbacks, "shutdown_rl_profiler", lambda: stopped.append(True))
+    monkeypatch.setattr(rl_callbacks, "print_rank_0", lambda *_: None)
+    callback = RLLoggingCallback(
+        RLConfig(rl_use_sequence_packing=packing, rl_profile=profile), global_batch_size=6
+    )
+    env.runtime_state.consumed_train_bins = 7
+    context = CallbackContext(model=None)
+
+    callback.on_train_start(context)
+    callback.on_train_step_end(context)
+    callback.on_train_end(context)
+
+    assert started == [("/ckpt", {"log_to_wandb": True, "log_to_tensorboard": True})]
+    assert env.runtime_state.consumed_train_bins == (7 + 24 if packing else 7)
+    assert stopped == ([True] if profile else [])
+
+
+def test_maybe_initialize_rl_profiler(monkeypatch):
+    calls = []
+    monkeypatch.setattr(rl_profiling, "initialize_rl_profiler", lambda **kw: calls.append(kw))
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    start = lambda **kw: rl_profiling.maybe_initialize_rl_profiler(
+        RLConfig(**kw), "/ckpt", log_to_wandb=False, log_to_tensorboard=True
+    )
+
+    assert start(rl_profile=False) is None and calls == []
+    assert start(rl_profile=True) == "/ckpt/profiles"
+    assert start(rl_profile=True, rl_profile_dir="/elsewhere") == "/elsewhere"
+    assert [c["output_dir"] for c in calls] == ["/ckpt/profiles", "/elsewhere"]
+    assert calls[0] == dict(
+        output_dir="/ckpt/profiles",
+        run_id="123",
+        enabled=True,
+        log_to_wandb=False,
+        log_to_tensorboard=True,
+    )
 
 
 def test_checkpoint_callback(monkeypatch):

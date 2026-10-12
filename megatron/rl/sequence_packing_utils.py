@@ -1198,14 +1198,16 @@ def get_sequence_packing_log_info(consumed_train_bins):
     return ''
 
 
+def bin_batch_size(micro_batch_size):
+    """Bins consumed per iteration across the data-parallel ranks."""
+    return mpu.get_data_parallel_world_size() * micro_batch_size * get_num_microbatches()
+
+
 def get_sequence_packing_tensorboard_metrics(consumed_train_bins, micro_batch_size):
     """Get tensorboard metrics for sequence packing mode."""
     metrics = {}
     if consumed_train_bins > 0:
-        bin_batch_size = (
-            mpu.get_data_parallel_world_size() * micro_batch_size * get_num_microbatches()
-        )
-        metrics['bin-batch-size'] = bin_batch_size
+        metrics['bin-batch-size'] = bin_batch_size(micro_batch_size)
         metrics['consumed-bins'] = consumed_train_bins
     return metrics
 
