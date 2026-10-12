@@ -3240,9 +3240,8 @@ def load_checkpoint(
             current_train_state.iteration = iteration
             current_train_state.consumed_train_samples = iteration * args.global_batch_size
             current_train_state.skipped_train_samples = 0
-        update_num_microbatches(consumed_samples=current_train_state.consumed_train_samples, verbose=True)
-        print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
-                     f'(consumed_train_samples {current_train_state.consumed_train_samples})')
+            update_num_microbatches(consumed_samples=current_train_state.consumed_train_samples, verbose=True)
+        print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} ')
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
@@ -3554,7 +3553,7 @@ def load_checkpoint(
     if has_nvidia_modelopt:
         print_distributed_quant_summary(model, msg='After loading checkpoint')
 
-    return current_train_state.iteration, current_train_state.num_floating_point_operations_so_far
+    return iteration, num_floating_point_operations_so_far
 
 
 def _to_dtensor(wrapped_model, model_state_dict):
