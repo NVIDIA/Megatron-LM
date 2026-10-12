@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
@@ -182,8 +183,12 @@ class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
 
 def _is_mxfp8_attention_active() -> bool:
     """Whether attention runs in MXFP8 here: in an FP8 autocast with an MXFP8 recipe and FP8 DPA
-    (layers kept in BF16 run outside it)."""
+    (layers kept in BF16 run outside it), with an FP8 backward. With NVTE_FP8_DPA_BWD=0, attention
+    keeps the BF16 q/k/v for its backward, which pre-quantized inputs would replace by their
+    dequantized values."""
     if not FP8GlobalStateManager.is_fp8_enabled():
+        return False
+    if int(os.getenv("NVTE_FP8_DPA_BWD", "1")) == 0:
         return False
     recipe = FP8GlobalStateManager.get_fp8_recipe()
     return recipe.mxfp8() and recipe.fp8_dpa
@@ -1108,6 +1113,8 @@ class MLASelfAttention(MultiLatentAttention):
                 and cu_seqlens_kv is None
                 and self.pg_collection.cp.size() == 1
                 and kv.shape[0] % 128 == 0
+                and kv.dtype == torch.bfloat16
+                and k_pos_emb.dtype == torch.bfloat16
                 and _is_mxfp8_attention_active()
             )
             if use_fused_kv_rope_quant:

@@ -2402,6 +2402,71 @@ class TestFusedMLAKVRoPEQuant:
         for name, grad in grads.items():
             assert torch.equal(grad, ref_grads[name]), name
 
+    @pytest.mark.parametrize("case", ["fp16", "fp8_dpa_bwd_off"])
+    def test_falls_back_to_unfused_path(self, case):
+        """FP16 inputs (the kernel takes BF16) and NVTE_FP8_DPA_BWD=0 (attention keeps the BF16
+        q/k/v for its backward) take the unfused path: the kernel is not called and outputs and
+        gradients match the option off."""
+        if mla_module.fused_mla_kv_rope_mxfp8 is None:
+            pytest.skip("Transformer Engine lacks fused_mla_kv_rope_mxfp8")
+        dtype, overrides = torch.bfloat16, {}
+        env = {
+            "NVTE_FUSED_ATTN": "1",
+            "NVTE_FLASH_ATTN": "0",
+            "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+        }
+        if case == "fp16":
+            dtype = torch.float16
+            overrides = dict(bf16=False, fp16=True, params_dtype=torch.float16)
+        else:
+            env["NVTE_FP8_DPA_BWD"] = "0"
+        with mock.patch.dict(os.environ, env, clear=False):
+            modules = []
+            for fused in (False, True):
+                config = _fused_kv_rope_quant_config(use_fused_mla_kv_rope_quant=fused, **overrides)
+                modules.append(
+                    MLASelfAttention(
+                        config,
+                        get_mla_self_attn_submodules(),
+                        layer_number=1,
+                        attn_mask_type=AttnMaskType.causal,
+                    )
+                    .cuda()
+                    .to(dtype)
+                )
+            reference, fused = modules
+            fused.load_state_dict(reference.state_dict())
+            assert fused._use_fused_kv_rope_quant
+
+            torch.manual_seed(0)
+            hidden_states = torch.randn(256, 2, 512, dtype=dtype, device="cuda")
+            grad_output = torch.randn_like(hidden_states)
+            results = []
+            for attention in (reference, fused):
+                x = hidden_states.clone().requires_grad_(True)
+                with (
+                    mock.patch.object(
+                        mla_module,
+                        "fused_mla_kv_rope_mxfp8",
+                        wraps=mla_module.fused_mla_kv_rope_mxfp8,
+                    ) as kernel,
+                    get_fp8_context(config),
+                ):
+                    output, _ = attention(x, None)
+                output.backward(grad_output)
+                grads = {
+                    name: p.grad for name, p in attention.named_parameters() if p.grad is not None
+                }
+                results.append((output.detach(), x.grad, grads, kernel.call_count))
+            (ref_out, ref_dx, ref_grads, ref_calls), (out, dx, grads, calls) = results
+
+        assert ref_calls == 0 and calls == 0
+        assert torch.equal(out, ref_out)
+        assert torch.equal(dx, ref_dx)
+        assert grads.keys() == ref_grads.keys()
+        for name, grad in grads.items():
+            assert torch.equal(grad, ref_grads[name]), name
+
     def test_eval_uses_unfused_path(self):
         if mla_module.fused_mla_kv_rope_mxfp8 is None:
             pytest.skip("Transformer Engine lacks fused_mla_kv_rope_mxfp8")
