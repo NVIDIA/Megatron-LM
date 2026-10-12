@@ -36,11 +36,11 @@ from megatron.core.inference.utils import (
     InferenceMode,
     detokenize_tokens,
     get_attention_mask,
+    get_language_model,
     model_eos_token_ids,
     set_decode_expert_padding,
     set_moe_metadata_sync,
 )
-from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -312,20 +312,14 @@ class TextGenerationController(MTPControllerMixin):
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
+        # The language model holds the vocab, the MTP block and the embedding; a multimodal
+        # wrapper keeps it under `language_model`.
+        self._language_model = get_language_model(unwrap_model(self.inference_wrapped_model.model))
         # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
-        # TODO(ksanthanam): Consider deprecating this check if LLaVAModel is no longer used
-        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-        if isinstance(unwrapped_model, LLaVAModel):
-            self.vocab_size = unwrapped_model.language_model.vocab_size
-        else:
-            self.vocab_size = unwrapped_model.vocab_size
+        self.vocab_size = self._language_model.vocab_size
 
         if getattr(self.inference_wrapped_model.inference_context, "enable_mtp_kv_cache", False):
-            language_model = (
-                unwrapped_model.language_model
-                if isinstance(unwrapped_model, LLaVAModel)
-                else unwrapped_model
-            )
+            language_model = self._language_model
             if language_model.position_embedding_type != "none":
                 raise ValueError(
                     "MTP KV caching requires position_embedding_type='none'; positional "
@@ -503,24 +497,28 @@ class TextGenerationController(MTPControllerMixin):
             return None
         return torch.tensor(sorted(self.extra_eos_token_id_set), dtype=torch.long)
 
-    def terminating_token_ids(self, termination_id: Optional[int]) -> frozenset:
-        """Token ids that end generation for a request with this `termination_id`.
+    def terminating_token_ids(
+        self, termination_id: Optional[int], stop_token_ids: Optional[List[int]] = None
+    ) -> frozenset:
+        """Model EOS and explicit stop token ids that end generation for a request.
 
         The CPU-side counterpart of the `extra_eos_token_id_tensor` check, for the
         termination sites that work on Python ints rather than a batched tensor:
         the engine's mid-speculative-block scan and the disaggregated handoff
-        admission check. Returns an empty set when termination is disabled
-        (`ignore_eos`, i.e. `termination_id` of -1 or None).
+        admission check. Disabling model EOS (`ignore_eos`, i.e. `termination_id`
+        of -1 or None) does not disable explicit stop token ids.
 
         Args:
             termination_id (Optional[int]): The request's own termination id.
+            stop_token_ids (Optional[List[int]]): Explicit request stop token ids.
 
         Returns:
-            frozenset: Terminating token ids, empty when termination is disabled.
+            frozenset: Model EOS ids (unless disabled) and explicit request stop ids.
         """
+        explicit_stops = frozenset(stop_token_ids or ())
         if termination_id is None or termination_id < 0:
-            return frozenset()
-        return self.extra_eos_token_id_set | {termination_id}
+            return explicit_stops
+        return self.extra_eos_token_id_set | {termination_id} | explicit_stops
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -1239,7 +1237,7 @@ class TextGenerationController(MTPControllerMixin):
         # Expose the active slice so downstream code sees the right length.
         self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
 
-    def _dynamic_step_sample_logits(self):
+    def _dynamic_step_sample_logits(self, sequence_lengths: Optional[Tensor] = None):
         """Sample tokens from logits for dynamic batching."""
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
         # and then broadcast the sampled tokens rather than broadcasting the raw logits.
@@ -1266,6 +1264,7 @@ class TextGenerationController(MTPControllerMixin):
             no_top_k=no_top_k,
             no_top_p=no_top_p,
             output=self._sampled_tokens_cuda[:n],
+            sequence_lengths=sequence_lengths,
         )
 
     def _replace_partial_prefill_sample_with_prompt_token(self) -> None:
@@ -2352,7 +2351,9 @@ class TextGenerationController(MTPControllerMixin):
 
         return active_request_ids, finished_request_ids, active_request_mask
 
-    def _run_async_sched_sample(self) -> _AsyncScheduleSampleResult:
+    def _run_async_sched_sample(
+        self, sequence_lengths: Optional[Tensor] = None
+    ) -> _AsyncScheduleSampleResult:
         """Sample active requests and start transferring their tokens to CPU.
 
         Returns:
@@ -2362,7 +2363,7 @@ class TextGenerationController(MTPControllerMixin):
         active_request_count = context.total_request_count - context.paused_request_count
 
         range_push("sampling")
-        self._dynamic_step_sample_logits()
+        self._dynamic_step_sample_logits(sequence_lengths=sequence_lengths)
         self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         if sampled_tokens_gpu.is_cuda:
@@ -3250,8 +3251,11 @@ class TextGenerationController(MTPControllerMixin):
             # -------------------------------------------------------------------------
             # Sample
             # -------------------------------------------------------------------------
-            # Enqueue sampling behind the current logits-producing work.
-            sample_result = self._run_async_sched_sample()
+            # Prepare has advanced the live lengths; sample using the positions
+            # of the pending logits, not those of the successor forward.
+            sample_result = self._run_async_sched_sample(
+                sequence_lengths=resolved_sequence_lengths - 1
+            )
 
             # Populate the next forward's input-ID view directly from GPU samples.
             context.copy_async_sched_sample_to_forward(sample_result.sampled_tokens_gpu)
@@ -3714,6 +3718,9 @@ class TextGenerationController(MTPControllerMixin):
         )
         max_prompt_length_in_batch = max(prompt_lengths_in_batch)
         min_prompt_length_in_batch = min(prompt_lengths_in_batch)
+
+        if any(req.sampling_params.seed is not None for req in active_requests.values()):
+            raise ValueError("Request-local seeds require dynamic inference")
 
         # For batch inference the sampling params are the same for all request
         sampling_params: SamplingParams = list(active_requests.values())[0].sampling_params

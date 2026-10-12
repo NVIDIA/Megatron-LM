@@ -27,7 +27,7 @@ import os
 
 import torch
 
-from megatron.core.ssm.ops.common.determinism import autotune_configs
+from megatron.core.tuning import autotune_configs
 
 try:
     import triton

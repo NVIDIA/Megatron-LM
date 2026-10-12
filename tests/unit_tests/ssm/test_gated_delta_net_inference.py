@@ -51,6 +51,7 @@ class TestGatedDeltaNetInference:
             bf16=True,
             tensor_model_parallel_size=1,
             experimental_attention_variant="gated_delta_net",
+            gdn_kernel_backend="fla",
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
         )

@@ -247,6 +247,24 @@ def main(
         volumes=artifacts,
     )
 
+    if (
+        scope == "unit-tests"
+        and test_case == "tests/unit_tests/transformer/**/*.py"
+        and environment == "dev"
+        and tag == "latest"
+        and platform == "dgx_h100"
+    ):
+        # NCCL 2.31 finalization waits for peers. Nonblocking communicators let
+        # PyTorch start every communicator's finalization before waiting, avoiding
+        # cyclic waits between the CP group's P2P and collective communicators (#7744).
+        executor.env_vars["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "1"
+        executor.env_vars["PYTEST_ADDOPTS"] = "-o faulthandler_timeout=600"
+        executor.env_vars["TORCH_CPP_LOG_LEVEL"] = "INFO"
+        executor.env_vars["NCCL_DEBUG_SUBSYS"] = "INIT,BOOTSTRAP,ENV,DESTROY"
+        executor.env_vars["NCCL_DEBUG_FILE"] = (
+            "/opt/megatron-lm/assets_dir/logs/nccl_debug.%h.%p.log"
+        )
+
     n_attempts = 0
     while n_attempts < 3:
         tee_buffer = _ThreadSafeBuffer()
