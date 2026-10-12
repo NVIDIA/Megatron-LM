@@ -121,7 +121,7 @@ class TestResponsesEnvAgent:
                 dict(
                     trajectory=[],
                     reward=0.0,
-                    problem_id="placeholder",
+                    problem_id="p0",
                     rollout_status="placeholder",
                     failure_reason="no_trainable_output",
                 ),
@@ -164,7 +164,11 @@ class TestResponsesEnvAgent:
     )
     def test_build_token_rollout(self, tmp_path, output, result_extra, agent_kwargs, expected):
         agent = _agent(tmp_path, **agent_kwargs)
-        rollout = agent.build_token_rollout(_run_result(output, **result_extra), "p0")
+        rollout = agent.build_token_rollout(
+            _run_result(output, **result_extra),
+            "p0",
+            generation_cap=agent.max_output_tokens_per_step,
+        )
         for attr, value in expected.items():
             assert getattr(rollout, attr) == value, attr
 
@@ -230,12 +234,13 @@ class TestResponsesEnvAgent:
             == expected
         )
 
-    # (args attributes, expected (collections, prompts_per_collection); None = raises)
+    # (args attributes, expected (collections, prompts_per_collection); class = raises)
     @pytest.mark.parametrize(
         "attrs, expected",
         [
             ({"curr_iteration": 3, "grpo_prompts_per_step": 8}, (3, 8)),
-            ({"iteration": 5}, (5, 64)),
+            ({"iteration": 5}, AttributeError),
+            ({"iteration": 5, "grpo_prompts_per_step": None}, AttributeError),
             (
                 {
                     "curr_iteration": 8,
@@ -255,11 +260,12 @@ class TestResponsesEnvAgent:
                 },
                 (2, 4),
             ),
-            ({"curr_iteration": 1, "grpo_prompts_per_step": 0}, None),
+            ({"curr_iteration": 1, "grpo_prompts_per_step": 0}, ValueError),
         ],
         ids=[
             "cadence-one-passthrough",
-            "iteration-fallback-and-default-prompts",
+            "missing-grpo-state-raises",
+            "explicit-none-grpo-state-raises",
             "batches-per-collection-cadence",
             "grpo-iterations-cadence",
             "invalid-prompts-raises",
@@ -267,7 +273,11 @@ class TestResponsesEnvAgent:
     )
     def test_resolve_curriculum_training_state(self, attrs, expected):
         args = SimpleNamespace(**attrs)
-        if expected is None:
+        if expected is AttributeError:
+            # Missing/None grpo state routes to get_prompt's logged uniform fallback.
+            with pytest.raises(AttributeError, match="grpo_prompts_per_step"):
+                resolve_curriculum_training_state(args)
+        elif expected is ValueError:
             with pytest.raises(ValueError, match="must be positive"):
                 resolve_curriculum_training_state(args)
         else:
@@ -290,7 +300,8 @@ class TestResponsesEnvAgent:
         assert await agent2.get_prompt(validation=True) in agent2.dataset
 
         def _no_training_state():
-            raise RuntimeError("no args")
+            # What get_args really raises when Megatron global state is uninitialized.
+            raise AssertionError("args is not initialized.")
 
         monkeypatch.setattr("megatron.training.global_vars.get_args", _no_training_state)
         assert await agent2.get_prompt(validation=False) in agent2.dataset
@@ -332,7 +343,8 @@ class TestResponsesEnvAgent:
             monkeypatch.delenv("SURELY_UNSET_VAR", raising=False)
             dataset_file = "${SURELY_UNSET_VAR}/dataset.jsonl"
         else:
-            dataset_file = _write_dataset(tmp_path, text='{"ok": 1}\nnot json')
+            valid = '{"responses_create_params": {"input": "q"}, "problem_id": "p"}'
+            dataset_file = _write_dataset(tmp_path, text=valid + "\nnot json")
         with pytest.raises(ValueError, match=error) if error else nullcontext():
             assert len(_agent(tmp_path, dataset_file=dataset_file).dataset) == 4
 
@@ -421,10 +433,19 @@ class TestResponsesEnvAgent:
         response = await agent.get_rollout_response(None, EnvRunRequest(payload={}))
         assert (response.result, response.failure_reason) == (None, "EnvConnectExhausted")
 
-    @pytest.mark.parametrize("kind", ["ok", "http-failure"])
+    @pytest.mark.parametrize("kind", ["ok", "row-cap-binds", "http-failure"])
     @pytest.mark.asyncio
     async def test_episode_end_to_end(self, tmp_path, kind):
-        agent = _agent(tmp_path, max_output_tokens_per_step=64)
+        if kind == "row-cap-binds":
+            # A row-level max_output_tokens below the agent cap must win the stamp AND be
+            # what the rollout self-reports as generation_cap (termination-check input).
+            row = {"responses_create_params": {"input": "q 0", "max_output_tokens": 32}}
+            capped = tmp_path / "capped.jsonl"
+            capped.write_text(json.dumps({**row, "problem_id": "p0"}) + "\n")
+            agent = _agent(tmp_path, max_output_tokens_per_step=64, dataset_file=str(capped))
+        else:
+            agent = _agent(tmp_path, max_output_tokens_per_step=64)
+        expected_cap = 32 if kind == "row-cap-binds" else 64
         seen, ok_body = [], {
             "reward": 1.0,
             "response": {"output": [_turn([1, 2], [3], completion_id="c-0")]},
@@ -433,9 +454,9 @@ class TestResponsesEnvAgent:
         def handler(request):
             seen.append(json.loads(request.content))
             return (
-                httpx.Response(200, json=ok_body)
-                if kind == "ok"
-                else httpx.Response(404, text="gone")
+                httpx.Response(404, text="gone")
+                if kind == "http-failure"
+                else httpx.Response(200, json=ok_body)
             )
 
         _install_transport(agent, handler)
@@ -443,19 +464,22 @@ class TestResponsesEnvAgent:
         rollout = await params.build_rollout(await params.run_episode())
 
         assert seen[0]["responses_create_params"]["temperature"] == 0.7
-        assert seen[0]["responses_create_params"]["max_output_tokens"] == 64
-        if kind == "ok":
+        assert seen[0]["responses_create_params"]["max_output_tokens"] == expected_cap
+        if kind == "http-failure":
+            assert (rollout.rollout_status, rollout.failure_reason) == ("placeholder", "http_404")
+            assert rollout.env_id == "test_env"
+            # Failure placeholders keep the real problem_id of the drawn row.
+            assert rollout.problem_id in {"p0", "p1", "p2", "p3"}
+        else:
             assert (rollout.trajectory, rollout.completion_ids) == ([[1, 2, 3]], ["c-0"])
-            assert rollout.generation_cap == 64
+            assert rollout.generation_cap == expected_cap
+        if kind == "ok":
             # The non-grouped path composes the same episode primitives.
             request = _request()
             request.num_rollouts = 2
             assert [r.trajectory for r in await agent.get_reward_rollouts(request)] == [
                 [[1, 2, 3]]
             ] * 2
-        else:
-            assert (rollout.rollout_status, rollout.failure_reason) == ("placeholder", "http_404")
-            assert rollout.env_id == "test_env"
 
     @pytest.mark.parametrize(
         "input_value, expected_prompt",

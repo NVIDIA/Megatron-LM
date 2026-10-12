@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from ..__init__ import GenericGenerationArgs
 from ..inference import InferenceRequest, InferenceResponse, LLMChatMessage
@@ -111,8 +111,10 @@ def resolve_curriculum_training_state(args) -> tuple[int, int]:
     if iteration is None:
         iteration = getattr(args, 'iteration')
 
-    prompts_per_collection = getattr(args, 'grpo_prompts_per_step', None)
-    prompts_per_collection = 64 if prompts_per_collection is None else int(prompts_per_collection)
+    prompts_per_collection = getattr(args, 'grpo_prompts_per_step')
+    if prompts_per_collection is None:
+        raise AttributeError("grpo_prompts_per_step is unset; not a GRPO training context")
+    prompts_per_collection = int(prompts_per_collection)
     if prompts_per_collection <= 0:
         raise ValueError(f"grpo_prompts_per_step must be positive, got {prompts_per_collection}")
 
@@ -142,13 +144,18 @@ def next_curriculum_index(
 
 
 def generation_args_to_run_payload(generation_args: GenericGenerationArgs, prompt: dict) -> dict:
-    """Merge sampling settings into a dataset row's ``responses_create_params``."""
-    if generation_args.top_k is not None:
+    """Stamp the trainer's sampling settings over the row's `responses_create_params`"""
+    if generation_args.top_k is not None and generation_args.top_k > 0:
         warnings.warn("top_k is not supported by the OpenAI Responses API and will be ignored.")
 
     payload = copy.deepcopy(prompt)
     payload['responses_create_params']['temperature'] = generation_args.temperature
-    payload['responses_create_params']['top_p'] = generation_args.top_p
+    # Megatron uses top_p == 0.0 (and None) as its keep-all sentinel;
+    # the OpenAI wire requires 0 < top_p <= 1 and vLLM-class engines reject 0.0 outright.
+    top_p = generation_args.top_p
+    payload['responses_create_params']['top_p'] = 1.0 if top_p is None or top_p <= 0.0 else top_p
+    # generation_args.max_tokens is deliberately not forwarded: it dies at the client,
+    # matching MegatronLocal; output caps are stamped by _stamp_output_caps.
     return payload
 
 
@@ -248,25 +255,39 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
     # so slow-but-alive episodes are never severed mid-flight.
     # rollout_timeout_s (opt-in) is the wall-clock bound; discards slow episodes' training signals.
     http_connect_timeout_s: float = Field(
-        default_factory=lambda: float(os.environ.get('LANGRL_ENV_HTTP_CONNECT_TIMEOUT_S', '60'))
+        default_factory=lambda: float(os.environ.get('LANGRL_ENV_HTTP_CONNECT_TIMEOUT_S', '60')),
+        gt=0,
+        validate_default=True,
     )
     rollout_timeout_s: float | None = Field(
-        default_factory=lambda: float(os.environ.get('LANGRL_ENV_ROLLOUT_TIMEOUT_S', '0')) or None
+        default_factory=lambda: float(os.environ.get('LANGRL_ENV_ROLLOUT_TIMEOUT_S', '0')) or None,
+        gt=0,
+        validate_default=True,
     )
     http_retries: int = Field(
-        default_factory=lambda: int(os.environ.get('LANGRL_ENV_HTTP_RETRIES', '3'))
+        default_factory=lambda: int(os.environ.get('LANGRL_ENV_HTTP_RETRIES', '3')),
+        ge=1,
+        validate_default=True,
     )
     # Bounded connect retries: re-resolve routes every refresh_every consecutive failures
     # give up at failure_cap so the pipeline slot frees as a placeholder.
     connect_refresh_every: int = Field(
-        default_factory=lambda: int(os.environ.get('LANGRL_ENV_CONNECT_REFRESH_EVERY', '10'))
+        default_factory=lambda: int(os.environ.get('LANGRL_ENV_CONNECT_REFRESH_EVERY', '10')),
+        ge=1,
+        validate_default=True,
     )
     connect_failure_cap: int = Field(
-        default_factory=lambda: int(os.environ.get('LANGRL_ENV_CONNECT_FAILURE_CAP', '60'))
+        default_factory=lambda: int(os.environ.get('LANGRL_ENV_CONNECT_FAILURE_CAP', '60')),
+        ge=1,
+        validate_default=True,
     )
     connect_retry_wait_s: float = Field(
-        default_factory=lambda: float(os.environ.get('LANGRL_ENV_CONNECT_RETRY_WAIT_S', '5'))
+        default_factory=lambda: float(os.environ.get('LANGRL_ENV_CONNECT_RETRY_WAIT_S', '5')),
+        ge=0,
+        validate_default=True,
     )
+    # One warning per process when curriculum sampling degrades to uniform.
+    _curriculum_fallback_logged: bool = PrivateAttr(False)
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -300,13 +321,22 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         """Next dataset row: curriculum order for training, uniform for validation."""
         if validation or not self.curriculum_sampling:
             return self.dataset[np.random.randint(0, len(self.dataset))]
-        # On fallback (no Megatron state), sample uniformly rather than blocking.
         # Rollout collection only runs on one rank; DP peers must not advance the cursor.
         try:
             from megatron.training.global_vars import get_args
 
             collections, prompts_per_collection = resolve_curriculum_training_state(get_args())
-        except Exception:
+        except (ImportError, AssertionError, AttributeError) as e:
+            # TODO(#7932): read TrainState.iteration once args.curr_iteration is removed.
+            if not self._curriculum_fallback_logged:
+                self._curriculum_fallback_logged = True
+                logger.warning(
+                    "ResponsesEnvAgent[%s]: curriculum_sampling is enabled but no training "
+                    "state is available (%s: %s); falling back to uniform sampling.",
+                    self.agent_name,
+                    type(e).__name__,
+                    e,
+                )
             return self.dataset[np.random.randint(0, len(self.dataset))]
 
         idx_global, self._curriculum_cursor = next_curriculum_index(
@@ -317,10 +347,13 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         )
         return self.dataset[idx_global % len(self.dataset)]
 
-    def build_token_rollout(self, result: RunResult, problem_id: str | None) -> TokenRollout:
+    def build_token_rollout(
+        self, result: RunResult, problem_id: str | None, generation_cap: int | None = None
+    ) -> TokenRollout:
         """Convert a /run result into a (possibly multi-turn) TokenRollout.
 
-        Each trainable output item becomes one trajectory row.
+        Each trainable output item becomes one trajectory row. 
+        `generation_cap`` is the effective per-turn cap stamped on the wire.
         Subclasses may override to post-process the built rollout (e.g. reward shaping).
         """
         trajectory: list[list[int]] = []
@@ -331,6 +364,20 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         for item in result.response.output:
             if not item.is_trainable():
                 continue
+            if not item.generation_token_ids or len(item.generation_log_probs) != len(
+                item.generation_token_ids
+            ):
+                logger.warning(
+                    "Env response item has inconsistent token metadata (%s generated tokens, "
+                    "%s logprobs): problem_id=%s env_id=%s; padding with a placeholder.",
+                    len(item.generation_token_ids or []),
+                    len(item.generation_log_probs or []),
+                    problem_id,
+                    self.env_id,
+                )
+                return TokenRollout.placeholder(
+                    self.env_id, failure_reason='token_metadata_mismatch', problem_id=problem_id
+                )
             trajectory.append(item.prompt_token_ids + item.generation_token_ids)
             generation_mask.append(
                 [False] * len(item.prompt_token_ids) + [True] * len(item.generation_token_ids)
@@ -349,7 +396,9 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
                 self.env_id,
                 result.reward,
             )
-            return TokenRollout.placeholder(self.env_id, failure_reason='no_trainable_output')
+            return TokenRollout.placeholder(
+                self.env_id, failure_reason='no_trainable_output', problem_id=problem_id
+            )
 
         mask_sample = result.mask_sample
         if not mask_sample and isinstance(result.instance_config, dict):
@@ -363,12 +412,28 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
                 failure_reason,
             )
             return TokenRollout.placeholder(
-                self.env_id, failure_reason=failure_reason, rollout_status='masked'
+                self.env_id,
+                failure_reason=failure_reason,
+                rollout_status='masked',
+                problem_id=problem_id,
             )
 
         # completion_ids key this rollout's turns into the engine's finished-request
-        # ledger (one record per turn); a partial set would misalign the join.
-        if len(completion_ids) != len(trajectory):
+        # ledger (one record per turn); they must be the Megatron engine's completion ids,
+        # or absent. A partial or duplicated set would misalign the unguarded ledger join.
+        if completion_ids and (
+            len(completion_ids) != len(trajectory)
+            or len(set(completion_ids)) != len(completion_ids)
+        ):
+            logger.warning(
+                "Env response carried %s completion ids for %s turns (or duplicates): "
+                "problem_id=%s env_id=%s; dropping them (rollout stays trainable, "
+                "staleness telemetry skips it).",
+                len(completion_ids),
+                len(trajectory),
+                problem_id,
+                self.env_id,
+            )
             completion_ids = []
 
         return TokenRollout(
@@ -379,7 +444,7 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
             env_id=self.env_id,
             problem_id=problem_id,
             completion_ids=completion_ids,
-            generation_cap=self.max_output_tokens_per_step,
+            generation_cap=generation_cap,
             rollout_status='graded' if result.final_eval_time is not None else 'ok',
         )
 
@@ -476,6 +541,39 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
                         )
                 await asyncio.sleep(self.connect_retry_wait_s)
 
+    async def _post_run_with_http_retry(
+        self, payload: dict[str, Any], server_name: str | None = None
+    ) -> RunResult:
+        """POST /run with the 5xx/timeout retry budget shared by rollouts and eval.
+
+        Raises the final error once retries are exhausted (immediately for
+        non-retryable failures); callers decide value-vs-fatal semantics.
+        """
+        for attempt in range(self.http_retries):
+            try:
+                return await self._post_run(payload, server_name=server_name)
+            except EnvHTTPError as e:
+                logger.warning(
+                    "/run HTTP %s from %s: %s", e.status, server_name or self.server_name, e.detail
+                )
+                if e.status < 500 or attempt == self.http_retries - 1:
+                    raise
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "/run attempt %s/%s timed out after %ss",
+                    attempt + 1,
+                    self.http_retries,
+                    self.rollout_timeout_s,
+                )
+                if attempt == self.http_retries - 1:
+                    raise
+            wait_s = 5 * (attempt + 1)
+            logger.warning(
+                "retrying /run in %ss (attempt %s/%s)", wait_s, attempt + 1, self.http_retries
+            )
+            await asyncio.sleep(wait_s)
+        raise RuntimeError("exhausted retry loop")  # unreachable: http_retries >= 1
+
     async def get_rollout_response(
         self,
         request: RolloutRequest | GroupedRolloutRequest | EvaluationRequest,
@@ -487,44 +585,17 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         # Route to the server stamped at prepare time: a dispatching parent may run
         # this method on behalf of the child that built the payload.
         target_server = inference_request.server_name or self.server_name
-
-        for attempt in range(self.http_retries):
-            try:
-                return EnvRunResponse(
-                    result=await self._post_run(payload, server_name=target_server)
-                )
-            except EnvHTTPError as e:
-                logger.warning(
-                    "get_rollout_response HTTP %s from %s: %s", e.status, target_server, e.detail
-                )
-                if e.status >= 500 and attempt < self.http_retries - 1:
-                    wait_s = 5 * (attempt + 1)
-                    logger.warning(
-                        "get_rollout_response retrying HTTP %s in %ss (attempt %s/%s)",
-                        e.status,
-                        wait_s,
-                        attempt + 1,
-                        self.http_retries,
-                    )
-                    await asyncio.sleep(wait_s)
-                    continue
-                return EnvRunResponse(failure_reason=f"http_{e.status}", failure_detail=e.detail)
-            except asyncio.TimeoutError as e:
-                logger.warning(
-                    "get_rollout_response attempt %s/%s timed out after %ss",
-                    attempt + 1,
-                    self.http_retries,
-                    self.rollout_timeout_s,
-                )
-                if attempt < self.http_retries - 1:
-                    await asyncio.sleep(5 * (attempt + 1))
-                    continue
-                return EnvRunResponse(failure_reason='rollout_timeout', failure_detail=str(e))
-            except Exception as e:
-                logger.exception("get_rollout_response failed; padding with a placeholder")
-                return EnvRunResponse(failure_reason=type(e).__name__, failure_detail=str(e))
-
-        return EnvRunResponse(failure_reason='unknown', failure_detail='exhausted retry loop')
+        try:
+            return EnvRunResponse(
+                result=await self._post_run_with_http_retry(payload, server_name=target_server)
+            )
+        except EnvHTTPError as e:
+            return EnvRunResponse(failure_reason=f"http_{e.status}", failure_detail=e.detail)
+        except asyncio.TimeoutError as e:
+            return EnvRunResponse(failure_reason='rollout_timeout', failure_detail=str(e))
+        except Exception as e:
+            logger.exception("get_rollout_response failed; padding with a placeholder")
+            return EnvRunResponse(failure_reason=type(e).__name__, failure_detail=str(e))
 
     def _stamp_output_caps(self, payload: dict) -> dict:
         """Apply this agent's output-token caps to a /run body in place."""
@@ -542,6 +613,9 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         payload = self._stamp_output_caps(
             generation_args_to_run_payload(request.generation_args, prompt)
         )
+        # The cap actually sent for this episode (row cap merged with the agent cap);
+        # the rollout must self-report this value or the trainer's termination check breaks.
+        effective_cap = payload['responses_create_params'].get('max_output_tokens')
         problem_id = _field(prompt, 'problem_id')
         inference_request = EnvRunRequest(payload=payload, server_name=self.server_name)
 
@@ -563,9 +637,13 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
                     response.failure_detail,
                 )
                 return TokenRollout.placeholder(
-                    self.env_id, failure_reason=response.failure_reason or 'unknown'
+                    self.env_id,
+                    failure_reason=response.failure_reason or 'unknown',
+                    problem_id=problem_id,
                 )
-            return self.build_token_rollout(response.result, problem_id)
+            return self.build_token_rollout(
+                response.result, problem_id, generation_cap=effective_cap
+            )
 
         return GroupRolloutParams(run_episode=run_episode, build_rollout=build_rollout)
 
@@ -579,23 +657,64 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         return list(await asyncio.gather(*[_single_rollout() for _ in range(request.num_rollouts)]))
 
     async def _evaluation(
-        self, prompt: dict, golden: None, request: EvaluationRequest
+        self, prompt: dict, golden: dict | None, request: EvaluationRequest
     ) -> EvaluationResponse[RewardEvaluationResult]:
         payload = self._stamp_output_caps(
             generation_args_to_run_payload(request.generation_args, prompt)
         )
-        # Same bounded, re-resolving transport as training rollouts.
-        result = await self._post_run(payload, server_name=self.server_name)
+        # Same transport and HTTP-retry classification as training rollouts;
+        # terminal failures propagate and run_evaluation turns them into dropped prompts.
+        result = await self._post_run_with_http_retry(payload, server_name=self.server_name)
         return run_result_to_evaluation_response(result, _field(prompt, 'problem_id'), self.env_id)
 
-    def evaluation_prompts(self, num_prompts: int, validation: bool = False) -> list[dict]:
-        return [self.dataset[i] for i in range(num_prompts) if i < len(self.dataset)]
+    async def evaluation_prompts(self, num_prompts: int, validation: bool = False) -> list[dict]:
+        """First ``num_prompts`` dataset rows; warns when the dataset is smaller."""
+        if num_prompts > len(self.dataset):
+            logger.warning(
+                "evaluation_prompts[%s]: dataset has %d rows; evaluating all of them "
+                "instead of the requested %d.",
+                self.env_id,
+                len(self.dataset),
+                num_prompts,
+            )
+        return self.dataset[:num_prompts]
 
     async def run_evaluation(self, request: EvaluationRequest) -> EvaluationResponse:
-        all_prompts = self.evaluation_prompts(request.num_prompts, request.validation)
-
-        results = await asyncio.gather(*[self.evaluation(p, None, request) for p in all_prompts])
-
-        return type(results[0])(
-            results=sum([result.results for result in results], []), env_id=self.env_id
+        """Pass@k-evaluate the leading dataset rows against the environment server."""
+        assert request.rank_info is None, (
+            "ResponsesEnvAgent evaluates the full prompt set; rank_info distribution "
+            "is not supported"
+        )
+        all_prompts = await self.evaluation_prompts(request.num_prompts, request.validation)
+        if not all_prompts:
+            raise ValueError(
+                f"ResponsesEnvAgent[{self.agent_name}]: no evaluation prompts "
+                f"(num_prompts={request.num_prompts}, dataset rows={len(self.dataset)})."
+            )
+        goldens = [p if isinstance(p, dict) else None for p in all_prompts]
+        results = await asyncio.gather(
+            *[self.evaluation(p, g, request) for p, g in zip(all_prompts, goldens)],
+            return_exceptions=True,
+        )
+        kept, failed = [], []
+        for prompt, result in zip(all_prompts, results):
+            if isinstance(result, BaseException):
+                failed.append(_field(prompt, 'problem_id'))
+            else:
+                kept.append(result)
+        if failed:
+            logger.warning(
+                "run_evaluation[%s]: dropping %d/%d prompts after exhausted retries: %s",
+                self.env_id,
+                len(failed),
+                len(results),
+                failed,
+            )
+        if not kept:
+            raise RuntimeError(
+                f"run_evaluation[{self.env_id}]: 0 usable eval results; all "
+                f"{len(results)} prompts failed."
+            )
+        return type(kept[0])(
+            results=sum([result.results for result in kept], []), env_id=self.env_id
         )
