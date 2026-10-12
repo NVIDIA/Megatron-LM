@@ -7,6 +7,28 @@ are listed below. Configuration checks on CPU do not qualify a parallel topology
 
 ## GPU validation status
 
+The submission branch is rebased onto `main` at
+`e30d863a6d82a3c45f2d71355dc73fbf5610967b`. Its explicit GDN backend selector
+requires `gdn_kernel_backend="fla"` for recurrence offloading; Torch and
+Transformer Engine backends fail at configuration time. The optional Qwen tool
+also explicitly selects FLA for both disabled and offloaded baselines.
+
+Post-rebase checks on 2026-10-11 (2026-10-12 UTC) pass 73 GDN recurrence/config
+cases, 16 gate-backward replay cases and 15 shared-manager cases on each of two
+ranks: 104 passed with no skips. The native complete reduced-model training suite
+passes 72 cases on each rank with 24 four-rank cases skipped and launcher exit
+code 0. Eleven configuration-boundary cases also pass on CPU. These checks do
+not rerun the historical four-rank or memory/runtime matrices below.
+
+A separate post-rebase comparison reruns complete pretrained Qwen TP=2/SP
+training with output-norm recomputation enabled. Both pre-GDR variants use fresh
+disabled and fraction-1 processes: four two-rank runs, eight rank files and
+24 exact complete rank-step states. Each comparison includes one warmup and two
+steady optimizer steps, with all pre-reset pool counts zero and positive transfer
+bytes in enabled arms. These runs use sequence 128 and the 1024-element threshold;
+they produce no timed samples. The local publication evidence is indexed by
+`publication-20261011/publication-checks.json`.
+
 The 2026-10-06/07/08/10/11 runs use RTX A6000 GPUs, PyTorch 2.11.0+cu130, Transformer
 Engine 2.20.2, FLA 0.5.1 and cuDNN 9.19.0. These public-package container runs
 do not replace upstream CI.

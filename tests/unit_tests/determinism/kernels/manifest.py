@@ -479,7 +479,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/ssm/test_gated_delta_net_offloading.py",
         ),
         kind="torch.compile",
-        notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
+        notes="Deterministic execution uses torch_chunk_gated_delta_rule; GDN1 requires "
+        "gdn_kernel_backend='torch'. FLA remains outside deterministic_mode support.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",

@@ -8,7 +8,9 @@ targets memory-constrained training. BestJuly confirmed in the
 that saved-tensor offloading would complement existing recomputation approaches.
 [The follow-up reply](https://github.com/NVIDIA/Megatron-LM/issues/6757#issuecomment-6008766114)
 accepts either current `main` or `dev` as a starting point.
-This implementation uses `main` at `d6316eb45`.
+The initial implementation uses `main` at `d6316eb45`; the submission branch is
+rebased onto `e30d863a6d82a3c45f2d71355dc73fbf5610967b`. Recorded A6000
+measurements retain their original source commits.
 
 The later [PR #7852](https://github.com/NVIDIA/Megatron-LM/pull/7852) implements
 input-projection and conv/QKV selective recomputation plus convolution-input offload.
@@ -85,7 +87,8 @@ Backward crosses the commit before reading FLA's saved tensors;
 the group-start backward lets the existing manager prefetch the preceding group.
 The output norm and its optional `gdn_norm_out` checkpoint remain outside this scope.
 
-The option is disabled by default. It requires BF16 GDN1 and the FLA recurrence;
+The option is disabled by default. It requires BF16 GDN1 and
+`gdn_kernel_backend="fla"`;
 configuration rejects GDN2, FP8/FP4, deterministic reference execution, full-layer
 recomputation, and CUDA graphs. Eval, no-grad, and fully frozen recurrence forwards
 do not register groups. A trainable gate is used as the group-start anchor if Q is

@@ -1536,7 +1536,8 @@ class TransformerConfig(ModelParallelConfig):
     "shortcut_post_norm": offload the input of the shortcut output normalization.
             Requires moe_shortcut_connection=True.
     "gdn_core_attn": offload tensors saved by the FLA GatedDeltaNet recurrence.
-            Initial support is BF16 GDN with no CUDA graphs or full recomputation.
+            Requires BF16 GDN and gdn_kernel_backend="fla", with no CUDA graphs
+            or full recomputation.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
