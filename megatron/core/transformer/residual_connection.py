@@ -121,6 +121,8 @@ class ResidualConnection(nn.Module, ABC):
                 return self._write_with_validation(
                     value, state, dropout_probability=dropout_probability, training=training
                 )
+            case _:
+                raise ValueError(f"Unsupported residual connection mode: {self.mode}.")
 
     def _read_with_validation(
         self,
