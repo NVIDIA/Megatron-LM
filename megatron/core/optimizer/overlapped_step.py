@@ -428,5 +428,4 @@ class OverlappedOptimizerStep:
                     weight_decay,
                     self.inv_scale,
                 )
-        for bucket in bucket_group.buckets:
-            bucket.grad_data.zero_()
+        bucket_group.zero_grads()
