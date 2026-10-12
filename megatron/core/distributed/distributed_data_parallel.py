@@ -7,6 +7,7 @@ from typing import Optional
 
 import torch
 
+from .. import num_microbatches_calculator
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
@@ -245,6 +246,16 @@ class DistributedDataParallel(_BaseDataParallel):
             "GTP requires average_in_collective=False (the default); averaged collectives reduce "
             "over the GTP-excluded group and would miss the 1/gtp_remat gradient scaling factor."
         )
+
+        if self.ddp_config.overwrite_main_grad:
+            self._check_overwrite_main_grad_supported(config, gtp_active)
+            for param in self.params_with_grad:
+                # Read by the fused weight-gradient GEMMs (Transformer Engine's and
+                # tensor_parallel.layers'): write main_grad instead of accumulating into it.
+                param.overwrite_main_grad = True
+        # overwrite_main_grad: set by zero_grad_buffer once a backward pass has told which
+        # .main_grads the backward hook adds into.
+        self._main_grads_to_zero_recorded = False
 
         # Compute gradient scaling factors.
         if config.calculate_per_token_loss:
@@ -569,14 +580,54 @@ class DistributedDataParallel(_BaseDataParallel):
 
     def _finish_param_sync_for_bucket_group(self, bucket_group):
         """Drain one bucket group's param all-gather and run its post-all-gather processing."""
-        # If aligning param all-gather across pipeline stages, all-gather is dispatched
-        # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
-        # If overlapping param all-gather with optimizer step, then all-gather has
-        # already been dispatched in optimizer step.
-        skip_next_bucket_dispatch = (
-            self.ddp_config.align_param_gather or self.overlap_param_gather_with_optimizer_step
-        )
+        if bucket_group.overlapped_step is not None:
+            # The optimizer updates the bucket group and starts its all-gather (and those of the
+            # next bucket groups) itself, so the next-bucket dispatch below is not ours to make.
+            bucket_group.overlapped_step.dispatch_param_gather(bucket_group)
+            skip_next_bucket_dispatch = True
+        else:
+            # If aligning param all-gather across pipeline stages, all-gather is dispatched
+            # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
+            # If overlapping param all-gather with optimizer step, then all-gather has
+            # already been dispatched in optimizer step.
+            skip_next_bucket_dispatch = (
+                self.ddp_config.align_param_gather or self.overlap_param_gather_with_optimizer_step
+            )
         bucket_group.finish_param_sync(skip_next_bucket_dispatch=skip_next_bucket_dispatch)
+
+    def _check_overwrite_main_grad_supported(self, config: TransformerConfig, gtp_active: bool):
+        """
+        overwrite_main_grad needs every parameter's gradient produced once per iteration, by a
+        fused weight-gradient GEMM that honors the attribute or by autograd through the
+        backward hook.
+        """
+        reasons = []
+        if num_microbatches_calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR is not None:
+            num_microbatches = num_microbatches_calculator.get_num_microbatches()
+            if num_microbatches != 1:
+                reasons.append(
+                    f"{num_microbatches} micro-batches per step accumulate their gradients"
+                )
+        if gtp_active:
+            reasons.append("GTP weight remat accumulates weight gradients into main_grad")
+        cuda_graph_impl = getattr(config, 'cuda_graph_impl', 'none')
+        if cuda_graph_impl in ('local', 'transformer_engine'):
+            reasons.append(
+                f"cuda_graph_impl={cuda_graph_impl!r} accumulates the graphs' weight gradients "
+                "into main_grad"
+            )
+        if getattr(config, 'defer_embedding_wgrad_compute', False):
+            reasons.append("defer_embedding_wgrad_compute accumulates into main_grad")
+        owners = {}
+        for module_name, module in self.module.named_modules(remove_duplicate=False):
+            for name, param in module.named_parameters(recurse=False):
+                if param.requires_grad:
+                    owners.setdefault(param, []).append(f"{module_name}.{name}".lstrip('.'))
+        shared = [names for names in owners.values() if len(names) > 1]
+        if shared:
+            reasons.append(f"shared parameters get one gradient per use: {shared}")
+        if reasons:
+            raise ValueError("overwrite_main_grad is not supported here: " + "; ".join(reasons))
 
     def _make_backward_post_hook(self, param: torch.nn.Parameter):
         """
@@ -591,6 +642,14 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
+                if (
+                    self.ddp_config.overwrite_main_grad
+                    and not self.param_to_bucket_group[param].is_last_microbatch
+                ):
+                    raise RuntimeError(
+                        "overwrite_main_grad: a backward pass inside no_sync() would accumulate "
+                        "gradients across micro-batches"
+                    )
                 cudagraph_wgrad_ready_event = getattr(param, '_cudagraph_wgrad_ready_event', None)
                 if self.ddp_config.overlap_grad_reduce and cudagraph_wgrad_ready_event is None:
                     # GTP_remat keeps its real wgrad in main_grad (via finalize); param.grad here is
@@ -704,6 +763,8 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
+            if bucket_group.overlapped_step is not None:
+                bucket_group.overlapped_step.grad_reduce_finished(bucket_group)
 
     def free_overlap_buffers(self):
         """Free overlap param-gather GPU buffers across all bucket groups."""
@@ -724,12 +785,50 @@ class DistributedDataParallel(_BaseDataParallel):
             # Don't reset grad_added_to_main_grad when CUDA Graph is used.
             # Because in CUDA Graph it no longer has the opportunity to set it back
             # to True, and there will be a double-GA.
+            if self.ddp_config.overwrite_main_grad:
+                # Before the reset: the flags tell which main_grads a fused GEMM wrote.
+                self._record_main_grads_to_zero()
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
-        for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.reset()
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+        # With the overlapped optimizer step, grads of a scheduled update stay until the update
+        # consumed them: each bucket is zeroed right after its update, before its all-gather.
+        grads_pending_update = any(
+            bucket_group.overlapped_step is not None
+            and bucket_group.overlapped_step.grads_pending_update
+            for bucket_group in bucket_groups
+        )
+        if not grads_pending_update:
+            for buffer in self.buffers + self.expert_parallel_buffers:
+                buffer.reset()
+        for bucket_group in bucket_groups:
             bucket_group.reset()
+
+    def _record_main_grads_to_zero(self):
+        """
+        overwrite_main_grad: once a backward pass has shown which .main_grads a fused
+        weight-gradient GEMM writes (grad_added_to_main_grad) and which the backward hook adds
+        autograd's gradient into, record the latter; the buffers zero only those from then on.
+        """
+        if self._main_grads_to_zero_recorded or not any(
+            param.grad_added_to_main_grad for param in self.params_with_grad
+        ):
+            return
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            produced_twice = [
+                param
+                for param, count in bucket_group.per_param_grad_ready_counts.items()
+                if count > 1
+            ]
+            if produced_twice:
+                raise RuntimeError(
+                    "overwrite_main_grad: the gradient of a parameter was produced more than "
+                    f"once in one iteration ({len(produced_twice)} parameter(s), the first of "
+                    f"shape {tuple(produced_twice[0].shape)})"
+                )
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.record_main_grads_to_zero()
+        self._main_grads_to_zero_recorded = True
 
     def broadcast_params(self):
         """

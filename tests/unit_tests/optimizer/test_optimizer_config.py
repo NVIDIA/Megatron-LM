@@ -53,3 +53,28 @@ def test_paramkey_matches():
     #  it has the attribute.
     setattr(p_with_attr, "is_embedding_or_output_parameter", False)
     assert not has_attr.matches(p_with_attr, "interesting.bias")
+
+
+def test_overlap_optimizer_step_with_forward_requirements():
+    """The overlapped step needs the distributed optimizer, Adam and no loss scaling."""
+    ok = dict(
+        optimizer='adam', bf16=True, use_distributed_optimizer=True, overlap_param_gather=True
+    )
+    OptimizerConfig(overlap_optimizer_step_with_forward=True, **ok)
+    for bad in (
+        dict(use_distributed_optimizer=False),
+        dict(optimizer='sgd'),
+        dict(fp16=True, bf16=False),
+        dict(loss_scale=1024.0),
+        dict(use_precision_aware_optimizer=True),
+        dict(optimizer_cpu_offload=True),
+        dict(optimizer_cuda_graph=True),
+        dict(overlap_param_gather_with_optimizer_step=True),
+        dict(log_num_zeros_in_grad=True),
+        dict(grad_norm_skip_threshold=10.0),
+        dict(overlap_optimizer_step_prefetch=-1),
+    ):
+        with pytest.raises(ValueError, match="overlap_optimizer_step_with_forward requires"):
+            OptimizerConfig(overlap_optimizer_step_with_forward=True, **{**ok, **bad})
+    # Off by default: none of the above is checked.
+    OptimizerConfig(**{**ok, 'optimizer_cuda_graph': True})
