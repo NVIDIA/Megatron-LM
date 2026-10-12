@@ -227,6 +227,13 @@ class HyperConnectionModule(MegatronModule):
     4. Residual merge: H_res^T @ x + expanded_output
     5. Block-level expand/contract for TransformerBlock boundaries
 
+    With ``config.enable_identity_hyper_connections`` (iHC, identity
+    hyper-connections) H_res is fixed to the n x n identity: the mapping
+    projection only produces H_pre and H_post, and the Sinkhorn-Knopp
+    projection is skipped. The H_res consumers are unchanged and receive the
+    identity matrix, so the propagation becomes
+        x_{l+1} = x_l + H_post^T @ F(H_pre @ x_l)
+
     Args:
         config: TransformerConfig with hyper-connection fields
         layer_number: Current layer index for initialization
@@ -238,31 +245,39 @@ class HyperConnectionModule(MegatronModule):
         self.layer_number = layer_number
         self.n = config.num_residual_streams
         self.hidden_size = config.hidden_size
+        # iHC: H_res is the identity; nothing is projected or Sinkhorn-normalized for it.
+        self.identity_h_res = config.enable_identity_hyper_connections
         self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
         self.sinkhorn_eps = _MHC_SINKHORN_EPS
         self.compute_h_eps = _MHC_COMPUTE_H_EPS
 
         # Projection weights for dynamic mappings
-        # Input: [s, b, n*C] -> Output: n^2 + 2n values per token
+        # Input: [s, b, n*C] -> Output: n^2 + 2n values per token (2n under iHC)
         # - H_pre: n values
         # - H_post: n values
-        # - H_res: n^2 values (before Sinkhorn projection)
-        self.mapping_proj = nn.Linear(
-            self.n * self.hidden_size, self.n * self.n + 2 * self.n, bias=False
-        )
+        # - H_res: n^2 values (before Sinkhorn projection); absent under iHC
+        num_h_res_outputs = 0 if self.identity_h_res else self.n * self.n
+        num_mapping_outputs = 2 * self.n + num_h_res_outputs
+        self.mapping_proj = nn.Linear(self.n * self.hidden_size, num_mapping_outputs, bias=False)
 
         init_alpha = config.mhc_init_gating_factor
         # Learnable scaling factors (Eq. 5 in paper)
         self.alpha_pre = nn.Parameter(torch.full((1,), init_alpha))
         self.alpha_post = nn.Parameter(torch.full((1,), init_alpha))
-        self.alpha_res = nn.Parameter(torch.full((1,), init_alpha))
+        if self.identity_h_res:
+            # No H_res logits to scale. Keep the attribute (as None) so callers
+            # can introspect it without registering a dead parameter.
+            self.register_parameter("alpha_res", None)
+        else:
+            self.alpha_res = nn.Parameter(torch.full((1,), init_alpha))
 
         # Static bias terms
-        self.bias = nn.Parameter(torch.zeros(self.n * self.n + 2 * self.n))
+        self.bias = nn.Parameter(torch.zeros(num_mapping_outputs))
         mark_keep_in_fp32(self.mapping_proj.weight)
         mark_keep_in_fp32(self.alpha_pre)
         mark_keep_in_fp32(self.alpha_post)
-        mark_keep_in_fp32(self.alpha_res)
+        if self.alpha_res is not None:
+            mark_keep_in_fp32(self.alpha_res)
         mark_keep_in_fp32(self.bias)
         self.norm_eps = 1e-6
 
@@ -289,13 +304,20 @@ class HyperConnectionModule(MegatronModule):
             )
 
             log_fused_mhc_backend_once()
-            self._sinkhorn_op = fused_sinkhorn
             self._h_aggregate_op = fused_h_aggregate
             self._h_aggregate_into_op = fused_h_aggregate_into
             self._h_post_bda_op = fused_h_post_bda
-            self._proj_rms_compute_h_op = fused_proj_rms_compute_h
+            if self.identity_h_res:
+                # iHC has no Sinkhorn step, and the fused projection kernel
+                # assumes the mHC [n^2 + 2n] output layout, so the projection
+                # takes the native path. Aggregate and H_post_bda stay fused.
+                self._sinkhorn_op = None
+                self._proj_rms_compute_h_op = None
+            else:
+                self._sinkhorn_op = fused_sinkhorn
+                self._proj_rms_compute_h_op = fused_proj_rms_compute_h
         else:
-            self._sinkhorn_op = native_sinkhorn
+            self._sinkhorn_op = None if self.identity_h_res else native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
             self._h_aggregate_into_op = native_h_aggregate_into
             self._h_post_bda_op = native_h_post_bda
@@ -315,7 +337,8 @@ class HyperConnectionModule(MegatronModule):
             setattr(self.mapping_proj.weight, 'sequence_parallel', True)
             setattr(self.alpha_pre, 'sequence_parallel', True)
             setattr(self.alpha_post, 'sequence_parallel', True)
-            setattr(self.alpha_res, 'sequence_parallel', True)
+            if self.alpha_res is not None:
+                setattr(self.alpha_res, 'sequence_parallel', True)
             setattr(self.bias, 'sequence_parallel', True)
 
     def _projection_and_get_norm(self, x: Tensor) -> Tuple[Tensor, Tensor]:
@@ -341,22 +364,18 @@ class HyperConnectionModule(MegatronModule):
         Compute h from projected hidden states and scaling factors.
 
         Args:
-            proj: [s, b, n^2 + 2n] - projected hidden states
+            proj: [s, b, n^2 + 2n] - projected hidden states ([s, b, 2n] under iHC)
             r: [s, b, 1] - scaling factors
 
         Returns:
             h_pre: [s, b, n] - aggregation weights
             h_post: [s, b, n] - expansion weights
-            h_res: [s, b, n^2] - residual mixing logits
+            h_res: [s, b, n^2] - residual mixing logits, or None under iHC
         """
-        alpha_ = torch.cat(
-            [
-                self.alpha_pre.expand(self.n),
-                self.alpha_post.expand(self.n),
-                self.alpha_res.expand(self.n * self.n),
-            ],
-            dim=-1,
-        )
+        alpha_parts = [self.alpha_pre.expand(self.n), self.alpha_post.expand(self.n)]
+        if not self.identity_h_res:
+            alpha_parts.append(self.alpha_res.expand(self.n * self.n))
+        alpha_ = torch.cat(alpha_parts, dim=-1)
 
         h = r * proj * alpha_ + self.bias
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
@@ -364,8 +383,22 @@ class HyperConnectionModule(MegatronModule):
 
         # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
         h_post = h[..., self.n : 2 * self.n].sigmoid() * 2
+        if self.identity_h_res:
+            # iHC projects nothing for H_res; the identity is materialized by the caller.
+            return h_pre, h_post, None
         h_res = h[..., 2 * self.n :]
         return h_pre, h_post, h_res
+
+    def _make_identity_h_res(self, s: int, b: int, dtype: torch.dtype, device) -> Tensor:
+        """
+        Materialize the iHC residual mixing matrix: the n x n identity for every token.
+
+        The H_res consumers (``apply_h_res`` and the fused H_post_bda kernels) expect
+        a dense ``[s, b, n, n]`` tensor, so the identity is materialized per token
+        rather than handed over as a stride-0 view. It carries no gradient.
+        """
+        eye = torch.eye(self.n, dtype=dtype, device=device)
+        return eye.expand(s, b, self.n, self.n).contiguous()
 
     @nvtx_decorator(message="HyperConnection::compute_mappings")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -380,12 +413,13 @@ class HyperConnectionModule(MegatronModule):
         Returns:
             h_pre: [s, b, n] - aggregation weights (sigmoid activated)
             h_post: [s, b, n] - expansion weights (2*sigmoid activated)
-            h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
+            h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic;
+                the identity under iHC)
         """
         s, b, _ = x.shape
 
         if self._proj_rms_compute_h_op is not None:
-            # Fused path: proj_rms + compute_h in one kernel launch sequence
+            # Fused path (mHC only): proj_rms + compute_h in one kernel launch sequence
             x_2d = x.reshape(s * b, self.n * self.hidden_size)
             with torch.cuda.nvtx.range("HyperConnection::fused_proj_rms_compute_h"):
                 h_pre, h_post, h_res, _ = self._proj_rms_compute_h_op(
@@ -401,18 +435,21 @@ class HyperConnectionModule(MegatronModule):
                 )
             h_pre = h_pre.view(s, b, self.n)
             h_post = h_post.view(s, b, self.n)
-            h_res = h_res.view(s, b, self.n, self.n)
         else:
             # Native path: separate proj_rms + _compute_h
             with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
                 proj, r = self._projection_and_get_norm(x)
             with torch.cuda.nvtx.range("HyperConnection::compute_h"):
                 h_pre, h_post, h_res = self._compute_h(proj, r)
-            h_res = h_res.view(s, b, self.n, self.n)
 
-        h_res = self._sinkhorn_op(
-            h_res, self.sinkhorn_iterations, self.sinkhorn_eps
-        )  # [s, b, n, n]
+        if self.identity_h_res:
+            # iHC: the projection carried no H_res logits. The residual mixing
+            # matrix is the identity and the Sinkhorn-Knopp projection is skipped.
+            h_res = self._make_identity_h_res(s, b, x.dtype, x.device)
+        else:
+            h_res = self._sinkhorn_op(
+                h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations, self.sinkhorn_eps
+            )  # [s, b, n, n]
 
         # The mixing weights are bounded (sigmoid outputs / doubly stochastic
         # matrix), so after the FP32 computation they are safe to apply to the
@@ -575,7 +612,8 @@ class HyperConnectionModule(MegatronModule):
             3-tuple API because fused_h_res_h_post_bda consumes the residual
             branch created by BroadcastTensorFused.
             aggregated: [s, b, C] - aggregated input for layer computation
-            h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
+            h_res: [s, b, n, n] - residual mixing matrix (for fused kernel);
+                the identity under iHC
             h_post: [s, b, n] - expansion weights
             residual: [s, b, n*C] - residual view for fused_h_res_h_post_bda
         """

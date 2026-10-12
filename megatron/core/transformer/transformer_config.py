@@ -1387,6 +1387,17 @@ class TransformerConfig(ModelParallelConfig):
     num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
+    enable_identity_hyper_connections: bool = False
+    """Use identity hyper-connections (iHC) instead of manifold-constrained ones (mHC).
+
+    Under iHC the residual mixing matrix H_res is fixed to the n x n identity, so every residual
+    stream carries itself to the next layer unchanged. The per-layer mapping projection then only
+    produces H_pre and H_post (2n outputs instead of n^2 + 2n), and the Sinkhorn-Knopp projection,
+    alpha_res and the H_res bias are dropped. The downstream H_res / H_post / BDA kernels are
+    unchanged and consume the identity matrix as-is. Requires enable_hyper_connections=True;
+    mhc_sinkhorn_iterations has no effect.
+    """
+
     mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
 
@@ -2958,6 +2969,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
+
+        # Validation for enable_identity_hyper_connections
+        if self.enable_identity_hyper_connections and not self.enable_hyper_connections:
+            raise ValueError(
+                "enable_identity_hyper_connections requires enable_hyper_connections=True."
+            )
 
         if self.fine_grained_activation_offloading:
             assert (
