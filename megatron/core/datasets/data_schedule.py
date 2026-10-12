@@ -1,12 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
 import enum
-from typing import Any, Callable, Dict, Optional, Type
+from functools import partial
+from typing import Any, Callable, Dict, Optional, Sequence, Type
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.context_parallel import get_batches_on_this_cp_rank
+from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
 from megatron.core.datasets.data_schedule_utils import (
     align_sample_id_groups,
     broadcast_scalars,
@@ -413,13 +414,21 @@ class PackingSchedulerEnum(enum.Enum):
 class DefaultDynamicCPScheduler(DpBalancedScheduler):
     """Balance packed samples while selecting a runtime CP size per microbatch."""
 
-    def __init__(self, *args, min_cp_size=1, **kwargs):
+    def __init__(
+        self, *args, min_cp_size: int = 1, cp_group_sizes: Sequence[int] | None = None, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.is_dynamic_cp = True
         self.total_dpxcp_ranks = self.dp_size * self.cp_size
+        valid_sizes = get_valid_dynamic_context_parallel_group_sizes(self.total_dpxcp_ranks)
         self.cp_group_sizes = tuple(
-            parallel_state.get_valid_dynamic_context_parallel_group_sizes(self.total_dpxcp_ranks)
+            sorted(set(valid_sizes if cp_group_sizes is None else cp_group_sizes))
         )
+        if set(self.cp_group_sizes) - set(valid_sizes):
+            raise ValueError(
+                f"Unsupported Dynamic CP group sizes {list(self.cp_group_sizes)} for "
+                f"DPxCP size {self.total_dpxcp_ranks}; expected a subset of {valid_sizes}"
+            )
         if min_cp_size not in self.cp_group_sizes:
             raise ValueError(
                 f"min_cp_size={min_cp_size} is not a valid group size for DPxCP size "
@@ -475,25 +484,21 @@ def wrap_data_iterator(
     Args:
         data_iterator: The original data_iterator to wrap around
         config: The config object containing the max_seqlen_per_dp_cp_rank
-        pg_collection: The process group collection.
+        pg_collection: Caller-owned process groups; must define dp_cp, dp, tp, and pp.
     """
 
     if pg_collection is None:
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        dp_group = parallel_state.get_data_parallel_group()
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-    else:
-        dp_cp_group = pg_collection.dp_cp
-        dp_group = pg_collection.dp
-        tp_group = pg_collection.tp
-        pp_group = pg_collection.pp
+        raise ValueError("pg_collection is required for sequence packing")
+    dp_cp_group = pg_collection.dp_cp
+    dp_group = pg_collection.dp
+    tp_group = pg_collection.tp
+    pp_group = pg_collection.pp
     assert (
         dp_cp_group is not None
         and dp_group is not None
         and tp_group is not None
         and pp_group is not None
-    ), "dp_cp_group, dp_group, tp_group must not be None when using sequence packing"
+    ), "dp_cp, dp, tp, and pp must be defined in pg_collection for sequence packing"
 
     dev = torch.cuda.current_device()
     dp_size = dp_group.size()
@@ -506,6 +511,9 @@ def wrap_data_iterator(
     scheduler_kwargs = {}
     if scheduler_type == PackingSchedulerEnum.DEFAULT_DYNAMIC_CP:
         scheduler_kwargs['min_cp_size'] = config.min_dynamic_context_parallel_size
+        if not pg_collection.dynamic_cp:
+            raise ValueError("pg_collection.dynamic_cp is required for dynamic CP scheduling")
+        scheduler_kwargs['cp_group_sizes'] = tuple(pg_collection.dynamic_cp)
 
     capacity = config.max_seqlen_per_dp_cp_rank
     alignment, pad_enabled = get_packed_sequence_alignment(config, tp_group.size())
@@ -543,6 +551,16 @@ def wrap_data_iterator(
         seqlen_sum_this_global_batch,
         seqlen_squared_sum_this_global_batch,
     )
+
+
+def _get_dynamic_cp_group(
+    group_size: int, groups: Dict[int, torch.distributed.ProcessGroup], name: str
+) -> torch.distributed.ProcessGroup:
+    """Select a pre-created runtime group from the caller's parallel grid."""
+    group = groups.get(group_size)
+    if group is None:
+        raise ValueError(f"pg_collection.{name} has no group for runtime CP size {group_size}")
+    return group
 
 
 def _sequence_parallel_tp_cp_group(
@@ -590,29 +608,38 @@ def get_batch_on_this_rank_for_sequence_packing(
         vp_stage (Optional[int]): The stage of the pipeline.
         return_context_parallel_batch (bool): Return layout-keyed batch views
             instead of the legacy GPT tuple.
-        dynamic_cp_group_func (Callable, optional): Returns the runtime DPxCP group of
-            ``group_size`` ranks containing this rank. Required when ``dynamic_cp`` is True.
+        dynamic_cp_group_func (Callable, optional): Overrides the collection's runtime CP
+            group lookup for ``group_size`` ranks containing this rank.
         dynamic_tp_cp_group_func (Callable, optional): Returns the TP x runtime-DPxCP group
-            of ``group_size`` ranks. Required for dynamic CP with sequence parallelism.
+            of ``group_size`` ranks. Overrides ``pg_collection.dynamic_tp_cp``.
         tp_cp_group (torch.distributed.ProcessGroup, optional): Static TP x CP group for
             sequence parallelism. Defaults to ``pg_collection.tp_cp``.
+        pg_collection (ProcessGroupCollection): Caller-owned parallel grid. Runtime groups
+            default to its ``dynamic_cp`` and ``dynamic_tp_cp`` maps; callbacks may override them.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
     """
 
     if pg_collection is None:
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
-    else:
-        tp_group = pg_collection.tp
-        pp_group = pg_collection.pp
-        cp_group = pg_collection.cp
-        if tp_cp_group is None:
-            tp_cp_group = getattr(pg_collection, "tp_cp", None)
+        raise ValueError("pg_collection is required for sequence packing")
+    tp_group = pg_collection.tp
+    pp_group = pg_collection.pp
+    cp_group = pg_collection.cp
+    if tp_group is None or pp_group is None or cp_group is None:
+        raise ValueError("pg_collection must define tp, pp, and cp for sequence packing")
+    if tp_cp_group is None:
+        tp_cp_group = pg_collection.tp_cp
     if dynamic_cp and dynamic_cp_group_func is None:
-        raise ValueError("dynamic_cp_group_func is required when dynamic_cp is True")
+        if not pg_collection.dynamic_cp:
+            raise ValueError("pg_collection.dynamic_cp is required when dynamic_cp is True")
+        dynamic_cp_group_func = partial(
+            _get_dynamic_cp_group, groups=pg_collection.dynamic_cp, name="dynamic_cp"
+        )
+    if dynamic_cp and dynamic_tp_cp_group_func is None:
+        dynamic_tp_cp_group_func = partial(
+            _get_dynamic_cp_group, groups=pg_collection.dynamic_tp_cp or {}, name="dynamic_tp_cp"
+        )
 
     tp_src_rank = torch.distributed.get_process_group_ranks(tp_group)[0]
 

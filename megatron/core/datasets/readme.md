@@ -234,6 +234,16 @@ This module contains the high-level scheduling logic and entry points:
 
 - **`get_batch_on_this_rank_for_sequence_packing()`**: Fetches and broadcasts a single packed microbatch for the current rank. Handles TP/PP broadcasting, constructs `PackedSeqParams` (with `cu_seqlens`, `max_seqlen`, `qkv_format=thd`), and optionally partitions sequences across CP ranks using Transformer Engine's `thd_get_partitioned_indices`.
 
+Both entry points require a caller-owned `ProcessGroupCollection`. Scheduling uses its
+`tp`, `pp`, `dp`, and `dp_cp` groups; batch preparation uses `tp`, `pp`, and `cp`, plus
+`tp_cp` for static CP layout conversion with sequence parallelism. Dynamic CP selects
+pre-created groups from `dynamic_cp` and `dynamic_tp_cp`, whose keys are runtime CP sizes
+(the groups in `dynamic_tp_cp` have `TP size * CP size` ranks). The scheduler only selects
+sizes present in `dynamic_cp`; the static `cp` group remains unchanged. The standard GPT
+and Hybrid forward steps pass their model's collection. Legacy training entrypoints may
+bootstrap a collection with `ProcessGroupCollection.use_mpu_process_groups()` before
+calling Core, while independent parallel grids supply their own groups directly.
+
 ### `data_schedule_utils.py`
 
 This module contains the utility functions used by the schedulers.
