@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import torch
 
-from megatron.core.parallel_state import get_valid_dynamic_context_parallel_group_sizes
+from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 _DYNAMIC_CP_WORKLOAD_CAP_DELTA = 0.05
@@ -660,7 +660,7 @@ def next_hdp_group_packing_aware(
     it falls back to the full DPxCP group if power-of-two expansion cannot fill
     every rank.
     """
-    valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(total_gpus)
+    valid_group_sizes: List[int] = get_valid_dynamic_context_parallel_group_sizes(total_gpus)
     if cp_group_sizes is None:
         cp_group_sizes = valid_group_sizes
     else:
@@ -892,6 +892,12 @@ def next_hdp_group_packing_aware(
 
     def fill_with_full_dpxcp_group() -> None:
         nonlocal micro_batches, exec_times, sample_ids_per_gpu, leftovers
+
+        if total_gpus not in enabled_cp_sizes:
+            raise ValueError(
+                "Cannot fill DPxCP ranks with configured Dynamic CP group sizes "
+                f"{enabled_cp_sizes}; full-domain group {total_gpus} is unavailable"
+            )
 
         selected: List[Tuple[int, int]] = []
         next_leftovers: List[Tuple[int, int]] = []
