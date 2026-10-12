@@ -845,6 +845,57 @@ def handle_mtp_in_state_dict(model, model_state_dict, optimizer_state_dict):
     return model_state_dict, optimizer_state_dict
 
 
+def handle_pipeline_parallel_in_state_dict(model, model_state_dict, optimizer_state_dict):
+    """Use global layer indices for FSDP model weights and optimizer state.
+
+    FSDP bypasses ``sharded_state_dict()``, where TransformerBlock and MambaStack
+    normally translate stage-local layer indices. DCP otherwise treats layers
+    from different pipeline stages as replicas of the same tensor. Apply this
+    after handlers that look up live modules using their local paths, on both
+    save and load. Tensor values remain shared with the original dictionaries so
+    DCP loads into the original local parameters and optimizer buffers in place.
+
+    MTP has its own layer namespace and must retain its local indices. The
+    one-based ``layer_number`` on each decoder/encoder layer also handles uneven
+    pipeline splits without computing an offset from the parallel topology.
+    """
+    layer_paths = {}
+    for path, module in model.named_modules():
+        path = _strip_wrapper_prefixes(path)
+        if 'mtp' in path.split('.'):
+            continue
+        match = re.fullmatch(r'(.*(?:decoder|encoder)\.layers\.)[0-9]+', path)
+        if match is None:
+            continue
+        layer_number = getattr(module, 'layer_number', None)
+        if layer_number is None:
+            raise ValueError(f"Cannot determine global layer number for {path}")
+        layer_paths[path + '.'] = f'{match.group(1)}{layer_number - 1}.'
+
+    def remap(state):
+        result = {}
+        for key, value in state.items():
+            norm = _strip_wrapper_prefixes(key)
+            wrapper = key[: len(key) - len(norm)]
+            new_key = key
+            for local_path, global_path in layer_paths.items():
+                if norm.startswith(local_path):
+                    new_key = wrapper + global_path + norm[len(local_path) :]
+                    break
+            if new_key in result:
+                raise ValueError(f"Duplicate global FSDP checkpoint key: {new_key}")
+            result[new_key] = value
+        return result
+
+    model_state_dict = remap(model_state_dict)
+    if optimizer_state_dict is not None:
+        optimizer_state_dict = optimizer_state_dict.copy()
+        for section in ('state', 'param_to_group_meta'):
+            if section in optimizer_state_dict:
+                optimizer_state_dict[section] = remap(optimizer_state_dict[section])
+    return model_state_dict, optimizer_state_dict
+
+
 def handle_fp8_extra_state_case(model_state_dict):
     """
     Handle the case where FP8 extra state is present in the model state dict.
