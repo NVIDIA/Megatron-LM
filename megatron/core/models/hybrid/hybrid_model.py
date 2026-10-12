@@ -397,12 +397,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
-            hybrid_submodules = hybrid_stack_spec.submodules
-            mtp_block_spec = hybrid_submodules.mtp_block_spec
+            decoder_submodules = hybrid_stack_spec.submodules
+            mtp_block_spec = decoder_submodules.mtp_block_spec
             assert mtp_block_spec is not None, (
                 "MTP pattern specified but mtp_block_spec is None in hybrid_stack_spec.submodules. "
                 "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
             )
+            if decoder_submodules.mtp_stack_submodules is not None:
+                # Wide decoder specs provide separate ordinary-width layer recipes for MTP.
+                mtp_stack_submodules = decoder_submodules.mtp_stack_submodules
+            else:
+                # Ordinary decoder specs can reuse their own layer recipes for MTP.
+                mtp_stack_submodules = decoder_submodules
 
             self.mtp = MultiTokenPredictionBlock(
                 config=self.config,
@@ -411,7 +417,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 vp_stage=self.vp_stage,
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
-                hybrid_submodules=hybrid_submodules,
+                hybrid_submodules=mtp_stack_submodules,
                 hash_moe_layer_threshold=hash_moe_layer_threshold or None,
                 name="mtp",
             )
@@ -736,6 +742,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_input_mask=mtp_input_mask,
                 packed_seq_params=packed_seq_params,
                 cp_batch=cp_batch,
+                padding_mask=padding_mask,
             )
             if mtp_inputs.decoder_input is None:
                 assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
@@ -754,6 +761,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 embedding=self.embedding,
                 decoder_input=mtp_inputs.decoder_input,
                 mtp_input_mask=mtp_inputs.mtp_input_mask,
+                padding_mask=mtp_inputs.padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
             )
@@ -787,7 +795,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     loss_mask=mtp_inputs.loss_mask,
                     output_layer=self.output_layer,
                     output_weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,

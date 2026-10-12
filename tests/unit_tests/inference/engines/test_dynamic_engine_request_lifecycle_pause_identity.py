@@ -25,7 +25,7 @@ from tests.unit_tests.inference.engines.request_lifecycle_test_utils import (
     _RunResult,
     _track_checkpoint_calls,
 )
-from tests.unit_tests.inference.engines.test_dynamic_engine import set_rounder as _set_rounder
+from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder as _reset_rounder
 from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import (
     _ASYNC_PARALLEL_SCENARIOS,
     _instrument_scenario_runtime,
@@ -228,5 +228,5 @@ class TestRequestLifecyclePairwiseEP2(RequestLifecyclePairwiseBase):
             assert treatment.witness["dispatches_total"] > treatment.witness["dispatches_at_pause"]
         finally:
             self._cleanup()
-            _set_rounder(64)
+            _reset_rounder()
             Utils.destroy_model_parallel()

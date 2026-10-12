@@ -40,7 +40,12 @@ from megatron.rl import rl_utils
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
+from megatron.training.argument_utils import (
+    _default_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config import RLConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from tests.unit_tests.test_utilities import Utils
 
@@ -228,7 +233,7 @@ class TestRLUtils:
             setattr(args, key, value)
 
         args = validate_args(args)
-        set_global_variables(args, False)
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     @pytest.mark.parametrize(
@@ -275,10 +280,14 @@ class TestRLUtils:
 
     def test_rl_granularity_defaults(self):
         args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
+        cfg = _default_config_from_args(RLConfig, args)
 
-        assert args.rl_submission_granularity == "B"
-        assert args.rl_consumption_granularity == "B"
-        assert args.rl_generation_lag == 0
+        assert cfg.rl_submission_granularity == "B"
+        assert cfg.rl_consumption_granularity == "B"
+        assert cfg.rl_generation_lag == 0
+        # The derived lag lives on the section; validate_args leaves the parsed flag untouched.
+        assert args.rl_generation_lag is None
+        assert not hasattr(args, "grpo_samples_per_iteration")
         assert not hasattr(args, "rl_parallel_generation_tasks")
 
     @pytest.mark.parametrize(
@@ -380,6 +389,7 @@ class TestRLUtils:
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", rollout_generator)
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(curr_iteration=1))
+        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
         )
@@ -464,13 +474,14 @@ class TestRLUtils:
         with pytest.raises(SystemExit):
             parse_args(ignore_unknown_args=False)
 
-    def _patch_rl_inference_mode_deps(self, monkeypatch, args):
+    def _patch_rl_inference_mode_deps(self, monkeypatch, args, rl_config):
         interface = MagicMock()
         interface.resume.return_value = object()
         interface.suspend.return_value = object()
         loop = SimpleNamespace(run_until_complete=MagicMock())
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
@@ -520,14 +531,15 @@ class TestRLUtils:
         lang_module = DummyLangModule(layer_config)
         model = [SimpleNamespace(config=config, module=lang_module)]
         args = SimpleNamespace(
-            rl_training_cuda_graphs=False,
             num_experts=num_experts,
             curr_iteration=11,
             cuda_graph_impl="local",
             cuda_graph_modules=[CudaGraphModule.attn],
             inference_cuda_graph_scope=InferenceCudaGraphScope.block,
         )
-        interface, _ = self._patch_rl_inference_mode_deps(monkeypatch, args)
+        interface, _ = self._patch_rl_inference_mode_deps(
+            monkeypatch, args, RLConfig(rl_training_cuda_graphs=False)
+        )
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
         monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
 
@@ -578,19 +590,20 @@ class TestRLUtils:
             skip_train=skip_train,
             world_size=1,
             cuda_graph_impl="none",
-            rl_offload_optimizer_during_inference=False,
-            langrl_env_config=None,
+            seq_length=SEQ,
+        )
+        rl_config = RLConfig(
             rl_prompts_per_eval=1,
             rl_default_temperature=1.0,
             rl_default_top_p=1.0,
             rl_default_top_k=0,
-            seq_length=SEQ,
         )
         response = SimpleNamespace(env_id="env", metrics=lambda: {"reward": [1.0, 0.5]}, results=[])
         agent = SimpleNamespace(run_evaluation=lambda request: [response])
         wandb_writer = MagicMock()
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
         monkeypatch.setattr(
             rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
         )
@@ -664,6 +677,7 @@ class TestRLUtils:
         layer_config = config if share_config else SimpleNamespace(flash_decode=True)
         model = DummyLogprobsModel(config, layer_config)
         monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(fp16=False, bf16=False))
+        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
         )

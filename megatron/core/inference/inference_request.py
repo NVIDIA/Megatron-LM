@@ -849,6 +849,23 @@ class DynamicInferenceRequest(InferenceRequest):
             self.prompt_tokens, self.block_size_tokens, cache_salt=self.block_hash_salt
         )
 
+    def resalt_block_hashes(self, block_hash_salt: Optional[str]) -> None:
+        """Replace the block-hash salt and recompute the prompt's block hashes.
+
+        Only valid for a request that holds no KV yet (nothing prefilled, matched,
+        or generated), since its hash chain must not change under blocks it
+        already owns. Clears any recorded prefix-match state.
+        """
+        self.block_hash_salt = block_hash_salt
+        self.num_matched_prefix_blocks = 0
+        self.mtp_private_suffix_start = None
+        if (
+            self.enable_prefix_caching
+            and self.block_size_tokens is not None
+            and self.prompt_tokens is not None
+        ):
+            self._compute_block_hashes()
+
     @property
     def remaining_prompt_length(self):
         """
@@ -997,7 +1014,10 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
-        return [getattr(sp, field) for field, _ in self.get_metadata_types()]
+        return [
+            -1 if field == "seed" and sp.seed is None else getattr(sp, field)
+            for field, _ in self.get_metadata_types()
+        ]
 
     @staticmethod
     def get_metadata_types() -> List[Tuple[str, torch.dtype]]:
@@ -1016,6 +1036,7 @@ class DynamicInferenceRequest(InferenceRequest):
             ("return_log_probs", torch.bool),
             ("skip_prompt_log_probs", torch.bool),
             ("top_n_logprobs", torch.int32),
+            ("seed", torch.int64),
         ]
 
     def add_event(

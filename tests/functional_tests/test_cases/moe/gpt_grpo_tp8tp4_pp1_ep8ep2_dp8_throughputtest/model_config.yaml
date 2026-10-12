@@ -111,7 +111,7 @@ MODEL_ARGS:
   --perform-rl-step: true
   --moe-pad-experts-for-cuda-graph-inference: true
   --rl-inference-model-unified-memory-level: 1
-  --rl-offload-inference-model-weights-when-idle: true
+  --rl-offload-inference-model-weights: true
   --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-num-cuda-graphs: 4
 

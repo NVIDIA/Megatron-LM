@@ -16,6 +16,7 @@ import torch
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.determinism import (
     ARG_VALUES_REQUIRED_FOR_DETERMINISM,
+    apply_determinism_env,
     apply_determinism_to_args,
 )
 
@@ -66,3 +67,16 @@ def test_other_required_args_still_checked():
     """The aux-loss branch is additive -- it must not shadow the dict-driven checks."""
     with pytest.raises(AssertionError, match="cross_entropy_loss_fusion"):
         apply_determinism_to_args(make_args(cross_entropy_loss_fusion=True))
+
+
+@pytest.mark.parametrize("scan_mode", [None, "1", "0"])
+def test_nccl_ep_scan_mode_is_required_before_group_creation(scan_mode):
+    """Deterministic setup must reject atomic expert-slot assignment before changing env."""
+    env = {} if scan_mode is None else {"NCCL_EP_HT_EM_AG_SCAN_MODE": scan_mode}
+    if scan_mode == "0":
+        with pytest.raises(AssertionError, match="NCCL_EP_HT_EM_AG_SCAN_MODE"):
+            apply_determinism_env(env)
+        assert env == {"NCCL_EP_HT_EM_AG_SCAN_MODE": "0"}
+    else:
+        apply_determinism_env(env)
+        assert env["NCCL_EP_HT_EM_AG_SCAN_MODE"] == "1"

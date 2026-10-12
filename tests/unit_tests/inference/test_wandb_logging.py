@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock, create_autospec, patch
 import pytest
 import torch
 
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -21,10 +22,15 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def set_rounder(value):
-    """Utility function to set the DynamicInferenceContext rounder."""
     DynamicInferenceContext.ROUNDER = value  # For backwards compatibility
     DynamicInferenceContext.TOKEN_ROUNDER = value
     DynamicInferenceContext.REQUEST_ROUNDER = value
+
+
+def reset_rounder():
+    DynamicInferenceContext.ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.TOKEN_ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.REQUEST_ROUNDER = 4  # the default in dynamic_context.py
 
 
 class TestInferenceWandbLogging:
@@ -40,7 +46,7 @@ class TestInferenceWandbLogging:
 
     @classmethod
     def teardown_class(cls):
-        set_rounder(64)
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     def _get_dynamic_context(
@@ -264,6 +270,7 @@ class TestInferenceWandbLogging:
             # Verify paused request count is included
             assert 'paused_request_count' in stats
             assert stats['paused_request_count'] >= 0
+        set_rounder(64)  # back to the class's pin
 
     @pytest.mark.internal
     def test_metrics_writer_none_handling(self):

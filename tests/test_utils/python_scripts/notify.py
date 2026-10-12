@@ -48,7 +48,7 @@ def get_project() -> Any:
 
 
 def _bridge_gpu(bridge_name: str) -> str:
-    for gpu in ("GB200", "H100", "A100"):
+    for gpu in ("GB300", "GB200", "H100", "A100"):
         if gpu.lower() in bridge_name.lower():
             return gpu
     return "Unknown"
@@ -68,6 +68,20 @@ def get_pipeline_jobs(
             continue
 
         child_pipeline_id = downstream["id"]
+        # GB300 runs asynchronously; the root's completion report must not
+        # classify its unfinished jobs as passed or failed.
+        if bridge.name == "functional:run_dev_dgx_gb300" and downstream.get("status") not in {
+            "success",
+            "failed",
+            "canceled",
+            "skipped",
+        }:
+            logger.info(
+                "GB300 pipeline %s is %s; excluding it from this completion report",
+                downstream.get("web_url") or f"{PROJECT_URL}/-/pipelines/{child_pipeline_id}",
+                downstream.get("status", "unknown"),
+            )
+            continue
         jobs = notification.get_jobs_from_pipeline(project, child_pipeline_id)
         bridge_gpu = _bridge_gpu(bridge.name)
         for job in jobs:

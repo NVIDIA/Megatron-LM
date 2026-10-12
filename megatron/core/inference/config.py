@@ -121,7 +121,8 @@ class MambaInferenceStateConfig:
             # gated off for GDP (batch-invariant chunk lengths, prefix-cache
             # extraction offsets). A future cross-rank consumer must reconcile
             # these across the PP group.
-            chunking = ssm_chunking(decoder.layer_type_list, decoder.layers)
+            # Align layers with layer_type_list (Shortcut-MoE registers each pair as one module).
+            chunking = ssm_chunking(decoder.layer_type_list, decoder.physical_layers())
             if chunking is None:
                 mamba_chunk_size = 128
                 ssm_chunk_alignment = mamba_chunk_size
@@ -289,6 +290,13 @@ class ImageProcessingConfig:
     spatial_merge_size: int = 1
     """Round patch-grid sides to a multiple of this, e.g. 2 for a 2x2 patch merger. Also
     scales the ``dynamic_resolution_model_length`` budget by ``spatial_merge_size**2``."""
+
+    image_break_token_id: Optional[int] = None
+    """Token placed after each row of a dynamic-resolution image's tokens except the last, e.g.
+    [IMG_BREAK]. None lays out each image as one run of image tokens."""
+
+    image_end_token_id: Optional[int] = None
+    """Token placed after the last row of a dynamic-resolution image's tokens, e.g. [IMG_END]."""
 
     dynamic_resolution_min_patches: int = 1
     """Minimum patches per image; smaller images are upscaled to reach it."""

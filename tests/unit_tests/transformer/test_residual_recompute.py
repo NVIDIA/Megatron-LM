@@ -42,7 +42,7 @@ from megatron.core.transformer.residual_recompute import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
 from megatron.core.typed_torch import apply_module
 from tests.unit_tests.test_utilities import Utils
@@ -166,6 +166,12 @@ class _MambaMixer(_TransformerBranch):
 
 
 class _RecordingTransformerLayer(WideResidualTransformerLayer):
+    def forward(self, *args, **kwargs):
+        self.received_residual_recompute_kwarg = "residual_stream_recompute_context" in kwargs
+        return super().forward(*args, **kwargs)
+
+
+class _RecordingOrdinaryTransformerLayer(TransformerLayer):
     def forward(self, *args, **kwargs):
         self.received_residual_recompute_kwarg = "residual_stream_recompute_context" in kwargs
         return super().forward(*args, **kwargs)
@@ -303,6 +309,12 @@ def _recording_layer_spec() -> ModuleSpec:
     return spec
 
 
+def _ordinary_recording_layer_spec() -> ModuleSpec:
+    spec = _layer_spec()
+    spec.module = _RecordingOrdinaryTransformerLayer
+    return spec
+
+
 def _mamba_spec() -> ModuleSpec:
     return ModuleSpec(
         module=WideResidualMambaLayer,
@@ -409,6 +421,35 @@ class TestResidualStreamRecomputePlan:
         assert contexts[0].manager is contexts[1].manager
         assert contexts[2].manager is contexts[3].manager
         assert contexts[1].manager is not contexts[2].manager
+
+    def test_keeps_atomic_layer_pairs_in_one_replay_block(self):
+        contexts = build_residual_stream_recompute_plan(
+            num_layers=8, block_size=4, atomic_layer_pairs=[(3, 4), (5, 6)]
+        )
+
+        assert [context.is_block_end for context in contexts] == [
+            False,
+            False,
+            True,
+            False,
+            False,
+            False,
+            True,
+            True,
+        ]
+        assert contexts[3].manager is contexts[4].manager
+        assert contexts[5].manager is contexts[6].manager
+        assert contexts[2].manager is not contexts[3].manager
+        assert contexts[6].manager is not contexts[7].manager
+
+    @pytest.mark.parametrize(
+        "atomic_layer_pairs", [[(1, 1)], [(1, 3)], [(-1, 0)], [(2, 3)], [(0, 1), (1, 2)]]
+    )
+    def test_rejects_invalid_atomic_layer_pairs(self, atomic_layer_pairs):
+        with pytest.raises(ValueError, match="adjacent in-range|must not overlap"):
+            build_residual_stream_recompute_plan(
+                num_layers=3, block_size=2, atomic_layer_pairs=atomic_layer_pairs
+            )
 
     @pytest.mark.parametrize("invalid_block_size", [False, 0, -1, 1.5])
     def test_rejects_invalid_block_size(self, invalid_block_size):
@@ -862,3 +903,30 @@ class TestResidualStreamRecomputeIntegration:
         assert len(replay_inputs) == 1
         assert replay_inputs[0] is cp_layout_state.finalized_hidden_states
         assert output.shape == hidden_states.shape
+
+    def test_hybrid_mtp_stack_stays_ordinary_width_and_skips_residual_replay(self):
+        config = _wide_recompute_config(num_layers=1)
+        stack = HybridStack(
+            config,
+            HybridStackSubmodules(attention_layer=_ordinary_recording_layer_spec()),
+            layer_type_list=[Symbols.ATTENTION],
+            post_layer_norm=False,
+            is_mtp_layer=True,
+            pg_collection=_process_groups(),
+        ).cuda()
+        hidden_states = torch.randn(4, 3, config.hidden_size, device="cuda", requires_grad=True)
+
+        output = stack(hidden_states=hidden_states, attention_mask=None)
+        output.square().mean().backward()
+
+        assert output.shape == hidden_states.shape
+        assert not stack.uses_wide_residual_stream
+        assert stack.residual_stream_readout is None
+        layer = stack.layers[0]
+        assert type(layer) is _RecordingOrdinaryTransformerLayer
+        assert layer.is_mtp_layer
+        assert not layer.supports_wide_residual_connections
+        assert layer._get_self_attention_residual_connection() is None
+        assert layer._get_mlp_residual_connection() is None
+        assert not layer.received_residual_recompute_kwarg
+        assert hidden_states.grad is not None

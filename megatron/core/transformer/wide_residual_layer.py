@@ -152,6 +152,38 @@ class StreamwiseSigmoidMap(nn.Module):
         return self.logit if return_logits else self.factors()
 
 
+class StreamwiseSigmoidWideResidualRead(nn.Module):
+    """Learn an independent ordinary-width read from a wide residual stream."""
+
+    def __init__(self, config: TransformerConfig, layer_number: int, branch_name: str) -> None:
+        super().__init__()
+        if config.wide_residual is None:
+            raise ValueError("StreamwiseSigmoidWideResidualRead requires wide_residual config.")
+        wr = config.wide_residual
+        self.layer_number = layer_number
+        self.branch_name = branch_name
+        self.num_streams = wr.num_streams
+        self.residual_stream_hidden_size = wr.num_streams * config.hidden_size
+        self.branch_hidden_size = config.hidden_size
+        self.branch_input_dtype = config.params_dtype
+        self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        """Read in branch precision; the operator fixes the output shape and dtype."""
+
+        if hidden_states.shape[-1] != self.residual_stream_hidden_size:
+            raise ValueError(
+                "StreamwiseSigmoidWideResidualRead expected residual-stream hidden size "
+                f"{self.residual_stream_hidden_size}, got {hidden_states.shape[-1]}."
+            )
+        return streamwise_sigmoid_read(
+            hidden_states,
+            self.read_map(return_logits=True),
+            self.num_streams,
+            output_dtype=self.branch_input_dtype,
+        )
+
+
 class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
     """Positive streamwise maps around one ordinary-width residual branch."""
 
@@ -269,8 +301,14 @@ class WideResidualTransformerLayer(TransformerLayer):
         is_mtp_layer: bool = False,
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ) -> None:
+        if is_mtp_layer:
+            raise ValueError(
+                "MTP auxiliary stacks must use ordinary-width TransformerLayer, not "
+                "WideResidualTransformerLayer."
+            )
         super().__init__(
             config=config,
             submodules=submodules,
@@ -281,6 +319,7 @@ class WideResidualTransformerLayer(TransformerLayer):
             is_mtp_layer=is_mtp_layer,
             add_layer_offset=add_layer_offset,
             pp_layer_offset=pp_layer_offset,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
             name=name,
         )
 

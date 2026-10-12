@@ -7,6 +7,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.vision.radio import RADIOViTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -778,3 +779,61 @@ class TestApplyTemporalGrouping:
         assert is_image == [True]
         assert isinstance(x_grouped, list)
         assert len(x_grouped) == 1
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("sizes_device", [None, "cpu", "cuda"], ids=["list", "cpu", "cuda"])
+    @pytest.mark.parametrize("skip_image_duplication", [False, True])
+    def test_mixed_media_with_host_or_tensor_sizes(self, sizes_device, skip_image_duplication):
+        """List and tensor geometry preserve pixels and packed boundaries after grouping."""
+        sizes = [(4, 4)] + [(4, 8)] * 4
+        if sizes_device is not None:
+            sizes = torch.tensor(sizes, dtype=torch.int32, device=sizes_device)
+        pixels = torch.arange(36 * 12, dtype=torch.float32, device="cuda").reshape(1, 36, 12)
+        cumulative = torch.tensor([0, 4, 12, 20, 28, 36], dtype=torch.int32, device="cuda")
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cumulative,
+            cu_seqlens_kv=cumulative,
+            max_seqlen_q=8,
+            max_seqlen_kv=8,
+        )
+
+        grouped, grouped_sizes, frames, grouped_packed, is_image = (
+            RADIOViTModel._apply_temporal_grouping(
+                SimpleNamespace(temporal_patch_dim=2, patch_dim=2),
+                pixels,
+                sizes,
+                [1, 4],
+                packed,
+                skip_image_duplication=skip_image_duplication,
+            )
+        )
+
+        image = pixels[:, :4]
+        expected_chunks = [
+            image if skip_image_duplication else torch.cat([image, image], dim=-1),
+            torch.cat([pixels[:, 4:12], pixels[:, 12:20]], dim=-1),
+            torch.cat([pixels[:, 20:28], pixels[:, 28:36]], dim=-1),
+        ]
+        if skip_image_duplication:
+            assert isinstance(grouped, list)
+            assert len(grouped) == len(expected_chunks)
+            for actual, expected in zip(grouped, expected_chunks):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(grouped, torch.cat(expected_chunks, dim=1), rtol=0, atol=0)
+
+        if sizes_device is None:
+            assert isinstance(grouped_sizes, list)
+            assert grouped_sizes == [(4, 4), (4, 8), (4, 8)]
+        else:
+            assert grouped_sizes.dtype == sizes.dtype
+            assert grouped_sizes.device == sizes.device
+            assert grouped_sizes.tolist() == [[4, 4], [4, 8], [4, 8]]
+        assert frames == [1, 2]
+        assert is_image == [True, False, False]
+        expected_cumulative = cumulative.new_tensor([0, 4, 12, 20])
+        torch.testing.assert_close(grouped_packed.cu_seqlens_q, expected_cumulative)
+        torch.testing.assert_close(grouped_packed.cu_seqlens_kv, expected_cumulative)
+        assert grouped_packed.max_seqlen_q == grouped_packed.max_seqlen_kv == 8
+        assert grouped_packed.qkv_format == packed.qkv_format

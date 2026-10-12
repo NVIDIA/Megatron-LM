@@ -27,6 +27,7 @@ from tools.run_dynamic_text_generation_server import (
     add_text_generation_server_args,
     parse_args_and_detect_vlm,
 )
+from megatron.training.global_vars import get_run_config
 
 # pylint: disable=line-too-long
 
@@ -235,18 +236,17 @@ if __name__ == "__main__":
             ),
         )
 
-        if getattr(args, 'moe_routing_trace_path', None):
+        cfg = get_run_config()
+        if cfg.logger.moe_routing_trace_path:
             rank = dist.get_rank()
             max_steps = getattr(args, 'moe_routing_trace_max_inference_steps', None) or 10**9
             init_moe_router_tracer(
-                output_dir=args.moe_routing_trace_path,
+                output_dir=cfg.logger.moe_routing_trace_path,
                 max_steps=max_steps,
                 rank=rank,
-                capture_hidden_states=getattr(
-                    args, 'moe_routing_trace_capture_hidden_states', False
-                ),
-                capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
-                dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
+                capture_hidden_states=cfg.logger.moe_routing_trace_capture_hidden_states,
+                capture_logits=cfg.logger.moe_routing_trace_capture_logits,
+                dump_router_weights=cfg.logger.moe_routing_trace_dump_weights,
             )
 
         engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
