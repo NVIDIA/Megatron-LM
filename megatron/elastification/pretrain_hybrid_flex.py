@@ -351,14 +351,18 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
     else:
         return (loss, num_tokens, {'lm loss': reporting_loss})
 
-def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42):
+def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42, training=True):
 
     dp_size = get_data_parallel_world_size()
     grad_accumulation_steps = get_current_global_batch_size() // (get_micro_batch_size() * dp_size)
     global _global_choice_counter
 
     # DP-specific seeding
-    iteration = get_train_state().iteration
+    train_state = get_train_state()
+    iteration = train_state.iteration
+    # Match the router's schedule for evaluation after the last executed step.
+    if not training and iteration > train_state.resume_iteration:
+        iteration -= 1
     rng = np.random.RandomState(
         base_seed + _global_choice_counter + grad_accumulation_steps * iteration * 10
     )
@@ -430,7 +434,10 @@ def forward_step(data_iterator, model: HybridModel):
         ) = get_batch(data_iterator)
     timers('batch-generator').stop()
 
-    if get_grad_acc_based_random_choice(args=args) < args.original_model_sample_prob:
+    if (
+        get_grad_acc_based_random_choice(args=args, training=model.training)
+        < args.original_model_sample_prob
+    ):
         # Funnel "full-model sample" through the regular router-driven path
         # with budget=1.0. flextron_forward unconditionally reads
         # flextron_kwargs['budget'], so an empty dict would KeyError here.
@@ -445,7 +452,9 @@ def forward_step(data_iterator, model: HybridModel):
         assert len(args.budget_list) == len(budget_probs), "budget_list and budget_probs must have the same length"
         budget_probs = [float(p) for p in budget_probs]
         budget_probs = [p / sum(budget_probs) for p in budget_probs]
-        selected_budget = get_grad_acc_based_random_choice(args=args, choices=args.budget_list, prob=budget_probs)
+        selected_budget = get_grad_acc_based_random_choice(
+            args=args, choices=args.budget_list, prob=budget_probs, training=model.training
+        )
         flextron_kwargs = {'budget': selected_budget}
 
     with stimer:
