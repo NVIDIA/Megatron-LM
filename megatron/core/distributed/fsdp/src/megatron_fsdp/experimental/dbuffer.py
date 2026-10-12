@@ -26,6 +26,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
 from .placement import BlockAtomic, TensorAtomic
+from .range import Range, intersect_ranges
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,8 +123,9 @@ class DBuffer:
         self.placements = placements
 
         self.layout = layout
-        self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
-        self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
+        local_range = self.layout.get_local_range(self.mesh, self.placements)
+        self.offset = local_range.start
+        self.local_buffer = torch.empty(local_range.numel, dtype=dtype, device=device)
 
     @classmethod
     def empty(
@@ -195,20 +197,15 @@ class DBuffer:
 
     def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
         """Return this buffer's owned range for logical tensor ``tensor_index``."""
-        tensor_start = self.layout.tensor_to_offset[tensor_index]
-        tensor_end = tensor_start + self.layout.tensor_shapes[tensor_index].numel()
-        buffer_start = self.offset
-        buffer_end = self.offset + self.local_buffer.numel()
-
-        overlap_start = max(tensor_start, buffer_start)
-        overlap_end = min(tensor_end, buffer_end)
-        if overlap_start >= overlap_end:
+        tensor_range = self.layout.get_tensor_range(tensor_index)
+        owned_range = intersect_ranges(tensor_range, Range(self.offset, self.local_buffer.numel()))
+        if owned_range.numel == 0:
             return None
 
         return _OwnedRange(
-            numel=overlap_end - overlap_start,
-            tensor_relative_offset=overlap_start - tensor_start,
-            buffer_relative_offset=overlap_start - buffer_start,
+            numel=owned_range.numel,
+            tensor_relative_offset=owned_range.start - tensor_range.start,
+            buffer_relative_offset=owned_range.start - self.offset,
         )
 
     @classmethod
@@ -245,10 +242,10 @@ class DBuffer:
         if not local_buffer.is_contiguous():
             raise ValueError("local_buffer must be contiguous for collective operations.")
 
-        offset, local_numel = layout.get_local_range(mesh, placements)
-        if local_buffer.numel() != local_numel:
+        local_range = layout.get_local_range(mesh, placements)
+        if local_buffer.numel() != local_range.numel:
             raise ValueError(
-                f"Expected local_buffer with {local_numel} elements, got "
+                f"Expected local_buffer with {local_range.numel} elements, got "
                 f"{local_buffer.numel()}."
             )
 
@@ -256,7 +253,7 @@ class DBuffer:
         buffer.mesh = mesh
         buffer.placements = placements
         buffer.layout = layout
-        buffer.offset = offset
+        buffer.offset = local_range.start
         buffer.local_buffer = local_buffer
         return buffer
 
@@ -276,12 +273,12 @@ class DBuffer:
         _validate_placements(placements)
         if self.placements == placements:
             return self
-        offset, local_numel = self.layout.get_local_range(self.mesh, placements)
-        local_offset = offset - self.offset
-        if local_offset < 0 or local_offset + local_numel > self.local_buffer.numel():
+        local_range = self.layout.get_local_range(self.mesh, placements)
+        local_offset = local_range.start - self.offset
+        if local_offset < 0 or local_offset + local_range.numel > self.local_buffer.numel():
             raise ValueError("DBuffer.view() requires a range contained in its local buffer.")
         return DBuffer.from_local(
-            self.local_buffer.narrow(0, local_offset, local_numel),
+            self.local_buffer.narrow(0, local_offset, local_range.numel),
             self.mesh,
             placements,
             self.layout,

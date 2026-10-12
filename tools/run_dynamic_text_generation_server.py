@@ -20,6 +20,14 @@ if _EXAMPLES_MULTIMODAL not in sys.path:
 
 import torch  # noqa: E402
 
+from examples.inference.advanced.vlm_dynamic_inference import (  # noqa: E402
+    _detect_vlm_from_checkpoint,
+    _print_resolved_args,
+    add_vlm_inference_args,
+)
+from examples.inference.advanced.vlm_dynamic_inference import (  # noqa: E402
+    get_model as get_vlm_model,
+)
 from examples.multimodal.multimodal_args import add_multimodal_extra_args  # noqa: E402
 from megatron.core.inference.config import (  # noqa: E402
     ImageProcessingConfig,
@@ -38,14 +46,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (  # noqa: E402
     start_text_gen_server,
     stop_text_gen_server,
-)
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (
-    _detect_vlm_from_checkpoint,
-    _print_resolved_args,
-    add_vlm_inference_args,
-)
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (  # noqa: E402,E501
-    get_model as get_vlm_model,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer  # noqa: E402
 from megatron.core.utils import (  # noqa: E402
