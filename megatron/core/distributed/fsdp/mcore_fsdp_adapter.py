@@ -81,6 +81,53 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
+@torch.no_grad()
+def _sync_fsdp_shared_embedding(module, buffer, config):
+    """Synchronize PP embedding replicas after v1 materializes meta parameters.
+
+    LanguageModule cannot synchronize meta tensors during model construction.
+    Materialization initializes each stage independently, so synchronize the
+    master weights before the first optimizer step (and checkpoint). Reconstruct
+    the logical tensor because flat-buffer shard offsets can differ by stage.
+    """
+    if not config.init_model_with_meta_device:
+        return
+    language_module = module
+    while hasattr(language_module, 'module'):
+        language_module = language_module.module
+    if not (
+        getattr(language_module, 'share_embeddings_and_output_weights', False)
+        or getattr(config, 'mtp_num_layers', None)
+    ):
+        return
+    group = getattr(language_module, 'embd_group', None)
+    if group is None or group == dist.GroupMember.NON_GROUP_MEMBER:
+        return
+    ranks = dist.get_process_group_ranks(group)
+    if len(ranks) < 2 or dist.get_rank() not in ranks:
+        return
+    if getattr(config, 'virtual_pipeline_model_parallel_size', None) not in (None, 1):
+        raise NotImplementedError(
+            'FSDP v1 meta initialization of shared embeddings requires non-interleaved PP'
+        )
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        uneven_dtensor_to_full_tensor,
+    )
+
+    weight = language_module.shared_embedding_or_output_weight()
+    name = next(name for name, param in module.named_parameters() if param is weight)
+    master_weight = buffer.dist_main_weight[name]
+    full_weight = uneven_dtensor_to_full_tensor(master_weight)
+    dist.broadcast(full_weight, src=ranks[0], group=group)
+    chunk = master_weight.__create_chunk_list__()[0]
+    local_slice = tuple(
+        slice(offset, offset + size) for offset, size in zip(chunk.offsets, chunk.sizes)
+    )
+    master_weight._local_tensor.copy_(full_weight[local_slice])
+    buffer.copy_main_weights_to_model_weights()
+
+
 def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> None:
     """Materialize and initialize one module's direct meta parameters."""
     # Container modules may have parameterized children but no direct parameters or
@@ -308,6 +355,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             ),
         )
         self.param_and_grad_buffer = self.module.param_and_grad_buffer
+        _sync_fsdp_shared_embedding(module, self.param_and_grad_buffer, config)
         self.no_sync = self.module.no_sync
         self.start_param_sync = self.module.start_param_sync
         self.start_grad_sync = self.module.start_grad_sync
