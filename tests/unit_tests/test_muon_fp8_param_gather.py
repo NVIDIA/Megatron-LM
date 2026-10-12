@@ -265,7 +265,7 @@ class TestMuonFP8ParamGather:
         validate_args(args)
         set_args(args)
         set_run_config(pretrain_cfg_container_from_args(args))
-        initialize_runtime_services(args, build_tokenizer=False)
+        initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
     def _batch(self):
