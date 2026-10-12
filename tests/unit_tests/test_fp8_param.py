@@ -939,8 +939,8 @@ class TestFP8Param:
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
         require_fp8_recipe("mxfp8")
-        if Utils.world_size != 8:
-            pytest.skip("Native MXFP8 transport matrix requires eight ranks (TP1 x DP8)")
+        if Utils.world_size != 4:
+            pytest.skip("Native MXFP8 transport matrix requires four ranks (TP1 x DP4)")
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)
         owner = optimizer_name == "muon"
         if not reuse_grad_buf:
