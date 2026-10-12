@@ -367,6 +367,10 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     if not isinstance(result, tuple):
         if 'vision_model_type' not in user_passed_attrs:
             return False
+        # No saved args may also mean no checkpoint at all; fail now rather than after every rank
+        # builds the full model.
+        if args.load is None or not os.path.isfile(get_checkpoint_tracker_filename(args.load)):
+            raise ValueError(f'No checkpoint found at --load {args.load}')
         args.mimo_checkpoint_prefix_map = _LLAVA_CHECKPOINT_PREFIX_MAP
         _resolve_mimo_vision_args(args, None, user_passed_attrs)
         return True

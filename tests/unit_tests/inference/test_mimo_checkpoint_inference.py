@@ -62,9 +62,12 @@ def test_checkpoint_detection(checkpoint_keys):
 
 
 @pytest.mark.parametrize("vision", [False, True], ids=["text", "vision"])
-def test_checkpoint_without_saved_args_uses_cli_vision_args(monkeypatch, vision):
+def test_checkpoint_without_saved_args_uses_cli_vision_args(tmp_path, monkeypatch, vision):
     """Without saved args (e.g. Megatron-Bridge), --vision-model-type selects the VLM."""
-    args = SimpleNamespace(model_provider='gpt', vision_model_type='pixtral-vit-large')
+    (tmp_path / 'latest_checkpointed_iteration.txt').write_text('1')
+    args = SimpleNamespace(
+        model_provider='gpt', vision_model_type='pixtral-vit-large', load=str(tmp_path)
+    )
     monkeypatch.setattr(vlm, 'load_args_from_checkpoint', lambda _: args)
     passed = {'vision_model_type'} if vision else set()
 
@@ -79,6 +82,21 @@ def test_checkpoint_without_saved_args_uses_cli_vision_args(monkeypatch, vision)
         assert args.img_h == 1540  # from the encoder registry
     else:
         assert not hasattr(args, 'mimo_checkpoint_prefix_map')
+
+
+@pytest.mark.parametrize("load", [None, 'missing'])
+def test_missing_checkpoint_with_cli_vision_args_fails_early(tmp_path, monkeypatch, load):
+    """A bad --load is reported before any model is built, not treated as a VLM checkpoint."""
+    args = SimpleNamespace(
+        model_provider='gpt',
+        vision_model_type='pixtral-vit-large',
+        load=load and str(tmp_path / load),
+    )
+    monkeypatch.setattr(vlm, 'load_args_from_checkpoint', lambda _: args)
+
+    with pytest.raises(ValueError, match='No checkpoint found'):
+        vlm._detect_vlm_from_checkpoint(args, {'vision_model_type'})
+    assert not hasattr(args, 'mimo_checkpoint_prefix_map')
 
 
 def test_sharded_state_dict_uses_checkpoint_keys(monkeypatch):
