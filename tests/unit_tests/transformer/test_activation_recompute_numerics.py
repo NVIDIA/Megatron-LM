@@ -115,6 +115,11 @@ class TestActivationRecomputeNumerics:
         }
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
         os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+        # The fused bias-dropout-add is torch.compile'd, and a recompute's no-grad pass hits
+        # new guards (e.g. a residual that does not require grad). If earlier tests in this
+        # process used up Dynamo's recompile limit, that call runs eagerly and draws different
+        # dropout masks than the compiled kernel. Start every case from an empty compile cache.
+        torch._dynamo.reset()
 
     def teardown_method(self, method):
         try:
