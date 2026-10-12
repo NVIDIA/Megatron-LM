@@ -477,6 +477,16 @@ def test_virtual_expert_routing_adapter_replay(dtype, compiled):
     planned = []
     manager.plan_dispatch = planned.append
 
+    # Invalid metadata must fail before planning; valid inputs below reuse this manager.
+    for invalid_ids, invalid_probs in (
+        (ids.bool(), probs),
+        (ids[:, :-1], probs[:, :-1]),
+        (ids, full_probs),
+    ):
+        with pytest.raises(ValueError, match="expert IDs and probabilities"):
+            manager.setup_metadata(invalid_ids, invalid_probs)
+        assert not planned, "invalid metadata must not reach the planner"
+
     def adapt(probs):
         planned.clear()
         manager.setup_metadata(ids, probs, padding_mask)
@@ -498,19 +508,6 @@ def test_virtual_expert_routing_adapter_replay(dtype, compiled):
         contention=True,
         what=f"virtual-expert routing adapter[{dtype=}, {compiled=}]",
     )
-
-
-@pytest.mark.parametrize("invalid", ["bool-map", "wrong-topk", "full-width-probs"])
-def test_virtual_expert_routing_adapter_rejects_invalid_layout(invalid):
-    """Reject incompatible router metadata before starting the planner."""
-    manager = object.__new__(_VirtualExpertHybridEPManager)
-    manager.router_topk = 2
-    ids = torch.zeros((3, 1 if invalid == "wrong-topk" else 2), dtype=torch.int64)
-    if invalid == "bool-map":
-        ids = ids.bool()
-    probs = torch.zeros((3, 4)) if invalid == "full-width-probs" else torch.zeros_like(ids).float()
-    with pytest.raises(ValueError, match="expert IDs and probabilities"):
-        manager.setup_metadata(ids, probs)
 
 
 # --- permute / unpermute --------------------------------------------------------------------

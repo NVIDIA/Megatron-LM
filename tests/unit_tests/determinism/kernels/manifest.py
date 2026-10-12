@@ -323,7 +323,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_moe_kernels.py",
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
-            K + "test_virtual_expert_allocator.py",
         ),
         kind="triton",
         notes="Route planning agrees with an independent CPU oracle for EP=1/2/4/8, skew/ties, "

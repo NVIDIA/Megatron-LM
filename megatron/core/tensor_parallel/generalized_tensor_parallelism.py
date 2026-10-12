@@ -37,16 +37,18 @@ import torch
 from packaging.version import Version
 
 from megatron.core.tensor_parallel.gtp_cuda_graphs import (
-    GraphWgradRingSlot,
     allocate_graph_wgrad_rings,
-    allocate_wgrad_ring,
     clear_graph_wgrad_rings,
     cuda_graph_pool_allocation,
     register_capture_comm,
     register_capture_params_to_ensure_ready,
     register_capture_wgrad_finalize,
     register_capture_wgrad_ring_slot,
-    wgrad_ring_key,
+)
+from megatron.core.tensor_parallel.gtp_eager_wgrad import (
+    EagerWgradRingSlot,
+    bind_eager_wgrad_ring_slot,
+    clear_eager_wgrad_rings,
 )
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
     is_gtp_symm_pool_registered,
@@ -315,49 +317,6 @@ _wgrad_buf_pool: Dict[tuple, list] = {}
 # per-(shape, expert_idx, chain_id) counter yields the alternating sequence. Cleared by
 # reset_gtp_state so a rebuilt model restarts numbering.
 _GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
-
-
-@dataclass
-class _EagerWgradRingSlot(GraphWgradRingSlot):
-    """Persistent eager input whose previous reduce-scatter must finish before reuse."""
-
-    rs_owner: object = None
-
-    def wait_for_reader(self) -> None:
-        """Finalize a deferred reduction before another GEMM writes into its input."""
-        rs_owner = self.rs_owner
-        if rs_owner is not None and rs_owner._wgrad_rs_handle is not None:
-            rs_owner._wait_reduce_scatter(finalize_grad=True)
-            # The previous result is accounted for; its marker must not suppress the next one.
-            rs_owner._already_finalized = False
-        self.ready_event.wait()
-
-
-_EAGER_WGRAD_RINGS: dict[tuple, list[_EagerWgradRingSlot]] = {}
-
-
-def _bind_eager_wgrad_ring_slot(param) -> _EagerWgradRingSlot:
-    """Initialize a domain's registered writers together on its first persistent request."""
-    ring_size = GTP_CONFIG.eager_wgrad_ring_size
-    if ring_size < 1:
-        raise ValueError("GTP_CONFIG.eager_wgrad_ring_size must be at least 1")
-    key = wgrad_ring_key(param, _stream_key)
-    if key not in _EAGER_WGRAD_RINGS:
-        matching_params = [
-            weight
-            for weight in _GTP_PARAMS
-            if weight.requires_grad
-            and weight.chain_id == param.chain_id
-            and wgrad_ring_key(weight, _stream_key) == key
-        ]
-        if not any(weight is param for weight in matching_params):
-            raise RuntimeError("Persistent eager wgrad writers must be registered in _GTP_PARAMS")
-        slots = _EAGER_WGRAD_RINGS[key] = allocate_wgrad_ring(
-            matching_params, key=key, ring_size=ring_size, slot_type=_EagerWgradRingSlot
-        )
-        for param_index, weight in enumerate(matching_params):
-            weight._gtp_eager_wgrad_ring_slot = slots[param_index % len(slots)]
-    return param._gtp_eager_wgrad_ring_slot
 
 
 def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
@@ -2013,7 +1972,12 @@ class GTPShardedParam(torch.nn.Parameter):
 
         ring_slot = getattr(self, "_gtp_eager_wgrad_ring_slot", None)
         if ring_slot is None and persistent:
-            ring_slot = _bind_eager_wgrad_ring_slot(self)
+            ring_slot = bind_eager_wgrad_ring_slot(
+                self,
+                _GTP_PARAMS,
+                ring_size=GTP_CONFIG.eager_wgrad_ring_size,
+                stream_key=_stream_key,
+            )
         if ring_slot is not None:
             ring_slot.wait_for_reader()
             return ring_slot.tensor[: self._unsharded_shape[0]]
@@ -2381,10 +2345,10 @@ class GTPShardedParam(torch.nn.Parameter):
                     f"{tuple(logical_view.shape)} for {weight._debug_name}"
                 )
             if wgrad.data_ptr() != logical_view.data_ptr():
-                if isinstance(slot, _EagerWgradRingSlot):
+                if isinstance(slot, EagerWgradRingSlot):
                     slot.wait_for_reader()
                 logical_view.copy_(wgrad)
-            if isinstance(slot, _EagerWgradRingSlot):
+            if isinstance(slot, EagerWgradRingSlot):
                 slot.rs_owner = self
             send_bufs.append(slot.tensor)
             release_bufs.append(wgrad)
@@ -2979,7 +2943,7 @@ def reset_gtp_state():
         param._wgrad_accum_expected = 0
     _GTP_PENDING_WGRAD_ACCUM.clear()
     clear_graph_wgrad_rings()
-    _EAGER_WGRAD_RINGS.clear()
+    clear_eager_wgrad_rings()
     for param in _GTP_PARAMS:
         for attr in (
             "_gtp_graph_wgrad_ring_slot",

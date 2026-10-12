@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Focused virtual-expert regressions: routing, GTP transport and training parity.
+"""Focused virtual-expert regressions: routing, peer transport and training parity.
 
 Run on one node with four Blackwell GPUs::
 
@@ -19,10 +19,12 @@ import sys
 import time
 from dataclasses import replace
 from functools import partialmethod
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 from torch.nn import functional as F
@@ -31,6 +33,7 @@ from transformer_engine.pytorch.attention.dot_product_attention import (
     backends as te_attention_backends,
 )
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+from triton.runtime import _allocation
 
 from megatron.core import parallel_state as ps
 from megatron.core.activations import squared_relu
@@ -47,9 +50,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import Pipe
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
-from megatron.core.tensor_parallel import gtp_cuda_graphs
-from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
-from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
@@ -109,10 +109,8 @@ def virtual_expert_environment(monkeypatch, hybridep_kernel_cache):
 
 
 @pytest.fixture
-def mxfp8_grouped_mlp(monkeypatch, virtual_expert_environment):
-    """Enable TE's real fused kernels even when pytest imported TE before setting its flags."""
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("MXFP8 requires Blackwell")
+def grouped_mlp_fusions(monkeypatch, virtual_expert_environment):
+    """Refresh TE fusion support after setting this test's environment."""
     from transformer_engine.pytorch.ops.fused import grouped_mlp
     from transformer_engine.pytorch.ops.fuser import (
         OperationFuser,
@@ -134,313 +132,174 @@ def mxfp8_grouped_mlp(monkeypatch, virtual_expert_environment):
         list(OperationFuser.forward_backward_fusion_functions),
     )
     try:
-        assert (
-            grouped_mlp.GroupedMLP_CuTeGEMMUnary.is_supported()
-        ), "MXFP8 parity requires TE's fused SReLU kernels and a compatible cuDNN frontend"
         for cls, fuse in (
             (grouped_mlp.GroupedMLP_CuTeGEMMGLU, grouped_mlp.fuse_ops),
             (grouped_mlp.GroupedMLP_CuTeGEMMUnary, grouped_mlp.fuse_srelu_ops),
         ):
             if cls.is_supported() and fuse not in OperationFuser.forward_backward_fusion_functions:
                 register_forward_backward_fusion(fuse, prepend=True)
-        yield
+        yield grouped_mlp
     finally:
         for check in checks:
             check.cache_clear()
 
 
-def _full_weight(p):
-    """All-gather the shard over its GTP group: the unpadded, unsharded weight."""
-    shards = [torch.empty_like(p.data) for _ in range(p.group.size())]
-    dist.all_gather(shards, p.data, group=p.group)
-    full = torch.cat(shards, dim=0)
-    return full[: full.shape[0] - p.pad_length] if p.pad_length else full
+@pytest.fixture
+def mxfp8_grouped_mlp(grouped_mlp_fusions):
+    """Require real Blackwell fused kernels for MXFP8 numerical comparisons."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 requires Blackwell")
+    assert (
+        grouped_mlp_fusions.GroupedMLP_CuTeGEMMUnary.is_supported()
+    ), "MXFP8 parity requires TE's fused SReLU kernels and a compatible cuDNN frontend"
 
 
-def _assert_clean(p):
-    """No in-flight gather and no stale hand-off marker after a consume."""
-    assert p._prefetch_handle is None
-    assert not getattr(p, "_already_ag_drained", False)
+@pytest.fixture
+def caller_allocator():
+    def allocator(*args):
+        raise AssertionError("MoonEP used the caller's allocator")
+
+    token = _allocation._allocator.set(allocator)
+    try:
+        yield allocator
+    finally:
+        _allocation._allocator.reset(token)
 
 
 @requires_cuda
-@pytest.mark.skipif(not HAVE_GTP, reason="GTP requires TransformerEngine >= 2.19")
-class TestVirtualExpertGTP:
-    """Weight peeks and reused gradient buffers used by virtual-expert transport."""
+@pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16-fp32-grad", "mxfp8-bf16-grad"])
+def test_virtual_expert_transport_allocator_replay(monkeypatch, caller_allocator, mxfp8):
+    """Real transport preserves the caller allocator after success, failure and graph capture."""
+    Utils.initialize_distributed()
+    rank, world = dist.get_rank(), dist.get_world_size()
+    device = torch.device("cuda", torch.cuda.current_device())
+    dist.all_reduce(torch.zeros(1, device=device))
+    symm_mem.set_backend("NCCL")
+    local, member = 2, 32768
+    weight_dtype = torch.uint8 if mxfp8 else torch.bfloat16
+    grad_dtype = torch.bfloat16 if mxfp8 else torch.float32
+    scale_member = member // 32 if mxfp8 else 0
+    w = SimpleNamespace(
+        rank=rank,
+        world_size=world,
+        num_local_experts=local,
+        member_numels=(member, member),
+        num_sms=32,
+        weight_arena=symm_mem.empty(
+            2 * local * (member + scale_member), dtype=weight_dtype, device=device
+        ),
+        grad_arena=symm_mem.empty(4 * local * member, dtype=grad_dtype, device=device),
+        weight_grid_barrier=torch.zeros(1, device=device, dtype=torch.int32),
+        grad_grid_barrier=torch.zeros(1, device=device, dtype=torch.int32),
+    )
+    w.weight_handle = symm_mem.rendezvous(w.weight_arena, dist.group.WORLD)
+    w.grad_handle = symm_mem.rendezvous(w.grad_arena, dist.group.WORLD)
+    weights = torch.full((2, local, member), rank + 1, device=device, dtype=weight_dtype)
+    scales = torch.full((2, local, scale_member), rank + 11, device=device, dtype=torch.uint8)
+    native = w.grad_arena[2 * local * member :].view(2, local, member)
 
-    @pytest.fixture(scope="class")
-    def four_rank_gtp_group(self):
-        """Keep the exact four-shard oracle on both four- and eight-GPU nodes."""
-        Utils.initialize_model_parallel()
-        groups = [
-            dist.new_group(list(range(start, start + 4)))
-            for start in range(0, dist.get_world_size(), 4)
-        ]
-        group = groups[dist.get_rank() // 4]
-        try:
-            yield group
-        finally:
-            torch.cuda.synchronize()
-            dist.barrier()
-            dist.destroy_process_group(group)
-            Utils.destroy_model_parallel()
-
-    @pytest.fixture(autouse=True)
-    def reset_gtp_state(self):
-        """Release GTP/FP8 state after each transport case."""
-        yield
-        FP8GlobalStateManager.reset()
-        gtp.reset_gtp_state()
-
-    @pytest.mark.parametrize("fwd", [True, False], ids=["forward", "backward"])
-    @pytest.mark.parametrize("readiness", ["missing", "in_flight", "ready"])
-    def test_peek_returns_ready_current_data(
-        self, monkeypatch, four_rank_gtp_group, fwd, readiness
-    ):
-        """Every readiness path exposes current bytes before consume, with exactly one gather.
-
-        Two same-key cache buffers prevent a key-only lookup from identifying the actual AG output.
-        The first consume can replace its ticket; subsequent peeks must follow the actual gather.
-        """
-        check_states = True
-        cache = gtp.GTPWeightCache()
-        monkeypatch.setattr(gtp, "_GTP_CACHE", cache)
-        monkeypatch.setattr(gtp, "_GTP_GROUPED_BUF_PARITY_COUNTER", {})
-        monkeypatch.setattr(gtp.GTP_CONFIG, "check_param_states", check_states)
-        monkeypatch.setattr(gtp.GTP_CONFIG, "weight_prefetch", True)
-        p = GTPShardedParam(torch.zeros(8, 16, dtype=torch.bfloat16, device="cuda"))
-        p.group = four_rank_gtp_group
-        p.chain_id = "GTP_remat_grouped_fc1_ungraphed"
-        held = [cache.reserve(p, p.dtype, fwd=fwd) for _ in range(2)]
-        buffers = [cache.get(ticket) for ticket in held]
-        for ticket in held:
-            cache.release(ticket)
-        assert buffers[0].data_ptr() != buffers[1].data_ptr()
-
-        calls = []
-        gather = p._all_gather_weight
-
-        def counted_gather(*args, **kwargs):
-            calls.append(kwargs["fwd"])
-            return gather(*args, **kwargs)
-
-        monkeypatch.setattr(p, "_all_gather_weight", counted_gather)
-        peek = p.peek_group_for_forward if fwd else p.peek_group_for_backward
-        consume = p.materialize_group_for_forward if fwd else p.materialize_group_for_backward
-        pointers = []
-        for step in range(3):
-            p.data.fill_(16 * step + dist.get_rank())
-            expected = _full_weight(p)
-            if readiness != "missing":
-                _, p._prefetch_handle = p._all_gather_weight(async_op=True, fwd=fwd)
-                assert p._prefetch_handle is not None
-                if check_states:
-                    assert p.state == gtp.GTPWeightState.ASYNC_WAIT
-            if readiness == "ready":
-                # An external drain (or another peek) has finished the gather's host-side work.
-                p._wait_param_gather()
-                p._already_ag_drained = True
-            initialized, previous, following = p.prefetch_initialized, p.prev_w, p.next_w
-            peeked = peek()
-            # Read immediately: a later consume must not supply the missing completion wait.
-            torch.testing.assert_close(peeked, expected, rtol=0, atol=0)
-            assert p._prefetch_handle is None and p._already_ag_drained
-            if check_states:
-                assert p.state == gtp.GTPWeightState.DATA_READY
-            assert (p.prefetch_initialized, p.prev_w, p.next_w) == (
-                initialized,
-                previous,
-                following,
+    def tables(tensor):
+        return tuple(
+            torch.tensor(
+                [tensor[k, j].data_ptr() for j in range(local)], device=device, dtype=torch.int64
             )
-            # A second peek on a different stream still observes completion and issues no gather.
-            with torch.cuda.stream(torch.cuda.Stream()):
-                again = peek()
-                torch.testing.assert_close(again, expected, rtol=0, atol=0)
-            assert again.data_ptr() == peeked.data_ptr()
-            gathered = consume()
-            assert gathered.data_ptr() == peeked.data_ptr()
-            torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
-            assert len(calls) == step + 1
-            _assert_clean(p)
-            pointers.append(peeked.data_ptr())
-        assert (
-            pointers[1] == pointers[2]
-        ), "the established deterministic schedule must reuse storage"
-
-    @pytest.mark.parametrize("eager_first", [True, False], ids=["eager-first", "graph-first"])
-    def test_eager_wgrad_preserves_graph_rings(self, monkeypatch, four_rank_gtp_group, eager_first):
-        """Eager allocation cannot suppress or rebuild graph rings, even after a reset."""
-        monkeypatch.setattr(gtp, "_EAGER_WGRAD_RINGS", {})
-        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
-        monkeypatch.setattr(gtp, "_FULL_ITERATION", False)
-        monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", True)
-        monkeypatch.setattr(gtp.GTP_CONFIG, "graph_wgrad_ring_size", 2)
-        monkeypatch.setattr(gtp.GTP_CONFIG, "eager_wgrad_ring_size", 4)
-        weights = [gtp.GTPShardedParam(torch.zeros(3, 4, device="cuda")) for _ in range(5)]
-        for weight in weights:
-            weight.group = four_rank_gtp_group
-            weight.chain_id = gtp.GTPChain.GRAPHED.value
-            weight.pad_length = 2
-            weight.main_grad = torch.zeros_like(weight)
-        graphed, eager = weights[:4], weights[-1]
-        eager.chain_id = gtp.GTPChain.UNGRAPHED.value
-        # Frozen weights are registered too, but DDP does not create their main_grad.
-        frozen = gtp.GTPShardedParam(torch.zeros_like(eager), requires_grad=False)
-        frozen.group = eager.group
-        frozen.chain_id = eager.chain_id
-        for previous, current in zip(graphed, graphed[1:]):
-            previous.next_w, current.prev_w = current, previous
-        monkeypatch.setattr(gtp, "_GTP_PARAMS", [*weights, frozen])
-
-        old_slots = []
-        for _ in range(2):
-            if eager_first:
-                eager_view = eager.get_wgrad_tensor(persistent=True)
-            gtp.initialize_graph_wgrad_rings()
-            if not eager_first:
-                eager_view = eager.get_wgrad_tensor(persistent=True)
-            assert len(gtp_cuda_graphs._GRAPH_WGRAD_RINGS) == 1
-            key, slots = next(iter(gtp_cuda_graphs._GRAPH_WGRAD_RINGS.items()))
-            assert len(slots) == 2
-            assert [slot.index for slot in slots] == [0, 1]
-            assert all(slot.key == key for slot in slots)
-            assert graphed[1]._gtp_graph_wgrad_ring_slot is slots[0]
-            assert graphed[2]._gtp_graph_wgrad_ring_slot is slots[1]
-            assert graphed[3]._gtp_graph_wgrad_ring_slot is slots[0]
-            assert len(gtp._EAGER_WGRAD_RINGS) == 1
-            assert not hasattr(frozen, "_gtp_eager_wgrad_ring_slot")
-            assert eager_view.shape == (10, 4)
-            eager_view.fill_(7)
-            for slot in slots:
-                slot.tensor.fill_(3)
-            torch.testing.assert_close(eager_view, torch.full_like(eager_view, 7))
-            assert len({slot.tensor.data_ptr() for slot in slots} | {eager_view.data_ptr()}) == 3
-            assert all(slot is not old for slot in slots for old in old_slots)
-            gtp.initialize_graph_wgrad_rings()
-            assert next(iter(gtp_cuda_graphs._GRAPH_WGRAD_RINGS.values())) is slots
-            assert eager.get_wgrad_tensor().data_ptr() == eager_view.data_ptr()
-            old_slots = [*slots, eager._gtp_eager_wgrad_ring_slot]
-            torch.cuda.synchronize()
-            gtp.reset_gtp_state()
-            assert not gtp_cuda_graphs._GRAPH_WGRAD_RINGS
-            assert not gtp._EAGER_WGRAD_RINGS
-            for weight in weights:
-                assert not hasattr(weight, "_gtp_graph_wgrad_ring_slot")
-                assert not hasattr(weight, "_gtp_eager_wgrad_ring_slot")
-
-    @pytest.mark.parametrize("ring_size", [1, 2, 4, 8])
-    @pytest.mark.parametrize("async_reduction", [False, True], ids=["sync", "async"])
-    def test_persistent_wgrad_reuse_preserves_every_reduction(
-        self, monkeypatch, four_rank_gtp_group, async_reduction, ring_size
-    ):
-        """Full gradients, padding and exactly-once completion survive shared/repeated writers."""
-        group = four_rank_gtp_group
-        rank = dist.get_rank(group)
-        monkeypatch.setattr(gtp, "_EAGER_WGRAD_RINGS", {})
-        monkeypatch.setattr(gtp, "_GTP_GROUPED_BUF_PARITY_COUNTER", {})
-        monkeypatch.setattr(gtp.GTP_CONFIG, "eager_wgrad_ring_size", ring_size)
-        monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", async_reduction)
-        monkeypatch.setattr(gtp.GTP_CONFIG, "reduce_scatter_with_fp32_accumulation", False)
-        monkeypatch.setattr(gtp.GTP_CONFIG, "calculate_per_token_loss", False)
-        # Both FC roles deliberately have the same shape; each has two independent experts.
-        layers = []
-        expected, completions = {}, {}
-        for layer in range(5):
-            roles = []
-            for role in ("fc1", "fc2"):
-                weights = [
-                    gtp.GTPShardedParam(torch.zeros(33, 16, dtype=torch.bfloat16, device="cuda"))
-                    for _ in range(2)
-                ]
-                for expert, weight in enumerate(weights):
-                    weight.group, weight.pad_length, weight.expert_idx = group, 2, expert
-                    weight.chain_id = f"GTP_remat_grouped_{role}_ungraphed"
-                    weight.is_routed_expert = True
-                    weight._debug_name = f"layers.{layer}.{role}.weight{expert}"
-                    weight.main_grad = torch.full_like(weight, 0.5)
-                    weight._double_buffer_parity()  # Normally assigned by the forward gathers.
-                    expected[id(weight)] = weight.main_grad.clone()
-                    completions[id(weight)] = 0
-
-                    def completed(weight=weight):
-                        completions[id(weight)] += 1
-
-                    weight.register_grad_accum_hook(None, completed)
-                weights[0].weight_list = weights
-                roles.append(weights)
-            layers.append(roles)
-        for previous, current in zip(layers, layers[1:]):
-            for prev_weights, weights in zip(previous, current):
-                prev_weights[0].next_w, weights[0].prev_w = weights[0], prev_weights[0]
-        monkeypatch.setattr(
-            gtp,
-            "_GTP_PARAMS",
-            [weight for layer in layers for weights in layer for weight in weights],
+            for k in range(2)
         )
 
-        pointers = {}
-        try:
-            # Repeating the tail before the cascade drains its first RS exercises early reuse.
-            for step in range(3):
-                for layer_index in (4, 4, 3, 2, 1, 0):
-                    for role_index in (1, 0):
-                        weights = layers[layer_index][role_index]
-                        if async_reduction:
-                            with torch.cuda.stream(gtp.get_rs_stream(weights[0].chain_id, group)):
-                                torch.cuda._sleep(1_000_000)
-                        grads = []
-                        for weight in weights:
-                            if step == 1:
-                                # Skip acquisition so input preparation must finalize the old
-                                # reader before copying a foreign gradient into the shared slot.
-                                grad = torch.empty(
-                                    weight._unsharded_shape,
-                                    dtype=weight.main_grad.dtype,
-                                    device=weight.device,
-                                )
-                            else:
-                                grad = weight.get_wgrad_tensor(persistent=True)
-                                prior = pointers.setdefault(id(weight), grad.data_ptr())
-                                assert grad.data_ptr() == prior
-                            base = (
-                                torch.arange(130 * 16, device="cuda").view(130, 16) % 11 - 5
-                            ).float() / 4 + (step + layer_index + weight.expert_idx) / 8
-                            grad.copy_(base + rank / 4)
-                            mean = torch.nn.functional.pad(base + 3 / 8, (0, 0, 0, 2))
-                            expected[id(weight)].add_(mean.chunk(4)[rank])
-                            grads.append(grad)
-                        weights[0].finalize_group_grads(grads)
-                torch.cuda.synchronize()
-                for layer in layers:
-                    for weights in layer:
-                        for weight in weights:
-                            torch.testing.assert_close(
-                                weight.main_grad, expected[id(weight)], rtol=0, atol=0
-                            )
-                            assert not torch.count_nonzero(
-                                weight._gtp_eager_wgrad_ring_slot.tensor[130:]
-                            )
-                            calls_per_step = 2 if layer is layers[-1] else 1
-                            assert completions[id(weight)] == (step + 1) * calls_per_step
-                # Allocate only the configured depth (or the number of writers if smaller).
-                expected_slots = min(ring_size, len(layers)) * 2 * 2
-                assert len(set(pointers.values())) == expected_slots
-        finally:
-            torch.cuda.synchronize()
-            for layer in layers:
-                for weights in layer:
-                    weights[0]._wait_reduce_scatter(finalize_grad=True)
+    sources, grads = tables(weights), tables(native)
+    scale_sources = tables(scales) if mxfp8 else None
+    plan = torch.tensor(
+        [[(d - 1) % world * local + j for j in range(local)] for d in range(world)],
+        device=device,
+        dtype=torch.int32,
+    )
+    allocations = []
+    fail_allocation = False
+    original = triton.set_allocator
 
-    @pytest.mark.parametrize("ring_size", [0, -1])
-    def test_eager_wgrad_rejects_invalid_ring_size(
-        self, monkeypatch, four_rank_gtp_group, ring_size
-    ):
-        monkeypatch.setattr(gtp.GTP_CONFIG, "eager_wgrad_ring_size", ring_size)
-        weight = gtp.GTPShardedParam(torch.zeros(3, 4, device="cuda"))
-        weight.group = four_rank_gtp_group
-        weight.main_grad = torch.zeros_like(weight)
-        with pytest.raises(ValueError, match="eager_wgrad_ring_size must be at least 1"):
-            weight.get_wgrad_tensor(persistent=True)
+    def track_allocator(allocator):
+        def scratch(size, alignment, stream):
+            assert _allocation._allocator.get() is scratch
+            if fail_allocation:
+                raise RuntimeError("descriptor scratch allocation failed")
+            allocations.append((size, alignment))
+            return allocator(size, alignment, stream)
+
+        original(scratch)
+
+    monkeypatch.setattr(triton, "set_allocator", track_allocator)
+
+    def push():
+        vt.launch_virtual_expert_weight_prefetch(
+            w, sources=sources, scale_sources=scale_sources, experts_to_copy=plan
+        )
+
+    def reduce():
+        vt.launch_virtual_expert_grad_reduce(w, native_grads=grads, experts_to_copy=plan)
+
+    graphs = []
+    try:
+        for graph in (False, True):
+            graphs.clear()
+            for call in (push, reduce):
+                # Fail before kernel submission on every rank; the caller's allocator must survive.
+                fail_allocation = True
+                with pytest.raises(RuntimeError, match="descriptor scratch allocation failed"):
+                    call()
+                assert _allocation._allocator.get() is caller_allocator
+                fail_allocation = False
+                w.grad_arena.fill_(rank + 1)
+                count = len(allocations)
+                call()
+                assert len(allocations) > count
+                assert _allocation._allocator.get() is caller_allocator
+                dist.barrier()
+                if graph:
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        call()
+                    assert _allocation._allocator.get() is caller_allocator
+                    graphs.append(g)
+                else:
+                    graphs.append(None)
+            for step in range(3):
+                weights.fill_(rank + 1 + step)
+                scales.fill_(rank + 11 + step)
+                w.weight_arena.zero_()
+                w.grad_arena.fill_(rank + 1 + step)
+                dist.barrier()
+                count = len(allocations)
+                for call, g in zip((push, reduce), graphs):
+                    call() if g is None else g.replay()
+                    assert _allocation._allocator.get() is caller_allocator
+                torch.cuda.synchronize()
+                if graph:
+                    assert (
+                        len(allocations) == count
+                    ), "replay must reuse captured descriptor scratch"
+                previous, following = (rank - 1) % world, (rank + 1) % world
+                for section in w.weight_arena.view(2, local * (member + scale_member)):
+                    torch.testing.assert_close(
+                        section[: local * member],
+                        torch.full_like(section[: local * member], previous + 1 + step),
+                        rtol=0,
+                        atol=0,
+                    )
+                    if mxfp8:
+                        torch.testing.assert_close(
+                            section[local * member :],
+                            torch.full_like(section[local * member :], previous + 11 + step),
+                            rtol=0,
+                            atol=0,
+                        )
+                torch.testing.assert_close(
+                    native, torch.full_like(native, rank + following + 2 + 2 * step), rtol=0, atol=0
+                )
+                dist.barrier()
+    finally:
+        torch.cuda.synchronize()
+        graphs.clear()
+        w.weight_handle = w.grad_handle = None
 
 
 def _assert_numerical_parity(actual, expected, tolerance, name, peak_tolerance=None):
@@ -823,30 +682,18 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
     def run(virtual):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         model_parallel_cuda_manual_seed(1234)
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=128,
-            num_attention_heads=4,
+        config = _virtual_expert_hybridep_config(
             ffn_hidden_size=256,
             moe_ffn_hidden_size=256,
             num_moe_experts=4,
-            expert_model_parallel_size=2,
             moe_router_topk=2,
             moe_router_score_function='sigmoid',
             moe_router_topk_scaling_factor=3.16,
-            moe_router_dtype='fp32',
             moe_router_load_balancing_type='none',
             moe_aux_loss_coeff=0,
-            moe_token_dispatcher_type='flex',
-            moe_flex_dispatcher_backend='hybridep',
             moe_virtual_expert_load_balance=virtual,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            add_bias_linear=False,
             activation_func=squared_relu,
             gated_linear_unit=False,
-            gradient_accumulation_fusion=True,
-            moe_grouped_gemm=True,
             use_transformer_engine_op_fuser=use_op_fuser,
             use_fused_weighted_squared_relu=True,
             moe_use_grouped_tensor=True,
@@ -1125,8 +972,9 @@ def _virtual_expert_hybridep_config(**overrides):
 
 
 @requires_hybridep
-@pytest.mark.launch_on_gb200
-@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+@pytest.mark.parametrize(
+    "precision", ["bf16", pytest.param("mxfp8", marks=pytest.mark.launch_on_gb200)]
+)
 @pytest.mark.parametrize(
     "recompute,offload_scope,use_op_fuser",
     [
@@ -1147,40 +995,18 @@ def _virtual_expert_hybridep_config(**overrides):
     ],
 )
 def test_virtual_expert_recompute_offload_scopes(
-    monkeypatch, precision, recompute, offload_scope, use_op_fuser
+    monkeypatch, grouped_mlp_fusions, precision, recompute, offload_scope, use_op_fuser
 ):
     """Exercise real MoonEP transfers through two forwards and reverse-order backward."""
+    if precision == "mxfp8" and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 requires Blackwell")
     if offload_scope == "expert_fc1":
         pytest.skip("FC1 offload needs a separate HybridEP/TE capacity-buffer fix.")
-
-    from transformer_engine.pytorch.ops.fused import grouped_mlp
-    from transformer_engine.pytorch.ops.fuser import (
-        OperationFuser,
-        register_forward_backward_fusion,
-    )
 
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
     from megatron.core.tensor_parallel import checkpoint
     from megatron.core.transformer.spec_utils import get_submodules
 
-    checks = (
-        grouped_mlp._GroupedMLP_CuTeGEMMBase.is_supported,
-        grouped_mlp.GroupedMLP_CuTeGEMMUnary.is_supported,
-        grouped_mlp._grouped_gemm_dsrelu_backward_supported,
-    )
-    for check in checks:
-        check.cache_clear()
-    monkeypatch.setattr(
-        OperationFuser,
-        "forward_backward_fusion_functions",
-        list(OperationFuser.forward_backward_fusion_functions),
-    )
-    for cls, fuse in (
-        (grouped_mlp.GroupedMLP_CuTeGEMMGLU, grouped_mlp.fuse_ops),
-        (grouped_mlp.GroupedMLP_CuTeGEMMUnary, grouped_mlp.fuse_srelu_ops),
-    ):
-        if cls.is_supported() and fuse not in OperationFuser.forward_backward_fusion_functions:
-            register_forward_backward_fusion(fuse, prepend=True)
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
     monkeypatch.setattr(
         fused_a2a.HybridEPBuffer,
@@ -1322,8 +1148,6 @@ def test_virtual_expert_recompute_offload_scopes(
             _assert_bitwise_parity(actual[name], expected, name)
     finally:
         Utils.destroy_model_parallel()
-        for check in checks:
-            check.cache_clear()
 
 
 @requires_hybridep
@@ -1340,28 +1164,21 @@ def test_virtual_expert_manager_rejects_mismatched_topk():
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("scope", ["moe_router", "moe_preprocess"])
-def test_virtual_expert_hybridep_rejects_partial_moe_cuda_graph_scopes(scope):
-    """Only the whole-layer moe scope preserves the planner's per-forward metadata."""
-    with pytest.raises(AssertionError, match="moe CUDA graph scope only"):
-        _virtual_expert_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=[scope])
-
-
-@pytest.mark.parametrize(
-    "overrides,match",
-    [
+def test_virtual_expert_rejects_unsupported_layout():
+    """Reject incompatible routing/storage layouts and partial MoE graph capture."""
+    for overrides, match in (
         ({"moe_token_dispatcher_type": "alltoall"}, "moe_token_dispatcher_type='flex'"),
         ({"moe_hybridep_routing_map_mode": "bool"}, "moe_hybridep_routing_map_mode='indices'"),
         ({"expert_model_parallel_size": 1}, "2<=expert_model_parallel_size<=64"),
         ({"num_moe_experts": 3}, "num_moe_experts divisible"),
         ({"moe_router_topk": 3}, "1<=moe_router_topk"),
         ({"moe_expert_capacity_factor": 1.0}, "moe_expert_capacity_factor=None"),
-    ],
-)
-def test_virtual_expert_rejects_unsupported_layout(overrides, match):
-    """Reject combinations that would drop routes or invalidate runtime storage."""
-    with pytest.raises(ValueError, match=match):
-        _virtual_expert_hybridep_config(**overrides)
+    ):
+        with pytest.raises(ValueError, match=match):
+            _virtual_expert_hybridep_config(**overrides)
+    for scope in ("moe_router", "moe_preprocess"):
+        with pytest.raises(AssertionError, match="moe CUDA graph scope only"):
+            _virtual_expert_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=[scope])
 
 
 @requires_cuda
