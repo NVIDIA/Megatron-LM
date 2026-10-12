@@ -332,8 +332,8 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
                     [
                         Headers.REQUEST_ERROR.value,
                         client_request_id,
-                        "SUBMIT_REQUEST_WITH_KV is not supported by native disaggregation; "
-                        "use SUBMIT_REQUEST",
+                        "Client-supplied KV handoffs are not supported by the native "
+                        "coordinator; use SUBMIT_REQUEST",
                         True,
                     ],
                     use_bin_type=True,
@@ -396,18 +396,18 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
         return
     request_id = int(metadata[1])
     instance_id = metadata[2] if len(metadata) > 2 else None
-    # Legacy releases have no instance fence. Fenced releases may affect only
+    # Two-field releases have no instance fence. Fenced releases may affect only
     # this coordinator incarnation, never a replacement reusing the request ID.
     if len(metadata) == 2 or instance_id == coordinator.instance_id:
         engine = coordinator.handoff_ownership.source_engine(request_id)
         if engine is None:
-            # Legacy/untracked handoffs have no registered owner; engines that
+            # Untracked handoffs have no registered owner; engines that
             # do not hold this request ignore the broadcast (including retries).
             coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id])
         elif not _release_owned_handoff(coordinator, request_id, engine):
             return  # No ACK: the caller must retry delivery.
     if len(metadata) == 2:
-        # The legacy client is fire-and-forget and does not expect an ACK.
+        # Two-field releases are fire-and-forget; do not send an ACK.
         return
     # ACK successful releases and stale-instance no-ops. Acknowledging a stale
     # instance retires the caller's retry without releasing allocations that

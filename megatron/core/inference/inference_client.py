@@ -409,8 +409,10 @@ class InferenceClient:
     def release_handoff(self, request_id: int) -> None:
         """Tell the coordinator to release the KV blocks pinned for `request_id`.
 
-        Fire-and-forget. The coordinator broadcasts RELEASE_KV to every engine;
-        engines without that request_id ignore the message.
+        Sends a two-field RELEASE_KV message without a coordinator instance ID
+        and does not wait for an acknowledgement. The coordinator targets the
+        registered source, or broadcasts if ownership is unknown; engines
+        without that request_id ignore the message.
         """
         payload = [Headers.RELEASE_KV.value, int(request_id)]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))

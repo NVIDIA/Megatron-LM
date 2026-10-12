@@ -200,7 +200,8 @@ def test_kv_handoff_round_trip_keeps_prompt_in_its_own_frame(native_disaggregati
         header, rejected_id, reason, source_safe = msgpack.unpackb(error_frame, raw=False)
         assert destination == b"client-0"
         assert header == Headers.REQUEST_ERROR.value and rejected_id == request_id
-        assert "native disaggregation" in reason and "use SUBMIT_REQUEST" in reason
+        assert "Client-supplied KV handoffs" in reason
+        assert "native coordinator" in reason and "use SUBMIT_REQUEST" in reason
         assert source_safe is True
         return
 
