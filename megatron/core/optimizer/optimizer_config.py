@@ -386,6 +386,14 @@ class OptimizerConfig:
     """With overlap_optimizer_step_with_forward: number of bucket groups beyond the one the
     forward pass is waiting for whose update and param all-gather are issued at that point."""
 
+    overlap_optimizer_step_flat_adam: bool = False
+    """With overlap_optimizer_step_with_forward: one TransformerEngine flat Adam launch per
+    bucket shard (flat_adam_capturable_master) instead of one multi-tensor launch per param
+    group and bucket group, for the float16 params updated through FP32 main params. The main
+    params and moments of a bucket shard are kept in one contiguous buffer each, laid out like
+    the shard; the update is bitwise the multi-tensor kernel's. A bucket shard whose buffers the
+    kernel cannot take keeps the multi-tensor launches, with a warning."""
+
     #######################
     # Optimizer Offload
     #######################
@@ -507,6 +515,10 @@ class OptimizerConfig:
                 raise ValueError(
                     "overlap_optimizer_step_with_forward requires " + ", ".join(unmet) + "."
                 )
+        if self.overlap_optimizer_step_flat_adam and not self.overlap_optimizer_step_with_forward:
+            raise ValueError(
+                "overlap_optimizer_step_flat_adam requires overlap_optimizer_step_with_forward."
+            )
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.

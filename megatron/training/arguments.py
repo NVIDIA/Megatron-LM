@@ -3172,6 +3172,10 @@ def _add_distributed_args(parser):
                        help='With --overlap-optimizer-step-with-forward, number of bucket groups beyond '
                        'the one the forward pass is waiting for whose update and all-gather are issued '
                        'at that point.')
+    group.add_argument('--overlap-optimizer-step-flat-adam', action='store_true',
+                       default=False, help='With --overlap-optimizer-step-with-forward, one flat Adam '
+                       'launch per bucket shard over contiguous main params and moments instead of '
+                       'one multi-tensor launch per param group and bucket group.')
     group.add_argument('--no-align-param-gather', action='store_false',
                        help='If not set, all PP stages will launch param all-gathers simultaneously. '
                        'Otherwise, each PP stage will independently launch as needed.',
