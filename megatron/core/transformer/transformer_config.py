@@ -4009,8 +4009,8 @@ class MLATransformerConfig(TransformerConfig):
     query before attention, instead of writing BF16 key and value that attention then
     quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA, zero attention
     dropout and qk_head_dim=128, qk_pos_emb_head_dim=64, v_head_dim=128; layers with TP or CP
-    above 1, THD inputs, recomputed up-projections or checkpointed core attention, and
-    evaluation use the unfused path."""
+    above 1, THD inputs, FP16 inputs, recomputed up-projections or checkpointed core attention,
+    NVTE_FP8_DPA_BWD=0 and evaluation use the unfused path."""
 
     q_lora_rank: int = 512
     """Rank of Query tensor's low rank representation."""
