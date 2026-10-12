@@ -532,6 +532,17 @@ jobs:
         run: |
           uv sync --locked --only-group linting
 
+      - name: Check core does not import training
+        # Resolve relative imports through the megatron namespace package.
+        run: >-
+          .venv/bin/ruff check megatron/core
+          --isolated
+          --select TID251
+          --ignore-noqa
+          --output-format github
+          --config 'namespace-packages = ["megatron"]'
+          --config 'lint.flake8-tidy-imports.banned-api = {"megatron.training" = {msg = "megatron.core must not depend on megatron.training."}}'
+
       - name: Test CI cache keys
         run: .github/scripts/test_cache_keys.sh
 

@@ -449,7 +449,7 @@ class MTPControllerMixin:
         active_request_count = context.total_request_count - context.paused_request_count
         active_slice = slice(context.paused_request_count, context.total_request_count)
 
-        unwrapped_model = self._unwrapped_model
+        unwrapped_model = self._language_model
 
         # On non-last pipeline stages, the model won't have decoder hidden states.
         has_mtp = self._is_last_pp_stage and context.mtp_decoder_hidden_states is not None
@@ -687,7 +687,7 @@ class MTPControllerMixin:
             return
 
         context = self.inference_wrapped_model.inference_context
-        unwrapped_model = self._unwrapped_model
+        unwrapped_model = self._language_model
         has_mtp = self._is_last_pp_stage and hasattr(unwrapped_model, "mtp")
         if not has_mtp and not self.model_is_pipeline_parallel:
             # No MTP on this rank and no PP broadcast to participate in.

@@ -1404,14 +1404,15 @@ class TestChunkedPrefillCudaGraphs:
         ssm_mixer="mamba",
         hidden_size=32,
         num_query_groups=None,
-        flash_attention_version=None,
+        flash_attention_version=2,
         init_method_std=0.02,
     ):
         """Create a GPT or hybrid model with optional CUDA graph support.
 
         `ssm_mixer` selects the hybrid stack's linear-attention mixer ("mamba"
         or "gdp"); it is ignored for GPT. `hidden_size`, `num_query_groups`,
-        `flash_attention_version` and `init_method_std` apply to GPT only.
+        and `init_method_std` apply to GPT only. `flash_attention_version`
+        applies to both model types.
         """
         cuda_graph_impl = "local" if num_cuda_graphs else "none"
 
@@ -1444,6 +1445,7 @@ class TestChunkedPrefillCudaGraphs:
         elif model_provider == "hybrid":
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
+                flash_attention_version=flash_attention_version,
                 num_layers=3,
                 hidden_size=256,
                 **hybrid_mixer_kwargs(ssm_mixer),
