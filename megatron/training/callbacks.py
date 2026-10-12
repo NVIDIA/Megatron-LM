@@ -83,6 +83,7 @@ class CallbackContext:
         total_loss_dict: Aggregated eval losses. Available in on_eval_end.
         timers_to_log: Mutable timer-name list; append to include extra timers. In on_log.
         log_fragments: Mutable list; append strings to extend the stdout log line. In on_log.
+        checkpointing_context: The loop's checkpointing context. From on_setup_start onwards.
     """
 
     model: list[MegatronModule] | None
@@ -99,6 +100,7 @@ class CallbackContext:
 
     timers_to_log: list[str] | None = None
     log_fragments: list[str] | None = None
+    checkpointing_context: dict | None = None
 
 
 class Callback:

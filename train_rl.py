@@ -16,10 +16,14 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
+    evaluate_rollouts,
     get_logprobs,
     get_rl_runtime_state,
     load_packed_data_by_index,
+    next_rollout_iterator,
+    rl_inference_interface_shutdown,
 )
+from megatron.rl.training_setup import RLSetupCallback
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
@@ -419,6 +423,7 @@ if __name__ == "__main__":
         "--reset-attention-mask is not supported in RL training: "
         "the forward pass masks via PackedSeqParams and never consumes a dense attention mask."
     )
+    assert args.perform_rl_step, "train_rl.py requires --perform-rl-step."
     if args.batch_invariant_mode and args.rank == 0:
         print(
             "WARNING: batch-invariant mode is enabled, so logprobs are not computed vocab-parallel"
@@ -431,10 +436,49 @@ if __name__ == "__main__":
     set_run_config(full_config)
     initialize_runtime_services(args, training=True)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
-    pretrain(
-        full_config,
-        None,  # we don't need to build any datasets for RL training
-        ModelType.encoder_or_decoder,
-        forward_step,
-        partial(model_provider, _model_builder),
+    rl_cfg = full_config.rl
+    rl_model_provider = partial(model_provider, _model_builder)
+
+    rl_setup = RLSetupCallback(
+        rl_cfg, model_provider=rl_model_provider, model_type=ModelType.encoder_or_decoder
     )
+
+    def next_train_iterator(iteration, current_iterator):
+        return next_rollout_iterator(
+            iteration,
+            current_iterator,
+            model=rl_setup.model,
+            inference_model=rl_setup.inference_model,
+            optimizer=rl_setup.optimizer,
+            ref_state_dict=rl_setup.ref_state_dict,
+            rl_config=rl_cfg,
+            args=get_args(),
+        )
+
+    def run_eval(**kwargs):
+        evaluate_rollouts(
+            model=rl_setup.model,
+            inference_model=rl_setup.inference_model,
+            optimizer=rl_setup.optimizer,
+            **kwargs,
+        )
+
+    try:
+        pretrain(
+            full_config,
+            None,  # we don't need to build any datasets for RL training
+            ModelType.encoder_or_decoder,
+            forward_step,
+            rl_model_provider,
+            # Even with --skip-train, RL keeps its optimizer unless --no-load-optim is set.
+            skip_train_keeps_optimizer=not args.no_load_optim,
+            next_train_iterator=next_train_iterator,
+            run_eval=run_eval,
+            # RL inference-only mode (--skip-train) still enters the loop to collect rollouts.
+            run_train_loop_without_updates=True,
+            suppress_microbatch_rampup_handling=rl_cfg.rl_use_sequence_packing,
+            callbacks=[rl_setup],
+        )
+    # RL owns the inference-interface shutdown.
+    finally:
+        rl_inference_interface_shutdown()
