@@ -1450,16 +1450,25 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_input = te_general_gemm(
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )
-            grad_weight = te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
-            )
+            # With a bias, the wgrad GEMM's cuBLASLt BGRAD epilogue reduces grad_output over
+            # its K dimension (the tokens) into the bias gradient, in place of a separate sum.
+            grad_weight, grad_bias = te_general_gemm(
+                inp.to(ctx.router_dtype),
+                grad_output,
+                ctx.router_dtype,
+                layout="NT",
+                grad=True,
+                bias=bias,
+            )[:2]
             grad_input = grad_input[0].to(ctx.input_dtype)
-            grad_weight = grad_weight[0].to(ctx.weight_dtype)
+            grad_weight = grad_weight.to(ctx.weight_dtype)
+            if grad_bias is not None:
+                grad_bias = grad_bias.to(ctx.weight_dtype)
         else:
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
             grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+            grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
 
-        grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
         return grad_input, grad_weight, grad_bias, None
 

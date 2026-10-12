@@ -842,6 +842,27 @@ def test_router_gating_linear_bias(router_dtype):
 
 
 @pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("router_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_tokens", [1, 4096])
+def test_router_gating_linear_bias_grad(router_dtype, num_tokens):
+    """The bias gradient from the wgrad GEMM's BGRAD epilogue matches the column sum of the
+    output gradient for bf16 parameters with a higher-precision router."""
+    torch.manual_seed(0)
+    inp = torch.randn((num_tokens, 1024), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    weight = torch.randn((32, 1024), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    bias = torch.randn((32,), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    grad_output = torch.randn((num_tokens, 32), dtype=router_dtype, device="cuda")
+
+    router_gating_linear(inp, weight, bias, router_dtype).backward(grad_output)
+
+    ref_grad_bias = grad_output.float().sum(dim=0).to(bias.dtype)
+    assert bias.grad.dtype == bias.dtype
+    # fp32 accumulation on both sides; only the summation order differs before the bf16 cast.
+    torch.testing.assert_close(bias.grad, ref_grad_bias, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.internal
 @pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
 @pytest.mark.parametrize("use_pre_softmax", [True, False])
 @pytest.mark.parametrize("topk", [1, 2])
