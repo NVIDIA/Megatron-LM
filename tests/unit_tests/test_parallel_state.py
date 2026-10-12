@@ -103,8 +103,10 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_initialize_and_destroy_model_parallel(order):
-    with pytest.raises(AssertionError):
-        assert ps.initialize_model_parallel(order=order)
+    if not torch.distributed.is_initialized():
+        # initialize_model_parallel() requires torch.distributed to be initialized.
+        with pytest.raises(AssertionError):
+            ps.initialize_model_parallel(order=order)
     Utils.initialize_distributed()
     with pytest.raises(RuntimeError):
         assert ps.initialize_model_parallel(tensor_model_parallel_size=2 * world_size, order=order)
