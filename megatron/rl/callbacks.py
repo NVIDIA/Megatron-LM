@@ -26,8 +26,6 @@ from megatron.training.utils import print_rank_0
 
 
 class RLLoggingCallback(Callback):
-    """RL timers, packing counters, GRPO collection progress, rollout throughput and the RL
-    profiler's lifecycle."""
 
     def __init__(self, rl_config: Any, *, global_batch_size: int) -> None:
         self._rl_config = rl_config
@@ -105,7 +103,6 @@ class RLLoggingCallback(Callback):
 
 
 class RLCheckpointCallback(Callback):
-    """Compacts the durable rollout bank once a checkpoint is durable (no-op without a bank)."""
 
     def on_checkpoint_saved(self, context: CallbackContext) -> None:
         rl_utils.maybe_compact_rollout_bank(context.durable_iteration)
