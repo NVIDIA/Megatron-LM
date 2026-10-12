@@ -10,7 +10,6 @@ _TRAIN_START_TIME = time.time()  # The earliest we can measure the start time.
 
 # Standard library.
 import argparse
-import copy
 import dataclasses
 import functools
 import gc
@@ -61,8 +60,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
-from megatron.core.inference.shards import build_inference_pg_collection
-from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
@@ -219,14 +216,6 @@ _TensorMetricObserverCallback = Callable[..., None]
 
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
-try:
-    from megatron.rl import rl_utils
-    from megatron.rl.inference.disagg import build_disagg_inference_model
-
-    has_rl_utils = True
-except ImportError:
-    has_rl_utils = False
-
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
@@ -1681,6 +1670,11 @@ def pretrain(
     tensor_metric_observer: _TensorMetricObserverCallback | None = None,
     *,
     build_tokenizer: bool = True,
+    skip_train_keeps_optimizer: bool = False,
+    next_train_iterator: Optional[Callable[[int, Any], Any]] = None,
+    run_eval: Optional[Callable[..., None]] = None,
+    run_train_loop_without_updates: bool = False,
+    suppress_microbatch_rampup_handling: bool = False,
 ):
     """Main training program.
 
@@ -1730,6 +1724,14 @@ def pretrain(
             `cfg_container.logger.tensor_metrics`.
         build_tokenizer: whether startup builds the shared tokenizer. Disable for
             workloads that provide their own tokenization, such as heterogeneous MiMo.
+        skip_train_keeps_optimizer: with --skip-train, still build the optimizer.
+        next_train_iterator / run_eval: the loop's data and evaluation hooks (see `train`);
+            default to the provider-built iterators and evaluate_and_print_results.
+            A caller-provided next_train_iterator skips the standard dataloaders entirely.
+        run_train_loop_without_updates: also enter the training loop under --skip-train when
+            there is training data (inference-only RL collection; no optimizer updates).
+        suppress_microbatch_rampup_handling: skip the automatic checkpoint on mid-loop
+            microbatch changes (for data sources that reconfigure microbatches every iteration).
     """
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
@@ -2023,6 +2025,7 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    callback_manager.callback_context.checkpointing_context = checkpointing_context
     callback_manager.trigger("on_setup_start")
 
     if args.train_full_dataset:
@@ -2031,10 +2034,6 @@ def pretrain(
             args, train_valid_test_dataset_provider
         )
 
-    # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
-    build_optimizer = not cfg_container.validation.skip_train or (
-        cfg_container.rl.perform_rl_step and not args.no_load_optim
-    )
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     with _otel_managed_span('model_init', 'megatron.startup.model_init', is_goodput_span=True):
@@ -2049,182 +2048,11 @@ def pretrain(
                 if pg_collection is not None
                 else ProcessGroupCollection.use_mpu_process_groups()
             ),
-            build_optimizer=build_optimizer,
+            skip_train_keeps_optimizer=skip_train_keeps_optimizer,
         )
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
-
-    # Build a separate inference model for RL if requested.
-    inference_model = None
-    if cfg_container.rl.perform_rl_step:
-        # RL inference doesn't support CP; when training uses CP>1, always build a
-        # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
-        force_cp1_inference_model = args.context_parallel_size > 1
-        if spec_declares_disaggregation(args.inference_shards):
-            # Disaggregated rollouts build this rank's prefill/decode model on
-            # the shard process groups maintained by the per-pool refit path.
-            inference_model = build_disagg_inference_model(
-                args,
-                model_type,
-                model_cfg,
-                cfg_container=cfg_container,
-                model_alloc_ctx=rl_utils.inference_model_alloc_context(),
-            )
-        elif (
-            cfg_container.rl.rl_inference_tensor_model_parallel_size is not None
-            or cfg_container.rl.rl_inference_pipeline_model_parallel_size is not None
-            or cfg_container.rl.rl_inference_expert_model_parallel_size is not None
-            or cfg_container.rl.rl_inference_expert_tensor_model_parallel_size is not None
-            or force_cp1_inference_model
-        ):
-            print_rank_0(
-                "Building separate RL inference model with custom parallelism: "
-                f"TP={cfg_container.rl.rl_inference_tensor_model_parallel_size}, "
-                f"PP={cfg_container.rl.rl_inference_pipeline_model_parallel_size}, "
-                f"CP={1 if force_cp1_inference_model else None}, "
-                f"EP={cfg_container.rl.rl_inference_expert_model_parallel_size}, "
-                f"ExptTP={cfg_container.rl.rl_inference_expert_tensor_model_parallel_size}"
-            )
-            inference_pg_collection = build_inference_pg_collection(
-                args.world_size,
-                tp_size=cfg_container.rl.rl_inference_tensor_model_parallel_size,
-                pp_size=cfg_container.rl.rl_inference_pipeline_model_parallel_size,
-                cp_size=1 if force_cp1_inference_model else None,
-                ep_size=cfg_container.rl.rl_inference_expert_model_parallel_size,
-                expt_tp_size=cfg_container.rl.rl_inference_expert_tensor_model_parallel_size,
-                use_tp_pp_dp_mapping=cfg_container.dist.use_tp_pp_dp_mapping,
-            )
-
-            # Build an isolated inference config so training config remains unchanged
-            inference_config = copy.deepcopy(model_cfg)
-            if cfg_container.rl.rl_inference_tensor_model_parallel_size is not None:
-                inference_config.tensor_model_parallel_size = cfg_container.rl.rl_inference_tensor_model_parallel_size
-            if cfg_container.rl.rl_inference_pipeline_model_parallel_size is not None:
-                inference_config.pipeline_model_parallel_size = (
-                    cfg_container.rl.rl_inference_pipeline_model_parallel_size
-                )
-            if force_cp1_inference_model:
-                inference_config.context_parallel_size = 1
-            if cfg_container.rl.rl_inference_expert_model_parallel_size is not None:
-                inference_config.expert_model_parallel_size = (
-                    cfg_container.rl.rl_inference_expert_model_parallel_size
-                )
-            if cfg_container.rl.rl_inference_expert_tensor_model_parallel_size is not None:
-                inference_config.expert_tensor_parallel_size = (
-                    cfg_container.rl.rl_inference_expert_tensor_model_parallel_size
-                )
-
-            with rl_utils.inference_model_alloc_context():
-                inference_model = get_model(
-                    model_provider,
-                    model_type,
-                    wrap_with_ddp=False,
-                    pg_collection=inference_pg_collection,
-                    config=inference_config,
-                )
-            inference_model[0].eval()
-
-        # Validate: offloading flag requires a separate inference model
-        if cfg_container.rl.rl_offload_inference_model_weights and inference_model is None:
-            raise ValueError(
-                "--rl-offload-inference-model-weights requires a separate inference model. "
-                "This flag is only useful when doing refit since the weights are shared with the training model."
-            )
-
-    # RL composition: the loop takes its data and evaluation hooks as functions,
-    # so the RL pieces that used to live inside it are built here.
-    next_train_iterator = run_eval = None
-    if cfg_container.rl.perform_rl_step:
-        assert has_rl_utils, "RL cannot run without the megatron.rl package"
-
-        if optimizer is None:
-            # In RL inference-only mode, train_iters must still be set despite having no optimizer.
-            update_train_iters(cfg_container.train)
-        ref_state_dict = None
-        if (cfg_container.train.train_iters or 0) > 0:
-            # GRPO loop state; eval-only runs (no iterations) evaluate the loaded weights directly.
-            if cfg_container.validation.skip_train:
-                # In inference-only mode, use current weights as reference.
-                print_rank_0("> RL inference-only: using current weights as reference.")
-                ref_state_dict = {
-                    k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()
-                }
-            else:
-                print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
-                load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
-                args.no_load_optim = True
-
-                # Load pretrained checkpoint
-                args.load = None
-                args.finetune = True
-                load_checkpoint(
-                        model,
-                        None,  # Don't load optimizer state
-                        None,  # Don't load scheduler state
-                        checkpointing_context=checkpointing_context,
-                        restore_training_state=True,
-                        skip_load_to_model_and_opt=HAVE_FSDP2
-                        and cfg_container.dist.use_torch_fsdp2
-                        and args.ckpt_format == "torch_dist",
-                    )
-                ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
-
-                # Reload RL training checkpoint weights
-                args.load = load
-                args.finetune = finetune
-                print_rank_0("> Reloading RL training checkpoint...")
-                load_checkpoint(
-                        model,
-                        None,
-                        None,
-                        checkpointing_context=checkpointing_context,
-                        restore_training_state=True,
-                        skip_load_to_model_and_opt=HAVE_FSDP2
-                        and cfg_container.dist.use_torch_fsdp2
-                        and args.ckpt_format == "torch_dist",
-                    )
-                update_num_microbatches(
-                    consumed_samples=get_train_state().consumed_train_samples, verbose=True
-                )
-
-                args.no_load_optim = no_load_optim
-            # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
-            print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
-            from megatron.core.num_microbatches_calculator import (
-                destroy_num_microbatches_calculator,
-                init_num_microbatches_calculator,
-            )
-
-            # First destroy the existing calculator
-            destroy_num_microbatches_calculator()
-            # Then initialize with the correct perform_rl_step=True context
-            init_num_microbatches_calculator(
-                rank=args.rank,
-                global_batch_size=cfg_container.train.global_batch_size,
-                micro_batch_size=cfg_container.train.micro_batch_size,
-                # RL runs on the plain MPU groups: train()'s _dp_world_size() for them.
-                data_parallel_size=mpu.get_data_parallel_world_size(),
-                decrease_batch_size_if_needed=cfg_container.train.decrease_batch_size_if_needed,
-                step_batch_size_schedule=cfg_container.train.step_batch_size_schedule,
-                seq_length=args.seq_length,
-            )
-            print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
-        next_train_iterator = functools.partial(
-            rl_utils.next_rollout_iterator,
-            model=model,
-            inference_model=inference_model,
-            optimizer=optimizer,
-            ref_state_dict=ref_state_dict,
-            rl_config=cfg_container.rl,
-            train_config=cfg_container.train,
-        )
-        run_eval = functools.partial(
-            rl_utils.evaluate_rollouts,
-            model=model,
-            inference_model=inference_model,
-            optimizer=optimizer,
-        )
 
     callback_manager.callback_context.model = model
     callback_manager.callback_context.optimizer = optimizer
@@ -2328,11 +2156,15 @@ def pretrain(
     # (do_train False), _end_otel_job_spans() ends startup as an idempotent
     # fallback.
 
+    # Enter the loop when training, or when the caller opted into running it.
+    train_state = get_train_state()
     if not cfg_container.validation.skip_train or (
-        cfg_container.rl.perform_rl_step and train_state.do_train
+        run_train_loop_without_updates and train_state.do_train
     ):
         if cfg_container.validation.skip_train:
-            print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
+            print_rank_0(
+                'inference-only mode (--skip-train); entering the train loop without updates ...'
+            )
         else:
             print_rank_0('training ...')
 
@@ -2358,7 +2190,7 @@ def pretrain(
                     pg_collection=pg_collection,
                     callback_manager=callback_manager,
                     tensor_metric_observer=tensor_metric_observer,
-                    suppress_microbatch_rampup_handling=cfg_container.rl.rl_use_sequence_packing,
+                    suppress_microbatch_rampup_handling=suppress_microbatch_rampup_handling,
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
@@ -2440,9 +2272,6 @@ def pretrain(
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
-
-    if cfg_container.rl.perform_rl_step:
-        rl_utils.rl_inference_interface_shutdown()
 
     if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
         from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
@@ -3014,7 +2843,7 @@ def setup_model_and_optimizer(
     *,
     cfg_container: PretrainConfigContainer | None = None,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
-    build_optimizer: bool | None = None,
+    skip_train_keeps_optimizer: bool = False,
 ):
     """Setup model and optimizer."""
     # Temporary args/config duplication during the training-loop refactor:
@@ -3027,8 +2856,9 @@ def setup_model_and_optimizer(
 
     cfg = cfg_container if cfg_container is not None else get_run_config()
 
-    if build_optimizer is None:
-        build_optimizer = not cfg.validation.skip_train
+    # No optimizer under --skip-train, unless the entry point keeps one for a loop that runs
+    # without updates (RL inference-only mode may offload it).
+    build_optimizer = not cfg.validation.skip_train or skip_train_keeps_optimizer
     wrap_with_ddp = build_optimizer
 
     if has_nvidia_modelopt:
@@ -4842,14 +4672,18 @@ def train(
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
-    next_train_iterator: callback returning the next iterator to consume.
-    run_eval: callback that runs validation at the eval points.
+    next_train_iterator(iteration, current_iterator): callback returning the iterator to
+        consume this iteration, starting from train_data_iterator; the dataloader path returns
+        current_iterator, a rollout source rebuilds it on its own schedule.
+    run_eval(prefix=, iteration=, verbose=, write_to_tensorboard=): callback that runs
+        validation at the eval points.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
     tensor_metric_observer: optional callback forwarded to each training step.
-    suppress_microbatch_rampup_handling: skip the checkpoint on mid-loop microbatch changes.
+    suppress_microbatch_rampup_handling: skip the automatic checkpoint on mid-loop microbatch
+        changes (for data sources that reconfigure microbatches every iteration).
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
@@ -5715,8 +5549,6 @@ def train(
             wandb_writer.finish()
         ft_integration.shutdown()
         one_logger_utils.finish()
-        if cfg.rl.perform_rl_step:
-            rl_utils.rl_inference_interface_shutdown()
         # This sys.exit() bypasses the rest of pretrain() -- including its normal
         # _end_otel_job_spans() call -- so the open megatron.train interval block (and
         # megatron.startup, if it somehow never closed) would otherwise only get ended

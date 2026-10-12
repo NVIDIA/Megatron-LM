@@ -401,6 +401,9 @@ class PretrainConfigContainer(ConfigContainerBase):
             load_optim=self.checkpoint.load_optim,
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
+            # The rollout deployment (inference shards, model CP) is not a pretrain section;
+            # validate_args checks that rule from the launch arguments.
+            separate_inference_model=None,
         )
         self.scheduler.validate_run(
             train_iters=self.train.train_iters,
