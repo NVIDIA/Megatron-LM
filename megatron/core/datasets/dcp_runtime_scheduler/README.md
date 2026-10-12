@@ -1,0 +1,44 @@
+# CPU-only runtime DCP planning
+
+This package contains the lightweight planner, physical-capacity and rank-row
+contracts, CP/EP forward/backward timeline, and the frozen timing-model kernels
+and parameters. It does not need the external `dcp-scheduler` repository.
+`ORIGIN.json` records the source commit and original hashes. The large attention
+JSON is whitespace-compacted; its decoded parameters are unchanged and its local
+hash is pinned by the loader. Other calibration files retain their original bytes.
+
+The worker runs this package directly by file path, without importing the
+Megatron/PyTorch parent packages. A persistent leader-only CPU process solves one
+batch ahead; the training process owns data reads and distributed calls. The
+solver's time budget is cooperative, not a hard deadline. Late results are waited
+for at consumption. Use `--no-dynamic-cp-runtime-async` for a same-solver control.
+
+Available in-tree models:
+
+- `calibrated_attention`: frozen GB200/GB300 FA core forward/backward formulas.
+  Supply the query/KV heads, head dimension, layer count and measured
+  non-attention times in model options. `allow_provisional=true` is required.
+  Currently restricted to a single NVL72 domain; these core times exclude FA
+  projections, and CUDA-graph/NCCL calibration transferred to eager/native is
+  provisional, not native/eager accuracy evidence.
+- `qwen35_gb200`: the frozen W32/EP4/local16K mixed model with paired FA
+  remainders, GDN and non-attention parameters. It preserves the a55 model and
+  its explicit mixed-stack/padding-transfer limitations, not a general Qwen
+  configuration or a precision guarantee. The global partition must remain
+  contiguous and the tail policy `extend_last` for that recipe.
+
+Example extra flags for a standard-FA NVL72 run (alongside the native DCP,
+varlen, packed-padding and parallelism arguments):
+
+```bash
+--dynamic-cp-runtime-model calibrated_attention \
+--dynamic-cp-runtime-model-options '{"hardware":"gb200","query_heads":32,"kv_heads":4,"head_dim":128,"layer_count":48,"allow_provisional":true}' \
+--dynamic-cp-runtime-solver-options '{"time_budget_s":0.8,"max_scored_candidates":4,"max_guide_candidates":4}'
+```
+
+The Python backend needs no additional numerical packages. To use the optional
+CPU JIT backend, make Numba available in the training environment and add
+`"kernel_backend":"numba"` to model options. No CUDA kernel is launched by these
+predictors. Caller-provided `module:factory` model, solver and historical powers
+baseline hooks remain supported. `--dynamic-cp-runtime-force-powers` bypasses
+the arbitrary search using the configured validated powers-only baseline.

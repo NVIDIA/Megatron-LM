@@ -1,0 +1,669 @@
+{
+ "extracted_from": {
+  "file": "ring_bwd.json",
+  "keys": [
+   "served",
+   "stage",
+   "inputs"
+  ],
+  "sha256": "ffd18e5f13092cfce8a15386894e17c5918f50835914972ffde60ed00071df12"
+ },
+ "inputs": {
+  "cards": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g5-gb300-structural/phase2/downloads/results/clock_cards",
+  "clock_law": "two_term",
+  "cp1_form": "F5b-1+jmax",
+  "cp1_model": "G5/phase2/served/fits/pending_bwd_gb300/cp1_model_f5b1_jmax_bwd_f0.json",
+  "cp1_model_sha256": "a8e57f156beae6283000802b9e3268340455d26ad5cb44b8acbaad47cadcff8e",
+  "n_admitted": 108,
+  "n_cells": 18,
+  "n_packs": 108,
+  "nsys_cells_traced": [
+   "qwen3_30b p4096 cp8",
+   "qwen3_30b p8192 cp4",
+   "qwen3_30b p16384 cp4",
+   "qwen3_30b p16384 cp8",
+   "qwen3_30b p16384 cp16",
+   "qwen3_5_397b p4096 cp2",
+   "qwen3_5_397b p8192 cp16",
+   "qwen3_5_397b p16384 cp2",
+   "qwen3_5_397b p16384 cp4",
+   "qwen3_5_397b p16384 cp8",
+   "qwen3_5_397b p16384 cp16",
+   "llama3_70b p4096 cp4",
+   "llama3_70b p4096 cp8",
+   "llama3_70b p8192 cp2",
+   "llama3_70b p8192 cp8",
+   "llama3_70b p16384 cp4",
+   "llama3_70b p16384 cp8",
+   "llama3_70b p16384 cp16"
+  ],
+  "ograph": "G5/phase2/served/fits/pending_bwd_gb300/ograph_bwd.json",
+  "read_root": "ring_bwd_nsys_gb300",
+  "s_bwd": 0.664,
+  "structural_constants": {
+   "K_call_by_head_dim": {
+    "128": 1,
+    "256": 3
+   },
+   "P_bwd_by_head_dim": {
+    "128": 152,
+    "256": 76
+   },
+   "R_bwd_rows": 128,
+   "provenance": {
+    "K_call_by_head_dim": "read",
+    "O_graph_bwd": "read",
+    "P_bwd_by_head_dim": "read",
+    "R_bwd_rows": "read",
+    "R_bwd_rows_by_head_dim": "read",
+    "helper_terms_alternatives": "read",
+    "helper_terms_by_head_dim": "read",
+    "roles": "read",
+    "s_bwd": "default",
+    "static_bwd_us_per_sequence_by_head_dim": "default"
+   }
+  }
+ },
+ "served": {
+  "W0": {
+   "cp2_sequential_sendrecv": {
+    "latency_us": 59.80678058,
+    "us_per_byte": 4.345244794e-06
+   },
+   "cp4_concurrent_intra_node": {
+    "latency_us": 31.06524344,
+    "us_per_byte": 2.131320826e-06
+   },
+   "nvl72_domain": {
+    "latency_us": 27.36987535,
+    "us_per_byte": 1.576545231e-06
+   }
+  },
+  "X": {
+   "kappa": 0.07011780736,
+   "x0_us": 16.87743276
+  },
+  "clock": {
+   "ceiling_mhz": 1845.0,
+   "helpers_clock_following": true,
+   "law": {
+    "formula": "k(f) = tile f0/f + (1 - lambda) C f0/f + lambda C; tile = tau x chain tiles (+ tau_jmax J_max), C = k0 + b_S S + tau rho n_chain + static(n) (U excluded)",
+    "kind": "structural",
+    "lambda": 0.5757,
+    "lambda_provisional": false,
+    "lambda_se": 0.031,
+    "lambda_source": "analyst file clock_law_lambda_bwd.json (sha 6373bcc19f20): PRIOR-served (BG2.2): GB200 B6.1 lambda 0.5757 +- 0.031 (analyst file clock_law_lambda_bwd.json under BD pending_bwd, sha 04bb764385f0); the GB300 reads (card-clock 0.356 / implied-clock 0.012) are recorded alternatives in clock_law_lambda_bwd_gb300.json; re-read and replaced by amendment if a later GB300 lane gives two MEASURED clocks with a lever >= 10 %"
+   },
+   "quantity": "attention_phase_group_median",
+   "text": "PB B6 + B7: every backward kernel entry under the structural law at the MEDIAN over the CP group's ranks of the card's attention-phase clock (uniform; the max-rank rule picks the critical rank by work); CP1 rows at the CP1 lane's own attention clock; per-rank / heater clocks and one-s / c-law / alpha-1 laws are frozen alternatives; attention readings >= 1.8 GHz flagged clock_ceiling"
+  },
+  "clock_law": "two_term",
+  "f0_mhz": 1800.0,
+  "glue": {
+   "accumulate": {
+    "a0_us": 10.12232706,
+    "a_us_per_MiB_kv": 0.6488085992,
+    "fit": {
+     "bias": -15.337,
+     "max": 106.353,
+     "med": 46.81,
+     "n": 8280,
+     "p90": 73.431,
+     "wape": 42.143
+    },
+    "median_us": 20.24,
+    "pinned_at_zero": [],
+    "se": [
+     0.3062123497,
+     0.01381668321
+    ],
+    "with_q_term": {
+     "a0_us": 9.846947409,
+     "a_us_per_MiB_kv": 0.6411260305,
+     "a_us_per_MiB_q": 0.004436436792,
+     "fit": {
+      "bias": -14.959,
+      "max": 108.06,
+      "med": 46.781,
+      "n": 8280,
+      "p90": 75.789,
+      "wape": 42.55
+     }
+    }
+   },
+   "clock_treatment": {
+    "helpers": "follow the clock with the kernel (x f0/f; tile-like, PB B6 (ii))",
+    "prep_accumulate_memset_copy": "clock-independent, served as read at the trace clock (PB B6 (ii))"
+   },
+   "copy": {
+    "c0_us": 1.341733828,
+    "c_us_per_MiB_bytes": 0.0,
+    "fit": {
+     "bias": -92.455,
+     "max": 98.282,
+     "med": 89.897,
+     "n": 828,
+     "p90": 94.364,
+     "wape": 92.455
+    },
+    "median_us": 0.0,
+    "pinned_at_zero": [
+     1
+    ],
+    "se": [
+     0.05568087806,
+     null
+    ]
+   },
+   "cp1_prep_coef": {
+    "o0_us": 50.60575036,
+    "o_kv_us_per_token": 0.001273274517,
+    "o_n_us_per_sequence": 0.0,
+    "o_q_us_per_token": 0.001329566689
+   },
+   "form": "class_direct",
+   "helpers": {
+    "by_head_dim": {
+     "128": {
+      "H_kv": {
+       "class": "bwd_helper_kv",
+       "coef": {
+        "c_n_us_per_sequence": 0.1534846351,
+        "c_us_per_head_token": 0.0007217035742,
+        "h0_us": 18.4072559
+       },
+       "form": "head_token",
+       "p90_ape": 16.983,
+       "rows": "ACTIVE (q_active | kv_active) x heads (diagnostic alternative)",
+       "wape": 7.362
+      },
+      "H_q": {
+       "class": "bwd_helper_q",
+       "coef": {
+        "c_n_us_per_sequence": 0.2821284006,
+        "c_us_per_head_token": 0.0003986992989,
+        "h0_us": 15.22130574
+       },
+       "form": "head_token",
+       "p90_ape": 5.411,
+       "rows": "ACTIVE (q_active | kv_active) x heads (diagnostic alternative)",
+       "wape": 2.613
+      }
+     },
+     "256": {
+      "H_kv": {
+       "class": "bwd_helper_kv",
+       "coef": {
+        "c_n_us_per_sequence": 0.01892836445,
+        "c_us_per_head_token": 0.002332091445,
+        "h0_us": 24.16776154
+       },
+       "form": "head_token",
+       "p90_ape": 16.994,
+       "rows": "ACTIVE (q_active | kv_active) x heads (diagnostic alternative)",
+       "wape": 7.44
+      },
+      "H_q": {
+       "class": "bwd_helper_q",
+       "coef": {
+        "c_n_us_per_sequence": 0.1179646579,
+        "c_us_per_head_token": 0.00042544598,
+        "h0_us": 6.475298251
+       },
+       "form": "head_token",
+       "p90_ape": 5.084,
+       "rows": "ACTIVE (q_active | kv_active) x heads (diagnostic alternative)",
+       "wape": 2.461
+      }
+     }
+    },
+    "by_head_dim_active_tokens": {
+     "128": {
+      "H_kv": {
+       "class": "bwd_helper_kv",
+       "coef": {
+        "c_n_us_per_sequence": 0.1534846351,
+        "c_us_per_head_token": 0.0007217035742,
+        "h0_us": 18.4072559
+       },
+       "form": "head_token",
+       "p90_ape": 16.983,
+       "rows": "ACTIVE (q_active | kv_active) x heads (diagnostic alternative)",
+       "wape": 7.362
+      },
+      "H_q": {
+       "class": "bwd_helper_q",
+       "coef": {
+        "c_n_us_per_sequence": 0.2821284006,
+        "c_us_per_head_token": 0.0003986992989,
+        "h0_us": 15.22130574
+       },
+       "form": "head_token",
+       "p90_ape": 5.411,
+       "rows": "ACTIVE (q_active | kv_active) x heads (diagnostic alternative)",
+       "wape": 2.613
+      }
+     },
+     "256": {
+      "H_kv": {
+       "class": "bwd_helper_kv",
+       "coef": {
+        "c_n_us_per_sequence": 0.01892836445,
+        "c_us_per_head_token": 0.002332091445,
+        "h0_us": 24.16776154
+       },
+       "form": "head_token",
+       "p90_ape": 16.994,
+       "rows": "ACTIVE (q_active | kv_active) x heads (diagnostic alternative)",
+       "wape": 7.44
+      },
+      "H_q": {
+       "class": "bwd_helper_q",
+       "coef": {
+        "c_n_us_per_sequence": 0.1179646579,
+        "c_us_per_head_token": 0.00042544598,
+        "h0_us": 6.475298251
+       },
+       "form": "head_token",
+       "p90_ape": 5.084,
+       "rows": "ACTIVE (q_active | kv_active) x heads (diagnostic alternative)",
+       "wape": 2.461
+      }
+     }
+    },
+    "by_head_dim_physical_rows": {
+     "128": {
+      "H_kv": {
+       "class": "bwd_helper_kv",
+       "coef": {
+        "c_n_us_per_sequence": 0.1554009209,
+        "c_us_per_head_token": 0.0005228476112,
+        "h0_us": 18.21711294
+       },
+       "form": "head_token",
+       "p90_ape": 23.516,
+       "rows": "physical (q_phys | kv_phys) x heads",
+       "se": [
+        0.1969261203,
+        3.377500807e-06,
+        0.005552644208
+       ],
+       "wape": 16.272
+      },
+      "H_q": {
+       "class": "bwd_helper_q",
+       "coef": {
+        "c_n_us_per_sequence": 0.2442829095,
+        "c_us_per_head_token": 0.000291259927,
+        "h0_us": 14.70163364
+       },
+       "form": "head_token",
+       "p90_ape": 33.742,
+       "rows": "physical (q_phys | kv_phys) x heads",
+       "se": [
+        0.7769007065,
+        1.758615953e-06,
+        0.02196866168
+       ],
+       "wape": 21.982
+      }
+     },
+     "256": {
+      "H_kv": {
+       "class": "bwd_helper_kv",
+       "coef": {
+        "c_n_us_per_sequence": 0.04551369193,
+        "c_us_per_head_token": 0.001816622914,
+        "h0_us": 21.39237527
+       },
+       "form": "head_token",
+       "p90_ape": 29.984,
+       "rows": "physical (q_phys | kv_phys) x heads",
+       "se": [
+        0.4053067155,
+        2.027068348e-05,
+        0.008542575934
+       ],
+       "wape": 17.326
+      },
+      "H_q": {
+       "class": "bwd_helper_q",
+       "coef": {
+        "c_n_us_per_sequence": 0.1261419788,
+        "c_us_per_head_token": 0.0003284922024,
+        "h0_us": 1.260763323
+       },
+       "form": "head_token",
+       "p90_ape": 40.224,
+       "rows": "physical (q_phys | kv_phys) x heads",
+       "se": [
+        1.031408381,
+        3.242077002e-06,
+        0.02157734659
+       ],
+       "wape": 22.764
+      }
+     }
+    },
+    "cp1_reference": {
+     "128": {
+      "H_kv": {
+       "as_traced": {
+        "coef": {
+         "c_n_us_per_sequence": 0.2555895204,
+         "c_us_per_head_token": 0.0007672729318,
+         "h0_us": 18.53210029
+        },
+        "form": "head_token",
+        "note": "no clock normalization (the run-3 by_class convention)",
+        "wape": 2.798
+       },
+       "as_two_term_heater": {
+        "coef": {
+         "c_n_us_per_sequence": 0.2635953337,
+         "c_us_per_head_token": 0.0006872700394,
+         "h0_us": 17.29468382
+        },
+        "form": "head_token",
+        "note": "the B4 convention: two-term law at the heater f_crit",
+        "wape": 3.168
+       },
+       "bias": 0.0,
+       "class": "bwd_helper_kv",
+       "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+       "coef": {
+        "c_n_us_per_sequence": 0.267046463,
+        "c_us_per_head_token": 0.0006502378227,
+        "h0_us": 16.68676522
+       },
+       "form": "head_token",
+       "kernel_names": "fmha_reduce_head_ragged (x2 per call)",
+       "n_packs": 232,
+       "p90_ape": 8.059,
+       "rmse_us": 1.907403348,
+       "share_of_window": 0.04678064081,
+       "sum_us_at_f0": 8642.878661,
+       "wape": 3.692
+      },
+      "H_q": {
+       "as_traced": {
+        "coef": {
+         "c_n_us_per_sequence": 0.1556811597,
+         "c_us_per_head_token": 0.000457634229,
+         "h0_us": 17.17981835
+        },
+        "form": "head_token",
+        "note": "no clock normalization (the run-3 by_class convention)",
+        "wape": 5.016
+       },
+       "as_two_term_heater": {
+        "coef": {
+         "c_n_us_per_sequence": 0.2327621886,
+         "c_us_per_head_token": 0.0004123969643,
+         "h0_us": 16.50030479
+        },
+        "form": "head_token",
+        "note": "the B4 convention: two-term law at the heater f_crit",
+        "wape": 5.114
+       },
+       "bias": -0.0,
+       "class": "bwd_helper_q",
+       "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+       "coef": {
+        "c_n_us_per_sequence": 0.2772470294,
+        "c_us_per_head_token": 0.0003913561564,
+        "h0_us": 16.07327584
+       },
+       "form": "head_token",
+       "kernel_names": "compute_dot_do_o_ragged_specialized + convert_dq_to_16bits_ragged (d128 plan; d256: compute_dot_do_o only)",
+       "n_packs": 232,
+       "p90_ape": 24.185,
+       "rmse_us": 18.05451167,
+       "share_of_window": 0.1318613563,
+       "sum_us_at_f0": 24361.82323,
+       "wape": 5.63
+      },
+      "form": "head_token",
+      "geometries": [
+       "llama3_70b",
+       "qwen3_30b"
+      ],
+      "n_packs": 232
+     },
+     "256": {
+      "H_kv": {
+       "as_traced": {
+        "coef": {
+         "c_n_us_per_sequence": 0.1870008498,
+         "c_us_per_head_token": 0.002627060031,
+         "h0_us": 18.86074807
+        },
+        "form": "head_token",
+        "note": "no clock normalization (the run-3 by_class convention)",
+        "wape": 3.308
+       },
+       "as_two_term_heater": {
+        "coef": {
+         "c_n_us_per_sequence": 0.1971327976,
+         "c_us_per_head_token": 0.002339606468,
+         "h0_us": 17.59486337
+        },
+        "form": "head_token",
+        "note": "the B4 convention: two-term law at the heater f_crit",
+        "wape": 3.207
+       },
+       "bias": 0.0,
+       "class": "bwd_helper_kv",
+       "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+       "coef": {
+        "c_n_us_per_sequence": 0.2065962475,
+        "c_us_per_head_token": 0.002201049127,
+        "h0_us": 17.22248262
+       },
+       "form": "head_token",
+       "kernel_names": "fmha_reduce_head_ragged (x2 per call)",
+       "n_packs": 116,
+       "p90_ape": 10.19,
+       "rmse_us": 2.108361867,
+       "share_of_window": 0.03582318397,
+       "sum_us_at_f0": 4554.489044,
+       "wape": 3.914
+      },
+      "H_q": {
+       "as_traced": {
+        "coef": {
+         "c_n_us_per_sequence": 0.0659684154,
+         "c_us_per_head_token": 0.0004925323566,
+         "h0_us": 5.878719802
+        },
+        "form": "head_token",
+        "note": "no clock normalization (the run-3 by_class convention)",
+        "wape": 2.13
+       },
+       "as_two_term_heater": {
+        "coef": {
+         "c_n_us_per_sequence": 0.1107738223,
+         "c_us_per_head_token": 0.0004430129869,
+         "h0_us": 5.741824939
+        },
+        "form": "head_token",
+        "note": "the B4 convention: two-term law at the heater f_crit",
+        "wape": 2.386
+       },
+       "bias": -0.0,
+       "class": "bwd_helper_q",
+       "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+       "coef": {
+        "c_n_us_per_sequence": 0.1359104971,
+        "c_us_per_head_token": 0.0004200220031,
+        "h0_us": 5.892748868
+       },
+       "form": "head_token",
+       "kernel_names": "compute_dot_do_o_ragged_specialized + convert_dq_to_16bits_ragged (d128 plan; d256: compute_dot_do_o only)",
+       "n_packs": 116,
+       "p90_ape": 37.373,
+       "rmse_us": 2.952328222,
+       "share_of_window": 0.06273293748,
+       "sum_us_at_f0": 7975.742097,
+       "wape": 2.952
+      },
+      "form": "head_token",
+      "geometries": [
+       "qwen3_5_397b"
+      ],
+      "n_packs": 116
+     }
+    },
+    "mode": "active_tokens",
+    "rule": "PB B5.1: the B4.1 head-token helper terms on the step's ACTIVE (q, kv) tokens (the ring helpers are the CP1 helpers); physical rows = frozen alternative",
+    "shard_test": {
+     "128": {
+      "H_kv": {
+       "c_active": 0.0007217035742,
+       "c_physical": 0.0005228476112,
+       "cp1_B4_1_c_us_per_head_token": 0.0006502378227,
+       "cp1_B4_1_h0_us": 16.68676522,
+       "cp1_constants_on_physical_rows_bias": 12.065,
+       "cp1_constants_on_physical_rows_wape": 16.574,
+       "ring_h0_us": 18.21711294,
+       "ring_over_cp1_c": 0.8040867401,
+       "scales_with_shard": false,
+       "wape_active_tokens": 7.362,
+       "wape_physical_rows": 16.272
+      },
+      "H_q": {
+       "c_active": 0.0003986992989,
+       "c_physical": 0.000291259927,
+       "cp1_B4_1_c_us_per_head_token": 0.0003913561564,
+       "cp1_B4_1_h0_us": 16.07327584,
+       "cp1_constants_on_physical_rows_bias": 25.476,
+       "cp1_constants_on_physical_rows_wape": 26.437,
+       "ring_h0_us": 14.70163364,
+       "ring_over_cp1_c": 0.7442323885,
+       "scales_with_shard": false,
+       "wape_active_tokens": 2.613,
+       "wape_physical_rows": 21.982
+      }
+     },
+     "256": {
+      "H_kv": {
+       "c_active": 0.002332091445,
+       "c_physical": 0.001816622914,
+       "cp1_B4_1_c_us_per_head_token": 0.002201049127,
+       "cp1_B4_1_h0_us": 17.22248262,
+       "cp1_constants_on_physical_rows_bias": 7.574,
+       "cp1_constants_on_physical_rows_wape": 16.858,
+       "ring_h0_us": 21.39237527,
+       "ring_over_cp1_c": 0.8253441016,
+       "scales_with_shard": false,
+       "wape_active_tokens": 7.44,
+       "wape_physical_rows": 17.326
+      },
+      "H_q": {
+       "c_active": 0.00042544598,
+       "c_physical": 0.0003284922024,
+       "cp1_B4_1_c_us_per_head_token": 0.0004200220031,
+       "cp1_B4_1_h0_us": 5.892748868,
+       "cp1_constants_on_physical_rows_bias": 26.198,
+       "cp1_constants_on_physical_rows_wape": 27.092,
+       "ring_h0_us": 1.260763323,
+       "ring_over_cp1_c": 0.7820833194,
+       "scales_with_shard": false,
+       "wape_active_tokens": 2.461,
+       "wape_physical_rows": 22.764
+      }
+     }
+    }
+   },
+   "memset_us": 2.88,
+   "prep": {
+    "fit": {
+     "bias": -3.194,
+     "max": 840.223,
+     "med": 14.397,
+     "n": 9000,
+     "p90": 69.02,
+     "wape": 20.027
+    },
+    "median_us": 149.224,
+    "p0_us": 39.18612586,
+    "p_kv_us_per_MiB_kv": 2.639446639,
+    "p_n_us_per_piece": 0.06979351862,
+    "p_q_us_per_MiB_q": 0.3594504472,
+    "pinned_at_zero": [],
+    "se": [
+     0.8470378675,
+     0.006320376248,
+     0.03146307023,
+     0.02021362355
+    ]
+   },
+   "prep_double_counting": {
+    "cp1_prep_coef": {
+     "o0_us": 50.60575036,
+     "o_kv_us_per_token": 0.001273274517,
+     "o_n_us_per_sequence": 0.0,
+     "o_q_us_per_token": 0.001329566689
+    },
+    "rule": "PB B7 (ii): the ring step is a fused_attn_bwd call like the CP1 one whose k0 now carries the CP1 call's prep; the class-direct ring prep is served only if the 108 comm walls support it (lowest WAPE among class_direct | none | excess_over_cp1); the others are frozen alternatives",
+    "served_mode": "class_direct",
+    "test": {
+     "class_direct": {
+      "bias": 0.951,
+      "cells_pass": 11,
+      "n_cells": 18,
+      "p90": 13.576,
+      "wape": 2.584
+     },
+     "excess_over_cp1": {
+      "bias": -2.315,
+      "cells_pass": 13,
+      "n_cells": 18,
+      "p90": 8.612,
+      "wape": 2.679
+     },
+     "none": {
+      "bias": -6.077,
+      "cells_pass": 0,
+      "n_cells": 18,
+      "p90": 19.637,
+      "wape": 6.089
+     }
+    }
+   },
+   "prep_mode": "class_direct",
+   "scaled": false
+  },
+  "kernel_scale": 1.0,
+  "kernel_scale_rule": {
+   "band_rule_would_serve": 0.8734138708,
+   "note": "rule 1 compares the traced bprop kernel sums with the step entries; under u_treatment none the entry carries the CP1 call's non-helper glue (k0 + b_S S), so the bprop-only numerator reads below 1 by that share - recorded, not served (B7 (iii)); the band rule's scale is the alternative scale_gresid",
+   "rule1_g_resid_bwd": 0.8734138708,
+   "rule1_inside_band": false,
+   "rule1_long_median": 0.9852597551,
+   "rule1_short_median": 0.8279793795,
+   "served_by": "PB B7 (iii): scale 1 served as written"
+  },
+  "pre": {
+   "p0_us": 18.98837433,
+   "p_kv_us_per_MiB": 1.765740379,
+   "p_q_us_per_MiB": -0.1976928899,
+   "served": true
+  },
+  "remainder": {
+   "dkv_share": 0.0,
+   "note": "PB B5 (iii): H1 holds on the comm traces - no remainder term",
+   "served": false
+  },
+  "s_bwd": 0.664,
+  "structure_of_cp": {
+   "16": "nvl72_domain",
+   "2": "cp2_sequential_sendrecv",
+   "32": "nvl72_domain",
+   "4": "cp4_concurrent_intra_node",
+   "8": "nvl72_domain"
+  },
+  "text": "S4-bwd served (PB B5 (iii)-(iv) + B5.1 + B6): W0 per class (timed comm_only, as read); glue class-direct on the comm traces (prep + B4.1 helpers on the ACTIVE tokens + accumulate per dKV MiB + memset + copy; helpers follow the clock, the rest clock-independent); X = x0 + kappa sum W0 from the exposed exchange on the comm traces (H1 False); pre served; kernel entries under the structural law (lambda 0.5757) at the CP group's median attention-phase clock; kernel scale 0.8734138708146022"
+ },
+ "stage": "WP-G3B ring layer S4-bwd read (PREREGISTRATION_BWD.md 3.2 rules 1-5 under PB B5: comm-trace class-direct glue, direct X, attention-phase clocks)"
+}

@@ -1,0 +1,357 @@
+{
+ "alignment": 128,
+ "clock": {
+  "alpha": 1.0,
+  "f0_mhz": 1600.0,
+  "kernel_law": {
+   "formula": "k(f) = tile f0/f + (1 - lambda) C f0/f + lambda C; tile = tau x chain tiles (+ tau_jmax J_max), C = k0 + b_S S + tau rho n_chain + static(n) (U excluded)",
+   "kind": "structural",
+   "lambda": 0.5757132463,
+   "lambda_provisional": false,
+   "lambda_se": 0.03083065088,
+   "lambda_source": "analyst file clock_law_lambda_bwd.json (sha 04bb764385f0):"
+  },
+  "law": "alpha",
+  "note": "PB B6 / B10.2: the ring block's structural law pre-splits every kernel entry (tile + (1 - lambda) C scaled under alpha 1, lambda C unscaled); the kernel clock = the CP group's median attention-phase clock (D2 (i)); readings >= 1750 MHz FLAGGED (B11.1), never corrected",
+  "quantity": "attention_phase_group_median",
+  "s": null
+ },
+ "clock_input": {
+  "alpha": 1.0,
+  "amendment": "PREREGISTRATION_BWD.md 3.3 / B6 (iii) / B10.2 / B11.1",
+  "card_mode_expected": "minimal",
+  "card_tree": "results/clock_cards/hold_f_bwd2/<SLURM_JOB_NAME>_<SLURM_JOB_ID>/<geometry>/p<S>/cp<N>/clock_card.json (+ anchor_f_bwd2/)",
+  "extractor": "code/tools/clock_card_extract_v2.py",
+  "f0_mhz": 1600.0,
+  "f_crit_rule": "the kernel clock of a sealed row = the MEDIAN over the CP group's ranks of the card's attention-phase clock (D2 (i)); the heater f_crit is recorded; CP1 rows: the lane's own attention-phase clock",
+  "fallback": "fail",
+  "flag_rule": "B11.1: rows whose group-median attention clock is >= 1750 MHz are FLAGGED in the verdict (not corrected); the per-rank-attention and B11 fields are scored alongside",
+  "kernel_law": {
+   "formula": "k(f) = tile f0/f + (1 - lambda) C f0/f + lambda C; tile = tau x chain tiles (+ tau_jmax J_max), C = k0 + b_S S + tau rho n_chain + static(n) (U excluded)",
+   "kind": "structural",
+   "lambda": 0.5757132463,
+   "lambda_provisional": false,
+   "lambda_se": 0.03083065088,
+   "lambda_source": "analyst file clock_law_lambda_bwd.json (sha 04bb764385f0):"
+  },
+  "law": "alpha",
+  "phase": "attention",
+  "quantity": "attention_phase_group_median",
+  "scorer_rule": "score_holdout_bwd.py --clock-cards: joins the card per row, takes the field's clock quantity from its split (group median | per-rank attention | B11), applies kernel_f0 x (f0 / f) + ring (the structural law's split), served_f0 alongside",
+  "source": "clock_card",
+  "two_term_s": 0.664,
+  "two_term_s_source": "hardware profile clock.two_term_s_bwd (B1.1 (report 01b, 2026-10-06): least squares on the log ratios of the 96 kernel-level NOCOMM flash_bprop pairs of probe B1 (hsg 7756270, llama3_70b-p4096-cp4, arm a duty 19 ~1465 MHz vs arm d light ~1938 MHz per rank, same kernel / rank / backward step); s_bwd = 0.664 +- 0.015 at f0_bwd = 1600 MHz; comm + nocomm 0.724; LS alpha 0.65 (reader alpha_kernel 0.764); one d128 cell, one clock lever - the d256 reading is open (no light nsys arm on qwen3_5_397b 16K))"
+ },
+ "composer": "r2 (compose_bwd_r2_lib.BwdComposerR2 on the round-1 model + ring block)",
+ "extracted_from": {
+  "bwd2_config_applied.json": "29dfb98c0a23689301909136219390dcd5b2ad83679430d469e49e8866e26b66",
+  "served_f_bwd2.json": "02b01a87503ae2b063c5775de80aee235ab96767676ebb1ca20306db28b0e504",
+  "served_h_bwd2.json": "ff6eed5377354d200b0e5492d7035645ec0b4c5233ce848c322d6b9dc3d1f52a"
+ },
+ "freeze": {
+  "FREEZE_F_BWD2": {
+   "amendments": [
+    "B0.1",
+    "B0.2",
+    "B1",
+    "B1.1 (K_call / class table / s_bwd pin)",
+    "B2 (clock state; (ii) h_bwd grid = the forward h_ph3 / h_ph4 lengths in a new seeded order - covers h_grid_deviation)",
+    "B3 (structural constants pin)",
+    "B4 / B4.1 (form selection; head-token helper terms)",
+    "B5 / B5.1 (class-direct glue, X, active-token helpers)",
+    "B6 (structural clock law at the group-median attention clock)",
+    "B7 (CP1 fit without U; ring entry tile + k0 + b_S q_phys + tau rho n_chain + static(n); scale 1)",
+    "B7.1 (helper-normalization correction; scale 1 served; class-direct prep; the FREEZE basis = run 8)",
+    "B8 / B8.2 / B8.4 (sealed-stage harness rules)",
+    "B9 (round-2 diagnosis)",
+    "B10 (round-2 pre-registration: decisions D1-D8)",
+    "B10.1 (outcomes; decisions (1)-(3))",
+    "B10.2 ((a) X = cp x g0(head_dim), (b) no tail term, (c) per-geometry shares with the known-limit text, (d) static once; >= 1750 MHz flagged)",
+    "B11 (the clock-quantity read on the two allocations)",
+    "B11.1 (B10.2 served as round 2; the d256 16K cp16 under-prediction a declared known limit; per-rank attention carried as a frozen alternative)"
+   ],
+   "installed": {
+    "amendment": "PREREGISTRATION_BWD.md B12 (the round-2 freeze enacted as the pre-registered default after the consultation)",
+    "checks": {
+     "anchor_keys_direct": true,
+     "determinism_byte_identical": true,
+     "draft_sha256": "4174fecb409a726da895b52ebb59dcfdd52f486f4cbee56e529f988c4ada645a",
+     "every_record_has_split": true,
+     "job_table_equals_dry_render": true,
+     "n_cells": 45,
+     "n_records": 675,
+     "predictions_sha_equals_pin": true,
+     "served_config_sha_equals_pin": true
+    },
+    "date": "2026-10-08",
+    "draft_sha256": "4174fecb409a726da895b52ebb59dcfdd52f486f4cbee56e529f988c4ada645a",
+    "from_draft": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/round2_real/freeze_bwd2/FREEZE_F_BWD2",
+    "job_table_rendered": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/round2_real/job_table_bwd2_dry.json",
+    "note": "the FREEZE pin = sha256 of THIS file; the sealed jobs' prologues log WPG3_FREEZE_F_BWD2_SHA256 and the scorer refuses a predictions file whose sha differs from predictions_sha256",
+    "predictions_json": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/hold_f_bwd2_predictions/predictions.json",
+    "predictions_sha256": "8adb42e6efbeb80dd6c0eabea46168bc7e4fb358e70e3bc5220d4ae91fd1026d",
+    "served_config": "../served/configs/served_f_bwd2.json",
+    "served_config_sha256": "02b01a87503ae2b063c5775de80aee235ab96767676ebb1ca20306db28b0e504",
+    "tool": "BD/phase2/tools/install_freeze_bwd2.py",
+    "tool_sha256": "df6b4a6b21af394bcccab8b97efe74c2de6305737582840c4ace4af0665dda5a",
+    "utc": "2026-10-07T17:24:15Z"
+   },
+   "known_limits": [
+    "d256 16K cp16 under-prediction under the served clock quantity (-11 / -15 % on the two round-2 allocations; B11.1)",
+    "per-geometry shares without a mechanism (B10.2 (c))",
+    "the d256 CP1 P90 (period-4 wave quantization)"
+   ],
+   "predictions_sha256": "8adb42e6efbeb80dd6c0eabea46168bc7e4fb358e70e3bc5220d4ae91fd1026d",
+   "round2": {
+    "clock_quantity": "attention_phase_group_median (D2 (i); B11.1: readings >= 1750 MHz flagged, never corrected)",
+    "compose_record": {
+     "path": "../served/fits/pending_bwd/round2_real/compose_bwd_r2.json",
+     "rel": "BD/phase2/served/fits/pending_bwd/round2_real/compose_bwd_r2.json",
+     "sha256": "fa6e36f649e2cfb8b305a9ae292c79c65228f40f9015335747faa1a5f1a59780"
+    },
+    "cp1_refit_round1_reproduced": {
+     "identical_within_1e-9": true,
+     "max_abs_coefficient_difference_ms": 4.967061484e-12,
+     "note": "cp1_target wall_minus_H: the same rows, H variant, law and estimator as round 1 -> the round-1 coefficients must come back"
+    },
+    "cp1_target": "wall_minus_H",
+    "known_limits": [
+     "d256 16K cp16 under-prediction under the served clock quantity (-11 / -15 % on the two round-2 allocations; B11.1)",
+     "per-geometry shares without a mechanism (B10.2 (c))",
+     "the d256 CP1 P90 (period-4 wave quantization)"
+    ],
+    "shares_by_geometry": {
+     "llama3_70b": 0.3998038979,
+     "qwen3_30b": 0.9168873725,
+     "qwen3_5_397b": 0.9517138407
+    },
+    "shares_known_limit": "PB B10.2 (c) / B11: the per-step shares of the shared constants (k0, b_S q_phys, tau rho n_chain) are served as per-(hardware, geometry) CONSTANTS without a mechanism: the per-term read on the 2c-R2-cov cells (23_diag_b10_lanes.md) found the share NOT a geometry property (within-geometry spread over the families 0.16-0.52) and the term paid short differing by geometry; the kv-head ordering of the pooled shares (2 -> 0.91, 4 -> 0.59, 8 -> 0.36) is a 3-point ordering, not evidence - a KNOWN LIMIT of the round-2 model",
+    "shares_mode": "NOT converged (spread 0.552 > 0.15): per-geometry shares (B10 D1 (i) SHARED rule: per-geometry constants of the same form)",
+    "shares_source": {
+     "path": "../served/fits/pending_bwd/round2_real/share_bwd_r2.json",
+     "rel": "BD/phase2/served/fits/pending_bwd/round2_real/share_bwd_r2.json",
+     "sha256": "2c8427ff9a42baa5c956dd179170a814efbc663ea8eba491a1938dd53e55e58a"
+    },
+    "static": "once per pack (static(n_pack); B10.2 (d))",
+    "tail": "not a term (B10.2 (b))",
+    "x_form": {
+     "form": "per_step_g0_by_head_dim",
+     "g0_by_head_dim": {
+      "128": 28.0,
+      "256": 36.8
+     },
+     "g0_pooled_us": 28.888
+    },
+    "x_g0_alternative": {
+     "g0_by_head_dim": {
+      "128": 28.032,
+      "256": 36.312
+     },
+     "source": "x_structure_bwd.json of the served run (round-1 + cov + d256 lanes); the frozen alternative setting r2_x_g0_served_run"
+    },
+    "x_g0_source": "--x-g0 pin (B10.2 (a) / B11: g0 d256 from the two 16K cp16 allocations)",
+    "x_source": {
+     "path": "../served/fits/pending_bwd/round2_real/x_structure_bwd.json",
+     "rel": "BD/phase2/served/fits/pending_bwd/round2_real/x_structure_bwd.json",
+     "sha256": "a90af15801346e25653b7d563bdfb7f43d8d01ac628311659a818b032b43a8c5"
+    }
+   },
+   "served_backward_model_keys": [
+    "clock_input",
+    "composition_by_lane_group",
+    "composition_calibration",
+    "composition_scores",
+    "cp1_form",
+    "formcand_gates",
+    "ring_layer",
+    "round2",
+    "scorer_clock_correction",
+    "split_in_records",
+    "structural_constants"
+   ],
+   "sha256": "4fc5732e9f33acc49908d3cda0fbd07e972c4dbd943cbc9e48727f3d8a4c40d7",
+   "utc": "2026-10-07T16:50:35Z"
+  },
+  "FREEZE_H_BWD2": {
+   "installed": {
+    "amendment": "PREREGISTRATION_BWD.md B12 (the round-2 freeze enacted as the pre-registered default after the consultation)",
+    "checks": {
+     "anchor_keys_direct": true,
+     "determinism_byte_identical": true,
+     "draft_sha256": "51e9c4c73514138065a1c89f51020a259b4876737ea71f9806dff3784e1b986d",
+     "every_record_has_split": true,
+     "job_table_equals_dry_render": true,
+     "n_cells": 24,
+     "n_records": 1176,
+     "predictions_sha_equals_pin": true,
+     "served_config_sha_equals_pin": true
+    },
+    "date": "2026-10-08",
+    "draft_sha256": "51e9c4c73514138065a1c89f51020a259b4876737ea71f9806dff3784e1b986d",
+    "from_draft": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/round2_real/freeze_bwd2/FREEZE_H_BWD2",
+    "job_table_rendered": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/round2_real/job_table_bwd2_dry.json",
+    "note": "the FREEZE pin = sha256 of THIS file; the sealed jobs' prologues log WPG3_FREEZE_H_BWD2_SHA256 and the scorer refuses a predictions file whose sha differs from predictions_sha256",
+    "predictions_json": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/hold_h_bwd2_predictions/predictions.json",
+    "predictions_sha256": "32eb7e2cf329ae8d08b7a472bfb9a5f5c7dacf88bbe906589d70c4646e5a4ed5",
+    "served_config": "../served/configs/served_h_bwd2.json",
+    "served_config_sha256": "ff6eed5377354d200b0e5492d7035645ec0b4c5233ce848c322d6b9dc3d1f52a",
+    "tool": "BD/phase2/tools/install_freeze_bwd2.py",
+    "tool_sha256": "df6b4a6b21af394bcccab8b97efe74c2de6305737582840c4ace4af0665dda5a",
+    "utc": "2026-10-07T17:24:15Z"
+   },
+   "known_limits": [
+    "d256 16K cp16 under-prediction under the served clock quantity (-11 / -15 % on the two round-2 allocations; B11.1)",
+    "per-geometry shares without a mechanism (B10.2 (c))",
+    "the d256 CP1 P90 (period-4 wave quantization)"
+   ],
+   "predictions_sha256": "32eb7e2cf329ae8d08b7a472bfb9a5f5c7dacf88bbe906589d70c4646e5a4ed5",
+   "sha256": "0209ac09455e1ee4223fa2d54bfa3d3d423e6753cec888077dbeb0763e99dbfb",
+   "utc": "2026-10-07T17:20:52Z"
+  }
+ },
+ "head": "b12",
+ "helper_variants": {
+  "served": "per_headdim_token"
+ },
+ "kernel_model": {
+  "path": "../served/fits/pending_bwd/cp1_model_f5b1_jmax_bwd_f0.json",
+  "rel": "BD/phase2/served/fits/pending_bwd/cp1_model_f5b1_jmax_bwd_f0.json",
+  "sha256": "7e06b18d31376f52ebc10a2cf723971d44fb7b99217a071a469817a65b8331f6"
+ },
+ "measured_stat": "sustained",
+ "ograph_bwd": {
+  "path": "../served/fits/pending_bwd/ograph_bwd.json",
+  "rel": "BD/phase2/served/fits/pending_bwd/ograph_bwd.json",
+  "sha256": "778a7e7647649ca067c1ed5c24d222be4f894c05da8c67128aa47efc3db82761"
+ },
+ "r2": {
+  "attribution": "round2",
+  "clock_quantity": null,
+  "shares": {
+   "llama3_70b": 0.3998038979,
+   "qwen3_30b": 0.9168873725,
+   "qwen3_5_397b": 0.9517138407
+  },
+  "static_per_call": true,
+  "tail": {},
+  "x_form": {
+   "form": "per_step_g0_by_head_dim",
+   "g0_by_head_dim": {
+    "128": 28.0,
+    "256": 36.8
+   },
+   "g0_pooled_us": 28.888
+  }
+ },
+ "ring_fit": {
+  "block": "served",
+  "path": "../served/fits/pending_bwd/ring_bwd.json",
+  "rel": "BD/phase2/served/fits/pending_bwd/ring_bwd.json",
+  "sha256": "95e9a12b580a141870d7f6d58e35665b57a61dda9f1026b3e97df0aa6cb85fc4"
+ },
+ "ring_prep_mode": {
+  "served": "class_direct"
+ },
+ "round": 2,
+ "round2_record": {
+  "clock_quantity": "attention_phase_group_median (D2 (i); B11.1: readings >= 1750 MHz flagged, never corrected)",
+  "compose_record": {
+   "path": "../served/fits/pending_bwd/round2_real/compose_bwd_r2.json",
+   "rel": "BD/phase2/served/fits/pending_bwd/round2_real/compose_bwd_r2.json",
+   "sha256": "fa6e36f649e2cfb8b305a9ae292c79c65228f40f9015335747faa1a5f1a59780"
+  },
+  "cp1_refit_round1_reproduced": {
+   "identical_within_1e-9": true,
+   "max_abs_coefficient_difference_ms": 4.967061484e-12,
+   "note": "cp1_target wall_minus_H: the same rows, H variant, law and estimator as round 1 -> the round-1 coefficients must come back"
+  },
+  "cp1_target": "wall_minus_H",
+  "known_limits": [
+   "d256 16K cp16 under-prediction under the served clock quantity (-11 / -15 % on the two round-2 allocations; B11.1)",
+   "per-geometry shares without a mechanism (B10.2 (c))",
+   "the d256 CP1 P90 (period-4 wave quantization)"
+  ],
+  "shares_by_geometry": {
+   "llama3_70b": 0.3998038979,
+   "qwen3_30b": 0.9168873725,
+   "qwen3_5_397b": 0.9517138407
+  },
+  "shares_known_limit": "PB B10.2 (c) / B11: the per-step shares of the shared constants (k0, b_S q_phys, tau rho n_chain) are served as per-(hardware, geometry) CONSTANTS without a mechanism: the per-term read on the 2c-R2-cov cells (23_diag_b10_lanes.md) found the share NOT a geometry property (within-geometry spread over the families 0.16-0.52) and the term paid short differing by geometry; the kv-head ordering of the pooled shares (2 -> 0.91, 4 -> 0.59, 8 -> 0.36) is a 3-point ordering, not evidence - a KNOWN LIMIT of the round-2 model",
+  "shares_mode": "NOT converged (spread 0.552 > 0.15): per-geometry shares (B10 D1 (i) SHARED rule: per-geometry constants of the same form)",
+  "shares_source": {
+   "path": "../served/fits/pending_bwd/round2_real/share_bwd_r2.json",
+   "rel": "BD/phase2/served/fits/pending_bwd/round2_real/share_bwd_r2.json",
+   "sha256": "2c8427ff9a42baa5c956dd179170a814efbc663ea8eba491a1938dd53e55e58a"
+  },
+  "static": "once per pack (static(n_pack); B10.2 (d))",
+  "tail": "not a term (B10.2 (b))",
+  "x_form": {
+   "form": "per_step_g0_by_head_dim",
+   "g0_by_head_dim": {
+    "128": 28.0,
+    "256": 36.8
+   },
+   "g0_pooled_us": 28.888
+  },
+  "x_g0_alternative": {
+   "g0_by_head_dim": {
+    "128": 28.032,
+    "256": 36.312
+   },
+   "source": "x_structure_bwd.json of the served run (round-1 + cov + d256 lanes); the frozen alternative setting r2_x_g0_served_run"
+  },
+  "x_g0_source": "--x-g0 pin (B10.2 (a) / B11: g0 d256 from the two 16K cp16 allocations)",
+  "x_source": {
+   "path": "../served/fits/pending_bwd/round2_real/x_structure_bwd.json",
+   "rel": "BD/phase2/served/fits/pending_bwd/round2_real/x_structure_bwd.json",
+   "sha256": "a90af15801346e25653b7d563bdfb7f43d8d01ac628311659a818b032b43a8c5"
+  }
+ },
+ "served": {
+  "setting": "s4bwd2",
+  "variant": "crit"
+ },
+ "served_field": "crit_s4bwd2",
+ "setting": "s4bwd2",
+ "shared_round1_files": {
+  "clock_law_lambda_bwd.json": {
+   "source_sha256": "04bb764385f0db38b896d5cdb280dcb7504590b604919fe1d0862646e68ad45d",
+   "vendored_as": "data/clock_law_lambda_bwd.json",
+   "vendored_sha256": "04bb764385f0db38b896d5cdb280dcb7504590b604919fe1d0862646e68ad45d"
+  },
+  "cp1_model_f5b1_jmax_bwd_f0.json": {
+   "source_sha256": "7e06b18d31376f52ebc10a2cf723971d44fb7b99217a071a469817a65b8331f6",
+   "vendored_as": "data/cp1_model_f5b1_jmax_bwd_f0.json",
+   "vendored_sha256": "7e06b18d31376f52ebc10a2cf723971d44fb7b99217a071a469817a65b8331f6"
+  },
+  "ograph_bwd.json": {
+   "source_sha256": "778a7e7647649ca067c1ed5c24d222be4f894c05da8c67128aa47efc3db82761",
+   "vendored_as": "data/ograph_bwd_served.json",
+   "vendored_sha256": "a11d9bbc94be07ced66f7a8ecd7ac521debb77c4f3b527e666b04de5caf06c0f"
+  },
+  "ring_bwd.json": {
+   "source_sha256": "95e9a12b580a141870d7f6d58e35665b57a61dda9f1026b3e97df0aa6cb85fc4",
+   "vendored_as": "data/ring_bwd_served.json",
+   "vendored_sha256": "ee4a27ef5f5f4ade03e8981430e1f6b09fef2488f8eed9dde65f950d72542c28"
+  },
+  "structural_constants_bwd.json": {
+   "source_sha256": "bace977f166b76e5889666ee5fcf0d859f040597295bc1ac69881468949d8f73",
+   "vendored_as": "data/structural_constants_bwd.json",
+   "vendored_sha256": "bace977f166b76e5889666ee5fcf0d859f040597295bc1ac69881468949d8f73"
+  }
+ },
+ "structural_constants": {
+  "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/structural_constants_bwd.json",
+  "s_bwd": 0.664,
+  "sha256": "bace977f166b76e5889666ee5fcf0d859f040597295bc1ac69881468949d8f73"
+ },
+ "u_treatment": {
+  "served": "none"
+ },
+ "variants": [
+  {
+   "name": "crit",
+   "text": "the critical-rank accounting: pre + max_rank sum_i (k'_i + g_i) + once-per-pack terms + X (compose_bwd_r2_lib.BwdComposerR2)"
+  }
+ ]
+}

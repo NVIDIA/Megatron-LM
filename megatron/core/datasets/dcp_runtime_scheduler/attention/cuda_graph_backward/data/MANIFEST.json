@@ -1,0 +1,179 @@
+{
+ "backward_campaign_dir": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward",
+ "composition_ported_from": {
+  "bwd_common.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/tools/bwd_common.py",
+   "sha256": "f3ced204d35c087b61ff80772e6b6a31ed59546f3dcaf5d22bbb6e182d1d2ffa"
+  },
+  "compose_bwd_lib.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/tools/compose_bwd_lib.py",
+   "sha256": "c0f4bcb9565495dce0032fb4edcaa56732b3a3d9706eca008e935a2829cb36f2"
+  },
+  "cp1_bwd_struct_read.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/tools/cp1_bwd_struct_read.py",
+   "sha256": "918e9db1476741c330790ed1c9a4889bf4700bc57945bc0eaab1306bd7c97baa"
+  },
+  "cp1_makespan.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3-gb200-structural/phase2/served/tools/cp1_makespan.py",
+   "sha256": "761cc2bc20f8b51f78425fd4e76e7dc990ba9b8b3e4ae2d95e9d2a99f023a778"
+  },
+  "cp1_makespan_bwd.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/tools/cp1_makespan_bwd.py",
+   "sha256": "9926cdc178e4360ee24401475203203b7cc8c17c1667ffaba4e4a8c03c5203b8"
+  },
+  "predict_bwd.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/tools/predict_bwd.py",
+   "sha256": "0a38e1fe41b02617b20461acb7159aaac8ddb84c6c3d99ebff2a9665e71eb89b"
+  },
+  "wp_g3_common.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3-gb200-structural/phase2/tools/wp_g3_common.py",
+   "sha256": "4fa39ac31b5388b4025324d8e5735493cde570fce5ef7b5267560a8fd928074c"
+  }
+ },
+ "date": "2026-10-07",
+ "forward_campaign_dir": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3-gb200-structural",
+ "freeze": {
+  "FREEZE_F_BWD": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/FREEZE_F_BWD",
+   "sha256": "4b61aa749a41f67b5630f9c995235d837dd8e1cf74396fbb2848355e1f351819"
+  },
+  "FREEZE_H_BWD": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/FREEZE_H_BWD",
+   "sha256": "9811b177984a34ca4bc84a57814f71895b4c92badca24aab977489ec1fe77399"
+  }
+ },
+ "hardware_profile": {
+  "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3-gb200-structural/phase2/tools/hardware_profiles/gb200.json",
+  "sha256": "9b87fe06c62b93684990deba358d9552b06c5d5a81a6d076d64cab6054c05745"
+ },
+ "model": "WP-G3B GB200 backward round 1 (PREREGISTRATION_BWD.md B7.1 (e); FREEZE_F_BWD / FREEZE_H_BWD 2026-10-07)",
+ "parity_target": {
+  "predictions.json": {
+   "note": "phase2/served/hold_f_bwd_predictions/predictions.json: the FROZEN f_bwd predictions (675 records, 45 cells; served_f0 at f0_bwd 1600 MHz) - not sealed data",
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/hold_f_bwd_predictions/predictions.json",
+   "sha256": "2fc423394a4212eb5a28d9a779b051398669d3a37835e3da50f714c054013f01"
+  }
+ },
+ "rule": "the composer package reads the vendored files only (never the campaign directory); every vendored file is pinned here and in the data file's gb200 / backward entry",
+ "schema": "dcp-scheduler/cuda-graph-backward-round1-manifest/1",
+ "sources": {
+  "FREEZE_F_BWD": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/FREEZE_F_BWD",
+   "sha256": "4b61aa749a41f67b5630f9c995235d837dd8e1cf74396fbb2848355e1f351819"
+  },
+  "FREEZE_H_BWD": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/FREEZE_H_BWD",
+   "sha256": "9811b177984a34ca4bc84a57814f71895b4c92badca24aab977489ec1fe77399"
+  },
+  "bwd_common.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/tools/bwd_common.py",
+   "sha256": "f3ced204d35c087b61ff80772e6b6a31ed59546f3dcaf5d22bbb6e182d1d2ffa"
+  },
+  "clock_law_lambda_bwd.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/clock_law_lambda_bwd.json",
+   "sha256": "04bb764385f0db38b896d5cdb280dcb7504590b604919fe1d0862646e68ad45d"
+  },
+  "compose_bwd_lib.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/tools/compose_bwd_lib.py",
+   "sha256": "c0f4bcb9565495dce0032fb4edcaa56732b3a3d9706eca008e935a2829cb36f2"
+  },
+  "cp1_bwd_struct_read.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/tools/cp1_bwd_struct_read.py",
+   "sha256": "918e9db1476741c330790ed1c9a4889bf4700bc57945bc0eaab1306bd7c97baa"
+  },
+  "cp1_makespan.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3-gb200-structural/phase2/served/tools/cp1_makespan.py",
+   "sha256": "761cc2bc20f8b51f78425fd4e76e7dc990ba9b8b3e4ae2d95e9d2a99f023a778"
+  },
+  "cp1_makespan_bwd.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/tools/cp1_makespan_bwd.py",
+   "sha256": "9926cdc178e4360ee24401475203203b7cc8c17c1667ffaba4e4a8c03c5203b8"
+  },
+  "cp1_model_f5b1_jmax_bwd_f0.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/cp1_model_f5b1_jmax_bwd_f0.json",
+   "sha256": "7e06b18d31376f52ebc10a2cf723971d44fb7b99217a071a469817a65b8331f6"
+  },
+  "gb200.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3-gb200-structural/phase2/tools/hardware_profiles/gb200.json",
+   "sha256": "9b87fe06c62b93684990deba358d9552b06c5d5a81a6d076d64cab6054c05745"
+  },
+  "hold_f_bwd_verdict.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/reports/hold_f_bwd_verdict.json",
+   "sha256": "1b79d821780ec3fd143bd3f30e62eb790244f19bbfb3264d2cca7d20725a2359"
+  },
+  "hold_f_bwd_verdict_b82.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/reports/hold_f_bwd_verdict_b82.json",
+   "sha256": "57a309344dfe97e646499ec5c39b6483ee4c3574cfb8c82b9e5fc1ac9271cc2a"
+  },
+  "ograph_bwd.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/ograph_bwd.json",
+   "sha256": "778a7e7647649ca067c1ed5c24d222be4f894c05da8c67128aa47efc3db82761"
+  },
+  "predict_bwd.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/tools/predict_bwd.py",
+   "sha256": "0a38e1fe41b02617b20461acb7159aaac8ddb84c6c3d99ebff2a9665e71eb89b"
+  },
+  "predictions.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/hold_f_bwd_predictions/predictions.json",
+   "sha256": "2fc423394a4212eb5a28d9a779b051398669d3a37835e3da50f714c054013f01"
+  },
+  "ring_bwd.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/ring_bwd.json",
+   "sha256": "95e9a12b580a141870d7f6d58e35665b57a61dda9f1026b3e97df0aa6cb85fc4"
+  },
+  "served_f_bwd.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/configs/served_f_bwd.json",
+   "sha256": "81f4df6dcd8060a70c2bfb611637d819edea28c170722630a0ed3a5908f34246"
+  },
+  "served_h_bwd.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/configs/served_h_bwd.json",
+   "sha256": "ed4737a88fc04b1a8c306587c05b2cd0d5182ec3076d27433a86f7e8e29320f1"
+  },
+  "structural_constants_bwd.json": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/structural_constants_bwd.json",
+   "sha256": "bace977f166b76e5889666ee5fcf0d859f040597295bc1ac69881468949d8f73"
+  },
+  "wp_g3_common.py": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3-gb200-structural/phase2/tools/wp_g3_common.py",
+   "sha256": "4fa39ac31b5388b4025324d8e5735493cde570fce5ef7b5267560a8fd928074c"
+  }
+ },
+ "tool": "tools/wp_g3_cuda_graph/vendor_backward_round1.py",
+ "vendored": {
+  "clock_law_lambda_bwd.json": {
+   "extraction": "verbatim copy (byte-identical; sha256 equals the source's)",
+   "sha256": "04bb764385f0db38b896d5cdb280dcb7504590b604919fe1d0862646e68ad45d",
+   "source": "clock_law_lambda_bwd.json"
+  },
+  "cp1_model_f5b1_jmax_bwd_f0.json": {
+   "extraction": "verbatim copy (byte-identical; sha256 equals the source's)",
+   "sha256": "7e06b18d31376f52ebc10a2cf723971d44fb7b99217a071a469817a65b8331f6",
+   "source": "cp1_model_f5b1_jmax_bwd_f0.json"
+  },
+  "ograph_bwd_served.json": {
+   "extraction": "the keys status / served / definition / stage of the source",
+   "sha256": "a11d9bbc94be07ced66f7a8ecd7ac521debb77c4f3b527e666b04de5caf06c0f",
+   "source": "ograph_bwd.json"
+  },
+  "ring_bwd_served.json": {
+   "extraction": "the keys served / stage / inputs of the source (json.dumps indent 1, sorted keys); the numbers are untouched",
+   "sha256": "ee4a27ef5f5f4ade03e8981430e1f6b09fef2488f8eed9dde65f950d72542c28",
+   "source": "ring_bwd.json"
+  },
+  "sealed_verdict_f_bwd.json": {
+   "extraction": "per-cell table (served WAPE / P90 / bias, gate, status, anchor, flags), passed / failed / inconclusive, overall statement, pooled served metrics, first-read counts",
+   "sha256": "ffc086178efcad47cd8db943160b36481f906f09d3b5fb65f046ef28b9a81ae5",
+   "source": "hold_f_bwd_verdict_b82.json"
+  },
+  "served_config_f_bwd.json": {
+   "extraction": "every top-level key; settings reduced to the served setting s4bwd (settings_all = the 34 names)",
+   "sha256": "7d3806e2fb6d328783ddffbf45970cb1f8a3023da93640655942e50af16e20b6",
+   "source": "served_f_bwd.json"
+  },
+  "structural_constants_bwd.json": {
+   "extraction": "verbatim copy (byte-identical; sha256 equals the source's)",
+   "sha256": "bace977f166b76e5889666ee5fcf0d859f040597295bc1ac69881468949d8f73",
+   "source": "structural_constants_bwd.json"
+  }
+ }
+}

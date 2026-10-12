@@ -11,6 +11,11 @@ import traceback
 from dataclasses import asdict, is_dataclass
 
 
+def _runtime_module(name):
+    prefix = f'{__package__}.' if __package__ else ''
+    return importlib.import_module(f'{prefix}dcp_runtime_scheduler.{name}')
+
+
 class _AttentionWorkModel:
     """Quadratic-work smoke-test proxy, not a calibrated GPU timing prediction."""
 
@@ -42,11 +47,19 @@ class _AttentionWorkModel:
 
 
 def _initialize_planner(spec):
-    from dcp_scheduler.runtime.planner import RuntimePlanGeometry
-
-    geometry = RuntimePlanGeometry(**spec['geometry'])
+    geometry_options = dict(spec['geometry'])
+    geometry_options['allowed_cp_sizes'] = tuple(sorted(set(geometry_options['allowed_cp_sizes'])))
+    geometry = _runtime_module('runtime.planner').RuntimePlanGeometry(**geometry_options)
     if spec['default_model']:
         model = _AttentionWorkModel(geometry=geometry, **spec['model_options'])
+    elif spec['model'] in (
+        'calibrated_attention',
+        'qwen35_gb200',
+        'dcp_scheduler.adapters:qwen35_new_core_model',
+    ):
+        model = _runtime_module('models').make_model(
+            spec['model'], geometry, **spec['model_options']
+        )
     else:
         module, factory = spec['model'].split(':', 1)
         model = getattr(importlib.import_module(module), factory)(**spec['model_options'])
@@ -54,13 +67,12 @@ def _initialize_planner(spec):
     if spec.get('solver'):
         module, factory = spec['solver'].split(':', 1)
         return getattr(importlib.import_module(module), factory)(geometry, model, **options)
-    from dcp_scheduler.runtime.lightweight import LightweightOptions, LightweightRuntimePlanner
-
-    return LightweightRuntimePlanner(geometry, model, LightweightOptions(**options))
+    runtime = _runtime_module('runtime.lightweight')
+    return runtime.LightweightRuntimePlanner(geometry, model, runtime.LightweightOptions(**options))
 
 
 def _solve(planner, spec, lengths, padded, baseline_rows):
-    from dcp_scheduler.runtime.planner import validate_rows
+    validate_rows = _runtime_module('runtime.planner').validate_rows
 
     started = {'monotonic_ns': time.monotonic_ns(), 'wall_ns': time.time_ns()}
     alignment = planner.geometry.dataset_alignment
@@ -99,15 +111,16 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
             if is_dataclass(getattr(planner, 'options', None))
             else spec.get('solver_options', {})
         ),
-        solver_entry=(
-            spec.get('solver') or 'dcp_scheduler.runtime.lightweight:LightweightRuntimePlanner'
-        )
+        solver_entry=(spec.get('solver') or f'{type(planner).__module__}:LightweightRuntimePlanner')
         + '.plan_padded',
         solve_start=started,
         solve_end={'monotonic_ns': time.monotonic_ns(), 'wall_ns': time.time_ns()},
         worker_pid=os.getpid(),
         worker_cuda_initialized=cuda_initialized,
         worker_distributed_initialized=distributed_initialized,
+        external_scheduler_imported=any(
+            name == 'dcp_scheduler' or name.startswith('dcp_scheduler.') for name in sys.modules
+        ),
     )
 
 

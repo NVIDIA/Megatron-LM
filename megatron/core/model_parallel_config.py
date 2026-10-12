@@ -167,8 +167,9 @@ class ModelParallelConfig:
     """
 
     dynamic_cp_runtime_model: Optional[str] = None
-    """CPU cost-model factory ('package.module:factory') for the bounded runtime DCP solver.
-    Replaces the native arbitrary-CP heuristic when set. Requires dcp-scheduler; PP1/VPP1 only.
+    """In-tree cost model ('calibrated_attention' or 'qwen35_gb200'), or a CPU factory
+    ('package.module:factory') for the bounded runtime DCP solver. Replaces the native
+    arbitrary-CP heuristic when set; PP1/VPP1 only. No external scheduler package is needed.
     """
 
     dynamic_cp_runtime_model_options: Optional[str] = None
@@ -176,7 +177,7 @@ class ModelParallelConfig:
 
     dynamic_cp_runtime_solver: Optional[str] = None
     """Optional CPU planner factory ('module:factory'), called with geometry, model and
-    solver-options keyword arguments. None uses dcp-scheduler's lightweight planner.
+    solver-options keyword arguments. None uses the in-tree lightweight planner.
     """
 
     dynamic_cp_runtime_solver_options: Optional[str] = None

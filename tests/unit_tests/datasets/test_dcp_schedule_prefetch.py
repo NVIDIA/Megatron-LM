@@ -209,7 +209,6 @@ def test_batch_normalization_does_not_mutate_raw_snapshot(monkeypatch):
 
 
 def test_planner_process_stays_cpu_only():
-    pytest.importorskip('dcp_scheduler.runtime.lightweight')
     from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler
 
     config = SimpleNamespace(max_seqlen_per_dp_cp_rank=1024, min_dynamic_context_parallel_size=1)
@@ -302,7 +301,6 @@ def test_runtime_cli_supports_both_async_directions():
 def test_worker_accepts_custom_planner_factory(monkeypatch):
     import sys
 
-    pytest.importorskip('dcp_scheduler.runtime.planner')
     from megatron.core.datasets.dcp_runtime_worker import _initialize_planner
 
     expected = object()

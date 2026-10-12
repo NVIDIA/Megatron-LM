@@ -1,0 +1,24 @@
+{
+ "alternatives": {
+  "card_clock_read": {
+   "lambda": 0.356,
+   "lambda_se": 0.025,
+   "s": 0.688
+  },
+  "implied_clock_read": {
+   "lambda": 0.012,
+   "lambda_se": 0.014,
+   "s": 0.908
+  }
+ },
+ "consumer": "bwd_common.load_lambda (refit_bwd.sh --hardware gb300 steps 3-5: cp1_bwd_formcand.py / ring_read_bwd.py structural law); written by the fit-chain tooling as the chain input of the pre-registered served value",
+ "f0_mhz": 1800.0,
+ "hardware": "gb300",
+ "helpers_clock_following": true,
+ "known_limit": "GB300 backward clock-law KNOWN LIMIT (BG2.2): between the alternatives the extrapolation from the lane clock to f0_bwd 1800 differs by +1.0 % (1720 MHz) / +1.9 % (1650) / +3.3 % (1540)",
+ "lambda": 0.5757,
+ "lambda_se": 0.031,
+ "source": "PRIOR-served (BG2.2): GB200 B6.1 lambda 0.5757 +- 0.031 (analyst file clock_law_lambda_bwd.json under BD pending_bwd, sha 04bb764385f0); the GB300 reads (card-clock 0.356 / implied-clock 0.012) are recorded alternatives in clock_law_lambda_bwd_gb300.json; re-read and replaced by amendment if a later GB300 lane gives two MEASURED clocks with a lever >= 10 %",
+ "status": "PRIOR-served (BG2.2, 2026-10-08 03:30): the GB200 STRUCTURAL law lambda_bwd 0.5757 +- 0.031 (PB B6.1) carried as the served GB300 backward clock law",
+ "utc": "2026-10-07T15:48:58Z"
+}

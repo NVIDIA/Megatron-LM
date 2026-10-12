@@ -222,6 +222,7 @@ class DcpSchedulePrefetcher:
             worker_pid=result['worker_pid'],
             worker_cuda_initialized=result['worker_cuda_initialized'],
             worker_distributed_initialized=result['worker_distributed_initialized'],
+            external_scheduler_imported=result.get('external_scheduler_imported', False),
             input_digest=pending['digest'],
             global_lengths=pending['prepared'][-1],
             padded_lengths=pending['prepared'][4],

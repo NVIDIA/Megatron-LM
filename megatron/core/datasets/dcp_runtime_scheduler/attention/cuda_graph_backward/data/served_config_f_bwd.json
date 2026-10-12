@@ -1,0 +1,392 @@
+{
+ "_comment": "WP-G3B served config of f_bwd (PREREGISTRATION_BWD.md 0 / 3.1-3.5 / B0.2 / B1): CP1 form F5b-1+jmax at f0_bwd 1600 MHz x the two-term clock input (s_bwd 0.664) + the S4-bwd ring layer read from the timed variants (S4-bwd served (PB B5 (iii)-(iv) + B5.1 + B6): W0 per class (timed comm_only, as read); glue class-direct on the comm traces (prep + B4.1 helpers on the ACTIVE tokens + accumulate per dKV MiB + memset + copy; helpers follow the clock, the rest clock-independent); X = x0 + kappa sum W0 from the exposed exchange on the comm traces (H1 holds); pre served; kernel entries under the structural law (lambda 0.575713246335817) at the CP group's median attention-phase clock; kernel scale 0.9108045229938406); kernel entry per the served model's u_treatment (none: none = PB B7, tile + k0 + b_S q_phys + tau rho n_chain + static(n), no U subtraction; subtracted_in_fit = run 7; inside_k0 = F5b(step) - O_graph_bwd(P_q)); ring prep mode class_direct (PB B7 (ii) decided on the 108 walls); every 3.5 alternative is a named setting scored alongside, never selected on sealed rows",
+ "alignment": 128,
+ "clock_input": {
+  "alpha": 1.0,
+  "amendment": "PREREGISTRATION_BWD.md 3.3 / B0.2 (two-term law served from the first freeze; alpha 1 and 0.76 frozen alternatives) / CD A25",
+  "card_mode_expected": "minimal",
+  "card_tree": "results/clock_cards/<item>/<SLURM_JOB_NAME>_<SLURM_JOB_ID>/<geometry>/p<S>/cp<N>/clock_card.json (+ anchor_<x>_bwd/)",
+  "extractor": "code/tools/clock_card_extract_v2.py",
+  "f0_mhz": 1600.0,
+  "f_crit_rule": "min over the CP group's ranks of the heater-phase SM clock telemetry mean (clock card f_crit; A19.1 (i))",
+  "fallback": "fail",
+  "law": "two_term",
+  "phase": "heater",
+  "rule": "served = O_graph_bwd + (F5b_f0 - O_graph_bwd) x [s f0 / f + 1 - s] at cp = 1; at cp > 1 every step's kernel entry x [s f0 / f_crit + 1 - s]; glue / exchange / pre unscaled",
+  "source": "clock_card",
+  "two_term_s": 0.664,
+  "two_term_s_source": "hardware profile clock.two_term_s_bwd (B1.1 (report 01b, 2026-10-06): least squares on the log ratios of the 96 kernel-level NOCOMM flash_bprop pairs of probe B1 (hsg 7756270, llama3_70b-p4096-cp4, arm a duty 19 ~1465 MHz vs arm d light ~1938 MHz per rank, same kernel / rank / backward step); s_bwd = 0.664 +- 0.015 at f0_bwd = 1600 MHz; comm + nocomm 0.724; LS alpha 0.65 (reader alpha_kernel 0.764); one d128 cell, one clock lever - the d256 reading is open (no light nsys arm on qwen3_5_397b 16K))"
+ },
+ "extracted_from": {
+  "file": "served_f_bwd.json",
+  "rule": "every top-level key; settings reduced to the served setting s4bwd (settings_all = the 34 names)",
+  "served_h_bwd.json": {
+   "note": "differs from served_f_bwd.json in _comment and item only",
+   "sha256": "ed4737a88fc04b1a8c306587c05b2cd0d5182ec3076d27433a86f7e8e29320f1"
+  },
+  "sha256": "81f4df6dcd8060a70c2bfb611637d819edea28c170722630a0ed3a5908f34246"
+ },
+ "helper_terms": {
+  "applied": true,
+  "by_head_dim": {
+   "128": {
+    "H_kv": {
+     "as_traced": {
+      "coef": {
+       "o0_us": 21.84759915,
+       "o_kv_us_per_token": 0.004950820145,
+       "o_n_us_per_sequence": 0.3200572208,
+       "o_q_us_per_token": 0.0001538072401
+      },
+      "form": "token",
+      "note": "no clock normalization (the run-3 by_class convention)",
+      "wape": 15.623
+     },
+     "as_two_term_heater": {
+      "coef": {
+       "o0_us": 19.86364419,
+       "o_kv_us_per_token": 0.004365210039,
+       "o_n_us_per_sequence": 0.3261774303,
+       "o_q_us_per_token": 4.605515628e-05
+      },
+      "form": "token",
+      "note": "the B4 convention: two-term law at the heater f_crit",
+      "wape": 15.813
+     },
+     "bias": -0.0,
+     "class": "bwd_helper_kv",
+     "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+     "coef": {
+      "o0_us": 19.0616466,
+      "o_kv_us_per_token": 0.004087467267,
+      "o_n_us_per_sequence": 0.3106515604,
+      "o_q_us_per_token": 2.866259711e-05
+     },
+     "form": "token",
+     "kernel_names": "fmha_reduce_head_ragged (x2 per call)",
+     "n_packs": 232,
+     "p90_ape": 21.627,
+     "rmse_us": 8.834968828,
+     "share_of_window": 0.04588063223,
+     "sum_us_at_f0": 9539.824529,
+     "wape": 15.99
+    },
+    "H_q": {
+     "as_traced": {
+      "coef": {
+       "o0_us": 19.93079247,
+       "o_kv_us_per_token": 0.0007355917647,
+       "o_n_us_per_sequence": 0.1840543719,
+       "o_q_us_per_token": 0.02417503041
+      },
+      "form": "token",
+      "note": "no clock normalization (the run-3 by_class convention)",
+      "wape": 27.96
+     },
+     "as_two_term_heater": {
+      "coef": {
+       "o0_us": 18.81433261,
+       "o_kv_us_per_token": 0.0005036101494,
+       "o_n_us_per_sequence": 0.280023581,
+       "o_q_us_per_token": 0.02122541797
+      },
+      "form": "token",
+      "note": "the B4 convention: two-term law at the heater f_crit",
+      "wape": 28.156
+     },
+     "bias": 0.0,
+     "class": "bwd_helper_q",
+     "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+     "coef": {
+      "o0_us": 18.5741538,
+      "o_kv_us_per_token": 0.0004476951306,
+      "o_n_us_per_sequence": 0.2828069882,
+      "o_q_us_per_token": 0.01987418378
+     },
+     "form": "token",
+     "kernel_names": "compute_dot_do_o_ragged_specialized + convert_dq_to_16bits_ragged (d128 plan; d256: compute_dot_do_o only)",
+     "n_packs": 232,
+     "p90_ape": 45.569,
+     "rmse_us": 47.98737395,
+     "share_of_window": 0.1277767169,
+     "sum_us_at_f0": 26568.23585,
+     "wape": 28.0
+    },
+    "form": "token"
+   },
+   "256": {
+    "H_kv": {
+     "as_traced": {
+      "coef": {
+       "o0_us": 22.14214759,
+       "o_kv_us_per_token": 0.00523280007,
+       "o_n_us_per_sequence": 0.2514720285,
+       "o_q_us_per_token": 0.0002550522406
+      },
+      "form": "token",
+      "note": "no clock normalization (the run-3 by_class convention)",
+      "wape": 2.841
+     },
+     "as_two_term_heater": {
+      "coef": {
+       "o0_us": 20.2401034,
+       "o_kv_us_per_token": 0.004509951205,
+       "o_n_us_per_sequence": 0.2635463381,
+       "o_q_us_per_token": 9.479166155e-05
+      },
+      "form": "token",
+      "note": "the B4 convention: two-term law at the heater f_crit",
+      "wape": 3.253
+     },
+     "bias": -0.0,
+     "class": "bwd_helper_kv",
+     "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+     "coef": {
+      "o0_us": 19.4379676,
+      "o_kv_us_per_token": 0.004192634225,
+      "o_n_us_per_sequence": 0.2696838087,
+      "o_q_us_per_token": 3.899396034e-05
+     },
+     "form": "token",
+     "kernel_names": "fmha_reduce_head_ragged (x2 per call)",
+     "n_packs": 116,
+     "p90_ape": 10.602,
+     "rmse_us": 2.387555691,
+     "share_of_window": 0.03432526277,
+     "sum_us_at_f0": 4814.551119,
+     "wape": 3.974
+    },
+    "H_q": {
+     "as_traced": {
+      "coef": {
+       "o0_us": 6.09106062,
+       "o_kv_us_per_token": 0.0001275661607,
+       "o_n_us_per_sequence": 0.06754962612,
+       "o_q_us_per_token": 0.01772552913
+      },
+      "form": "token",
+      "note": "no clock normalization (the run-3 by_class convention)",
+      "wape": 1.828
+     },
+     "as_two_term_heater": {
+      "coef": {
+       "o0_us": 6.34417761,
+       "o_kv_us_per_token": 6.916382113e-05,
+       "o_n_us_per_sequence": 0.1352054744,
+       "o_q_us_per_token": 0.01519081323
+      },
+      "form": "token",
+      "note": "the B4 convention: two-term law at the heater f_crit",
+      "wape": 2.647
+     },
+     "bias": -0.0,
+     "class": "bwd_helper_q",
+     "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+     "coef": {
+      "o0_us": 6.481168485,
+      "o_kv_us_per_token": 9.082876655e-06,
+      "o_n_us_per_sequence": 0.1703029886,
+      "o_q_us_per_token": 0.0141441382
+     },
+     "form": "token",
+     "kernel_names": "compute_dot_do_o_ragged_specialized + convert_dq_to_16bits_ragged (d128 plan; d256: compute_dot_do_o only)",
+     "n_packs": 116,
+     "p90_ape": 43.737,
+     "rmse_us": 4.240194134,
+     "share_of_window": 0.06038148377,
+     "sum_us_at_f0": 8469.264814,
+     "wape": 3.537
+    },
+    "form": "token"
+   }
+  },
+  "rule": "PB B4 as written (frozen alternative 'per_headdim_token'): H per head_dim token form; the form was fitted on wall_norm - H; CP1BwdModel.kernel() adds H back; the helper classes follow the two-term clock law",
+  "variant": "per_headdim_token"
+ },
+ "helper_variants": {
+  "alternative_settings": [
+   "kernel_f5b1_helper_head_token",
+   "kernel_f5b1_jmax_nohelper"
+  ],
+  "rule": "PB B4.1: served H variant decided by the per-unit table (cp1_bwd_selection.json helper_variant_decision); the other variant and the no-helper fit are frozen alternatives",
+  "served": "per_headdim_token"
+ },
+ "item": "f_bwd",
+ "kernel_model": {
+  "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/cp1_model_f5b1_jmax_bwd_f0.json",
+  "rel": "BD/phase2/served/fits/pending_bwd/cp1_model_f5b1_jmax_bwd_f0.json",
+  "sha256": "7e06b18d31376f52ebc10a2cf723971d44fb7b99217a071a469817a65b8331f6"
+ },
+ "measured_stat": "sustained",
+ "ograph_bwd": {
+  "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/ograph_bwd.json",
+  "rel": "BD/phase2/served/fits/pending_bwd/ograph_bwd.json",
+  "sha256": "778a7e7647649ca067c1ed5c24d222be4f894c05da8c67128aa47efc3db82761"
+ },
+ "ring_fit": {
+  "block": "served",
+  "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/ring_bwd.json",
+  "rel": "BD/phase2/served/fits/pending_bwd/ring_bwd.json",
+  "sha256": "95e9a12b580a141870d7f6d58e35665b57a61dda9f1026b3e97df0aa6cb85fc4"
+ },
+ "ring_prep_mode": {
+  "alternative_settings": [
+   "ring_prep_excess_over_cp1",
+   "ring_prep_none"
+  ],
+  "served": "class_direct",
+  "test": {
+   "class_direct": {
+    "bias": 2.295,
+    "cells_pass": 7,
+    "n_cells": 18,
+    "p90": 16.314,
+    "wape": 5.74
+   },
+   "excess_over_cp1": {
+    "bias": -0.92,
+    "cells_pass": 7,
+    "n_cells": 18,
+    "p90": 14.779,
+    "wape": 6.056
+   },
+   "none": {
+    "bias": -4.442,
+    "cells_pass": 1,
+    "n_cells": 18,
+    "p90": 22.328,
+    "wape": 7.556
+   }
+  }
+ },
+ "schema": "wp-g3b-served-config-bwd/1",
+ "served": {
+  "setting": "s4bwd",
+  "variant": "crit"
+ },
+ "settings": {
+  "s4bwd": {
+   "clock": {
+    "alpha": 1.0,
+    "f0_mhz": 1600.0,
+    "kernel_law": {
+     "formula": "k(f) = tile f0/f + (1 - lambda) C f0/f + lambda C; tile = tau x chain tiles (+ tau_jmax J_max), C = k0 + b_S S + tau rho n_chain + static(n) (U excluded)",
+     "kind": "structural",
+     "lambda": 0.5757132463,
+     "lambda_provisional": false,
+     "lambda_se": 0.03083065088,
+     "lambda_source": "analyst file clock_law_lambda_bwd.json (sha 04bb764385f0):"
+    },
+    "law": "alpha",
+    "note": "PB B6: the ring block's law pre-splits every kernel entry (structural: tile + (1 - lambda) C scaled under alpha 1, lambda C unscaled); the split's clock_law_override carries it; this block applies to blocks without a law",
+    "quantity": "attention_phase_group_median",
+    "s": null
+   },
+   "kernel_model": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/cp1_model_f5b1_jmax_bwd_f0.json",
+   "ograph_block": "served",
+   "ring_block": "served",
+   "role": "served",
+   "text": "S4-bwd served (PB B5 (iii)-(iv) + B5.1 + B6): W0 per class (timed comm_only, as read); glue class-direct on the comm traces (prep + B4.1 helpers on the ACTIVE tokens + accumulate per dKV MiB + memset + copy; helpers follow the clock, the rest clock-independent); X = x0 + kappa sum W0 from the exposed exchange on the comm traces (H1 holds); pre served; kernel entries under the structural law (lambda 0.575713246335817) at the CP group's median attention-phase clock; kernel scale 0.9108045229938406"
+  }
+ },
+ "settings_all": [
+  "clock_alpha0",
+  "clock_alpha076",
+  "clock_alpha1",
+  "clock_f0fwd",
+  "kernel_f5b1",
+  "kernel_f5b1_helper_head_token",
+  "kernel_f5b1_jmax_alpha1",
+  "kernel_f5b1_jmax_cp1_u_subtracted",
+  "kernel_f5b1_jmax_nohelper",
+  "kernel_f5b1_jmax_two_term",
+  "kernel_f5b1_jmax_unweighted",
+  "kernel_f5b3",
+  "kernel_f5bq",
+  "kernel_f5bq_jmax",
+  "kernel_f5bsum",
+  "kernel_f5bsum_jmax",
+  "kernel_nullratio",
+  "ograph_storage_mib",
+  "ring_heater_clock",
+  "ring_helpers_physical_rows",
+  "ring_law_alpha1",
+  "ring_law_c",
+  "ring_law_one_s",
+  "ring_nocomm_diff",
+  "ring_per_rank_clocks",
+  "ring_pre_folded",
+  "ring_pre_separate",
+  "ring_prep_excess_over_cp1",
+  "ring_prep_none",
+  "ring_scale_1",
+  "ring_scale_gresid",
+  "ring_w0_fwd_map",
+  "ring_x0_zero",
+  "s4bwd"
+ ],
+ "sources": {
+  "formcand": {
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/cp1_bwd_formcand.json",
+   "sha256": "7fca3be38baa32d5c1ae2ad264be3bc12841432b5b3efbb727e031ad403172d4"
+  },
+  "ring": {
+   "H1": "H1 HOLDS: X served as x0 + kappa sum W0 (no remainder)",
+   "H2": "H2 FAILS: traced glue vs timed G outside 10 % on the short or the long packs (class median)",
+   "kernel_scale": 1.0,
+   "pre_served": true
+  },
+  "selection": {
+   "mode": "no candidate passes every unit: the one passing the most units (15 / 18); the failing units are known limits",
+   "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/pending_bwd/cp1_bwd_selection.json",
+   "served": "F5b-1+jmax",
+   "sha256": "24263bba67d95f09f47ce8cfb76b06433ebaef39bff8c25e20c6e8f60a5b7b00"
+  }
+ },
+ "structural_constants": {
+  "path": "/data/tailaim/work_data/dcp_benchmark/experiments/attention-coverage-20260925/campaigns/wp-g3b-gb200-backward/phase2/served/fits/structural_constants_bwd.json",
+  "values": {
+   "K_call_by_head_dim": {
+    "128": 1,
+    "256": 3
+   },
+   "P_bwd_by_head_dim": {
+    "128": 152,
+    "256": 76
+   },
+   "R_bwd_rows": 128,
+   "R_bwd_rows_by_head_dim": {
+    "128": 128,
+    "256": 256
+   },
+   "pinned_present": true,
+   "provenance": {
+    "K_call_by_head_dim": "pinned",
+    "O_graph_bwd": "read",
+    "P_bwd_by_head_dim": "read",
+    "R_bwd_rows": "read",
+    "R_bwd_rows_by_head_dim": "pinned",
+    "helper_terms_alternatives": "read",
+    "helper_terms_by_head_dim": "read",
+    "roles": "read",
+    "s_bwd": "pinned",
+    "static_bwd_us_per_sequence_by_head_dim": "default"
+   },
+   "s_bwd": 0.664,
+   "static_bwd_us_per_sequence_by_head_dim": null
+  }
+ },
+ "u_treatment": {
+  "alternative_settings": [
+   "kernel_f5b1_jmax_cp1_u_subtracted"
+  ],
+  "rule": "PB B7 (i): the CP1 form fitted on wall_norm - H, static only, NO U / O_graph subtraction (k0 positive; the CP1 non-helper glue lives in k0 + b_S S); the run-7 U-subtracted structure is the frozen alternative cp1_u_subtracted",
+  "served": "none"
+ },
+ "variants": [
+  {
+   "name": "crit",
+   "text": "the critical-rank accounting: wall = pre + max_rank sum_i (k'_i + g_i) + X (PB section 0)"
+  }
+ ]
+}
