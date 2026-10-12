@@ -366,6 +366,47 @@ def test_fused_residual_rmsnorm_quantize_grad_rejects_unsupported_configs(overri
         _make_fused_residual_quantize_grad_config(**overrides)
 
 
+def _make_router_grad_fusion_config(**overrides) -> TransformerConfig:
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_router_grad_fusion=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def test_router_grad_fusion_accepts_hybridep_config():
+    config = _make_router_grad_fusion_config()
+
+    assert config.moe_router_grad_fusion
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (dict(moe_flex_dispatcher_backend="deepep"), "'hybridep' flex dispatcher"),
+        (
+            dict(moe_token_dispatcher_type="alltoall", moe_flex_dispatcher_backend=None),
+            "'hybridep' flex dispatcher",
+        ),
+        (dict(moe_latent_size=64), "moe_latent_size"),
+        (
+            dict(overlap_dispatch_backward_with_experts_wgrad=True),
+            "overlap_dispatch_backward_with_experts_wgrad",
+        ),
+    ],
+)
+def test_router_grad_fusion_rejects_unsupported_configs(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _make_router_grad_fusion_config(**overrides)
+
+
 def _make_mxfp8_wire_config(**overrides) -> TransformerConfig:
     kwargs = dict(
         num_layers=1,

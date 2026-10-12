@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 import logging
 import os
 import warnings
@@ -28,6 +29,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     fused_dispatch,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
+    hybrid_ep_dispatch_grad_fan_in,
     hybrid_ep_local_combine_add,
     is_nccl_ep_bootstrapped,
     nccl_ep_combine,
@@ -1127,12 +1129,25 @@ class _HybridEPManager(_DispatchManager):
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
 
+    def _can_fan_in_dispatch_grad(self) -> bool:
+        """With a single-rank group the dispatch backward is a local unpermute that can add the
+        router's input gradient."""
+        return (
+            self.group.size() == 1
+            and not self.config.moe_permute_fusion_into_hybridep
+            and not self.drop_and_pad
+            and self._padded_num_tokens in (None, self._original_num_tokens)
+        )
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        grad_fan_in=None,
     ) -> torch.Tensor:
+        """Dispatch the tokens; ``grad_fan_in`` (a ``DispatchGradFanIn``), if given, receives the
+        expert-input gradient in the backward pass for the router input's gradient fan-in."""
         # HybridEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
             if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
@@ -1148,8 +1163,11 @@ class _HybridEPManager(_DispatchManager):
             hidden_states = torch.cat(
                 [hidden_states, hidden_states.new_zeros((pad_rows, hidden_states.shape[-1]))], dim=0
             )
+        hybrid_ep_dispatch_fn = hybrid_ep_dispatch
+        if grad_fan_in is not None and self._can_fan_in_dispatch_grad():
+            hybrid_ep_dispatch_fn = functools.partial(hybrid_ep_dispatch_grad_fan_in, grad_fan_in)
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
-            hybrid_ep_dispatch(
+            hybrid_ep_dispatch_fn(
                 x=hidden_states,
                 routing_map=self.routing_map,
                 probs=self.token_probs,
@@ -1981,12 +1999,19 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs
 
+    @property
+    def supports_dispatch_grad_fan_in(self) -> bool:
+        """Whether ``token_dispatch`` takes a ``DispatchGradFanIn`` for the router input's
+        gradient."""
+        return isinstance(self._comm_manager, _HybridEPManager)
+
     def token_dispatch(
         self,
         hidden_states: torch.Tensor,
         probs: Optional[torch.Tensor] = None,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        grad_fan_in=None,
     ):
         """
         Execute fused permutation and AlltoAll communication.
@@ -2001,15 +2026,24 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             probs (torch.Tensor): Routing probabilities (unused in current implementation)
             async_finish (bool): Whether to use asynchronous communication completion
             allocate_on_comm_stream (bool): Whether to allocate buffers on communication stream
+            grad_fan_in (DispatchGradFanIn, optional): Receives the expert-input gradient in the
+                backward pass for the router input's gradient fan-in, where the HybridEP backend
+                allows. Requires ``supports_dispatch_grad_fan_in``.
 
         Returns:
             A tuple of dispatched tokens and probabilities.
         """
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
-        dispatched_hidden_states = self._comm_manager.dispatch(
-            hidden_states, async_finish, allocate_on_comm_stream
-        )
+        if grad_fan_in is not None:
+            assert self.supports_dispatch_grad_fan_in, "grad_fan_in requires the HybridEP backend"
+            dispatched_hidden_states = self._comm_manager.dispatch(
+                hidden_states, async_finish, allocate_on_comm_stream, grad_fan_in=grad_fan_in
+            )
+        else:
+            dispatched_hidden_states = self._comm_manager.dispatch(
+                hidden_states, async_finish, allocate_on_comm_stream
+            )
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states, wait_current_stream=False)
             self.shared_experts.linear_fc1_forward_and_act(dispatched_hidden_states)

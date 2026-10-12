@@ -15,6 +15,7 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_rout
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.fused_a2a import DispatchGradFanIn, RouterInputGradFanIn
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -542,15 +543,20 @@ class MoELayer(BaseMoELayer):
         )
         return hidden_states, probs
 
-    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor, grad_fan_in=None):
         """Dispatches tokens to assigned expert ranks via communication.
 
         This method performs the actual communication (e.g., All-to-All) to distribute
         tokens and their associated probabilities to the devices hosting their assigned
-        experts.
+        experts. ``grad_fan_in`` (a ``DispatchGradFanIn``), if given, receives the expert-input
+        gradient in the backward pass for the router input's gradient fan-in.
         """
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RegisterDelayedWgradForExperts.apply(self, hidden_states)
+        if grad_fan_in is not None:
+            return self.token_dispatcher.token_dispatch(
+                hidden_states, probs, grad_fan_in=grad_fan_in
+            )
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
@@ -717,11 +723,26 @@ class MoELayer(BaseMoELayer):
             and getattr(self.token_dispatcher, "supports_combine_residual", False)
             and not self.config.moe_latent_size
         )
+        # The router's input gradient is added inside the dispatch backward's unpermute of the
+        # expert-input gradient: the router input passes through a fan-in whose backward runs
+        # once both are there.
+        grad_fan_in = None
+        if (
+            self.config.moe_router_grad_fusion
+            and self.training
+            and torch.is_grad_enabled()
+            and intermediate_tensors is None
+            and not self.moe_layer_recompute
+            and getattr(self.token_dispatcher, "supports_dispatch_grad_fan_in", False)
+        ):
+            grad_fan_in = DispatchGradFanIn(self.config.moe_router_topk)
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
+                    if grad_fan_in is not None:
+                        hidden_states = RouterInputGradFanIn.apply(hidden_states, grad_fan_in)
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask, input_ids)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
@@ -741,7 +762,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
+                dispatched_input, probs = self.dispatch(hidden_states, probs, grad_fan_in)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None

@@ -1012,6 +1012,11 @@ class TransformerConfig(ModelParallelConfig):
     no hidden dropout in training). With the HybridEP flex dispatcher and a single-rank expert
     group the add is fused into the combine, rounding once instead of twice."""
 
+    moe_router_grad_fusion: bool = False
+    """In the backward pass of an MoE layer with the HybridEP flex dispatcher and a single-rank
+    expert group, add the router's input gradient inside the unpermute of the expert-input gradient
+    (one pass, one rounding) instead of a separate add of the two [tokens, hidden] gradients."""
+
     moe_hybridep_pad_uneven_dispatch_inputs: bool = False
     """Pad uneven HybridEP dispatch inputs to the group maximum before dispatch.
     Enable when local HybridEP input token counts can differ across ranks, for example
@@ -2943,6 +2948,25 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "fused_residual_rmsnorm_quantize_grad is incompatible with "
                     "fp32_residual_connection."
+                )
+
+        if self.moe_router_grad_fusion:
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend != "hybridep"
+            ):
+                raise ValueError(
+                    "moe_router_grad_fusion requires the 'hybridep' flex dispatcher backend."
+                )
+            if self.moe_latent_size:
+                raise ValueError(
+                    "moe_router_grad_fusion is incompatible with moe_latent_size: the dispatch "
+                    "backward's gradient is in the latent dimension."
+                )
+            if self.overlap_dispatch_backward_with_experts_wgrad:
+                raise ValueError(
+                    "moe_router_grad_fusion is incompatible with "
+                    "overlap_dispatch_backward_with_experts_wgrad."
                 )
 
         if self.use_te_activation_func:
