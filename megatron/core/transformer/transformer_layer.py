@@ -1013,7 +1013,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if self._input_layernorm_returns_residual:
             input_layernorm_output, residual = input_layernorm_output
         else:
-            residual = hidden_states if residual_connection is None else connection_state[0]
+            residual = (
+                hidden_states
+                if residual_connection is None
+                else residual_connection.residual_stream(connection_state)
+            )
 
         if residual_connection is None and self.config.fp32_residual_connection:
             residual = residual.float()
@@ -1285,7 +1289,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if self._pre_mlp_layernorm_returns_residual:
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
         else:
-            residual = hidden_states if residual_connection is None else connection_state[0]
+            residual = (
+                hidden_states
+                if residual_connection is None
+                else residual_connection.residual_stream(connection_state)
+            )
 
         if residual_connection is None and self.config.fp32_residual_connection:
             residual = residual.float()

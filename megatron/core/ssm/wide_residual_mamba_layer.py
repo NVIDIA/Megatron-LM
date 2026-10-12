@@ -108,7 +108,7 @@ class WideResidualMambaLayer(MambaLayer):
                 fp32_residual_connection=self.config.fp32_residual_connection,
                 branch_input_dtype=self.config.params_dtype,
             )
-        residual = connection_state[0]
+        residual = self.residual_read.residual_stream(connection_state)
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         if recompute_context is not None and not isinstance(self.norm, IdentityOp):
