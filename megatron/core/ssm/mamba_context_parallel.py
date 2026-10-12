@@ -141,11 +141,19 @@ class MambaContextParallel:
         # either 1 or `ngroups_local_tp // cp_size`
 
     def pre_conv_ssm(
-        self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        input_: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        include_gate: bool = True,
     ) -> torch.Tensor:
-        """Method to be applied before the convolution and SSM"""
+        """Prepare convolution/SSM fields, optionally leaving the gate local.
+
+        With ``include_gate=False``, return only canonical x/B/C/dt. The caller
+        retains the original TP-local gate and applies it after post_conv_ssm.
+        """
         if self.cp_size == 1:
-            return input_
+            return input_ if include_gate else input_[..., self.d_inner_local_tp :]
 
         z, x, B, C, dt = torch.split(
             input_,
@@ -162,7 +170,8 @@ class MambaContextParallel:
         # TODO (duncan): Can the some or all of the all_to_alls be combined?
 
         # [l_global//cp, b, d_inner] -> [l_global, b, d_inner//cp]
-        z = _all_to_all_cp2hp(z, self.cp_group)
+        if include_gate:
+            z = _all_to_all_cp2hp(z, self.cp_group)
 
         # [l_global//cp, b, d_inner] -> [l_global, b, d_inner//cp]
         x = _all_to_all_cp2hp(x, self.cp_group)
@@ -195,7 +204,7 @@ class MambaContextParallel:
         # [l_global//cp, b, nheads] -> [l_global, b, nheads//cp]
         dt = _all_to_all_cp2hp(dt, self.cp_group)
 
-        output = torch.cat([z, x, B, C, dt], dim=-1)
+        output = torch.cat(([z] if include_gate else []) + [x, B, C, dt], dim=-1)
         if not self.sequence_is_contiguous:
             output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
 
