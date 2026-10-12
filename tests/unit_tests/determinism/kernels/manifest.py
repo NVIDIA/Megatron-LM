@@ -221,6 +221,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "in a fixed order; bit-identical to PyTorch's embedding backward followed by main_grad.add_.",
     ),
     KernelEntry(
+        name="fused_moe_residual_add",
+        sources=("megatron/core/fusions/fused_moe_residual_add.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Elementwise with unique stores; bit-identical to the two unfused adds it replaces.",
+    ),
+    KernelEntry(
         name="fused_mla_yarn_rope",
         sources=("megatron/core/fusions/fused_mla_yarn_rope_apply.py",),
         tests=(K + "test_fused_triton_kernels.py",),
@@ -384,6 +391,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
     ),
+    # ---------------------------------------------------------------- Triton config selection
+    KernelEntry(
+        name="triton_autotune_policy",
+        sources=(
+            "megatron/core/tuning/interception.py",
+            "megatron/core/tuning/policy.py",
+            "megatron/core/tuning/selection.py",
+            "megatron/core/tuning/table.py",
+        ),
+        tests=(K + "test_autotune_kernels.py", K + "test_ssm_kernels.py"),
+        kind="dispatch",
+        notes="Bit-exact reduction replay through the Autotuner adapter using min-cost and "
+        "JSON-table choices; every candidate of each config-invariant kernel must give "
+        "bit-identical outputs; SSM replay runs the real SSM autotuners through runtime "
+        "pinning, with autotune caching on and off.",
+    ),
     # ---------------------------------------------------------------- SSM
     KernelEntry(
         name="ssm_causal_conv1d",
@@ -424,7 +447,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
-        notes="determinism.py is the autotune/workspace policy every SSM kernel test runs under.",
+        notes="determinism.py provides ordered workspaces and re-exports the shared tuning "
+        "policy; SSM replay checks that runtime pinning covers the module-level autotuners, "
+        "with Triton's autotune cache enabled and disabled.",
     ),
     KernelEntry(
         name="ssm_gdp_kernels",
@@ -667,6 +692,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
+        name="dsa_indexer_weights_projection",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
+        tests=(K + "test_te_wrappers.py",),
+        kind="dispatch",
+        notes="Dispatches the non-quantized FP32 indexer projection to TE general_gemm when "
+        "supported or FP32 torch.mm otherwise; the replay covers both forward routes and the "
+        "custom-autograd dgrad and wgrad GEMMs.",
+    ),
+    KernelEntry(
         name="fp8_fp4_master_weight_casts",
         sources=(
             "megatron/core/fp8_utils.py",
@@ -693,6 +727,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MXFP8Tensor dispatches the Megatron quantize kernel (replayed: "
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
         "flashinfer on Blackwell and are not replayed in CI.",
+    ),
+    KernelEntry(
+        name="inference_request_seed_sampling",
+        sources=(
+            "megatron/core/inference/sampling/torch_sampling.py",
+            "megatron/core/inference/sampling/request_seed_noise.py",
+        ),
+        tests=(K + "test_request_seed_sampling.py",),
+        kind="triton",
+        training_path=False,
+        notes="Request-local Philox exponential draws replay across batch layouts and "
+        "scalar/batched launches, including under side-stream contention.",
     ),
     KernelEntry(
         name="inference_flashinfer_sampling",

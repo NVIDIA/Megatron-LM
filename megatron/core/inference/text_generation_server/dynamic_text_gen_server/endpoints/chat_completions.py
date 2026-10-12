@@ -48,6 +48,7 @@ from .common import (
     generation_config_sampling_defaults,
     log_sampling_defaults_once,
     resolve_sampling_default,
+    sampling_params_for_choice,
     validate_offload_params,
 )
 
@@ -1218,6 +1219,7 @@ try:
                 stop = [stop]
 
             sampling_params = SamplingParams(
+                seed=req.get("seed"),
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -1260,11 +1262,11 @@ try:
             streams = [
                 client.add_request_streaming(
                     prompt_tokens,
-                    sampling_params,
+                    sampling_params_for_choice(sampling_params, index),
                     multi_modal_data=prepared_multimodal_data,
                     offload_params=offload_params,
                 )
-                for _ in range(n)
+                for index in range(n)
             ]
             chat_parsers = None
             if parsers:
@@ -1329,10 +1331,10 @@ try:
         request_ids = []
         tasks = []
         try:
-            for _ in range(n):
+            for index in range(n):
                 request_id, future = client.add_request_with_id(
                     prompt_tokens,
-                    sampling_params,
+                    sampling_params_for_choice(sampling_params, index),
                     multi_modal_data=prepared_multimodal_data,
                     offload_params=offload_params,
                 )
