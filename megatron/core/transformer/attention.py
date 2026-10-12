@@ -131,12 +131,10 @@ try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
 
     HAVE_FUSED_QKV_ROPE = True
-    HAVE_FUSED_QKV_ROPE_FP8_ATTENTION = (
-        "defer_for_fp8_attention" in inspect.signature(apply_fused_qkv_rotary_pos_emb).parameters
-    )
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
-    HAVE_FUSED_QKV_ROPE_FP8_ATTENTION = False
+
+from megatron.core.fusions.fused_qkv_rope_fp8 import fused_qkv_rope_fp8_quantize
 
 
 class LinearQkvInterface(Protocol):
@@ -1610,26 +1608,24 @@ class Attention(MegatronModule, ABC):
                         max_seqlen=rope_freqs_max_seqlen,
                     )
             else:
-                # The FP8 attention fusion hands TE placeholders that its core attention fills
-                # (or fuses with the FP8 quantization), so they must not be offloaded or
-                # recomputed from.
-                defer_for_fp8_attention = (
+                # With FP8 current-scaling attention, rotate and quantize Q/K/V in one fused kernel
+                # and hand FP8 tensors to core attention. Checkpointed or offloaded core attention
+                # is left on the regular path.
+                fp8_qkv = None
+                if (
                     self.config.fused_qkv_rope_fp8_attention
+                    and self.config.context_parallel_size == 1
                     and not (self.checkpoint_core_attention and self.training)
                     and not (self.offload_core_attention and self.training)
-                )
-                if defer_for_fp8_attention:
-                    assert HAVE_FUSED_QKV_ROPE_FP8_ATTENTION, (
-                        "fused_qkv_rope_fp8_attention requires a TransformerEngine version whose "
-                        "apply_fused_qkv_rotary_pos_emb supports defer_for_fp8_attention."
-                    )
-                    query, key, value = apply_fused_qkv_rotary_pos_emb(
-                        mixed_qkv,
-                        q_pos_emb,
-                        k_pos_emb,
-                        qkv_split_arg_list,
-                        defer_for_fp8_attention=True,
-                    )
+                    and hasattr(self.core_attention, "fused_qkv_rope_fp8_quantizer")
+                ):
+                    qkv_quantizer = self.core_attention.fused_qkv_rope_fp8_quantizer()
+                    if qkv_quantizer is not None:
+                        fp8_qkv = fused_qkv_rope_fp8_quantize(
+                            mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list, qkv_quantizer
+                        )
+                if fp8_qkv is not None:
+                    query, key, value = fp8_qkv
                 else:
                     query, key, value = apply_fused_qkv_rotary_pos_emb(
                         mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list

@@ -2307,6 +2307,44 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+    def fused_qkv_rope_fp8_quantizer(self):
+        """The QKV quantizer if this layer will run FP8 current-scaling fused attention, else None.
+
+        Only then can the caller fuse RoPE with the e4m3 quantization of Q/K/V and pass the FP8
+        tensors in (their gradients come back in bf16, see ``forward``). Builds TE's FP8
+        metadata the same way ``forward`` would, so it is safe to call before the first forward.
+        """
+        te_forward_params = inspect.signature(te.pytorch.DotProductAttention.forward).parameters
+        if not (
+            "bf16_backward" in te_forward_params
+            and FP8GlobalStateManager.is_fp8_enabled()
+            and int(os.getenv("NVTE_FP8_DPA_BWD", "1"))
+        ):
+            return None
+        if not getattr(self, "fp8_initialized", False):
+            self.init_fp8_metadata(num_gemms=3)
+        if not self.fp8_meta["recipe"].fp8_dpa:
+            return None
+        # pylint: disable=import-outside-toplevel
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import META_QKV
+        from transformer_engine.pytorch.constants import DType
+        from transformer_engine.pytorch.tensor.float8_tensor import Float8CurrentScalingQuantizer
+
+        quantizers = self.quantizers.get("scaling_fwd", ())
+        if len(quantizers) <= META_QKV:
+            return None
+        quantizer = quantizers[META_QKV]
+        if (
+            type(quantizer) is Float8CurrentScalingQuantizer
+            and quantizer.dtype == DType.kFloat8E4M3
+            and not quantizer.with_amax_reduction
+        ):
+            # the usage TE's forward sets for the attention inputs (rowwise only)
+            quantizer.internal = False
+            quantizer.set_usage(rowwise=True, columnwise=False)
+            return quantizer
+        return None
+
     def forward(
         self,
         query: Tensor,
@@ -2320,6 +2358,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
+        # Q/K/V quantized by the caller (fused RoPE + FP8 quantize): TE returns FP8 gradients for
+        # FP8 inputs unless asked not to, but the producer's backward expects bf16.
+        if bf16_backward is None and hasattr(query, "_scale_inv"):
+            bf16_backward = True
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
