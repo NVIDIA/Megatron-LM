@@ -302,7 +302,7 @@ _RESIDUAL_STATE_PREFIXES = tuple(
 )
 
 
-def _load_residual_state(
+def load_residual_state(
     module, state_dict, prefix, local_metadata, strict, missing, unexpected, errors
 ):
     """Accept existing residual model keys with strict loading."""
@@ -378,7 +378,7 @@ class WideResidualTransformerLayer(TransformerLayer):
                     config, self.layer_number, branch_name, mode="write"
                 ),
             )
-        self.register_load_state_dict_pre_hook(_load_residual_state)
+        self.register_load_state_dict_pre_hook(load_residual_state)
         residual_connections = [
             reader
             for reader in (self.residual_read_self_attn, self.residual_read_mlp)
