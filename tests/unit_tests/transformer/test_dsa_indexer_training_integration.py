@@ -59,6 +59,13 @@ def test_dsa_trainability_mode_requires_no_load_optim_for_transitions(monkeypatc
     )
     monkeypatch.setattr(checkpointing, "get_args", lambda: runtime_args)
     monkeypatch.setattr(checkpointing, "get_checkpoint_version", lambda: 3.0)
+    # check_checkpoint_args reads data_parallel_random_init off the run config rather than
+    # args; without a stub get_run_config raises "run config is not initialized."
+    monkeypatch.setattr(
+        checkpointing,
+        "get_run_config",
+        lambda: SimpleNamespace(rng=SimpleNamespace(data_parallel_random_init=False)),
+    )
 
     checkpointing.check_checkpoint_args(SimpleNamespace(**common, dsa_train_indexer_only=True))
     with pytest.raises(AssertionError, match="Use --no-load-optim"):
