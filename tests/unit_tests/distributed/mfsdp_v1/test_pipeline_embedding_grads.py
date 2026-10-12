@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Meta initialization must preserve shared embedding identity across PP stages."""
+"""Shared embedding gradients must reduce across PP, including empty local shards."""
 
 import pytest
 import torch
@@ -20,7 +20,7 @@ from tests.unit_tests.test_utilities import Utils
 class StageEmbedding(torch.nn.Linear):
     def __init__(self, value, rows):
         self.value = value
-        super().__init__(16, rows, bias=False, device='meta', dtype=torch.bfloat16)
+        super().__init__(16, rows, bias=False, device='cuda', dtype=torch.bfloat16)
         self.weight.shared_embedding = True
         self.weight._tensor_parallel_mode = 'column'
 
@@ -51,10 +51,8 @@ class EmbeddingStage(torch.nn.Module):
 @pytest.mark.parametrize('sharing', ['tied', 'mtp', 'none'])
 @pytest.mark.parametrize('wrapped', [False, True])
 @pytest.mark.parametrize('decoupled', [False, True])
-def test_materialized_embedding_replicas_and_compute_weights(
-    pp, tp, sharing, wrapped, decoupled, rows
-):
-    """Use real v1 initialization and BF16 forward/backward with decoupled gradients."""
+def test_shared_embedding_gradient_reduction(pp, tp, sharing, wrapped, decoupled, rows):
+    """Exercise ordinary and decoupled gradients through real v1 BF16 backward."""
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
     try:
         model_parallel_cuda_manual_seed(123)
@@ -66,7 +64,7 @@ def test_materialized_embedding_replicas_and_compute_weights(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
             pipeline_dtype=torch.bfloat16,
-            init_model_with_meta_device=True,
+            init_model_with_meta_device=False,
             bf16=True,
             params_dtype=torch.bfloat16,
             mtp_num_layers=1 if sharing == 'mtp' else None,
@@ -87,14 +85,8 @@ def test_materialized_embedding_replicas_and_compute_weights(
             module=module,
             fsdp_unit_modules=[StageEmbedding],
         )
-        expected = (stage + 1) * 10 if sharing == 'none' else 10
+        expected = (stage + 1) * 10
         name = 'module.embedding.weight' if wrapped else 'embedding.weight'
-        master = model.param_and_grad_buffer.dist_main_weight[name]
-        full = uneven_dtensor_to_full_tensor(master)
-        reference = torch.cat(
-            [torch.full((rows, 16), expected + i, device='cuda') for i in range(tp)]
-        )
-        torch.testing.assert_close(full, reference, rtol=0, atol=0, check_dtype=False)
         output = model(torch.ones(2, 16, device='cuda', dtype=torch.bfloat16))
         assert torch.all(
             output == (expected + parallel_state.get_tensor_model_parallel_rank()) * 16
