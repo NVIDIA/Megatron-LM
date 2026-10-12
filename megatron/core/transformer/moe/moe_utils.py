@@ -133,6 +133,14 @@ def switch_load_balancing_loss_func(
         mask_expanded = padding_mask.unsqueeze(-1)
         probs = probs * mask_expanded
 
+    # An entirely padded MTP depth can have no valid tokens across the reduction
+    # group. Its masked probabilities contribute zero loss; keep normalization
+    # finite so backward does not turn that zero contribution into NaNs.
+    if isinstance(total_num_tokens, torch.Tensor):
+        total_num_tokens = total_num_tokens.clamp(min=1)
+    else:
+        total_num_tokens = max(total_num_tokens, 1)
+
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
@@ -1525,11 +1533,11 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
 
 
 def _deepep_permute_pads_grouped_tensor_input(config: TransformerConfig) -> bool:
-    """Whether DeepEP fused permutation pads input for TE grouped-tensor GEMM."""
+    """Whether DeepEP v1/v2 fused permutation pads input for TE grouped-tensor GEMM."""
     return (
         config.moe_use_grouped_tensor
         and config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "deepep"
+        and config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
         and config.moe_permute_fusion
         and fused_permute_and_pad_with_probs is not None
     )

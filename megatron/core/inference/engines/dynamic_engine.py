@@ -82,7 +82,6 @@ from megatron.core.utils import (
     nvtx_range_push,
     round_up_to_nearest_multiple,
     trace_async_exceptions,
-    unwrap_model,
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
@@ -1021,7 +1020,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
-        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
+        unwrapped = controller._language_model
         mtp_warmup_enabled = (
             controller.num_mtp_depths > 0
             and (controller.num_speculative_tokens or 0) > 0
@@ -1878,7 +1877,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         request_id = request.request_id
-
         if is_resume:
             if request_id not in self.requests or self.get_request(request_id) is not request:
                 raise ValueError(f"Cannot resume unknown request ID {request_id}.")
@@ -1899,6 +1897,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+
+        seed_error = None
+        if request.sampling_params.seed is not None:
+            if self.context.config.sampling_backend != "torch":
+                seed_error = "Request-local seeds require sampling_backend='torch'"
+            elif self.context.config.num_speculative_tokens:
+                seed_error = "Request-local seeds do not yet support speculative decoding"
+            elif "seed" not in self.context.request_metadata:
+                seed_error = "Request-local seeds require seed in request metadata"
+        if seed_error is not None:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(ValueError(seed_error))
 
         assert (
             request.sampling_params.num_tokens_to_generate is None
