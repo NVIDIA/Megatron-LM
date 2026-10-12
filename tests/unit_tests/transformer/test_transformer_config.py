@@ -383,6 +383,110 @@ def test_mxfp8_wire_dtypes_require_op_fuser_grouped_gemm(overrides):
         _make_mxfp8_wire_config(**overrides)
 
 
+def _make_permute_quantize_config(**overrides) -> TransformerConfig:
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        moe_expert_rank_capacity_factor=1.0,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        bf16=True,
+        moe_permute_quantize_fusion=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def _te_has_gather_quantize_mxfp8() -> bool:
+    try:
+        from transformer_engine.pytorch.triton.gather_quantize_mxfp8 import (  # noqa: F401
+            gather_quantize_mxfp8,
+        )
+    except ImportError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(
+    not _te_has_gather_quantize_mxfp8(),
+    reason="needs a Transformer Engine with gather_quantize_mxfp8",
+)
+def test_permute_quantize_fusion_accepts_hybridep_mxfp8_op_fuser_config():
+    config = _make_permute_quantize_config()
+
+    assert config.moe_permute_quantize_fusion
+    assert config.moe_use_grouped_tensor
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (dict(moe_flex_dispatcher_backend="ncclep"), "'hybridep' flex dispatcher"),
+        (
+            dict(moe_token_dispatcher_type="alltoall", moe_flex_dispatcher_backend=None),
+            "'hybridep' flex dispatcher",
+        ),
+        (dict(moe_permute_fusion_into_hybridep=True), "moe_permute_fusion_into_hybridep"),
+        (dict(fp8="hybrid"), "fp8='e4m3'"),
+        (dict(fp8_recipe="tensorwise"), "fp8_recipe='mxfp8'"),
+        (dict(use_transformer_engine_op_fuser=False), "use_transformer_engine_op_fuser"),
+        (dict(moe_grouped_gemm=False), "moe_grouped_gemm"),
+        (dict(moe_expert_rank_capacity_factor=None), "moe_expert_rank_capacity_factor"),
+    ],
+)
+def test_permute_quantize_fusion_rejects_unsupported_configs(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _make_permute_quantize_config(**overrides)
+
+
+def _has_triton() -> bool:
+    from megatron.core.fusions.fused_local_routing_metadata import HAVE_TRITON
+
+    return bool(HAVE_TRITON)
+
+
+@pytest.mark.skipif(
+    not (_te_has_gather_quantize_mxfp8() and _has_triton()),
+    reason="needs a Transformer Engine with gather_quantize_mxfp8 and Triton",
+)
+def test_local_routing_metadata_fusion_accepts_single_rank_permute_quantize_config():
+    config = _make_permute_quantize_config(moe_local_routing_metadata_fusion=True)
+
+    assert config.moe_local_routing_metadata_fusion
+    assert config.expert_model_parallel_size == 1 and config.expert_tensor_parallel_size == 1
+
+
+def test_local_routing_metadata_fusion_requires_permute_quantize_fusion():
+    with pytest.raises(ValueError, match="moe_permute_quantize_fusion"):
+        _make_permute_quantize_config(
+            moe_permute_quantize_fusion=False, moe_local_routing_metadata_fusion=True
+        )
+
+
+@pytest.mark.skipif(
+    not _te_has_gather_quantize_mxfp8(),
+    reason="needs a Transformer Engine with gather_quantize_mxfp8",
+)
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(expert_model_parallel_size=2),
+        dict(tensor_model_parallel_size=2, expert_tensor_parallel_size=2),
+        dict(tensor_model_parallel_size=2),  # expert TP defaults to TP
+    ],
+)
+def test_local_routing_metadata_fusion_rejects_multi_rank_expert_groups(overrides):
+    with pytest.raises(ValueError, match="single-rank expert group"):
+        _make_permute_quantize_config(moe_local_routing_metadata_fusion=True, **overrides)
+
+
 requires_te_2_9 = pytest.mark.skipif(
     not is_te_min_version("2.9.0"), reason="sequence packing requires Transformer Engine >= 2.9.0"
 )

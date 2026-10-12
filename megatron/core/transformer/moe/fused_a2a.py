@@ -275,7 +275,254 @@ try:
 except ImportError:
     HAVE_HYBRIDEP = False
 
+try:
+    from transformer_engine.pytorch import MXFP8Quantizer
+    from transformer_engine.pytorch.constants import TE_DType
+    from transformer_engine.pytorch.triton.gather_quantize_mxfp8 import gather_quantize_mxfp8
+except ImportError:
+    gather_quantize_mxfp8 = None
+
+from megatron.core.fusions.fused_local_routing_metadata import (
+    HAVE_TRITON as HAVE_LOCAL_ROUTING_METADATA,
+)
+from megatron.core.fusions.fused_local_routing_metadata import fused_local_routing_metadata
+
 _hybrid_ep_buffer = None
+
+
+class LocalRoutingHandle(tuple):
+    '''
+    HybridEP dispatch handle whose metadata came from ``fused_local_routing_metadata``; it also
+    carries the permute's row map and padded counts, which the backward pass reuses.
+    '''
+
+    row_to_token: torch.Tensor
+    padded_tokens_per_expert: torch.Tensor
+    permuted_probs: Optional[torch.Tensor]
+
+
+def _accumulate_overflow(over_budget, handle):
+    '''Fold a HybridEP handle's overflow flag into the over_budget accumulator, if one is given.'''
+    if over_budget is not None:
+        over_budget |= handle[-1] != 0
+
+
+def _dense_rows_to_tokens(dense_to_expert_map, num_dense_tokens, probs, num_permuted_tokens):
+    '''
+    Invert HybridEP's dense_to_expert_map: the source token of every permuted row (-1 on
+    padding rows) and, when probs are given, the probabilities in permuted order (0 on padding
+    rows). Sync-free: entries without a row scatter into a spare slot that is sliced off.
+    '''
+    assert dense_to_expert_map.dtype == torch.int32
+    num_rows, num_experts = dense_to_expert_map.shape
+    device = dense_to_expert_map.device
+    tokens = torch.arange(num_rows, dtype=torch.int32, device=device)
+    valid = (dense_to_expert_map >= 0) & (tokens[:, None] < num_dense_tokens)
+    rows = torch.where(valid, dense_to_expert_map, num_permuted_tokens).long()
+    row_to_token = torch.full((num_permuted_tokens + 1,), -1, dtype=torch.int32, device=device)
+    row_to_token.scatter_(
+        0, rows.reshape(-1), tokens[:, None].expand(num_rows, num_experts).reshape(-1)
+    )
+    permuted_probs = None
+    if probs is not None:
+        permuted_probs = torch.zeros(num_permuted_tokens + 1, dtype=torch.float32, device=device)
+        permuted_probs.scatter_(0, rows[: probs.shape[0]].reshape(-1), probs.reshape(-1))
+        permuted_probs = permuted_probs[:num_permuted_tokens]
+    return row_to_token[:num_permuted_tokens], permuted_probs
+
+
+if HAVE_HYBRIDEP:
+
+    class HybridEPQuantizePermuteBuffer(HybridEPBuffer):
+        '''
+        HybridEP buffer of a single-rank group whose permutes quantize the rows to MXFP8.
+
+        On one rank the dispatch is a self-permutation: every token row is copied into its
+        expert slots and the slots of each expert are padded. This buffer keeps HybridEP's
+        metadata preprocessing and its combine, and replaces the dispatch copy and the permute
+        of ``dispatch_with_permute`` with one gather that writes the GroupedTensor the
+        Transformer Engine grouped MLP consumes (rowwise and columnwise MXFP8 data with
+        GEMM-swizzled scales), so the grouped MLP does not quantize the permuted rows again.
+        The backward permute of the expert-output gradient keeps the gathered BF16 rows as
+        well, for the fc2 bias gradient.
+        '''
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            assert self.group_size == 1, "the quantizing permute is a single-rank self-permutation"
+            self.quantizer = MXFP8Quantizer(
+                TE_DType[torch.float8_e4m3fn], rowwise=True, columnwise=True
+            )
+            self.quantizer.optimize_for_gemm = True
+
+        def dispatch_with_permute(self, local_routing_metadata=False, over_budget=None, **kwargs):
+            '''
+            HybridEP's dispatch_with_permute with the permuted rows quantized: the dispatched
+            tokens are a GroupedTensor (with the BF16 rows kept when a handle is given, i.e. in
+            the backward pass). Falls back to HybridEP's own permute for what the gather does
+            not cover (fused permute-dispatch, scaling factors, non-BF16 rows, no static
+            number of permuted tokens, a pad multiple that is not a multiple of 128).
+
+            With ``local_routing_metadata`` the forward pass builds the routing metadata from
+            the local routing map with ``fused_local_routing_metadata`` instead of HybridEP's
+            cross-rank planner, and the backward pass reuses the permute's row map and padded
+            counts stashed on the handle. ``over_budget``, if given, is OR-ed with the
+            overflow flag of the metadata, whichever path produced it.
+            '''
+            hidden = kwargs["hidden"]
+            handle = kwargs.get("handle")
+            pad_multiple = kwargs.get("pad_multiple")
+            num_permuted_tokens = kwargs.get("num_permuted_tokens")
+            if (
+                kwargs.get("fuse_permute_dispatch")
+                or kwargs.get("scaling_factor") is not None
+                or hidden.dtype != torch.bfloat16
+                or not pad_multiple
+                or pad_multiple % 128
+                or num_permuted_tokens is None
+                or num_permuted_tokens % 128
+            ):
+                dispatched = super().dispatch_with_permute(**kwargs)
+                _accumulate_overflow(over_budget, dispatched[4])
+                return dispatched
+            is_backward = handle is not None
+            hidden = hidden.contiguous()
+            num_tokens, hidden_dim = hidden.shape
+            probs = row_to_token = permuted_probs = padded_tokens_per_expert = None
+            if is_backward:
+                if isinstance(handle, LocalRoutingHandle):
+                    row_to_token = handle.row_to_token
+                    padded_tokens_per_expert = handle.padded_tokens_per_expert
+            else:
+                # HybridEP's own prologue of dispatch_with_permute, up to the metadata.
+                topk, routing_data, probs, _ = self._prepare_routing_data(
+                    topk_idx=None,
+                    topk_weights=None,
+                    num_of_tokens=num_tokens,
+                    num_of_experts=None,
+                    probs=kwargs["probs"],
+                    routing_map=kwargs["routing_map"],
+                    num_of_experts_per_rank=kwargs["num_of_experts_per_rank"],
+                )
+                num_token_slots = self._resolve_token_slots(
+                    kwargs.get("num_of_tokens_per_rank"), num_tokens
+                )
+                config = self.update_template_config(
+                    hidden_dim=hidden_dim,
+                    num_of_tokens_per_rank=num_token_slots,
+                    num_local_experts=kwargs["num_of_experts_per_rank"],
+                    pad_multiple=pad_multiple,
+                    use_fp8=kwargs.get("use_fp8"),
+                    fuse_permute_dispatch=False,
+                    topk=topk,
+                )
+                if local_routing_metadata and topk == 0 and HAVE_LOCAL_ROUTING_METADATA:
+                    handle = self._local_routing_handle(
+                        routing_data,
+                        probs,
+                        config,
+                        num_tokens,
+                        num_token_slots,
+                        num_permuted_tokens,
+                        pad_multiple,
+                        over_budget,
+                    )
+                    row_to_token = handle.row_to_token
+                    padded_tokens_per_expert = handle.padded_tokens_per_expert
+                    permuted_probs = handle.permuted_probs
+                else:
+                    routing_data = self._pad_routing_rows(routing_data, topk, num_token_slots)
+                    handle_impl = self.runtime.metadata_preprocessing(
+                        config=config,
+                        routing_map=routing_data,
+                        num_of_tokens_per_rank=num_token_slots,
+                        num_of_valid_tokens=num_tokens,
+                        num_permuted_tokens=num_permuted_tokens,
+                        pad_multiple=pad_multiple,
+                        enable_permute=True,
+                        fuse_permute_dispatch=False,
+                        non_blocking=True,
+                    )
+                    handle = (
+                        handle_impl.sparse_to_dense_map,
+                        handle_impl.rdma_to_attn_map,
+                        handle_impl.attn_to_rdma_map,
+                        handle_impl.num_dispatched_tokens_tensor,
+                        handle_impl.local_expert_routing_map,
+                        handle_impl.dense_chunk_layout,
+                        handle_impl.dense_to_expert_map,
+                        handle_impl.tokens_per_expert,
+                        handle_impl.num_of_tokens_per_rank,
+                        handle_impl.config,
+                        handle_impl.num_of_valid_tokens,
+                        handle_impl.overflow_flag,
+                    )
+                    _accumulate_overflow(over_budget, handle)
+            if row_to_token is None:
+                # handle[5] / handle[6]: dense_chunk_layout / dense_to_expert_map.
+                row_to_token, permuted_probs = _dense_rows_to_tokens(
+                    handle[6], handle[5][-1], probs, num_permuted_tokens
+                )
+            if padded_tokens_per_expert is None:
+                tokens_per_expert = handle[7].to(torch.int64)  # handle[7]: tokens_per_expert
+                padded_tokens_per_expert = (tokens_per_expert + pad_multiple - 1) // pad_multiple
+                padded_tokens_per_expert *= pad_multiple
+            dispatched = gather_quantize_mxfp8(
+                hidden,
+                row_to_token,
+                padded_tokens_per_expert,
+                self.quantizer,
+                keep_high_precision=is_backward,
+            )
+            return dispatched, permuted_probs, None, padded_tokens_per_expert, handle
+
+        def _local_routing_handle(
+            self,
+            routing_map,
+            probs,
+            config,
+            num_tokens,
+            num_token_slots,
+            num_permuted_tokens,
+            pad_multiple,
+            over_budget,
+        ):
+            '''
+            The dispatch handle of a single-rank group from the local routing map: HybridEP's
+            metadata preprocessing (routing-map all-gather, scan and padding kernels) replaced
+            by one fused kernel. ``local_expert_routing_map`` is not written by HybridEP's
+            permuting preprocessing either and stays empty.
+            '''
+            metadata = fused_local_routing_metadata(
+                routing_map,
+                probs,
+                num_token_slots,
+                num_permuted_tokens,
+                pad_multiple,
+                config.num_of_tokens_per_chunk_preprocessing_api,
+                over_budget,
+            )
+            num_experts = routing_map.shape[1]
+            handle = LocalRoutingHandle(
+                (
+                    metadata.sparse_to_dense_map,
+                    metadata.rdma_to_attn_map,
+                    routing_map.new_empty((num_token_slots, 0)),
+                    metadata.num_dispatched_tokens,
+                    routing_map.new_empty((0, num_experts)),
+                    metadata.dense_chunk_layout,
+                    metadata.dense_to_expert_map,
+                    metadata.tokens_per_expert,
+                    num_token_slots,
+                    config,
+                    num_tokens,
+                    metadata.overflow_flag,
+                )
+            )
+            handle.row_to_token = metadata.row_to_token
+            handle.padded_tokens_per_expert = metadata.padded_tokens_per_expert
+            handle.permuted_probs = metadata.permuted_probs
+            return handle
 
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
@@ -293,6 +540,7 @@ def init_hybrid_ep_buffer(
     num_blocks_unpermute: Optional[int] = None,
     fp8_dispatch: bool = False,
     num_sms_preprocessing_api: Optional[int] = None,
+    permute_quantize: bool = False,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -323,8 +571,16 @@ def init_hybrid_ep_buffer(
             Whether to use FP8 communication during the dispatch phase.
         num_sms_preprocessing_api (Optional[int]):
             Number of SMs used by the preprocessing (metadata scan) kernel.
+        permute_quantize (bool):
+            Whether the permutes of a single-rank group quantize the rows to MXFP8 for the
+            Transformer Engine grouped MLP (``HybridEPQuantizePermuteBuffer``).
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
+    if permute_quantize and gather_quantize_mxfp8 is None:
+        raise ImportError(
+            "The quantizing HybridEP permute requires a Transformer Engine with "
+            "gather_quantize_mxfp8."
+        )
     global _hybrid_ep_buffer
     kwargs = {}
     if num_sms_dispatch_api is not None:
@@ -337,7 +593,8 @@ def init_hybrid_ep_buffer(
         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
     if num_sms_preprocessing_api is not None:
         kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
-    _hybrid_ep_buffer = HybridEPBuffer(
+    buffer_cls = HybridEPQuantizePermuteBuffer if permute_quantize else HybridEPBuffer
+    _hybrid_ep_buffer = buffer_cls(
         group=group,
         hidden_dim=hidden_dim,
         max_num_of_tokens_per_rank=num_tokens,
@@ -376,6 +633,9 @@ class HybridEPDispatch(torch.autograd.Function):
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        permute_quantize=False,
+        local_routing_metadata=False,
+        over_budget=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -411,6 +671,13 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_unpermute,
                 fp8_dispatch,
                 num_sms_preprocessing_api,
+                permute_quantize,
+            )
+        if isinstance(_hybrid_ep_buffer, HybridEPQuantizePermuteBuffer) != permute_quantize:
+            raise RuntimeError(
+                "The HybridEP buffer was initialized with permute_quantize="
+                f"{not permute_quantize}; every MoE layer of a process must agree "
+                "(reset_hybrid_ep_buffer() between configurations)."
             )
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
@@ -432,6 +699,11 @@ class HybridEPDispatch(torch.autograd.Function):
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
             **({"fuse_permute_dispatch": fused} if fused else {}),
+            **(
+                {"local_routing_metadata": True, "over_budget": over_budget}
+                if local_routing_metadata
+                else {}
+            ),
         )
 
         ctx.handle = handle
@@ -462,6 +734,9 @@ class HybridEPDispatch(torch.autograd.Function):
             combined_hidden,
             None,
             combined_probs,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -532,6 +807,9 @@ if HAVE_HYBRIDEP:
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        permute_quantize=False,
+        local_routing_metadata=False,
+        over_budget=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -565,6 +843,17 @@ if HAVE_HYBRIDEP:
                 is performed.
             num_sms_preprocessing_api (int):
                 Number of SMs used by the preprocessing (metadata scan) kernel.
+            permute_quantize (bool):
+                On a single-rank group, quantize the permuted rows to MXFP8 for the
+                Transformer Engine grouped MLP instead of permuting them in BF16; the
+                dispatched tokens are then a GroupedTensor. Requires num_permuted_tokens and a
+                pad_multiple that is a multiple of 128.
+            local_routing_metadata (bool):
+                With permute_quantize, build the routing metadata from the local routing map
+                with one fused kernel instead of HybridEP's cross-rank planner.
+            over_budget (Optional[torch.Tensor]):
+                [1] bool accumulator OR-ed in place with the overflow flag of the metadata
+                when local_routing_metadata is set.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -580,6 +869,9 @@ if HAVE_HYBRIDEP:
             num_permuted_tokens,
             pad_multiple,
             num_sms_preprocessing_api,
+            permute_quantize,
+            local_routing_metadata,
+            over_budget,
         )
 
     @internal_api

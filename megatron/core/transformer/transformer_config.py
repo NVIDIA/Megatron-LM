@@ -1089,6 +1089,26 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_permute_quantize_fusion: bool = False
+    """Quantize the expert inputs to MXFP8 inside the HybridEP token permute, writing the grouped
+    operand of the Transformer Engine grouped MLP directly (rowwise and columnwise data with
+    GEMM-swizzled scales), and the expert-output gradient likewise in the backward pass, so the
+    grouped MLP does not quantize the permuted rows again and HybridEP's dispatch copy and BF16
+    permute disappear. Only a single-rank expert group (EP=1 with expert TP=1) is a
+    self-permutation that can be fused; larger groups keep HybridEP's BF16 permute. Requires the
+    'hybridep' flex dispatcher without moe_permute_fusion_into_hybridep, fp8='e4m3' with
+    fp8_recipe='mxfp8', use_transformer_engine_op_fuser with moe_grouped_gemm,
+    moe_expert_rank_capacity_factor and a Transformer Engine with gather_quantize_mxfp8."""
+
+    moe_local_routing_metadata_fusion: bool = False
+    """Build the HybridEP routing metadata of a single-rank expert group from the local routing
+    map with one fused kernel (per-expert token counts and padded counts, the dense token and
+    chunk layouts, the permute's row map and permuted probabilities, the overflow flag) instead
+    of HybridEP's cross-rank planner (routing-map all-gather, scan and padding kernels) and the
+    separate row-map and padded-count ops of the quantizing permute; the backward pass reuses
+    the forward's row map. Requires moe_permute_quantize_fusion, a single-rank expert group
+    (expert_model_parallel_size 1 and expert_tensor_parallel_size 1) and Triton."""
+
     moe_ncclep_zero_copy: bool = False
     """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
     (ep_bootstrap zero_copy + symm-mem-backed receive/combine buffers) instead of the default HBM
@@ -2139,6 +2159,60 @@ class TransformerConfig(ModelParallelConfig):
                     "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
                     "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
                 )
+
+        if self.moe_permute_quantize_fusion:
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend != "hybridep"
+            ):
+                raise ValueError(
+                    "moe_permute_quantize_fusion requires the 'hybridep' flex dispatcher backend."
+                )
+            if self.moe_permute_fusion_into_hybridep:
+                raise ValueError(
+                    "moe_permute_quantize_fusion is incompatible with "
+                    "moe_permute_fusion_into_hybridep."
+                )
+            if self.fp8 != "e4m3" or self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "moe_permute_quantize_fusion requires fp8='e4m3' with fp8_recipe='mxfp8'."
+                )
+            if not (self.use_transformer_engine_op_fuser and self.moe_grouped_gemm):
+                raise ValueError(
+                    "moe_permute_quantize_fusion requires use_transformer_engine_op_fuser and "
+                    "moe_grouped_gemm: only the fused grouped MLP consumes the pre-quantized "
+                    "GroupedTensor."
+                )
+            if self.moe_expert_rank_capacity_factor is None:
+                raise ValueError(
+                    "moe_permute_quantize_fusion requires moe_expert_rank_capacity_factor, which "
+                    "fixes the number of permuted tokens."
+                )
+            try:
+                from transformer_engine.pytorch.triton.gather_quantize_mxfp8 import (  # noqa: F401
+                    gather_quantize_mxfp8,
+                )
+            except ImportError as e:
+                raise ValueError(
+                    "moe_permute_quantize_fusion requires a Transformer Engine with "
+                    "gather_quantize_mxfp8."
+                ) from e
+
+        if self.moe_local_routing_metadata_fusion:
+            if not self.moe_permute_quantize_fusion:
+                raise ValueError(
+                    "moe_local_routing_metadata_fusion requires moe_permute_quantize_fusion: it "
+                    "builds the metadata of the quantizing HybridEP permute."
+                )
+            if self.expert_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+                raise ValueError(
+                    "moe_local_routing_metadata_fusion requires a single-rank expert group "
+                    "(expert_model_parallel_size=1 and expert_tensor_parallel_size=1)."
+                )
+            from megatron.core.fusions.fused_local_routing_metadata import HAVE_TRITON
+
+            if not HAVE_TRITON:
+                raise ValueError("moe_local_routing_metadata_fusion requires Triton.")
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")

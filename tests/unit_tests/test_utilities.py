@@ -100,6 +100,17 @@ def is_op_fuser_available():
     return is_te_min_version("2.14.0")
 
 
+def is_permute_quantize_fusion_available():
+    """moe_permute_quantize_fusion needs a TE build with the gather + MXFP8 group quantize kernel."""
+    try:
+        from transformer_engine.pytorch.triton.gather_quantize_mxfp8 import (  # noqa: F401
+            gather_quantize_mxfp8,
+        )
+    except ImportError:
+        return False
+    return True
+
+
 def is_nccl_ep_fp8_dispatch_available():
     """MXFP8 wire dtypes need a TE build whose EpBuffer takes the quant recipes AND that returns
     the plain-tensor MXFP8 carrier (mxfp8_carrier_to_grouped, TE PR #3355 -- older quant-recipe
