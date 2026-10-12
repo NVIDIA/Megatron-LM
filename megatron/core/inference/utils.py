@@ -26,7 +26,8 @@ def detokenize_tokens(
     Args:
         tokenizer: Tokenizer that supplies ``detokenize`` and optionally ``eod``.
         tokens: Token IDs to detokenize.
-        remove_EOD: Remove trailing EOD tokens before detokenization.
+        remove_EOD: Remove trailing end-of-sequence tokens before detokenization: every id in
+            ``model_eos_token_ids``, which also stops generation.
         skip_special_tokens: Pass special-token removal through when supported.
 
     Returns:
@@ -35,8 +36,9 @@ def detokenize_tokens(
     if not tokens:
         return ""
 
-    if remove_EOD and getattr(tokenizer, "eod", None) is not None:
-        while tokens and tokens[-1] == tokenizer.eod:
+    if remove_EOD:
+        eos_token_ids = model_eos_token_ids(tokenizer)
+        while tokens and tokens[-1] in eos_token_ids:
             tokens = tokens[:-1]
     if not tokens:
         return ""
@@ -44,6 +46,17 @@ def detokenize_tokens(
     if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
         return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
     return tokenizer.detokenize(tokens)
+
+
+def get_language_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the language model: the one a multimodal wrapper holds, or the model itself.
+
+    Multimodal wrappers (e.g. LLaVAModel) keep the language model under ``language_model``.
+    Inference code that reads language-model state (vocab size, MTP block, embedding) resolves
+    it here rather than checking for a specific wrapper class.
+    """
+    language_model = getattr(model, "language_model", None)
+    return model if language_model is None else language_model
 
 
 def model_eos_token_ids(tokenizer: Any) -> frozenset:

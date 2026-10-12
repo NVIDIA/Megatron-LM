@@ -120,6 +120,26 @@ def test_owned_engine_command_targets_megatron_only_service():
     assert command[-4:] == ["--load", "/checkpoints/model", "--tensor-model-parallel-size", "2"]
 
 
+def test_engine_service_initializes_config_before_megatron(monkeypatch):
+    args, config = object(), object()
+    build_config = MagicMock(return_value=config)
+    set_config, runtime_services = MagicMock(), MagicMock()
+    monkeypatch.setattr(engine_service, "parse_and_validate_args", lambda **kwargs: args)
+    monkeypatch.setattr(engine_service, "inference_cfg_container_from_args", build_config)
+    monkeypatch.setattr(engine_service, "set_run_config", set_config)
+    monkeypatch.setattr(engine_service, "initialize_runtime_services", runtime_services)
+
+    def initialize():
+        build_config.assert_called_once_with(args, build_model_config=False)
+        set_config.assert_called_once_with(config)
+        runtime_services.assert_called_once_with(args)
+        raise RuntimeError("initialization reached")
+
+    monkeypatch.setattr(engine_service, "initialize_megatron", initialize)
+    with pytest.raises(RuntimeError, match="initialization reached"):
+        engine_service.main()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "role,backend",

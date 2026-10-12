@@ -18,7 +18,9 @@ from megatron.inference.integrations.dynamo.telemetry import EngineEventReporter
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 
 
@@ -78,9 +80,11 @@ async def _serve() -> None:
 
 
 def main() -> None:
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=_extra_args, args_defaults={"no_load_rng": True, "no_load_optim": True}
     )
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
     initialize_megatron()
     try:
         with torch.inference_mode():

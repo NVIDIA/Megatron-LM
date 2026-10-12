@@ -25,6 +25,7 @@ from megatron.core.transformer.cuda_graph_config import (
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.tuning import AutotunePolicy
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
@@ -52,6 +53,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     # Standard arguments.
     parser = _add_network_size_args(parser)
     parser = _add_wide_residual_args(parser)
+    parser = _add_triton_autotune_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
     parser = _add_rl_args(parser)
@@ -146,6 +148,12 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     # Experimental yaml
     if args.yaml_cfg is not None:
+        cli_policy = _default_config_from_args(AutotunePolicy, args, prefix='triton_autotune')
+        if cli_policy != AutotunePolicy():
+            raise ValueError(
+                'Triton autotune CLI arguments cannot be combined with --yaml-cfg; '
+                'set triton_autotune in the YAML configuration instead.'
+            )
         if _wide_residual_config_from_args(args) is not None:
             raise ValueError(
                 'Wide-residual CLI arguments cannot be combined with --yaml-cfg because '
@@ -473,70 +481,10 @@ def validate_args(args, defaults={}):
     )
     args.data_parallel_size = args.world_size // total_model_size
 
-    from megatron.training.config import RLConfig
+    from megatron.training.config import InferenceSetupConfig, RLConfig
 
     rl_cfg = _default_config_from_args(RLConfig, args)
-    args.rl_generation_lag = rl_cfg.rl_generation_lag
-    args.grpo_samples_per_iteration = rl_cfg.grpo_samples_per_iteration
-
-    if args.perform_rl_step:
-        # ----------------------------------------------------------------
-        # CUDA graphs
-        #
-        #   --cuda-graph-impl controls whether CUDA graphs are built.
-        #   The sweep of various inference CUDA graphs is built inside inference, not the RL loop.
-        #   Both training and inference CUDA graphs are gated by this flag.
-        #
-        #   --rl-training-cuda-graphs controls whether CUDA graphs are used during training.
-        #   Toggling CUDA graphs on and off is done inside the RL loop.
-        #
-        #   --rl-persist-cuda-graphs controls whether CUDA graphs are built once, or repeatedly.
-        #   When this flag is True, inference requires static memory pointers for the KV cache.
-        #   When this flag is False, inference is in charge of deleting/rebuilding CUDA graphs.
-        #
-        # KV cache management (--rl-kv-cache-management-mode)
-        #
-        #   Inference initializes the KV cache, inside either a normal memory pool, UVM, or TMS.
-        #
-        #   On suspend (inference -> training):
-        #     "persist"   — no-op; KV cache stays on GPU.
-        #     "offload"   — KV cache is offloaded to CPU.
-        #     "recompute" — KV cache is deleted entirely.
-        #
-        #   On resume (training → inference):
-        #     "persist"   — no-op; KV cache is already on GPU.
-        #     "offload"   — KV cache is restored from CPU.
-        #     "recompute" — KV cache is recomputed from scratch.
-        # ----------------------------------------------------------------
-
-        # Persisting CGs only makes sense if we build any CGs.
-        assert not args.rl_persist_cuda_graphs or args.cuda_graph_impl != "none", (
-            "--rl-persist-cuda-graphs is set but no CUDA graphs are being built."
-        )
-        # Training CGs only makes sense if we build any CGs.
-        assert not args.rl_training_cuda_graphs or args.cuda_graph_impl != "none", (
-            "--rl-training-cuda-graphs is set but no CUDA graphs are being built."
-        )
-        # If CUDA graphs persist and KV cache memory address is not static, we need
-        # either UVM or torch_memory_saver to maintain memory address stability for CGs.
-        if args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode != "persist":
-            try:
-                from torch_memory_saver import torch_memory_saver
-            except ImportError:
-                assert args.inference_dynamic_batching_unified_memory_level > 0, (
-                    "Persisting CUDA graphs requires static KV cache memory. Use "
-                    "--rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
-                )
-
-        # There's no need to manually offload the KV cache with UVM.
-        assert not (
-            args.inference_dynamic_batching_unified_memory_level > 0
-            and args.rl_kv_cache_management_mode == "offload"
-        ), "--rl-kv-cache-management-mode=offload is incompatible with UVM"
-
-        if args.rl_use_sequence_packing:
-            assert args.micro_batch_size == 1, \
-                "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
+    _default_config_from_args(InferenceSetupConfig, args).validate()
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '
@@ -692,25 +640,6 @@ def validate_args(args, defaults={}):
         f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
         f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})" \
         f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
-
-    if args.perform_rl_step:
-        num_generated_samples_per_inference_iteration = (
-            args.grpo_samples_per_iteration * args.grpo_iterations)
-
-        # Ensure that the number of prompts we collect is a multiple of the global batch size.
-        assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
-            f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
-
-        # For now only exit/checkpoint on iterations where we generate data. We don't currently
-        # have a way to checkpoint the generated data.
-        num_training_iterations_per_inference_iteration = (
-            num_generated_samples_per_inference_iteration // args.global_batch_size)
-        if args.exit_interval is not None:
-            assert args.exit_interval % num_training_iterations_per_inference_iteration == 0, \
-                f"exit_interval should be divisible by number of global batches per inference iteration."
-        if args.save_interval is not None:
-            assert args.save_interval % num_training_iterations_per_inference_iteration == 0, \
-                f"save_interval should be divisible by number of global batches per inference iteration."
 
     # === Hybrid layer pattern: deprecation handling and validation ===
 
@@ -1057,6 +986,10 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
             '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
+    if args.fp4_param_gather:
+        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
+            '--fp4-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
+
     # FP4 and FP8 are mutually exclusive
     if args.fp4 and args.fp8:
         raise ValueError("--fp4-format and --fp8-format cannot be used simultaneously. Please choose one.")
@@ -1401,7 +1334,7 @@ def validate_args(args, defaults={}):
 
     if args.hybrid_context_parallel:
         assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
-        assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
+        assert args.cuda_graph_impl == "none", 'Hybrid context parallelism not supported with CUDA Graph'
         assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
@@ -1928,10 +1861,15 @@ def validate_args(args, defaults={}):
     if args.skip_train and not args.perform_rl_step and not args.no_load_optim:
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
-    if args.skip_train and args.perform_rl_step and args.no_load_optim and args.rl_offload_optimizer_during_inference:
-        assert False, \
-            '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
-            '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
+    rl_cfg.validate_run(
+        cuda_graph_impl=args.cuda_graph_impl,
+        micro_batch_size=args.micro_batch_size,
+        global_batch_size=args.global_batch_size,
+        skip_train=args.skip_train,
+        load_optim=not args.no_load_optim,
+        save_interval=args.save_interval,
+        exit_interval=args.exit_interval,
+    )
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -2213,6 +2151,21 @@ def _add_inference_args(parser):
                        '1) allocate `memory_buffer` in unified memory. '
                        'Eventually, additional levels will be included to '
                        'control other tensors within the context.')
+    group.add_argument('--inference-kv-cache-management-mode', '--rl-kv-cache-management-mode',
+                       dest='kv_cache_management_mode',
+                       type=str, default='persist', choices=['persist', 'offload', 'recompute'],
+                       help='What the engine does with the KV cache while it is suspended: '
+                       'persist keeps it on GPU, offload moves it to CPU and restores it on '
+                       'resume, recompute frees it and recomputes it on resume. '
+                       '--rl-kv-cache-management-mode is the deprecated spelling.')
+    group.add_argument('--inference-static-kv-memory-pointers', '--rl-persist-cuda-graphs',
+                       dest='static_kv_memory_pointers',
+                       action=argparse.BooleanOptionalAction, default=False,
+                       help='Keep the KV cache at fixed device addresses across suspend/resume so '
+                       'CUDA graphs that reference it stay valid and are not recaptured. Requires '
+                       'UVM or torch_memory_saver unless the cache persists on GPU. '
+                       '--rl-persist-cuda-graphs / --no-rl-persist-cuda-graphs are the deprecated '
+                       'spellings.')
     group.add_argument('--enable-chunked-prefill', dest='enable_chunked_prefill',
                        action='store_true', default=False,
                        help="Enable chunked prefill (disabled by default)")
@@ -2566,6 +2519,41 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.')
+    return parser
+
+
+def _parse_triton_autotune_block_size(value):
+    """Parse a named Triton block-size override for the nested policy."""
+    name, separator, size = value.partition('=')
+    if separator and name.startswith('BLOCK') and name.isidentifier():
+        try:
+            size = int(size)
+        except ValueError:
+            pass
+        else:
+            if size > 0:
+                return name, size
+    raise argparse.ArgumentTypeError(
+        f'Invalid block size {value!r}; expected BLOCK_NAME=positive_integer.'
+    )
+
+
+def _add_triton_autotune_args(parser):
+    """Add CLI controls for the process-wide Triton autotune policy."""
+    autotune_factory = ArgumentGroupFactory(
+        AutotunePolicy, exclude=['block_sizes'], prefix='triton_autotune'
+    )
+    group = autotune_factory.build_group(parser, title='Triton autotune policy')
+    # NAME=VALUE pairs cannot be inferred from the field type.
+    group.add_argument(
+        '--triton-autotune-block-sizes',
+        type=_parse_triton_autotune_block_size,
+        nargs='+',
+        default=(),
+        metavar='BLOCK_NAME=VALUE',
+        help='Block sizes to match when no tuned table entry applies, '
+        'for example BLOCK_SIZE=128 BLOCK_M=64.',
+    )
     return parser
 
 

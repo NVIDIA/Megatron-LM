@@ -37,6 +37,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
 from tests.unit_tests.test_utilities import Utils
 
 # Small, fixed geometry: block_size_tokens=8 keeps block-boundary crossings reachable with
@@ -783,6 +784,68 @@ class TestMtpPrefillBookkeeping:
         mha = context.non_graph_attn_metadata["mha_metadata"]
         assert mha.state_data["max_seqlen_q"] == 2
         assert mha.state_data["max_seqlen_k"] == 2
+
+    def test_prefill_step_never_publishes_max_seqlen_q_of_one(self):
+        """One-token and zero-row requests must not publish max_seqlen_q == 1.
+
+        FlashAttention-2 reads max_seqlen_q == 1 as one query token per sequence and, under GQA,
+        reshapes q assuming total_q == num_seqs, which a zero-row request breaks. Only the q
+        bound is raised; the k bound stays tight.
+        """
+        context = _make_context()
+        device = torch.cuda.current_device()
+        block_table = self._block_table(context, [[3], [7], [9]])
+
+        context._mtp_setup_prefill_step(
+            append_counts=torch.tensor([1, 0, 1], device=device), block_table_prefill=block_table
+        )
+
+        mha = context.non_graph_attn_metadata["mha_metadata"]
+        assert mha.state_data["max_seqlen_q"] == 2
+        assert mha.state_data["max_seqlen_k"] == 1
+
+    def test_prefill_step_metadata_is_correct_under_flash_attention_2(self):
+        """FA2 on the commit pass's metadata matches a reference when a request has zero rows.
+
+        Only the published lengths and bounds are taken from the context; the paged cache and
+        block table are synthetic, since FA2 needs a block size that is a multiple of 256.
+        """
+        flash_attn = pytest.importorskip("flash_attn")
+        context = _make_context()
+        device = torch.cuda.current_device()
+        block_table = self._block_table(context, [[3], [7], [9], [11]])
+
+        context._mtp_setup_prefill_step(
+            append_counts=torch.tensor([1, 0, 1, 1], device=device), block_table_prefill=block_table
+        )
+
+        mha = context.non_graph_attn_metadata["mha_metadata"]
+        num_seqs = mha.state_data["cu_query_seq_lengths"].numel() - 1
+        cu_q = mha.state_data["cu_query_seq_lengths"]
+        cu_k = mha.state_data["cu_kv_seq_lengths"]
+        kv_lengths = mha.state_data["kv_seq_lengths"]
+        total_q = int(cu_q[-1].item())
+        assert total_q < num_seqs, "test needs a zero-row request"
+
+        num_heads, num_kv_heads, head_dim, page = 8, 2, 64, 256
+        q = torch.randn(total_q, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn(num_seqs, page, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        pages = torch.arange(num_seqs, device=device, dtype=torch.int32)[:, None]
+        out = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            mha.state_data["max_seqlen_q"],
+            mha.state_data["max_seqlen_k"],
+            causal=True,
+            block_table=pages,
+        )
+
+        expected = reference_paged_attention(q, k, v, cu_q, kv_lengths, pages)
+        torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
 
     def test_finalize_clears_the_varlen_mode(self):
         """The commit pass must hand the step back exactly as it found it."""
