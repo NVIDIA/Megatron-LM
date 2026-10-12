@@ -16,7 +16,6 @@ from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
 )
 from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 from ..transformer.module import MegatronModule
-from ..utils import is_te_min_version
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
@@ -141,11 +140,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     def _trainable_parameters(self) -> Iterator[torch.nn.Parameter]:
         """Yield the parameters the base optimizer owns before the empty-shard filter.
 
-        ``_get_param_groups`` keeps every ``requires_grad`` parameter, and under TE < 2.18
-        MFSDP v2 then drops the ones whose *local* shard is empty, working around a TE
-        FusedAdam bug (see :func:`get_megatron_optimizer`). That filter is applied per rank,
-        so on an older TE the surviving set differs across ranks; this iterator reconstructs
-        the rank-invariant superset, which is the same thing on either TE.
+        ``_get_param_groups`` keeps every ``requires_grad`` parameter, and MFSDP v2
+        then drops the ones whose *local* shard is empty (see :func:`get_megatron_optimizer`).
+        The surviving set differs across ranks; this iterator reconstructs the
+        rank-invariant superset needed for checkpoint metadata.
         """
         for model_chunk in self.model_chunks:
             for param in model_chunk.parameters():
@@ -199,7 +197,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
         The keys are read off live state (``exp_avg``/``exp_avg_sq`` for Adam) rather than
         hard-coded, so any base optimizer works. They are gathered because a parameter that
-        the TE < 2.18 empty-shard filter dropped from this rank's optimizer is only described
+        the empty-shard filter dropped from this rank's optimizer is only described
         by the rank that owns a non-empty shard of it, which is what lets every rank
         synthesize a placeholder with exactly the owning rank's keys. A parameter that has no
         state anywhere (nothing has stepped yet) is simply absent.
@@ -470,12 +468,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         if not self.is_stub_optimizer:
             self.optimizer.zero_grad(set_to_none=set_to_none)
 
-        if not is_te_min_version("2.18.0"):
-            # Older TE FusedAdam requires empty local shards to be omitted from optimizer
-            # parameter groups (see the matching workaround in get_megatron_optimizer()).
-            # Those parameters are not cleared by optimizer.zero_grad().
-            for model_chunk in self.model_chunks:
-                model_chunk.zero_grad(set_to_none=set_to_none)
+        # Empty local shards are omitted from the optimizer, but FSDP requires
+        # every shard in a parameter group to have a consistent gradient binding.
+        # Clear model-owned gradients too, preserving bindings during CUDA graph replay.
+        for model_chunk in self.model_chunks:
+            model_chunk.zero_grad(set_to_none=set_to_none)
 
     def _copy_model_grads_to_main_grads(self) -> None:
         """Install optimizer-compatible gradients for non-precision-aware optimizers."""
