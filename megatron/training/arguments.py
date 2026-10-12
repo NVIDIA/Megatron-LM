@@ -2376,7 +2376,6 @@ def _add_network_size_args(parser):
         "gated_linear_unit",
         "bias_activation_fusion",
         "activation_func_fp8_input_store",
-        "test_mode",
         "memory_efficient_layer_norm",
         "fused_single_qkv_rope",
         "fp8_dot_product_attention",
@@ -3204,9 +3203,6 @@ def _add_validation_args(parser):
 
     val_factory = ArgumentGroupFactory(ValidationConfig)
     group = val_factory.build_group(parser, "validation")
-    # Owned by TransformerConfig; retain the existing CLI option.
-    group.add_argument('--test-mode', action='store_true',
-                       help='Run all real-time test alongside the experiment.')
 
     return parser
 
