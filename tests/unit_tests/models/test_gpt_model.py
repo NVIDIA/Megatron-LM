@@ -26,6 +26,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
@@ -767,10 +768,17 @@ def test_tied_embedding_copies_match_across_pipeline_stages(
         use_cpu_initialization=use_cpu_initialization,
         **fp8_kwargs,
     )
+    # CPU initialization under meta-device initialization is the ModelOpt checkpoint-load flow,
+    # which builds with the ModelOpt spec; TE linear layers cannot be CPU-initialized on meta.
+    transformer_layer_spec = (
+        get_gpt_modelopt_spec(config)
+        if use_cpu_initialization
+        else get_gpt_layer_with_transformer_engine_spec()
+    )
     with torch.device("meta") if init_model_with_meta_device else nullcontext():
         model = GPTModel(
             config=config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            transformer_layer_spec=transformer_layer_spec,
             vocab_size=128,
             max_sequence_length=8,
             pre_process=parallel_state.is_pipeline_first_stage(),
@@ -778,11 +786,9 @@ def test_tied_embedding_copies_match_across_pipeline_stages(
             share_embeddings_and_output_weights=True,
         )
 
-    # TE layers follow the meta context unless CPU initialization pins them to the host, so the
-    # cases above exercise the production device placement rather than a stand-in.
-    assert any(p.is_meta for p in model.decoder.parameters()) == (
-        init_model_with_meta_device and not use_cpu_initialization
-    )
+    # The decoder keeps the production device placement (ModelOpt materializes it after
+    # construction), so the cases above exercise the real layers rather than a stand-in.
+    assert any(p.is_meta for p in model.decoder.parameters()) == init_model_with_meta_device
     weight = model.shared_embedding_or_output_weight()
     assert not weight.is_meta
     embd_group = parallel_state.get_embedding_group()

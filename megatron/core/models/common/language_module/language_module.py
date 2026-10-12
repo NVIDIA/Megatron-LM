@@ -263,10 +263,12 @@ class LanguageModule(MegatronModule):
         )
         old_params = dict(owner.named_parameters(recurse=False))
         device = torch.cuda.current_device()
-        owner._apply(
-            lambda t: torch.empty_like(t, device=device) if t.is_meta else t, recurse=False
-        )
-        if hasattr(owner, "reset_parameters"):
+        has_initializer = hasattr(owner, "reset_parameters")
+        # Owners without an initializer get their values from the checkpoint;
+        # zero the storage so the tied-copy all-reduce cannot accidentally sum NaNs.
+        allocate = torch.empty_like if has_initializer else torch.zeros_like
+        owner._apply(lambda t: allocate(t, device=device) if t.is_meta else t, recurse=False)
+        if has_initializer:
             owner.reset_parameters()
         # reset_parameters may replace the Parameter objects (TE does); keep their attributes.
         for name, old_param in old_params.items():
