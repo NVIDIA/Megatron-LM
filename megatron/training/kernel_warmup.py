@@ -9,12 +9,15 @@ from argparse import Namespace
 
 import torch
 
+from megatron.training.global_vars import get_run_config
+
 logger = logging.getLogger(__name__)
 
 
 def _warmup_cross_entropy(args: Namespace, tp_group: torch.distributed.ProcessGroup) -> None:
     from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 
+    cfg = get_run_config()
     sequence = args.seq_length // args.context_parallel_size
     vocab = args.padded_vocab_size
     if vocab <= 0:
@@ -23,14 +26,14 @@ def _warmup_cross_entropy(args: Namespace, tp_group: torch.distributed.ProcessGr
         raise ValueError("CE vocabulary must be divisible by tensor parallel size")
     for _ in range(2):
         logits = torch.zeros(
-            (sequence, args.micro_batch_size, vocab // tp_group.size()),
+            (sequence, cfg.train.micro_batch_size, vocab // tp_group.size()),
             device="cuda",
             dtype=args.logit_dtype or args.params_dtype,
             requires_grad=True,
         )
         # Match the model's batch-major labels, including singleton-dimension
         # strides: contiguous() need not copy a transposed microbatch of one.
-        labels = torch.zeros((args.micro_batch_size, sequence), device="cuda", dtype=torch.long)
+        labels = torch.zeros((cfg.train.micro_batch_size, sequence), device="cuda", dtype=torch.long)
         labels = labels.transpose(0, 1).contiguous()
         loss = fused_vocab_parallel_cross_entropy(logits, labels, tp_group)
         # Match LanguageModule.compute_language_model_loss, including the [b, s]
@@ -48,10 +51,11 @@ def _warmup_activation(args: Namespace, tp_size: int, width: int, *, flatten: bo
     from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
     from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 
+    cfg = get_run_config()
     sequence = args.seq_length // args.context_parallel_size
-    leading_shape = (sequence, args.micro_batch_size)
+    leading_shape = (sequence, cfg.train.micro_batch_size)
     if flatten:
-        leading_shape = (sequence * args.micro_batch_size,)
+        leading_shape = (sequence * cfg.train.micro_batch_size,)
     for _ in range(2):
         x = torch.zeros(
             (*leading_shape, width // tp_size * (2 if args.swiglu else 1)),
@@ -85,6 +89,7 @@ def _warmup_activation(args: Namespace, tp_size: int, width: int, *, flatten: bo
 def _warmup_residual(args: Namespace, tp_size: int) -> None:
     from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 
+    cfg = get_run_config()
     sequence = args.seq_length // args.context_parallel_size
     if args.sequence_parallel:
         sequence //= tp_size
@@ -92,7 +97,7 @@ def _warmup_residual(args: Namespace, tp_size: int) -> None:
         with torch.set_grad_enabled(grad_enabled):
             for _ in range(2):
                 x = torch.zeros(
-                    (sequence, args.micro_batch_size, args.hidden_size),
+                    (sequence, cfg.train.micro_batch_size, args.hidden_size),
                     device="cuda",
                     dtype=args.params_dtype,
                     requires_grad=True,
@@ -135,7 +140,8 @@ def warmup_training_kernels(args: Namespace, tp_group: torch.distributed.Process
     parallelism are preserved. Dynamic expert shapes and library-specific kernels
     can still compile later; shutting down workers does not disable compilation.
     """
-    if args.seq_length // args.context_parallel_size <= 0 or args.micro_batch_size <= 0:
+    cfg = get_run_config()
+    if args.seq_length // args.context_parallel_size <= 0 or cfg.train.micro_batch_size <= 0:
         raise ValueError("Kernel warmup dimensions must be positive")
     tp_size = tp_group.size()
     # New warmups (notably dropout) must not advance training RNG state. The

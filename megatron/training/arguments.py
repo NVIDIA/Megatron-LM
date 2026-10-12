@@ -3204,6 +3204,9 @@ def _add_validation_args(parser):
 
     val_factory = ArgumentGroupFactory(ValidationConfig)
     group = val_factory.build_group(parser, "validation")
+    # Owned by TransformerConfig; retain the existing CLI option.
+    group.add_argument('--test-mode', action='store_true',
+                       help='Run all real-time test alongside the experiment.')
 
     return parser
 

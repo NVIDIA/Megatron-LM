@@ -245,6 +245,7 @@ def _initialize_tp_communicators():
             "'transformer_engine' packages"
         )
 
+    cfg = get_run_config()
     args = get_args()
 
     if args.tp_comm_overlap_cfg is not None:
@@ -255,12 +256,12 @@ def _initialize_tp_communicators():
 
     if getattr(args, 'decoder_tp_comm_overlap', False):
         input_shape = [
-            (args.decoder_seq_length * args.micro_batch_size) // args.context_parallel_size,
+            (args.decoder_seq_length * cfg.train.micro_batch_size) // args.context_parallel_size,
             args.hidden_size,
         ]
     else:
         input_shape = [
-            (args.seq_length * args.micro_batch_size) // args.context_parallel_size,
+            (args.seq_length * cfg.train.micro_batch_size) // args.context_parallel_size,
             args.hidden_size,
         ]
 
@@ -558,6 +559,7 @@ def set_jit_fusion_options(tp_size=None):
 
 def _warmup_jit_function(tp_size=None):
     """Compilie JIT functions before the main training steps"""
+    cfg = get_run_config()
     args = get_args()
     if args.bf16:
         dtype = torch.bfloat16
@@ -607,7 +609,7 @@ def _warmup_jit_function(tp_size=None):
     input = torch.rand(
         (
             args.seq_length // args.context_parallel_size,
-            args.micro_batch_size,
+            cfg.train.micro_batch_size,
             args.ffn_hidden_size // args.tensor_model_parallel_size,
         ),
         dtype=dtype,
@@ -651,12 +653,12 @@ def _warmup_jit_function(tp_size=None):
     else:
         seq_length = args.seq_length
     input = torch.rand(
-        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
         dtype=dtype,
         device="cuda",
     )
     residual = torch.rand(
-        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
         dtype=dtype,
         device="cuda",
     )

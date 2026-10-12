@@ -367,6 +367,7 @@ def test_attention_metric_logging_reads_model_config(
     )
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.logger = LoggerConfig(log_interval=100, tensorboard_log_interval=1)
+    run_config.train.micro_batch_size = 1
     writer = Mock()
     monkeypatch.setattr(training, 'get_args', lambda: args)
     monkeypatch.setattr(training, 'get_timers', Mock())

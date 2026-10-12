@@ -276,7 +276,14 @@ def check_checkpoint_args(
             'data_parallel_random_init value from checkpoint does not match cfg.rng.'
         )
     if check_training_state and args.phase_transition_iterations:
-        _compare('global_batch_size')
+        if 'global_batch_size' not in skip_args:
+            saved_train = checkpoint_config.get('train', {}) if checkpoint_config is not None else {}
+            saved_batch_size = saved_train.get(
+                'global_batch_size', getattr(checkpoint_args, 'global_batch_size', None)
+            )
+            assert saved_batch_size == cfg.train.global_batch_size, (
+                'global_batch_size value from checkpoint does not match cfg.train.'
+            )
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size')
     if get_checkpoint_version() >= 3.0 and not args.use_dist_ckpt:
@@ -3190,21 +3197,25 @@ def load_checkpoint(
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The
     # GBS-match check applies only when adopting this checkpoint's own args (not a finetune load).
     if restore_training_state and getattr(args, 'override_ckpt_iteration', None) is not None:
+        cfg = get_run_config()
         if 'args' in state_dict and not args.finetune:
-            ckpt_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
+            saved_train = checkpoint_config.get('train', {}) if checkpoint_config is not None else {}
+            ckpt_global_batch_size = saved_train.get(
+                'global_batch_size', getattr(state_dict['args'], 'global_batch_size', None)
+            )
             if (
                 ckpt_global_batch_size is not None
-                and ckpt_global_batch_size != args.global_batch_size
+                and ckpt_global_batch_size != cfg.train.global_batch_size
             ):
                 warn_rank_0(
                     '--override-ckpt-iteration recomputes consumed_train_samples = target_iter * '
-                    f'current global_batch_size ({args.global_batch_size}), but this checkpoint '
+                    f'current global_batch_size ({cfg.train.global_batch_size}), but this checkpoint '
                     f'was saved at global_batch_size {ckpt_global_batch_size}. If the target '
                     "iteration is in the checkpoint run's units, the data loader resumes from a "
                     'shifted sample offset.'
                 )
         iteration = args.override_ckpt_iteration
-        args.consumed_train_samples = iteration * args.global_batch_size
+        args.consumed_train_samples = iteration * cfg.train.global_batch_size
         args.skipped_train_samples = 0
         print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
                      f'(consumed_train_samples {args.consumed_train_samples})')

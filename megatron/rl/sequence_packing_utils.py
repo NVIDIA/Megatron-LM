@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from torch.utils.data import DataLoader, TensorDataset
 from dataclasses import dataclass, field
 from megatron.core.utils import log_single_rank, round_up_to_nearest_multiple
-from megatron.training.global_vars import get_tokenizer
+from megatron.training.global_vars import get_run_config, get_tokenizer
 from megatron.training.utils import get_nvtx_range
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core import mpu
@@ -1200,10 +1200,11 @@ def get_sequence_packing_log_info(args):
 
 def get_sequence_packing_tensorboard_metrics(args):
     """Get tensorboard metrics for sequence packing mode."""
+    cfg = get_run_config()
     metrics = {}
     if args.consumed_train_bins > 0:
         bin_batch_size = (
-            mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            mpu.get_data_parallel_world_size() * cfg.train.micro_batch_size * get_num_microbatches()
         )
         metrics['bin-batch-size'] = bin_batch_size
         metrics['consumed-bins'] = args.consumed_train_bins

@@ -984,7 +984,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
 
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist"])
 @pytest.mark.parametrize("no_load_rng", [False, True])
-@pytest.mark.parametrize("load_mode", ["default", "inference", "resume", "override"])
+@pytest.mark.parametrize("load_mode", ["default", "inference", "resume", "override", "converter"])
 def test_checkpoint_load_without_microbatch_calculator(
     init_model_parallel,
     create_ckpt_load_args,
@@ -992,6 +992,8 @@ def test_checkpoint_load_without_microbatch_calculator(
     ckpt_format,
     no_load_rng,
     load_mode,
+    run_config,
+    monkeypatch,
 ):
     """Checkpoint loading restores data, not the training runtime calculator."""
     args = create_ckpt_load_args
@@ -1002,6 +1004,8 @@ def test_checkpoint_load_without_microbatch_calculator(
     args.data_parallel_size = args.world_size
     args.global_batch_size = args.world_size
     args.micro_batch_size = 1
+    run_config.train.global_batch_size = args.global_batch_size
+    run_config.train.micro_batch_size = 1
     args.fp16 = False
     args.bf16 = False
     args.hidden_size = 32
@@ -1042,7 +1046,7 @@ def test_checkpoint_load_without_microbatch_calculator(
         before_load_cuda_rng = torch.cuda.get_rng_state().clone()
         args.no_load_rng = no_load_rng
         # These training options must not influence an inference load.
-        args.override_ckpt_iteration = None if load_mode == "resume" else 7
+        args.override_ckpt_iteration = None if load_mode in ("resume", "converter") else 7
         is_inference = load_mode in ("default", "inference")
         args.phase_transition_iterations = [100] if is_inference else None
         args.no_load_optim = True
@@ -1057,6 +1061,14 @@ def test_checkpoint_load_without_microbatch_calculator(
             ):
                 delattr(args, name)
         unset_num_microbatches_calculator()
+        if is_inference or load_mode == "converter":
+            from megatron.training.argument_utils import inference_cfg_container_from_args
+
+            # Converters restore consumed-sample metadata without a training config.
+            monkeypatch.setattr(
+                "megatron.training.global_vars._GLOBAL_RUN_CONFIG",
+                inference_cfg_container_from_args(args, build_model_config=False),
+            )
         if is_inference:
             with mock.patch(
                 "megatron.training.checkpointing.get_rerun_state_machine",

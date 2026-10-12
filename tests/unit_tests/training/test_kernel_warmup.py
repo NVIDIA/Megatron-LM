@@ -52,7 +52,8 @@ def tp_group():
 
 
 @pytest.fixture(autouse=True)
-def reset_compilation_cache(monkeypatch):
+def reset_compilation_cache(monkeypatch, run_config):
+    run_config.train.micro_batch_size = 2
     # Each case represents a separate training configuration. Accumulating all
     # dtype/layout variants can exceed Dynamo's limit and silently test eager code.
     torch._dynamo.reset()
@@ -71,7 +72,7 @@ def reset_compilation_cache(monkeypatch):
 )
 @pytest.mark.parametrize("micro_batch_size", [1, 2])
 def test_warmup_preserves_rng_and_live_storage(
-    tp_group, dtype, logit_dtype, micro_batch_size, monkeypatch
+    tp_group, dtype, logit_dtype, micro_batch_size, monkeypatch, run_config
 ):
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = torch.cuda.get_rng_state().clone()
@@ -106,6 +107,7 @@ def test_warmup_preserves_rng_and_live_storage(
     monkeypatch.setattr(fused_cross_entropy, "calculate_predicted_logits", observe_labels)
     args = configuration(tp_group, dtype)
     args.micro_batch_size = micro_batch_size
+    run_config.train.micro_batch_size = micro_batch_size
     args.logit_dtype = logit_dtype
     args.seq_length = 16
     args.context_parallel_size = 2
