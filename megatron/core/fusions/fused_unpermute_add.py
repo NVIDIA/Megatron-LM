@@ -76,6 +76,21 @@ def _unpermute_add_kernel(
         )
 
 
+@triton.jit
+def _probs_grad_gather_kernel(
+    grad_ptr, map_ptr, num_dense_ptr, out_ptr, num_tokens, num_experts, E_POW2: tl.constexpr
+):
+    # One program handles one token: its gradient for every expert is the gradient of its row.
+    row = tl.program_id(0)
+    num_dense = tl.load(num_dense_ptr)
+    cols = tl.arange(0, E_POW2)
+    col_mask = cols < num_experts
+    src = tl.load(map_ptr + row.to(tl.int64) * num_experts + cols, mask=col_mask, other=-1)
+    active = (src >= 0) & (row < num_dense) & col_mask
+    grad = tl.load(grad_ptr + src.to(tl.int64), mask=active, other=0.0)
+    tl.store(out_ptr + row.to(tl.int64) * num_experts + cols, grad, mask=col_mask)
+
+
 def fused_unpermute_add(
     permuted: torch.Tensor,
     dense_to_expert_map: torch.Tensor,
@@ -137,5 +152,49 @@ def fused_unpermute_add(
         BLOCK_T=block_t,
         BLOCK_H=256,
         num_warps=4,
+    )
+    return out
+
+
+def fused_probs_grad_gather(
+    grad_permuted_probs: torch.Tensor,
+    dense_to_expert_map: torch.Tensor,
+    num_dense_tokens: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Gather the gradient of the permuted routing probabilities back to [tokens, experts].
+
+    out[t, e] = grad_permuted_probs[dense_to_expert_map[t, e]] for the entries >= 0 of the first
+    ``num_dense_tokens`` tokens, 0 elsewhere: the probability half of HybridEP's dispatch
+    backward, for when the hidden-state half is done by :func:`fused_unpermute_add`.
+
+    Args:
+        grad_permuted_probs (torch.Tensor): [num_permuted_tokens] gradient of the permuted probs.
+        dense_to_expert_map (torch.Tensor): As in :func:`fused_unpermute_add`.
+        num_dense_tokens (torch.Tensor): As in :func:`fused_unpermute_add`.
+        num_tokens (int): Number of output tokens.
+
+    Returns:
+        torch.Tensor: [num_tokens, num_experts] in the dtype of ``grad_permuted_probs``.
+    """
+    assert HAVE_TRITON, "fused_probs_grad_gather requires Triton"
+    num_experts = dense_to_expert_map.shape[1]
+    assert grad_permuted_probs.dim() == 1 and grad_permuted_probs.is_contiguous()
+    assert dense_to_expert_map.is_contiguous() and dense_to_expert_map.dtype == torch.int32
+    assert dense_to_expert_map.shape[0] >= num_tokens
+    out = torch.empty(
+        num_tokens, num_experts, dtype=grad_permuted_probs.dtype, device=grad_permuted_probs.device
+    )
+    if num_tokens == 0:
+        return out
+    _probs_grad_gather_kernel[(num_tokens,)](
+        grad_permuted_probs,
+        dense_to_expert_map,
+        num_dense_tokens,
+        out,
+        num_tokens,
+        num_experts,
+        E_POW2=triton.next_power_of_2(num_experts),
+        num_warps=1,
     )
     return out

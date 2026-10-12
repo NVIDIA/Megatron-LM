@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from megatron.core.fusions.fused_unpermute_add import HAVE_TRITON, fused_unpermute_add
+from megatron.core.fusions.fused_unpermute_add import (
+    HAVE_TRITON,
+    fused_probs_grad_gather,
+    fused_unpermute_add,
+)
 
 
 def _make_routing(num_tokens, num_experts, topk, pad_multiple, drop_frac, generator):
@@ -54,4 +58,27 @@ def test_fused_unpermute_add(num_experts, with_add, num_dense_offset):
     out = fused_unpermute_add(permuted, dense_map, num_dense, topk, add=add, num_tokens=num_tokens)
     ref = _reference(permuted, dense_map, num_tokens - num_dense_offset, add)
 
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_TRITON, reason="Requires CUDA, Triton"
+)
+@pytest.mark.parametrize("num_experts", [8, 12, 32])
+@pytest.mark.parametrize("num_dense_offset", [0, 5])
+def test_fused_probs_grad_gather(num_experts, num_dense_offset):
+    generator = torch.Generator().manual_seed(0)
+    num_tokens, topk = 300, 4
+    dense_map, num_permuted = _make_routing(num_tokens, num_experts, topk, 16, 0.05, generator)
+    dense_map = dense_map.cuda()
+    grad = torch.randn(num_permuted, generator=generator).cuda()
+    num_dense = num_tokens - num_dense_offset
+    num_dense_t = torch.tensor([num_dense], dtype=torch.int32, device="cuda")
+
+    out = fused_probs_grad_gather(grad, dense_map, num_dense_t, num_tokens)
+
+    src = dense_map.long()
+    valid = (src >= 0) & (torch.arange(num_tokens, device="cuda")[:, None] < num_dense)
+    ref = torch.where(valid, grad[src.clamp(min=0)], torch.zeros((), device="cuda"))
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
