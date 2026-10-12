@@ -83,7 +83,6 @@ from megatron.core.utils import (
     nvtx_range_push,
     round_up_to_nearest_multiple,
     trace_async_exceptions,
-    unwrap_model,
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
@@ -1027,7 +1026,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
-        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
+        unwrapped = controller._language_model
         mtp_warmup_enabled = (
             controller.num_mtp_depths > 0
             and (controller.num_speculative_tokens or 0) > 0
@@ -1082,24 +1081,31 @@ class DynamicInferenceEngine(AbstractEngine):
                         mtp_seen_batch_sizes.add(n)
                         device = torch.cuda.current_device()
                         batch_dim = n // tp_size if sp_enabled else n
-                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
-                        for depth in mtp_warmup_depths:
-                            unwrapped.compute_mtp_single_step(
-                                hidden_states=torch.zeros(
-                                    (batch_dim, 1, model_config.hidden_size),
-                                    device=device,
-                                    dtype=model_config.params_dtype,
-                                ),
-                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
-                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
-                                depth=depth,
-                                cache_key=("mtp", n, depth),
-                            )
+                        # Cache-free MTP graph, replayed only when the MTP KV cache is off; with
+                        # it on, real and EP dummy forwards both replay the KV-aware graph below.
+                        if not context.enable_mtp_kv_cache:
+                            # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                            for depth in mtp_warmup_depths:
+                                unwrapped.compute_mtp_single_step(
+                                    hidden_states=torch.zeros(
+                                        (batch_dim, 1, model_config.hidden_size),
+                                        device=device,
+                                        dtype=model_config.params_dtype,
+                                    ),
+                                    next_token_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.long
+                                    ),
+                                    position_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.int64
+                                    ),
+                                    depth=depth,
+                                    cache_key=("mtp", n, depth),
+                                )
 
-                        # KV-aware MTP graph: when the MTP KV cache is enabled, ALSO capture a graph
-                        # that includes the draft-attention KV append+attend (the cache-free graph
-                        # above does not), under a distinct ("mtp_kv", n, depth) key that the real
-                        # spec-decode path replays. The EP dummy path keeps the cache-free graph.
+                        # KV-aware MTP graph: when the MTP KV cache is enabled, capture a graph
+                        # that includes the draft-attention KV append+attend under a distinct
+                        # ("mtp_kv", n, depth) key, replayed by the real spec-decode path and the
+                        # EP dummy path (which stages the same dummy-block metadata).
                         # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
                         # replay overwrites it from gpu_view each step, so only shapes/bounds count.
                         if context.enable_mtp_kv_cache:
@@ -1944,7 +1950,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         request_id = request.request_id
-
         if is_resume:
             if request_id not in self.requests or self.get_request(request_id) is not request:
                 raise ValueError(f"Cannot resume unknown request ID {request_id}.")
@@ -1965,6 +1970,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+
+        seed_error = None
+        if request.sampling_params.seed is not None:
+            if self.context.config.sampling_backend != "torch":
+                seed_error = "Request-local seeds require sampling_backend='torch'"
+            elif self.context.config.num_speculative_tokens:
+                seed_error = "Request-local seeds do not yet support speculative decoding"
+            elif "seed" not in self.context.request_metadata:
+                seed_error = "Request-local seeds require seed in request metadata"
+        if seed_error is not None:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(ValueError(seed_error))
 
         assert (
             request.sampling_params.num_tokens_to_generate is None
@@ -2698,6 +2715,10 @@ class DynamicInferenceEngine(AbstractEngine):
                             request_log_probs = request_log_probs[:-num_dropped]
                         if top_n_logprobs is not None and req_idx in top_n_logprobs:
                             top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_dropped]
+                if eos_mid_block_hit:
+                    eos_mid_block_hit = bool(tokens) and tokens[-1] in self._terminating_token_ids(
+                        request
+                    )
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -2802,7 +2823,13 @@ class DynamicInferenceEngine(AbstractEngine):
                         accepted_t != -1
                     ).long()
 
+                if (
+                    stop_word_hit or eos_mid_block_hit
+                ) and not request.sampling_params.do_kv_handoff:
+                    request.finish_reason = "stop"
+
                 if request_id in finished_request_ids:
+                    self._set_finish_reason(request)
                     # Reconstruct routing from per-block storage before popping.
                     if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
@@ -2991,26 +3018,41 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Find which stop word finished IDs are in the current active requests
         result = self.stop_word_finished_request_ids & set(active_request_ids)
+        # Partial prefill cannot finish; preserve its stop until the final chunk.
+        result.discard(self.context.chunked_prefill_request_id)
         # Move to "being finished" set so post_process_requests can skip the extra token
         self.stop_word_being_finished_ids = result
         # Clear the IDs that we're returning (they'll be marked as finished)
         self.stop_word_finished_request_ids -= result
         return result
 
+    def _set_finish_reason(self, request: DynamicInferenceRequest) -> None:
+        """Record final termination semantics without re-inferring them in clients."""
+        if request.finish_reason is not None or request.sampling_params.do_kv_handoff:
+            return
+        is_stop = request.request_id in self.stop_word_being_finished_ids or (
+            bool(request.generated_tokens)
+            and request.generated_tokens[-1] in self._terminating_token_ids(request)
+        )
+        request.finish_reason = "stop" if is_stop else "length"
+
     def _terminating_token_ids(self, request: DynamicInferenceRequest) -> frozenset:
         """Token ids that end generation for this request.
 
         The CPU-side counterpart of the controller's per-step tensor check, resolved
-        through the controller so every termination site shares one rule. Empty when
-        termination is disabled (`ignore_eos`).
+        through the controller, including explicit request stop ids.
+        Disabling model EOS (`ignore_eos`) does not disable explicit stops.
 
         Args:
             request (DynamicInferenceRequest): Request to resolve ids for.
 
         Returns:
-            frozenset: Terminating token ids, empty when termination is disabled.
+            frozenset: Model EOS ids (unless disabled) and explicit request stop ids.
         """
-        return self.controller.terminating_token_ids(request.sampling_params.termination_id)
+        return self.controller.terminating_token_ids(
+            request.sampling_params.termination_id,
+            stop_token_ids=request.sampling_params.stop_token_ids,
+        )
 
     def _truncate_at_mid_block_eos(
         self,
@@ -3059,10 +3101,12 @@ class DynamicInferenceEngine(AbstractEngine):
     def _find_mid_block_eos(
         self, request: DynamicInferenceRequest, tokens: list[int]
     ) -> Optional[int]:
-        """Locate an EOS token inside a multi-token speculative step.
+        """Locate an explicit stop token or a speculative-block model EOS.
 
-        Only meaningful when a step emits more than one token, i.e. under speculative
-        decoding: the controller's termination check inspects just the step's last token,
+        Model EOS is scanned when a step emits more than one token. Explicit
+        request stop tokens are also checked for single-token steps, since the
+        controller does not hold their variable-length sets. Its EOS check inspects
+        just the step's last token,
         so an EOS on an accepted draft position is otherwise missed and generation runs
         past it. A single-token step was already checked by the controller, and a request
         the controller has already finished does not reach here as unfinished.
@@ -3074,8 +3118,12 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             Optional[int]: Index of the first EOS in `tokens`, or None if there is none.
         """
-        if len(tokens) <= 1 or request.request_id in self.stop_word_being_finished_ids:
+        if not tokens or request.request_id in self.stop_word_being_finished_ids:
             return None
+        if len(tokens) == 1:
+            # Model EOS was checked by the controller. Explicit request stops
+            # are handled here, including the non-speculative single-token path.
+            return 0 if tokens[0] in (request.sampling_params.stop_token_ids or ()) else None
         terminating_ids = self._terminating_token_ids(request)
         if not terminating_ids:
             return None

@@ -164,7 +164,7 @@ def _graceful_shutdown(signum, frame):
 
 
 def set_global_variables(args, cfg_container, build_tokenizer=True):
-    """Register caller-provided args/config and construct runtime services."""
+    """Register caller-provided args/config and construct training runtime services."""
 
     assert args is not None
     assert cfg_container is not None
@@ -172,12 +172,30 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_run_config(cfg_container)
     set_args(args)
-    initialize_runtime_services(args, build_tokenizer=build_tokenizer)
+    initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=True)
 
 
-def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True) -> None:
-    """Construct services independently of CLI parsing and config construction."""
+def initialize_runtime_services(
+    args: Namespace, *, build_tokenizer: bool = True, training: bool = False
+) -> None:
+    """Initialize shared services, plus training-only services when requested."""
+    if build_tokenizer:
+        _build_tokenizer(args)
+    _set_wandb_writer(args)
+    _set_telemetry(args, include_training=training)
 
+    if args.enable_experimental:
+        set_experimental_flag(True)
+
+    if args.disable_jit_fuser:
+        disable_jit_fuser()
+
+    if training:
+        initialize_training_runtime_services(args)
+
+
+def initialize_training_runtime_services(args: Namespace) -> None:
+    """Initialize training-only services after the shared runtime services."""
     if args.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
         # into megatron.training, which imports this module.
@@ -194,19 +212,12 @@ def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True
         step_batch_size_schedule=args.step_batch_size_schedule,
         seq_length=args.seq_length,
     )
-    if build_tokenizer:
-        _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
-    _set_wandb_writer(args)
     _set_one_logger(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
     _set_energy_monitor(args)
-    _set_telemetry(args)
     _set_train_state()
-
-    if args.enable_experimental:
-        set_experimental_flag(True)
 
     if args.exit_signal_handler:
         _set_signal_handler(args.exit_signal)
@@ -214,9 +225,6 @@ def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True
     if args.exit_signal_handler_for_training:
         signal.signal(signal.SIGINT, _graceful_shutdown)
         signal.signal(signal.SIGTERM, _graceful_shutdown)
-
-    if args.disable_jit_fuser:
-        disable_jit_fuser()
 
 
 def unset_global_variables():
@@ -468,7 +476,7 @@ def _detect_gpu_identity(local_rank):
         return {}
 
 
-def build_telemetry_resource_attrs(args):
+def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     """Build the OTel resource-attribute dict from training config.
 
     Shared by _set_telemetry() (the main process) and
@@ -480,20 +488,24 @@ def build_telemetry_resource_attrs(args):
     # Attach training config as resource attributes so they appear as
     # Process tags in Jaeger, making it easy to identify and compare runs.
     resource_attrs = {}
-    for attr, arg_name in [
+    fields = [
         ('dl.local_rank', 'local_rank'),
         ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
         ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
         ('dl.data_parallel.size', 'data_parallel_size'),
-        ('dl.batch_size', 'global_batch_size'),
         ('dl.sequence_length', 'seq_length'),
         ('megatron.num_layers', 'num_layers'),
         ('megatron.hidden_size', 'hidden_size'),
         ('megatron.num_attention_heads', 'num_attention_heads'),
-        ('megatron.train_iters', 'train_iters'),
-        ('megatron.micro_batch_size', 'micro_batch_size'),
         ('megatron.ckpt_format', 'ckpt_format'),
-    ]:
+    ]
+    if include_training:
+        fields.extend([
+            ('dl.batch_size', 'global_batch_size'),
+            ('megatron.train_iters', 'train_iters'),
+            ('megatron.micro_batch_size', 'micro_batch_size'),
+        ])
+    for attr, arg_name in fields:
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
@@ -558,7 +570,7 @@ def build_telemetry_resource_attrs(args):
     return resource_attrs
 
 
-def _set_telemetry(args):
+def _set_telemetry(args, *, include_training: bool = True):
     """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
     cfg = get_run_config()
     global _GLOBAL_TELEMETRY_HANDLE
@@ -588,7 +600,10 @@ def _set_telemetry(args):
     # _detect_gpu_identity() does an nvmlInit()/nvmlShutdown() round trip, and a run with
     # telemetry off must not touch NVML (or anything else) just because nemo-lens is importable.
     # setup_telemetry() ignores resource_attributes for a disabled config, so {} is equivalent.
-    resource_attrs = build_telemetry_resource_attrs(args) if config.enabled else {}
+    resource_attrs = (
+        build_telemetry_resource_attrs(args, include_training=include_training)
+        if config.enabled else {}
+    )
 
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
         config, rank=args.rank, world_size=args.world_size,
