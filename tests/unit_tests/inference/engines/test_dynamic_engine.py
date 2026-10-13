@@ -1980,22 +1980,32 @@ def test_drained_reset_rejects_suspended_state_before_context_mutation():
     engine.controller._async_sched_logits.clear.assert_not_called()
 
 
-def test_drained_reset_rejects_outstanding_requests_before_mutation():
-    """Reset rejects a nonempty request table before clearing engine state."""
+@pytest.mark.parametrize(
+    ("requests", "staging_tasks", "match"),
+    [
+        ({7: object()}, set(), "must drain all requests before reset"),
+        # A staged reply outlives its request, so an empty request table is not enough.
+        ({}, {object()}, "must drain all payload staging before reset"),
+    ],
+    ids=["outstanding-requests", "in-flight-staging"],
+)
+def test_drained_reset_rejects_undrained_work_before_mutation(requests, staging_tasks, match):
+    """Reset rejects outstanding requests or payload staging before clearing engine state."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._state_events = {}
     engine.state = EngineState.RUNNING
-    requests = {7: object()}
     engine.requests = requests
+    engine._staging_tasks = staging_tasks
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
         _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
     )
 
-    with pytest.raises(RuntimeError, match="must drain all requests before reset"):
+    with pytest.raises(RuntimeError, match=match):
         engine.reset()
 
     assert engine.requests is requests
+    assert engine._staging_tasks is staging_tasks
     engine.context.reset.assert_not_called()
     engine.controller._async_sched_logits.clear.assert_not_called()
 
@@ -2384,12 +2394,16 @@ def test_streaming_partials_are_sent():
 
 
 class _RecordingStager:
-    """RequestPayloadStager test double: keeps every staged (uid, payload)."""
+    """RequestPayloadStager test double: keeps every staged (uid, payload), or raises
+    ``error`` without staging anything."""
 
-    def __init__(self):
+    def __init__(self, error=None):
         self.staged = []
+        self.error = error
 
     def stage(self, uid, payload, *, finished_metadata, offload_params=None):
+        if self.error is not None:
+            raise self.error
         self.staged.append((uid, payload))
         self.finished_metadata = finished_metadata
         self.offload_params = offload_params
@@ -2432,28 +2446,36 @@ def _reply_engine(stager):
     engine.local_metadata_ledger = {}
     engine.payload_stager = stager
     engine._staging_tasks = set()
-    engine._staging_tasks_peak = 0
     engine.socket_for_receiving_requests = mock.Mock()
     return engine
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("with_stager", "streaming", "expected_offloaded"),
-    [(False, False, False), (True, False, True), (True, True, False)],
+    ("stager", "streaming", "expected_offloaded"),
+    [
+        (None, False, False),
+        ("records", False, True),
+        ("records", True, False),
+        ("raises", False, False),
+    ],
 )
 async def test_payload_offload_stages_only_eligible_completed_replies(
-    with_stager, streaming, expected_offloaded
+    stager, streaming, expected_offloaded
 ):
     """A stager offloads completed non-streaming replies only.
 
     Failed and streaming requests are neither staged nor stripped, and replies are untouched
-    without a stager. An offloaded reply never carries the prompt tensors, even when the
-    request opted into return_prompt_tokens (the stager holds the prompt ids); a reply that
-    is not offloaded still honours the opt-in. The ledger is a separate mechanism and stays
-    off here.
+    without a stager or when its write raises. An offloaded reply never carries the prompt
+    tensors, even when the request opted into return_prompt_tokens (the stager holds the
+    prompt ids); a reply that is not offloaded still honours the opt-in. The ledger is a
+    separate mechanism and stays off here.
     """
-    engine = _reply_engine(_RecordingStager() if with_stager else None)
+    if stager is not None:
+        stager = _RecordingStager(
+            error=RuntimeError("write failed") if stager == "raises" else None
+        )
+    engine = _reply_engine(stager)
     completed = _reply_request(
         "chatcmpl-ok",
         Status.COMPLETED,
@@ -2493,6 +2515,8 @@ async def test_payload_offload_stages_only_eligible_completed_replies(
     assert ok_wire["generated_tokens"] == [10, 11]
     assert completed.generated_log_probs == [-0.5, -0.25]
     assert completed.prompt_tokens.tolist() == [1, 2, 3]
+    if stager is None:
+        assert engine._staging_log_suffix() == ""
 
 
 @pytest.mark.asyncio
@@ -2519,134 +2543,74 @@ async def test_finished_request_record_is_built_once_for_ledger_and_stager():
 
 
 class _BlockingStager:
-    """RequestPayloadStager test double whose write blocks until ``release`` is set."""
+    """RequestPayloadStager test double whose write sets ``started``, then blocks until
+    ``release`` is set."""
 
-    def __init__(self, *, error=None):
+    def __init__(self):
+        self.started = threading.Event()
         self.release = threading.Event()
         self.threads = []
-        self.error = error
 
     def stage(self, uid, payload, *, finished_metadata, offload_params=None):
         self.threads.append(threading.current_thread())
+        self.started.set()
         assert self.release.wait(timeout=10)
-        if self.error is not None:
-            raise self.error
         return RequestPayloadStageResult(response_metadata={"ng_commit_coords": {"uid": uid}})
 
 
 @pytest.mark.asyncio
-async def test_slow_stager_does_not_block_the_engine_loop():
-    """stage() runs off the engine loop: _send_requests_to_coordinator returns while the
-    write is still running, other replies go out at once, and the staged reply follows
-    as soon as its write finishes, carrying the stager's metadata."""
+async def test_slow_stager_does_not_block_the_engine_loop(caplog):
+    """stage() runs off the engine loop.
+
+    _send_requests_to_coordinator returns while the writes are still running and other
+    replies go out at once. The step log reports the backlog and its peak since the last
+    log line. Shutdown waits for in-flight writes, logs how many it waited for (and is
+    silent when there are none), and each staged reply carries the stager's metadata.
+    """
     stager = _BlockingStager()
     engine = _reply_engine(stager)
-    completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])
-    failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
+    drain_logger = "megatron.core.inference.engines.dynamic_engine"
 
-    engine._send_requests_to_coordinator([completed, failed])
-    for _ in range(3):  # let the staging task start its write
-        await asyncio.sleep(0.01)
+    def drain_messages():
+        return [
+            r.getMessage() for r in caplog.records if "in-flight payload staging" in r.getMessage()
+        ]
 
-    # The write is still blocked, yet the engine already moved on.
-    assert [wire["uid"] for wire in _sent_replies(engine)] == ["chatcmpl-failed"]
-    assert stager.threads and stager.threads[0] is not threading.current_thread()
-
-    stager.release.set()
-    await engine._drain_staging_tasks()
-
-    _, ok_wire = _sent_replies(engine)
-    assert ok_wire["uid"] == "chatcmpl-ok"
-    assert ok_wire["payload_offloaded"] is True
-    assert ok_wire["generated_log_probs"] is None
-    assert ok_wire["payload_stage_metadata"] == {"ng_commit_coords": {"uid": "chatcmpl-ok"}}
-    assert not engine._staging_tasks
-
-
-@pytest.mark.asyncio
-async def test_stager_error_keeps_payload_on_the_reply():
-    """A stager that raises must not lose the reply: it goes out unstaged."""
-    stager = _BlockingStager(error=RuntimeError("write failed"))
-    stager.release.set()
-    engine = _reply_engine(stager)
-
-    engine._send_requests_to_coordinator(
-        [_reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])]
-    )
-    await engine._drain_staging_tasks()
-
-    (ok_wire,) = _sent_replies(engine)
-    assert ok_wire["payload_offloaded"] is False
-    assert ok_wire["generated_log_probs"] == [-0.5, -0.25]
-
-
-@pytest.mark.asyncio
-async def test_drain_waits_for_in_flight_staging():
-    """Shutdown drains staging tasks so no staged reply is dropped."""
-    stager = _BlockingStager()
-    engine = _reply_engine(stager)
-    engine._send_requests_to_coordinator(
-        [_reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])]
-    )
-    asyncio.get_running_loop().call_later(0.05, stager.release.set)
-
-    await engine._drain_staging_tasks()
-
-    assert [wire["uid"] for wire in _sent_replies(engine)] == ["chatcmpl-ok"]
-
-
-@pytest.mark.asyncio
-async def test_staging_backlog_is_reported_in_the_step_log():
-    """The periodic step log shows in-flight staging tasks and the peak since the
-    previous log line, so a write path that cannot keep up shows as a growing backlog."""
-    stager = _BlockingStager()
-    engine = _reply_engine(stager)
+    with caplog.at_level(logging.INFO, logger=drain_logger):
+        await engine._drain_staging_tasks()
+    assert drain_messages() == []
 
     engine._send_requests_to_coordinator(
         [
             _reply_request("chatcmpl-a", Status.COMPLETED, [-0.5, -0.25]),
+            _reply_request("chatcmpl-failed", Status.FAILED, None),
             _reply_request("chatcmpl-b", Status.COMPLETED, [-0.5, -0.25]),
         ]
     )
+    assert await asyncio.to_thread(stager.started.wait, 10)
+
+    # A write is still blocked, yet the engine already moved on.
+    assert [wire["uid"] for wire in _sent_replies(engine)] == ["chatcmpl-failed"]
+    assert stager.threads[0] is not threading.current_thread()
     assert engine._staging_log_suffix() == " ... payload staging: in-flight 2, peak 2"
 
-    stager.release.set()
-    await engine._drain_staging_tasks()
+    # Release only once draining is underway, so the drain has to wait for both writes.
+    asyncio.get_running_loop().call_soon(stager.release.set)
+    with caplog.at_level(logging.INFO, logger=drain_logger):
+        await engine._drain_staging_tasks()
+
+    (message,) = drain_messages()
+    assert message.startswith("Waiting for 2 in-flight payload staging task(s) before shutdown")
+    assert not engine._staging_tasks
+    staged = {wire["uid"]: wire for wire in _sent_replies(engine)[1:]}
+    assert sorted(staged) == ["chatcmpl-a", "chatcmpl-b"]
+    for uid, wire in staged.items():
+        assert wire["payload_offloaded"] is True
+        assert wire["generated_log_probs"] is None
+        assert wire["payload_stage_metadata"] == {"ng_commit_coords": {"uid": uid}}
     # The peak resets at each log line, to the backlog at that moment.
     assert engine._staging_log_suffix() == " ... payload staging: in-flight 0, peak 2"
     assert engine._staging_log_suffix() == " ... payload staging: in-flight 0, peak 0"
-
-
-def test_staging_backlog_log_is_empty_without_a_stager():
-    engine = _reply_engine(None)
-    assert engine._staging_log_suffix() == ""
-
-
-@pytest.mark.asyncio
-async def test_drain_logs_the_in_flight_count(caplog):
-    """Shutdown names how many staged replies it waited for and how long it took."""
-    stager = _BlockingStager()
-    engine = _reply_engine(stager)
-    engine._send_requests_to_coordinator(
-        [_reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])]
-    )
-    asyncio.get_running_loop().call_later(0.05, stager.release.set)
-
-    with caplog.at_level(logging.INFO, logger="megatron.core.inference.engines.dynamic_engine"):
-        await engine._drain_staging_tasks()
-
-    (message,) = [
-        r.getMessage() for r in caplog.records if "in-flight payload staging" in r.getMessage()
-    ]
-    assert message.startswith("Waiting for 1 in-flight payload staging task(s) before shutdown")
-
-
-@pytest.mark.asyncio
-async def test_drain_is_silent_when_nothing_is_in_flight(caplog):
-    engine = _reply_engine(_BlockingStager())
-    with caplog.at_level(logging.INFO, logger="megatron.core.inference.engines.dynamic_engine"):
-        await engine._drain_staging_tasks()
-    assert not [r for r in caplog.records if "in-flight payload staging" in r.getMessage()]
 
 
 def _submit_request_message(request_id, sampling_params, prompt, offload_params):

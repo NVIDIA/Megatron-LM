@@ -480,6 +480,9 @@ class DynamicInferenceEngine(AbstractEngine):
     # Defaults for instances created without __init__ (tests build the engine via __new__).
     payload_stager: Optional[RequestPayloadStager] = None
     prompt_preparer: Optional[RequestPromptPreparer] = None
+    # Immutable so instances never share one task set; __init__ installs a mutable one.
+    _staging_tasks: Set[asyncio.Task] = frozenset()
+    _staging_tasks_peak: int = 0
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -680,7 +683,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
     def reset(self) -> None:
-        """Reset per-run state; the caller must first drain all requests."""
+        """Reset per-run state; the caller must first drain all requests and payload staging."""
 
         initialize_runtime_state = not hasattr(self, "_state_events")
         if not initialize_runtime_state and self.state not in (
@@ -696,6 +699,13 @@ class DynamicInferenceEngine(AbstractEngine):
             raise RuntimeError(
                 "The engine must drain all requests before reset; "
                 f"got {len(self.requests)} outstanding request(s)."
+            )
+
+        # A staged reply outlives its request, so an empty request table is not enough.
+        if not initialize_runtime_state and self._staging_tasks:
+            raise RuntimeError(
+                "The engine must drain all payload staging before reset; "
+                f"got {len(self._staging_tasks)} in-flight staging task(s)."
             )
 
         use_coordinator = getattr(self, "use_coordinator", False)

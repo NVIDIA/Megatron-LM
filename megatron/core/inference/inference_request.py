@@ -1439,7 +1439,19 @@ class RequestPayloadStageResult:
 
 
 class RequestPayloadStager(Protocol):
-    """Protocol to handle offloading of request payloads to a storage backend."""
+    """Protocol to handle offloading of request payloads to a storage backend.
+
+    The engine calls ``stage()`` on a worker thread (``asyncio.to_thread``), one call
+    per completed request, so implementations must follow these rules:
+
+    * Calls run concurrently with each other, so ``stage()`` must be thread-safe.
+    * Calls share the event loop's default thread pool. A write that blocks for a long
+      time holds a pool thread, so many slow writes can use up the pool and delay other
+      ``to_thread`` work.
+    * ``stage()`` must use only its arguments and the stager's own state. It must not
+      touch engine state, the engine's ZMQ sockets, or anything else owned by the engine
+      loop's thread.
+    """
 
     def stage(
         self,
