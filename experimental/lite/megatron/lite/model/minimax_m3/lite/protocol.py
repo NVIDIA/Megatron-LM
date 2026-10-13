@@ -58,6 +58,7 @@ class ImplConfig:
     moe_dispatcher: str = "alltoall"  # alltoall | deepep | hybridep
     moe_hybridep_num_sms: int | None = None
     moe_hybridep_fused_permute: bool = False
+    moe_permute_fusion: bool = True
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     hf_path: str = ""
@@ -302,6 +303,7 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         moe_dispatcher=impl_cfg.moe_dispatcher,
         moe_hybridep_num_sms=impl_cfg.moe_hybridep_num_sms,
         moe_hybridep_fused_permute=impl_cfg.moe_hybridep_fused_permute,
+        moe_permute_fusion=impl_cfg.moe_permute_fusion,
         fp8=False,
         recompute_modules=recompute_spec,
         deterministic=impl_cfg.deterministic,

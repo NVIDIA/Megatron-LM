@@ -173,6 +173,7 @@ class MiniMaxM3Layer(nn.Module):
         moe_hybridep_num_sms: int | None = None,
         moe_hybridep_fused_permute: bool = False,
         moe_act_recompute: bool = False,
+        moe_permute_fusion: bool = True,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -226,7 +227,7 @@ class MiniMaxM3Layer(nn.Module):
                 moe_hybridep_num_sms=moe_hybridep_num_sms,
                 moe_hybridep_fused_permute=moe_hybridep_fused_permute,
                 moe_act_recompute=moe_act_recompute,
-                moe_permute_fusion=True,
+                moe_permute_fusion=moe_permute_fusion,
             )
             self.mlp: M3DenseMLP | None = None
         else:
@@ -300,6 +301,7 @@ class MiniMaxM3Model(nn.Module):
                     moe_hybridep_num_sms=train_config.moe_hybridep_num_sms,
                     moe_hybridep_fused_permute=train_config.moe_hybridep_fused_permute,
                     moe_act_recompute=moe_act_recompute,
+                    moe_permute_fusion=getattr(train_config, "moe_permute_fusion", True),
                     msa_backend=msa_backend,
                 )
                 for idx in self.layer_indices
