@@ -254,7 +254,15 @@ class InferenceSetupConfig:
     state only. Only safe when EP coordination is not required (e.g. ep_world_size == 1)."""
 
     inference_shards: str | None = None
-    """Partition the world into independent inference shards."""
+    """Partition the world using comma-separated ``key=value`` fields per shard, with
+    shards separated by ``+`` or ``;``. Keys are ``tp``, ``pp``, ``ep``, ``expt_tp``,
+    ``dp``, ``cp`` (currently only 1), and ``role``. For example,
+    ``tp=2,role=prefill+tp=1,dp=2,role=decode`` uses four ranks: one TP=2 prefill
+    engine and two TP=1 decode engines. Shard sizes (``tp * pp * dp``) must sum to
+    the world size. Native disaggregation requires every shard to declare a role,
+    both prefill and decode roles to be present, and prefix caching to be enabled.
+    See "Disaggregated Prefill and Decode" in ``docs/mcore-inference-user-guide.md``
+    for a frontend launch example."""
 
     disagg_kv_transport_backend: Literal["nixl", "nccl"] = "nixl"
     """Backend for native disaggregated KV and recurrent-state transfers."""
