@@ -259,7 +259,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                pre_mlp_layernorm=(
+                    backend.layer_norm(has_residual=True) if num_experts else IdentityOp
+                ),
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
                 sharded_state_dict_keys_map=(
