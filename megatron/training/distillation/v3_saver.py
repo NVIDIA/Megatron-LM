@@ -14,7 +14,14 @@ from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
 
 from .logits_saver import LogitsSaverHooks
-from .v3_format import MAX_VOCAB_SIZE, capture_batch, encode, join_inputs, pack_targets
+from .v3_format import (
+    MAX_VOCAB_SIZE,
+    capture_batch,
+    encode,
+    finalize_record,
+    join_inputs,
+    pack_targets,
+)
 from .v3_replay import layout_options, token_map
 from .v3_storage import KINDS, Storage, member_name, parse_tar_name, tar_name, write_tar
 
@@ -131,11 +138,16 @@ class PairedLogitsSaver(LogitsSaverHooks):
             all_values.append(full_values)
             all_indices.append(full_indices)
         if self.cp_rank == 0:
-            inputs = join_inputs(batches)
             args = get_args()
-            targets = pack_targets(
-                torch.cat(all_values), torch.cat(all_indices), vocab_size=args.padded_vocab_size
+            contract = self.metadata_dict["contract"]
+            # Store the padding-free record: trailing zero-weight positions are dropped.
+            inputs, values, indices = finalize_record(
+                join_inputs(batches),
+                torch.cat(all_values),
+                torch.cat(all_indices),
+                isolated=contract["attention_mode"] == "isolated_segments",
             )
+            targets = pack_targets(values, indices, vocab_size=contract["logprob_vocab_size"])
             start = args.consumed_train_samples
             end = start + get_num_microbatches() * self.dp_size * args.micro_batch_size
             record_id = f'{self.metadata_dict["generation"]}:dp{self.dp_rank}:{start}-{end}'

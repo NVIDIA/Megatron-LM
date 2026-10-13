@@ -3,50 +3,51 @@
 """Lossless, token-aligned records for self-contained offline KD caches.
 
 This module deliberately has no training/runtime dependencies so the format can
-also be inspected and tested on CPU without initializing Megatron.
+also be inspected, written, and tested on CPU without initializing Megatron, and
+reused by non-Megatron producers and consumers.
 """
 
 import hashlib
 import io
+import itertools
+import json
 from typing import Any
 
-import numpy as np
 import torch
 import zstandard
 
 FORMAT_VERSION = 3
 MAX_VOCAB_SIZE = 1 << 24
 LOGPROB_SENTINEL = -1000.0
+PADDING_POLICY = "strip"
+ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")
+# Token-aligned input fields. Only ``tokens`` is required; the rest have defaults.
 TOKEN_FIELDS = ("tokens", "labels", "position_ids", "loss_mask")
-BOUNDARY_FIELDS = ("cu_seqlens", "cu_seqlens_padded")
-# Settings every tar in a cache must share, whichever dump job wrote it.
-SHARED_KEYS = (
-    "format_version",
+OPTIONAL_TOKEN_FIELDS = ("labels", "position_ids", "loss_mask")
+# Contract settings every tar in a cache must share, whichever producer wrote it.
+CONTRACT_KEYS = (
     "first_sample",
     "dp_size_save",
     "mbs_save",
     "gbs_save",
-    "cp_size_save",
-    "save_interval",
-    "train_budget",
     "seq_length",
-    "sft",
-    "inter_document_masking",
-    "reset_attention_mask",
-    "tokenizer",
-    "padded_vocab_size",
-    "targets",
-    "dataset_identity",
-    "attention_mode",
+    "padding_divisor",
     "padding_policy",
+    "attention_mode",
+    "tokenizer",
+    "logprob_vocab_size",
+    "temperature",
+    "targets",
 )
+# Megatron provenance that Megatron dump jobs must also share (parallel-dump alignment).
+MEGATRON_ALIGNMENT_KEYS = ("save_interval", "train_budget")
 
 
-def index_bits_for_vocab(vocab_size: int) -> int:
-    """Choose the smallest index width with a uint16 low word."""
+def index_encoding_for_vocab(vocab_size: int) -> str:
+    """Return the vocabulary-index encoding for a normalization domain size."""
     if type(vocab_size) is not int or not 1 <= vocab_size <= MAX_VOCAB_SIZE:
         raise ValueError("Offline KD vocabulary size must be an integer in [1, 2**24]")
-    return max(16, (vocab_size - 1).bit_length())
+    return "u16" if vocab_size <= 1 << 16 else "u16+u8"
 
 
 def attention_mode_for_layout(
@@ -56,7 +57,7 @@ def attention_mode_for_layout(
     reset_attention_mask: bool,
     create_attention_mask: bool,
 ) -> str:
-    """Describe the effective dataset attention path, excluding loss masking."""
+    """Describe a Megatron dataset's effective attention path, excluding loss masking."""
     if sft or inter_document_masking:
         return "isolated_segments"
     if reset_attention_mask and create_attention_mask:
@@ -64,36 +65,90 @@ def attention_mode_for_layout(
     return "causal"
 
 
+def segment_padding_divisor(*, context_parallel_size: int, sequence_parallel_tp: int) -> int:
+    """Megatron SFT's per-segment padding divisor (``SFTDataset._calculate_padding_divisor``)."""
+    cp_pad = 2 * context_parallel_size if context_parallel_size > 1 else 1
+    return cp_pad * max(1, sequence_parallel_tp)
+
+
 def validate_metadata(meta: dict[str, Any]) -> None:
-    """Reject unsupported or internally inconsistent V3 encoding/context declarations."""
+    """Reject unsupported or internally inconsistent V3 metadata."""
     if meta.get("format_version") != FORMAT_VERSION:
         raise ValueError("Expected offline KD v3 metadata")
-    bits = index_bits_for_vocab(meta.get("padded_vocab_size"))
-    if (
-        type(meta.get("targets", {}).get("index_bits")) is not int
-        or meta["targets"]["index_bits"] != bits
-    ):
-        raise ValueError("Offline KD target index_bits disagrees with padded_vocab_size")
-    mode = meta.get("attention_mode")
-    if mode not in ("causal", "causal_eod_reset", "isolated_segments"):
+    if not isinstance(meta.get("producer"), str):
+        raise ValueError("Offline KD v3 metadata requires a producer")
+    contract = meta.get("contract")
+    if not isinstance(contract, dict) or any(key not in contract for key in CONTRACT_KEYS):
+        raise ValueError("Offline KD v3 metadata is missing contract settings")
+    encoding = index_encoding_for_vocab(contract["logprob_vocab_size"])
+    if contract["targets"].get("index_encoding") != encoding:
+        raise ValueError("Offline KD target index_encoding disagrees with logprob_vocab_size")
+    if contract["temperature"] != 1.0:
+        raise ValueError("Offline KD v3 targets must be temperature-1 log probabilities")
+    if contract["attention_mode"] not in ATTENTION_MODES:
         raise ValueError("Unsupported offline KD attention_mode")
-    packed = bool(meta.get("sft") or meta.get("inter_document_masking"))
-    if (mode == "isolated_segments") != packed:
-        raise ValueError("Offline KD attention_mode disagrees with packing flags")
-    if mode == "causal_eod_reset" and not meta.get("reset_attention_mask"):
-        raise ValueError("Offline KD causal_eod_reset requires reset_attention_mask")
-    if meta.get("padding_policy") != "preserve":
-        raise ValueError("Offline KD v3 requires padding_policy=preserve")
+    if contract["padding_policy"] != PADDING_POLICY:
+        raise ValueError(f"Offline KD v3 requires padding_policy={PADDING_POLICY}")
+    for key in ("padding_divisor", "seq_length", "dp_size_save", "mbs_save", "gbs_save"):
+        if type(contract[key]) is not int or contract[key] < 1:
+            raise ValueError(f"Offline KD v3 contract {key} must be a positive integer")
 
 
 def mismatched_settings(meta: dict[str, Any], expected: dict[str, Any]) -> list[str]:
-    """Return the shared settings on which two cache descriptions disagree."""
-    return [key for key in SHARED_KEYS if meta.get(key) != expected.get(key)]
+    """Return contract (and, between Megatron jobs, alignment) settings that disagree."""
+    mismatched = [
+        key
+        for key in CONTRACT_KEYS
+        if meta.get("contract", {}).get(key) != expected.get("contract", {}).get(key)
+    ]
+    if meta.get("producer") == expected.get("producer") == "megatron":
+        mismatched += [
+            key
+            for key in MEGATRON_ALIGNMENT_KEYS
+            if meta.get("provenance", {}).get(key) != expected.get("provenance", {}).get(key)
+        ]
+    return mismatched
 
 
 def digest(data: bytes) -> str:
-    """Return a stable fingerprint (used for tokenizer identity)."""
+    """Return a stable SHA-256 fingerprint."""
     return hashlib.sha256(data).hexdigest()
+
+
+def tokenizer_fingerprint(
+    vocab: dict[str, int], special_ids: dict[str, int | None], size: int
+) -> str:
+    """Hash the ID-to-token mapping that cached inputs and targets depend on.
+
+    The canonical object is ``{"vocab": [[token, id], ...] sorted by id,
+    "special_ids": {bos, eos, pad, unk}, "size": n}`` serialized as compact,
+    key-sorted UTF-8 JSON. Normalizers, pre-tokenizers, and chat templates are
+    deliberately excluded: inputs are stored as token IDs.
+    """
+    canonical = {
+        "vocab": sorted(
+            ([str(token), int(index)] for token, index in vocab.items()), key=lambda item: item[1]
+        ),
+        "special_ids": {role: special_ids.get(role) for role in ("bos", "eos", "pad", "unk")},
+        "size": int(size),
+    }
+    return digest(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    )
+
+
+def hf_tokenizer_identity(tokenizer: Any, *, eod_id: int | None = None) -> dict[str, Any]:
+    """Describe a Hugging Face tokenizer for the ``tokenizer`` contract setting."""
+    special_ids = {
+        role: getattr(tokenizer, f"{role}_token_id", None) for role in ("bos", "eos", "pad", "unk")
+    }
+    size = len(tokenizer)
+    return {
+        "sha256": tokenizer_fingerprint(tokenizer.get_vocab(), special_ids, size),
+        "size": size,
+        "special_ids": special_ids,
+        "eod_id": eod_id,
+    }
 
 
 def encode(payload: dict[str, Any]) -> bytes:
@@ -124,7 +179,11 @@ def int32(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def capture_batch(batch: dict[str, Any]) -> dict[str, Any]:
-    """Own a CPU snapshot before TP filtering, THD flattening, and CP slicing."""
+    """Own a CPU snapshot of a fixed-length dataset microbatch before TP/CP slicing.
+
+    This is the teacher-side capture layout (dataset boundaries, padding included);
+    :func:`finalize_record` converts joined captures into the stored layout.
+    """
     shape = batch["tokens"].shape
     if len(shape) != 2:
         raise ValueError("Offline KD v3 initially requires fixed-length [batch, sequence] inputs")
@@ -139,27 +198,24 @@ def capture_batch(batch: dict[str, Any]) -> dict[str, Any]:
             if not torch.isfinite(tensor).all() or (tensor < 0).any():
                 raise ValueError("Offline KD loss weights must be finite and nonnegative")
             binary = bool(((tensor == 0) | (tensor == 1)).all())
-            payload["loss_mask_encoding"] = "bool" if binary else "float32"
             payload[key] = tensor.to(torch.bool) if binary else tensor
         else:
             payload[key] = int32(tensor)
         payload[key] = payload[key].reshape(-1)
-    for key in BOUNDARY_FIELDS:
-        boundaries = batch.get(key)
-        if boundaries is None:
-            payload[key] = None
-            continue
+    boundaries = batch.get("cu_seqlens")
+    payload["cu_seqlens"] = None
+    if boundaries is not None:
         if boundaries.ndim != 2 or boundaries.shape[0] != rows:
-            raise ValueError(f"Offline KD {key} must retain its original per-sample rows")
+            raise ValueError("Offline KD cu_seqlens must retain its original per-sample rows")
         compact = []
         for row in boundaries:
             row = int32(row)
             # Default collate pads the metadata by repeating the final boundary.
             row = torch.unique_consecutive(row)
             if row.numel() < 2 or row[0] != 0 or row[-1] != length or (row[1:] <= row[:-1]).any():
-                raise ValueError(f"Invalid offline KD {key} boundaries")
+                raise ValueError("Invalid offline KD cu_seqlens boundaries")
             compact.append(row)
-        payload[key] = compact
+        payload["cu_seqlens"] = compact
     return payload
 
 
@@ -173,19 +229,105 @@ def join_inputs(batches: list[dict[str, Any]]) -> dict[str, Any]:
         offsets.extend((batch["sample_offsets"][1:] + offsets[-1]).tolist())
     result["sample_offsets"] = torch.tensor(offsets, dtype=torch.int64)
     for key in TOKEN_FIELDS:
-        result[key] = torch.cat([batch[key] for batch in batches])
-    result["loss_mask_encoding"] = "bool" if result["loss_mask"].dtype == torch.bool else "float32"
-    for key in BOUNDARY_FIELDS:
-        available = [batch[key] is not None for batch in batches]
-        if any(available) != all(available):
-            raise ValueError(f"Mixed availability of {key} within a cache iteration")
-        result[key] = [row for batch in batches for row in batch[key]] if all(available) else None
+        parts = [batch[key] for batch in batches]
+        if len({part.dtype for part in parts}) > 1:
+            parts = [part.float() for part in parts]  # Mixed binary/fractional weights.
+        result[key] = torch.cat(parts)
+    available = [batch["cu_seqlens"] is not None for batch in batches]
+    if any(available) != all(available):
+        raise ValueError("Mixed availability of cu_seqlens within a cache iteration")
+    result["cu_seqlens"] = (
+        [row for batch in batches for row in batch["cu_seqlens"]] if all(available) else None
+    )
     return result
 
 
+def default_inputs(
+    tokens: torch.Tensor, segment_lengths: torch.Tensor, final_labels: torch.Tensor | None = None
+) -> dict[str, torch.Tensor]:
+    """Defaults for omitted optional fields, per segment.
+
+    ``position_ids`` count from 0 within each segment; ``labels`` are the next token
+    within the segment, and ``final_labels`` (one per segment) at each segment's last
+    position; ``loss_mask`` is all ones. Stored segments never end on an unscored
+    position (trailing zero-weight positions are stripped), so the last position has a
+    real next-token label that the stored tokens cannot provide.
+    """
+    total = tokens.numel()
+    starts = torch.zeros(total, dtype=torch.int64)
+    labels = torch.zeros(total, dtype=torch.int32)
+    if total > 1:
+        labels[:-1] = tokens[1:].to(torch.int32)
+    if segment_lengths.numel():
+        offsets = torch.cumsum(segment_lengths, 0)
+        segment_of = torch.repeat_interleave(torch.arange(segment_lengths.numel()), segment_lengths)
+        starts = (offsets - segment_lengths)[segment_of]
+        labels[offsets - 1] = 0 if final_labels is None else final_labels.to(torch.int32)
+    positions = torch.arange(total, dtype=torch.int64) - starts
+    return {
+        "position_ids": positions.to(torch.int32),
+        "labels": labels,
+        "loss_mask": torch.ones(total, dtype=torch.bool),
+    }
+
+
+def finalize_record(
+    inputs: dict[str, Any], values: torch.Tensor, indices: torch.Tensor, *, isolated: bool
+) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
+    """Convert joined teacher captures to the stored, padding-free record.
+
+    Within each segment (each saved ``cu_seqlens`` segment when ``isolated``, else
+    each whole sample), drop the trailing run of zero-weight positions. Under causal
+    attention no kept position attends to them and they are never scored, so this is
+    lossless; it removes dataset padding and trailing masked turns alike. Targets drop
+    the same rows. Optional fields equal to their defaults are omitted.
+    """
+    offsets = inputs["sample_offsets"].tolist()
+    weights = inputs["loss_mask"].float()
+    keep = torch.zeros(weights.numel(), dtype=torch.bool)
+    segment_lengths, segment_counts = [], []
+    for sample in range(len(offsets) - 1):
+        start, end = offsets[sample], offsets[sample + 1]
+        bounds = inputs["cu_seqlens"][sample].tolist() if isolated else [0, end - start]
+        count = 0
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            scored = torch.nonzero(weights[start + a : start + b]).reshape(-1)
+            if scored.numel():
+                kept = int(scored[-1]) + 1
+                keep[start + a : start + a + kept] = True
+                segment_lengths.append(kept)
+                count += 1
+        segment_counts.append(count)
+    lengths = torch.tensor(segment_lengths, dtype=torch.int64)
+    segment_ends = list(itertools.accumulate(segment_lengths))
+    sample_ends = [segment_ends[c - 1] if c else 0 for c in itertools.accumulate(segment_counts)]
+    record = {
+        "format_version": FORMAT_VERSION,
+        "sample_offsets": torch.tensor([0, *sample_ends], dtype=torch.int64),
+        "tokens": inputs["tokens"][keep],
+        "segment_lengths": lengths.to(torch.int32),
+        "segment_counts": torch.tensor(segment_counts, dtype=torch.int32),
+    }
+    ends = torch.cumsum(lengths, 0) - 1
+    final_labels = inputs["labels"][keep][ends].to(torch.int32)
+    defaults = default_inputs(record["tokens"], lengths, final_labels)
+    for key in OPTIONAL_TOKEN_FIELDS:
+        kept = inputs[key][keep]
+        default = defaults[key]
+        if kept.dtype == torch.bool or default.dtype == torch.bool:
+            same = kept.dtype == default.dtype and torch.equal(kept, default)
+        else:
+            same = torch.equal(kept.to(default.dtype), default)
+        if not same:
+            record[key] = kept
+    if "labels" not in record:
+        record["segment_final_labels"] = final_labels
+    return record, values[keep], indices[keep]
+
+
 def pack_targets(values: torch.Tensor, indices: torch.Tensor, *, vocab_size: int) -> dict[str, Any]:
-    """Encode [tokens, K] indices as uint16 low words and packed high-bit planes."""
-    bits = index_bits_for_vocab(vocab_size)
+    """Encode [tokens, K] indices as uint16 low words plus, above 2**16, a uint8 high byte."""
+    encoding = index_encoding_for_vocab(vocab_size)
     if values.shape != indices.shape or values.ndim != 2:
         raise ValueError("Offline KD targets must have matching [tokens, K] shapes")
     if not values.is_floating_point() or indices.dtype not in (torch.int32, torch.int64):
@@ -198,76 +340,106 @@ def pack_targets(values: torch.Tensor, indices: torch.Tensor, *, vocab_size: int
         or ((indices == -1) & (values != LOGPROB_SENTINEL)).any()
     ):
         raise ValueError("Offline KD vocabulary index is out of range or has an unmasked sentinel")
-    flat = indices.reshape(-1).numpy()
-    high = np.empty((bits - 16, (flat.size + 7) // 8), dtype=np.uint8)
-    for plane in range(bits - 16):
-        high[plane] = np.packbits(((flat >> (16 + plane)) & 1).astype(np.uint8), bitorder="big")
-    return {
+    payload = {
         "format_version": FORMAT_VERSION,
-        "index_bits": bits,
+        "index_encoding": encoding,
         "values": values,
         "indices_low": (indices & 0xFFFF).to(torch.uint16),
-        "indices_high": torch.from_numpy(high),
     }
+    if encoding == "u16+u8":
+        payload["indices_high"] = ((indices >> 16) & 0xFF).to(torch.uint8)
+    return payload
 
 
 def unpack_targets(
     payload: dict[str, Any], *, vocab_size: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reconstruct vocabulary indices in canonical token order."""
-    bits = payload.get("index_bits")
-    if type(bits) is not int or not 16 <= bits <= 24:
-        raise ValueError("Malformed offline KD target index_bits")
-    if vocab_size is not None and bits != index_bits_for_vocab(vocab_size):
-        raise ValueError("Offline KD target index_bits disagrees with padded vocabulary")
-    low, high = payload["indices_low"], payload["indices_high"]
-    values = payload["values"]
+    encoding = payload.get("index_encoding")
+    if encoding not in ("u16", "u16+u8"):
+        raise ValueError("Malformed offline KD target index_encoding")
+    if vocab_size is not None and encoding != index_encoding_for_vocab(vocab_size):
+        raise ValueError("Offline KD target index_encoding disagrees with logprob_vocab_size")
+    values, low = payload["values"], payload["indices_low"]
+    high = payload.get("indices_high")
     if (
         values.shape != low.shape
         or values.ndim != 2
         or not values.is_floating_point()
         or low.dtype != torch.uint16
-        or high.dtype != torch.uint8
-        or tuple(high.shape) != (bits - 16, (low.numel() + 7) // 8)
+        or (encoding == "u16") != (high is None)
+        or (high is not None and (high.dtype != torch.uint8 or high.shape != low.shape))
     ):
         raise ValueError("Malformed offline KD target tensors")
     indices = low.to(torch.int64)
-    for plane, packed in enumerate(high.numpy()):
-        if low.numel() % 8 and packed[-1] & ((1 << (8 - low.numel() % 8)) - 1):
-            raise ValueError("Malformed offline KD high-bit plane padding")
-        unpacked = np.unpackbits(packed, count=low.numel(), bitorder="big").copy()
-        indices |= torch.from_numpy(unpacked).to(torch.int64).reshape(low.shape) << (16 + plane)
+    if high is not None:
+        indices |= high.to(torch.int64) << 16
     if vocab_size is not None and ((indices >= vocab_size) & (values != LOGPROB_SENTINEL)).any():
         raise ValueError("Offline KD target vocabulary index is out of range")
     return values, indices
 
 
 def validate_inputs(payload: dict[str, Any]) -> None:
-    """Reject malformed sample offsets and token-aligned input fields."""
+    """Reject malformed stored inputs (sample offsets, segments, token-aligned fields)."""
     offsets = payload["sample_offsets"]
     if (
         offsets.ndim != 1
         or offsets.numel() < 2
         or offsets[0] != 0
-        or (offsets[1:] <= offsets[:-1]).any()
+        or (offsets[1:] < offsets[:-1]).any()
     ):
         raise ValueError("Malformed offline KD sample offsets")
+    total = int(offsets[-1])
     for key in TOKEN_FIELDS:
-        if payload[key].ndim != 1 or payload[key].numel() != offsets[-1]:
-            raise ValueError(f"Malformed offline KD {key} tensor")
-    for key in BOUNDARY_FIELDS:
-        rows = payload.get(key)
-        if rows is None:
+        tensor = payload.get(key)
+        if tensor is None and key != "tokens":
             continue
-        if len(rows) != offsets.numel() - 1:
-            raise ValueError(f"Malformed offline KD {key} sample count")
-        for i, row in enumerate(rows):
-            if (
-                row.ndim != 1
-                or row.numel() < 2
-                or row[0] != 0
-                or row[-1] != offsets[i + 1] - offsets[i]
-            ):
-                raise ValueError(f"Malformed offline KD {key} endpoints")
-            if (row[1:] <= row[:-1]).any():
-                raise ValueError(f"Malformed offline KD {key} order")
+        if tensor is None or tensor.ndim != 1 or tensor.numel() != total:
+            raise ValueError(f"Malformed offline KD {key} tensor")
+    lengths, counts = payload.get("segment_lengths"), payload.get("segment_counts")
+    if payload.get("labels") is None:
+        final = payload.get("segment_final_labels")
+        segments = (
+            lengths.numel() if lengths is not None else int((offsets[1:] > offsets[:-1]).sum())
+        )
+        if final is None or final.ndim != 1 or final.numel() != segments:
+            raise ValueError("Offline KD records without labels need one final label per segment")
+    if (lengths is None) != (counts is None):
+        raise ValueError("Offline KD segment_lengths and segment_counts must appear together")
+    if lengths is None:
+        return
+    if (
+        counts.numel() != offsets.numel() - 1
+        or int(counts.sum()) != lengths.numel()
+        or (lengths <= 0).any()
+        or (counts < 0).any()
+    ):
+        raise ValueError("Malformed offline KD segments")
+    per_sample = torch.zeros(counts.numel(), dtype=torch.int64)
+    if lengths.numel():
+        owner = torch.repeat_interleave(torch.arange(counts.numel()), counts.long())
+        per_sample.index_add_(0, owner, lengths.long())
+    if not torch.equal(per_sample, offsets[1:] - offsets[:-1]):
+        raise ValueError("Offline KD segments disagree with sample lengths")
+
+
+def fill_input_defaults(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return inputs with every optional field present (stored values or defaults).
+
+    Inputs without segments treat each non-empty sample as one segment.
+    """
+    offsets = payload["sample_offsets"]
+    sample_lengths = (offsets[1:] - offsets[:-1]).to(torch.int64)
+    if payload.get("segment_lengths") is None:
+        lengths = sample_lengths[sample_lengths > 0]
+        counts = (sample_lengths > 0).to(torch.int32)
+    else:
+        lengths = payload["segment_lengths"].to(torch.int64)
+        counts = payload["segment_counts"]
+    result = dict(payload)
+    result["segment_lengths"], result["segment_counts"] = lengths, counts
+    defaults = default_inputs(payload["tokens"], lengths, payload.get("segment_final_labels"))
+    for key in OPTIONAL_TOKEN_FIELDS:
+        if result.get(key) is None:
+            result[key] = defaults[key]
+    return result

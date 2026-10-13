@@ -45,47 +45,60 @@ def inputs(ids, length=8, packed=False):
     return batch
 
 
-def settings(dp=2, mbs=2, gbs=8, **overrides):
-    """Shared cache settings, as a dump job records them in every tar."""
-    result = {
-        "format_version": 3,
+def settings(dp=2, mbs=2, gbs=8, *, contract=None, provenance=None, producer="megatron"):
+    """Cache metadata shared by every tar: the portable contract plus provenance."""
+    shared = {
         "first_sample": 0,
         "dp_size_save": dp,
         "mbs_save": mbs,
         "gbs_save": gbs,
-        "cp_size_save": 1,
-        "save_interval": 2,
-        "train_budget": 1024,
         "seq_length": 8,
-        "sft": False,
-        "inter_document_masking": False,
-        "reset_attention_mask": False,
-        "tokenizer": None,
-        "padded_vocab_size": 1 << 17,
-        "targets": {"k": 1},
-        "dataset_identity": {"seed": 7},
-        "padding_policy": "preserve",
+        "padding_divisor": 1,
+        "padding_policy": "strip",
+        "attention_mode": "causal",
+        "tokenizer": {"sha256": "test", "size": 3, "special_ids": {}, "eod_id": 2},
+        "logprob_vocab_size": 1 << 17,
+        "temperature": 1.0,
+        "targets": {"k": 1, "p": None, "min_k": 1, "save_dtype": "fp32"},
     }
-    result.update(overrides)
-    result["targets"] = {
-        "index_bits": codec.index_bits_for_vocab(result["padded_vocab_size"]),
-        **result["targets"],
+    shared.update(contract or {})
+    shared["targets"] = {
+        **shared["targets"],
+        "index_encoding": codec.index_encoding_for_vocab(shared["logprob_vocab_size"]),
     }
-    result.setdefault(
-        "attention_mode",
-        codec.attention_mode_for_layout(
-            sft=result["sft"],
-            inter_document_masking=result["inter_document_masking"],
-            reset_attention_mask=result["reset_attention_mask"],
-            create_attention_mask=True,
-        ),
+    return {
+        "format_version": 3,
+        "producer": producer,
+        "contract": shared,
+        "provenance": {
+            "save_interval": 2,
+            "train_budget": 1024,
+            "cp_size_save": 1,
+            "dataset_identity": {"seed": 7},
+            **(provenance or {}),
+        },
+    }
+
+
+def make_record(captured, contract):
+    """Finalize captured inputs and identity targets exactly as the saver does."""
+    target_ids = captured["tokens"].to(torch.int64).reshape(-1, 1)
+    record, values, indices = codec.finalize_record(
+        captured,
+        target_ids.float(),
+        target_ids,
+        isolated=contract["attention_mode"] == "isolated_segments",
     )
-    return result
+    targets = codec.pack_targets(values, indices, vocab_size=contract["logprob_vocab_size"])
+    return record, targets
 
 
-def write_flush(storage, metadata, rank, begin, finish, *, packed=False, generation="gen"):
+def write_flush(
+    storage, metadata, rank, begin, finish, *, packed=False, generation="gen", source=None
+):
     """Write one teacher DP rank's flush exactly as the saver does."""
-    dp, mbs, gbs = metadata["dp_size_save"], metadata["mbs_save"], metadata["gbs_save"]
+    contract = metadata["contract"]
+    dp, mbs, gbs = contract["dp_size_save"], contract["mbs_save"], contract["gbs_save"]
     members = {"inputs": [], "targets": []}
     for iteration in range(begin, finish):
         start, end = iteration * gbs, (iteration + 1) * gbs
@@ -94,13 +107,10 @@ def write_flush(storage, metadata, rank, begin, finish, *, packed=False, generat
             for mb in range(gbs // (dp * mbs))
             for j in range(mbs)
         ]
-        captured = codec.capture_batch(inputs(ids, packed=packed))
-        target_ids = captured["tokens"].to(torch.int64).reshape(-1, 1)
-        targets = codec.pack_targets(
-            target_ids.float(), target_ids, vocab_size=metadata["padded_vocab_size"]
-        )
-        captured["record_id"] = targets["record_id"] = f"{generation}:dp{rank}:{start}-{end}"
-        for kind, payload in (("inputs", captured), ("targets", targets)):
+        batch = (source or inputs)(ids, packed=packed)
+        record, targets = make_record(codec.capture_batch(batch), contract)
+        record["record_id"] = targets["record_id"] = f"{generation}:dp{rank}:{start}-{end}"
+        for kind, payload in (("inputs", record), ("targets", targets)):
             members[kind].append(
                 (storage_module.member_name(start, end, kind), codec.encode(payload))
             )
@@ -124,19 +134,33 @@ def write_cache(
     iterations=4,
     bundle=2,
     packed=False,
-    extra_metadata=None,
+    contract=None,
+    provenance=None,
+    metadata=None,
     start=0,
     generation="gen",
+    source=None,
 ):
     storage = Storage(str(root))
-    metadata = settings(dp, mbs, gbs, **{"sft": packed, **(extra_metadata or {})})
+    if metadata is None:
+        mode = {"attention_mode": "isolated_segments"} if packed else {}
+        metadata = settings(
+            dp, mbs, gbs, contract={**mode, **(contract or {})}, provenance=provenance
+        )
     for begin in range(start, iterations, bundle):
         finish = min(begin + bundle, iterations)
         for rank in range(dp):
             name = storage_module.tar_name(rank, begin * gbs, finish * gbs, "inputs")
             if not storage.exists(name):
                 write_flush(
-                    storage, metadata, rank, begin, finish, packed=packed, generation=generation
+                    storage,
+                    metadata,
+                    rank,
+                    begin,
+                    finish,
+                    packed=packed,
+                    generation=generation,
+                    source=source,
                 )
     return storage, metadata
 
@@ -153,17 +177,15 @@ def ids_of(samples):
     return [s["sample_id"] for s in samples]
 
 
-def test_compact_inputs_preserve_labels_masks_and_positions():
+def test_capture_owns_a_compact_snapshot():
     source = inputs([0, 1], packed=True)
     source["labels"][0, 0] = -100
     source["cu_seqlens"] = torch.tensor([[0, 4, 8, 8], [0, 2, 8, 8]])
     captured = codec.capture_batch(source)
     assert captured["tokens"].dtype == torch.int32
     assert captured["loss_mask"].dtype == torch.bool
-    restored = codec.decode(codec.encode(captured))
-    codec.validate_inputs(restored)
-    assert restored["labels"][0] == -100
-    assert restored["cu_seqlens"][1].tolist() == [0, 2, 8]
+    assert captured["labels"][0] == -100
+    assert captured["cu_seqlens"][1].tolist() == [0, 2, 8]
     source["tokens"].fill_(999)
     assert captured["tokens"][0] == 0  # Owned snapshot, not an alias.
 
@@ -179,83 +201,62 @@ def test_fractional_mask_and_integer_overflow():
         codec.capture_batch(source)
 
 
-def test_17_bit_indices_and_zstd_checksums():
-    indices = torch.tensor([[0, 65535, 65536, 131071, -1]])
-    values = torch.tensor([[0.0, -1.0, -2.0, -3.0, -1000.0]])
-    encoded = codec.pack_targets(values, indices, vocab_size=1 << 17)
-    restored_values, restored_indices = codec.unpack_targets(encoded)
-    assert torch.equal(restored_values, values)
-    assert torch.equal(restored_indices[:, :4], indices[:, :4])
-    with pytest.raises(ValueError, match="vocabulary"):
-        codec.pack_targets(values, indices + (1 << 17), vocab_size=1 << 17)
-    raw = codec.encode(encoded)
+def test_zstd_checksum_detects_corruption():
+    raw = codec.encode(
+        codec.pack_targets(torch.zeros(1, 1), torch.zeros(1, 1, dtype=torch.long), vocab_size=3)
+    )
     with pytest.raises(ValueError, match="checksum"):
         codec.decode(raw[:-1] + bytes([raw[-1] ^ 1]))
 
 
 @pytest.mark.parametrize(
-    "vocab_size,bits",
-    [
-        (1, 16),
-        (65535, 16),
-        (65536, 16),
-        (65537, 17),
-        (1 << 17, 17),
-        ((1 << 17) + 1, 18),
-        (1 << 18, 18),
-        ((1 << 18) + 1, 19),
-        (1 << 19, 19),
-        (1 << 24, 24),
-    ],
+    "vocab_size,encoding",
+    [(1, "u16"), (65536, "u16"), (65537, "u16+u8"), (1 << 17, "u16+u8"), (1 << 24, "u16+u8")],
 )
-def test_variable_width_indices_roundtrip(vocab_size, bits):
+def test_index_encoding_roundtrip(vocab_size, encoding):
     indices = torch.tensor([[0, vocab_size - 1, -1, 0, vocab_size - 1]])
     values = torch.tensor([[-1.0, -2.0, -1000.0, -3.0, -4.0]])
     payload = codec.pack_targets(values, indices, vocab_size=vocab_size)
-    assert payload["index_bits"] == bits
+    assert payload["index_encoding"] == encoding
     assert payload["indices_low"].dtype == torch.uint16
-    assert payload["indices_high"].shape == (bits - 16, 1)
+    assert ("indices_high" in payload) == (encoding == "u16+u8")
+    if "indices_high" in payload:
+        assert payload["indices_high"].dtype == torch.uint8
+        assert payload["indices_high"].shape == indices.shape
     restored, ids = codec.unpack_targets(codec.decode(codec.encode(payload)), vocab_size=vocab_size)
     assert torch.equal(restored, values)
     keep = values != -1000.0
     assert torch.equal(ids[keep], indices[keep])
-    assert ids[0, 2] == (1 << bits) - 1  # Validity is carried by the logprob sentinel.
+    # The -1 selection sentinel decodes to all ones; validity comes from the logprob sentinel.
+    assert ids[0, 2] == (0xFFFF if encoding == "u16" else 0xFFFFFF)
 
 
 @pytest.mark.parametrize("vocab_size", [0, -1, (1 << 24) + 1, 1.5, True])
-def test_index_width_rejects_invalid_vocab_size(vocab_size):
+def test_index_encoding_rejects_invalid_vocab_size(vocab_size):
     with pytest.raises(ValueError, match="vocabulary size"):
-        codec.index_bits_for_vocab(vocab_size)
-
-
-def test_high_bit_plane_order_and_padding():
-    indices = torch.tensor([[0, 1 << 16, 1 << 17, (1 << 16) | (1 << 17), 0]])
-    payload = codec.pack_targets(torch.zeros_like(indices).float(), indices, vocab_size=1 << 18)
-    assert payload["indices_high"].tolist() == [[0b01010000], [0b00110000]]
-    payload["indices_high"][0, 0] |= 1
-    with pytest.raises(ValueError, match="plane padding"):
-        codec.unpack_targets(payload)
+        codec.index_encoding_for_vocab(vocab_size)
 
 
 @pytest.mark.parametrize(
-    "case", ["width", "width_type", "width_mismatch", "planes", "dtype", "bounds"]
+    "case", ["encoding", "mismatch", "missing_high", "extra_high", "dtype", "bounds"]
 )
 def test_malformed_target_encoding_rejected(case):
     payload = codec.pack_targets(torch.zeros(1, 2), torch.tensor([[0, 1]]), vocab_size=65537)
     kwargs = {}
-    if case == "width":
-        payload["index_bits"] = 25
-    elif case == "width_type":
-        payload["index_bits"] = 17.0
-    elif case == "width_mismatch":
+    if case == "encoding":
+        payload["index_encoding"] = "u24"
+    elif case == "mismatch":
         kwargs["vocab_size"] = 65536
-    elif case == "planes":
+    elif case == "missing_high":
+        del payload["indices_high"]
+    elif case == "extra_high":
+        payload = codec.pack_targets(torch.zeros(1, 2), torch.tensor([[0, 1]]), vocab_size=3)
         payload["indices_high"] = torch.zeros(1, 2, dtype=torch.uint8)
     elif case == "dtype":
         payload["indices_low"] = payload["indices_low"].long()
     else:
         payload["indices_low"][0, 1] = 2
-        payload["indices_high"][0, 0] = 0b01000000  # ID 65538 exceeds declared vocabulary.
+        payload["indices_high"][0, 1] = 1  # ID 65538 exceeds the declared vocabulary.
         kwargs["vocab_size"] = 65537
     with pytest.raises(ValueError):
         codec.unpack_targets(payload, **kwargs)
@@ -268,19 +269,44 @@ def test_target_encoder_rejects_invalid_ids(index, value):
 
 
 @pytest.mark.parametrize(
-    "overrides",
+    "contract",
     [
         {"attention_mode": "unknown"},
-        {"padding_policy": "strip"},
-        {"attention_mode": "isolated_segments"},
-        {"sft": True, "attention_mode": "causal"},
-        {"attention_mode": "causal_eod_reset"},
-        {"targets": {"index_bits": 18}},
+        {"padding_policy": "preserve"},
+        {"temperature": 0.7},
+        {"padding_divisor": 0},
+        {"targets": {"k": 1, "p": None, "min_k": 1, "save_dtype": "fp32", "index_encoding": "u16"}},
     ],
 )
-def test_unsupported_context_and_encoding_metadata_rejected(overrides):
+def test_unsupported_contract_metadata_rejected(contract):
+    metadata = settings(contract=contract)
+    if "targets" in contract:
+        metadata["contract"]["targets"] = contract["targets"]
     with pytest.raises(ValueError):
-        codec.validate_metadata(settings(**overrides))
+        codec.validate_metadata(metadata)
+
+
+def test_metadata_requires_producer_and_every_contract_key():
+    metadata = settings()
+    del metadata["producer"]
+    with pytest.raises(ValueError, match="producer"):
+        codec.validate_metadata(metadata)
+    metadata = settings()
+    del metadata["contract"]["tokenizer"]
+    with pytest.raises(ValueError, match="contract"):
+        codec.validate_metadata(metadata)
+
+
+def test_contract_and_megatron_alignment_comparisons():
+    base = settings()
+    assert codec.mismatched_settings(settings(provenance={"dataset_identity": {}}), base) == []
+    assert codec.mismatched_settings(settings(contract={"seq_length": 16}), base) == ["seq_length"]
+    assert codec.mismatched_settings(settings(provenance={"save_interval": 4}), base) == [
+        "save_interval"
+    ]
+    # Alignment provenance only binds Megatron jobs to each other.
+    other = settings(producer="vllm", provenance={"save_interval": 4})
+    assert codec.mismatched_settings(other, base) == []
 
 
 @pytest.mark.parametrize(
@@ -304,14 +330,126 @@ def test_effective_attention_mode(sft, inter_document, reset, create, expected):
         )
         == expected
     )
-    codec.validate_metadata(
-        settings(
-            sft=sft,
-            inter_document_masking=inter_document,
-            reset_attention_mask=reset,
-            attention_mode=expected,
-        )
+    codec.validate_metadata(settings(contract={"attention_mode": expected}))
+
+
+def test_tokenizer_fingerprint_is_canonical():
+    vocab = {"a": 0, "b": 1, "c": 2}
+    special = {"bos": None, "eos": 2, "pad": None, "unk": None}
+    first = codec.tokenizer_fingerprint(vocab, special, 3)
+    assert first == codec.tokenizer_fingerprint(dict(reversed(vocab.items())), special, 3)
+    assert first != codec.tokenizer_fingerprint({**vocab, "d": 3}, special, 4)
+    assert first != codec.tokenizer_fingerprint(vocab, {**special, "pad": 1}, 3)
+
+    class HF:
+        bos_token_id, eos_token_id, pad_token_id, unk_token_id = None, 2, None, None
+
+        def get_vocab(self):
+            return vocab
+
+        def __len__(self):
+            return 3
+
+    identity = codec.hf_tokenizer_identity(HF(), eod_id=2)
+    assert identity == {"sha256": first, "size": 3, "special_ids": special, "eod_id": 2}
+    assert codec.hf_tokenizer_identity(HF(), eod_id=0)["sha256"] == first  # EOD is not hashed.
+
+
+def packed_capture(weights, *, bounds=(0, 4, 8)):
+    """One packed sample of 8 tokens with explicit loss weights."""
+    source = inputs([3], packed=True)
+    source["cu_seqlens"] = torch.tensor([list(bounds)])
+    source["position_ids"] = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])  # SFT restarts per document.
+    source["loss_mask"] = torch.tensor([weights], dtype=torch.float32)
+    return codec.capture_batch(source)
+
+
+def test_finalize_strips_only_trailing_zero_weight_positions():
+    captured = packed_capture([0, 1, 1, 0, 0, 1, 0, 0])
+    targets = torch.arange(8).reshape(-1, 1)
+    record, values, indices = codec.finalize_record(
+        captured, targets.float(), targets, isolated=True
     )
+    # Leading prompts (positions 0 and 4) stay; trailing padding/masked tails go.
+    assert record["tokens"].tolist() == [300, 301, 302, 304, 305]
+    assert record["segment_lengths"].tolist() == [3, 2]
+    assert record["segment_counts"].tolist() == [2]
+    assert record["sample_offsets"].tolist() == [0, 5]
+    assert indices.reshape(-1).tolist() == [0, 1, 2, 4, 5]
+    assert torch.equal(values, indices.float())
+    # Positions and labels equal their defaults (with per-segment final labels).
+    assert "position_ids" not in record and "labels" not in record
+    assert record["segment_final_labels"].tolist() == [303, 306]
+    restored = codec.fill_input_defaults(record)
+    assert restored["position_ids"].tolist() == [0, 1, 2, 0, 1]
+    assert restored["loss_mask"].float().tolist() == [0, 1, 1, 0, 1]
+    assert restored["labels"].tolist() == captured["labels"][[0, 1, 2, 4, 5]].tolist()
+
+
+def test_finalize_drops_fully_masked_segments_and_samples():
+    captured = packed_capture([0, 0, 0, 0, 0, 1, 1, 1])
+    targets = torch.arange(8).reshape(-1, 1)
+    record, _, _ = codec.finalize_record(captured, targets.float(), targets, isolated=True)
+    assert record["segment_lengths"].tolist() == [4]
+    empty = packed_capture([0] * 8)
+    record, values, _ = codec.finalize_record(empty, targets.float(), targets, isolated=True)
+    assert record["sample_offsets"].tolist() == [0, 0]
+    assert record["segment_counts"].tolist() == [0]
+    assert values.shape == (0, 1)
+    codec.validate_inputs(record)
+
+
+def test_unpacked_samples_are_one_segment():
+    source = inputs([0, 1])
+    source["loss_mask"][1, 6:] = 0
+    captured = codec.capture_batch(source)
+    targets = torch.arange(16).reshape(-1, 1)
+    record, _, _ = codec.finalize_record(captured, targets.float(), targets, isolated=False)
+    assert record["sample_offsets"].tolist() == [0, 8, 14]
+    assert record["segment_lengths"].tolist() == [8, 6]
+
+
+def test_input_defaults_are_per_segment():
+    tokens = torch.tensor([5, 6, 7, 8, 9], dtype=torch.int32)
+    defaults = codec.default_inputs(tokens, torch.tensor([3, 2]), torch.tensor([10, 11]))
+    assert defaults["position_ids"].tolist() == [0, 1, 2, 0, 1]
+    assert defaults["labels"].tolist() == [6, 7, 10, 9, 11]
+    assert defaults["loss_mask"].all()
+    minimal = {
+        "format_version": 3,
+        "sample_offsets": torch.tensor([0, 5]),
+        "tokens": tokens,
+        "segment_lengths": torch.tensor([3, 2], dtype=torch.int32),
+        "segment_counts": torch.tensor([2], dtype=torch.int32),
+    }
+    with pytest.raises(ValueError, match="final label"):
+        codec.validate_inputs(minimal)
+    minimal["segment_final_labels"] = torch.tensor([10, 11], dtype=torch.int32)
+    codec.validate_inputs(minimal)
+    filled = codec.fill_input_defaults(minimal)
+    assert filled["labels"].tolist() == [6, 7, 10, 9, 11]
+
+
+@pytest.mark.parametrize("case", ["counts", "length", "zero", "sum"])
+def test_malformed_segments_rejected(case):
+    record = {
+        "format_version": 3,
+        "sample_offsets": torch.tensor([0, 5]),
+        "tokens": torch.zeros(5, dtype=torch.int32),
+        "labels": torch.zeros(5, dtype=torch.int32),
+        "segment_lengths": torch.tensor([3, 2], dtype=torch.int32),
+        "segment_counts": torch.tensor([2], dtype=torch.int32),
+    }
+    if case == "counts":
+        record["segment_counts"] = torch.tensor([1], dtype=torch.int32)
+    elif case == "length":
+        del record["segment_counts"]
+    elif case == "zero":
+        record["segment_lengths"] = torch.tensor([5, 0], dtype=torch.int32)
+    else:
+        record["segment_lengths"] = torch.tensor([3, 3], dtype=torch.int32)
+    with pytest.raises(ValueError):
+        codec.validate_inputs(record)
 
 
 def test_tars_are_self_describing_and_immutable(tmp_path):
@@ -511,7 +649,7 @@ def test_input_only_readers_never_open_targets(tmp_path, monkeypatch):
 
 def test_mismatched_tar_is_rejected_before_any_record_is_used(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=2)
-    write_cache(tmp_path, iterations=4, extra_metadata={"seq_length": 16}, generation="bad")
+    write_cache(tmp_path, iterations=4, contract={"seq_length": 16}, generation="bad")
     live = reader(storage, metadata)
     assert ids_of(live.samples(list(range(16)), 16)) == list(range(16))
     with pytest.raises(ValueError, match="seq_length"):
@@ -529,15 +667,71 @@ def test_inputs_and_targets_from_different_jobs_are_rejected(tmp_path):
     live.close()
 
 
-def test_packed_shortening_rejected_and_collation_preserves_boundaries(tmp_path):
+def test_packed_samples_must_fit_the_student_length(tmp_path):
     storage, metadata = write_cache(tmp_path, packed=True)
     live = reader(storage, metadata)
     samples = live.samples([0, 1], 2)
     live.close()
-    with pytest.raises(ValueError, match="prefix shortening"):
-        replay.collate_samples(samples, 4)
-    result = replay.collate_samples(samples, 8)
+    with pytest.raises(ValueError, match="student sequence length"):
+        replay.collate_samples(samples, 4, packed=True)
+    result = replay.collate_samples(samples, 8, packed=True)
     assert result["cu_seqlens"].tolist() == [[0, 4, 8], [0, 4, 8]]
+
+
+def tail_masked(ids, packed=False):
+    """Packed samples whose documents end with a zero-weight position (padding-like)."""
+    batch = inputs(ids, packed=packed)
+    batch["position_ids"] = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]).expand(len(ids), -1)
+    batch["loss_mask"][:, [3, 7]] = 0
+    return batch
+
+
+@pytest.mark.parametrize(
+    "divisor,length,bounds,tokens",
+    [
+        (1, 8, [0, 3, 8], [0, 1, 2, 4, 5, 6, None, None]),
+        (2, 8, [0, 4, 8], [0, 1, 2, None, 4, 5, 6, None]),
+        (2, 12, [0, 4, 12], [0, 1, 2, None, 4, 5, 6, None, None, None, None, None]),
+    ],
+)
+def test_stripped_segments_are_repadded_for_the_student(tmp_path, divisor, length, bounds, tokens):
+    storage, metadata = write_cache(
+        tmp_path, packed=True, contract={"padding_divisor": 2}, source=tail_masked
+    )
+    live = reader(storage, metadata)
+    sample = live.samples([0], 1)[0]
+    live.close()
+    assert sample["segments"].tolist() == [3, 3]  # Stored without padding.
+    batch = replay.collate_samples([sample], length, packed=True, divisor=divisor)
+    assert batch["cu_seqlens"].tolist() == [bounds]
+    expected = [0 if t is None else t for t in tokens]
+    assert batch["tokens"][0].tolist() == expected
+    padding = torch.tensor([t is None for t in tokens])
+    assert (batch["loss_mask"][0][padding] == 0).all()
+    values = batch["_kd_values"][0].reshape(-1)
+    assert (values[padding] == -1000).all() and (
+        values[~padding] == torch.tensor(expected)[~padding]
+    ).all()
+    # Positions restart per segment and continue through each segment's padding.
+    starts = torch.tensor(bounds[:-1])
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        assert batch["position_ids"][0][a:b].tolist() == list(range(b - a))
+    assert int(starts[-1]) < length
+
+
+def test_rows_without_teacher_entries_are_never_scored():
+    sample = {
+        "tokens": torch.tensor([1, 2, 3], dtype=torch.int32),
+        "labels": torch.tensor([2, 3, 4], dtype=torch.int32),
+        "position_ids": torch.arange(3, dtype=torch.int32),
+        "loss_mask": torch.ones(3, dtype=torch.bool),
+        "segments": torch.tensor([3]),
+        "sample_id": 0,
+        "teacher_values": torch.tensor([[-1.0], [-1000.0], [-2.0]]),
+        "teacher_indices": torch.tensor([[1], [0], [2]]),
+    }
+    batch = replay.collate_samples([sample], 3)
+    assert batch["loss_mask"][0].tolist() == [1.0, 0.0, 1.0]
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -845,9 +1039,9 @@ def test_dump_validation_rejects_unsafe_options(runtime_environment, change, mes
 
 def replay_cache(tmp_path, args, runtime, *, iterations=4, generation="gen"):
     """Create a runtime-compatible cache."""
-    extra = {"tokenizer": runtime.tokenizer_identity()}
+    contract = {"tokenizer": runtime.tokenizer_identity()}
     storage, metadata = write_cache(
-        tmp_path, iterations=iterations, extra_metadata=extra, generation=generation
+        tmp_path, iterations=iterations, contract=contract, generation=generation
     )
     args.logits_load_dir = str(tmp_path)
     return storage, metadata
@@ -931,8 +1125,8 @@ def test_resume_validates_sample_cursor(tmp_path, runtime_environment):
 def test_student_rejects_incompatible_cache(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
     replay_cache(tmp_path, args, runtime)
-    args.padded_vocab_size = 5
-    with pytest.raises(RuntimeError, match="padded vocabulary"):
+    args.padded_vocab_size = 2  # Smaller than the 3-token tokenizer: real tokens would be lost.
+    with pytest.raises(RuntimeError, match="smaller than the tokenizer"):
         runtime.initialize_replay(args)
 
 
@@ -979,9 +1173,7 @@ def test_frontier_is_collective_and_errors_together(tmp_path, runtime_environmen
     assert len(listings) == 1
     assert runtime._PLAN["available"] == 32 and live.total_samples == 32
     # A hole: the next range's owner has not published yet; every rank raises the same error.
-    write_cache(
-        tmp_path, start=6, iterations=8, extra_metadata={"tokenizer": metadata["tokenizer"]}
-    )
+    write_cache(tmp_path, start=6, iterations=8, metadata=metadata)
     args.consumed_train_samples = 32
     payload = []
 
@@ -1125,7 +1317,10 @@ def teacher_saver(runtime, tmp_path, dp_size=2):
     return types.SimpleNamespace(
         dp_size=dp_size,
         cp_size=1,
-        metadata_dict={"saver": {"k": 1}, "identifiers": {"seed": 7}},
+        metadata_dict={
+            "saver": {"k": 1, "p": None, "min_k": 1, "save_dtype": "fp32"},
+            "identifiers": {"seed": 7},
+        },
         save_dir=str(tmp_path),
     )
 
@@ -1133,8 +1328,8 @@ def teacher_saver(runtime, tmp_path, dp_size=2):
 def teacher_cache(tmp_path, runtime, args, **kwargs):
     saver = teacher_saver(runtime, tmp_path)
     shared = runtime._dump_settings(saver)
-    shared["first_sample"] = kwargs.pop("first_sample", 0)
-    return write_cache(tmp_path, extra_metadata=shared, **kwargs)
+    shared["contract"]["first_sample"] = kwargs.pop("first_sample", 0)
+    return write_cache(tmp_path, metadata=shared, **kwargs)
 
 
 @pytest.mark.parametrize("create_attention_mask", [False, True])
@@ -1145,24 +1340,52 @@ def test_teacher_and_student_use_effective_attention_mode(
     args.reset_attention_mask = True
     args.create_attention_mask_in_dataloader = create_attention_mask
     metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
+    metadata["contract"]["first_sample"] = 0
     expected = "causal_eod_reset" if create_attention_mask else "causal"
-    assert metadata["attention_mode"] == expected
-    assert metadata["padding_policy"] == "preserve"
-    assert metadata["targets"]["index_bits"] == 17
+    contract = metadata["contract"]
+    assert contract["attention_mode"] == expected
+    assert (contract["padding_policy"], contract["temperature"]) == ("strip", 1.0)
+    assert contract["targets"]["index_encoding"] == "u16+u8"
+    assert metadata["producer"] == "megatron" and metadata["provenance"]["reset_attention_mask"]
     runtime._check_student_compatibility(args, metadata)
     args.create_attention_mask_in_dataloader = not create_attention_mask
     with pytest.raises(ValueError, match="attention_mode"):
         runtime._check_student_compatibility(args, metadata)
 
 
-def test_packed_reader_requires_segment_boundaries(tmp_path):
-    storage, metadata = write_cache(tmp_path, extra_metadata={"sft": True})
-    live = reader(storage, metadata)
+def test_isolated_records_require_segments(tmp_path):
+    # Another producer's record that omits segments; isolated attention needs them.
+    metadata = settings(contract={"attention_mode": "isolated_segments"})
+    live = replay.ReplayReader(Storage(str(tmp_path)), metadata, [])
+    record = {
+        "format_version": 3,
+        "record_id": "gen:dp0:0-8",
+        "sample_offsets": torch.tensor([0, 2, 4, 6, 8]),
+        "tokens": torch.zeros(8, dtype=torch.int32),
+        "labels": torch.zeros(8, dtype=torch.int32),
+    }
     try:
-        with pytest.raises(ValueError, match="requires saved cu_seqlens"):
-            live.samples([0], 1)
+        with pytest.raises(ValueError, match="requires saved segments"):
+            live.decode_record(0, 0, 8, "gen", codec.encode(record))
     finally:
         live.close()
+
+
+def test_unsegmented_causal_records_use_defaults(tmp_path):
+    live = replay.ReplayReader(Storage(str(tmp_path)), settings(), [])
+    record = {
+        "format_version": 3,
+        "record_id": "gen:dp0:0-8",
+        "sample_offsets": torch.tensor([0, 2, 4, 6, 8]),
+        "tokens": torch.arange(8, dtype=torch.int32),
+        "segment_final_labels": torch.tensor([2, 4, 6, 8], dtype=torch.int32),
+    }
+    inputs_, _ = live.decode_record(0, 0, 8, "gen", codec.encode(record))
+    live.close()
+    assert inputs_["segment_lengths"].tolist() == [2, 2, 2, 2]
+    assert inputs_["labels"].tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert inputs_["loss_mask"].all()
+    assert inputs_["position_ids"].tolist() == [0, 1] * 4
 
 
 def test_reader_checks_target_width_against_tar_metadata(tmp_path):
@@ -1179,13 +1402,81 @@ def test_reader_checks_target_width_against_tar_metadata(tmp_path):
         next(target_stream)
         raw_inputs = next(input_stream)[1]
         payload = codec.decode(next(target_stream)[1])
-        payload["index_bits"] = 18
-        with pytest.raises(ValueError, match="index_bits"):
+        payload["index_encoding"] = "u16"
+        with pytest.raises(ValueError, match="index_encoding"):
             live.decode_record(0, 0, 8, "gen", raw_inputs, codec.encode(payload))
     finally:
         input_stream.close()
         target_stream.close()
         live.close()
+
+
+def test_targets_beyond_the_student_vocabulary_are_masked(tmp_path, capsys):
+    storage, metadata = write_cache(tmp_path, iterations=2)
+    exact = reader(storage, metadata, student_vocab_size=1 << 17)
+    assert exact.samples([0], 1)[0]["teacher_values"].min() > -1000
+    exact.close()
+    # Token IDs are id*100+position, so sample 1's targets (100..107) exceed a 104-entry vocab.
+    small = reader(storage, metadata, student_vocab_size=104)
+    sample = small.samples([0, 1], 2)[1]
+    small.close()
+    masked = sample["teacher_indices"].reshape(-1) >= 0
+    values = sample["teacher_values"].reshape(-1)
+    assert (values[4:] == -1000).all() and (values[:4] > -1000).all()
+    assert small.masked_entries > 0 and masked.all()
+    assert "beyond the student vocabulary" in capsys.readouterr().out
+
+
+def test_megatron_hf_tokenizer_fingerprint_matches_other_producers(
+    runtime_environment, monkeypatch
+):
+    _, runtime, _ = runtime_environment
+
+    class HF:
+        bos_token_id, eos_token_id, pad_token_id, unk_token_id = 1, 2, None, 0
+
+        def get_vocab(self):
+            return {"<unk>": 0, "<s>": 1, "</s>": 2, "a": 3}
+
+        def __len__(self):
+            return 4
+
+    wrapper = types.SimpleNamespace(eod=2, _tokenizer=types.SimpleNamespace(tokenizer=HF()))
+    monkeypatch.setattr(sys.modules["megatron.training"], "get_tokenizer", lambda: wrapper)
+    assert runtime.tokenizer_identity() == codec.hf_tokenizer_identity(HF(), eod_id=2)
+
+
+@pytest.mark.parametrize(
+    "student,teacher_divisor,seq_length,ok",
+    [
+        ({"context_parallel_size": 1}, 4, 8, True),
+        ({"context_parallel_size": 2}, 4, 8, True),
+        ({"context_parallel_size": 2}, 8, 8, True),
+        ({"context_parallel_size": 4}, 4, 8, False),
+        ({"context_parallel_size": 1}, 1, 16, True),  # Longer packs re-pad into more room.
+        ({"context_parallel_size": 1}, 1, 4, False),
+    ],
+)
+def test_student_packing_checks(
+    tmp_path, runtime_environment, student, teacher_divisor, seq_length, ok
+):
+    args, runtime, _ = runtime_environment
+    args.sft = True
+    args.seq_length = seq_length
+    for key, value in student.items():
+        setattr(args, key, value)
+    metadata = settings(
+        contract={
+            "attention_mode": "isolated_segments",
+            "padding_divisor": teacher_divisor,
+            "tokenizer": runtime.tokenizer_identity(),
+        }
+    )
+    if ok:
+        runtime._check_student_compatibility(args, metadata)
+    else:
+        with pytest.raises(ValueError):
+            runtime._check_student_compatibility(args, metadata)
 
 
 @pytest.mark.parametrize(
@@ -1248,7 +1539,7 @@ def test_teacher_metadata_checks_cache_and_cleans_only_its_range(tmp_path, runti
     args.exit_interval = 4
     saver = teacher_saver(runtime, tmp_path)
     metadata = runtime.initialize_dump_metadata(saver)  # Empty cache.
-    assert (metadata["published_through"], metadata["first_sample"]) == (0, 0)
+    assert (metadata["published_through"], metadata["contract"]["first_sample"]) == (0, 0)
     teacher_cache(tmp_path, runtime, args, start=4, iterations=8)
     (tmp_path / "dp1__48-64.targets.tar").unlink()  # Job B's interrupted tail.
     args.logits_save_range_start = 4
@@ -1273,13 +1564,13 @@ def test_unfrozen_teacher_recovers_first_sample(tmp_path, runtime_environment):
     args.freeze_all_layers = False
     args.consumed_train_samples = 16
     saver = teacher_saver(runtime, tmp_path)
-    assert runtime.initialize_dump_metadata(saver)["first_sample"] == 16
+    assert runtime.initialize_dump_metadata(saver)["contract"]["first_sample"] == 16
     teacher_cache(tmp_path, runtime, args, first_sample=16, start=2, iterations=4)
     args.load = "resumed-training-checkpoint"
     args.consumed_train_samples = 24
     metadata = runtime.initialize_dump_metadata(saver)
-    assert (metadata["first_sample"], metadata["published_through"]) == (16, 32)
-    assert metadata["teacher_checkpoint"] == "resumed-training-checkpoint"
+    assert (metadata["contract"]["first_sample"], metadata["published_through"]) == (16, 32)
+    assert metadata["provenance"]["teacher_checkpoint"] == "resumed-training-checkpoint"
 
 
 def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeypatch):
@@ -1292,7 +1583,11 @@ def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeyp
     saver.tp_rank = saver.cp_rank = saver.dp_rank = 0
     saver.cp_size = saver.dp_size = 1
     saver._initialized = True
-    saver.metadata_dict = {"generation": "gen", "published_through": 0}
+    saver.metadata_dict = {
+        "generation": "gen",
+        "published_through": 0,
+        "contract": {"attention_mode": "causal", "logprob_vocab_size": 1 << 17},
+    }
     saver._captured = []
     saver._pending_writes = collections.OrderedDict()
     saver._process_single_microbatch = lambda logits: (logits.half(), logits.long())
@@ -1331,11 +1626,7 @@ def test_saver_writes_paired_tars_readable_by_replay(tmp_path, runtime_environme
         start, end = iteration * 8, (iteration + 1) * 8
         for rank in (0, 1):
             ids = [start + (mb * 2 + rank) * 2 + j for mb in range(2) for j in range(2)]
-            captured = codec.capture_batch(inputs(ids))
-            target_ids = captured["tokens"].long().reshape(-1, 1)
-            targets = codec.pack_targets(
-                target_ids.float(), target_ids, vocab_size=metadata["padded_vocab_size"]
-            )
+            captured, targets = make_record(codec.capture_batch(inputs(ids)), metadata["contract"])
             captured["record_id"] = targets["record_id"] = f"gen:dp{rank}:{start}-{end}"
             writes.setdefault(rank, {})[(start, end)] = {
                 "start": start,
@@ -1460,7 +1751,7 @@ def test_only_v3_extracts_vocabularies_above_17_bits(runtime_environment):
     payload = codec.pack_targets(
         values.reshape(1, 2), indices.reshape(1, 2), vocab_size=logits.shape[-1]
     )
-    assert payload["index_bits"] == 18
+    assert payload["index_encoding"] == "u16+u8"
     restored, ids = codec.unpack_targets(payload, vocab_size=logits.shape[-1])
     assert torch.equal(ids, indices.reshape(1, 2))
     assert torch.equal(restored, values.reshape(1, 2))
@@ -1649,7 +1940,13 @@ def test_cp_saver_reassembles_canonical_token_targets(runtime_environment, monke
     saver.dp_size = 1
     saver.cp_group = object()
     saver._cp_dst_rank_global = 9
-    saver.metadata_dict = {"generation": "test"}
+    saver.metadata_dict = {
+        "generation": "test",
+        "contract": {
+            "attention_mode": "isolated_segments" if packed else "causal",
+            "logprob_vocab_size": 1 << 17,
+        },
+    }
     saver._captured = [(captured, maps[0], *mapped[0])]
     saver._serialize_attempt()
     raw = saver._iteration_records["targets"]
@@ -1756,16 +2053,16 @@ def test_top_p_encoded_sentinel_is_excluded_from_kl_and_ghost_mass():
     )
     namespace = {"torch": torch, "dist": torch.distributed, "CACHED_LOGITS_LOGPROB_SENTINEL": -1e3}
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
-    # -1 encodes as 131071, which is a real vocabulary ID at the format limit.
+    # With a u16 encoding, -1 decodes as 65535, a real vocabulary ID at the limit.
     values, indices = codec.unpack_targets(
         codec.pack_targets(
             torch.tensor([[0.7, 0.0]]).log().clamp_min(-1e3),
             torch.tensor([[0, -1]]),
-            vocab_size=1 << 17,
+            vocab_size=1 << 16,
         )
     )
-    assert indices[0, 1] == 131071
-    logits = torch.linspace(-2, 2, 1 << 17).reshape(1, 1, -1).requires_grad_()
+    assert indices[0, 1] == 65535
+    logits = torch.linspace(-2, 2, 1 << 16).reshape(1, 1, -1).requires_grad_()
     actual = namespace["topk_kl_div"](
         logits.clone(), values.unsqueeze(0), indices.unsqueeze(0), 1, 0, None, add_ghost_token=True
     )
@@ -1867,3 +2164,65 @@ def test_dp_resharding_with_rampup_shuffle_and_resume(
     finally:
         for stream in iterators:
             stream.close()
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def minimal_inputs(ids, packed=False):
+    """A producer that only knows tokens: optional fields take their defaults."""
+    batch = inputs(ids, packed=packed)
+    tokens = batch["tokens"]
+    batch["labels"] = torch.cat((tokens[:, 1:], torch.zeros_like(tokens[:, :1])), 1)
+    batch["loss_mask"] = torch.ones_like(tokens, dtype=torch.float32)
+    batch["loss_mask"][:, -1] = 0
+    return batch
+
+
+FIXTURE_VARIANTS = {
+    # name: (write_cache kwargs)
+    "u16_causal": dict(contract={"logprob_vocab_size": 4096}),  # Labels/mask stored.
+    "u16u8_packed_stripped": dict(
+        packed=True, contract={"padding_divisor": 2}, source=tail_masked, gbs=4, mbs=1
+    ),
+    "u16_minimal_fields": dict(contract={"logprob_vocab_size": 4096}, source=minimal_inputs),
+}
+
+
+def build_fixture(root, name):
+    return write_cache(root, iterations=2, bundle=2, **FIXTURE_VARIANTS[name])
+
+
+@pytest.mark.parametrize("name", sorted(FIXTURE_VARIANTS))
+def test_golden_fixtures_decode(tmp_path, name):
+    """Committed V3 dumps that other producers/consumers (e.g. ModelOpt) must also decode.
+
+    Regenerate with ``OFFLINE_KD_V3_REGEN_FIXTURES=1``; review the diff before committing.
+    """
+    import os
+    import shutil
+
+    golden = FIXTURES / name
+    if os.environ.get("OFFLINE_KD_V3_REGEN_FIXTURES"):
+        shutil.rmtree(golden, ignore_errors=True)
+        build_fixture(golden, name)
+    expected_storage, expected_meta = build_fixture(tmp_path, name)
+    storage = Storage(str(golden))
+    meta = storage_module.read_meta(storage, storage_module.list_tars(storage)[0].name)
+    codec.validate_metadata(meta)
+    assert codec.mismatched_settings(meta, expected_meta) == []
+    count = groups(storage, meta)[-1][1]
+    got_reader, want_reader = reader(storage, meta), reader(expected_storage, expected_meta)
+    try:
+        got = got_reader.samples(list(range(count)), count)
+        want = want_reader.samples(list(range(count)), count)
+    finally:
+        got_reader.close()
+        want_reader.close()
+    for a, b in zip(got, want):
+        for key in (*codec.TOKEN_FIELDS, "segments", "teacher_values", "teacher_indices"):
+            assert torch.equal(a[key], b[key]), (name, key)
+    if name == "u16_minimal_fields":
+        members = dict(storage_module.iter_tar(storage, "dp0__0-16.inputs.tar"))
+        record = codec.decode(members["0-8.inputs.pt.zst"])
+        assert not set(codec.OPTIONAL_TOKEN_FIELDS) & set(record)  # All defaults: omitted.

@@ -81,12 +81,15 @@ the complete final student global batch. If validation is enabled, provide an ex
 ordinary validation dataset (or mock data). Validation uses LM loss without cached KD
 targets, and does not build the original training split.
 
-Use the same tokenizer vocabulary and packing/attention isolation settings as the
-teacher. The tokenizer fingerprint includes vocabulary IDs and relevant special tokens.
-Position IDs, labels, and loss weights are replayed exactly as saved. Dataset identity
-is provenance rather than a student alignment constraint; `--logits-load-ignore-hash`
-is unnecessary for V3. Member checksums and pairing identities are always checked;
-`--logits-load-ignore-errors` is rejected.
+Use the same tokenizer as the teacher (checked by fingerprint, see
+[Tokenizer fingerprint](#tokenizer-fingerprint)) and settings that reproduce the cache's
+`attention_mode`. The student's padded vocabulary must be at least the tokenizer size; it
+need not equal the teacher's. Target entries whose index is beyond the student vocabulary
+(teacher padding rows) are masked into the ghost bucket, counted, and reported when they
+exceed 0.01% of entries. Stored labels, loss weights and positions are replayed exactly.
+Dataset identity is provenance rather than a student alignment constraint;
+`--logits-load-ignore-hash` is unnecessary for V3. Member checksums and pairing identities
+are always checked; `--logits-load-ignore-errors` is rejected.
 
 ### Reordering, subsets, and growing dumps
 
@@ -128,17 +131,21 @@ When the student DP size does not divide the teacher's, or the student microbatc
 smaller than the teacher's, several student ranks read the same teacher tar, so the
 bytes read exceed the dump size by that factor (as in V2).
 
-The full saved sequence is partitioned for the student's CP configuration. Only CP rank
-0 of each data-parallel replica reads storage; it maps targets for every CP rank and
-scatters them. Non-packed prefix shortening slices inputs and targets together
-**before** this partitioning. Increasing CP is allowed when the student sequence length
-satisfies the partition's divisibility requirements. Packed sequences cannot be
-shortened. Their original padding is retained; a CP/layout change is rejected when saved
-document padding is incompatible. Replay cannot recover tokens discarded by the teacher's
-dataset builder. Changing TP or PP also requires a compatible model checkpoint and
-Megatron configuration. The student must retain the teacher's padded vocabulary size;
-adjust vocabulary padding when changing TP so cached probabilities over padded vocabulary
-slots remain meaningful.
+Dumps store no padding (see [Stored records](#stored-records)); the student lays each
+sample out again for its own configuration. Only CP rank 0 of each data-parallel replica
+reads storage; it maps targets for every CP rank and scatters them.
+
+- Non-packed samples keep their prefix up to the student sequence length (prefix
+  shortening) and pad the tail; the student length cannot exceed the teacher's.
+- Packed samples (`isolated_segments`) pad each segment to the student's own SFT divisor
+  (`2·CP` when CP > 1, times TP with sequence parallelism) and extend the last segment to
+  the student sequence length, as Megatron SFT does. The student divisor must divide the
+  cache's `padding_divisor`, which guarantees every pack still fits; a smaller divisor
+  yields less padding than the teacher used. A packed student sequence length may exceed
+  the teacher's but not fall below it.
+
+Replay cannot recover tokens discarded by the teacher's dataset builder. Changing TP or PP
+also requires a compatible model checkpoint and Megatron configuration.
 
 ## Storage
 
@@ -161,111 +168,179 @@ missing or corrupt shard points directly at the rank (and node) that wrote it. R
 only need inputs (the first pipeline stage, and middle stages for packed data) never
 download targets.
 
-Each tar begins with `_meta.json`, followed by one member per teacher iteration:
+Each tar begins with `_meta.json`, followed by one member per teacher iteration
+(`START-END.inputs.pt.zst` or `START-END.targets.pt.zst`, with a matching `record_id`).
+Each data member is one zstd frame whose built-in content checksum is verified on read,
+holding a `torch.save` dictionary of CPU tensors.
 
-| Member | Contents |
+The rest of this section is the producer-neutral specification. Megatron is one producer;
+other producers (for example a vLLM-based dumper) and consumers (for example a Hugging
+Face loader) implement the same rules. `v3_format.py` has no Megatron dependencies and
+can be reused directly. Golden dumps under `tests/offline_kd_cpu/fixtures/` must decode
+identically in every implementation.
+
+### Metadata
+
+```json
+{"format_version": 3, "producer": "megatron",
+ "kind": "inputs", "dp_rank": 0, "range": [0, 51200], "generation": "<job id>",
+ "contract": {...},
+ "provenance": {...}}
+```
+
+`contract` must be identical across every tar of a cache, whichever producer wrote it:
+
+| Contract key | Meaning |
 | --- | --- |
-| `_meta.json` | Format version, kind (`inputs`/`targets`), DP rank, sample range, writing job's generation, `first_sample`, and the shared cache settings: teacher DP/MBS/GBS/CP, save interval, train budget, sequence length, packing and attention flags, tokenizer fingerprint, padded vocabulary, target settings, dataset identity, teacher checkpoint (provenance) |
-| `START-END.inputs.pt.zst` | This rank's samples for that iteration (see below) |
-| `START-END.targets.pt.zst` | Sparse targets for the same tokens, with a matching `record_id` |
+| `first_sample` | Global sample index where replay starts |
+| `dp_size_save`, `mbs_save`, `gbs_save` | Writer layout: sample `x` of an iteration starting at `s` lives in rank `((x-s)//mbs) % dp`, row `((x-s)//(mbs·dp))·mbs + (x-s)%mbs`; one record per iteration of `gbs` samples |
+| `seq_length` | Sample (pack) capacity |
+| `padding_divisor` | Per-segment padding granularity the writer used (1 when segments were not padded) |
+| `padding_policy` | Always `"strip"` (see [Stored records](#stored-records)) |
+| `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)) |
+| `tokenizer` | `{"sha256", "size", "special_ids", "eod_id"}` (see [Tokenizer fingerprint](#tokenizer-fingerprint)) |
+| `logprob_vocab_size` | Size of the vocabulary the teacher normalized over; every valid index is below it |
+| `temperature` | Always `1.0` |
+| `targets` | `{"k", "p", "min_k", "save_dtype", "index_encoding"}` |
 
-Each data member is one zstd frame whose built-in content checksum is verified on read.
+`provenance` is producer-specific and never compared across producers. Megatron records
+`cp_size_save`, `save_interval`, `train_budget`, `sft`, `inter_document_masking`,
+`reset_attention_mask`, `dataset_identity` and `teacher_checkpoint`; Megatron dump jobs
+additionally require matching `save_interval` and `train_budget` among themselves so
+parallel jobs share flush boundaries and dataset order.
 
-| Input field | Encoding | Purpose |
+### Stored records
+
+Within each segment, the writer drops the trailing run of positions with zero loss
+weight. Under causal attention no kept position attends to them and they are never
+scored, so this is lossless; it removes dataset padding (per-document and pack tails) and
+trailing masked turns alike. Leading or inner zero-weight positions (prompts) are kept.
+Targets drop the same rows. Consequently every stored segment ends on a scored position.
+
+| Inputs field | Required | Encoding / default |
 | --- | --- | --- |
-| `tokens`, `labels`, `position_ids` | Flat int32 tensors | Exact processed inputs, including negative labels |
-| `loss_mask` | Bool when binary; otherwise float32 | Preserve independent loss weighting |
-| `sample_offsets` | Int64 offsets into flat tensors | Retain each original training sample |
-| `cu_seqlens` | Per-sample int32 boundary rows, or absent | Preserve packed document attention boundaries |
-| `cu_seqlens_padded` | Per-sample int32 boundary rows, when supplied | Preserve the dataset's padded boundary convention |
-| `record_id` | `generation:dpR:START-END` | Bind inputs to targets and to the writing job |
+| `record_id` | yes | `generation:dpR:START-END`, also in the targets member |
+| `sample_offsets` | yes | int64 `[samples + 1]` offsets into the flat token tensors (empty samples allowed) |
+| `tokens` | yes | int32 flat token IDs |
+| `segment_lengths`, `segment_counts` | for `isolated_segments` | int32 positive lengths of each sample's segments, and segments per sample; otherwise each non-empty sample is one segment |
+| `position_ids` | no | int32; default counts from 0 within each segment |
+| `labels` | no | int32; default is the next token within the segment, and `segment_final_labels[i]` at segment `i`'s last position |
+| `segment_final_labels` | when `labels` is omitted | int32, one per segment |
+| `loss_mask` | no | bool, or float32 for fractional weights; default all ones |
 
-Sample IDs are derived from the saved DP/microbatch layout rather than stored.
-Targets are canonical `[total_tokens, K]` tensors using the existing log probability
-dtype and variable-width vocabulary indices. Sample offsets address the same flattened token
-space. Storage is independent of the teacher's microbatch tensor shape. Boundary
-metadata records the dataset's processed, potentially padded layout; it does not claim
-to recover original unpadded documents.
+Writers may omit an optional field only when it equals its default; Megatron does so
+automatically (RoPE models never read `position_ids`, so most Megatron dumps omit them).
+Readers fill defaults before use. A target row with no valid entry (all sentinel) is
+never scored by Megatron students, whatever its stored loss weight.
 
 ### Target contract
 
-These are fixed V3 schema rules, not configurable modes:
+- Target row `t` stores the distribution from the output-layer logits at input position
+  `t`, predicting the next token. Producers using prompt-token scores (e.g. vLLM
+  `prompt_logprobs`, which score token `t` given the prefix) shift by one.
+- Values are full-vocabulary-normalized log probabilities at **T=1** over
+  `logprob_vocab_size` entries, followed by top-K selection and optional top-P masking.
+  They are never renormalized over K. Temperature-scaled dumps are rejected; any
+  temperature belongs in the student loss.
+- Every row has exactly K entries. A logprob of `-1000` marks a masked or unavailable
+  entry; its decoded index must be ignored. Rows with fewer than K available entries are
+  filled with it.
+- The loss derives ghost residual mass as `1 - sum(exp(retained_logprobs))`; no residual
+  tensor is stored.
 
-- Target row `t` stores the distribution from the captured output-layer logits at
-  input position `t`, predicting the next token. Stored labels and loss weights are
-  already aligned to that output position. A producer using prompt-token scores must
-  convert their offsets to this convention before writing V3.
-- Values are full-vocabulary-normalized log probabilities at **T=1**, followed by
-  top-K selection and optional top-P masking. They are never renormalized over K.
-  Temperature scaling is deferred.
-- `padded_vocab_size` describes the softmax normalization domain, including padded
-  vocabulary slots, matching Megatron's vocabulary-parallel CE and the student KD
-  softmax. The tokenizer's vocabulary size is recorded separately in `tokenizer`.
-- The loss derives ghost residual mass as `1 - sum(exp(retained_logprobs))`, with
-  the existing numerical guard. No additional residual tensor is stored.
-- A logprob value of `-1000` identifies a masked or unavailable target entry. Its
-  decoded index must be ignored, even if that index is a valid vocabulary ID.
-
-### Vocabulary-index encoding
-
-The writer selects one width per dump:
-
-```text
-index_bits = max(16, (padded_vocab_size - 1).bit_length())
-```
-
-V3 supports padded vocabularies from 1 through `2**24` entries. V1/V2 retain their
-existing 17-bit encoding and vocabulary limit. Widths are recorded in both
-`_meta.json`'s `targets.index_bits` and each target payload's `index_bits`.
-
-| Target field | Encoding |
+| Targets field | Encoding |
 | --- | --- |
-| `values` | `[total_tokens, K]`, selected floating dtype |
-| `indices_low` | `[total_tokens, K]`, uint16 lower words |
-| `indices_high` | `[index_bits - 16, ceil(total_tokens * K / 8)]`, uint8 packed planes |
-| `index_bits` | Integer width from 16 through 24 |
+| `values` | `[tokens, K]`, `save_dtype` |
+| `indices_low` | `[tokens, K]`, uint16 lower 16 bits |
+| `indices_high` | `[tokens, K]`, uint8 bits 16–23; present only for `index_encoding: "u16+u8"` |
+| `index_encoding` | `"u16"` when `logprob_vocab_size <= 65536`, else `"u16+u8"` (up to `2**24`) |
 
-Indices flatten in token-major, then K order. High-plane row 0 stores bit 16,
-row 1 bit 17, and so on. Each plane uses `packbits(bitorder="big")`: its first
-index occupies the first byte's most significant bit. Unused trailing bits are zero.
-Widths of 16 use a zero-row `indices_high` tensor. The `-1` selection sentinel
-encodes as all ones across the chosen width; validity is determined by the logprob
-sentinel, so the maximum valid index remains usable.
+The `-1` selection sentinel encodes as all ones. Readers validate dtypes, shapes, the
+encoding against `logprob_vocab_size`, and that valid entries index below it. TP gathering
+in the Megatron saver uses FP32 transport, exact for every supported index. V1/V2 keep
+their 17-bit encoding.
 
-Readers validate widths, tensor dtypes/shapes, unused bits and unmasked index bounds.
-TP gathering uses FP32 transport, which represents every supported vocabulary
-index exactly. Vocabularies exceeding `2**24` entries are rejected.
-
-### Context contract
-
-Every tar declares `padding_policy: "preserve"` and one machine-readable
-`attention_mode`, checked against its packing/reset flags:
+### Context
 
 | `attention_mode` | Context construction |
 | --- | --- |
-| `causal` | Causal attention over each saved sample's physical positions |
-| `causal_eod_reset` | Causal attention isolated after EOD tokens using the dataset attention mask |
-| `isolated_segments` | Causal attention within the saved `cu_seqlens` segments |
+| `causal` | Causal attention over each sample |
+| `causal_eod_reset` | Causal attention reset after `eod_id` tokens |
+| `isolated_segments` | Causal attention within each stored segment |
 
-The writer records the effective dataset path: setting `reset_attention_mask`
-without creating a dataset attention mask still yields `causal`. Students must
-reproduce the saved mode. Packed records require `cu_seqlens`.
+Megatron derives the mode from its dataset path: `reset_attention_mask` without a
+dataloader attention mask still yields `causal`. Students must reproduce the mode.
+`loss_mask` controls scoring, not attention; a zero-weight prompt still supplies context.
 
-Positions, physical padding and segment boundaries are preserved as captured.
-`position_ids` is explicit; `loss_mask` controls scoring, not attention visibility.
-A prompt with zero loss weight still supplies context. Boundary endpoints may
-include dataset padding; they do not assert that padding is excluded from attention.
-No separate attention-validity tensor or dense attention matrix is stored. Removing
-padding, arbitrary attention masks and repacking contexts are outside this schema's
-current supported adapters. Changing attention isolation would change the teacher
-context and invalidate the cached targets.
+### Tokenizer fingerprint
 
-The uncompressed input overhead is approximately **13 bytes per token** with a binary
-mask, or 16 with fractional weights, plus sample/document offsets and container overhead.
-FP16/BF16 targets take approximately `(2 + index_bits / 8) * K` bytes per token,
-plus per-plane rounding and container overhead. At 17 bits this is `4.125 * K`, so
-binary inputs add about 2.46% at K=128 before compression. Compression ratios depend
-on the data.
+`sha256` hashes this canonical object, serialized with
+`json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)` as UTF-8:
+
+```json
+{"vocab": [[token_string, id], ...],
+ "special_ids": {"bos": .., "eos": .., "pad": .., "unk": ..},
+ "size": n}
+```
+
+For Hugging Face tokenizers, `vocab` is `get_vocab()` (including added tokens) sorted by
+ID, `special_ids` are the `*_token_id` attributes (null when absent), and `size` is
+`len(tokenizer)` (`v3_format.hf_tokenizer_identity`). Megatron fingerprints its wrapped
+Hugging Face tokenizer the same way. Normalizers, pre-tokenizers and chat templates are
+excluded because inputs are stored as IDs. Megatron's EOD is recorded as `eod_id` for
+`causal_eod_reset` and is not hashed.
+
+### Writing V3 from vLLM
+
+A non-Megatron teacher writes the same tars with `producer` set accordingly. The writer
+owns tokenization and packing; vLLM only scores token IDs.
+
+**Scoring existing documents (default).**
+
+1. Tokenize each document with the teacher's Hugging Face tokenizer (apply the chat
+   template, if any) and append EOS. Pass the IDs to vLLM as `prompt_token_ids` with
+   `SamplingParams(max_tokens=1, prompt_logprobs=K)`, configuring vLLM to return raw
+   (unprocessed) logprobs (the `logprobs_mode` option in recent versions). vLLM requires
+   at least one generated token; discard it.
+2. Row `t` takes `prompt_logprobs[t + 1]`, so the last content token's row is the
+   distribution over EOS. Keep exactly the top K entries (vLLM may add the prompt token's
+   own logprob); fill missing entries with `-1000`.
+3. Give the EOS position zero loss weight (it has no next token); the stripping rule
+   removes it. Omit `labels` and store `segment_final_labels` = EOS: the stored segment
+   then matches what a Megatron SFT dataset produces.
+4. Store `loss_mask` only when some tokens are not trained on, e.g. from
+   `apply_chat_template(..., return_assistant_tokens_mask=True)` for assistant-only loss.
+   Omit `position_ids`.
+
+**Teacher-generated responses.** To distill on responses the teacher writes (sequence-level
+KD), make each segment prompt plus completion: completion rows come from the generated
+tokens' `logprobs=K`, prompt rows from `prompt_logprobs` or sentinel rows with zero loss
+weight. Targets must still be raw T=1 logprobs whatever the sampling temperature or top-P;
+record sampling settings under `provenance`. A completion ending in EOS gets EOS as its
+final label; one cut at `max_tokens` gets zero weight on its last position, which is
+stripped. Completions are fixed at dump time; on-policy distillation (student-generated
+data) needs a live teacher and is outside V3.
+
+Without appending EOS, the single generated token's `logprobs=K` also provides the last
+row, but its final label is then the sampled token rather than a data label.
+
+**Layout.**
+
+- Pack segments into samples of `seq_length` tokens in an `isolated_segments` cache, one
+  writer per `dp_rank`, `mbs_save=1`, `gbs_save` samples per record; store no padding.
+- `padding_divisor` promises that the samples still fit when each segment is padded to a
+  multiple of it. Packing with headroom for, say, 64 lets a Megatron student use any SFT
+  divisor (`2·CP`, times TP with sequence parallelism) that divides 64; 1 restricts packed
+  students to CP 1 without sequence parallelism.
+- Set `logprob_vocab_size` to the model's `config.vocab_size` and fingerprint the
+  tokenizer with `hf_tokenizer_identity`.
+
+### Size
+
+Inputs cost about 4 bytes per token for `tokens` plus whichever optional fields differ
+from their defaults (labels 4, positions 4, loss mask 1 or 4). FP16/BF16 targets take
+about `4·K` bytes per token with `u16` indices, or `5·K` with `u16+u8`, before zstd; the
+high byte compresses to a small fraction of a byte per entry for typical token IDs.
 
 ### Object storage
 
@@ -301,7 +376,9 @@ transitions, custom dense attention masks, and teacher full-layer recomputation 
 rejected. Top-P filtering retains uniform K and its value sentinels, and the accepted
 teacher attempt reports `avg-logprobs-kept` just as V2 does.
 
-The CPU suite exercises codec integrity, exact input/target pairing, reshuffling and its
+The CPU suite exercises the producer-neutral format (index encodings, padding stripping and
+re-padding, input defaults, metadata contract, tokenizer fingerprint, golden fixtures),
+codec integrity, exact input/target pairing, reshuffling and its
 checkpointed extent, DP/MBS changes, ramp-up, prefix shortening, CP token maps and
 per-CP-rank target shards, publication and holes from parallel jobs, the collective
 replay frontier, chunked remote reads, frozen-teacher range resume and cleanup,

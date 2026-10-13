@@ -4,6 +4,7 @@
 
 import bisect
 import concurrent.futures
+import itertools
 import json
 import queue
 import random
@@ -13,9 +14,10 @@ from typing import Any, Callable, Iterator
 import torch
 
 from .v3_format import (
-    BOUNDARY_FIELDS,
+    LOGPROB_SENTINEL,
     TOKEN_FIELDS,
     decode,
+    fill_input_defaults,
     mismatched_settings,
     unpack_targets,
     validate_inputs,
@@ -78,8 +80,7 @@ def token_map(
         raise ValueError(f"Unsupported offline KD CP layout: {layout}")
     boundaries = None
     if packed:
-        physical = inputs.get("cu_seqlens_padded") or inputs["cu_seqlens"]
-        boundaries = merged_boundaries(physical, lengths)
+        boundaries = merged_boundaries(inputs["cu_seqlens"], lengths)
         if hybrid_padded_zigzag:
             from megatron.core.context_parallel.layout import _build_thd_zigzag_metadata
 
@@ -154,8 +155,9 @@ def discover_groups(
     ranges exist beyond a gap (e.g. parallel dump jobs that are still writing).
     """
     validate_metadata(metadata)
-    ranges = complete_ranges(list_tars(storage), metadata["dp_size_save"])
-    gbs = metadata["gbs_save"]
+    contract = metadata["contract"]
+    ranges = complete_ranges(list_tars(storage), contract["dp_size_save"])
+    gbs = contract["gbs_save"]
     previous = None
     for start, end in ranges:
         if end <= start or (end - start) % gbs:
@@ -165,7 +167,7 @@ def discover_groups(
         previous = (start, end)
     by_start = dict(ranges)
     groups = []
-    cursor = metadata["first_sample"]
+    cursor = contract["first_sample"]
     while cursor in by_start:
         groups.append((cursor, by_start[cursor]))
         cursor = by_start[cursor]
@@ -324,13 +326,21 @@ class ReplayReader:
         decode_threads: int = 4,
         prefetch_depth: int = 2,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+        student_vocab_size: int | None = None,
     ):
         validate_metadata(metadata)
         self.storage = storage
         self.metadata = metadata
-        self.gbs = metadata["gbs_save"]
-        self.mbs = metadata["mbs_save"]
-        self.dp = metadata["dp_size_save"]
+        self.contract = metadata["contract"]
+        self.gbs = self.contract["gbs_save"]
+        self.mbs = self.contract["mbs_save"]
+        self.dp = self.contract["dp_size_save"]
+        self.isolated = self.contract["attention_mode"] == "isolated_segments"
+        self.student_vocab_size = student_vocab_size
+        # Entries whose index the student vocabulary lacks are masked into the ghost bucket.
+        self.masked_entries = 0
+        self.target_entries = 0
+        self._masking_warned = False
         self.groups = [tuple(group) for group in groups]
         if shuffle:
             random.Random(seed).shuffle(self.groups)
@@ -416,11 +426,8 @@ class ReplayReader:
         record_id = f"{generation}:dp{dp_rank}:{start}-{end}"
         inputs = decode(raw_inputs)
         validate_inputs(inputs)
-        if (
-            self.metadata["attention_mode"] == "isolated_segments"
-            and inputs.get("cu_seqlens") is None
-        ):
-            raise ValueError("Offline KD isolated_segments requires saved cu_seqlens")
+        if self.isolated and inputs.get("segment_lengths") is None:
+            raise ValueError("Offline KD isolated_segments requires saved segments")
         if inputs.get("record_id") != record_id:
             raise ValueError(f"Offline KD input record {inputs.get('record_id')} != {record_id}")
         if inputs["sample_offsets"].numel() - 1 != (end - start) // self.dp:
@@ -430,10 +437,39 @@ class ReplayReader:
             payload = decode(raw_targets)
             if payload.get("record_id") != record_id:
                 raise ValueError("Offline KD inputs and targets belong to different records")
-            targets = unpack_targets(payload, vocab_size=self.metadata["padded_vocab_size"])
+            targets = unpack_targets(payload, vocab_size=self.contract["logprob_vocab_size"])
             if targets[0].shape[0] != inputs["tokens"].numel():
                 raise ValueError("Offline KD input/target token counts disagree")
+            targets = self._mask_unknown_indices(*targets)
+        inputs = fill_input_defaults(inputs)
+        inputs["segment_offsets"] = torch.cat(
+            (torch.zeros(1, dtype=torch.int64), torch.cumsum(inputs["segment_counts"].long(), 0))
+        )
         return inputs, targets
+
+    def _mask_unknown_indices(
+        self, values: torch.Tensor, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        valid = values != LOGPROB_SENTINEL
+        self.target_entries += int(valid.sum())
+        if self.student_vocab_size is None:
+            return values, indices
+        unknown = valid & (indices >= self.student_vocab_size)
+        count = int(unknown.sum())
+        if count:
+            self.masked_entries += count
+            values = values.masked_fill(unknown, LOGPROB_SENTINEL)
+            indices = indices.masked_fill(unknown, 0)
+            fraction = self.masked_entries / max(1, self.target_entries)
+            if fraction > 1e-4 and not self._masking_warned:
+                self._masking_warned = True
+                print(
+                    f"WARNING: offline KD v3 masked {self.masked_entries} teacher target entries "
+                    f"({fraction:.2%}) with indices beyond the student vocabulary "
+                    f"({self.student_vocab_size}); check the teacher/student vocabularies",
+                    flush=True,
+                )
+        return values, indices
 
     def _lane(self, dp_rank: int, group_index: int, record_index: int) -> _Lane:
         lane = self.lanes.get(dp_rank)
@@ -459,8 +495,8 @@ class ReplayReader:
             a, b = inputs["sample_offsets"][row : row + 2].tolist()
             sample = {field: inputs[field][a:b] for field in TOKEN_FIELDS}
             sample["sample_id"] = sid
-            for field in BOUNDARY_FIELDS:
-                sample[field] = None if inputs.get(field) is None else inputs[field][row]
+            s0, s1 = inputs["segment_offsets"][row : row + 2].tolist()
+            sample["segments"] = inputs["segment_lengths"][s0:s1]
             if targets is not None:
                 sample["teacher_values"], sample["teacher_indices"] = (
                     tensor[a:b] for tensor in targets
@@ -478,59 +514,118 @@ class ReplayReader:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
 
-def collate_samples(
-    samples: list[dict], seq_length: int, *, cp_size: int = 1, layout: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    """Build a student CPU microbatch, shortening only non-packed prefixes.
+def _layout_sample(
+    sample: dict, seq_length: int, *, packed: bool, divisor: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Place a stored (padding-free) sample at the student's fixed length.
 
-    Teacher targets are mapped into one ``[local_sequence, batch, K]`` shard per
-    student CP rank with exactly the token mapping used for the inputs.
+    Returns ``(source, positions, boundaries)``: for each output position, the stored
+    token it comes from (``-1`` for padding) and its position id within its segment,
+    plus the padded segment boundaries for packed samples. Packed segments are padded
+    to ``divisor`` and the pack tail extends the last segment, as Megatron SFT does;
+    non-packed samples keep their prefix and pad the tail.
+    """
+    length = sample["tokens"].numel()
+    if not packed:
+        kept = min(length, seq_length)
+        source = torch.cat((torch.arange(kept), torch.full((seq_length - kept,), -1)))
+        return source, torch.arange(seq_length), None
+    lengths = sample["segments"].tolist()
+    padded = [-(-n // divisor) * divisor for n in lengths]
+    if sum(padded) > seq_length:
+        raise ValueError(
+            f"Offline KD packed sample needs {sum(padded)} tokens after padding segments to a "
+            f"multiple of {divisor}; the student sequence length is {seq_length}"
+        )
+    if padded:
+        padded[-1] += seq_length - sum(padded)
+    else:
+        padded = [seq_length]  # Fully stripped sample: one padding segment.
+    pieces, positions, cursor = [], [], 0
+    for real, total in zip(lengths + [0] * (len(padded) - len(lengths)), padded):
+        pieces.extend((torch.arange(cursor, cursor + real), torch.full((total - real,), -1)))
+        positions.append(torch.arange(total))
+        cursor += real
+    boundaries = torch.tensor([0, *itertools.accumulate(padded)], dtype=torch.int32)
+    return torch.cat(pieces), torch.cat(positions), boundaries
+
+
+def collate_samples(
+    samples: list[dict],
+    seq_length: int,
+    *,
+    packed: bool = False,
+    divisor: int = 1,
+    cp_size: int = 1,
+    layout: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a student CPU microbatch from stored samples.
+
+    Stored samples carry no padding: segments are padded back for the student (see
+    :func:`_layout_sample`), padding positions get zero loss weight and sentinel
+    targets, and teacher targets are mapped into one ``[local_sequence, batch, K]``
+    shard per student CP rank with exactly the token mapping used for the inputs.
     """
     if not samples:
         raise ValueError("Cannot collate an empty offline KD microbatch")
-    result = {}
-    packed = samples[0]["cu_seqlens"] is not None
+    fields = {field: [] for field in TOKEN_FIELDS}
+    boundary_rows, values, indices = [], [], []
+    with_targets = "teacher_values" in samples[0]
     for sample in samples:
-        length = sample["tokens"].numel()
-        if (sample["cu_seqlens"] is not None) != packed:
-            raise ValueError("Mixed packed/unpacked offline KD samples")
-        if length < seq_length or (packed and length != seq_length):
-            raise ValueError(
-                "Offline KD sequence length mismatch; only non-packed prefix shortening is supported"
-            )
-    for field in TOKEN_FIELDS:
-        dtype = torch.float32 if field == "loss_mask" else torch.int64
-        result[field] = torch.stack([sample[field][:seq_length].to(dtype) for sample in samples])
-    for field in BOUNDARY_FIELDS:
-        rows = [sample[field] for sample in samples]
-        if all(row is None for row in rows):
-            result[field] = None
-        elif any(row is None for row in rows):
-            raise ValueError(f"Mixed offline KD {field} availability")
-        else:
-            width = max(row.numel() for row in rows)
-            result[field] = torch.stack(
-                [torch.cat((row, row[-1:].expand(width - row.numel()))) for row in rows]
-            )
-    result["max_seqlen"] = (
-        torch.tensor(
-            [int((s["cu_seqlens"][1:] - s["cu_seqlens"][:-1]).max()) for s in samples],
-            dtype=torch.int32,
+        source, positions, boundaries = _layout_sample(
+            sample, seq_length, packed=packed, divisor=divisor
         )
-        if packed
-        else None
-    )
+        real = source >= 0
+        take = source.clamp_min(0)
+        for field in TOKEN_FIELDS:
+            dtype = torch.float32 if field == "loss_mask" else torch.int64
+            column = sample[field].to(dtype)[take] if sample["tokens"].numel() else None
+            filled = (
+                positions.to(dtype)
+                if field == "position_ids"
+                else torch.zeros(seq_length, dtype=dtype)
+            )
+            if column is not None:
+                filled = torch.where(real, column, filled)
+            fields[field].append(filled)
+        if with_targets:
+            k = sample["teacher_values"].shape[-1]
+            row_values = torch.full(
+                (seq_length, k), LOGPROB_SENTINEL, dtype=sample["teacher_values"].dtype
+            )
+            row_indices = torch.zeros((seq_length, k), dtype=torch.int64)
+            row_values[real] = sample["teacher_values"][source[real]]
+            row_indices[real] = sample["teacher_indices"][source[real]]
+            # A row without any teacher entry carries no KD signal; never score it.
+            fields["loss_mask"][-1] *= (row_values != LOGPROB_SENTINEL).any(-1).float()
+            values.append(row_values)
+            indices.append(row_indices)
+        boundary_rows.append(boundaries)
+    result = {field: torch.stack(rows) for field, rows in fields.items()}
+    result["cu_seqlens_padded"] = None
+    if packed:
+        width = max(row.numel() for row in boundary_rows)
+        result["cu_seqlens"] = torch.stack(
+            [torch.cat((row, row[-1:].expand(width - row.numel()))) for row in boundary_rows]
+        )
+        result["max_seqlen"] = torch.tensor(
+            [int((row[1:] - row[:-1]).max()) for row in boundary_rows], dtype=torch.int32
+        )
+    else:
+        result["cu_seqlens"] = result["max_seqlen"] = None
     result["_kd_sample_ids"] = [sample["sample_id"] for sample in samples]
-    if "teacher_values" in samples[0]:
-        values = torch.cat([s["teacher_values"][:seq_length] for s in samples])
-        indices = torch.cat([s["teacher_indices"][:seq_length] for s in samples])
-        boundaries = {
-            "sample_offsets": torch.arange(len(samples) + 1, dtype=torch.int64) * seq_length
+    if with_targets:
+        mapping_inputs = {
+            "sample_offsets": torch.arange(len(samples) + 1, dtype=torch.int64) * seq_length,
+            "cu_seqlens": boundary_rows if packed else None,
         }
-        for field in BOUNDARY_FIELDS:
-            boundaries[field] = None if result[field] is None else [s[field] for s in samples]
+        flat_values, flat_indices = torch.cat(values), torch.cat(indices)
         shards = [
-            map_targets(values, indices, token_map(boundaries, rank, cp_size, **(layout or {})))
+            map_targets(
+                flat_values,
+                flat_indices,
+                token_map(mapping_inputs, rank, cp_size, **(layout or {})),
+            )
             for rank in range(cp_size)
         ]
         result["_kd_values"] = [shard[0] for shard in shards]
@@ -554,6 +649,7 @@ class ReplayIterator:
         prefetch: bool = False,
         cp_size: int = 1,
         layout: dict[str, Any] | None = None,
+        divisor: int = 1,
     ):
         self.reader = reader
         self.consumed = consumed
@@ -564,6 +660,7 @@ class ReplayIterator:
         self.num_microbatches = num_microbatches
         self.cp_size = cp_size
         self.layout = layout
+        self.divisor = divisor
         self._microbatch = 0
         self._count = 0
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1) if prefetch else None
@@ -574,7 +671,14 @@ class ReplayIterator:
 
     def _load(self, start: int, end: int) -> dict[str, Any]:
         samples = self.reader.samples(list(range(start, start + self.mbs)), end)
-        return collate_samples(samples, self.seq_length, cp_size=self.cp_size, layout=self.layout)
+        return collate_samples(
+            samples,
+            self.seq_length,
+            packed=self.reader.isolated,
+            divisor=self.divisor,
+            cp_size=self.cp_size,
+            layout=self.layout,
+        )
 
     def __next__(self) -> dict[str, Any]:
         if self._microbatch == 0:

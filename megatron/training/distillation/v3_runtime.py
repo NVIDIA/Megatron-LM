@@ -11,9 +11,11 @@ import torch.distributed as dist
 
 from .v3_format import (
     attention_mode_for_layout,
-    digest,
-    index_bits_for_vocab,
+    hf_tokenizer_identity,
+    index_encoding_for_vocab,
     mismatched_settings,
+    segment_padding_divisor,
+    tokenizer_fingerprint,
     validate_metadata,
 )
 from .v3_replay import ReplayIterator, ReplayReader, describe_hole, discover_groups, layout_options
@@ -113,32 +115,57 @@ def _validate_dump_options(args: Any) -> None:
         )
 
 
+def _tokenizer_attr(tokenizer: Any, name: str) -> Any:
+    try:
+        return getattr(tokenizer, name)
+    except (AttributeError, NotImplementedError):
+        return None
+
+
 def tokenizer_identity() -> dict[str, Any]:
-    """Fingerprint actual vocabulary IDs and relevant special tokens."""
+    """Describe the tokenizer with the format's canonical fingerprint.
+
+    Hugging Face tokenizers (wrapped by Megatron) are fingerprinted exactly as a
+    non-Megatron producer would, from ``get_vocab()`` and HF special-token IDs.
+    Other tokenizers use their vocabulary mapping in the same canonical form.
+    """
     from megatron.training import get_tokenizer
 
     tokenizer = get_tokenizer()
+    eod = _tokenizer_attr(tokenizer, "eod")
+    inner = getattr(tokenizer, "_tokenizer", None)
+    for candidate in (getattr(inner, "tokenizer", None), inner):
+        if (
+            candidate is not None
+            and hasattr(candidate, "get_vocab")
+            and hasattr(candidate, "__len__")
+        ):
+            return hf_tokenizer_identity(candidate, eod_id=eod)
     try:
         vocab = tokenizer.vocab
-        if not isinstance(vocab, dict):
-            raise ValueError("Offline KD v3 requires a tokenizer exposing its vocabulary mapping")
-        identity = {"vocab": sorted((str(token), int(index)) for token, index in vocab.items())}
     except NotImplementedError:
-        wrapped = getattr(tokenizer, "_tokenizer", tokenizer)
-        if type(wrapped).__name__ != "NullTokenizer":
+        if type(inner or tokenizer).__name__ != "NullTokenizer":
             raise ValueError("Offline KD v3 requires an explicit vocabulary mapping") from None
-        identity = {"synthetic_integer_vocabulary": int(tokenizer.vocab_size)}
-    for key in ("eod", "pad", "bos", "eos"):
-        try:
-            identity[key] = getattr(tokenizer, key)
-        except (AttributeError, NotImplementedError):
-            identity[key] = None
+        vocab = {str(index): index for index in range(int(tokenizer.vocab_size))}
+    if not isinstance(vocab, dict):
+        raise ValueError("Offline KD v3 requires a tokenizer exposing its vocabulary mapping")
+    special_ids = {role: _tokenizer_attr(tokenizer, role) for role in ("bos", "eos", "pad", "unk")}
     return {
-        "sha256": digest(json.dumps(identity, sort_keys=True).encode()),
-        "vocab_size": int(tokenizer.vocab_size),
-        "eod": identity["eod"],
-        "pad": identity["pad"],
+        "sha256": tokenizer_fingerprint(vocab, special_ids, len(vocab)),
+        "size": len(vocab),
+        "special_ids": special_ids,
+        "eod_id": eod,
     }
+
+
+def student_padding_divisor(args: Any) -> int:
+    """Per-segment padding the student's packed (SFT) batches need for its CP/SP layout."""
+    if not args.sft:
+        return 1
+    return segment_padding_divisor(
+        context_parallel_size=args.context_parallel_size,
+        sequence_parallel_tp=args.tensor_model_parallel_size * bool(args.sequence_parallel),
+    )
 
 
 def dump_range(args: Any) -> tuple[int | None, int]:
@@ -196,37 +223,47 @@ def frozen_resume_iteration(args: Any) -> int:
 
 
 def _dump_settings(saver: Any) -> dict[str, Any]:
-    """Settings every tar of a cache must share (see ``SHARED_KEYS``), minus ``first_sample``."""
+    """This dump job's metadata: the shared contract (minus ``first_sample``) and provenance."""
     from megatron.training import get_args
 
     args = get_args()
+    targets = saver.metadata_dict["saver"]
     settings = {
         "format_version": 3,
-        "dp_size_save": saver.dp_size,
-        "mbs_save": args.micro_batch_size,
-        "gbs_save": args.global_batch_size,
-        "cp_size_save": saver.cp_size,
-        "save_interval": args.save_interval,
-        "train_budget": args.train_samples or args.train_iters * args.global_batch_size,
-        "seq_length": args.seq_length,
-        "sft": bool(args.sft),
-        "inter_document_masking": bool(args.dataloader_inter_document_masking),
-        "reset_attention_mask": bool(args.reset_attention_mask),
-        "tokenizer": tokenizer_identity(),
-        "padded_vocab_size": args.padded_vocab_size,
-        "targets": {
-            **saver.metadata_dict["saver"],
-            "format_version": 3,
-            "index_bits": index_bits_for_vocab(args.padded_vocab_size),
+        "producer": "megatron",
+        "contract": {
+            "dp_size_save": saver.dp_size,
+            "mbs_save": args.micro_batch_size,
+            "gbs_save": args.global_batch_size,
+            "seq_length": args.seq_length,
+            "padding_divisor": student_padding_divisor(args),
+            "padding_policy": "strip",
+            "attention_mode": attention_mode_for_layout(
+                sft=args.sft,
+                inter_document_masking=args.dataloader_inter_document_masking,
+                reset_attention_mask=args.reset_attention_mask,
+                create_attention_mask=args.create_attention_mask_in_dataloader,
+            ),
+            "tokenizer": tokenizer_identity(),
+            "logprob_vocab_size": args.padded_vocab_size,
+            "temperature": 1.0,
+            "targets": {
+                "k": targets["k"],
+                "p": targets["p"],
+                "min_k": targets["min_k"],
+                "save_dtype": targets["save_dtype"],
+                "index_encoding": index_encoding_for_vocab(args.padded_vocab_size),
+            },
         },
-        "dataset_identity": saver.metadata_dict["identifiers"],
-        "attention_mode": attention_mode_for_layout(
-            sft=args.sft,
-            inter_document_masking=args.dataloader_inter_document_masking,
-            reset_attention_mask=args.reset_attention_mask,
-            create_attention_mask=args.create_attention_mask_in_dataloader,
-        ),
-        "padding_policy": "preserve",
+        "provenance": {
+            "cp_size_save": saver.cp_size,
+            "save_interval": args.save_interval,
+            "train_budget": args.train_samples or args.train_iters * args.global_batch_size,
+            "sft": bool(args.sft),
+            "inter_document_masking": bool(args.dataloader_inter_document_masking),
+            "reset_attention_mask": bool(args.reset_attention_mask),
+            "dataset_identity": saver.metadata_dict["identifiers"],
+        },
     }
     # Compare exactly what a JSON round trip through a tar's _meta.json preserves.
     return json.loads(json.dumps(settings))
@@ -253,15 +290,19 @@ def initialize_dump_metadata(saver: Any) -> dict:
             if tars:
                 existing = read_meta(storage, tars[0].name)
                 validate_metadata(existing)
+                first_sample = existing["contract"]["first_sample"]
                 mismatched = mismatched_settings(
-                    existing, {**expected, "first_sample": existing.get("first_sample")}
+                    existing,
+                    {
+                        **expected,
+                        "contract": {**expected["contract"], "first_sample": first_sample},
+                    },
                 )
                 if mismatched:
                     raise ValueError(
                         f"Teacher settings differ from existing v3 tars ({', '.join(mismatched)}); "
                         "use a new save directory"
                     )
-                first_sample = existing["first_sample"]
             start_iteration, end_iteration = dump_range(args)
             start = first_sample if start_iteration is None else start_iteration * gbs
             end = end_iteration * gbs
@@ -276,9 +317,9 @@ def initialize_dump_metadata(saver: Any) -> dict:
             return {
                 "metadata": {
                     **expected,
-                    "first_sample": first_sample,
+                    "contract": {**expected["contract"], "first_sample": first_sample},
+                    "provenance": {**expected["provenance"], "teacher_checkpoint": str(args.load)},
                     "generation": uuid.uuid4().hex,
-                    "teacher_checkpoint": str(args.load),
                     "published_through": published,
                     "range_end": end,
                 }
@@ -294,32 +335,34 @@ def initialize_dump_metadata(saver: Any) -> dict:
 
 def _check_student_compatibility(args: Any, metadata: dict) -> None:
     validate_metadata(metadata)
-    if metadata.get("format_version") != 3 or metadata["tokenizer"] != tokenizer_identity():
+    contract = metadata["contract"]
+    if contract["tokenizer"]["sha256"] != tokenizer_identity()["sha256"]:
         raise ValueError("Offline KD v3 tokenizer/vocabulary mismatch")
-    if args.padded_vocab_size != metadata["padded_vocab_size"]:
+    if args.padded_vocab_size < contract["tokenizer"]["size"]:
         raise ValueError(
-            "V3 teacher/student padded vocabulary sizes must match; "
-            "adjust vocabulary padding when changing TP"
+            f"Student vocabulary ({args.padded_vocab_size}) is smaller than the tokenizer "
+            f"({contract['tokenizer']['size']})"
         )
-    if (
-        bool(args.sft) != metadata["sft"]
-        or bool(args.dataloader_inter_document_masking) != metadata["inter_document_masking"]
-    ):
-        raise ValueError("Student packing flags must match the saved v3 layout")
-    if bool(args.reset_attention_mask) != metadata["reset_attention_mask"]:
-        raise ValueError("Student attention isolation differs from the teacher cache")
     mode = attention_mode_for_layout(
         sft=args.sft,
         inter_document_masking=args.dataloader_inter_document_masking,
         reset_attention_mask=args.reset_attention_mask,
         create_attention_mask=args.create_attention_mask_in_dataloader,
     )
-    if mode != metadata["attention_mode"]:
-        raise ValueError("Student attention_mode differs from the teacher cache")
-    packed = metadata["sft"] or metadata["inter_document_masking"]
-    if args.seq_length > metadata["seq_length"] or (
-        packed and args.seq_length != metadata["seq_length"]
-    ):
+    if mode != contract["attention_mode"]:
+        raise ValueError(
+            f"Student attention_mode {mode} differs from the cache's {contract['attention_mode']}"
+        )
+    if mode == "isolated_segments":
+        if args.seq_length < contract["seq_length"]:
+            raise ValueError("Packed student sequence length must be at least the teacher's")
+        divisor = student_padding_divisor(args)
+        if contract["padding_divisor"] % divisor:
+            raise ValueError(
+                f"Student segment padding ({divisor}, from its CP/SP layout) must divide the "
+                f"teacher's ({contract['padding_divisor']}) so re-padded packs always fit"
+            )
+    elif args.seq_length > contract["seq_length"]:
         raise ValueError("Only non-packed prefix shortening is supported by v3 replay")
     if args.context_parallel_size > 1 and args.seq_length % (2 * args.context_parallel_size):
         raise ValueError("Student sequence length must be divisible by 2 * CP")
@@ -348,11 +391,12 @@ def initialize_replay(args: Any) -> None:
             if shuffle:
                 if replay_end is None:
                     # Fix the shuffled extent at the first launch; resumes reuse it.
-                    replay_end = groups[-1][1] if groups else metadata["first_sample"]
-                if (groups[-1][1] if groups else metadata["first_sample"]) < replay_end:
+                    replay_end = groups[-1][1] if groups else metadata["contract"]["first_sample"]
+                published_end = groups[-1][1] if groups else metadata["contract"]["first_sample"]
+                if published_end < replay_end:
                     raise ValueError(
                         f"Shuffled replay was planned over samples up to {replay_end}, but only "
-                        f"{groups[-1][1] if groups else metadata['first_sample']} are published"
+                        f"{published_end} are published"
                     )
                 groups = [group for group in groups if group[1] <= replay_end]
                 if not groups:
@@ -547,6 +591,7 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
             decode_threads=args.logits_load_decode_threads,
             prefetch_depth=args.logits_load_msc_prefetch_depth,
             chunk_bytes=args.logits_load_read_chunk_mb << 20,
+            student_vocab_size=args.padded_vocab_size,
         )
         _PLAN["readers"].append(reader)
         return ReplayIterator(
@@ -560,6 +605,7 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
             prefetch=True,
             cp_size=cp_size,
             layout=layout_options(args, hybrid=_HYBRID_LAYOUT),
+            divisor=student_padding_divisor(args),
         )
 
     iterator = _ContextParallelReplay(source_factory if cp_rank == 0 else None, cp_rank, cp_size)
@@ -657,7 +703,7 @@ def prepare_replay_batch(batch: dict) -> tuple[dict, dict | None]:
     if args.create_attention_mask_in_dataloader:
         from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 
-        eod = _PLAN["metadata"]["tokenizer"]["eod"]
+        eod = _PLAN["metadata"]["contract"]["tokenizer"]["eod_id"]
         result["attention_mask"] = torch.stack(
             [
                 _get_ltor_masks_and_position_ids(
