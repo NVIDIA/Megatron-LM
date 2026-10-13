@@ -388,6 +388,7 @@ asyncio.run(main())
 | `num_tokens_to_generate` | Max new tokens to generate |
 | `num_tokens_total` | Cap on prompt + generated length. Mutually exclusive with `num_tokens_to_generate` |
 | `temperature` | Softmax temperature (`1.0` = unmodified) |
+| `seed` | Optional nonnegative int64 request seed; dynamic Torch sampling only |
 | `top_k` | Keep top-k logits (`0` = disabled) |
 | `top_p` | Nucleus sampling threshold (`0.0` = disabled) |
 | `termination_id` | Token id that stops generation (commonly the EOD token) |
@@ -401,6 +402,27 @@ asyncio.run(main())
 | `add_BOS` | Prepend BOS when tokenizing |
 | `streaming`, `streaming_interval` | Emit incremental partial replies. Refer to [Streaming](#streaming) |
 | `do_kv_handoff` | Pin KV blocks and publish handoff metadata for a peer decode engine. Refer to [Disaggregated Prefill and Decode](#disaggregated-prefill-and-decode) |
+
+An explicit `seed` assigns random draws by request seed and absolute token
+position, so moving a request between dynamic batch slots does not reassign its
+random stream. `/v1/chat/completions` and `/v1/completions` accept the same field;
+chat choice `i` or completion prompt `i` uses `(seed + i) % 2**63`. Use a different
+seed for each independently sampled rollout and reuse it when retrying that
+logical request. Omitting `seed` retains the shared-generator sampling path.
+
+This requires dynamic inference with `sampling_backend="torch"` and no
+speculative decoding. Unsupported modes reject seeded requests. CUDA seeded
+draws require Triton and use one batched noise-generation launch per sampling
+bucket, keyed by request seed, absolute position, and vocabulary index. Explicit
+request seeds require CUDA logits; CPU seeded sampling is not supported.
+Unseeded rows retain the shared-generator path and seeded rows do not consume
+its random draws. Exact
+seeded CUDA token sequences can differ from the earlier per-row Torch implementation:
+the same seed identifies a different random stream, not a loss of repeatability.
+Replay requires the same implementation and runtime, not different RNG algorithms
+or CPU/CUDA backends. This feature does not make model logits
+batch invariant, freeze policy weights, or snapshot external tool execution.
+Identical generated tokens still require identical logits and sampling settings.
 
 ```python
 sp = SamplingParams(
