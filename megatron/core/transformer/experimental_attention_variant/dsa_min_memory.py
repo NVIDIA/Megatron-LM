@@ -24,12 +24,15 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor,
     _yarn_linear_ramp_mask,
 )
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_zigzag_allgather_cp_key_reorder,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
     set_min_memory_triton_enabled,
     triton_indexer_loss_grad,
@@ -713,25 +716,6 @@ def _cp_group_size(pg_collection) -> int:
     return 1 if cp_group is None else cp_group.size()
 
 
-class _AllReduceIndexerLoss(torch.autograd.Function):
-    """Sum a scalar loss across a process group, keeping it differentiable.
-
-    Forward sums; backward broadcasts the incoming scalar gradient unchanged, because each rank's
-    partial contributed additively to the total. torch.distributed.all_reduce alone would detach
-    the scalar from the graph and silently zero the indexer's gradient.
-    """
-
-    @staticmethod
-    def forward(ctx, loss: torch.Tensor, group) -> torch.Tensor:
-        loss = loss.clone()
-        torch.distributed.all_reduce(loss, group=group)
-        return loss
-
-    @staticmethod
-    def backward(ctx, grad_loss: torch.Tensor):
-        return grad_loss, None
-
-
 def _tile_global_start(query_positions: Optional[torch.Tensor], q_start: int) -> int:
     """Global position of the first query row in a tile whose local offset is ``q_start``.
 
@@ -1234,7 +1218,12 @@ def _simplified_sparse_forward_impl(
     if cp_size > 1:
         # Each rank's KL covers only its own queries. The loss is a mean over the full sequence,
         # so the partials must be summed; without this each rank backpropagates its share alone.
-        indexer_loss = _AllReduceIndexerLoss.apply(indexer_loss, pg_collection.cp)
+        # The helper's backward passes the scalar gradient through unchanged, which is what an
+        # additive partial needs -- a plain all_reduce would detach it and zero the indexer's
+        # gradient instead. Cloning first because the helper reduces a contiguous input in place.
+        indexer_loss = reduce_from_tensor_model_parallel_region(
+            indexer_loss.clone(), pg_collection.cp
+        )
     return output.reshape(sq, batch_size, num_query_heads * value.size(-1)), indexer_loss
 
 
