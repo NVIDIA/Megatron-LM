@@ -118,6 +118,7 @@ def test_deterministic_indexer_grads_match_reference_and_replay(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.launch_on_gb200
 def test_deterministic_indexer_grads_match_cudnn_kernel():
     """The replacement must follow cuDNN's clipped-log KL, not only well-normalized targets."""
     if torch.cuda.get_device_capability()[0] != 10:
@@ -175,6 +176,7 @@ def test_deterministic_indexer_grads_match_cudnn_kernel():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("heads", [16, 64])
 def test_non_cp_sparse_attention_backward_reference_and_replay(heads):
     """Real FlashMLA/cuDNN forward/backward, including head padding and SBHD batches."""
@@ -281,6 +283,7 @@ def test_non_cp_sparse_attention_backward_reference_and_replay(heads):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("loss_coeff", [0.0, 0.3])
+@pytest.mark.launch_on_gb200
 def test_real_ratio4_no_grad_and_training_forward_parity(loss_coeff, monkeypatch):
     """Real learned-indexer CSA forwards preserve compact key order and output bits."""
     if torch.cuda.get_device_capability()[0] != 10:
