@@ -3323,6 +3323,9 @@ _FILLED = ResumedGeneration(
     num_evictions=2,
     finished=True,
 )
+# A preparer's wire form that lost a field: refused as it is rebuilt, not as it is admitted.
+_UNREADABLE = ResumedGeneration([7, 8], 6, **_SCORED, **_STAMPED).to_wire()
+del _UNREADABLE["token_ids"]
 
 
 @pytest.mark.parametrize(
@@ -3335,11 +3338,7 @@ _FILLED = ResumedGeneration(
         (False, _FILLED, None),
         (False, ResumedGeneration([], 5, **_STAMPED), "fresh"),
         (False, ResumedGeneration([], 6, log_probs=[], finished=True, **_STAMPED), None),
-        (
-            False,
-            ResumedGeneration([7, 8], 6, log_probs=[-0.5], **_STAMPED),
-            "has log probs and tokens of different lengths, 1 and 2",
-        ),
+        (False, _UNREADABLE, "wire is malformed: KeyError: 'token_ids'"),
         (
             False,
             ResumedGeneration([7, 8], 6, **_STAMPED),
@@ -3360,7 +3359,7 @@ _FILLED = ResumedGeneration(
         "text-served-budget-filled",
         "no-tokens-admitted-fresh",
         "no-tokens-served-empty",
-        "misaligned-refused",
+        "unreadable-refused",
         "unscored-refused",
         "unstamped-refused",
         "overflow-fails-as-admission",
@@ -3370,7 +3369,7 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
     """add_request admits a resume on the request as built, under the banked budget rather than
     the request's; a multimodal resume's boundaries are measured on the expanded prompt; one with
     nothing generated yet is admitted fresh, or served empty when the preparer says it ended; a
-    refusal names its reason."""
+    refusal, of a wire that does not read back or of what the payload lacks, names its reason."""
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
     engine.context.max_sequence_length = 2 if outcome == "overflow" else 32
@@ -3384,7 +3383,8 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
     engine.stop_word_being_finished_ids = set()
     engine.controller.terminating_token_ids.return_value = frozenset()
     engine._loop = asyncio.new_event_loop()
-    offload_params = {"ng_capture": "c", RESUMED_GENERATION_FIELD: resumed.to_wire()}
+    wire = resumed if isinstance(resumed, dict) else resumed.to_wire()
+    offload_params = {"ng_capture": "c", RESUMED_GENERATION_FIELD: wire}
     media = (
         {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])} if multimodal else {}
     )
