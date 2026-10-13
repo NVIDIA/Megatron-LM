@@ -142,5 +142,11 @@ def test_chained_optimizer_combines_python_float_norms_and_skips_missing_ones():
 
     norm = ChainedOptimizer([MockOptimizer(3.0, "dp"), MockOptimizer(4.0, "dp-ep")]).get_grad_norm()
     assert isinstance(norm, float) and norm == 5.0
-    assert ChainedOptimizer([MockOptimizer(None, "dp"), MockOptimizer(4.0, "dp-ep")]).get_grad_norm() == 4.0
-    assert ChainedOptimizer([MockOptimizer(None, "dp"), MockOptimizer(None, "dp-ep")]).get_grad_norm() == 0.0
+    assert (
+        ChainedOptimizer([MockOptimizer(None, "dp"), MockOptimizer(4.0, "dp-ep")]).get_grad_norm()
+        == 4.0
+    )
+    assert (
+        ChainedOptimizer([MockOptimizer(None, "dp"), MockOptimizer(None, "dp-ep")]).get_grad_norm()
+        == 0.0
+    )
