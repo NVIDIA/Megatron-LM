@@ -214,18 +214,46 @@ from .utils import (
 
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
-try:
-    from megatron.rl import rl_utils
-    from megatron.rl.rl_profiling import (
-        RL_LOGGABLE_TIMER_NAMES,
-        initialize_rl_profiler,
-        log_iteration_profile,
-        shutdown_rl_profiler,
-    )
 
+# megatron.rl's training hooks import the RL agent, inference and server stack, so they are
+# imported by _import_rl_utils for RL runs only, not when this module loads.
+rl_utils = None
+RL_LOGGABLE_TIMER_NAMES = ()
+initialize_rl_profiler = None
+log_iteration_profile = None
+shutdown_rl_profiler = None
+has_rl_utils = False
+
+
+def _import_rl_utils(rl_config) -> None:
+    """Import megatron.rl when RL steps, RL sequence packing or the RL profiler are enabled.
+
+    ``rl_config`` is the run's RL config section, which the training loop reads these
+    switches from. Sets ``has_rl_utils`` and the module-level RL names; a missing package
+    leaves ``has_rl_utils`` False, as the guarded module-level import used to.
+    """
+    global rl_utils, RL_LOGGABLE_TIMER_NAMES, has_rl_utils
+    global initialize_rl_profiler, log_iteration_profile, shutdown_rl_profiler
+    if has_rl_utils or not any(
+        getattr(rl_config, name, False)
+        for name in ("perform_rl_step", "rl_use_sequence_packing", "rl_profile")
+    ):
+        return
+    try:
+        from megatron.rl import rl_utils as _rl_utils
+        from megatron.rl.rl_profiling import RL_LOGGABLE_TIMER_NAMES as _timer_names
+        from megatron.rl.rl_profiling import initialize_rl_profiler as _initialize_profiler
+        from megatron.rl.rl_profiling import log_iteration_profile as _log_profile
+        from megatron.rl.rl_profiling import shutdown_rl_profiler as _shutdown_profiler
+    except ImportError:
+        return
+    rl_utils = _rl_utils
+    RL_LOGGABLE_TIMER_NAMES = _timer_names
+    initialize_rl_profiler = _initialize_profiler
+    log_iteration_profile = _log_profile
+    shutdown_rl_profiler = _shutdown_profiler
     has_rl_utils = True
-except ImportError:
-    has_rl_utils = False
+
 
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
@@ -1695,6 +1723,7 @@ def pretrain(
     # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
     timers = get_timers()
+    _import_rl_utils(cfg_container.rl)
 
     # OTel span setup (_start_otel_job_spans) is deferred until after
     # kernel warmup below, where program_start/main_entry/pretrain_entry
@@ -4657,6 +4686,7 @@ def train(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
+    _import_rl_utils(cfg.rl)
     timers = get_timers()
     train_state = get_train_state()
 

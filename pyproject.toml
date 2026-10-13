@@ -6,6 +6,24 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = true
+# Ship megatron.rl's shared-prefix packing modules (torch and the standard
+# library only), the lazy package __init__, and generation_api, which backs the
+# lazy megatron.rl.Request exports and needs pydantic (not a declared dependency).
+# The RL runtime (rl_utils, agent, inference, server) needs undeclared
+# dependencies and stays out of built wheels. An editable install maps the whole
+# megatron/rl directory, so megatron.training imports the RL runtime only for RL
+# runs.
+py-modules = [
+    "megatron.rl.generation_api",
+    "megatron.rl.shared_prefix_alignment",
+    "megatron.rl.shared_prefix_cost",
+    "megatron.rl.shared_prefix_dense_bins",
+    "megatron.rl.shared_prefix_execution",
+    "megatron.rl.shared_prefix_metadata",
+    "megatron.rl.shared_prefix_packing",
+    "megatron.rl.shared_prefix_tensors",
+    "megatron.rl.tree_layout",
+]
 
 [tool.setuptools.packages.find]
 include = [
