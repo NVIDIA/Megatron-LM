@@ -113,7 +113,17 @@ def _indexer(device, cp_group):
     )
 
 
-def _run(query, key, value, hidden, indexer, q_chunk, query_positions=None, input_norm=None):
+def _run(
+    query,
+    key,
+    value,
+    hidden,
+    indexer,
+    q_chunk,
+    query_positions=None,
+    input_norm=None,
+    cache_indexer_k=True,
+):
     """Call the kernel the way _forward_min_memory does once K and V are gathered."""
     return dsa_min_memory_gqa(
         query,
@@ -126,9 +136,10 @@ def _run(query, key, value, hidden, indexer, q_chunk, query_positions=None, inpu
         False,
         query_chunk_size=q_chunk,
         key_chunk_size=SEQLEN,
-        # The learned indexer K must be cached so it is projected once for the whole sequence and
-        # all-gathered; the streamed projection would read local hidden states at global offsets.
-        cache_indexer_k=True,
+        # Caching projects the learned indexer K once for the whole sequence and all-gathers it.
+        # With cache_indexer_k=False the backward rebuilds it instead, which has to perform the
+        # same gather and zigzag reorder -- see the recompute test below.
+        cache_indexer_k=cache_indexer_k,
         use_triton=False,
         simplified_input_norm=input_norm,
         query_positions=query_positions,
@@ -149,7 +160,7 @@ def _reference(device, q_chunk):
     return out.detach(), grads
 
 
-def _sharded(device, cp_group, positions, q_chunk):
+def _sharded(device, cp_group, positions, q_chunk, cache_indexer_k=True):
     """This rank's result, with the gather run over the live group."""
     q, k, v, h = _global_inputs(device)
     q_local = q[positions].detach().requires_grad_(True)
@@ -169,6 +180,7 @@ def _sharded(device, cp_group, positions, q_chunk):
         q_chunk,
         query_positions=query_positions,
         input_norm=_input_norm(device),
+        cache_indexer_k=cache_indexer_k,
     )
     grads = torch.autograd.grad(
         out.float().sum() + loss,
@@ -281,6 +293,34 @@ class TestContextParallelParity:
             summed = grads[3].clone()
             torch.distributed.all_reduce(summed, group=cp_group)
             torch.testing.assert_close(summed, ref_grads[3], atol=1e-5, rtol=1e-5)
+        finally:
+            Utils.destroy_model_parallel()
+
+    def test_recomputing_the_indexer_k_matches_caching_it(self, cp_size):
+        """cache_indexer_k=False makes the backward rebuild the learned-K index itself.
+
+        The rebuild has to all-gather across the CP group and undo the zigzag exactly as the
+        forward's projection did. Building it from this rank's hidden states alone yields an
+        index spanning only the local shard, while topk_indices address the global key set --
+        and it would embed RoPE at local rather than global positions. Either way the gradient
+        is wrong while the cached path stays right, so the two must agree.
+
+        Comparing the two settings rather than a reference isolates the recompute: everything
+        else about the two runs is identical.
+        """
+        if _launched_world_size() < cp_size:
+            pytest.skip(f"cp={cp_size} needs {cp_size} ranks")
+        cp_group, device, q_chunk, positions = self._setup(cp_size)
+        try:
+            cached_out, cached = _sharded(
+                device, cp_group, positions, q_chunk, cache_indexer_k=True
+            )
+            rebuilt_out, rebuilt = _sharded(
+                device, cp_group, positions, q_chunk, cache_indexer_k=False
+            )
+            torch.testing.assert_close(rebuilt_out, cached_out, atol=1e-5, rtol=1e-5)
+            for name, a, b in zip(("dQ", "dK", "dV", "dW_k", "dW_q"), rebuilt, cached, strict=True):
+                torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5, msg=f"{name} differs")
         finally:
             Utils.destroy_model_parallel()
 

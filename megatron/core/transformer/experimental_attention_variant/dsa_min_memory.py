@@ -1353,6 +1353,9 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         ctx.use_triton = use_triton
         ctx.query_positions = query_positions
         ctx.cp_group = getattr(pg_collection, "cp", None) if pg_collection else None
+        # The backward recomputes the learned-K index when it was not retained, and has to
+        # reorder the gather exactly as the forward did.
+        ctx.cp_layout_contiguous = cp_layout_contiguous
         return output, indexer_loss
 
     @staticmethod
@@ -1376,8 +1379,15 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             # forward does: the tile loop below would otherwise reproject the causal prefix per
             # tile. This is the recompute the empty cached_k asked for, done once rather than
             # once per tile, and it is released when this backward returns.
+            #
+            # Must go through the same helper the forward used, not the plain projection it
+            # wraps: under CP that one returns this rank's shard, while topk_indices address the
+            # global key set, and it would embed RoPE at local rather than global positions. The
+            # helper reduces to the plain projection when there is no CP group. Both conditions
+            # above come from config, so every rank takes this branch together and the gather
+            # inside cannot hang.
             with torch.no_grad():
-                full_k_index = _build_full_indexer_k(
+                full_k_index = _project_full_indexer_k(
                     hidden_states,
                     learned_k_weight,
                     ctx.index_head_dim,
@@ -1386,6 +1396,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     ctx.rotary_interleaved,
                     ctx.use_indexer_rope,
                     ctx.simplified_input_norm,
+                    ctx.pg_collection,
+                    contiguous=ctx.cp_layout_contiguous,
                 )
         grad_output = grad_output.reshape(sq, batch_size, num_query_heads, value.size(-1))
         grad_query = _grad_accumulator(query) if ctx.needs_input_grad[0] else None
