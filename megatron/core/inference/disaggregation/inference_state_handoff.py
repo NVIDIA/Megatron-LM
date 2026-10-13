@@ -248,6 +248,10 @@ class InferenceStateHandoffMixin:
         self._failed_handoff_requests.clear()
         self._pending_handoff_hash_owners.clear()
 
+    def _pending_prefill_block_hashes(self) -> set[int]:
+        """Prevent recovery prefill from duplicating blocks reserved by imports."""
+        return set(self._pending_handoff_hash_owners)
+
     def schedule_waiting_requests(self) -> None:
         """Recover evicted decodes locally, but reject new prompt submissions.
 
@@ -925,6 +929,10 @@ class InferenceStateHandoffMixin:
         Side: decode engine; pull and push transport paths.
         """
 
+        # Recovery publishes prefix hashes before its forward completes. Do not
+        # reuse those blocks or reserve a later chunk's hashes until it finishes.
+        if self.context.num_prefill_requests or self.context.chunked_prefill_request_id != -1:
+            return False
         allocator = self.context.kv_block_allocator
         cached_blocks = self._find_cached_handoff_prefix(handoff.hashes, handoff.num_blocks)
 

@@ -723,6 +723,86 @@ def test_failed_handoff_allocation_releases_hash_reservation(handoff_loop):
     _drain_loop(handoff_loop)
 
 
+@pytest.mark.parametrize("chunked", [False, True])
+def test_eviction_recovery_waits_for_imported_prefix(handoff_loop, chunked):
+    engine = _HandoffHarness(handoff_loop)
+    context = engine.context
+    context.enable_prefix_caching = True
+    context.batch_invariant_mode = False
+    context.prefix_cache_lru_clock = 0
+    allocator = KVBlockAllocator(
+        context,
+        pool_size=16,
+        paused_limit=0,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+    )
+    context.kv_block_allocator = allocator
+    engine.add_request_with_kv_handoff(
+        7, [1, 2, 3, 4], SamplingParams(num_tokens_to_generate=3), {"resume_tokens": [99]}, [100]
+    )
+    pending = engine._pending_kv_imports[0]
+    block_hash = pending.hashes[0]
+    imported_block = pending.local_blocks[0]
+    engine.add_request(
+        8,
+        [1, 2, 3, 4],
+        SamplingParams(num_tokens_to_generate=3),
+        precomputed_block_hashes=pending.hashes,
+    )
+    request = engine.get_request(8)
+    request.add_event_evict()
+    request.remaining_prompt_tokens = request.prompt_tokens.clone()
+    engine._prefix_coordination_waits = 0
+    engine._can_schedule_non_chunked_prefill = mock.Mock(return_value=True)
+    engine._can_schedule_chunked_prefill = mock.Mock(return_value=True)
+    engine._cg_admission_gating_active = mock.Mock(return_value=False)
+    context._compute_prefix_match = mock.Mock(return_value=SimpleNamespace(prefix_skip_tokens=0))
+    context.add_request = mock.Mock(
+        side_effect=lambda _: allocator.retain_memory_blocks(
+            [allocator.kv_hash_to_block_id[block_hash]]
+        )
+    )
+    schedule = (
+        DynamicInferenceEngine.schedule_chunked_prefill
+        if chunked
+        else DynamicInferenceEngine.schedule_non_chunked_prefill
+    )
+    schedule(engine)
+    context.add_request.assert_not_called()
+    assert list(engine.waiting_request_ids) == [8]
+    assert engine._pending_handoff_hash_owners[block_hash] == 7
+
+    with mock.patch(
+        "megatron.core.inference.disaggregation.inference_state_handoff.admit_prefilled_decode"
+    ):
+        engine._finalize_kv_handoff_import(pending)
+    schedule(engine)
+    context.add_request.assert_called_once_with(request)
+    assert not engine.waiting_request_ids
+    assert int(allocator.block_ref_counts[imported_block]) == 2
+    allocator.release_memory_blocks(torch.tensor([imported_block], dtype=torch.int32))
+    assert allocator.kv_hash_to_block_id[block_hash] == imported_block
+    assert int(allocator.block_ref_counts[imported_block]) == 1
+
+
+@pytest.mark.parametrize("prefills, chunked_id", [(1, -1), (0, 8)])
+def test_import_waits_for_recovery_prefill(handoff_loop, prefills, chunked_id):
+    engine = _HandoffHarness(handoff_loop)
+    engine.context.num_prefill_requests = prefills
+    engine.context.chunked_prefill_request_id = chunked_id
+    engine.add_request_with_kv_handoff(
+        7, [1, 2, 3, 4], SamplingParams(num_tokens_to_generate=3), {"resume_tokens": [99]}, [100]
+    )
+    assert not engine._pending_kv_imports
+    assert not engine._pending_handoff_hash_owners
+    assert not engine._kv_transfer_agent.calls
+    engine.context.num_prefill_requests = 0
+    engine.context.chunked_prefill_request_id = -1
+    assert engine._drain_deferred_kv_handoffs() == 1
+    assert engine._pending_kv_imports[0].request_id == 7
+
+
 def test_matching_inflight_prefix_waits_for_hash_owner(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     params = SamplingParams(num_tokens_to_generate=2)

@@ -3463,11 +3463,15 @@ class DynamicInferenceEngine(AbstractEngine):
             return not self._can_schedule_chunked_prefill(req)
         return not self._can_schedule_non_chunked_prefill(req, record_cg_wait=False)
 
+    def _pending_prefill_block_hashes(self) -> set[int]:
+        """Return hashes reserved by work whose KV is not yet ready for reuse."""
+        return set()
+
     def schedule_non_chunked_prefill(self) -> None:
         """Schedule non-chunked prefill requests."""
         prefix_caching_enabled = self.context.enable_prefix_caching
         if prefix_caching_enabled:
-            pending_block_hashes = set()
+            pending_block_hashes = self._pending_prefill_block_hashes()
             pending_request_ids = []
         while self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
@@ -3648,7 +3652,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
         if prefix_caching_enabled:
-            pending_block_hashes = set()
+            pending_block_hashes = self._pending_prefill_block_hashes()
             pending_request_ids = []
         can_schedule = True
         while self.waiting_request_ids and can_schedule:
