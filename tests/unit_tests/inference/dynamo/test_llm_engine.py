@@ -85,6 +85,12 @@ def test_sampling_params_maps_greedy_and_limits():
     assert params.detokenize_stop_sequence
     assert params.stop_words == ["END"]
     assert not build_sampling_params({}).detokenize_stop_sequence
+    for seed in (None, 0, 42):
+        params = build_sampling_params({"sampling_options": {"seed": seed}})
+        assert params.seed == seed
+        assert params.serialize()["seed"] == seed
+    with pytest.raises(ValueError, match="seed"):
+        build_sampling_params({"sampling_options": {"seed": -1}})
     with pytest.raises(ValueError, match="nonzero min_tokens"):
         build_sampling_params({"stop_conditions": {"min_tokens": 2}})
 

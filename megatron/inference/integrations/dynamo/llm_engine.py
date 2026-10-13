@@ -61,6 +61,7 @@ def build_sampling_params(request: GenerateRequest) -> SamplingParams:
     sampling = request.get("sampling_options") or {}
     stop = request.get("stop_conditions") or {}
     params = SamplingParams()
+    params.seed = sampling.get("seed")
     if sampling.get("temperature") is not None:
         params.temperature = float(sampling["temperature"])
     if sampling.get("top_p") is not None:
