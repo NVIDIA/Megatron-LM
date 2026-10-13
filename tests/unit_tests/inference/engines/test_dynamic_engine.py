@@ -2618,15 +2618,23 @@ def test_generate_mixed_batch_waits_only_for_its_pending_future():
 
 
 def test_snapshot_live_requests():
-    """Every entry but a failed one is copied. Any loop may run the snapshot while none runs the
-    engine, as between a suspend and a resume driven inline; a live engine loop refuses the others.
-    """
+    """Every entry but a failed one is copied; one a stop word or mid-block EOS has ended, which
+    bookkeeping has still to complete, reads finished. Any loop may run the snapshot while none runs
+    the engine, as between a suspend and a resume driven inline; a live engine loop refuses the
+    others."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._loop, other_loop = asyncio.new_event_loop(), asyncio.new_event_loop()
-    live = _make_request_entry(engine._loop, 1, Status.ACTIVE_AND_GENERATING_TOKENS, resolve=False)
-    failed = _make_request_entry(engine._loop, 2, Status.FAILED, resolve=False)
-    engine.requests = {1: live, 2: failed}
-    expected = [LiveRequestSnapshot.from_record(live.record)]
+    active = Status.ACTIVE_AND_GENERATING_TOKENS
+    live, stop_hit, stop_masked, failed = (
+        _make_request_entry(engine._loop, request_id, status, resolve=False)
+        for request_id, status in ((1, active), (2, active), (3, active), (4, Status.FAILED))
+    )
+    engine.requests = {1: live, 2: stop_hit, 3: stop_masked, 4: failed}
+    engine.stop_word_finished_request_ids, engine.stop_word_being_finished_ids = {2}, {3}
+    expected = [
+        LiveRequestSnapshot.from_record(entry.record, finished=finished)
+        for entry, finished in ((live, False), (stop_hit, True), (stop_masked, True))
+    ]
     assert engine._loop.run_until_complete(engine.snapshot_live_requests()) == expected
     assert other_loop.run_until_complete(engine.snapshot_live_requests()) == expected
 
@@ -3322,22 +3330,36 @@ _FILLED = ResumedGeneration(
     [
         (False, ResumedGeneration([7, 8], 6, policy_epoch=[(0, 9)], **_SCORED), None),
         (False, ResumedGeneration([7, 8], 5, **_SCORED, **_STAMPED), None),
-        (True, ResumedGeneration([7, 8], 6, **_SCORED, **_STAMPED), None),
+        (True, ResumedGeneration([7, 8], 6, policy_epoch=[(0, 3), (3, 4)], **_SCORED), None),
         (True, ResumedGeneration([7, 8], 7, finished=True, **_SCORED, **_STAMPED), None),
         (False, _FILLED, None),
-        (False, ResumedGeneration([], 6, **_STAMPED), "refused"),
-        (False, ResumedGeneration([7, 8], 6, log_probs=[-0.5], **_STAMPED), "refused"),
-        (False, ResumedGeneration([7, 8], 6, **_STAMPED), "refused"),
-        (False, ResumedGeneration([7, 8], 6, **_SCORED), "refused"),
+        (False, ResumedGeneration([], 5, **_STAMPED), "fresh"),
+        (False, ResumedGeneration([], 6, log_probs=[], finished=True, **_STAMPED), None),
+        (
+            False,
+            ResumedGeneration([7, 8], 6, log_probs=[-0.5], **_STAMPED),
+            "has log probs and tokens of different lengths, 1 and 2",
+        ),
+        (
+            False,
+            ResumedGeneration([7, 8], 6, **_STAMPED),
+            "carries no log probs for a request that returns them",
+        ),
+        (
+            False,
+            ResumedGeneration([7, 8], 6, **_SCORED),
+            "carries no policy epoch for an engine that stamps one",
+        ),
         (False, ResumedGeneration([7, 8], 6, **_SCORED, **_STAMPED), "overflow"),
     ],
     ids=[
         "text-continued-same-epoch-without-kv",
         "text-continued-under-the-banked-budget",
-        "multimodal-continued",
+        "multimodal-continued-without-kv",
         "multimodal-served-under-the-banked-budget",
         "text-served-budget-filled",
-        "no-tokens-refused",
+        "no-tokens-admitted-fresh",
+        "no-tokens-served-empty",
         "misaligned-refused",
         "unscored-refused",
         "unstamped-refused",
@@ -3346,7 +3368,9 @@ _FILLED = ResumedGeneration(
 )
 def test_admit_resumed_generation(multimodal, resumed, outcome):
     """add_request admits a resume on the request as built, under the banked budget rather than
-    the request's; a multimodal resume's boundaries are measured on the expanded prompt."""
+    the request's; a multimodal resume's boundaries are measured on the expanded prompt; one with
+    nothing generated yet is admitted fresh, or served empty when the preparer says it ended; a
+    refusal names its reason."""
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
     engine.context.max_sequence_length = 2 if outcome == "overflow" else 32
@@ -3378,6 +3402,15 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
     def shifted(boundaries):
         return [(p + shift if p >= 3 else p, epoch) for p, epoch in boundaries]
 
+    if outcome == "fresh":
+        (admitted,) = engine.requests[1].record.requests
+        assert list(engine.waiting_request_ids) == [1]
+        assert admitted.status == Status.ACTIVE_AND_GENERATING_TOKENS
+        assert (admitted.generated_tokens, admitted.offload_params) == ([], {"ng_capture": "c"})
+        assert admitted.sampling_params.num_tokens_to_generate == resumed.num_tokens_to_generate
+        assert (admitted.policy_epoch, admitted.kv_cache_epoch) == ([(0, 9)], [(0, 9)])
+        assert FinishedRequestRecord.from_request(admitted).num_evictions == 0
+        return
     if outcome:
         failed = future.result()
         (error,) = [
@@ -3392,7 +3425,7 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
             assert isinstance(error, MaxSequenceLengthOverflowError) and reason is None
         else:
             assert isinstance(error, PromptPreparationError) and reason in str(error)
-            assert reason == "invalid resumed generation"
+            assert reason == f"resumed generation {outcome}"
         return
     if resumed.finished:
         completed = future.result()
@@ -9105,10 +9138,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # THE KILL. What survives: the stager's finished payloads and the framework's snapshot of
         # the live calls; together they cover every call exactly once.
         banked = {
-            params["call_id"]: (payload, telemetry)
+            params["call_id"]: (payload, telemetry, True)
             for payload, telemetry, params in engine.payload_stager.by_uid.values()
         }
-        live = {s.offload_params["call_id"]: (s.payload, s.record) for s in snapshot(engine)}
+        live = {
+            s.offload_params["call_id"]: (s.payload, s.record, s.finished) for s in snapshot(engine)
+        }
         assert set(banked) | set(live) == set(call_ids.values()) and not set(banked) & set(live)
         truth = {**banked, **live}
         resumes = {
@@ -9120,9 +9155,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 policy_epoch=telemetry.policy_epoch,
                 kv_cache_epoch=telemetry.kv_cache_epoch,
                 num_evictions=telemetry.num_evictions,
-                finished=call_id in banked,
+                finished=finished,
             )
-            for call_id, (payload, telemetry) in truth.items()
+            for call_id, (payload, telemetry, finished) in truth.items()
         }
 
         # RESTART: a fresh engine; the framework's preparer hands back the durable prefixes.
@@ -9131,7 +9166,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         futures = wire_and_submit(engine, epoch=4, resumes=resumes)
         assert resumes == {}  # every call resumed something
         for request_id, future in futures.items():
-            assert future.done() is (call_ids[request_id] in banked)  # served iff it had finished
+            assert future.done() is truth[call_ids[request_id]][2]  # served iff it had finished
         while engine.has_unfinished_requests():
             self._run_step(restarted)
         assert snapshot(engine) == []
@@ -9142,7 +9177,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         }
         for r in env.requests:
             call_id, prompt = call_ids[r.request_id], prompts[r.request_id]
-            (bank, bank_telemetry), served = truth[call_id], call_id in banked
+            bank, bank_telemetry, served = truth[call_id]
             uid, payload, telemetry = by_call[call_id]
             cut = len(prompt) + len(bank.generated_token_ids) - 1
             # The banked tokens lead a payload that runs to the budget. A served generation keeps

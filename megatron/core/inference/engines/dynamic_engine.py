@@ -2080,7 +2080,9 @@ class DynamicInferenceEngine(AbstractEngine):
             request.add_event_finish()
             self.finished_request_count += 1
         else:
-            assert request.status == Status.FAILED, request.status
+            assert (
+                request.status == Status.FAILED
+            ), f"Request {request.request_id} ended in non-terminal status {request.status}."
             request.add_event_fail()
         return request_entry.record.merge()
 
@@ -2348,9 +2350,11 @@ class DynamicInferenceEngine(AbstractEngine):
             raise RuntimeError(
                 "snapshot_live_requests must run on the engine loop while it is running"
             )
+        # The generation's stop condition may be detected one step before bookkeeping completes it.
+        ending = self.stop_word_finished_request_ids | self.stop_word_being_finished_ids
         return [
-            LiveRequestSnapshot.from_record(entry.record)
-            for entry in self.requests.values()
+            LiveRequestSnapshot.from_record(entry.record, finished=request_id in ending)
+            for request_id, entry in self.requests.items()
             if entry.record[-1].status != Status.FAILED
         ]
 
@@ -2706,13 +2710,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Resumed request path.
         try:
-            resumed = ResumedGeneration.from_wire(wire).with_expanded_prompt(
-                prompt_length, len(request.prompt_tokens)
+            resumed = ResumedGeneration.from_wire(wire)
+            record = build_resumed_record(
+                request,
+                resumed,
+                prompt_length=prompt_length,
+                generation_epoch=self._generation_epoch,
             )
-            record = build_resumed_record(request, resumed, generation_epoch=self._generation_epoch)
         except ValueError as invalid:
             # Refused the way rank zero refuses a prompt: _add_request fails the request.
             params[_PROMPT_PREPARATION_ERROR_FIELD] = str(invalid)
+            return self._add_request(request)
+        if record is None:  # nothing generated yet
             return self._add_request(request)
 
         entry = RequestEntry(record=record, future=self._loop.create_future())
