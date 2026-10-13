@@ -2395,12 +2395,13 @@ def test_streaming_partials_are_sent():
 
 
 class _RecordingStager:
-    """RequestPayloadStager test double: keeps every staged (uid, payload), or raises
-    ``error`` without staging anything."""
+    """RequestPayloadStager test double: keeps every staged (uid, payload) and returns
+    ``response_metadata``, or raises ``error`` without staging anything."""
 
-    def __init__(self, error=None):
+    def __init__(self, error=None, response_metadata=None):
         self.staged = []
         self.error = error
+        self.response_metadata = response_metadata or {}
 
     def stage(self, uid, payload, *, finished_metadata, offload_params=None):
         if self.error is not None:
@@ -2408,7 +2409,7 @@ class _RecordingStager:
         self.staged.append((uid, payload))
         self.finished_metadata = finished_metadata
         self.offload_params = offload_params
-        return RequestPayloadStageResult()
+        return RequestPayloadStageResult(response_metadata=self.response_metadata)
 
 
 def _reply_request(uid, status, log_probs, *, streaming=False, return_prompt_tokens=False):
@@ -2459,6 +2460,8 @@ def _reply_engine(stager):
         ("records", False, True),
         ("records", True, False),
         ("raises", False, False),
+        # Metadata that cannot be serialized breaks the reply after a successful write.
+        ("unsendable", False, None),
     ],
 )
 async def test_payload_offload_stages_only_eligible_completed_replies(
@@ -2467,14 +2470,16 @@ async def test_payload_offload_stages_only_eligible_completed_replies(
     """A stager offloads completed non-streaming replies only.
 
     Failed and streaming requests are neither staged nor stripped, and replies are untouched
-    without a stager or when its write raises. An offloaded reply never carries the prompt
+    without a stager or when its write raises; a staged reply that cannot be sent exits
+    the process instead of leaving the client waiting. An offloaded reply never carries the prompt
     tensors, even when the request opted into return_prompt_tokens (the stager holds the
     prompt ids); a reply that is not offloaded still honours the opt-in. The ledger is a
     separate mechanism and stays off here.
     """
     if stager is not None:
         stager = _RecordingStager(
-            error=RuntimeError("write failed") if stager == "raises" else None
+            error=RuntimeError("write failed") if stager == "raises" else None,
+            response_metadata={"coords": object()} if stager == "unsendable" else None,
         )
     engine = _reply_engine(stager)
     completed = _reply_request(
@@ -2486,12 +2491,18 @@ async def test_payload_offload_stages_only_eligible_completed_replies(
     )
     failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
 
-    engine._send_requests_to_coordinator([completed, failed])
-    await engine._drain_staging_tasks()
+    with mock.patch("megatron.core.utils.sys.exit") as exit_process:
+        engine._send_requests_to_coordinator([completed, failed])
+        await engine._drain_staging_tasks()
 
     wires = {wire["uid"]: wire for wire in _sent_replies(engine)}
-    ok_wire, failed_wire = wires["chatcmpl-ok"], wires["chatcmpl-failed"]
-    assert failed_wire["payload_offloaded"] is False
+    assert wires["chatcmpl-failed"]["payload_offloaded"] is False
+    if expected_offloaded is None:
+        exit_process.assert_called_once_with(1)
+        assert "chatcmpl-ok" not in wires
+        return
+    exit_process.assert_not_called()
+    ok_wire = wires["chatcmpl-ok"]
     assert engine.local_metadata_ledger == {}
     assert ok_wire["payload_offloaded"] is expected_offloaded
     if expected_offloaded:

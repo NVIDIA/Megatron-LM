@@ -1737,6 +1737,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if serialized:
             self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
 
+    @trace_async_exceptions
     async def _stage_and_reply(
         self,
         stager: RequestPayloadStager,
@@ -1751,7 +1752,8 @@ class DynamicInferenceEngine(AbstractEngine):
         for this request's write, so its stage metadata describes a durable write. The
         reply is sent after the await, back on the engine loop's thread, which is the
         only thread that uses the ZMQ socket. A failed write keeps the payload on the
-        reply.
+        reply. Nothing awaits this task, so any other error exits the process (like the
+        engine loop) instead of vanishing and leaving the client waiting forever.
         """
         try:
             stage_result = await asyncio.to_thread(
