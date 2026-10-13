@@ -184,7 +184,7 @@ class FsdpParameterGroup:
         # _build_fsdp_parameters() creates views into this storage, which requires a valid
         # storage size. Release it only after construction; a later unshard reallocates it.
         self._unsharded_model_weight.release_storage()
-        self._switch_to_sharded_parameters()
+        self.bind_sharded_parameters()
 
     @staticmethod
     def _collect_parameter_metadata(
@@ -415,11 +415,13 @@ class FsdpParameterGroup:
             module, parameter_name = get_parameter_owner(owning_module, fqn)
             module._parameters[parameter_name] = parameter
 
-    def _switch_to_sharded_parameters(self) -> None:
+    def bind_sharded_parameters(self) -> None:
+        """Install sharded parameter references without changing storage."""
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.sharded)
 
-    def _switch_to_unsharded_parameters(self) -> None:
+    def bind_unsharded_parameters(self) -> None:
+        """Install full parameter references without changing storage."""
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
@@ -507,7 +509,7 @@ class FsdpParameterGroup:
                 )
                 if allocated
             }
-        self._switch_to_unsharded_parameters()
+        self.bind_unsharded_parameters()
         return ready_phases
 
     def _install_unsharded_parameters(
@@ -570,10 +572,6 @@ class FsdpParameterGroup:
                     rowwise=rowwise,
                     columnwise=columnwise,
                 )
-
-    def reshard_parameters(self) -> None:
-        """Install sharded DTensor parameters on the owning modules."""
-        self._switch_to_sharded_parameters()
 
     def release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
         """Release all full-parameter storage, or only MXFP8 rowwise storage.
@@ -642,7 +640,7 @@ class FsdpParameterGroup:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
         return has_any_grad
 
-    def reduce_partial_gradients(self, partial_grad: DBuffer, *, is_last_microbatch: bool) -> None:
+    def reduce_gradients(self, partial_grad: DBuffer, *, is_last_microbatch: bool) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
 
         For HSDP/HFSDP main_grad rests DP-outer-Partial between microbatches,

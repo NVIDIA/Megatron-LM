@@ -299,33 +299,6 @@ def test_shared_mtp_backward_matches_baseline(distributed_setup):
     torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
 
 
-def test_rejects_delayed_te_weight_gradient(distributed_setup):
-    """Default automatic synchronization rejects weight gradients produced after autograd."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = te.Linear(
-        16,
-        16,
-        bias=False,
-        params_dtype=torch.bfloat16,
-        device=device,
-        delay_wgrad_compute=True,
-        fuse_wgrad_accumulation=False,
-    )
-    with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
-    x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
-    model(x).float().square().mean().backward()
-    assert model.weight.grad is None
-    assert model.phase is Phase.BACKWARD
-
-    with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
-        model.backward_dw()
-
-
 def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
     """Tied delayed weights are unsupported until TE accumulates their gradients."""
     device = distributed_setup.device

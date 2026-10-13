@@ -407,8 +407,13 @@ def test_delayed_wgrad_matches_immediate(process_group_collection, distributed_s
             losses.append(torch.stack(microbatch_losses).mean())
         return torch.stack(losses)
 
+    def backward_dw():
+        # Delayed wgrad needs the full parameter binding, but not its weight storage.
+        assert delayed_layer.weight.untyped_storage().nbytes() == 0
+        delayed_layer.backward_dw()
+
     immediate_losses = train(immediate_layer)
-    delayed_losses = train(delayed_layer, delayed_layer.backward_dw)
+    delayed_losses = train(delayed_layer, backward_dw)
     torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
 
 
