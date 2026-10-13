@@ -7,8 +7,13 @@
     {
         "name": "0.19.0 (latest)",
         "version": "0.19.0",
-        "url": "https://docs.nvidia.com/megatron-core/developer-guide/latest/",
+        "url": "https://docs.nvidia.com/megatron-core/developer-guide/0.19.0/",
         "preferred": true
+    },
+    {
+        "name": "0.18.2",
+        "version": "0.18.2",
+        "url": "https://docs.nvidia.com/megatron-core/developer-guide/0.18.2/"
     },
     {
         "name": "0.18.0",
@@ -16,9 +21,19 @@
         "url": "https://docs.nvidia.com/megatron-core/developer-guide/0.18.0/"
     },
     {
+        "name": "0.17.1",
+        "version": "0.17.1",
+        "url": "https://docs.nvidia.com/megatron-core/developer-guide/0.17.1/"
+    },
+    {
         "name": "0.17.0",
         "version": "0.17.0",
         "url": "https://docs.nvidia.com/megatron-core/developer-guide/0.17.0/"
+    },
+    {
+        "name": "0.16.1",
+        "version": "0.16.1",
+        "url": "https://docs.nvidia.com/megatron-core/developer-guide/0.16.1/"
     },
     {
         "name": "0.16.0",
