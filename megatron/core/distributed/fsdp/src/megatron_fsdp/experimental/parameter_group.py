@@ -31,6 +31,7 @@ from ..utils import HAVE_TE
 from .dbuffer import DBuffer
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
+from .placement import BlockAtomic, RowAtomic, TensorAtomic
 
 if HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
@@ -45,6 +46,17 @@ else:
 
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
+
+
+def _contains_any_placement_type(
+    *placement_groups: tuple[Placement, ...], placement_types: type | tuple[type, ...]
+) -> bool:
+    """Return whether any placement in ``placement_groups`` matches ``placement_types``."""
+    for placements in placement_groups:
+        for placement in placements:
+            if isinstance(placement, placement_types):
+                return True
+    return False
 
 
 def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
@@ -124,12 +136,15 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        # TODO: Revisit passing owner assignments into the group constructor in a future PR.
+        parameter_to_owner: dict[nn.Parameter, int] | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
-            fqn_to_parameter: Root-module-relative FQNs and their parameters.
+            fqn_to_parameter: Root-module-relative FQNs and their parameters, in logical
+                tensor order. Tied parameters count once.
             mesh: Parent device mesh containing the data-parallel axes.
             model_weight_placements: Compute-weight buffer placements.
             main_grad_placements: Main-gradient buffer placements.
@@ -139,6 +154,9 @@ class FsdpParameterGroup:
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
+            parameter_to_owner: Construction-time mapping from original parameters to
+                owner ranks in ``mesh``. Every TensorAtomic parameter needs an entry;
+                entries for other parameters and non-TensorAtomic groups are ignored.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
             fqn_to_parameter
@@ -148,8 +166,16 @@ class FsdpParameterGroup:
         self.grad_divisor = grad_divisor
         parameters = tuple(parameter_to_fqns)
 
+        if parameter_to_owner is not None and _contains_any_placement_type(
+            model_weight_placements,
+            main_grad_placements,
+            main_weight_placements,
+            placement_types=TensorAtomic,
+        ):
+            self._validate_parameter_to_owner(parameter_to_fqns, parameter_to_owner)
         self._initialize_buffers(
             parameters,
+            parameter_to_owner,
             model_weight_placements,
             main_grad_placements,
             main_weight_placements,
@@ -192,25 +218,67 @@ class FsdpParameterGroup:
                 )
         return parameter_to_fqns, dtype, requires_grad
 
+    @staticmethod
+    def _validate_parameter_to_owner(
+        parameter_to_fqns: dict[nn.Parameter, list[str]],
+        parameter_to_owner: dict[nn.Parameter, int],
+    ) -> None:
+        """Report by FQN the first parameter that has no owner assignment."""
+        for parameter, fqns in parameter_to_fqns.items():
+            if parameter not in parameter_to_owner:
+                raise ValueError(f"parameter_to_owner is missing entries for parameters {fqns!r}.")
+
+    def _build_layout(
+        self,
+        parameters: tuple[nn.Parameter, ...],
+        parameter_to_owner: dict[nn.Parameter, int] | None,
+        *placement_groups: tuple[Placement, ...],
+    ) -> GlobalLayout:
+        """Build the global layout shared by this group's buffers."""
+        shapes = (parameter.shape for parameter in parameters)
+        if not _contains_any_placement_type(*placement_groups, placement_types=TensorAtomic):
+            # MXFP8 groups keep 32-row blocks on one rank; other dtypes pack rows.
+            return GlobalLayout.build_for_row_atomic(
+                shapes, dp_size=self.mesh.size(), block_size=32 if self.dtype == torch.uint8 else 1
+            )
+        if _contains_any_placement_type(
+            *placement_groups, placement_types=(RowAtomic, BlockAtomic)
+        ):
+            raise ValueError(
+                "TensorAtomic cannot be mixed with RowAtomic or BlockAtomic placements."
+            )
+        if self.mesh.ndim != 1:
+            raise ValueError("TensorAtomic requires a 1-D data-parallel mesh.")
+        if parameter_to_owner is None:
+            raise ValueError("TensorAtomic placements require parameter_to_owner.")
+        return GlobalLayout.build_for_tensor_atomic(
+            shapes,
+            dp_size=self.mesh.size(),
+            tensor_owners=(parameter_to_owner[parameter] for parameter in parameters),
+        )
+
     def _initialize_buffers(
         self,
         parameters: tuple[nn.Parameter, ...],
+        parameter_to_owner: dict[nn.Parameter, int] | None,
         model_weight_placements: tuple[Placement, ...],
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         use_symmetric_memory: bool,
     ) -> None:
-        """Allocate weight and gradient buffers in their required dependency order."""
+        """Build the shared layout and allocate weight and gradient buffers."""
+        layout = self._build_layout(
+            parameters,
+            parameter_to_owner,
+            model_weight_placements,
+            main_grad_placements,
+            main_weight_placements,
+        )
+
         if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
-        # All weight and gradient buffers share the same packing and padding.
-        layout = GlobalLayout.build(
-            (parameter.shape for parameter in parameters),
-            dp_size=self.mesh.size(),
-            block_size=32 if self.dtype == torch.uint8 else 1,
-        )
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
 
         self.main_weight = DBuffer(

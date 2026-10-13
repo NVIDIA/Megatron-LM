@@ -9,11 +9,20 @@ from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
 
 import megatron.core.parallel_state as ps
+from megatron.core.inference import utils as inference_utils
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.tensor_parallel import random as tp_random
+from megatron.core.transformer import cuda_graphs, multi_token_prediction
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
+
+try:
+    from transformer_engine.pytorch import distributed as te_distributed
+except ImportError:
+    te_distributed = None
 
 _NVTE_ATTN_ENV_VARS = (
     'NVTE_FLASH_ATTN',
@@ -46,6 +55,105 @@ def clear_nvte_env_vars():
     """Clear NVTE attention backend environment variables."""
     for name in _NVTE_ATTN_ENV_VARS:
         os.environ.pop(name, None)
+
+
+def reset_cuda_graph_global_state():
+    """Reset the process-global CUDA-graph state a passing test can leave behind."""
+    record = cuda_graphs._CudagraphGlobalRecord
+    # TestLLaVACudaGraph is an example of where the pool leaks.
+    # TestPackedSeqCudagraphs is an example that is affected by a leaked pool.
+
+    # TestMHCWithCudaGraph is an example of where training records leak.
+    # TestLocalCudagraphPipelineOutput is an example that is affected by leaked training records.
+    if (
+        record.cudagraph_record
+        or record.cudagraph_inference_record
+        or record.cudagraph_created
+        or record._saved_tensors_observer is not None
+        or cuda_graphs.CudaGraphManager.global_mempool is not None
+    ):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        cuda_graphs.delete_cuda_graphs()
+
+
+def _snapshot_torch_settings():
+    return {
+        "deterministic": (
+            torch.are_deterministic_algorithms_enabled(),
+            torch.is_deterministic_algorithms_warn_only_enabled(),
+        ),
+        "fill_uninitialized_memory": torch.utils.deterministic.fill_uninitialized_memory,
+        "cudnn": (
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.allow_tf32,
+        ),
+        "matmul": (
+            torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+        ),
+    }
+
+
+def _restore_torch_settings(settings):
+    mode, warn_only = settings["deterministic"]
+    torch.use_deterministic_algorithms(mode, warn_only=warn_only)
+    torch.utils.deterministic.fill_uninitialized_memory = settings["fill_uninitialized_memory"]
+    (
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+        torch.backends.cudnn.allow_tf32,
+    ) = settings["cudnn"]
+    (
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+    ) = settings["matmul"]
+
+
+def snapshot_process_state():
+    """Capture process-global settings a test may change; restoring puts back the values."""
+    state = {
+        # Set by every engine, cleared only by suspend(); breaks TestInferenceTopKRouter.
+        "inference_mode": (InferenceMode._is_active, InferenceMode._use_bounded_mxfp8_rows),
+        # The first init fixes the tracker type;
+        # TestPartialCudaGraph forces TE, TestMTPCudaGraphInference the no-op one.
+        "rng_tracker": (
+            tp_random._CUDA_RNG_STATE_TRACKER,
+            tp_random._CUDA_RNG_STATE_TRACKER_INITIALIZED,
+        ),
+        # test_thd_format (deterministic), TestGPTModelBatchInvariant (tf32),
+        # test_guard_agrees_with_config_resolution (fill_uninitialized_memory).
+        "torch": _snapshot_torch_settings(),
+    }
+    if te_distributed is not None:
+        # TestParallelAttention fills it with byte tensors;
+        # test_forward_backward_func_with_full_cuda_graph then expects generators.
+        state["te_rng_states"] = te_distributed._ALL_ACTIVE_RNG_STATES
+    return state
+
+
+def restore_process_state(state):
+    """Return every item captured by `snapshot_process_state` to its captured value."""
+    InferenceMode._is_active, InferenceMode._use_bounded_mxfp8_rows = state["inference_mode"]
+    tp_random._CUDA_RNG_STATE_TRACKER, tp_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = state[
+        "rng_tracker"
+    ]
+    _restore_torch_settings(state["torch"])
+    if "te_rng_states" in state:
+        te_distributed._ALL_ACTIVE_RNG_STATES = state["te_rng_states"]
+
+
+def reset_transient_process_state():
+    """Drop the lazily built caches no later test may inherit."""
+    reset_cuda_graph_global_state()
+    # Sized at the first num_layers seen; TestMTPLossLoggingHelper reads it back.
+    multi_token_prediction.MTPLossLoggingHelper.tracker.clear()
+    # Built from the first model (TestMTPCudaGraphExpertParallel resets it by hand).
+    inference_utils.moe_layer_cache = None
+    inference_utils._moe_metadata_sync_initialized = False
 
 
 def is_nccl_ep_available():
@@ -135,13 +243,15 @@ class Utils:
     @staticmethod
     def initialize_distributed():
         clear_nvte_env_vars()
+        if torch.cuda.is_available():
+            # Also when another test already created the default group without binding one.
+            torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
 
         if not torch.distributed.is_initialized() and Utils.rank >= 0:
             print(
                 f'Initializing torch.distributed with rank: {Utils.rank}, '
                 f'world_size: {Utils.world_size}'
             )
-            torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
             init_method = 'tcp://'
             master_ip = os.getenv('MASTER_ADDR', 'localhost')
             master_port = os.getenv('MASTER_PORT', '29500')

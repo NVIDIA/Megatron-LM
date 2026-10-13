@@ -10,6 +10,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.rl import rl_utils
 from megatron.rl.sequence_packing_utils import SequencePacker, create_packed_seq_params_for_bin
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -54,7 +55,7 @@ def _set_minimal_args():
     args.micro_batch_size = 1
     args.wandb_project = None
     args = validate_args(args)
-    set_global_variables(args, False)
+    set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
 
 
 @pytest.fixture

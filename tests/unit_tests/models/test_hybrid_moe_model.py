@@ -17,6 +17,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -90,6 +91,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "defer_embedding_wgrad_compute": False,
     "delay_wgrad_compute": False,
     "use_grouped_gemm_for_dense_mlp": False,
+    "wide_residual": None,
     "overlap_dispatch_backward_with_experts_wgrad": False,
     "deterministic_mode": False,
     "disable_bf16_reduced_precision_matmul": False,
@@ -103,10 +105,12 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_rope_interleaved": False,
     "dsa_indexer_rotate_activation": True,
     "dsa_indexer_scoring_relu": True,
+    "dsa_indexer_weights_proj_output_dtype": "bf16",
     "dsa_indexer_skip_topk_offset": 0,
     "dsa_indexer_topk": None,
     "dsa_indexer_topk_freq": 1,
     "dsa_indexer_use_sparse_loss": False,
+    "dsa_indexer_weights_proj_use_quantization": True,
     "dsa_kernel_backend": "none",
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
@@ -148,6 +152,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fused_residual_rmsnorm": False,
     "fused_single_qkv_rope": False,
     "gated_linear_unit": False,
+    "gdn_kernel_backend": "fla",
     "gdp_cutedsl_kernel": False,
     "gdp_num_chunk_states_to_recompute": 2,
     "gdp_num_householder": 3,
@@ -317,6 +322,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "recompute_method": None,
     "recompute_modules": ["core_attn"],
     "recompute_num_layers": None,
+    "residual_stream_recompute_num_layers": None,
     "rotary_interleaved": False,
     "sequence_parallel": True,
     "softmax_scale": None,
@@ -351,12 +357,15 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_mup": False,
     "use_ring_exchange_p2p": False,
     "use_te_activation_func": False,
-    "use_te_rng_tracker": False,
+    # RNGConfig now propagates the fixture's te_rng_tracker=True; the old
+    # args adapter missed this differently named field and left it False.
+    "use_te_rng_tracker": True,
     "variable_seq_lengths": False,
     "virtual_pipeline_model_parallel_size": None,
     "wgrad_deferral_limit": 0,
     "window_attn_skip_freq": None,
     "window_size": None,
+    "wide_residual": None,
     "fine_grained_activation_offloading": False,
     "min_offloaded_tensor_size": 1024 * 1024,
     "offload_modules": [],
@@ -385,6 +394,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "sequence_packing_scheduler": None,
     "moe_hybridep_pad_uneven_dispatch_inputs": False,
     "sequence_packing_scheduler": None,
+    "moe_hybridep_routing_map_mode": "indices",
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
@@ -576,7 +586,7 @@ class TestHybridMoEModel:
         args.vocab_size = 131072
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     def setup_method(self, method):

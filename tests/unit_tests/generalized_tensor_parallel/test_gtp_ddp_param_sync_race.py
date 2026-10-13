@@ -175,6 +175,8 @@ def _record_prefetches(ddp_model, targets):
 @contextlib.contextmanager
 def _gtp_env():
     """MPU at ``gtp_remat_size=GTP`` with padding off; restores global GTP state on exit."""
+    # Wait for all ranks to finish restoring the previous test's groups before teardown.
+    torch.distributed.barrier()
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=GTP
@@ -185,6 +187,10 @@ def _gtp_env():
         yield
     finally:
         gtp_module.GTP_CONFIG.pad_for_alignment = orig_pad
+        # The grouped-expert test can leave a prefetch running on a separate CUDA stream.
+        # The world barrier does not drain that stream; finish it before clearing groups/cache.
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
         ps.destroy_model_parallel()
         gtp_module.GTPShardedParam._chain_state.clear()
         gtp_module.get_global_GTP_cache().clear()

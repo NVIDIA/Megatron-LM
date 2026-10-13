@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 import weakref
 from pathlib import Path
@@ -44,6 +46,9 @@ class TempNamedDir(TemporaryDirectory):
         self._finalizer = weakref.finalize(
             self, self._cleanup, self.name, warn_message="Implicitly cleaning up {!r}".format(self)
         )
+        # Only rank zero owns removal, including implicit cleanup on garbage collection.
+        if Utils.rank != 0:
+            self._finalizer.detach()
         self.sync = sync
 
     def cleanup(self, override_sync: Optional[bool] = None) -> None:

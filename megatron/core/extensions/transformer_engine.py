@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import importlib
 import inspect
 import io
 import os
@@ -24,7 +25,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
     get_context_parallel_group,
@@ -85,6 +86,22 @@ except ImportError:
 
         te = MagicMock()
         HAVE_TE = False
+
+
+def _get_te_linear_attention() -> type[torch.nn.Module] | None:
+    """Return TE's GatedDeltaNetAttention (Gated DeltaNet) module, if available."""
+    if not HAVE_TE:
+        return None
+    try:
+        te_pytorch = importlib.import_module("transformer_engine.pytorch")
+        importlib.import_module("transformer_engine.pytorch.attention.linear_attention.gdn")
+        return te_pytorch.GatedDeltaNetAttention
+    except (AttributeError, ImportError):
+        return None
+
+
+_TE_LINEAR_ATTENTION = _get_te_linear_attention()
+HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
@@ -2146,6 +2163,69 @@ class TERowParallelLinear(TELinear):
             super().backward_dw()
 
 
+class TEGatedDeltaNetAttention(torch.nn.Module):
+    """Adapt Megatron GDN kernel inputs to Transformer Engine's GatedDeltaNetAttention."""
+
+    def __init__(
+        self, num_attention_heads: int, qk_head_dim: int, value_head_dim: int, layer_number: int
+    ) -> None:
+        super().__init__()
+        if not HAVE_TE_GDN:
+            raise ImportError("Transformer Engine GatedDeltaNetAttention (GDN) is not available.")
+        assert _TE_LINEAR_ATTENTION is not None
+        self.value_head_dim = value_head_dim
+        self.te_attention = _TE_LINEAR_ATTENTION(
+            num_attention_heads=num_attention_heads,
+            kv_channels=(qk_head_dim, value_head_dim),
+            qkv_format="bshd",
+            layer_number=layer_number,
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run TE GDN through the FLA-compatible Megatron kernel interface."""
+        del kwargs
+
+        batch, sequence = q.shape[:2]
+        qkv_format = "bshd"
+        if cu_seqlens is not None:
+            qkv_format = "thd"
+            q, k, v = (tensor.reshape(-1, *tensor.shape[2:]) for tensor in (q, k, v))
+            g, beta = (tensor.reshape(-1, tensor.shape[-1]) for tensor in (g, beta))
+
+        result = self.te_attention(
+            q,
+            k,
+            v,
+            qkv_format=qkv_format,
+            cu_seqlens=cu_seqlens,
+            g=g.float(),
+            beta=beta.float(),
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if output_final_state:
+            output, final_state = result
+        else:
+            output = result
+            final_state = None
+
+        output = output.reshape(batch, sequence, -1, self.value_head_dim)
+        return output, final_state
+
+
 # Some patched TE builds expose a `softcap` kwarg on DotProductAttention without bumping the TE
 # version number, so we probe the signature once instead of gating on is_te_min_version().
 _te_dpa_supports_softcap = (
@@ -2364,6 +2444,46 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+    @contextmanager
+    def _temporary_runtime_context_parallel_group(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ):
+        """Bind TE to one microbatch's CP group and restore it on every exit path."""
+        if packed_seq_params is None or packed_seq_params.local_cp_size is None:
+            yield
+            return
+
+        runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        assert runtime_cp_group is not None
+        original_cp_group = self.cp_group
+        original_cp_global_ranks = self.cp_global_ranks
+
+        try:
+            if runtime_cp_group.size() == 1:
+                # Dynamic CP metadata retains the singleton group, while TE
+                # must see CP disabled for this microbatch.
+                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            else:
+                if TEDotProductAttention.cp_stream is None:
+                    TEDotProductAttention.cp_stream = torch.cuda.Stream()
+                super().set_context_parallel_group(
+                    runtime_cp_group,
+                    torch.distributed.get_process_group_ranks(runtime_cp_group),
+                    TEDotProductAttention.cp_stream,
+                    self.cp_comm_type,
+                )
+            yield
+        finally:
+            if original_cp_group is None or original_cp_group.size() == 1:
+                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            else:
+                super().set_context_parallel_group(
+                    original_cp_group,
+                    original_cp_global_ranks,
+                    TEDotProductAttention.cp_stream,
+                    self.cp_comm_type,
+                )
+
     def forward(
         self,
         query: Tensor,
@@ -2377,36 +2497,33 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
+        with self._temporary_runtime_context_parallel_group(packed_seq_params):
+            return self._forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                num_splits=num_splits,
+                bf16_backward=bf16_backward,
+            )
+
+    def _forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Run TE attention after the runtime CP binding has been installed."""
         if packed_seq_params is not None:
-            # If Dynamic CP group is provided, update TE DPA CP group
-            if packed_seq_params.cp_group is not None:
-                # Converse of the assert below: a CP-off (local_cp_size == 1)
-                # sub-sample must not carry a CP group, otherwise it would be
-                # routed through the CP attention path. Producers must only
-                # bind cp_group when local_cp_size > 1.
-                assert (
-                    packed_seq_params.local_cp_size is None or packed_seq_params.local_cp_size > 1
-                ), "cp_group must not be set when local_cp_size == 1 (CP-off convention)"
-                # Hybrid/dynamic CP can enable CP at runtime on a model built
-                # with context_parallel_size == 1, where the constructor never
-                # allocated the auxiliary CP stream. Create it lazily; TE's
-                # AttnFuncWithCPAndKVP2P dereferences it unconditionally.
-                if TEDotProductAttention.cp_stream is None:
-                    TEDotProductAttention.cp_stream = torch.cuda.Stream()
-                self.cp_group = packed_seq_params.cp_group
-                super().set_context_parallel_group(
-                    self.cp_group,
-                    torch.distributed.get_process_group_ranks(self.cp_group),
-                    TEDotProductAttention.cp_stream,
-                    self.cp_comm_type,
-                )
-            # If cp_group is None but local_cp_size is provided,
-            # Indicates to turn off CP dynamically
-            elif packed_seq_params.local_cp_size is not None:
-                assert (
-                    packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 
@@ -3907,10 +4024,20 @@ if HAVE_TE and is_te_min_version("2.7.0.dev"):
         fused_topk_with_score_function,
     )
 
+    try:
+        _fused_topk_sig = inspect.signature(fused_topk_with_score_function)
+        fused_topk_with_score_function_supports_topk_indices = (
+            "topk_indices" in _fused_topk_sig.parameters
+        )
+        del _fused_topk_sig
+    except (TypeError, ValueError):
+        fused_topk_with_score_function_supports_topk_indices = False
+
 else:
     fused_topk_with_score_function = None
     fused_compute_score_for_moe_aux_loss = None
     fused_moe_aux_loss = None
+    fused_topk_with_score_function_supports_topk_indices = False
 
 
 def set_save_original_input(module):

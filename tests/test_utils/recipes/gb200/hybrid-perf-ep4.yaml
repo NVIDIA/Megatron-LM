@@ -49,5 +49,5 @@ products:
   - test_case: [hybrid_nanov3_3b_perf_gb200_4gpu]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_gb200]

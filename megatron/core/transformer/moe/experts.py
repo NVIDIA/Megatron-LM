@@ -554,12 +554,9 @@ class TEGroupedMLP(MegatronModule):
         else:
             return False
 
-        # Check TE CuTe DSL fused kernel conditions (must match TE's
-        # fuse_grouped_mlp_ops matching logic).
-        import os
-
-        if use_glu_fusion and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-            return False
+        # TE can execute GroupedLinear -> activation -> GroupedLinear without a fused kernel.
+        # Leave CuTeDSL enablement and layout checks to TE's fusion matcher so disabling
+        # NVTE_CUTEDSL_FUSED_GROUPED_MLP does not disable the basic op-fuser path.
         return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
@@ -1126,6 +1123,15 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
+        # Only set up the checkpoint when a backward pass will actually follow.
+        # CheckpointWithoutOutput discards the activation and relies on a grad hook to
+        # recompute it; under torch.no_grad() the output does not require grad, so the
+        # hook is never registered and the discard is left without its counterpart.
+        # self.training is not sufficient here: when "moe" is also in recompute_modules,
+        # CheckpointFunction invokes this forward once under no_grad and again under
+        # enable_grad during backward, and self.training is True in both cases.
+        setup_activation_checkpoint = self.activation_recompute and torch.is_grad_enabled()
+
         # With both unfused groups enabled, offload fc1 + activation as ONE group named
         # "fused_group_mlp", like the fused path: the saved-tensor hooks catch everything saved
         # inside (fc1 input, fc1 output), so it goes to CPU in one D2H burst after fc2 and comes
@@ -1155,7 +1161,7 @@ class TEGroupedMLP(MegatronModule):
 
             moe_act_manager = off_interface(offload_moe_act, fc1_output, "moe_act")
 
-            if self.activation_recompute:
+            if setup_activation_checkpoint:
                 self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
                 with moe_act_manager as fc1_output:
                     bias_act_output = self.activation_checkpoint.checkpoint(
@@ -1168,7 +1174,8 @@ class TEGroupedMLP(MegatronModule):
         # recompute its saved input is discarded (storage resized to 0) right after fc2, and an
         # offload group must not hold such a tensor. The commit still happens after fc2 (below).
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
-        if self.activation_recompute:
+
+        if setup_activation_checkpoint:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed

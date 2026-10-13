@@ -23,6 +23,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -159,6 +160,114 @@ class TestDynamicContext:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_prefill_batch_never_advertises_max_seqlen_q_of_one(self):
+        """A batch containing prefill must not publish max_seqlen_q == 1.
+
+        FlashAttention-2 reads max_seqlen_q == 1 as one query token per sequence and, under GQA,
+        reshapes q assuming total_q == num_seqs, which a padded prefill batch violates.
+        """
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=256,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            max_tokens=64,
+            max_requests=16,
+        )
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=torch.arange(0, 1, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=9),
+            )
+        )
+        assert ctx.num_prefill_requests == 1
+        ctx.initialize_attention_state()
+        _, max_seqlen_q = ctx.cu_query_lengths()
+        assert max_seqlen_q >= 2
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("flash_attention_version", [2, 4])
+    def test_one_token_prefill_metadata_is_correct_under_flash_attention(
+        self, flash_attention_version
+    ):
+        """Flash attention on the metadata published for padded one-token prefills is correct.
+
+        Eager padding rounds tokens and requests independently, so total_q != num_seqs here,
+        which FlashAttention-2's GQA single-query path cannot handle.
+        """
+        if flash_attention_version == 2:
+            varlen = pytest.importorskip("flash_attn").flash_attn_varlen_func
+        else:
+            varlen = pytest.importorskip("flash_attn.cute").flash_attn_varlen_func
+        block_size = 256  # FA2 paged KV requires a multiple of 256.
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=1024,
+            buffer_size_gb=0.05,
+            block_size_tokens=block_size,
+            max_tokens=512,
+        )
+        for request_id in range(3):
+            ctx.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.tensor([request_id + 1], device='cpu'),
+                    sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+                )
+            )
+        ctx.initialize_attention_state()
+        ctx.transfer_bookkeeping_to_gpu()
+
+        cu_q, max_seqlen_q = ctx.cu_query_lengths()
+        cu_k, kv_lengths, max_seqlen_k = ctx.cu_kv_lengths()
+        block_table = ctx.active_attn_metadata["mha_metadata"].state_data["block_table"]
+        total_q = ctx.padded_active_token_count
+        assert total_q != cu_q.numel() - 1, "test needs total_q != num_seqs"
+
+        num_heads, num_kv_heads, head_dim = 8, 2, 128
+        num_blocks = int(block_table.max().item()) + 1
+        q = torch.randn(total_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(
+            num_blocks, block_size, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+        if flash_attention_version == 2:
+            out = varlen(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=True,
+                block_table=block_table,
+            )
+        else:
+            out, _ = varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_q,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                seqused_k=kv_lengths,
+                page_table=block_table,
+                causal=True,
+            )
+
+        expected = reference_paged_attention(q, k, v, cu_q, kv_lengths, block_table)
+        real = slice(0, cu_q[-1].item())
+        torch.testing.assert_close(out[real].float(), expected[real], atol=2e-2, rtol=2e-2)
 
     @pytest.mark.internal
     @rounder_override(64)
