@@ -3997,6 +3997,15 @@ class MLATransformerConfig(TransformerConfig):
     Requires apply_rope_fusion=True, q_lora_rank set, TP=1, SBHD, MXFP8 DPA, and zero
     attention dropout."""
 
+    use_fused_mla_kv_rope_quant: bool = False
+    """Split the key/value up-projection output, apply RoPE to the key and quantize key and value
+    for MXFP8 attention in one Transformer Engine kernel (SM100 only), and quantize the RoPE'd
+    query before attention, instead of writing BF16 key and value that attention then
+    quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA, zero attention
+    dropout and qk_head_dim=128, qk_pos_emb_head_dim=64, v_head_dim=128; layers with TP or CP
+    above 1, THD inputs, FP16 inputs, recomputed up-projections or checkpointed core attention,
+    NVTE_FP8_DPA_BWD=0 and evaluation use the unfused path."""
+
     q_lora_rank: int = 512
     """Rank of Query tensor's low rank representation."""
 
@@ -4088,6 +4097,19 @@ class MLATransformerConfig(TransformerConfig):
                 "fp8_dot_product_attention=True so TE interprets the pre-quantized Q/K/V "
                 "scale layout correctly, plus attention_dropout=0.0 because MXFP8 attention "
                 "backward does not support dropout."
+            )
+
+        if self.use_fused_mla_kv_rope_quant and (
+            self.fp8 is None
+            or self.fp8_recipe != Fp8Recipe.mxfp8
+            or not self.fp8_dot_product_attention
+            or self.attention_dropout != 0.0
+        ):
+            raise ValueError(
+                "use_fused_mla_kv_rope_quant requires FP8 with fp8_recipe='mxfp8' and "
+                "fp8_dot_product_attention=True, because it feeds MXFP8 Q/K/V to attention, "
+                "plus attention_dropout=0.0 because MXFP8 attention backward does not support "
+                "dropout."
             )
 
         if self.attention_output_gate:
