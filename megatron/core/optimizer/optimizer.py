@@ -1727,7 +1727,7 @@ class ChainedOptimizer(MegatronOptimizer):
     @override
     @torch.no_grad()
     def prepare_model_params_for_param_sync(self) -> None:
-        """Drain pending gathers, then stage each shared model chunk once."""
+        """Stage params once per DDP model chunk before explicit param sync."""
         from .distrib_optimizer import DistributedOptimizer
 
         model_chunks = []
@@ -1739,8 +1739,9 @@ class ChainedOptimizer(MegatronOptimizer):
                     continue
                 dist_optimizers.append(optimizer)
                 for model_chunk in optimizer.model_chunks:
-                    if id(model_chunk) not in model_chunk_ids:
-                        model_chunk_ids.add(id(model_chunk))
+                    model_chunk_id = id(model_chunk)
+                    if model_chunk_id not in model_chunk_ids:
+                        model_chunk_ids.add(model_chunk_id)
                         model_chunks.append(model_chunk)
             else:
                 optimizer.prepare_model_params_for_param_sync()

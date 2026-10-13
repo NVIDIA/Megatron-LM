@@ -1279,7 +1279,6 @@ class _ParamAndGradBuffer:
             # nvfp4_packed_numel_unpadded is already set by _compute_nvfp4_packed_layout.
 
         assert self.numel_unpadded <= self.numel
-
         if self.has_nvfp4_params:
             assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
         if self.ddp_config.use_distributed_optimizer:

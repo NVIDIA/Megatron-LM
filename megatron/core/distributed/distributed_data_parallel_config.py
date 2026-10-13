@@ -298,11 +298,10 @@ class DistributedDataParallelConfig:
         support explicit force-sync even when the optimizer normally gathers
         high-precision parameters synchronously through its own fallback.
         """
-        return (
-            self.use_distributed_optimizer
-            or self.overlap_param_gather
-            or self.reuse_grad_buf_for_mxfp8_param_ag
-        )
+        if self.use_distributed_optimizer:
+            return True
+
+        return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
 
     def __post_init__(self):
         import os
