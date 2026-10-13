@@ -3373,7 +3373,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # DistributedOptimizer config that owns the buffers and hooks; non-overlapped
         # optimizers stage during optimizer.step().
         optimizer_instances = getattr(optimizer, 'chained_optimizers', [optimizer])
-        reused_buffer_overlap_optimizers = [
+        mxfp8_overlap_optimizers = [
             optim_instance
             for optim_instance in optimizer_instances
             if (
@@ -3382,12 +3382,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 and optim_instance.ddp_config.overlap_param_gather
             )
         ]
-        if reused_buffer_overlap_optimizers:
+        if mxfp8_overlap_optimizers:
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
-                for optim_instance in reused_buffer_overlap_optimizers:
+                for optim_instance in mxfp8_overlap_optimizers:
                     optim_instance._copy_main_params_to_param_buffer()
 
         if getattr(config, "sequence_packing_scheduler", None) is not None:
