@@ -117,15 +117,15 @@ def scatter(
 
     For each participating parameter (a key of `tensor_to_owner`):
 
-    - If this rank owns it, `source[i]` is flattened (a view on contiguous tensors) and each rank's
+    - If this rank owns it, `source[i]` is viewed flat and each rank's
       shard is sliced out and sent to it directly. The owner keeps its own result chunk.
     - Otherwise, if this rank holds elements of the parameter, the chunk is received directly
       into `destination.get_tensor_view(i)`. The owner's local destination shard is unchanged.
 
     Args:
-        source: Full result tensor per owned parameter, in any shape with the matching number of
-            elements; flattened for slicing. Entries for parameters this rank does not own
-            are never read.
+        source: Contiguous full result tensor per owned parameter, with the destination's dtype
+            and device and the matching number of elements in any shape. Entries for parameters
+            this rank does not own are never read.
         destination: Sharded result buffer. P2P receives write only remote-owned participating
             tensor shards; other tensors and padding are unchanged. This may
             be a separate scratch DBuffer for updates the caller will apply later.
@@ -150,7 +150,16 @@ def scatter(
         # Don't send local chunks.
         if owner != this_rank:
             continue
-        flat = source[i].flatten().contiguous()
+        tensor = source[i]
+        if (
+            not tensor.is_contiguous()
+            or tensor.dtype != destination.dtype
+            or tensor.device != destination.device
+        ):
+            raise ValueError(
+                f"source[{i}] must be contiguous and match the destination's dtype and device."
+            )
+        flat = tensor.view(layout.get_tensor_range(i).numel)
         for dest in rank_ranges:
             if dest == this_rank:
                 continue
