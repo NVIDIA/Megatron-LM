@@ -79,7 +79,7 @@ def _train(tools, cfg, src, parallel, *, steps=STEPS, seq_len=S, load=True, dete
         assert torch.equal(w, w0[n]), f"indexer weight {n} changed during training"
     runtime.zero_grad(handle)
     del handle, runtime
-    tools.reset_parallel_state(ps)
+    tools.reset_parallel_state(ps, keep_groups=optimizer == "fsdp2")
     stats = SimpleNamespace(step_ms=1e3 * sum(step_times[2:]) / max(len(step_times) - 2, 1), peak_gib=peak_gib)
     return losses, norms, stats
 

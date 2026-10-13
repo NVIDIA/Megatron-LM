@@ -295,8 +295,10 @@ _PS_GROUP_ATTRS = ("tp_group", "ep_group", "etp_group", "cp_group", "pp_group", 
                    "tp_ep_group", "ep_dp_group")
 
 
-def _reset_parallel_state(ps):
-    """dist_opt initialises mcore's global parallel state per topology; tear it (and lite's groups) down between cases."""
+def _reset_parallel_state(ps, *, keep_groups=False):
+    """dist_opt initialises mcore's global parallel state per topology; tear it (and lite's groups) down between cases.
+
+    FSDP2 caches a DeviceMesh per rank set and keeps using its process group, so fsdp2 cases keep their groups alive."""
     import gc
 
     import torch.distributed as dist
@@ -308,7 +310,7 @@ def _reset_parallel_state(ps):
     if mpu.is_initialized():
         mpu.destroy_model_parallel()
     gc.collect()
-    for attr in _PS_GROUP_ATTRS:
+    for attr in () if keep_groups else _PS_GROUP_ATTRS:
         group = getattr(ps, attr, None)
         if group is not None:
             try:

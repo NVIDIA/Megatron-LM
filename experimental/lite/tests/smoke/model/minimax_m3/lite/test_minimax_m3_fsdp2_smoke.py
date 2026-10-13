@@ -103,4 +103,4 @@ def test_fsdp2_step_matches_dist_opt_loss(magi_cfg, magi_source, dist, runtime_t
     assert rel < LOSS_REL, (name, loss0, ref_loss)
     ps = handle._parallel_state
     del handle
-    runtime_tools.reset_parallel_state(ps)
+    runtime_tools.reset_parallel_state(ps, keep_groups=True)
