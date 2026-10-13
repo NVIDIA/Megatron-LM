@@ -4740,7 +4740,7 @@ def train(
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
-            update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
+            update_num_microbatches(consumed_samples=train_state.consumed_train_samples, verbose=True)
 
             args.no_load_optim = no_load_optim
 
