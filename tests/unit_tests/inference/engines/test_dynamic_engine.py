@@ -54,6 +54,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
+    OffloadedRequestPayload,
     RequestPayloadStageResult,
     RequestPromptPreparationResult,
     Status,
@@ -2580,13 +2581,18 @@ async def test_slow_stager_does_not_block_the_engine_loop(caplog):
         await engine._drain_staging_tasks()
     assert drain_messages() == []
 
-    engine._send_requests_to_coordinator(
-        [
-            _reply_request("chatcmpl-a", Status.COMPLETED, [-0.5, -0.25]),
-            _reply_request("chatcmpl-failed", Status.FAILED, None),
-            _reply_request("chatcmpl-b", Status.COMPLETED, [-0.5, -0.25]),
-        ]
-    )
+    with mock.patch.object(
+        OffloadedRequestPayload, "from_request", wraps=OffloadedRequestPayload.from_request
+    ) as from_request:
+        engine._send_requests_to_coordinator(
+            [
+                _reply_request("chatcmpl-a", Status.COMPLETED, [-0.5, -0.25]),
+                _reply_request("chatcmpl-failed", Status.FAILED, None),
+                _reply_request("chatcmpl-b", Status.COMPLETED, [-0.5, -0.25]),
+            ]
+        )
+        # Payloads are copied to host during bookkeeping, before any staging task runs.
+        assert from_request.call_count == 2
     assert await asyncio.to_thread(stager.started.wait, 10)
 
     # A write is still blocked, yet the engine already moved on.

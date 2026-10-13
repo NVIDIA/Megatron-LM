@@ -1723,8 +1723,11 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.payload_stager is not None and not getattr(
                 request.sampling_params, "streaming", False
             ):
+                # Copy the payload to host here, during bookkeeping, so the staging task
+                # (which keeps the request alive until its write returns) holds no device memory.
+                payload = OffloadedRequestPayload.from_request(request)
                 task = asyncio.get_running_loop().create_task(
-                    self._stage_and_reply(self.payload_stager, request, finished_metadata)
+                    self._stage_and_reply(self.payload_stager, request, payload, finished_metadata)
                 )
                 self._staging_tasks.add(task)
                 task.add_done_callback(self._staging_tasks.discard)
@@ -1738,6 +1741,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self,
         stager: RequestPayloadStager,
         request: DynamicInferenceRequest,
+        payload: OffloadedRequestPayload,
         finished_metadata: FinishedRequestRecord,
     ) -> None:
         """Stage one completed payload on a worker thread, then send its reply.
@@ -1749,8 +1753,6 @@ class DynamicInferenceEngine(AbstractEngine):
         only thread that uses the ZMQ socket. A failed write keeps the payload on the
         reply.
         """
-        # Built on the loop thread: it reads (and moves to CPU) engine-owned request state.
-        payload = OffloadedRequestPayload.from_request(request)
         try:
             stage_result = await asyncio.to_thread(
                 stager.stage,
