@@ -1,17 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Parity tests for DSA-over-GQA context parallelism.
+"""Unit tests for the DSA-over-GQA context-parallel helpers.
 
-Context parallelism is exercised here without a process group. After the all-gather a rank's
-state is exactly "full K and V, this rank's slice of Q, this rank's global query positions", and
-that state can be constructed directly. Emulating it single-process tests the part that is
-genuinely new -- threading global positions through the tiling loops -- and it runs on any GPU
+Covers the pieces that need no process group: the scalar that carries a tile's global position,
+the tiling validation, and the gather helper's guards and zigzag reorder. These run on any GPU
 count, which matters because the real cp=2 configuration needs ranks this cluster allocates in
 groups of four alongside TP.
 
-What this does *not* cover is the collective itself: whether the gather's backward reduce-scatters
-rather than splits, and whether the learned-K reduction spans the group. Those need a live process
-group and live in test_dsa_gqa_context_parallel_dist.py, which runs under torch.distributed.
+End-to-end parity -- output, gradients, and the collectives themselves -- lives in
+test_dsa_gqa_context_parallel_dist.py, which runs under torch.distributed against a live group.
+Emulating a post-gather rank single-process is not possible for the learned-K router: its keys
+come from hidden_states, so a local hidden slice yields an index covering only this rank.
 """
 
 from types import SimpleNamespace
@@ -21,27 +20,19 @@ import torch
 
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     _gather_kv_for_context_parallel,
-    _simplified_indexer_norm_spec,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_zigzag_allgather_cp_key_reorder,
     build_zigzag_cp_local_positions,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
-    _simplified_topk_index_tile,
     _tile_global_start,
     _validate_query_positions,
-    dsa_min_memory_gqa,
-)
-from tests.unit_tests.transformer.test_attention_variant_dsa_gqa import (
-    _simplified_test_indexer,
 )
 
 SEQLEN, BATCH, HIDDEN = 16, 2, 12
-HEADS, HEAD_DIM, TOPK = 2, 4, 3
+HEADS, HEAD_DIM = 2, 4
 CP_SIZE = 2
-# chunk_len = SEQLEN // (2 * CP_SIZE) = 4, so a tile of 4 never straddles the two zigzag chunks.
-Q_CHUNK = 4
 
 
 def _inputs(seed=0, requires_grad=False):
@@ -51,41 +42,6 @@ def _inputs(seed=0, requires_grad=False):
     v = torch.randn(SEQLEN, BATCH, 1, HEAD_DIM, requires_grad=requires_grad)
     h = torch.randn(SEQLEN, BATCH, HIDDEN)
     return q, k, v, h
-
-
-def _input_norm():
-    """The indexer input-norm spec the min-memory backward path expects."""
-    linear_qkv = SimpleNamespace(
-        layer_norm_weight=torch.randn(HIDDEN),
-        layer_norm_bias=None,
-        eps=1.0e-5,
-        skip_norm_and_all_gather=False,
-    )
-    norm_config = SimpleNamespace(
-        normalization="RMSNorm", layernorm_epsilon=1.0e-5, layernorm_zero_centered_gamma=False
-    )
-    return _simplified_indexer_norm_spec(linear_qkv, norm_config)
-
-
-def _run(
-    query, key, value, hidden, indexer, query_positions=None, input_norm=None, q_chunk=Q_CHUNK
-):
-    """Invoke the min-memory sparse path the way _forward_min_memory does."""
-    return dsa_min_memory_gqa(
-        query,
-        key,
-        value,
-        hidden.detach(),
-        indexer,
-        HEAD_DIM**-0.5,
-        0.1,
-        False,
-        query_chunk_size=q_chunk,
-        key_chunk_size=SEQLEN,
-        use_triton=False,
-        simplified_input_norm=input_norm,
-        query_positions=query_positions,
-    )
 
 
 class TestPositionHelpers:
@@ -139,64 +95,3 @@ class TestGatherHelper:
         )
         reorder = build_zigzag_allgather_cp_key_reorder(SEQLEN // CP_SIZE, CP_SIZE, device)
         assert gathered_positions[reorder].tolist() == list(range(SEQLEN))
-
-
-class TestForwardParity:
-    """cp=2 emulated against a full-sequence cp=1 reference."""
-
-    def test_topk_selection_agrees_with_cp1(self):
-        """Top-k is discrete, so exact agreement is the sharpest signal of correct masking."""
-        q, k, v, h = _inputs()
-        indexer = _simplified_test_indexer(HIDDEN, HEAD_DIM, TOPK, learned_k=False)
-        w = indexer.linear_q.weight
-
-        for rank in range(CP_SIZE):
-            pos = build_zigzag_cp_local_positions(SEQLEN, CP_SIZE, rank, q.device)
-            for q_lo in range(0, pos.numel(), Q_CHUNK):
-                q_hi = q_lo + Q_CHUNK
-                g_start = int(pos[q_lo].item())
-                _, local_idx, _ = _simplified_topk_index_tile(
-                    h[pos],
-                    k,
-                    q_lo,
-                    q_hi,
-                    w,
-                    TOPK,
-                    HEAD_DIM,
-                    0,
-                    None,
-                    False,
-                    False,
-                    HEAD_DIM**-0.5,
-                    SEQLEN,
-                    q_pos_start=g_start,
-                )
-                _, ref_idx, _ = _simplified_topk_index_tile(
-                    h,
-                    k,
-                    g_start,
-                    g_start + Q_CHUNK,
-                    w,
-                    TOPK,
-                    HEAD_DIM,
-                    0,
-                    None,
-                    False,
-                    False,
-                    HEAD_DIM**-0.5,
-                    SEQLEN,
-                )
-                assert torch.equal(
-                    local_idx, ref_idx
-                ), f"rank {rank} tile {q_lo}:{q_hi} (global {g_start}) selected different keys"
-
-    def test_output_matches_cp1(self):
-        q, k, v, h = _inputs()
-        indexer = _simplified_test_indexer(HIDDEN, HEAD_DIM, TOPK, learned_k=False)
-        ref_out, ref_loss = _run(q, k, v, h, indexer)
-
-        for rank in range(CP_SIZE):
-            pos = build_zigzag_cp_local_positions(SEQLEN, CP_SIZE, rank, q.device)
-            # Post-gather state: K and V full length, Q and hidden_states local.
-            out, _ = _run(q[pos], k, v, h[pos], indexer, query_positions=pos)
-            torch.testing.assert_close(out, ref_out[pos], atol=1e-5, rtol=1e-5)

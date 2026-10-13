@@ -103,11 +103,7 @@ def _indexer(device, cp_group):
         index_rotary_dim=0,
         rotary_pos_emb=None,
         pg_collection=SimpleNamespace(tp=_UnitGroup(), cp=cp_group),
-        config=SimpleNamespace(
-            dsa_indexer_mode="simplified",
-            dsa_simplified_use_learned_k=True,
-            rotary_interleaved=False,
-        ),
+        config=SimpleNamespace(dsa_indexer_mode="simplified", rotary_interleaved=False),
         linear_q=linear_q,
         linear_k=linear_k,
     )

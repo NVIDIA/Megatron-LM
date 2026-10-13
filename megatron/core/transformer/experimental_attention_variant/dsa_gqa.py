@@ -1011,18 +1011,6 @@ class DSGQACoreAttention(MegatronModule):
                 "DSA over GQA context parallelism currently covers the sparse path only; "
                 "dsa_fwd_use_dense_attn and the dense indexer loss are not yet position-aware."
             )
-        # The learned indexer K is projected per rank and all-gathered inside the min-memory
-        # path, which requires the full-sequence cache; without it K would be projected blockwise
-        # from the local hidden_states and cover only this rank's tokens.
-        if (
-            cp_size > 1
-            and getattr(self.config, "dsa_simplified_use_learned_k", False)
-            and not _dsa_caches_indexer_k(self.config)
-        ):
-            raise NotImplementedError(
-                "DSA over GQA context parallelism with --dsa-simplified-use-learned-k requires "
-                "--dsa-kernel-cache-indexer-k."
-            )
         dsa_key, dsa_value, query_positions = _gather_kv_for_context_parallel(
             key,
             value,
