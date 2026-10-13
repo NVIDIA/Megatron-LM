@@ -114,6 +114,13 @@ def test_factory_clears_initializers_after_all_master_weights(monkeypatch, path)
     optimizer_module._clear_high_precision_initializers(chunks + chunks)
 
 
+def test_plain_module_buffers_method_is_not_ddp_layout():
+    from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+    optimizer = LayerWiseDistributedOptimizer.__new__(LayerWiseDistributedOptimizer)
+    assert optimizer._build_param_sort_keys([torch.nn.Linear(4, 4)]) is None
+
+
 def test_failed_construction_preserves_initializers(monkeypatch):
     """Do not sweep initializers if optimizer construction raises."""
     model = _model()

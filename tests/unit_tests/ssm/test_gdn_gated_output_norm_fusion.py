@@ -38,6 +38,7 @@ def _config(**overrides):
         gradient_accumulation_fusion=False,
         experimental_attention_variant="gdn",
         linear_attention_freq=[1],
+        linear_cp_mode="headwise",
         transformer_impl="transformer_engine",
     )
     kwargs.update(overrides)
@@ -97,6 +98,7 @@ def _model(pre_fusion, recompute=False, **overrides):
     groups = ProcessGroupCollection(
         tp=parallel_state.get_tensor_model_parallel_group(),
         cp=parallel_state.get_context_parallel_group(),
+        tp_cp=parallel_state.get_tensor_and_context_parallel_group(),
     )
     model = spec.module(config, submodules=spec.submodules, layer_number=1, pg_collection=groups)
     return model.cuda().to(config.params_dtype)

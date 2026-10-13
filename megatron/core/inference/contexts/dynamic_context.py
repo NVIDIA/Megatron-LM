@@ -715,6 +715,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         # Initialize context state.
         self.params_dtype = model_config.params_dtype
+        self.hidden_size = model_config.hidden_size
+        self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.max_sequence_length = inference_config.max_sequence_length
 
         # Leave room beyond max_sequence_length for a scheduled verification step and

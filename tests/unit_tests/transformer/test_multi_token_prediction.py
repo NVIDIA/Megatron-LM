@@ -225,7 +225,7 @@ class TestMultiTokenPredictionLayer:
         monkeypatch.setattr(
             mtp_module.parallel_state, "get_data_parallel_group", unexpected_global_read
         )
-        monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", capture_metrics)
+        monkeypatch.setattr(MTPLossLoggingHelper, "save_loss_to_tracker", capture_metrics)
 
         config = TransformerConfig(
             mtp_num_layers=1,

@@ -557,6 +557,19 @@ class TEGroupedMLP(MegatronModule):
             if not hasattr(te_ops, "ScaledSReLU"):
                 return _unsupported("weighted squared_relu needs ScaledSReLU")
 
+        if use_glu_fusion and getattr(self, "activation_recompute", False):
+            if self.config.activation_func is situlu:
+                activation_op = te_ops.ScaledSiTUGLU
+            elif (
+                self.config.activation_func is quick_gelu
+                or self.config.activation_func_clamp_value is not None
+            ):
+                activation_op = te_ops.ScaledClampedQGeGLU
+            else:
+                activation_op = te_ops.ScaledSwiGLU
+            if "activation_recompute_in_mlp" not in inspect.signature(activation_op).parameters:
+                return _unsupported("TE scaled GLU op does not support activation recompute")
+
         # TE can execute GroupedLinear -> activation -> GroupedLinear without a fused kernel.
         # Leave CuTeDSL enablement and layout checks to TE's fusion matcher so disabling
         # NVTE_CUTEDSL_FUSED_GROUPED_MLP does not disable the basic op-fuser path.
@@ -657,10 +670,17 @@ class TEGroupedMLP(MegatronModule):
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         activation_recompute_in_mlp = bool(getattr(self, "activation_recompute", False))
         if self.config.activation_func is situlu and self.config.gated_linear_unit:
+            situ_kwargs = {}
+            if (
+                "activation_recompute_in_mlp"
+                in inspect.signature(te.pytorch.ops.ScaledSiTUGLU).parameters
+            ):
+                situ_kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
             op = te.pytorch.ops.ScaledSiTUGLU(
                 glu_interleave_size=glu_interleave,
                 beta1=self.config.situ_glu_beta1,
                 beta2=self.config.situ_glu_beta2,
+                **situ_kwargs,
             )
         elif self.config.activation_func == F.silu and self.config.gated_linear_unit:
             clamp_value = self.config.activation_func_clamp_value

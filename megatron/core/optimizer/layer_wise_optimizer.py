@@ -1044,9 +1044,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             return None
         identity: Dict[torch.nn.Parameter, tuple] = {}
         for chunk_idx, chunk in enumerate(model_chunks):
-            buffers = list(getattr(chunk, 'buffers', [])) + list(
-                getattr(chunk, 'expert_parallel_buffers', [])
-            )
+            # A plain nn.Module exposes buffers() as a method, not DDP buffer metadata.
+            # Leave it on the documented no-layout fallback instead of iterating that method.
+            chunk_buffers = getattr(chunk, 'buffers', [])
+            if callable(chunk_buffers):
+                chunk_buffers = []
+            buffers = list(chunk_buffers) + list(getattr(chunk, 'expert_parallel_buffers', []))
             for buffer_idx, buffer in enumerate(buffers):
                 param_index_map = getattr(buffer, 'param_index_map', None)
                 if param_index_map is None:

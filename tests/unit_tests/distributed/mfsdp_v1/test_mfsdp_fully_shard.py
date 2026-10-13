@@ -82,7 +82,7 @@ def test_all_gather_pipeline_prefetch_size():
     )
 
     actual = pipeline._extend_by_prefetch_size(
-        [0], PrefetchOrder.FORWARD_PASS_ORDER, suggested_prefetch_size=10, double_buffer_units=set()
+        [0], PrefetchOrder.FORWARD_PASS_ORDER, suggested_prefetch_size=10, bwd=False
     )
 
     assert actual == [0, 1, 2]
@@ -134,8 +134,8 @@ def test_hfsdp_pipeline_preserves_inner_prefetch_size_policy():
     }
     calls = []
 
-    def extend_by_size(bucket_ids, order, suggested_size, double_buffer_units):
-        calls.append(("inner", bucket_ids, order, suggested_size, double_buffer_units))
+    def extend_by_size(bucket_ids, order, suggested_size, bwd):
+        calls.append(("inner", bucket_ids, order, suggested_size, bwd))
         return [0, 1]
 
     def extend_by_units(bucket_ids, order, num_units):
@@ -153,7 +153,7 @@ def test_hfsdp_pipeline_preserves_inner_prefetch_size_policy():
     )
 
     assert calls == [
-        ("inner", [0], PrefetchOrder.FORWARD_PASS_ORDER, 123, set()),
+        ("inner", [0], PrefetchOrder.FORWARD_PASS_ORDER, 123, False),
         ("outer", [0, 1], PrefetchOrder.FORWARD_PASS_ORDER, 1),
         ("launch_outer", [0, 1, 2], False),
     ]

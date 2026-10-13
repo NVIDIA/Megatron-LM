@@ -928,11 +928,11 @@ class TestStandaloneEmbeddingLossWithMHC:
         assert recv_1 == [(32, 2, H * N)]
         assert send_0 == recv_1
 
-    def test_mhc_shapes_last_stage_output_is_1stream(self):
+    def test_mhc_communication_shape_stays_expanded_on_last_physical_rank(self):
         """
-        Last stage (post_process) does output_contract: [s,b,n*C] → [s,b,C].
-        The send shape from last rank should be C (but get_tensor_shapes returns C
-        because last rank doesn't send forward).
+        Communication shapes retain all streams, including the VPP wraparound boundary.
+        Without VPP, the terminal rank does not send forward; post_process contraction
+        describes the model output, not this communication buffer shape.
         """
         H, N = 64, 4
         cfg = _make_config(
@@ -953,8 +953,7 @@ class TestStandaloneEmbeddingLossWithMHC:
             pp_group=_make_pp_group(1, 2),
             is_recv=False,
         )
-        # Last stage sends C (after contract), not n*C
-        assert send_last == [(32, 2, H)]
+        assert send_last == [(32, 2, N * H)]
 
 
 # ===========================================================================
@@ -1312,8 +1311,9 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
         ), f"rank 0 send {shapes[0][0]} != rank 1 recv {shapes[1][1]}"
         # rank 0 (first) sends n*C
         assert shapes[0][0] == [(32, 2, H * N)]
-        # rank 1 (last) sends C
-        assert shapes[1][0] == [(32, 2, H)]
+        # The last physical rank sends expanded streams to rank 0's next virtual chunk.
+        assert shapes[1][0] == [(32, 2, H * N)]
+        assert shapes[1][0] == shapes[0][1]
 
     def test_pp4_flexible_vpp_mhc_all_consecutive_match(self):
         """PP=4 with flexible VPP layout + mHC: send[i] == recv[i+1] for all i."""
@@ -1342,13 +1342,14 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
                 shapes[i][0] == shapes[i + 1][1]
             ), f"rank {i} send {shapes[i][0]} != rank {i+1} recv {shapes[i+1][1]}"
 
-        # First stage sends n*C, intermediate stages send/recv n*C, last stage sends C
+        # Every logical communication boundary, including VPP wraparound, carries n*C.
         assert shapes[0][0] == [(32, 2, H * N)]
         for i in (1, 2):
             assert shapes[i][0] == [(32, 2, H * N)]
             assert shapes[i][1] == [(32, 2, H * N)]
-        assert shapes[3][0] == [(32, 2, H)]
+        assert shapes[3][0] == [(32, 2, H * N)]
         assert shapes[3][1] == [(32, 2, H * N)]
+        assert shapes[3][0] == shapes[0][1]
 
     def test_pp2_flexible_vpp_no_mhc_baseline(self):
         """Baseline: PP=2 with flexible VPP layout, no mHC — all shapes are C."""

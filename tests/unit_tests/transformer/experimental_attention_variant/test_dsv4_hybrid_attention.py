@@ -84,8 +84,8 @@ def _make_config(
     v_head_dim=64,
     qk_pos_emb_head_dim=32,
     q_lora_rank=64,
-    output_projection_groups=8,
-    output_projection_lora_rank=64,
+    output_projection_groups=None,
+    output_projection_lora_rank=None,
     csa_compress_ratios=None,
     csa_window_size=8,
     tensor_model_parallel_size=1,
@@ -99,6 +99,10 @@ def _make_config(
     """Create an MLATransformerConfig for DSv4 hybrid attention tests."""
     if csa_compress_ratios is None:
         csa_compress_ratios = [0, 4, 128, 4]
+    if output_projection_groups is None:
+        output_projection_groups = extra_config_kwargs.get('o_groups', 8)
+    if output_projection_lora_rank is None:
+        output_projection_lora_rank = extra_config_kwargs.get('o_lora_rank', 64)
     extra_config_kwargs.setdefault('experimental_attention_variant', 'dsv4_hybrid')
     # Native attention fixtures opt out of the DSv4 fused backend default.
     extra_config_kwargs.setdefault('dsa_kernel_backend', 'none')
@@ -507,6 +511,25 @@ def _build_attention(config, layer_number, pg_collection, **kwargs):
     spec = layer_spec.submodules.self_attention
     return build_module(
         spec, config=config, layer_number=layer_number, pg_collection=pg_collection, **kwargs
+    )
+
+
+def _build_dsv4_moe_layer(config, layer_number, pg_collection):
+    """Build the complete DSv4 layer used by dev's CP and MoE graph tests."""
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_transformer_layer_with_experimental_attention_variant_spec,
+    )
+    from megatron.core.transformer.spec_utils import build_module
+
+    layer_specs = get_transformer_layer_with_experimental_attention_variant_spec(
+        config=config, backend=TESpecProvider()
+    )
+    return build_module(
+        layer_specs[layer_number - 1],
+        config=config,
+        layer_number=layer_number,
+        pg_collection=pg_collection,
     )
 
 

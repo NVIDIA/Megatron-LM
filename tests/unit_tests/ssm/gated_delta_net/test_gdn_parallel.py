@@ -61,7 +61,7 @@ def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[t
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 def test_parallel_gated_delta_net_correctness(
-    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode, run_config
 ):
     transformer_config = TransformerConfig(
         hidden_size=128,

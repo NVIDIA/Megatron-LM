@@ -4063,14 +4063,7 @@ def _add_checkpointing_args(parser):
 
     ckpt_factory = ArgumentGroupFactory(
         CheckpointConfig,
-        exclude=[
-            "most_recent_k",
-            "save_tokenizer_assets",
-            "save_optim",
-            "save_rng",
-            "load_optim",
-            "load_rng",
-        ],
+        exclude=["most_recent_k", "save_optim", "save_rng", "load_optim", "load_rng"],
     )
     group = ckpt_factory.build_group(parser, "checkpointing")
 

@@ -402,7 +402,9 @@ def test_kda_cp2_packed_with_physical_padding_matches_cp1():
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_parallel_kda_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode):
+def test_parallel_kda_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode, run_config
+):
     config = _make_config(linear_cp_mode=linear_cp_mode)
     _test_parallel_attention_correctness(
         transformer_config=config,

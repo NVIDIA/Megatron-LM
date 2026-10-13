@@ -25,7 +25,7 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
-from megatron.training.config import PretrainConfigContainer
+from megatron.training.config import CheckpointConfig, PretrainConfigContainer
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
@@ -63,6 +63,17 @@ class CapturingTransformerConfig:
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
+
+
+@pytest.mark.parametrize(
+    "flag", [None, "--no-save-tokenizer-assets", "--disable-save-tokenizer-assets"]
+)
+def test_tokenizer_checkpoint_assets_flag_populates_args_and_config(flag):
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([] if flag is None else [flag])
+    assert args.save_tokenizer_assets is (flag is None)
+    assert _default_config_from_args(CheckpointConfig, args).save_tokenizer_assets is (flag is None)
 
 
 def _minimal_training_args(monkeypatch):

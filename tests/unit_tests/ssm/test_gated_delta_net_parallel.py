@@ -53,6 +53,7 @@ def test_parallel_gated_delta_net_correctness(
         bf16=True,
         experimental_attention_variant="gated_delta_net",
         linear_attention_freq=[1],
+        linear_cp_mode="headwise",
         transformer_impl="transformer_engine",
     )
 

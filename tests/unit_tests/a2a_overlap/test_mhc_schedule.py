@@ -102,7 +102,7 @@ class _RecordingLayer:
         # belongs to no RecomputeSegment and the segment hooks are skipped.
         self.recompute_segment = None
 
-    def get_fp8_context(self):
+    def get_low_precision_context(self):
         return nullcontext()
 
     def release_state(self):

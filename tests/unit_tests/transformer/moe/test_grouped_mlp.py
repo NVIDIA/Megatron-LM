@@ -857,14 +857,14 @@ def test_make_fused_ops_selects_scaled_situ_glu(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("activation_func", "activation_func_clamp_value"),
-    [(F.silu, None), (F.silu, 7.0), (situlu, None), (quick_gelu, None)],
+    ("activation_func", "activation_func_clamp_value", "expected"),
+    [(F.silu, None, True), (F.silu, 7.0, True), (situlu, None, False), (quick_gelu, None, True)],
     ids=("swiglu", "clamped-swiglu", "situ-glu", "quick-geglu"),
 )
-def test_is_fused_impl_supported_rejects_scaled_glu_activation_recompute(
-    monkeypatch, activation_func, activation_func_clamp_value
+def test_is_fused_impl_supported_checks_scaled_glu_activation_recompute_capability(
+    monkeypatch, activation_func, activation_func_clamp_value, expected
 ):
-    """TE scaled GLU ops cannot honor selective MoE activation recompute."""
+    """Accept recompute only when the selected TE scaled GLU op exposes its control."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
@@ -880,10 +880,10 @@ def test_is_fused_impl_supported_rejects_scaled_glu_activation_recompute(
     )
     module.activation_recompute = True
 
-    assert module._is_fused_impl_supported() is False
+    assert module._is_fused_impl_supported() is expected
 
 
-def test_is_fused_impl_supported_requires_cutedsl_env(monkeypatch):
+def test_is_fused_impl_supported_allows_te_ops_without_cutedsl(monkeypatch):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
@@ -895,7 +895,7 @@ def test_is_fused_impl_supported_requires_cutedsl_env(monkeypatch):
         FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
     )
 
-    assert module._is_fused_impl_supported() is False
+    assert module._is_fused_impl_supported() is True
 
 
 def test_is_fused_impl_supported_requires_scaled_fc2_bias(monkeypatch):

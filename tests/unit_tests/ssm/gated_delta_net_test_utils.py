@@ -79,6 +79,8 @@ class GatedDeltaNetTestBase:
             context_parallel_size=cp_size,
             experimental_attention_variant="gdn2" if use_gdn2 else "gated_delta_net",
             linear_attention_freq=[1],
+            # These legacy parity/recompute fixtures use batched SBHD and zigzag CP.
+            linear_cp_mode="headwise",
             transformer_impl="transformer_engine",
         )
         gdn_spec = get_experimental_attention_variant_module_spec(config=self.transformer_config)

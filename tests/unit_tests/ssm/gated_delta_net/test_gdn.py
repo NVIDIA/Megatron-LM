@@ -168,7 +168,11 @@ def test_torch_chunk_gated_delta_rule_preserves_public_signature():
         "cu_seqlens",
         "cp_context",
         "scale",
+        "kwargs",
     )
+    assert signature.parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
+    assert signature.parameters["cp_context"].default is None
+    assert signature.parameters["scale"].default is None
 
 
 def test_gdn_headwise_cp_head_divisibility_includes_cp_size():
