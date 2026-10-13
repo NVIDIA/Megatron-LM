@@ -610,6 +610,44 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         Utils.destroy_model_parallel()
 
 
+def test_te_fused_mla_kv_rope_mxfp8_replays():
+    """The fused MLA key/value split + key RoPE + MXFP8 quantization that MLA dispatches with
+    use_fused_mla_kv_rope_quant (its backward is the replayed Triton key/value split RoPE)."""
+    from megatron.core.transformer import multi_latent_attention as mla
+
+    if not _IS_BLACKWELL or mla.fused_mla_kv_rope_mxfp8 is None:
+        pytest.skip("needs Transformer Engine's fused_mla_kv_rope_mxfp8 on SM100+")
+    seeded()
+    s, b, h = 2048, 2, 16
+    kv = torch.randn(s, b, h, 256, device="cuda", dtype=torch.bfloat16)
+    kv_down = torch.randn(s, b, 512 + 64, device="cuda", dtype=torch.bfloat16)
+    k_pos_emb = kv_down[..., 512:].unsqueeze(-2)
+    cos = torch.randn(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
+
+    def fn(kv, k_pos_emb, cos, sin):
+        key, value = mla.fused_mla_kv_rope_mxfp8(kv, k_pos_emb, cos, sin, 128)
+        return tuple(
+            getattr(t, name)
+            for t in (key, value)
+            for name in (
+                "_rowwise_data",
+                "_rowwise_scale_inv",
+                "_columnwise_data",
+                "_columnwise_scale_inv",
+            )
+        )
+
+    assert_replays_bit_exact(
+        fn,
+        (kv, k_pos_emb, cos, sin),
+        replays=3,
+        backward=False,
+        contention=True,
+        what="TE fused MLA key/value RoPE + MXFP8",
+    )
+
+
 # --- fused top-k router with dense indices ------------------------------------------------------
 
 
