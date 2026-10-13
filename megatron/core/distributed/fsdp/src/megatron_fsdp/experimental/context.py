@@ -207,12 +207,14 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Wait on submitted gradient reductions.
+        """Restore sharded bindings and wait on submitted gradient reductions.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
+        for module in self._module_names:
+            module.bind_sharded_parameters()
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
