@@ -21,12 +21,20 @@ class PipelineSplit:
     Add ``PipelineSplit`` itself to the list. Instances of this class are not valid entries.
     """
 
+    def __init__(self) -> None:
+        raise TypeError(
+            "PipelineSplit must not be instantiated. Use the bare PipelineSplit class instead."
+        )
+
 
 class MTPSplit:
     """Bare class sentinel that begins an MTP depth in a hybrid config list.
 
     Add ``MTPSplit`` itself to the list. Instances of this class are not valid entries.
     """
+
+    def __init__(self) -> None:
+        raise TypeError("MTPSplit must not be instantiated. Use the bare MTPSplit class instead.")
 
 
 HybridLayerConfigListEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]

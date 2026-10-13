@@ -284,6 +284,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Parse the selected first-class representation. The config-list path deliberately never
         # projects configs to symbols or synthesizes a pattern string.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            PipelineSplit,
             parse_hybrid_layer_config_list,
             parse_hybrid_pattern,
             select_pipeline_segment,
@@ -319,6 +320,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             self.mtp_layer_config_list = parsed_config_list.mtp_layer_config_list
             self.mtp_num_depths = parsed_config_list.mtp_num_depths
+            architecture_layer_configs = tuple(
+                entry
+                for entry in parsed_config_list.main_layer_config_list
+                if entry is not PipelineSplit
+            ) + (self.mtp_layer_config_list or ())
+            layer_utils.validate_shared_rotary_config(
+                architecture_layer_configs, self.config.kv_channels, self.position_embedding_type
+            )
+            if self.config.experimental_attention_variant_loss_scale_func is None:
+                self.config.experimental_attention_variant_loss_scale_func = (
+                    layer_utils.get_attention_variant_loss_scale_func(architecture_layer_configs)
+                )
             hash_moe_layer_threshold = _get_hash_moe_layer_threshold(
                 parsed_config_list.main_layer_config_list, self.config.moe_num_hash_layers
             )
@@ -336,19 +349,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
             self.config._hybrid_has_moe_layers = any(
-                type(entry) is MoELayerConfig
-                for entry in (
-                    *parsed_config_list.main_layer_config_list,
-                    *(self.mtp_layer_config_list or ()),
-                )
+                type(entry) is MoELayerConfig for entry in architecture_layer_configs
             )
             if self.config.mtp_num_layers is None and self.mtp_num_depths > 0:
                 self.config.mtp_num_layers = self.mtp_num_depths
-            mtp_overlap_configs = (
-                self.config,
-                *parsed_config_list.main_layer_config_list,
-                *(self.mtp_layer_config_list or ()),
-            )
+            mtp_overlap_configs = (self.config, *architecture_layer_configs)
             self.config.is_hybrid_model = True
 
             layer_config_list, layer_offset = select_pipeline_segment_from_config_list(
