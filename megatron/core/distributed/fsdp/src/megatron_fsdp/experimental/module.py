@@ -364,13 +364,9 @@ class FsdpModule:
                 f"Unsharding requires a FORWARD, BACKWARD, or None phase, got {phase!r}."
             )
         phases = (
-            (Phase.FORWARD, Phase.BACKWARD)
-            if phase is None
-            or not any(
-                group.dtype == torch.uint8 and not group._is_model_weight_unsharded()
-                for group in self._parameter_groups
-            )
-            else (phase,)
+            (phase,)
+            if phase is not None and self._per_phase_unshard_groups
+            else (Phase.FORWARD, Phase.BACKWARD)
         )
         if all(requested_phase in self._unshard_events for requested_phase in phases):
             return
@@ -389,11 +385,7 @@ class FsdpModule:
         if is_recomputing:
             # Backward reuses BF16 weights and any gathered MXFP8 columnwise planes,
             # but no longer needs the MXFP8 rowwise planes used for recomputation.
-            groups = [
-                group
-                for group in self._parameter_groups
-                if group.dtype == torch.uint8 and not group._is_model_weight_unsharded()
-            ]
+            groups = self._per_phase_unshard_groups
             if groups:
                 allgather_stream = self.context.allgather_stream
                 allgather_stream.wait_stream(self.context.current_stream())
@@ -502,6 +494,11 @@ class FsdpModule:
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
         """Parameter groups owned by this FsdpModule."""
         return self._parameter_groups
+
+    @property
+    def _per_phase_unshard_groups(self) -> tuple[FsdpParameterGroup, ...]:
+        """Parameter groups that unshard different data for forward and backward."""
+        return tuple(group for group in self._parameter_groups if group.needs_per_phase_unshard)
 
     @property
     def num_parameter_elements(self) -> int:

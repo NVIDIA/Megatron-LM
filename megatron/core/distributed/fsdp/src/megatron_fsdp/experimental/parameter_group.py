@@ -36,13 +36,17 @@ from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, TensorAtomic
 
 if HAVE_TE:
-    from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
+    from .quantized_dbuffer import QuantizedDBuffer, effective_dtype, update_mxfp8_tensor
 else:
     QuantizedDBuffer = DBuffer
 
     def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
         """Without TE, all parameters use their native storage dtype."""
         return tensor.dtype
+
+    def update_mxfp8_tensor(*args, **kwargs) -> None:
+        """Without TE, no parameter group holds MXFP8 weights to update."""
+        raise RuntimeError("update_mxfp8_tensor requires Transformer Engine.")
 
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -435,6 +439,13 @@ class FsdpParameterGroup:
         """Whether compute weights are already unsharded."""
         return self.model_weight.placements == self._unsharded_model_weight.placements
 
+    @property
+    def needs_per_phase_unshard(self) -> bool:
+        """Whether forward and backward unshard different data."""
+        return isinstance(self.model_weight, QuantizedDBuffer) and not (
+            self._is_model_weight_unsharded()
+        )
+
     def _mxfp8_planes_to_unshard(self, phase: Phase | None) -> tuple[bool, bool]:
         """Translate ``phase`` into the (rowwise, columnwise) planes not unsharded yet."""
         unsharded_model_weight = self._unsharded_model_weight
@@ -484,8 +495,6 @@ class FsdpParameterGroup:
             if isinstance(unsharded_model_weight, DBuffer):
                 fsdp_parameter.unsharded.data = tensor_view
             else:
-                from .quantized_dbuffer import update_mxfp8_tensor
-
                 update_mxfp8_tensor(tensor_view, fsdp_parameter.unsharded, **mxfp8_planes)
 
     def _materialize_unsharded_model_weight(
@@ -523,7 +532,12 @@ class FsdpParameterGroup:
         self._switch_to_sharded_parameters()
 
     def release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
-        """Release all full-parameter storage, or only MXFP8 rowwise storage."""
+        """Release all full-parameter storage, or only MXFP8 rowwise storage.
+
+        Storage is resized to zero instead of replacing parameter ``.data``: autograd
+        may have saved views into the unsharded parameters during forward, and those
+        views must follow the Storage when a later unshard reallocates it.
+        """
         unsharded_model_weight = self._unsharded_model_weight
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only
