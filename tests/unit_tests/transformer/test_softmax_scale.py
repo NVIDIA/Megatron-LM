@@ -92,8 +92,8 @@ def _prefill_inputs(num_heads, head_dim):
     """Inputs for flash_decode_and_prefill with two 1-token prefills."""
     device, dtype = 'cuda', torch.float16
     return dict(
-        # q: [total_tokens, num_heads, 1, head_dim] — squeezed to [total, heads, head_dim]
-        q=torch.randn(2, num_heads, 1, head_dim, device=device, dtype=dtype),
+        # q: [total_tokens, 1, num_heads, head_dim] — squeezed to [total, heads, head_dim]
+        q=torch.randn(2, 1, num_heads, head_dim, device=device, dtype=dtype),
         k=torch.randn(2, num_heads, head_dim, device=device, dtype=dtype),
         v=torch.randn(2, num_heads, head_dim, device=device, dtype=dtype),
         cu_seqlens_q=torch.tensor([0, 1, 2], device=device, dtype=torch.int32),
