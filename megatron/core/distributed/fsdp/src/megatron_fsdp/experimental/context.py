@@ -218,6 +218,10 @@ class FsdpContext:
         while self._delayed_post_backward_callbacks:
             module, callback = self._delayed_post_backward_callbacks.pop()
             callback(module)
+        # Standalone training can call optimizer.step() immediately after backward.
+        # Wait for reductions on the last microbatch; earlier microbatches keep
+        # overlapping reduction with compute. MCore calls finish_grad_sync() itself
+        # after its schedule completes, including delayed weight gradients.
         if not self.caller_managed_grad_sync and self.is_last_microbatch:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
