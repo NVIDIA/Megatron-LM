@@ -179,7 +179,7 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert list(context.backward_order) == [model.layers[1], model.layers[0]]
 
 
-def test_sibling_roots_enqueue_one_post_backward_wait(distributed_setup, monkeypatch):
+def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(distributed_setup, monkeypatch):
     """Sibling roots should share one final wait across accumulated microbatches."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
