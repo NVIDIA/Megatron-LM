@@ -580,6 +580,7 @@ class _CudagraphGlobalRecord:
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
     _saved_tensors_observer = None
+    _te_capture_started = False
 
     @classmethod
     def _enable_saved_tensors_observer(cls):
@@ -626,6 +627,13 @@ class _CudagraphGlobalRecord:
         try:
             return cls._create_cudagraphs()
         finally:
+            # A failed capture must not leave DDP hooks disabled for subsequent backwards.
+            if is_graph_capturing():
+                _set_warmup_end()
+                _set_capture_end()
+                if cls._te_capture_started:
+                    te_set_capture_end()
+                    cls._te_capture_started = False
             cls._disable_saved_tensors_observer()
 
     @classmethod
@@ -681,9 +689,20 @@ class _CudagraphGlobalRecord:
             GTP_CONFIG.check_param_states = False
             initialize_graph_wgrad_rings()
 
+        # Recording/warmup can keep AccumulateGrad nodes alive on the default stream.
+        # Match full-iteration capture: let autograd redirect those stale references to
+        # the capturing stream rather than introduce an illegal default-stream dependency.
+        # Intentionally leave this process-global setting enabled, as full-iteration capture
+        # does. The API has no getter for restoring its previous value; resetting it to False
+        # could disable an override enabled by another caller. It only affects capture-time
+        # stream handling, not ordinary eager backward.
+        if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
+            torch.autograd.graph.set_override_stale_capture_stream(True)
+
         _set_capture_start()
         if has_te_modules:
             te_set_capture_start()
+            cls._te_capture_started = True
 
         global bwd_buffer_reuse_ref_count, fwd_buffer_reuse_ref_count
 
@@ -755,6 +774,7 @@ class _CudagraphGlobalRecord:
         _set_capture_end()
         if has_te_modules:
             te_set_capture_end()
+            cls._te_capture_started = False
 
         torch.cuda.set_stream(torch.cuda.default_stream())
 

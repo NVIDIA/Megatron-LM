@@ -211,6 +211,56 @@ def test_topk_routing_replays(case, fused, det_algos):
         )
 
 
+@pytest.mark.parametrize("det_algos", [True, False])
+def test_quantile_balancing_histogram_and_bias_replay(det_algos):
+    """Replay accumulated integer histograms, routing gradients, and the batch update."""
+    seeded()
+    num_tokens, num_experts, num_bins = 8192, 64, 128
+    logits = torch.randn(num_tokens, num_experts, device="cuda", requires_grad=True)
+    bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
+    bounds = torch.tensor([-1.0, 1.0], device="cuda")
+    histogram = torch.zeros(num_experts, num_bins, device="cuda", dtype=torch.int32)
+
+    def fn(logits, histogram):
+        # The harness clones the caller-owned histogram before every replay.
+        outputs = []
+        for microbatch in logits.chunk(2):
+            outputs.append(
+                moe_utils.topk_routing_with_score_function(
+                    microbatch,
+                    topk=8,
+                    score_function="sigmoid",
+                    expert_bias=bias,
+                    qb_histogram=histogram,
+                    qb_bin_bounds=bounds,
+                )
+            )
+        probs = torch.cat([output[0] for output in outputs])
+        routing_map = torch.cat([output[1] for output in outputs])
+        updated_bias, updated_bounds = moe_utils.get_updated_expert_bias_with_quantile(
+            histogram, bounds, bias, topk=8
+        )
+        return probs, routing_map, histogram, updated_bias, updated_bounds
+
+    with deterministic_algorithms(det_algos):
+        outputs, grads = assert_replays_bit_exact(
+            fn,
+            (logits, histogram),
+            grad_outputs={"out[0]": torch.randn_like(logits)},
+            replays=3,
+            contention=True,
+            what="global-batch QB histogram and bias update",
+        )
+    assert torch.equal(
+        outputs["out[2]"].sum(dim=-1),
+        torch.full((num_experts,), num_tokens, device="cuda", dtype=torch.int64),
+    )
+    assert torch.all(outputs["out[1]"].sum(dim=-1) == 8)
+    assert torch.isfinite(outputs["out[3]"]).all()
+    assert torch.isfinite(outputs["out[4]"]).all()
+    assert grads["in[0]"].abs().sum() > 0
+
+
 def test_group_limited_topk_replays():
     seeded()
     scores = torch.rand(8192, 256, device="cuda")
@@ -491,6 +541,43 @@ class TestMoEModules:
         assert_module_replays_bit_exact(
             router, (hidden,), replays=3, what=f"TopKRouter[flex-{backend}-dense]"
         )
+
+    @pytest.mark.parametrize("accumulate", [True, False])
+    def test_global_batch_quantile_router_replays(self, accumulate):
+        """Include the router's nonpersistent histogram in the replay comparison."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="quantile_balancing",
+            moe_router_quantile_balancing_estimation_scope="global_batch",
+            moe_router_score_function="sigmoid",
+            moe_aux_loss_coeff=0.0,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.train(accumulate)
+        with torch.no_grad():
+            router.expert_bias.copy_(torch.linspace(-0.1, 0.1, 64, device="cuda"))
+        logits = torch.randn(8192, 64, device="cuda", requires_grad=True)
+
+        def fn(logits):
+            router.qb_histogram.zero_()
+            probs, routing_map = router.quantile_balancing(logits)
+            return probs, routing_map, router.qb_histogram.clone()
+
+        outputs, grads = assert_replays_bit_exact(
+            fn,
+            (logits,),
+            grad_outputs={"out[0]": torch.randn_like(logits)},
+            replays=3,
+            contention=True,
+            what=f"global-batch TopKRouter[accumulate={accumulate}]",
+        )
+        assert torch.all(outputs["out[2]"].sum(dim=-1) == (8192 if accumulate else 0))
+        assert grads["in[0]"].abs().sum() > 0
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     def test_te_grouped_mlp_replays_on_uneven_experts(self):
