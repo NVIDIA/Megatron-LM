@@ -1005,6 +1005,19 @@ class HybridStack(MegatronModule):
         if getattr(self.config, "mla_down_proj_fusion", False):
             submodules = self._fuse_mla_down_proj(submodules)
 
+        if getattr(self.config, "mla_latent_cp", False) and isinstance(
+            submodules.mla_layer, ModuleSpec
+        ):
+            # Experimental latent-KV context parallelism; copies the spec like the fusion above.
+            from megatron.core.transformer.experimental_attention_variant.mla_latent_cp import (
+                apply_mla_latent_cp_spec,
+            )
+
+            submodules = copy.deepcopy(submodules)
+            submodules.mla_layer.submodules.self_attention = apply_mla_latent_cp_spec(
+                submodules.mla_layer.submodules.self_attention
+            )
+
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
