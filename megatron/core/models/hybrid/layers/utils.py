@@ -28,6 +28,11 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
+    # Brackets group layers into one logical layer that HybridStack builds as a nested
+    # HybridStack, e.g. ``[M*E]``. See "Bracketed layer groups" in
+    # docs/user-guide/hybrid-model-migration.md.
+    GROUP_START = "["
+    GROUP_END = "]"
     LAYER_CONFIG_MAP = {
         MAMBA: MambaLayerConfig,
         GDN: GDNLayerConfig,
