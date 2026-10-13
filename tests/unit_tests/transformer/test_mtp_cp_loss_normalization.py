@@ -51,7 +51,9 @@ def _masks(device):
         yield (positions == position).unsqueeze(0).to(torch.float64)
 
 
-def _run_loss(hidden, weight, labels, mask, config, packed, group, *, training=False):
+def _run_loss(
+    hidden, weight, labels, mask, config, packed, group, *, training=False, mtp_input_mask=None
+):
     length = labels.size(1)
     hidden = hidden.clone().reshape(-1, 1, 4).requires_grad_()
     weight = weight.clone().requires_grad_()
@@ -81,6 +83,7 @@ def _run_loss(hidden, weight, labels, mask, config, packed, group, *, training=F
         config=config,
         cp_group=group,
         packed_seq_params=packed,
+        mtp_input_mask=mtp_input_mask,
         **kwargs,
     )
     # Isolate MTP's actual custom backward from the ordinary LM gradient.
@@ -161,6 +164,64 @@ def test_mtp_cp_gradients_match_unpartitioned(cp_group, device, depth, packed, p
             torch.distributed.all_reduce(reconstructed, group=cp_group)
             torch.testing.assert_close(reconstructed, reference, atol=1e-11, rtol=1e-9)
         torch.testing.assert_close(actual[2], expected[2], atol=1e-11, rtol=1e-9)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("conditioning", ["boundary", "all_valid", "all_invalid"])
+def test_mtp_cp_conditioning_mask_gradients(cp_group, device, packed, per_token, conditioning):
+    """Cumulative conditioning validity must determine each depth's CP-wide denominator."""
+    hidden, weight, labels, config, params, indices = _case(3, packed, device, cp_group)
+    config.calculate_per_token_loss = per_token
+    boundaries = [0, 8, 16] if packed else [0, 16]
+    mask = torch.ones_like(labels, dtype=torch.float64)
+    # Also exclude a target independently of conditioning validity.
+    mask[:, -2] = 0
+    input_mask = torch.ones_like(labels, dtype=torch.bool)
+    if conditioning == "boundary":
+        # The first token on CP rank 1 invalidates conditioning paths on rank 0.
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            input_mask[:, start + (end - start) // 4] = False
+    elif conditioning == "all_invalid":
+        input_mask.zero_()
+
+    expected = _run_loss(
+        hidden, weight, labels, mask, config, params, None, mtp_input_mask=input_mask
+    )
+    # Check the CP1 reference independently: depth d consumes conditioning tokens
+    # at positions i+1 through i+d and predicts labels[i+d], within one sequence.
+    # This catches dropping the mask (or its cumulative history) in both CP paths.
+    for depth in range(1, 4):
+        effective_mask = torch.zeros_like(mask)
+        targets = torch.zeros_like(labels)
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            for position in range(start, end - depth):
+                effective_mask[:, position] = mask[:, position + depth] * input_mask[
+                    :, position + 1 : position + depth + 1
+                ].all(dim=-1)
+                targets[:, position] = labels[:, position + depth]
+        logits = F.linear(hidden[depth], weight).squeeze(1)
+        reference = logits.softmax(dim=-1) - F.one_hot(targets.squeeze(0), weight.size(0))
+        reference *= (effective_mask.squeeze(0) / effective_mask.sum().clamp(min=1)).unsqueeze(-1)
+        reference *= config.mtp_loss_scaling_factor / config.mtp_num_layers
+        torch.testing.assert_close(expected[1][depth - 1, :, 0], reference, atol=1e-11, rtol=1e-9)
+
+    actual = _run_loss(
+        hidden[:, indices],
+        weight,
+        labels[:, indices],
+        mask[:, indices],
+        config,
+        params,
+        cp_group,
+        mtp_input_mask=input_mask[:, indices],
+    )
+    for local, reference in zip(actual[:2], expected[:2]):
+        reconstructed = torch.zeros_like(reference)
+        reconstructed[:, indices] = local
+        torch.distributed.all_reduce(reconstructed, group=cp_group)
+        torch.testing.assert_close(reconstructed, reference, atol=1e-11, rtol=1e-9)
+    torch.testing.assert_close(actual[2], expected[2], atol=1e-11, rtol=1e-9)
 
 
 def test_mtp_cp_logged_loss_uses_global_count(cp_group, device, monkeypatch):
