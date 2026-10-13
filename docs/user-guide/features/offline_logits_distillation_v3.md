@@ -230,8 +230,9 @@ Targets drop the same rows. Consequently every stored segment ends on a scored p
 
 Writers may omit an optional field only when it equals its default; Megatron does so
 automatically (RoPE models never read `position_ids`, so most Megatron dumps omit them).
-Readers fill defaults before use. A target row with no valid entry (all sentinel) is
-never scored by Megatron students, whatever its stored loss weight.
+Readers fill defaults before use. A target row with no valid entry (all sentinel)
+contributes zero KD loss; its stored loss weight still controls CE supervision.
+Student-inserted padding has zero loss weight for both losses.
 
 ### Target contract
 

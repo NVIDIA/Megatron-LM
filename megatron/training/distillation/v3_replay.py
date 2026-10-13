@@ -596,8 +596,6 @@ def collate_samples(
             row_indices = torch.zeros((seq_length, k), dtype=torch.int64)
             row_values[real] = sample["teacher_values"][source[real]]
             row_indices[real] = sample["teacher_indices"][source[real]]
-            # A row without any teacher entry carries no KD signal; never score it.
-            fields["loss_mask"][-1] *= (row_values != LOGPROB_SENTINEL).any(-1).float()
             values.append(row_values)
             indices.append(row_indices)
         boundary_rows.append(boundaries)

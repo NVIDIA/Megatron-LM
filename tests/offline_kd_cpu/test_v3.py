@@ -719,7 +719,7 @@ def test_stripped_segments_are_repadded_for_the_student(tmp_path, divisor, lengt
     assert int(starts[-1]) < length
 
 
-def test_rows_without_teacher_entries_are_never_scored():
+def test_missing_teacher_entries_preserve_scoring_mask():
     sample = {
         "tokens": torch.tensor([1, 2, 3], dtype=torch.int32),
         "labels": torch.tensor([2, 3, 4], dtype=torch.int32),
@@ -730,8 +730,8 @@ def test_rows_without_teacher_entries_are_never_scored():
         "teacher_values": torch.tensor([[-1.0], [-1000.0], [-2.0]]),
         "teacher_indices": torch.tensor([[1], [0], [2]]),
     }
-    batch = replay.collate_samples([sample], 3)
-    assert batch["loss_mask"][0].tolist() == [1.0, 0.0, 1.0]
+    batch = replay.collate_samples([sample], 4)
+    assert batch["loss_mask"][0].tolist() == [1.0, 1.0, 1.0, 0.0]
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -1718,6 +1718,56 @@ def test_paired_loss_uses_explicit_targets_and_keeps_gradients(
     assert list(report) == ["lm loss", "logits distillation loss", "total loss"]
     lm_only = module.paired_loss(mask, lm_losses, types.SimpleNamespace(training=False), None)
     assert list(lm_only[2]) == ["lm loss"]
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.5])
+@pytest.mark.parametrize("missing_rows", [[1], [0, 1]])
+def test_missing_kd_targets_keep_ce_loss_and_gradients(
+    runtime_environment, monkeypatch, alpha, missing_rows
+):
+    args, _, _ = runtime_environment
+    args.logits_load_kd_loss_alpha = alpha
+    _loss_namespace(monkeypatch)
+    monkeypatch.delitem(sys.modules, f"{_namespace}.v3_loss", raising=False)
+    module = importlib.import_module(f"{_namespace}.v3_loss")
+    monkeypatch.setattr(module, "get_args", lambda: args)
+    teacher = torch.tensor([[2.0, 0.0, -1.0], [0.0, 2.0, -1.0], [1.0, 1.0, 0.0]]).log_softmax(-1)
+    values = teacher.clone()
+    values[missing_rows] = codec.LOGPROB_SENTINEL
+    sample = {
+        "tokens": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "labels": torch.tensor([1, 2, 0], dtype=torch.int32),
+        "position_ids": torch.arange(3, dtype=torch.int32),
+        "loss_mask": torch.tensor([1, 1, 0], dtype=torch.bool),
+        "segments": torch.tensor([3]),
+        "sample_id": 0,
+        "teacher_values": values,
+        "teacher_indices": torch.arange(3).expand(3, -1),
+    }
+    batch = replay.collate_samples([sample], 4)
+    logits = torch.tensor(
+        [[[0.0, 1.0, -1.0]], [[1.0, 0.0, -1.0]], [[-1.0, 0.0, 1.0]], [[0.0, 0.0, 0.0]]],
+        requires_grad=True,
+    )
+    ce = torch.nn.functional.cross_entropy(
+        logits[:, 0], batch["labels"][0], reduction="none"
+    ).unsqueeze(0)
+    total, count, report = module.paired_loss(
+        batch["loss_mask"],
+        ce,
+        types.SimpleNamespace(training=True),
+        {"logits": logits, "values": batch["_kd_values"][0], "indices": batch["_kd_indices"][0]},
+    )
+    expected_kd = (teacher.exp() * (teacher - logits[:3, 0].log_softmax(-1))).sum(-1)
+    expected_kd[missing_rows] = 0
+    expected = (1 - alpha) * ce[0, :2].sum() + alpha * expected_kd[:2].sum()
+    assert torch.allclose(total, expected, atol=1e-6)
+    assert torch.allclose(report["lm loss"][0], ce[0, :2].sum())
+    assert count == 2
+    total.backward()
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad[1].abs().sum() > 0  # CE still trains the token with no KD entries.
+    assert (logits.grad[2:] == 0).all()  # Original masking and inserted padding remain unscored.
 
 
 def legacy_saver_methods():
