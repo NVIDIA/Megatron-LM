@@ -241,7 +241,7 @@ def _run_forward_backward(module, pg_collection):
                     assert not _is_gtp_parameter(parameter), name
                     active = parameter.main_grad.flatten()[:_STREAMS]
                     assert torch.count_nonzero(active) > 0, name
-                if ".mlp.experts." in name:
+                if ".mlp.experts." in name or ".routed_experts." in name:
                     assert torch.count_nonzero(parameter.main_grad) > 0, name
 
             records.append(

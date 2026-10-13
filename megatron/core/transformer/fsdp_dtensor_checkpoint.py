@@ -113,6 +113,7 @@ def get_expert_index_from_key(key):
     Returns:
         int: Expert index if found, None otherwise.
     """
+    key = key.replace('routed_experts.', 'mlp.experts.')
     # GroupedMLP: index is at the end after 'weight'
     if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
         m = re.search(r'^.*\.mlp\.experts\.linear_fc\d\.weight(\d+)', key)
@@ -152,8 +153,12 @@ def handle_experts_in_state_dict(state_dict, num_experts: int | None = None):
     def replace_expert_index_in_key(key, expert_index, state_dict):
         """Replace expert index in key with new index corresponding to the current rank"""
         new_expert_index = expert_index + local_expert_start
+        expert_key = key.replace("routed_experts.", "mlp.experts.")
         # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
-        if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
+        if (
+            'mlp.experts.linear_fc1.weight' in expert_key
+            or 'mlp.experts.linear_fc2.weight' in expert_key
+        ):
             # Handle SwiGLU weight{idx}_w and weight{idx}_v format
             if key.endswith('_w') or key.endswith('_v'):
                 suffix = key[-2:]  # '_w' or '_v'
@@ -164,7 +169,7 @@ def handle_experts_in_state_dict(state_dict, num_experts: int | None = None):
             else:
                 new_key = key.replace(f'weight{expert_index}', f'weight{new_expert_index}')
         # SequentialMLP: index is between 'local_experts.' and next '.'
-        elif 'mlp.experts.local_experts' in key:
+        elif 'mlp.experts.local_experts' in expert_key:
             new_key = key.replace(
                 f'local_experts.{expert_index}.', f'local_experts.{new_expert_index}.'
             )
@@ -198,11 +203,15 @@ def expert_param_local_key(key: str, num_experts: int | None = None) -> str:
     expert_index = get_expert_index_from_key(key)
     if expert_index is not None:
         new_expert_index = expert_index - local_expert_offset
+        expert_key = key.replace("routed_experts.", "mlp.experts.")
         # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
-        if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
+        if (
+            'mlp.experts.linear_fc1.weight' in expert_key
+            or 'mlp.experts.linear_fc2.weight' in expert_key
+        ):
             new_key = key.replace(f'weight{expert_index}', f'weight{new_expert_index}')
         # SequentialMLP: index is between 'local_experts.' and next '.'
-        elif 'mlp.experts.local_experts' in key:
+        elif 'mlp.experts.local_experts' in expert_key:
             new_key = key.replace(
                 f'local_experts.{expert_index}.', f'local_experts.{new_expert_index}.'
             )
@@ -239,7 +248,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     # ------------------------------------------------------------------
     _layer_glu = {}
     for name, module in model.named_modules():
-        if isinstance(module, TransformerLayer):
+        if isinstance(module, TransformerLayer) or name.endswith(".routed_experts"):
             _layer_glu[_strip_wrapper_prefixes(name)] = getattr(
                 module.config, 'gated_linear_unit', False
             )
@@ -259,6 +268,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         """
         Check if this key should be handled as SwiGLU linear_fc1 weight or bias.
         """
+        key = key.replace('routed_experts.', 'mlp.experts.')
         # Non-expert MLP: 'mlp.linear_fc1.weight', 'mlp.linear_fc1.bias'
         # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc1.bias0'
         # SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight',
@@ -351,7 +361,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 model_state_dict[key],
                 dist_param,
                 swiglu_shard_axis=0,
-                is_expert_param='mlp.experts' in key,
+                is_expert_param=('mlp.experts' in key or 'routed_experts' in key),
             )
 
             # Update the model state dict with the new keys
@@ -385,7 +395,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                         opt_state_dict[key][subkey],
                         dist_param,
                         swiglu_shard_axis=0,
-                        is_expert_param="mlp.experts" in key,
+                        is_expert_param=("mlp.experts" in key or "routed_experts" in key),
                     )
                     new_opt_state_dict[f"{key}_w"][subkey] = weight_w
                     new_opt_state_dict[f"{key}_v"][subkey] = weight_v

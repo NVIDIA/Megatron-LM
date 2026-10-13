@@ -102,6 +102,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
         self.hidden_dropout = config.hidden_dropout
+        self.add_module("residual_read", None)
+        self.add_module("norm", None)
         self.mixer = build_module(
             submodules.mixer,
             self.config,
@@ -116,6 +118,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        self.add_module("residual_write", None)
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 

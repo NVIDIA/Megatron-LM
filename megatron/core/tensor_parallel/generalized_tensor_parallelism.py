@@ -202,7 +202,7 @@ def _classify_param_chain(param_name: str) -> str:
     # Routed grouped experts: own homogeneous chain per weight-role (fc1/fc2) for one-block-ahead
     # prefetch. Checked BEFORE the generic rules (".mlp.shared_experts." is a distinct substring, so
     # shared experts never fall in here).
-    if ".mlp.experts." in n:
+    if ".mlp.experts." in n or ".routed_experts." in n:
         graphed = _FULL_ITERATION or bool(_CUDA_GRAPH_MODULES and "moe" in _CUDA_GRAPH_MODULES)
         # The grouped split is an EAGER-only optimization: when MoE is captured, keep grouped
         # weights in the plain GRAPHED chain so the cross-graph drain — wait_async_comms(
