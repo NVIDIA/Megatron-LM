@@ -104,6 +104,30 @@ C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="dev_csa_packed_compaction_and_routing",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_layout_kernels.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/thd_layout_kernels.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/thd_indexer_kernels.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py",
+        ),
+        tests=(K + "test_dsv4_dev_replay.py",),
+        kind="triton",
+        notes="Real CuTe compaction forward/unique-store backward and Triton/compiled integer "
+        "routing metadata replay. External sparse-attention backward is not certified here; "
+        "numerical CP/indexer parity remains in the dev CSA tests.",
+    ),
+    KernelEntry(
+        name="dev_csa_fused_compressor_dispatch",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_compressor.py",
+        ),
+        tests=(K + "test_dsv4_dev_replay.py",),
+        kind="dispatch",
+        notes="Actual cuDNN frontend compressor forward replay and strict-determinism "
+        "dispatch guard. dAPE backward uses atomics and remains unqualified for bit-exact replay.",
+    ),
+    KernelEntry(
         name="nonuniform_tp_mapping",
         sources=("megatron/core/distributed/nonuniform_tp.py",),
         tests=(K + "test_dev_sync_kernels.py",),
@@ -162,7 +186,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_dev_sync_kernels.py",),
         kind="triton",
         notes="Compiled integer scale-prefix refresh plus actual TE MXFP8 conversion and "
-        "Triton scale packing on Blackwell. The DSv4 compact-indexer extension stays deferred.",
+        "Triton scale packing on Blackwell. End-to-end compact-indexer parity is in the dev suite.",
     ),
     KernelEntry(
         name="kda_recurrence",
@@ -187,7 +211,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_dev_sync_kernels.py",),
         kind="torch-op",
         notes="Retained integer route metadata only, rebuilt on every replay rather than "
-        "cache hits. The balanced-indexer compute path remains explicitly deferred.",
+        "cache hits. This entry covers metadata, not balanced-indexer attention numerics.",
     ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(

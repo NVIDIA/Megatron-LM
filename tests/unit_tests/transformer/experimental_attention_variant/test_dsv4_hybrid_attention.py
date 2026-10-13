@@ -1,8 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import sys
 from argparse import ArgumentParser
 from dataclasses import replace
 from functools import partial
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -25,6 +27,26 @@ except ImportError:
     _hadamard_transform = None
 
 _SEED = 42
+
+
+class _CpuProjectionStub(IdentityOp):
+    """Constructor-only linear stub with a weight for dev's Muon QKV layout metadata."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.weight = torch.nn.Parameter(torch.empty(1))
+
+
+@pytest.fixture
+def cudnn_config_capability(monkeypatch):
+    """Model the frontend signature only for config tests, without replacing GPU kernels."""
+
+    def indexer_forward_top_k_wrapper(*, deterministic=False):
+        raise AssertionError("Configuration validation must not execute kernels")
+
+    cudnn = ModuleType("cudnn")
+    cudnn.DSA = SimpleNamespace(indexer_forward_top_k_wrapper=indexer_forward_top_k_wrapper)
+    monkeypatch.setitem(sys.modules, "cudnn", cudnn)
 
 
 def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
@@ -227,7 +249,7 @@ def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
         q_layernorm=identity_op.IdentityOp,
         kv_layernorm=identity_op.IdentityOp,
         linear_q_down_proj=identity_op.IdentityOp,
-        linear_q_up_proj=identity_op.IdentityOp,
+        linear_q_up_proj=_CpuProjectionStub,
         linear_kv_proj=identity_op.IdentityOp,
         core_attention=ModuleSpec(module=identity_op.IdentityOp),
         linear_proj=identity_op.IdentityOp,
@@ -255,15 +277,25 @@ def test_config_includes_mtp_ratio_and_derives_dimensions():
     assert config.hetereogenous_dist_checkpoint is True
 
 
-def test_config_requires_contiguous_context_parallelism():
-    """Static packed CP uses the main-owned contiguous layout contract."""
-    with pytest.raises(ValueError, match="attention_cp_layout='contiguous'"):
+def test_config_requires_contiguous_context_parallelism(monkeypatch):
+    """The canonical layout option maps to dev's contiguous CP partition contract."""
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_config.is_te_min_version", lambda *_a, **_k: True
+    )
+    with pytest.raises(ValueError, match="cp_partition_mode='contiguous'"):
         _make_config(context_parallel_size=2)
-    config = _make_config(context_parallel_size=2, attention_cp_layout="contiguous")
+    with pytest.raises(ValueError, match="requires THD inputs"):
+        _make_config(context_parallel_size=2, attention_cp_layout="contiguous")
+    config = _make_config(
+        context_parallel_size=2,
+        attention_cp_layout="contiguous",
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=128,
+    )
     assert config.context_parallel_size == 2
 
 
-def test_config_accepts_cudnn_backend_for_fused_sbhd():
+def test_config_accepts_cudnn_backend_for_fused_sbhd(cudnn_config_capability):
     """DSv4 may select the CSA cuDNN adapter while ordinary DSA keeps its own router."""
     with (
         patch(
@@ -298,11 +330,13 @@ def test_config_rejects_tilelang_backend_for_dsv4():
     ("variant", "requested", "expected"),
     [("dsv4_hybrid", None, "cudnn"), ("dsv4_hybrid", "none", "none"), ("dsa", None, "none")],
 )
-def test_cli_backend_default_preserves_explicit_none(variant, requested, expected):
+def test_cli_backend_default_preserves_explicit_none(
+    variant, requested, expected, cudnn_config_capability
+):
     """The generated CLI preserves omission for variant-aware config defaults."""
-    from megatron.training.arguments import _add_network_size_args
+    from megatron.training.arguments import _add_experimental_attention_variant_args
 
-    parser = _add_network_size_args(ArgumentParser())
+    parser = _add_experimental_attention_variant_args(ArgumentParser())
     argv = [] if requested is None else ['--dsa-kernel-backend', requested]
     args = parser.parse_args(argv)
     assert args.dsa_kernel_backend == requested
@@ -404,7 +438,7 @@ def _build_cpu_attention_for_ratio_resolution(monkeypatch, config, explicit_rati
         q_layernorm=identity_op.IdentityOp,
         kv_layernorm=identity_op.IdentityOp,
         linear_q_down_proj=identity_op.IdentityOp,
-        linear_q_up_proj=identity_op.IdentityOp,
+        linear_q_up_proj=_CpuProjectionStub,
         linear_kv_proj=identity_op.IdentityOp,
         core_attention=ModuleSpec(module=identity_op.IdentityOp),
         linear_proj=identity_op.IdentityOp,

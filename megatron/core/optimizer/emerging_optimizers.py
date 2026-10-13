@@ -892,31 +892,37 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if partition_dim == -1:
             partition_dim = None
 
-        # Look up the shapes only. `grad` is still this rank's row shard here, so the
-        # split has to wait until the callee has gathered the whole matrix.
-        qkv_split_shapes = None
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
+            # Preserve dev's explicit split-QKV contract for every TP mode. GTP shards
+            # cut through projection boundaries, so reconstruct before splitting rather
+            # than falling back to unsplit NS for blockwise/distributed GTP.
+            grad, gtp_slice = self._gather_gtp_remat_qkv_grad(p, grad, tp_group)
+            if self.split_qkv_per_head:
+                grad = self._orthogonalize_qkv_per_head(p, grad, tp_group)
+                return self._restore_gtp_remat_qkv_grad(grad, gtp_slice)
+
             qkv_split_shapes = getattr(p, "qkv_split_shapes", None)
             if qkv_split_shapes is None:
                 qkv_split_shapes = self.qkv_split_shapes
             if not qkv_split_shapes:
                 raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
-            if (
-                self.split_qkv_per_head
-                or getattr(p, "qkv_split_groups_are_complete", None) is False
-            ):
-                # Dev's per-head and fragmented-TP layouts require complete head boundaries.
-                # Reconstruct GTP rows first, then let the layout helper reconstruct TP rows.
-                grad, gtp_slice = self._gather_gtp_remat_qkv_grad(p, grad, tp_group)
-                if self.split_qkv_per_head:
-                    grad = self._orthogonalize_qkv_per_head(p, grad, tp_group)
-                else:
-                    grad = self._orthogonalize_global_qkv(p, grad, tp_group, qkv_split_shapes)
+            if getattr(p, "qkv_split_groups_are_complete", None) is False:
+                grad = self._orthogonalize_global_qkv(p, grad, tp_group, qkv_split_shapes)
                 return self._restore_gtp_remat_qkv_grad(grad, gtp_slice)
-        grad = self.scaled_orthogonalize_fn_with_gtp_remat(
-            p, grad, tp_group, partition_dim, qkv_split_shapes=qkv_split_shapes
-        )
-        return grad
+
+            grad = self._orthogonalize_split_qkv(
+                grad,
+                qkv_split_shapes,
+                lambda projection_grad: self.scaled_orthogonalize_fn(
+                    projection_grad,
+                    tp_group,
+                    partition_dim,
+                    tp_mode_this_group="duplicated" if self.tp_mode == "auto" else self.tp_mode,
+                ),
+            )
+            return self._restore_gtp_remat_qkv_grad(grad, gtp_slice)
+
+        return self.scaled_orthogonalize_fn_with_gtp_remat(p, grad, tp_group, partition_dim)
 
 
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):

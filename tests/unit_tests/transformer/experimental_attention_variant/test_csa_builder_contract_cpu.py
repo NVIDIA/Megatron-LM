@@ -1,12 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Pin main's core-output ownership and static packed-input contract."""
+"""Pin dev CSA output ownership behind the retained main construction interfaces."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer import transformer_config as config_module
 from megatron.core.transformer.experimental_attention_variant import (
     deepseek_v4_hybrid_attention as dsv4,
 )
@@ -28,7 +31,8 @@ class _NoOffload:
 
 
 @pytest.mark.parametrize("fused", [False, True])
-def test_sbhd_wrapper_owns_inverse_rope_for_custom_core(monkeypatch, fused):
+@pytest.mark.parametrize("packed", [False, True])
+def test_wrapper_does_not_repeat_core_inverse_rope(monkeypatch, fused, packed):
     raw = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], requires_grad=True)
     original = raw.detach().clone()
     calls = []
@@ -48,9 +52,11 @@ def test_sbhd_wrapper_owns_inverse_rope_for_custom_core(monkeypatch, fused):
             boundary_hidden=None,
             boundary_kv=None,
         ):
-            assert packed_seq_params is None
+            assert (packed_seq_params is not None) == packed
             assert boundary_hidden is None and boundary_kv is None
-            return raw
+            if fused:
+                return fused_inverse(raw, inverse=True)
+            return torch.cat((raw[..., :2], inverse_rotation(raw[..., 2:], inverse=True)), dim=-1)
 
     def inverse_rotation(value, *args, **kwargs):
         assert kwargs["inverse"] is True
@@ -75,12 +81,14 @@ def test_sbhd_wrapper_owns_inverse_rope_for_custom_core(monkeypatch, fused):
             v_head_dim=4,
             apply_rope_fusion=fused,
             output_projection_lora_rank=4,
+            o_lora_rank=4,
         ),
         pg_collection=SimpleNamespace(cp=group),
         rotary_pos_emb=Rotary(),
         _dsv4_uses_yarn_rope=False,
         num_attention_heads_per_partition=1,
         output_projection_local_groups=1,
+        o_local_groups=1,
         linear_o_group_proj=torch.eye(4),
         linear_proj=lambda value: (value, None),
         get_query_key_value_tensors=lambda *args, **kwargs: (raw,) * 5,
@@ -90,11 +98,14 @@ def test_sbhd_wrapper_owns_inverse_rope_for_custom_core(monkeypatch, fused):
         training=True,
     )
     monkeypatch.setattr(dsv4, "off_interface", lambda enabled, value, name: _NoOffload(value))
-    monkeypatch.setattr(dsv4, "apply_rotary_pos_emb", inverse_rotation)
-    monkeypatch.setattr(dsv4, "fused_mla_rope_inplace", object())
-    monkeypatch.setattr(dsv4, "fused_mla_rope_out_of_place", fused_inverse)
+    monkeypatch.setattr(
+        dsv4, "apply_rotary_pos_emb", lambda *args, **kwargs: pytest.fail("duplicate inverse RoPE")
+    )
 
-    output, bias = dsv4.DSv4HybridAttention.forward(layer, raw, None)
+    packed_params = PackedSeqParams(qkv_format="thd") if packed else None
+    output, bias = dsv4.DSv4HybridAttention.forward(
+        layer, raw, None, packed_seq_params=packed_params
+    )
 
     torch.testing.assert_close(output, torch.tensor([[[1.0, 2.0, 4.0, -3.0]]]))
     torch.testing.assert_close(raw, original)
@@ -104,16 +115,15 @@ def test_sbhd_wrapper_owns_inverse_rope_for_custom_core(monkeypatch, fused):
     torch.testing.assert_close(raw.grad, torch.tensor([[[1.0, 1.0, -1.0, 1.0]]]))
 
 
-def test_dsv4_rejects_packed_native_backend_before_calling_custom_core():
-    with pytest.raises(ValueError, match="requires dsa_kernel_backend='cudnn'"):
+def test_dsv4_rejects_non_thd_context_parallel_input():
+    with pytest.raises(ValueError, match="requires qkv_format='thd'"):
         dsv4.DSv4HybridAttention.forward(
             SimpleNamespace(
                 config=SimpleNamespace(dsa_kernel_backend="none"),
-                pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1)),
+                pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 2)),
             ),
             torch.ones(2, 1, 4),
             None,
-            packed_seq_params=SimpleNamespace(qkv_format="thd"),
         )
 
 
@@ -132,17 +142,23 @@ def _scope_config(**overrides):
 
 
 @pytest.mark.parametrize(
-    "overrides,error,message",
+    "overrides",
     [
-        ({"dynamic_context_parallel": True}, ValueError, "dynamic context parallelism"),
-        ({"hybrid_context_parallel": True}, ValueError, "dynamic context parallelism"),
-        ({"dsa_cp_balance_indexer": True}, ValueError, "balanced CP indexer"),
-        ({"dsa_indexer_precision": "mxfp8"}, ValueError, "MXFP8 indexer"),
+        {"dynamic_context_parallel": True},
+        {"hybrid_context_parallel": True},
+        {"dsa_cp_balance_indexer": True},
+        {"dsa_indexer_precision": "mxfp8"},
     ],
 )
-def test_dsv4_scope_rejects_deferred_options(overrides, error, message):
-    with pytest.raises(error, match=message):
-        TransformerConfig._validate_dsv4_execution_scope(_scope_config(**overrides))
+def test_dsv4_scope_keeps_dev_options_available(overrides):
+    TransformerConfig._validate_dsv4_execution_scope(_scope_config(**overrides))
+
+
+def test_dsv4_rejects_unknown_indexer_precision():
+    with pytest.raises(ValueError, match="dsa_indexer_precision must be"):
+        TransformerConfig._validate_dsv4_execution_scope(
+            _scope_config(dsa_indexer_precision="invalid")
+        )
 
 
 def test_main_sbhd_scope_remains_available():
@@ -159,3 +175,49 @@ def test_dsv4_scope_does_not_disable_other_models_context_parallelism():
     TransformerConfig._validate_dsv4_execution_scope(
         _scope_config(experimental_attention_variant="gdn", context_parallel_size=2)
     )
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_dsv4_retains_dev_runtime_cp_layout_ownership(monkeypatch, dynamic):
+    """The real config keeps uniform per-pack CP instead of selecting main's static converter."""
+    monkeypatch.setattr(config_module, "is_te_min_version", lambda *args, **kwargs: True)
+    monkeypatch.setattr(config_module, "_validate_dsa_kernel_backend_dependencies", lambda *_: None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    cudnn = ModuleType("cudnn")
+
+    def indexer_forward_top_k_wrapper(*, deterministic=False):
+        raise AssertionError("This CPU test only checks configuration, not kernel execution")
+
+    def cp_wrapper(*, q_causal_offsets=None):
+        raise AssertionError("This CPU test only checks configuration, not kernel execution")
+
+    cudnn.DSA = SimpleNamespace(
+        indexer_forward_top_k_wrapper=indexer_forward_top_k_wrapper,
+        indexer_forward_wrapper=cp_wrapper,
+        dense_indexer_score_recompute_wrapper=cp_wrapper,
+        dense_attn_score_recompute_wrapper=cp_wrapper,
+        dense_indexer_backward_wrapper=cp_wrapper,
+    )
+    monkeypatch.setitem(sys.modules, "cudnn", cudnn)
+    config = config_module.MLATransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        multi_latent_attention=True,
+        experimental_attention_variant="dsv4_hybrid",
+        is_hybrid_model=True,
+        add_bias_linear=False,
+        csa_compress_ratios=[4, 0],
+        dsa_kernel_backend="cudnn",
+        context_parallel_size=1 if dynamic else 2,
+        dynamic_context_parallel=dynamic,
+        cp_partition_mode="contiguous",
+        sequence_packing_scheduler="default_dynamic_cp" if dynamic else "dp_balanced",
+        max_seqlen_per_dp_cp_rank=128,
+        dsa_cp_balance_indexer=True,
+    )
+    assert config.dsa_cp_balance_indexer
+    assert config.dynamic_context_parallel == dynamic
+    assert config.cp_partition_mode == config.attention_cp_layout == "contiguous"
+    assert config.linear_cp_mode == "chunkwise"
+    assert not config._linear_cp_layout_explicit

@@ -2,6 +2,7 @@
 
 """Focused tests for the SBHD fused CSA integration surface."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -197,7 +198,7 @@ def test_indexer_topk_pads_to_requested_width_when_compressed_kv_is_short(monkey
     k = torch.zeros(1, 3, 4)
     w = torch.ones(1, 2, 2)
 
-    indices, lengths, _ = fused_csa._indexer_topk_bshd(q, k, w, topk=5, ratio=1)
+    indices, lengths, _, _ = fused_csa._indexer_topk_core(q, k, w, topk=5, ratio=1)
 
     assert indices.shape == (1, 2, 5)
     assert torch.equal(indices[..., :3], torch.tensor([[[0, 1, 2], [0, 1, 2]]]))
@@ -241,7 +242,8 @@ def test_flash_mla_adapter_pads_and_restores_small_head_count(monkeypatch):
 
     monkeypatch.setattr(fused_csa, "_flash_mla_sparse_fwd", fake_flash)
     monkeypatch.setattr(fused_csa, "_get_head_padding", lambda _heads: 64)
-    monkeypatch.setattr(fused_csa, "_get_topk_alignment", lambda: 1)
+    monkeypatch.setattr(fused_csa, "get_flash_mla_topk_alignment", lambda: 1)
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda *_args: nullcontext())
 
     q = torch.randn(3, 2, 8)
     kv = torch.randn(5, 8)
@@ -341,11 +343,12 @@ def test_fused_dense_training_uses_full_teacher_and_compact_indices_for_backward
 
     monkeypatch.setattr(
         fused_csa,
-        "_indexer_topk_bshd",
+        "_indexer_topk_core",
         lambda *_args, **_kwargs: (
             selected.clone(),
             (selected >= 0).sum(dim=-1).int(),
             indexer_scores.clone(),
+            None,
         ),
     )
 
@@ -468,11 +471,12 @@ def test_sparse_indexer_backward_preserves_invalid_minus_one(monkeypatch):
 
     monkeypatch.setattr(
         fused_csa,
-        "_indexer_topk_bshd",
+        "_indexer_topk_core",
         lambda *_args, **_kwargs: (
             selected.clone(),
             (selected >= 0).sum(dim=-1).int(),
             torch.zeros(batch, seqlen, compressed_rows),
+            None,
         ),
     )
     monkeypatch.setattr(
@@ -557,9 +561,10 @@ def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
             selected,
             (selected >= 0).sum(dim=-1).int(),
             torch.zeros(batch, seqlen, compressed_rows),
+            None,
         )
     )
-    monkeypatch.setattr(fused_csa, "_indexer_topk_bshd", topk_call)
+    monkeypatch.setattr(fused_csa, "_indexer_topk_core", topk_call)
 
     # Use a differentiable toy attention to exercise the actual custom autograd
     # function without requiring either GPU backend.
@@ -567,14 +572,13 @@ def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
         out = q + kv.mean(dim=0) + attn_sink.view(1, -1, 1)
         return out, q.new_zeros(q.shape[:2]), None
 
-    def fake_attention_backward(q, kv, _out, d_out, _lse, _sink, *_args):
+    def fake_attention_backward(q, kv, _out, d_out, _lse, _sink, *_args, **_kwargs):
         d_kv = d_out.sum(dim=(0, 1)).unsqueeze(0).expand_as(kv) / kv.shape[0]
-        return d_out.clone(), d_kv, d_out.sum(dim=(0, 2))
+        return {"dq": d_out.clone(), "dkv": d_kv, "d_sink": d_out.sum(dim=(0, 2))}
 
     attention_forward = MagicMock(side_effect=fake_attention_forward)
     attention_backward = MagicMock(side_effect=fake_attention_backward)
     monkeypatch.setattr(fused_csa, "_csa_fwd_flash_mla", attention_forward)
-    monkeypatch.setattr(fused_csa, "_csa_sparse_attention_backward", attention_backward)
 
     unexpected = MagicMock(side_effect=AssertionError("disabled indexer loss performed loss work"))
     for name in (
@@ -591,7 +595,9 @@ def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
         fused_csa,
         "_DSA",
         SimpleNamespace(
-            indexer_backward_wrapper=unexpected, dense_indexer_backward_wrapper=unexpected
+            indexer_backward_wrapper=unexpected,
+            dense_indexer_backward_wrapper=unexpected,
+            sparse_attention_backward_wrapper=attention_backward,
         ),
     )
 
@@ -644,13 +650,17 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
     module.softmax_scale = 0.5
     module.attn_sink = nn.Parameter(torch.zeros(2))
     module.num_attention_heads = module.attn_sink.numel()
+    module.n_local_heads = module.num_attention_heads
     module.layer_number = 1
+    module.pg_collection = SimpleNamespace(cp=None)
     module.config = SimpleNamespace(
         dsa_indexer_loss_coeff=0.0,
         dsa_indexer_use_sparse_loss=False,
         calculate_per_token_loss=False,
         num_layers=1,
         mtp_num_layers=0,
+        dsa_indexer_precision="bf16",
+        deterministic_mode=False,
     )
 
     class FakeCompressor:
@@ -661,12 +671,16 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
         index_topk = 2
         softmax_scale = 0.25
 
-        def forward_before_topk(self, x, qr):
+        def forward_before_topk(self, x, qr, packed_seq_params):
             return (x.new_zeros(4, 1, 2, 2), x.new_zeros(1, 1, 2), qr.new_zeros(4, 1, 2))
 
     module.__dict__["compressor"] = FakeCompressor()
     module.__dict__["indexer"] = FakeIndexer()
     module.train()
+    monkeypatch.setattr(module, "_get_bshd_compact_indexer_workspace", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        csa_module, "_OutputInverseRope", lambda *_a, **_k: SimpleNamespace(fused_params=object())
+    )
 
     expected = torch.randn(4, 1, 6)
     fused_call = MagicMock(return_value=(expected, torch.tensor(0.0)))
@@ -700,11 +714,11 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
     fused_call.assert_called_once()
 
 
-def test_public_surface_is_csa_namespaced_and_sbhd_only():
+def test_public_surface_is_csa_namespaced_and_keeps_dev_cp_entrypoint():
     assert "csa_sparse_attn" in fused_csa.__all__
     assert "fused_csa_indexer_sparse_attn" in fused_csa.__all__
     assert not hasattr(fused_csa, "dsa_sparse_attn")
-    assert not hasattr(fused_csa, "FusedCSAIndexerSparseAttnFromTopkFunc")
+    assert hasattr(fused_csa, "FusedCSAIndexerSparseAttnFromTopkFunc")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

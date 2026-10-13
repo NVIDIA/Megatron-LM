@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import argparse
+import inspect
 import logging
 import math
 import os
@@ -1977,11 +1978,20 @@ class TransformerConfig(ModelParallelConfig):
                 else (
                     "chunkwise"
                     if variant in ("gdn", "gated_delta_net", "kda")
-                    or (self.is_hybrid_model and variant not in ("gdn2", "dsv4_hybrid"))
+                    or (self.is_hybrid_model and variant != "gdn2")
                     else "headwise"
                 )
             )
         self._linear_cp_layout_explicit = self.linear_cp_layout is not None
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            # Preserve dev's uniform runtime-CP ownership for DSv4. Migrating dynamic
+            # and balanced indexer routes to the newer per-layer layout manager is a
+            # separate refactor; the attention modules already own these boundaries.
+            if self.linear_cp_layout not in (None, self.attention_cp_layout) and (
+                self.context_parallel_size > 1 or self.dynamic_context_parallel
+            ):
+                raise ValueError("DSv4 requires a uniform attention/linear CP layout.")
+            self._linear_cp_layout_explicit = False
         if self.linear_cp_layout is None:
             self.linear_cp_layout = "zigzag"
         if hasattr(self, "o_groups"):
@@ -1999,16 +2009,13 @@ class TransformerConfig(ModelParallelConfig):
                 setattr(self, legacy, canonical_value)
 
     def _validate_dsv4_execution_scope(self) -> None:
-        """Reject deferred DSv4 extensions before generic layout/backend validation."""
+        """Validate dev indexer choices before the shared layout/backend checks."""
         if self.experimental_attention_variant != "dsv4_hybrid":
             return
-        if self.dynamic_context_parallel or self.hybrid_context_parallel:
-            raise ValueError("DSv4 dynamic context parallelism is not supported yet.")
-        if self.dsa_cp_balance_indexer:
-            raise ValueError("The DSv4 balanced CP indexer is deferred.")
-        if self.dsa_indexer_precision != "bf16":
+        if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
             raise ValueError(
-                "DSv4 MXFP8 indexer extensions are deferred; use dsa_indexer_precision='bf16'."
+                "dsa_indexer_precision must be 'bf16' or 'mxfp8', "
+                f"got {self.dsa_indexer_precision!r}"
             )
 
     def _validate_cp_layouts(self) -> None:
@@ -2027,7 +2034,11 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
             )
-        if self.linear_cp_layout == "contiguous" and self.dynamic_context_parallel:
+        if (
+            self._linear_cp_layout_explicit
+            and self.linear_cp_layout == "contiguous"
+            and self.dynamic_context_parallel
+        ):
             raise ValueError(
                 "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
             )
@@ -2594,14 +2605,23 @@ class TransformerConfig(ModelParallelConfig):
                     "cp_comm_type=allgather only."
                 )
         elif self.experimental_attention_variant == "dsv4_hybrid":
+            if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
+                raise ValueError(
+                    "dsa_indexer_precision must be 'bf16' or 'mxfp8', "
+                    f"got {self.dsa_indexer_precision!r}"
+                )
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
             mtp_layers = self.mtp_num_layers or 0
-            minimum_len = self.num_layers + mtp_layers
-            assert len(self.csa_compress_ratios) >= minimum_len, (
+            # Minimum length is num_layers + mtp_num_layers (the GPT path uses exactly this,
+            # where mtp_num_layers == #MTP transformer layers). On HybridModel an MTP "depth"
+            # can expand to MULTIPLE hybrid layers, so mtp_num_layers (= depth count) undercounts
+            # the real MTP layers and csa_compress_ratios must be at least long enough to index
+            # every MTP attention layer (num_layers + layer_number - 1). Hence ">=", not "==".
+            expected_len = self.num_layers + mtp_layers
+            assert len(self.csa_compress_ratios) >= expected_len, (
                 f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must be at least "
-                f"num_layers + mtp_num_layers "
-                f"({self.num_layers} + {mtp_layers} = {minimum_len})"
+                f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
             )
             assert all(
                 ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
@@ -2609,25 +2629,42 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
-            if self.context_parallel_size > 1 and self.attention_cp_layout != "contiguous":
-                raise ValueError(
-                    "DSv4 context parallelism requires attention_cp_layout=contiguous."
-                )
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
+            self.hetereogenous_dist_checkpoint = True
+
+            uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
+            indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
+            uses_mxfp8_indexer = uses_ratio4_indexer and self.dsa_indexer_precision == "mxfp8"
+            if uses_mxfp8_indexer and self.dsa_kernel_backend != "cudnn":
+                raise ValueError("MXFP8 DSA indexer precision requires dsa_kernel_backend='cudnn'")
+
             if self.dsa_kernel_backend == "tilelang":
                 raise ValueError(
                     "dsv4_hybrid does not support dsa_kernel_backend='tilelang'; use 'cudnn' "
                     "for fused CSA kernels or 'none' for the PyTorch fallback."
                 )
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+
             if self.dsa_kernel_backend == "cudnn":
                 sm = torch.cuda.get_device_capability()
                 assert sm[0] >= 9, (
-                    "dsa_kernel_backend='cudnn' requires SM90+ (Hopper or later), "
+                    f"dsa_kernel_backend='cudnn' requires SM90+ (Hopper or later), "
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
-                uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
-                indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
+                if uses_mxfp8_indexer:
+                    if sm[0] < 10:
+                        raise ValueError("MXFP8 compact DSA indexer requires SM100 or later")
+                    if self.dsa_indexer_n_heads != 64 or self.dsa_indexer_head_dim != 128:
+                        raise ValueError(
+                            "MXFP8 compact DSA indexer requires dsa_indexer_n_heads=64 and "
+                            "dsa_indexer_head_dim=128"
+                        )
+                    if indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
+                        raise ValueError(
+                            "MXFP8 DSA indexer loss supports only sparse loss; set "
+                            "dsa_indexer_use_sparse_loss=True"
+                        )
+
                 if (
                     sm[0] == 9
                     and uses_ratio4_indexer
@@ -2639,7 +2676,60 @@ class TransformerConfig(ModelParallelConfig):
                         "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
                         "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
                     )
-            self.hetereogenous_dist_checkpoint = True
+
+                from cudnn import DSA
+
+                if sm[0] >= 10 and uses_ratio4_indexer:
+                    compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
+                    required_parameters = {"deterministic"}
+                    if uses_mxfp8_indexer:
+                        required_parameters.update(
+                            {
+                                "precision",
+                                "q_scale",
+                                "k_scale",
+                                "cu_seqlens_q_scale_padded",
+                                "cu_seqlens_k_scale_padded",
+                                "sf_vec_size",
+                            }
+                        )
+                    wrapper_parameters = (
+                        set(inspect.signature(compact_wrapper).parameters)
+                        if callable(compact_wrapper)
+                        else set()
+                    )
+                    missing_parameters = required_parameters - wrapper_parameters
+                    if missing_parameters:
+                        raise ValueError(
+                            "Fused DSA indexer requires a compatible cuDNN Frontend compact "
+                            "wrapper; "
+                            f"missing parameters: {', '.join(sorted(missing_parameters))}"
+                        )
+
+                if (
+                    self.context_parallel_size > 1 or self.dynamic_context_parallel
+                ) and uses_ratio4_indexer:
+                    required_wrappers = [DSA.indexer_forward_wrapper]
+                    if indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
+                        required_wrappers.extend(
+                            [
+                                DSA.dense_indexer_score_recompute_wrapper,
+                                DSA.dense_attn_score_recompute_wrapper,
+                                DSA.dense_indexer_backward_wrapper,
+                            ]
+                        )
+                    missing_offsets = [
+                        wrapper.__name__
+                        for wrapper in required_wrappers
+                        if "q_causal_offsets" not in inspect.signature(wrapper).parameters
+                    ]
+                    if missing_offsets:
+                        raise ValueError(
+                            "DSv4 CP with ratio-4 fused DSA requires cuDNN Frontend wrappers "
+                            "with q_causal_offsets support; missing from: "
+                            f"{', '.join(missing_offsets)}. Install a compatible cuDNN Frontend "
+                            "build or set dsa_kernel_backend='none'."
+                        )
 
         if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
             raise NotImplementedError(
