@@ -1275,6 +1275,11 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             query.size(1), query.size(0), key.size(0), use_triton, key_chunk_override=key_chunk_size
         ).routing_key_chunk
         _validate_query_positions(query_positions, query.size(0), query_chunk_size)
+        # An empty weight is how dsa_min_memory_gqa encodes "no learned K" across the Function
+        # boundary, where None is not expressible. Everything downstream spells that case None
+        # and scores against the attention keys directly, so translate once here; projecting an
+        # empty weight instead reaches F.linear and raises a size mismatch.
+        learned_k_weight = linear_k_weight if linear_k_weight.numel() > 0 else None
         routing_topk_cache = [] if cache_routing else None
         selected_scores_cache = [] if cache_selected_scores else None
         with _triton_dispatch_enabled(use_triton):
@@ -1289,17 +1294,21 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                 # Under context parallelism the result must span the *gathered* sequence, to
                 # match the global key set topk_indices address. The helper reduces to the
                 # plain chunked projection when there is no CP group.
-                full_k_index = _project_full_indexer_k(
-                    hidden_states,
-                    linear_k_weight,
-                    index_head_dim,
-                    index_rotary_dim,
-                    rotary_pos_emb,
-                    rotary_interleaved,
-                    use_indexer_rope,
-                    simplified_input_norm,
-                    pg_collection,
-                    contiguous=cp_layout_contiguous,
+                full_k_index = (
+                    _project_full_indexer_k(
+                        hidden_states,
+                        learned_k_weight,
+                        index_head_dim,
+                        index_rotary_dim,
+                        rotary_pos_emb,
+                        rotary_interleaved,
+                        use_indexer_rope,
+                        simplified_input_norm,
+                        pg_collection,
+                        contiguous=cp_layout_contiguous,
+                    )
+                    if learned_k_weight is not None
+                    else None
                 )
                 output, indexer_loss = _simplified_sparse_forward_impl(
                     query,
@@ -1322,7 +1331,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     simplified_input_norm,
                     routing_topk_cache=routing_topk_cache,
                     selected_scores_cache=selected_scores_cache,
-                    linear_k_weight=linear_k_weight,
+                    linear_k_weight=learned_k_weight,
                     full_k_index=full_k_index,
                     query_positions=query_positions,
                 )
@@ -1364,13 +1373,16 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             ctx.saved_tensors
         )
         full_k_index = cached_k if cached_k.numel() > 0 else None
+        # Same "no learned K" encoding the forward translates; the recompute below has to spell
+        # it the same way or it reprojects an empty weight.
+        learned_k_weight = linear_k_weight if linear_k_weight.numel() > 0 else None
         sq, batch_size, num_query_heads, _ = query.shape
         # Mirror the forward's normalization: sq is this rank's shard, and the indexer loss is a
         # mean over the whole sequence, so the divisor is the global token count. Dividing by the
         # local count makes every rank's gradient cp_size too large, which the logged loss never
         # reveals because only the backward is wrong.
         total_positions = batch_size * sq * _cp_group_size(ctx.pg_collection)
-        if full_k_index is None:
+        if full_k_index is None and learned_k_weight is not None:
             # Not retained from the forward, so project it once here for the same reason the
             # forward does: the tile loop below would otherwise reproject the causal prefix per
             # tile. This is the recompute the empty cached_k asked for, done once rather than
@@ -1378,7 +1390,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             with torch.no_grad():
                 full_k_index = _build_full_indexer_k(
                     hidden_states,
-                    linear_k_weight,
+                    learned_k_weight,
                     ctx.index_head_dim,
                     ctx.index_rotary_dim,
                     ctx.rotary_pos_emb,
@@ -1466,7 +1478,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             ctx.indexer_score_scale,
                             ctx.key_chunk_size,
                             ctx.simplified_input_norm,
-                            linear_k_weight=linear_k_weight,
+                            linear_k_weight=learned_k_weight,
                             full_k_index=full_k_index,
                             q_pos_start=q_start,
                         )
