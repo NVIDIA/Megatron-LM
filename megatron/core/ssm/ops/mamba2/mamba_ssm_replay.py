@@ -54,12 +54,9 @@ NULL_SLOT_ID = -1
 
 # ---------------------------------------------------------------------------
 # Launch-config selection (ported from replayssm_config.py; spec kernels only).
-# Hard-coded heuristics rather than @triton.autotune: autotuning benchmarks every
-# candidate config by re-running the kernel on the live arguments, and the flush
-# kernel updates the SSM checkpoint in place, so each benchmark run would fold the
-# history into it again (avoiding that needs `restore_value` copies of the whole
-# checkpoint). Fixed configs also make the selection deterministic and add no
-# tuning latency to the first eager decode step at each new batch size.
+# Hard-coded configs, not @triton.autotune: autotuning re-runs the kernel on its live
+# arguments and the flush kernel updates the SSM state in place, so tuning a shape first
+# seen while serving would corrupt real requests' state.
 # ---------------------------------------------------------------------------
 _config_overrides: dict = {}
 
