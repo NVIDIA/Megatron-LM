@@ -66,7 +66,8 @@ class ImplConfig:
     optimizer_config: OptimizerConfig | None = None
     # Magi CP dispatch chunk (tokens; batch padded to chunk*cp), FP32 dK group-reduce, and the kernel
     # backend of the dense layers' native calc_attn. ``fa4`` is the production path; ``sdpa_ol`` is
-    # retained for tests only and materialises [H, S, S] logits in backward.
+    # retained for tests only and materialises [H, S, S] logits in backward. ``fa4_varlen`` (cp=1) calls
+    # flash_attn.cute varlen directly, as mm_megatron_forward does.
     magi_chunk_size: int = 2048
     magi_high_precision_reduce: bool = False
     magi_dense_kernel_backend: str = "fa4"
@@ -275,7 +276,8 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
     )
     import os
 
-    os.environ.setdefault("MAGI_ATTENTION_KERNEL_BACKEND", magi_settings.dense_kernel_backend)
+    if magi_settings.dense_kernel_backend != "fa4_varlen":
+        os.environ.setdefault("MAGI_ATTENTION_KERNEL_BACKEND", magi_settings.dense_kernel_backend)
     if magi_settings.dense_kernel_backend == "fa4":
         # FA4 rejects a non-zero SM margin (Magi defaults to 4 when CUDA_DEVICE_MAX_CONNECTIONS > 1)
         os.environ.setdefault("MAGI_ATTENTION_FFA_FORWARD_SM_MARGIN", "0")

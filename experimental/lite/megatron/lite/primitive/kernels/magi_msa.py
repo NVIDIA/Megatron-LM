@@ -83,7 +83,7 @@ class MagiMsaSettings:
 
     chunk_size: int = 2048  # CP dispatch granularity (tokens); total tokens are padded to chunk_size * cp
     high_precision_reduce: bool = False  # FP32 required-dK group-reduce in backward
-    dense_kernel_backend: str = "fa4"  # MAGI_ATTENTION_KERNEL_BACKEND for the dense layers' calc_attn (fa4 | sdpa_ol)
+    dense_kernel_backend: str = "fa4"  # dense layers' kernel: Magi calc_attn (fa4 | sdpa_ol) or flash_attn.cute varlen direct (fa4_varlen, cp=1)
     deterministic: bool = False  # ordered msa_v1 backward (bitwise-reproducible, slower)
 
 
@@ -202,6 +202,7 @@ class MagiMsaContext:
     pad: int
     max_seqlen: int
     position_ids: torch.Tensor  # int64 [T_local]
+    dense_fa4: tuple[torch.Tensor, bool] | None = None  # (cu_seqlens, deterministic) for dense_kernel_backend="fa4_varlen"
 
     @property
     def local_tokens(self) -> int:
@@ -215,6 +216,10 @@ class MagiMsaContext:
         """``packed_seq_params`` for ``GQAttention``'s generic ``attention_backend="magi"`` path."""
         from types import SimpleNamespace
 
+        if self.dense_fa4 is not None:
+            return SimpleNamespace(
+                qkv_format="magi", fa4_varlen=self.dense_fa4, max_seqlen_q=self.max_seqlen, max_seqlen_kv=self.max_seqlen
+            )
         if self.dense_key is None:
             raise RuntimeError("MagiMsaContext has no dense_key; plan_magi_batch(need_dense_key=True) is required")
         return SimpleNamespace(
@@ -264,7 +269,12 @@ def plan_magi_batch(
     key = m.msa.make_magi_msa_key(list(cu_seqlens), group, config=msa_config, dispatch_config=dcfg)
     position_ids = m.msa.get_position_ids(key).to(torch.int64)
     dense_key = None
-    if need_dense_key:
+    dense_fa4 = None
+    if need_dense_key and settings.dense_kernel_backend == "fa4_varlen":
+        if ps.cp_size != 1:
+            raise ValueError("dense_kernel_backend='fa4_varlen' requires cp=1")
+        dense_fa4 = (torch.tensor(cu_seqlens, dtype=torch.int32, device=position_ids.device), settings.deterministic)
+    elif need_dense_key:
         cu_t = torch.tensor(cu_seqlens, dtype=torch.int32, device=position_ids.device)
         dense_key = m.magi_attn_varlen_key(
             cu_t,
@@ -296,6 +306,7 @@ def plan_magi_batch(
         pad=pad,
         max_seqlen=max(seq_lens),
         position_ids=position_ids,
+        dense_fa4=dense_fa4,
     )
 
 
