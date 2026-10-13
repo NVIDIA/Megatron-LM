@@ -394,6 +394,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
 
+        self.add_module("residual_read_self_attn", None)
+
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
         self.input_layernorm = submodules.input_layernorm(
@@ -429,6 +431,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             name=(name + ".self_attention") if name is not None else None,
         )
 
+        self.add_module("residual_write_self_attn", None)
+
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
 
@@ -453,6 +457,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         # [Module 6: BiasDropoutFusion]
         self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config)
+
+        self.add_module("residual_read_mlp", None)
 
         # [Module 7: Pre MLP] Optional Layernorm before MLP
         self.pre_mlp_layernorm = submodules.pre_mlp_layernorm(
@@ -494,6 +500,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         )
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
+
+        self.add_module("residual_write_mlp", None)
 
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
