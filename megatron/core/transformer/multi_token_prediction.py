@@ -1,6 +1,7 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import inspect
 import warnings
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
@@ -795,8 +796,13 @@ def _compute_mtp_acceptance_counts(
     mtp_labels: Tensor,
     loss_mask: Tensor,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    preds: Optional[Tensor] = None,
 ) -> tuple[Tensor, Tensor]:
-    """Compute MTP acceptance correct/total counts."""
+    """Compute MTP acceptance correct/total counts.
+
+    ``preds`` is the argmax of ``mtp_logits`` over the full vocabulary, [s, b], when the loss
+    already found it; otherwise it is computed here.
+    """
     with torch.no_grad():
         if (
             tp_group is None
@@ -809,10 +815,11 @@ def _compute_mtp_acceptance_counts(
             )
         tp_size = torch.distributed.get_world_size(group=tp_group) if tp_group is not None else 1
 
-        if tp_size > 1:
-            preds = _vocab_parallel_argmax(mtp_logits, tp_group, tp_size)
-        else:
-            preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
+        if preds is None:
+            if tp_size > 1:
+                preds = _vocab_parallel_argmax(mtp_logits, tp_group, tp_size)
+            else:
+                preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
 
         labels_match = mtp_labels.transpose(0, 1).contiguous()  # [b, s] => [s, b]
         mask_match = loss_mask.transpose(0, 1).contiguous()  # [b, s] => [s, b]
@@ -1078,6 +1085,14 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+def _accepts_return_argmax(compute_language_model_loss: Callable) -> bool:
+    """Whether the loss callable takes ``return_argmax`` (LanguageModule's loss does)."""
+    try:
+        return "return_argmax" in inspect.signature(compute_language_model_loss).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Tensor,
@@ -1179,6 +1194,9 @@ def process_mtp_loss(
 
     cumulative_mtp_input_mask = None
     rolled_num_tokens = original_num_tokens
+    # LanguageModule's loss can return the argmax of the logits from its cross entropy, which
+    # spares the acceptance metric a pass over them.
+    loss_returns_argmax = is_training and _accepts_return_argmax(compute_language_model_loss)
     if mtp_input_mask is not None:
         assert mtp_input_mask.shape == loss_mask.shape, (
             f"mtp_input_mask shape {mtp_input_mask.shape} must match "
@@ -1261,7 +1279,13 @@ def process_mtp_loss(
                 # no-mask fast path for all non-multimodal MTP callers.
                 num_tokens = rolled_num_tokens
 
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        mtp_preds = None
+        if loss_returns_argmax:
+            mtp_loss, mtp_preds = compute_language_model_loss(
+                mtp_labels, mtp_logits, return_argmax=True
+            )
+        else:
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
 
         mtp_loss = layer_loss_mask * mtp_loss
 
@@ -1270,7 +1294,7 @@ def process_mtp_loss(
                 torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
             correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits, mtp_labels, layer_loss_mask, tp_group=tp_group
+                mtp_logits, mtp_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
             )
 
             if metric_avg_group is None:
