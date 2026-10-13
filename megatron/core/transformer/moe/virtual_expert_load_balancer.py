@@ -25,7 +25,7 @@ from megatron.core.fp8_utils import is_mxfp8tensor
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 
 try:
-    from megatron.core.transformer.moe.virtual_expert_triton import (
+    from megatron.core.transformer.moe.ops.virtual_expert_triton import (
         MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
         VirtualExpertPlannerWorkspace,
         launch_virtual_expert_grad_reduce,

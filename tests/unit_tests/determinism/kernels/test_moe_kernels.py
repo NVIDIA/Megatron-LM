@@ -34,13 +34,13 @@ from megatron.core.transformer.moe.experts import (
     _te_supports_scaled_tanh_srelu,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.ops.virtual_expert_triton import VirtualExpertPlannerWorkspace
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     VirtualExpertLoadBalancer,
     plan_virtual_expert_routes,
 )
-from megatron.core.transformer.moe.virtual_expert_triton import VirtualExpertPlannerWorkspace
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version

@@ -327,7 +327,7 @@ Triton kernels, a virtual-expert dispatcher, and Transformer Engine's grouped ex
   probabilities, starts planning and weight prefetch, then supplies remapped runtime expert
   IDs to HybridEP. HybridEP handles token dispatch and combine using a fixed receive capacity
   calculated to cover the balanced workload and padding.
-- **Triton kernels:** [virtual_expert_triton.py](virtual_expert_triton.py) implements planning,
+- **Triton kernels:** [virtual_expert_triton.py](ops/virtual_expert_triton.py) implements planning,
   selected-weight prefetch, and replica-gradient reduction. The planner combines histogram
   construction, cross-rank histogram exchange, placement, and route remapping in one cooperative
   kernel launch. Separate transport kernels push selected weights into peer virtual slots and

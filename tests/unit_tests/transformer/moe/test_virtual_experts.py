@@ -56,9 +56,9 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.moe import fused_a2a, moe_utils
 from megatron.core.transformer.moe import router as router_module
-from megatron.core.transformer.moe import virtual_expert_triton as vt
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
+from megatron.core.transformer.moe.ops import virtual_expert_triton as vt
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer

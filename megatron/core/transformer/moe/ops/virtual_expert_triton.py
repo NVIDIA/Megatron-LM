@@ -937,6 +937,7 @@ def _source_scratch(device_index: int, entries: int) -> torch.Tensor:
 
 def _launch_with_descriptor_allocator(kernel, *args, **kwargs):
     """Scope Triton's allocator override to this launch, including exception paths."""
+
     def launch():
         triton.set_allocator(
             lambda size, alignment, stream: torch.empty(size, dtype=torch.int8, device="cuda")

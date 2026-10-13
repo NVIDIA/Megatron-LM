@@ -319,7 +319,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- MoE
     KernelEntry(
         name="virtual_expert_planner",
-        sources=("megatron/core/transformer/moe/virtual_expert_triton.py",),
+        sources=("megatron/core/transformer/moe/ops/virtual_expert_triton.py",),
         tests=(
             K + "test_moe_kernels.py",
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
