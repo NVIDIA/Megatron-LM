@@ -10,6 +10,7 @@ is skipped, while the downstream H_res / H_post / BDA kernels are unchanged.
 
 import pytest
 import torch
+import torch._dynamo
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import (
@@ -63,6 +64,10 @@ class TestIdentityHyperConnectionModule:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        # iHC's constant H_res adds requires_grad=False guard variants to the shared
+        # torch.compile'd mHC kernels; drop them so later tests in the same process do
+        # not hit the recompile limit and silently fall back to eager mid-comparison.
+        torch._dynamo.reset()
 
     def _make_module(self, identity=True, hidden_size=64, num_streams=4, **extra):
         config = _make_config(identity, hidden_size, num_streams, **extra)
@@ -273,6 +278,10 @@ class TestIdentityHyperConnectionTransformerLayer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        # iHC's constant H_res adds requires_grad=False guard variants to the shared
+        # torch.compile'd mHC kernels; drop them so later tests in the same process do
+        # not hit the recompile limit and silently fall back to eager mid-comparison.
+        torch._dynamo.reset()
 
     def _make_layer(self, hidden_size=64, num_streams=4, **extra):
         config = _make_config(True, hidden_size, num_streams, **extra)
