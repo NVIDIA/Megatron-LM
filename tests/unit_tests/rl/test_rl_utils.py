@@ -58,6 +58,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import RLConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
+from megatron.training.state import TrainState
 from tests.unit_tests.test_utilities import Utils
 
 BATCH = 2
@@ -463,6 +464,7 @@ class TestRLUtils:
         get_environment_rollouts to consume banked groups without inference."""
         n_prompts = 4
         fake_groups = [[f"group_{i}"] for i in range(n_prompts)]
+        train_state = TrainState(iteration=1)
         loop = asyncio.new_event_loop()
 
         async def gen():
@@ -478,7 +480,8 @@ class TestRLUtils:
         monkeypatch.setattr(rl_utils, "colocated_inference", colocated)
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", rollout_generator)
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
-        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(curr_iteration=1))
+        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace())
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
         monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
@@ -564,13 +567,15 @@ class TestRLUtils:
         with pytest.raises(SystemExit):
             parse_args(ignore_unknown_args=False)
 
-    def _patch_rl_inference_mode_deps(self, monkeypatch, args, rl_config):
+    def _patch_rl_inference_mode_deps(self, monkeypatch, args, rl_config, *, iteration=0):
         interface = MagicMock()
         interface.resume.return_value = object()
         interface.suspend.return_value = object()
         loop = SimpleNamespace(run_until_complete=MagicMock())
+        train_state = TrainState(iteration=iteration)
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
         monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(
@@ -622,13 +627,12 @@ class TestRLUtils:
         model = [SimpleNamespace(config=config, module=lang_module)]
         args = SimpleNamespace(
             num_experts=num_experts,
-            curr_iteration=11,
             cuda_graph_impl="local",
             cuda_graph_modules=[CudaGraphModule.attn],
             inference_cuda_graph_scope=InferenceCudaGraphScope.block,
         )
         interface, _ = self._patch_rl_inference_mode_deps(
-            monkeypatch, args, RLConfig(rl_training_cuda_graphs=False)
+            monkeypatch, args, RLConfig(rl_training_cuda_graphs=False), iteration=11
         )
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
         monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
@@ -644,6 +648,7 @@ class TestRLUtils:
             call(lang_module, "local"),
             call(lang_module, "none"),
         ]
+        interface.set_generation_epoch.assert_called_once_with(11)
         expected_modules = (
             [
                 CudaGraphModule.mamba,
@@ -676,12 +681,9 @@ class TestRLUtils:
         eval_only/* wandb path. --skip-train alone still runs the RL loop with monotonically
         advancing iteration, so its evals log against the global step (see PR #6043)."""
         args = SimpleNamespace(
-            do_train=do_train,
-            skip_train=skip_train,
-            world_size=1,
-            cuda_graph_impl="none",
-            seq_length=SEQ,
+            skip_train=skip_train, world_size=1, cuda_graph_impl="none", seq_length=SEQ
         )
+        train_state = TrainState(do_train=do_train)
         rl_config = RLConfig(
             rl_prompts_per_eval=1,
             rl_default_temperature=1.0,
@@ -693,6 +695,7 @@ class TestRLUtils:
         wandb_writer = MagicMock()
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
         monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
         monkeypatch.setattr(
             rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())

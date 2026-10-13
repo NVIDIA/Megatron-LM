@@ -70,6 +70,7 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
 @pytest.mark.parametrize("restored_samples", [0, 8, 32])
 def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restored_samples):
     from megatron.training import training
+    from megatron.training.state import TrainState
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -78,9 +79,10 @@ def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restor
     args.load = "checkpoint"
     args.data_parallel_size = 1
     args.micro_batch_size = 1
-    args.consumed_train_samples = 0
+    train_state = TrainState()
     model = [SimpleNamespace()]
     monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_train_state", lambda: train_state)
     monkeypatch.setattr(training, "get_timers", Mock())
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
     monkeypatch.setattr(training, "has_nvidia_modelopt", False)
@@ -91,7 +93,7 @@ def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restor
 
     def restore(*unused_args, **unused_kwargs):
         assert unused_kwargs["restore_training_state"] is True
-        args.consumed_train_samples = restored_samples
+        train_state.consumed_train_samples = restored_samples
         events.append("load")
         return 7, 0
 

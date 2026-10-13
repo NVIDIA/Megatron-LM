@@ -39,6 +39,7 @@ from megatron.training.checkpointing import (
 )
 from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
+from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -557,9 +558,6 @@ def create_ckpt_load_args(create_args):
     """Setup dummy args allowing checkpoint load."""
     args = create_args
     args.auto_detect_ckpt_format = False
-    args.consumed_train_samples = 0
-    args.skipped_train_samples = 0
-    args.consumed_valid_samples = 0
     args.num_layers = 1
     args.hidden_size = 2
     args.num_attention_heads = 1
@@ -834,11 +832,16 @@ def test_load_checkpoint_override_opt_param_scheduler(
     args.min_lr = 0.1
     args.decoupled_lr = 0.5
     args.decoupled_min_lr = 0.05
-    args.consumed_train_samples = 42
+    train_state = TrainState(consumed_train_samples=42)
 
-    with TempNamedDir(
-        tmp_path_dist_ckpt / "test_load_checkpoint_override_opt_param_scheduler", sync=True
-    ) as ckpt_dir:
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_train_state", return_value=train_state
+        ) as get_train_state,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "test_load_checkpoint_override_opt_param_scheduler", sync=True
+        ) as ckpt_dir,
+    ):
         args.load = ckpt_dir
         args.save = ckpt_dir
         args.save_tokenizer_assets = False
@@ -875,6 +878,8 @@ def test_load_checkpoint_override_opt_param_scheduler(
         )
 
         # Load checkpoint and verify runtime overrides are restored.
+        train_state = TrainState()
+        get_train_state.return_value = train_state
         loaded_iter, loaded_flops = load_checkpoint(
             [new_model],
             new_optimizer,
@@ -888,7 +893,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert new_optimizer.param_groups[0]["min_lr"] == args.min_lr
         assert new_optimizer.param_groups[1]["max_lr"] == args.decoupled_lr
         assert new_optimizer.param_groups[1]["min_lr"] == args.decoupled_min_lr
-        assert new_opt_param_scheduler.num_steps == args.consumed_train_samples
+        assert new_opt_param_scheduler.num_steps == train_state.consumed_train_samples == 42
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
         # Ensure loading without optimizer/scheduler remains safe.
@@ -1006,8 +1011,13 @@ def test_checkpoint_load_without_microbatch_calculator(
     args.bf16 = False
     args.hidden_size = 32
     args.num_attention_heads = 4
-    args.consumed_train_samples = 123 * args.global_batch_size
-    with TempNamedDir(tmp_path_dist_ckpt / "inference_checkpoint", sync=True) as ckpt_dir:
+    train_state = TrainState(consumed_train_samples=123 * args.global_batch_size)
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_train_state", return_value=train_state
+        ) as get_train_state,
+        TempNamedDir(tmp_path_dist_ckpt / "inference_checkpoint", sync=True) as ckpt_dir,
+    ):
         args.load = ckpt_dir
         args.save = ckpt_dir
         args.save_tokenizer_assets = False
@@ -1046,15 +1056,10 @@ def test_checkpoint_load_without_microbatch_calculator(
         is_inference = load_mode in ("default", "inference")
         args.phase_transition_iterations = [100] if is_inference else None
         args.no_load_optim = True
-        args.consumed_train_samples = 0
+        train_state = None if is_inference else TrainState()
+        get_train_state.return_value = train_state
         if is_inference:
-            for name in (
-                "global_batch_size",
-                "micro_batch_size",
-                "consumed_train_samples",
-                "skipped_train_samples",
-                "consumed_valid_samples",
-            ):
+            for name in ("global_batch_size", "micro_batch_size"):
                 delattr(args, name)
         unset_num_microbatches_calculator()
         if is_inference:
@@ -1070,7 +1075,8 @@ def test_checkpoint_load_without_microbatch_calculator(
         else:
             metadata = load_checkpoint([restored], None, None, restore_training_state=True)
             expected_iteration = 7 if load_mode == "override" else 123
-            assert args.consumed_train_samples == expected_iteration * args.global_batch_size
+            assert train_state.iteration == expected_iteration
+            assert train_state.consumed_train_samples == expected_iteration * args.global_batch_size
         assert metadata == (7 if load_mode == "override" else 123, 456)
         for expected, actual in zip(model.parameters(), restored.parameters()):
             assert torch.equal(expected, actual)
