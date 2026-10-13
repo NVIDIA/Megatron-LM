@@ -39,6 +39,15 @@ def load_script(config_path: str) -> str:
     help="Pass 'lts' for PyTorch 24.01 and 'dev' for a more recent version.",
 )
 @click.option(
+    "--platform",
+    required=False,
+    type=str,
+    default="dgx_gb200",
+    show_default=True,
+    help="Filters all tests by matching platform (e.g. 'dgx_gb200' or 'dgx_h100'). "
+    "GB200 recipes run with 4 GPUs per node.",
+)
+@click.option(
     "--output-path",
     required=True,
     type=str,
@@ -69,6 +78,7 @@ def main(
     test_case: Optional[str],
     environment: str,
     output_path: str,
+    platform: str,
     enable_lightweight_mode: bool = False,
     record_checkpoints: bool = False,
 ):
@@ -78,6 +88,7 @@ def main(
         model=model,
         test_case=test_case,
         environment=environment,
+        platform=platform,
         container_tag="none",
     )
 
