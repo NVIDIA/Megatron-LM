@@ -1,22 +1,34 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-
 import dataclasses
+from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+import megatron.core.models.gpt.fine_grained_callables as fine_grained_callables
+import megatron.core.parallel_state as parallel_state
+import megatron.core.transformer.moe.moe_utils as moe_utils
 import megatron.core.transformer.moe.router as router_mod
+import megatron.core.transformer.moe.router as router_module
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.moe.moe_utils import (
+    MoEAuxLossAutoScaler,
+    fused_compute_score_for_moe_aux_loss,
+    fused_moe_aux_loss,
     get_default_pg_collection,
+    get_tokens_per_expert_and_token_count,
     get_updated_expert_bias,
     router_gating_linear,
     topk_routing_with_score_function,
@@ -43,6 +55,106 @@ try:
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
 
+HAVE_DENSE_ROUTER_FUSION = (
+    HAVE_ROUTER_FUSION and moe_utils.fused_topk_with_score_function_supports_topk_indices
+)
+
+
+@pytest.mark.parametrize(
+    "backend,routing_map_mode,num_experts,capacity_factor,expected_dtype",
+    [
+        ("deepep", "bool", 8, None, torch.int64),
+        ("ncclep", "bool", 8, None, torch.int64),
+        ("hybridep", "bool", 8, None, None),
+        ("hybridep", "indices", 1 << 15, None, torch.int16),
+        ("hybridep", "indices", (1 << 15) + 1, None, None),
+        ("hybridep", "indices", 8, 1.0, None),
+    ],
+)
+def test_dense_route_indices_dtype(
+    monkeypatch, backend, routing_map_mode, num_experts, capacity_factor, expected_dtype
+):
+    monkeypatch.setattr(router_module, "fused_topk_with_score_function_supports_topk_indices", True)
+    monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    router = SimpleNamespace(
+        config=SimpleNamespace(
+            moe_router_fusion=True,
+            moe_token_dispatcher_type="flex",
+            moe_expert_capacity_factor=capacity_factor,
+            moe_flex_dispatcher_backend=backend,
+            moe_hybridep_routing_map_mode=routing_map_mode,
+            num_moe_experts=num_experts,
+        ),
+        expt_tp_group=SimpleNamespace(size=lambda: 1),
+    )
+
+    assert TopKRouter._dense_route_indices_dtype(router) == expected_dtype
+
+
+@pytest.mark.parametrize("supports_topk_indices", [False, True])
+def test_fused_router_only_forwards_supported_topk_indices(monkeypatch, supports_topk_indices):
+    received_kwargs = {}
+
+    def fake_fused_router(**kwargs):
+        received_kwargs.update(kwargs)
+        return torch.zeros_like(kwargs["logits"]), kwargs.get(
+            "topk_indices", torch.zeros_like(kwargs["logits"], dtype=torch.bool)
+        )
+
+    monkeypatch.setattr(moe_utils, "HAVE_TE", True)
+    monkeypatch.setattr(moe_utils, "fused_topk_with_score_function", fake_fused_router)
+    monkeypatch.setattr(
+        moe_utils, "fused_topk_with_score_function_supports_topk_indices", supports_topk_indices
+    )
+    logits = torch.randn(4, 8)
+    topk_indices = torch.empty(4, 2, dtype=torch.int64)
+
+    topk_routing_with_score_function(logits, 2, fused=True, topk_indices=topk_indices)
+
+    assert ("topk_indices" in received_kwargs) is supports_topk_indices
+    if supports_topk_indices:
+        assert received_kwargs["topk_indices"] is topk_indices
+
+    received_kwargs.clear()
+    topk_routing_with_score_function(logits, 2, fused=True)
+    assert "topk_indices" not in received_kwargs
+
+
+@pytest.mark.parametrize("padding", ["none", "mixed", "all"])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_expert_bias_dense_counts_match_bool_path(padding, deterministic):
+    """Dense-index expert-bias counting must give the bool-path counts without changing the
+    tensor shape (no row filtering): padding tokens and invalid (-1) routes get zero weight."""
+    num_tokens, num_experts = 4, 4
+    indices = torch.tensor([[0, 1], [1, 2], [2, 3], [3, -1]])  # last token has one invalid route
+    valid = indices >= 0
+    bool_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool)
+    rows = torch.arange(num_tokens).unsqueeze(-1).expand_as(indices)
+    bool_map[rows[valid], indices[valid]] = True
+    padding_mask = {
+        "none": None,
+        "mixed": torch.tensor([False, True, False, False]),
+        "all": torch.ones(num_tokens, dtype=torch.bool),
+    }[padding]
+
+    def count(routing_map):
+        router = SimpleNamespace(
+            enable_expert_bias=True, local_tokens_per_expert=torch.zeros(num_experts)
+        )
+        prev = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(deterministic)
+        try:
+            TopKRouter._apply_expert_bias(router, routing_map, padding_mask=padding_mask)
+        finally:
+            torch.use_deterministic_algorithms(prev)
+        return router.local_tokens_per_expert
+
+    keep = torch.ones(num_tokens, dtype=torch.bool) if padding_mask is None else ~padding_mask
+    expected = (bool_map & keep.unsqueeze(-1)).sum(dim=0).to(torch.float32)
+
+    assert torch.equal(count(indices), expected)
+    assert torch.equal(count(bool_map), expected)
+
 
 class _ProcessGroup:
     def __init__(self, size):
@@ -50,6 +162,344 @@ class _ProcessGroup:
 
     def size(self):
         return self._size
+
+
+def test_dynamic_cp_aux_loss_uses_runtime_cp_then_tp_groups():
+    router = TopKRouter.__new__(TopKRouter)
+    static_tp = object()
+    static_tp_cp = object()
+    static_tp_dp_cp = object()
+    runtime_cp = SimpleNamespace(size=lambda: 2)
+    object.__setattr__(router, "tp_group", static_tp)
+    object.__setattr__(router, "cp_group", None)
+    object.__setattr__(router, "tp_cp_group", static_tp_cp)
+    object.__setattr__(router, "tp_dp_cp_group", static_tp_dp_cp)
+
+    packed = PackedSeqParams(qkv_format="thd", local_cp_size=2, cp_group=runtime_cp)
+    groups = router._get_aux_loss_groups(packed)
+
+    assert groups.loss_reduce_groups == (runtime_cp, static_tp)
+    assert groups.metric_reduce_group is None
+    assert groups.metric_avg_group is static_tp_dp_cp
+    assert groups.metric_needs_dp_avg is False
+
+
+def test_dynamic_cp_size_one_aux_loss_uses_tp_group_only():
+    router = TopKRouter.__new__(TopKRouter)
+    static_tp = object()
+    static_tp_cp = object()
+    static_tp_dp_cp = object()
+    object.__setattr__(router, "tp_group", static_tp)
+    object.__setattr__(router, "cp_group", None)
+    object.__setattr__(router, "tp_cp_group", static_tp_cp)
+    object.__setattr__(router, "tp_dp_cp_group", static_tp_dp_cp)
+
+    runtime_cp = SimpleNamespace(size=lambda: 1)
+    packed = PackedSeqParams(qkv_format="thd", local_cp_size=1, cp_group=runtime_cp)
+    groups = router._get_aux_loss_groups(packed)
+
+    assert groups.loss_reduce_groups == (static_tp,)
+    assert groups.metric_reduce_group is None
+    assert groups.metric_avg_group is static_tp_dp_cp
+    assert groups.metric_needs_dp_avg is False
+
+
+def test_static_aux_loss_keeps_tp_cp_group():
+    router = TopKRouter.__new__(TopKRouter)
+    static_tp_cp = object()
+    object.__setattr__(router, "tp_cp_group", static_tp_cp)
+
+    groups = router._get_aux_loss_groups()
+
+    assert groups.loss_reduce_groups == (static_tp_cp,)
+    assert groups.metric_reduce_group is static_tp_cp
+    assert groups.metric_avg_group is None
+    assert groups.metric_needs_dp_avg is True
+
+
+def test_token_count_reduction_composes_runtime_cp_and_tp(monkeypatch):
+    class _Group:
+        def __init__(self, size):
+            self._size = size
+
+        def size(self):
+            return self._size
+
+    cp_group = _Group(2)
+    tp_group = _Group(3)
+    calls = []
+
+    def _reduce(value, group):
+        calls.append(group)
+        return value * group.size()
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.moe_utils.reduce_from_tensor_model_parallel_region", _reduce
+    )
+    routing_map = torch.tensor([[True, False], [False, True]])
+
+    tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+        routing_map, reduce_group=(cp_group, tp_group), topk=1
+    )
+
+    assert calls == [cp_group, tp_group]
+    assert torch.equal(tokens_per_expert, torch.tensor([6, 6]))
+    assert local_tokens == 2
+    assert total_tokens == 12
+
+
+def test_token_count_reduction_preserves_positional_api(monkeypatch):
+    group = _ProcessGroup(2)
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.moe_utils.reduce_from_tensor_model_parallel_region",
+        lambda value, pg: value * pg.size(),
+    )
+    routing_map = torch.tensor([[True, False], [False, False]])
+    counts, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+        routing_map, group, 1, True
+    )
+    assert torch.equal(counts, torch.tensor([2, 0]))
+    assert local_tokens == 1
+    assert total_tokens == 2
+
+
+def test_fine_grained_router_receives_runtime_cp(monkeypatch):
+    packed = PackedSeqParams(qkv_format="thd", local_cp_size=2, cp_group=_ProcessGroup(2))
+    hidden = torch.randn(4, 1, 8)
+    padding_mask = torch.tensor([[False, False, True, True]])
+    probs = torch.ones(4, 2)
+    mlp = Mock(spec=MoELayer)
+    mlp.use_shared_expert = False
+    mlp.route.return_value = (probs, probs.bool())
+    mlp.preprocess.return_value = (hidden, probs)
+    layer = SimpleNamespace(
+        mlp=mlp,
+        config=SimpleNamespace(moe_token_dispatcher_type="alltoall"),
+        _forward_attention=Mock(return_value=(hidden, None)),
+        _forward_mlp=lambda hidden_states: hidden_states,
+        offload_mlp_norm=False,
+        recompute_pre_mlp_layernorm=False,
+        _pre_mlp_layernorm_returns_residual=False,
+        pre_mlp_layernorm=torch.nn.Identity(),
+        init_backward_dw_wrapper=Mock(),
+        backward_dw_wrapper=Mock(),
+    )
+    node = SimpleNamespace(
+        chunk_state=SimpleNamespace(
+            attention_mask=None,
+            rotary_pos_emb=None,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            packed_seq_params=packed,
+            sequence_len_offset=None,
+            padding_mask=padding_mask,
+        ),
+        layer_state=SimpleNamespace(),
+        detach=lambda tensor: tensor.detach(),
+    )
+    monkeypatch.setattr(
+        fine_grained_callables, "off_interface", lambda _enabled, tensor, _name: nullcontext(tensor)
+    )
+    forward_funcs, _ = fine_grained_callables.build_transformer_layer_callables(layer)
+    forward_funcs[0](node, hidden)
+    mlp.route.assert_called_once_with(hidden, padding_mask, packed_seq_params=packed)
+
+
+def test_shortcut_router_receives_runtime_cp():
+    packed = PackedSeqParams(qkv_format="thd", local_cp_size=2, cp_group=_ProcessGroup(2))
+    hidden = torch.randn(4, 1, 8)
+    padding_mask = torch.tensor([[False, False, True, True]])
+    probs = torch.ones(4, 2)
+    mlp = Mock(spec=MoELayer)
+    mlp.route.return_value = (probs, probs.bool())
+    block = SimpleNamespace(
+        recompute_shortcut_pre_mlp_layernorm=False,
+        shortcut_pre_mlp_layernorm=torch.nn.Identity(),
+        moe_layer=SimpleNamespace(
+            mlp=mlp, _maybe_unflatten_for_moe=Mock(return_value=(hidden, padding_mask, None, None))
+        ),
+    )
+    ShortcutMoEBlock._moe_router_preprocess(block, hidden, padding_mask, packed)
+    mlp.route.assert_called_once_with(hidden, padding_mask, packed_seq_params=packed)
+
+
+def test_token_count_reduction_keeps_local_count_with_in_place_reduce(monkeypatch):
+    """The TP reduction all-reduces contiguous tensors in place. Local valid-token
+    counts must stay per-rank; otherwise downstream per-token-loss scaling re-reduces
+    an already-global count (2x at runtime CP2)."""
+    import megatron.core.tensor_parallel.mappings as mappings
+
+    class _Group:
+        def size(self):
+            return 2
+
+    cp_group = _Group()
+    # The peer CP rank holds 2 valid tokens (one per expert); this rank holds 1.
+    peer_tokens_per_expert = torch.tensor([1, 1])
+
+    def _in_place_all_reduce(tensor, group=None):
+        assert group is cp_group
+        tensor.add_(peer_tokens_per_expert)
+
+    # Drive the real reduce_from_tensor_model_parallel_region -> _reduce path and fake
+    # only the collective, preserving its in-place semantics.
+    monkeypatch.setattr(mappings, "get_tensor_model_parallel_group_if_none", lambda g: g)
+    monkeypatch.setattr(torch.distributed, "all_reduce", _in_place_all_reduce)
+    routing_map = torch.tensor([[True, False], [False, False]])  # second token is padding
+
+    tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+        routing_map, reduce_group=cp_group, topk=1, with_padding_mask=True
+    )
+
+    assert torch.equal(tokens_per_expert, torch.tensor([2, 1]))
+    assert local_tokens == 1
+    assert total_tokens == 3
+
+
+def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
+    router = TopKRouter.__new__(TopKRouter)
+    object.__setattr__(router, "topk", 2)
+    object.__setattr__(
+        router, "config", SimpleNamespace(num_moe_experts=2, moe_router_aux_loss_fusion=False)
+    )
+    object.__setattr__(router, "get_aux_loss_coeff", lambda _name: 1.0)
+    object.__setattr__(
+        router,
+        "_get_aux_loss_groups",
+        lambda _packed=None: SimpleNamespace(
+            loss_reduce_groups=(object(),),
+            metric_reduce_group=None,
+            metric_avg_group=None,
+            metric_needs_dp_avg=False,
+            metric_pre_reduce_groups=(),
+        ),
+    )
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.router.get_tokens_per_expert_and_token_count",
+        lambda **_kwargs: (torch.tensor([4, 6]), 5, 10),
+    )
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.router.switch_load_balancing_loss_func",
+        lambda **_kwargs: torch.tensor(4.0),
+    )
+
+    captured = {}
+
+    def _capture_attach(probs, *_args, **kwargs):
+        captured.update(kwargs)
+        return probs
+
+    object.__setattr__(router, "attach_and_log_load_balancing_loss", _capture_attach)
+
+    seq_length = 5
+    batch_size = 2
+    probs = torch.zeros(seq_length * batch_size, 2)
+    routing_map = torch.zeros(seq_length * batch_size, 2, dtype=torch.bool)
+    router._apply_seq_aux_loss(probs, probs, routing_map, seq_length=seq_length, bsz=batch_size)
+
+    assert captured["valid_token_count"] == 10
+    assert "aux_loss_scale_num_tokens" not in captured
+
+
+class TestDynamicCPRouterDistributed:
+    """Numerical and gradient coverage using real runtime process groups."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1, dynamic_context_parallel=True)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=1.0,
+            calculate_per_token_loss=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+        self.router = cast(TopKRouter, MoELayer(config, submodules).router).cuda().train()
+
+    def teardown_method(self, method):
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("runtime_cp_size", [1, 2, 4])
+    def test_runtime_group_token_counts(self, runtime_cp_size):
+        world_size = torch.distributed.get_world_size()
+        if world_size < runtime_cp_size or world_size % runtime_cp_size != 0:
+            pytest.skip(f"world size {world_size} cannot form CP{runtime_cp_size} groups")
+
+        runtime_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+            group_size=runtime_cp_size
+        )
+        runtime_cp_rank = runtime_cp_group.rank()
+        local_valid_tokens = runtime_cp_rank + 1
+        routing_map = torch.zeros((runtime_cp_size, 2), dtype=torch.bool, device="cuda")
+        routing_map[:local_valid_tokens, runtime_cp_rank % 2] = True
+
+        tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+            routing_map,
+            reduce_group=(runtime_cp_group, self.router.tp_group),
+            topk=1,
+            with_padding_mask=True,
+        )
+
+        expected_per_expert = [0, 0]
+        for cp_rank in range(runtime_cp_size):
+            expected_per_expert[cp_rank % 2] += cp_rank + 1
+        torch.testing.assert_close(
+            tokens_per_expert,
+            torch.tensor(expected_per_expert, dtype=tokens_per_expert.dtype, device="cuda"),
+        )
+        assert local_tokens.item() == local_valid_tokens
+        assert total_tokens.item() == runtime_cp_size * (runtime_cp_size + 1) // 2
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("runtime_cp_size", [1, 2, 4])
+    def test_runtime_group_aux_loss_gradient_scaling(self, runtime_cp_size):
+        world_size = torch.distributed.get_world_size()
+        if world_size < runtime_cp_size or world_size % runtime_cp_size != 0:
+            pytest.skip(f"world size {world_size} cannot form CP{runtime_cp_size} groups")
+
+        runtime_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+            group_size=runtime_cp_size
+        )
+        runtime_cp_rank = runtime_cp_group.rank()
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd", local_cp_size=runtime_cp_size, cp_group=runtime_cp_group
+        )
+        loss_groups = self.router._get_aux_loss_groups(packed_seq_params).loss_reduce_groups
+
+        activation = torch.zeros(1, device="cuda", requires_grad=True)
+        aux_source = torch.tensor(float(runtime_cp_rank + 1), device="cuda", requires_grad=True)
+        MoEAuxLossAutoScaler.set_loss_scale(torch.tensor(1.0, device="cuda"))
+        output = self.router.attach_and_log_load_balancing_loss(
+            activation,
+            aux_loss_coeff=1.0,
+            aux_loss=aux_source.square(),
+            aux_loss_name="dynamic_cp_gradient_test",
+            reduce_group=None,
+            needs_dp_avg=False,
+            valid_token_count=runtime_cp_rank + 1,
+            aux_loss_scale_reduce_groups=loss_groups,
+        )
+        output.sum().mul_(0).backward()
+
+        group_token_count = runtime_cp_size * (runtime_cp_size + 1) // 2
+        expected_grad = 2 * aux_source.detach() * group_token_count
+        torch.testing.assert_close(aux_source.grad, expected_grad)
 
 
 class TestTop2Router:
@@ -164,6 +614,52 @@ class TestTop2Router:
             diagnostics[:, RouterDiagnosticChannel.VALID_TOKEN_COUNT, 0],
             torch.full((2,), 32.0, device="cuda"),
         )
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.AUX_ACTUAL_OVERLAP, 0],
+            torch.ones(2, device="cuda"),
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_DENSE_ROUTER_FUSION,
+        reason="TE dense fused router output is not available",
+    )
+    @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
+    @pytest.mark.parametrize("topk", [2, 4])
+    def test_router_diagnostics_accept_dense_routing_indices(self, monkeypatch, backend, topk):
+        """With TE dense fused output, flex deepep/ncclep return int64 [num_tokens, topk]
+        indices next to full-width probs; the diagnostics need the bool [num_tokens, num_experts]
+        map (topk == num_experts used to misread ids as flags)."""
+        monkeypatch.setattr(
+            router_module, "fused_topk_with_score_function_supports_topk_indices", True
+        )
+        self.router = self.router.cuda()
+        self.router.config.moe_router_fusion = True
+        self.router.config.moe_token_dispatcher_type = "flex"
+        self.router.config.moe_flex_dispatcher_backend = backend
+        self.router.config.moe_expert_capacity_factor = None
+        self.router.config.moe_router_topk = topk
+        self.router.topk = topk
+        self.router.tp_group = _ProcessGroup(1)
+        num_experts = self.router.config.num_moe_experts
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+        observed = []
+
+        with capture_tensor_observations(
+            lambda *args: observed.append(args), frozenset({"router_diagnostics"})
+        ):
+            probs, routing_map = self.router(hidden_states)
+
+        assert routing_map.dtype == torch.int64 and routing_map.shape == (64, topk)
+        assert probs.shape == (64, num_experts)
+        assert len(observed) == 1
+        diagnostics = observed[0][3]
+        assert diagnostics.shape == (2, ROUTER_DIAGNOSTIC_CHANNEL_COUNT, num_experts)
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.VALID_TOKEN_COUNT, 0],
+            torch.full((2,), 32.0, device="cuda"),
+        )
+        # Without expert bias the unbiased aux-loss top-k equals the dispatched top-k.
         torch.testing.assert_close(
             diagnostics[:, RouterDiagnosticChannel.AUX_ACTUAL_OVERLAP, 0],
             torch.ones(2, device="cuda"),
@@ -297,10 +793,71 @@ class TestTop2Router:
         assert self.sequential_mlp.router.weight.grad.abs().sum() > 0
 
     @pytest.mark.internal
+    @pytest.mark.parametrize("loss_type", ["aux_loss", "seq_aux_loss", "global_aux_loss"])
+    @pytest.mark.parametrize("fused", [False, True])
+    @pytest.mark.parametrize("with_history", [False, True])
+    def test_aux_loss_with_entirely_padded_input(self, monkeypatch, loss_type, fused, with_history):
+        """Zero valid tokens contribute finite zero auxiliary gradients, even with history."""
+        if fused and (fused_moe_aux_loss is None or fused_compute_score_for_moe_aux_loss is None):
+            pytest.skip("TE fused auxiliary-loss operators are unavailable")
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type=loss_type,
+            moe_aux_loss_coeff=0.001,
+            moe_router_aux_loss_fusion=fused,
+            moe_router_dtype="fp32",
+            params_dtype=torch.float32,
+            add_bias_linear=False,
+        )
+        losses = []
+        compute_aux_loss = router_mod.switch_load_balancing_loss_func
+
+        def record_aux_loss(*args, **kwargs):
+            loss = compute_aux_loss(*args, **kwargs)
+            losses.append(loss.detach())
+            return loss
+
+        monkeypatch.setattr(router_mod, "switch_load_balancing_loss_func", record_aux_loss)
+        router = TopKRouter(config, pg_collection=get_default_pg_collection()).cuda()
+        hidden_states = torch.randn(8, 2, 16, device="cuda", requires_grad=True)
+        if with_history:
+            probs, _ = router(hidden_states)
+            # Isolate the attached auxiliary gradient from the routing output loss.
+            (probs.sum() * 0).backward()
+            assert torch.isfinite(router.weight.grad).all()
+            assert torch.count_nonzero(router.weight.grad) > 0
+            router.zero_grad(set_to_none=True)
+            hidden_states.grad = None
+        previous_counts = (
+            router.global_tokens_per_expert.clone() if loss_type == "global_aux_loss" else None
+        )
+        padding_mask = torch.ones(8, 2, dtype=torch.bool, device="cuda")
+        probs, _ = router(hidden_states, padding_mask=padding_mask)
+        (probs.sum() * 0).backward()
+        assert len(losses) == (2 if with_history else 1)
+        torch.testing.assert_close(losses[-1], torch.zeros_like(losses[-1]))
+        torch.testing.assert_close(router.weight.grad, torch.zeros_like(router.weight.grad))
+        torch.testing.assert_close(hidden_states.grad, torch.zeros_like(hidden_states.grad))
+        if previous_counts is not None:
+            torch.testing.assert_close(router.global_tokens_per_expert, previous_counts)
+
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_router_with_padding_mask(self):
-        """Test that padding mask correctly excludes padding tokens from routing."""
+    @pytest.mark.parametrize("router_fusion", [False, True])
+    def test_router_with_padding_mask(self, router_fusion):
+        """Test that the padding mask leaves HybridEP routing unchanged: the router only feeds
+        the mask to the losses, dropless HybridEP excludes padded rows in the dispatcher."""
+        if router_fusion and not HAVE_ROUTER_FUSION:
+            pytest.skip("TE fused router ops not available")
         self.router = self.router.cuda()
+        self.router.config.moe_router_fusion = router_fusion
+        self.router.config.moe_token_dispatcher_type = "flex"
+        self.router.config.moe_flex_dispatcher_backend = "hybridep"
+        self.router.config.moe_hybridep_routing_map_mode = "bool"
         seq_len = 32
         batch_size = 2
         hidden_size = self.router.config.hidden_size
@@ -340,8 +897,84 @@ class TestTop2Router:
                 self.router.config.num_moe_experts,
             )
 
+            # Padded rows stay routed (top-k routes with nonzero weights) like any other row.
+            padding_rows = padding_mask.reshape(-1)
+            topk = self.router.config.moe_router_topk
+            assert torch.all(routing_map_with_mask[padding_rows].sum(dim=-1) == topk)
+            assert torch.all(torch.count_nonzero(probs_with_mask[padding_rows], dim=-1) == topk)
+
             # Verify that probs for valid tokens are similar
             assert torch.equal(probs_valid_part, probs_without_mask)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_DENSE_ROUTER_FUSION,
+        reason="TE dense fused router output is not available",
+    )
+    def test_hybridep_dense_routing_keeps_padding_rows_routed(self, monkeypatch):
+        """The router does not drop padded rows for any dispatcher: dropless HybridEP excludes
+        them itself in _HybridEPManager.setup_metadata. Here the mask only feeds the losses."""
+        monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+        self.router = self.router.cuda()
+        self.router.config.moe_router_fusion = True
+        self.router.config.moe_token_dispatcher_type = "flex"
+        self.router.config.moe_flex_dispatcher_backend = "hybridep"
+        self.router.config.moe_hybridep_routing_map_mode = "indices"
+        hidden_states = torch.randn(
+            (8, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        padding_mask = torch.zeros((8, 2), dtype=torch.bool, device="cuda")
+        padding_mask[4:, :] = True
+
+        with torch.no_grad():
+            probs, routing_map = self.router(hidden_states, padding_mask=padding_mask)
+            probs_no_mask, routing_map_no_mask = self.router(hidden_states)
+
+        assert routing_map.dtype == torch.int16
+        assert routing_map.shape == (16, self.router.config.moe_router_topk)
+        assert torch.all(routing_map >= 0)
+        assert torch.equal(routing_map, routing_map_no_mask)
+        torch.testing.assert_close(probs, probs_no_mask)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        "dispatcher,backend,capacity_factor,rank_capacity_factor",
+        [
+            ("allgather", "deepep", None, None),
+            ("alltoall", "deepep", None, None),
+            ("flex", "deepep", None, None),
+            ("flex", "deepepv2", None, None),
+            ("flex", "hybridep", 1.0, None),
+            ("flex", "hybridep", None, 1.0),
+            ("flex", "hybridep", None, None),
+        ],
+    )
+    def test_padding_mask_never_changes_routes(
+        self, dispatcher, backend, capacity_factor, rank_capacity_factor
+    ):
+        """The router keeps every route regardless of dispatcher; the padding mask only feeds the
+        losses and the expert-bias update. Dropless HybridEP excludes padded rows in its own
+        token dispatcher, not here."""
+        self.router = self.router.cuda()
+        self.router.config.moe_token_dispatcher_type = dispatcher
+        self.router.config.moe_flex_dispatcher_backend = backend
+        self.router.config.moe_expert_capacity_factor = capacity_factor
+        self.router.config.moe_expert_rank_capacity_factor = rank_capacity_factor
+        hidden_states = torch.randn(
+            (16, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        padding_mask = torch.zeros((16, 2), dtype=torch.bool, device="cuda")
+        padding_mask[8:, :] = True
+
+        with torch.no_grad():
+            probs_with_mask, routing_map_with_mask = self.router(
+                hidden_states, padding_mask=padding_mask
+            )
+            probs_without_mask, routing_map_without_mask = self.router(hidden_states)
+
+        torch.testing.assert_close(probs_with_mask, probs_without_mask)
+        assert torch.equal(routing_map_with_mask, routing_map_without_mask)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -684,6 +1317,102 @@ class TestAuxLossFreeTop2Router:
         print("Updated bias after first forward pass:", updated_bias)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_dense_expert_bias_token_counts(self, deterministic):
+        self.router = self.router.cuda()
+        self.router.local_tokens_per_expert.zero_()
+        topk_indices = torch.tensor(
+            [[0, 3], [1, 4], [0, 7], [2, 5]], device="cuda", dtype=torch.int16
+        )
+        padding_mask = torch.tensor([False, True, False, False], device="cuda")
+
+        previous_deterministic = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(deterministic)
+        try:
+            self.router._apply_expert_bias(topk_indices, padding_mask=padding_mask)
+        finally:
+            torch.use_deterministic_algorithms(previous_deterministic)
+
+        expected = torch.tensor([2, 0, 1, 1, 0, 1, 0, 1], device="cuda", dtype=torch.int64)
+        torch.testing.assert_close(self.router.local_tokens_per_expert, expected)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_DENSE_ROUTER_FUSION,
+        reason="TE dense fused router output is not available",
+    )
+    def test_fused_dense_routing_with_expert_bias(self):
+        self.router = self.router.cuda()
+        self.router.config.moe_router_fusion = True
+        self.router.config.moe_token_dispatcher_type = "flex"
+        self.router.config.moe_flex_dispatcher_backend = "deepep"
+        self.router.local_tokens_per_expert.zero_()
+        self.router.expert_bias.copy_(
+            torch.arange(self.router.config.num_moe_experts, device="cuda", dtype=torch.float32)
+        )
+        hidden_states = torch.randn(
+            (4, 2, self.router.config.hidden_size), device="cuda"
+        ).bfloat16()
+        padding_mask = torch.tensor(
+            [[False, True], [False, False], [True, False], [False, False]], device="cuda"
+        )
+
+        _, topk_indices = self.router(hidden_states, padding_mask=padding_mask)
+
+        assert topk_indices.dtype == torch.int64
+        assert topk_indices.shape == (8, self.router.config.moe_router_topk)
+        expected = torch.bincount(
+            topk_indices[~padding_mask.reshape(-1)].reshape(-1),
+            minlength=self.router.config.num_moe_experts,
+        ).to(self.router.local_tokens_per_expert.dtype)
+        torch.testing.assert_close(self.router.local_tokens_per_expert, expected)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
+        reason="TE fused router ops not available",
+    )
+    @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
+    @pytest.mark.parametrize("dense_te_indices", [False, True])
+    def test_flex_dense_backends_get_full_width_probs_from_router(
+        self, monkeypatch, backend, dense_te_indices
+    ):
+        """The router knows nothing about the dispatcher: for the deepep/ncclep flex backends it
+        returns the same full-width [num_tokens, num_experts] probs as for alltoall. Only the
+        route representation differs when TE emits dense indices (int64 [num_tokens, topk]);
+        the per-route weight selection is the dispatcher's job."""
+        if dense_te_indices and not HAVE_DENSE_ROUTER_FUSION:
+            pytest.skip("TE dense fused router output is not available")
+        monkeypatch.setattr(
+            router_module, "fused_topk_with_score_function_supports_topk_indices", dense_te_indices
+        )
+        self.router = self.router.cuda()
+        self.router.config.moe_router_fusion = True
+        hidden_states = torch.randn(
+            (4, 2, self.router.config.hidden_size), device="cuda"
+        ).bfloat16()
+
+        # Reference: the alltoall dispatcher path returns full-width probs and a bool map.
+        self.router.config.moe_token_dispatcher_type = "alltoall"
+        with torch.no_grad():
+            full_probs, bool_map = self.router(hidden_states)
+
+        self.router.config.moe_token_dispatcher_type = "flex"
+        self.router.config.moe_flex_dispatcher_backend = backend
+        self.router.config.moe_expert_capacity_factor = None
+        with torch.no_grad():
+            probs, routing_map = self.router(hidden_states)
+
+        torch.testing.assert_close(probs, full_probs)
+        topk = self.router.config.moe_router_topk
+        if dense_te_indices:
+            assert routing_map.dtype == torch.int64
+            assert routing_map.shape == (8, topk)
+            assert bool_map.gather(1, routing_map).all()
+        else:
+            assert routing_map.dtype == torch.bool
+            assert torch.equal(routing_map, bool_map)
+
     def test_expert_bias_ignores_2d_padding_mask(self):
         self.router = self.router.cuda()
         routing_map = torch.tensor(

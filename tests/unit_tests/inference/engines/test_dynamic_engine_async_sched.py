@@ -51,7 +51,7 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase as _DynamicInferenceEngineTestBase,
 )
-from tests.unit_tests.inference.engines.test_dynamic_engine import set_rounder as _set_rounder
+from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder as _reset_rounder
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -714,11 +714,13 @@ _ASYNC_PAIR_SCENARIOS = (
         atol=5.0e-3,
         parity="reproducible",
     ),
+    # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
+    # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
     _pair_scenario(
         "flashinfer-fused-rope",
         "kernel:flashinfer-fused-rope",
         config={
-            "hidden_size": 64,
+            "hidden_size": 256,
             "position_embedding_type": "rope",
             "use_flashinfer_fused_rope": True,
         },
@@ -1751,7 +1753,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-recipe-forwards"] > 0
         if "fused-rope" in signals:
             assert context.use_flashinfer_fused_rope
-            assert model_config.hidden_size // model_config.num_attention_heads == 16
+            assert model_config.hidden_size // model_config.num_attention_heads == 64
             model = controller.inference_wrapped_model.model
             assert model.rotary_pos_emb.inv_freq.is_cuda
             assert model.rotary_pos_emb_cache[context.max_sequence_length].is_cuda
@@ -1942,7 +1944,7 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
     @classmethod
     def teardown_class(cls):
         delete_cuda_graphs()
-        _set_rounder(64)
+        _reset_rounder()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("scenario", _ASYNC_PAIR_SCENARIOS, ids=lambda case: case.name)
@@ -2010,7 +2012,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             gc.collect()
             delete_cuda_graphs()
             torch.cuda.empty_cache()
-            _set_rounder(64)
+            _reset_rounder()
             Utils.destroy_model_parallel()
 
 

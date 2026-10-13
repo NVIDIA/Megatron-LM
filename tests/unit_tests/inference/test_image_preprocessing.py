@@ -179,6 +179,25 @@ def test_round_plus_half_matches_observed_hf_grid_contract():
     assert hf_compatible.size == (416, 704)
 
 
+def test_aspect_preserving_video_allows_hf_rounded_grid_above_target():
+    image_module = pytest.importorskip("PIL.Image")
+    image = image_module.new("RGB", (100, 153))
+
+    resized = dynamic_res_preprocess(
+        image,
+        min_patches=1024,
+        max_patches=1024,
+        res_step=16,
+        pixel_shuffle=True,
+        spatial_merge_size=2,
+        video_maintain_aspect_ratio=True,
+    )
+
+    # HF independently rounds the dimensions to 26x40 patches. Its nominal
+    # 1024-patch video target is not a hard cap in this path.
+    assert resized.size == (416, 640)
+
+
 def test_torch_bicubic_antialias_resize_mode_uses_tensor_resize(monkeypatch):
     image_module = pytest.importorskip("PIL.Image")
     pytest.importorskip("torchvision")

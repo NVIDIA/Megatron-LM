@@ -127,8 +127,18 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
     supports_audio = False
 
     multimodal_prompt_config = MultimodalPromptConfig(
-        image_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
-        video_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
+        image_spec=MediaPromptSpec(
+            model_token="<image>", prefix="<img>", suffix="</img>", content_part_separator="\n"
+        ),
+        video_spec=MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            content_part_separator="\n",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        ),
+        content_part_order="media_first",
     )
 
     def get_preexpanded_media_token_id(self, modality: str) -> int:

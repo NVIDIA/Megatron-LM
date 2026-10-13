@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestHyperCommGrid:
@@ -522,16 +523,11 @@ class TestHyperCommGridIntegration:
     @classmethod
     def setup_class(cls):
         """Set up distributed environment for the entire test class."""
-        if not dist.is_initialized():
-            # Initialize PyTorch distributed with NCCL backend
-            # This assumes proper environment variables are set (RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT)
-            try:
-                dist.init_process_group(backend="nccl")
-                cls.distributed_initialized = True
-            except Exception as e:
-                pytest.skip(f"Cannot initialize distributed: {e}")
-        else:
+        try:
+            Utils.initialize_distributed()
             cls.distributed_initialized = True
+        except Exception as e:
+            pytest.skip(f"Cannot initialize distributed: {e}")
 
     def test_real_distributed_basic_functionality(self):
         """Test basic HyperCommGrid functionality with real distributed backend."""

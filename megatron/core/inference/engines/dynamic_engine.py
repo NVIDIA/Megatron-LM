@@ -41,6 +41,10 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
+    PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
+    PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     DynamicInferenceEvent,
     DynamicInferenceEventType,
     DynamicInferenceRequest,
@@ -78,7 +82,6 @@ from megatron.core.utils import (
     nvtx_range_push,
     round_up_to_nearest_multiple,
     trace_async_exceptions,
-    unwrap_model,
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
@@ -89,6 +92,111 @@ from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
 # that start with ``_`` (see ``endpoints.common.validate_offload_params``), so
 # this namespace cannot be forged from a request body.
 _PROMPT_PREPARATION_ERROR_FIELD = "_request_prompt_preparation_error"
+
+_MULTIMODAL_STITCHING_FIELDS = {
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD: (
+        "a nonnegative integer counting the exact, already-expanded previous-turn tokens "
+        "at the start of the prompt"
+    ),
+    PREFIX_MEDIA_COUNT_FIELD: (
+        "a nonnegative integer counting logical image/video items in the previous prefix"
+    ),
+}
+
+
+def _take_expanded_prefix_stitching_metadata(offload_params):
+    """Remove and return engine-private expanded-prefix stitching metadata."""
+    if not isinstance(offload_params, dict):
+        return None, offload_params
+
+    required_fields = set(_MULTIMODAL_STITCHING_FIELDS)
+    if not required_fields.intersection(offload_params):
+        return None, offload_params
+
+    missing_fields = required_fields.difference(offload_params)
+    if missing_fields:
+        missing = "; ".join(
+            f"{field!r}: {_MULTIMODAL_STITCHING_FIELDS[field]}" for field in sorted(missing_fields)
+        )
+        raise ValueError(
+            "Incomplete multimodal expanded-prefix stitching metadata. "
+            f"Missing {missing}. A RequestPromptPreparer must be configured and return the "
+            "stitched prompt with its expanded prefix token count."
+        )
+
+    for field in required_fields:
+        value = offload_params[field]
+        if type(value) is not int or value < 0:
+            raise ValueError(
+                f"Invalid multimodal stitching field {field!r}: "
+                f"expected {_MULTIMODAL_STITCHING_FIELDS[field]}."
+            )
+
+    metadata = {field: offload_params[field] for field in required_fields}
+    consumed_fields = required_fields | {PREFIX_TEMPLATE_TOKEN_IDS_FIELD, PREFIX_EOS_TOKEN_ID_FIELD}
+    remaining = {key: value for key, value in offload_params.items() if key not in consumed_fields}
+    return metadata, remaining or None
+
+
+def _prepend_expanded_multimodal_prefix(
+    prefix_tokens, suffix_tokens, suffix_mask, inference_wrapper, modality
+):
+    """Prepend exact prior model tokens to an expanded current-turn suffix."""
+    prefix_mask = inference_wrapper.build_preexpanded_media_token_mask(prefix_tokens, modality)
+
+    # Offset suffix mask positions so we inject the suffix embeddings correctly.
+    # For example: [ -1 0 1 2 -1 ] is the prefix mask, then the suffix mask
+    # needs to at least start at 3, or else the first prefix embedding will be
+    # used for the first suffix embedding.
+    prefix_embedding_count = int((prefix_mask >= 0).sum().item())
+    suffix_mask = suffix_mask.clone()
+    suffix_media_positions = suffix_mask >= 0
+    suffix_mask[suffix_media_positions] += prefix_embedding_count
+
+    return torch.cat((prefix_tokens, suffix_tokens)), torch.cat((prefix_mask, suffix_mask))
+
+
+def _slice_suffix_media_metadata(
+    prefix_media_count, *, num_tiles, imgs_sizes, num_frames, video_frame_indices, video_fps
+):
+    """Select metadata for media placeholders occurring in the compact suffix."""
+    if not isinstance(prefix_media_count, int) or prefix_media_count < 0:
+        raise ValueError("Expanded-prefix stitching requires a nonnegative prefix media count.")
+
+    # Retrieve the total media count and offset into the media data.
+    if num_frames is not None:
+        # Number of frame groups (such as videos or tubelets).
+        total_media_count = len(num_frames)
+        prefix_media_offset = int(num_frames[:prefix_media_count].sum().item())
+    elif imgs_sizes is not None:
+        # Number of frames.
+        total_media_count = len(imgs_sizes)
+        prefix_media_offset = prefix_media_count
+    elif num_tiles is not None:
+        # Number of tiles.
+        total_media_count = len(num_tiles)
+        prefix_media_offset = 0
+    else:
+        total_media_count = 0
+        prefix_media_offset = 0
+
+    if prefix_media_count > total_media_count:
+        raise ValueError(
+            "Expanded-prefix stitching prefix media count exceeds the request media count: "
+            f"prefix={prefix_media_count}, total={total_media_count}."
+        )
+
+    return {
+        "suffix_media_count": total_media_count - prefix_media_count,
+        "num_tiles": (num_tiles[prefix_media_count:] if num_tiles is not None else None),
+        "imgs_sizes": (imgs_sizes[prefix_media_offset:] if imgs_sizes is not None else None),
+        "num_frames": (num_frames[prefix_media_count:] if num_frames is not None else None),
+        "video_frame_indices": (
+            video_frame_indices[prefix_media_count:] if video_frame_indices is not None else None
+        ),
+        "video_fps": (video_fps[prefix_media_count:] if video_fps is not None else None),
+    }
+
 
 # Wire encoding of a None offload frame: msgpack nil is the single byte 0xc0,
 # i.e. ``msgpack.packb(None, use_bin_type=True)``. Spelled as a literal because
@@ -695,7 +803,6 @@ class DynamicInferenceEngine(AbstractEngine):
             request = entry.record[-1]
             if isinstance(request, DynamicVLMInferenceRequest):
                 request.image_embeddings = None
-                request.image_token_mask = None
 
     def _refresh_vlm_request_data(self, request: DynamicVLMInferenceRequest) -> None:
         """Rebuild missing media state for a known-multimodal request."""
@@ -723,42 +830,34 @@ class DynamicInferenceEngine(AbstractEngine):
         # for the inference wrapper decoder inputs.
         wrapper = self.controller.inference_wrapped_model
         modality = "video" if num_frames is not None else "image"
-        if request.media_tokens_preexpanded:
-            mask = wrapper.build_preexpanded_media_token_mask(request.prompt_tokens, modality)
-        else:
-            if request.compact_prompt_tokens is None:
-                raise RuntimeError(
-                    f"Cannot refresh vision state for request {request.request_id}: the compact "
-                    "multimodal prompt was not retained."
-                )
-            media_token_id = wrapper.resolve_media_token_id(self.controller.tokenizer, modality)
-            expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
-            if num_frames is not None:
-                expansion_kwargs["num_frames"] = num_frames
-                prompt_config = wrapper.multimodal_prompt_config
-                if (
-                    prompt_config is not None
-                    and prompt_config.video_spec.expansion_mode == "temporal_patch"
-                ):
-                    expansion_kwargs["tokenizer"] = self.controller.tokenizer
-                    expansion_kwargs["video_frame_indices"] = request.video_frame_indices
-                    expansion_kwargs["video_fps"] = request.video_fps
-            _, mask_list = wrapper.expand_image_tokens(
-                [request.compact_prompt_tokens.tolist()],
-                image_token_id=media_token_id,
-                **expansion_kwargs,
-            )
-            mask_values = [(-1 if value is None else int(value)) for value in mask_list[0]]
-            generated_suffix_length = len(request.prompt_tokens) - len(mask_values)
+        if request.image_token_mask is not None:
+            # If a request is checkpointed, retrieve the previous mask,
+            # which can be composed of multiple turns.
+            mask = request.image_token_mask.to(device=request.prompt_tokens.device)
+            generated_suffix_length = len(request.prompt_tokens) - len(mask)
             if generated_suffix_length < 0:
                 raise RuntimeError(
-                    f"Refreshed media mask for request {request.request_id} is longer than "
+                    f"Preserved media mask for request {request.request_id} is longer than "
                     "its checkpointed prompt."
                 )
-            mask = torch.tensor(
-                mask_values + ([-1] * generated_suffix_length),
-                dtype=torch.int64,
-                device=request.prompt_tokens.device,
+            if generated_suffix_length > 0:
+                # Mask out the previously generated tokens as invalid for media embeddings.
+                # This will extend our checkpointed mask for future turns as well.
+                mask = torch.cat(
+                    (
+                        mask,
+                        torch.full(
+                            (generated_suffix_length,), -1, dtype=mask.dtype, device=mask.device
+                        ),
+                    )
+                )
+        elif request.media_tokens_preexpanded:
+            # Non-checkpointed pre-expanded input prompt. Build a new mask.
+            mask = wrapper.build_preexpanded_media_token_mask(request.prompt_tokens, modality)
+        else:
+            raise RuntimeError(
+                f"Cannot refresh vision state for request {request.request_id}: the media "
+                "token mask was not retained."
             )
 
         encoder_kwargs = {"num_image_tiles": num_tiles, "imgs_sizes": imgs_sizes}
@@ -921,7 +1020,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
-        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
+        unwrapped = controller._language_model
         mtp_warmup_enabled = (
             controller.num_mtp_depths > 0
             and (controller.num_speculative_tokens or 0) > 0
@@ -976,24 +1075,31 @@ class DynamicInferenceEngine(AbstractEngine):
                         mtp_seen_batch_sizes.add(n)
                         device = torch.cuda.current_device()
                         batch_dim = n // tp_size if sp_enabled else n
-                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
-                        for depth in mtp_warmup_depths:
-                            unwrapped.compute_mtp_single_step(
-                                hidden_states=torch.zeros(
-                                    (batch_dim, 1, model_config.hidden_size),
-                                    device=device,
-                                    dtype=model_config.params_dtype,
-                                ),
-                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
-                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
-                                depth=depth,
-                                cache_key=("mtp", n, depth),
-                            )
+                        # Cache-free MTP graph, replayed only when the MTP KV cache is off; with
+                        # it on, real and EP dummy forwards both replay the KV-aware graph below.
+                        if not context.enable_mtp_kv_cache:
+                            # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                            for depth in mtp_warmup_depths:
+                                unwrapped.compute_mtp_single_step(
+                                    hidden_states=torch.zeros(
+                                        (batch_dim, 1, model_config.hidden_size),
+                                        device=device,
+                                        dtype=model_config.params_dtype,
+                                    ),
+                                    next_token_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.long
+                                    ),
+                                    position_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.int64
+                                    ),
+                                    depth=depth,
+                                    cache_key=("mtp", n, depth),
+                                )
 
-                        # KV-aware MTP graph: when the MTP KV cache is enabled, ALSO capture a graph
-                        # that includes the draft-attention KV append+attend (the cache-free graph
-                        # above does not), under a distinct ("mtp_kv", n, depth) key that the real
-                        # spec-decode path replays. The EP dummy path keeps the cache-free graph.
+                        # KV-aware MTP graph: when the MTP KV cache is enabled, capture a graph
+                        # that includes the draft-attention KV append+attend under a distinct
+                        # ("mtp_kv", n, depth) key, replayed by the real spec-decode path and the
+                        # EP dummy path (which stages the same dummy-block metadata).
                         # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
                         # replay overwrites it from gpu_view each step, so only shapes/bounds count.
                         if context.enable_mtp_kv_cache:
@@ -1452,13 +1558,16 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         # A suspend/resume cycle is how a weight refit is staged, so treat resume
-        # as a new weight generation and re-salt the prefix cache. Bumped while
-        # still suspended, before anything can be admitted, so there is no window
-        # in which a post-refit request is admitted under the old salt. Requests
-        # re-added below keep the salt they were constructed with, so a request
-        # that spans the refit republishes under its original generation and is
-        # unmatchable by new arrivals.
+        # as a new weight generation and re-salt the prefix cache. Requests can
+        # be constructed before this bump -- those still waiting at suspend, and
+        # those submitted while paused or suspended, since the coordinator loop
+        # keeps admitting SUBMITs -- so re-salt every request that holds no KV
+        # yet: all of its blocks will be computed by the new weights. A request
+        # already part-way through prefill or decode keeps its original salt, so
+        # it republishes under its original generation and is unmatchable by
+        # new arrivals.
         self._weight_epoch += 1
+        self._resalt_unprefilled_requests()
 
         InferenceMode.set_active()
 
@@ -1534,6 +1643,31 @@ class DynamicInferenceEngine(AbstractEngine):
             self._loop.call_soon_threadsafe(
                 asyncio.create_task, self._notify_cond_for_new_request()
             )
+
+    def _resalt_unprefilled_requests(self) -> None:
+        """Re-salt requests that hold no KV yet under the current weight epoch.
+
+        Such a request has its whole prompt computed by the weights that serve
+        it after resume, so it must hash like a request admitted now. A request
+        with any prefill or decode progress keeps its salt: its leading blocks
+        were computed by the previous weights.
+        """
+        for entry in self.requests.values():
+            request = entry.record[-1]
+            if (
+                request.finished_chunk_token_count > 0
+                or request.generated_tokens
+                or request.num_cached_tokens > 0
+                or request.num_matched_prefix_blocks > 0
+                or request.request_id == self.context.chunked_prefill_request_id
+            ):
+                continue
+            # Same scoping as add_request: VLM requests are image-bearing, so
+            # they are salted by their media identity as well.
+            media_cache_key = (
+                request.media_cache_key if isinstance(request, DynamicVLMInferenceRequest) else None
+            )
+            request.resalt_block_hashes(_weight_scoped_salt(self._weight_epoch, media_cache_key))
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
@@ -1750,7 +1884,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         request_id = request.request_id
-
         if is_resume:
             if request_id not in self.requests or self.get_request(request_id) is not request:
                 raise ValueError(f"Cannot resume unknown request ID {request_id}.")
@@ -1771,6 +1904,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+
+        seed_error = None
+        if request.sampling_params.seed is not None:
+            if self.context.config.sampling_backend != "torch":
+                seed_error = "Request-local seeds require sampling_backend='torch'"
+            elif self.context.config.num_speculative_tokens:
+                seed_error = "Request-local seeds do not yet support speculative decoding"
+            elif "seed" not in self.context.request_metadata:
+                seed_error = "Request-local seeds require seed in request metadata"
+        if seed_error is not None:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(ValueError(seed_error))
 
         assert (
             request.sampling_params.num_tokens_to_generate is None
@@ -2063,6 +2208,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """Prepare media tokens, run the vision encoder, register per-request
         media data on the context, and return a DynamicVLMInferenceRequest.
         """
+        prefix_stitching_metadata, offload_params = _take_expanded_prefix_stitching_metadata(
+            offload_params
+        )
         cached_vision_entry = self._get_cached_vision_entry(media_cache_key)
         if cached_vision_entry is not None:
             modality = cached_vision_entry.modality
@@ -2156,11 +2304,21 @@ class DynamicInferenceEngine(AbstractEngine):
 
         mask_tensor: Optional[Tensor] = None
         image_embeddings: Optional[Tensor] = None
-        compact_prompt_tokens: Optional[Tensor] = None
         expected_embedding_count = 0
 
         if has_images:
             inference_wrapper = self.controller.inference_wrapped_model
+            suffix_media_metadata = None
+            if prefix_stitching_metadata is not None:
+                # Retrieve suffix multimodal data and metadata.
+                suffix_media_metadata = _slice_suffix_media_metadata(
+                    prefix_stitching_metadata[PREFIX_MEDIA_COUNT_FIELD],
+                    num_tiles=num_tiles,
+                    imgs_sizes=imgs_sizes,
+                    num_frames=num_frames,
+                    video_frame_indices=video_frame_indices,
+                    video_fps=video_fps,
+                )
 
             # Compute input mask that provides multimodal embedding injection
             # guidelines for the inference wrapper decoder inputs.
@@ -2171,35 +2329,83 @@ class DynamicInferenceEngine(AbstractEngine):
                 media_token_id = inference_wrapper.resolve_media_token_id(
                     self.controller.tokenizer, modality
                 )
-                compact_prompt_tokens = tokens.clone()
-                token_list: List[List[int]] = [tokens.tolist()]
-                expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
-                if num_frames is not None:
-                    expansion_kwargs["num_frames"] = num_frames
-                    prompt_config = inference_wrapper.multimodal_prompt_config
-                    if (
-                        prompt_config is not None
-                        and prompt_config.video_spec.expansion_mode == "temporal_patch"
-                    ):
-                        expansion_kwargs["tokenizer"] = self.controller.tokenizer
-                        expansion_kwargs["video_frame_indices"] = video_frame_indices
-                        expansion_kwargs["video_fps"] = video_fps
-                expanded_tokens_list, mask_list = inference_wrapper.expand_image_tokens(
-                    token_list, image_token_id=media_token_id, **expansion_kwargs
-                )
-                # expand_image_tokens pads the embedding slots with -1, but the mask
-                # below is what splices the embeddings in, so keep a real token id in
-                # prompt_tokens where the model has one: they are echoed to HTTP
-                # clients, detokenized for raw_text and hashed for prefix caching, and
-                # none of those accept a negative id.
-                expanded_tokens = [
-                    media_token_id if token < 0 else token for token in expanded_tokens_list[0]
-                ]
-                tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
-                mask_tensor = torch.tensor(
-                    [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
-                )
-                expected_embedding_count = sum(value is not None for value in mask_list[0])
+                prefix_tokens = None
+                if prefix_stitching_metadata is not None:
+                    # Split the exact, already-expanded prefix from the compact suffix.
+                    prefix_length = prefix_stitching_metadata[PREFIX_EXPANDED_TOKEN_COUNT_FIELD]
+                    if prefix_length > len(tokens):
+                        raise ValueError(
+                            f"Expanded prefix token count {prefix_length} exceeds the prompt "
+                            f"length {len(tokens)}."
+                        )
+                    prefix_tokens, tokens = tokens[:prefix_length], tokens[prefix_length:]
+                expansion_num_tiles = num_tiles
+                expansion_imgs_sizes = imgs_sizes
+                expansion_num_frames = num_frames
+                expansion_video_frame_indices = video_frame_indices
+                expansion_video_fps = video_fps
+                suffix_media_count = None
+                if suffix_media_metadata is not None:
+                    # Suffix / compact tokens require multi-modal expansion.
+                    expansion_num_tiles = suffix_media_metadata["num_tiles"]
+                    expansion_imgs_sizes = suffix_media_metadata["imgs_sizes"]
+                    expansion_num_frames = suffix_media_metadata["num_frames"]
+                    expansion_video_frame_indices = suffix_media_metadata["video_frame_indices"]
+                    expansion_video_fps = suffix_media_metadata["video_fps"]
+                    suffix_media_count = suffix_media_metadata["suffix_media_count"]
+
+                if prefix_tokens is not None:
+                    slice_placeholders = int((tokens == media_token_id).sum().item())
+                    if slice_placeholders != suffix_media_count:
+                        raise ValueError(
+                            f"Expected {suffix_media_count} compact media placeholder(s) after "
+                            f"the expanded prefix, found {slice_placeholders}."
+                        )
+
+                if suffix_media_count == 0:
+                    # No multimodal data.
+                    mask_tensor = torch.full_like(tokens, -1, dtype=torch.int64)
+                else:
+                    token_list: List[List[int]] = [tokens.tolist()]
+                    expansion_kwargs = {
+                        "num_tiles": expansion_num_tiles,
+                        "imgs_sizes": expansion_imgs_sizes,
+                    }
+                    if expansion_num_frames is not None:
+                        # Video and tubelet expansion kwargs.
+                        expansion_kwargs["num_frames"] = expansion_num_frames
+                        prompt_config = inference_wrapper.multimodal_prompt_config
+                        if (
+                            prompt_config is not None
+                            and prompt_config.video_spec.expansion_mode == "temporal_patch"
+                        ):
+                            expansion_kwargs["tokenizer"] = self.controller.tokenizer
+                            expansion_kwargs["video_frame_indices"] = expansion_video_frame_indices
+                            expansion_kwargs["video_fps"] = expansion_video_fps
+                    # Expand and prompt-format multimodal placeholder tokens.
+                    expanded_tokens_list, mask_list = inference_wrapper.expand_image_tokens(
+                        token_list, image_token_id=media_token_id, **expansion_kwargs
+                    )
+                    # Construct expanded token sequence with model-specific media tokens.
+                    expanded_tokens = [
+                        # Map -1 to <media>.
+                        media_token_id if token < 0 else token
+                        for token in expanded_tokens_list[0]
+                    ]
+                    tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
+                    # Multimodal mask: [ -1 = Text / 0, 1, 2, ... = Media Embed Indices ]
+                    mask_tensor = torch.tensor(
+                        [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
+                    )
+                    expected_embedding_count = sum(value is not None for value in mask_list[0])
+
+                if prefix_tokens is not None:
+                    # Multi-Modal Prefix Stitching
+                    tokens, mask_tensor = _prepend_expanded_multimodal_prefix(
+                        prefix_tokens, tokens, mask_tensor, inference_wrapper, modality
+                    )
+                    expected_embedding_count = int((mask_tensor >= 0).sum().item())
+                    media_tokens_preexpanded = True
 
             # Retrieve or compute the vision embedding.
             image_embeddings = self._get_cached_vision_embedding(media_cache_key)
@@ -2271,7 +2477,6 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
-            compact_prompt_tokens=compact_prompt_tokens,
             media_tensors=media_tensors,
             sampling_params=sampling_params,
             offload_params=offload_params,
@@ -2412,8 +2617,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
             num_stop_word_trim = 0
             num_stop_word_prompt_score_trim = 0
+            eos_mid_block_hit = False
             is_prefill = len(request.generated_tokens) == 0
             if request_id != consumed_chunked_prefill_request_id:
+                tokens, request_log_probs, eos_mid_block_hit = self._truncate_at_mid_block_eos(
+                    request, tokens, request_log_probs, top_n_logprobs, req_idx
+                )
+
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 # If the request already has more tokens, then we only append as much as is necessary
@@ -2439,6 +2649,10 @@ class DynamicInferenceEngine(AbstractEngine):
                             request_log_probs = request_log_probs[:-num_dropped]
                         if top_n_logprobs is not None and req_idx in top_n_logprobs:
                             top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_dropped]
+                if eos_mid_block_hit:
+                    eos_mid_block_hit = bool(tokens) and tokens[-1] in self._terminating_token_ids(
+                        request
+                    )
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -2543,7 +2757,13 @@ class DynamicInferenceEngine(AbstractEngine):
                         accepted_t != -1
                     ).long()
 
+                if (
+                    stop_word_hit or eos_mid_block_hit
+                ) and not request.sampling_params.do_kv_handoff:
+                    request.finish_reason = "stop"
+
                 if request_id in finished_request_ids:
+                    self._set_finish_reason(request)
                     # Reconstruct routing from per-block storage before popping.
                     if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
@@ -2572,9 +2792,11 @@ class DynamicInferenceEngine(AbstractEngine):
                             handoff_ssm_slots_by_request.get(request_id)
                         )
                     finished_entry = self.requests[request_id]
-                elif stop_word_hit:
-                    # Stop word detected - mark for removal in next step's bookkeeping
-                    # Don't pop yet; let the next step handle it properly via callback
+                elif stop_word_hit or eos_mid_block_hit:
+                    # Stop word or mid-speculative-block EOS detected - mark for removal in
+                    # next step's bookkeeping. Don't pop yet; let the next step handle it
+                    # properly via callback. Both share this deferred-finish channel
+                    # because the context still has the request active at this point.
                     self.stop_word_finished_request_ids.add(request_id)
                     active_request_ids.append(request_id)
                 else:
@@ -2730,11 +2952,119 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Find which stop word finished IDs are in the current active requests
         result = self.stop_word_finished_request_ids & set(active_request_ids)
+        # Partial prefill cannot finish; preserve its stop until the final chunk.
+        result.discard(self.context.chunked_prefill_request_id)
         # Move to "being finished" set so post_process_requests can skip the extra token
         self.stop_word_being_finished_ids = result
         # Clear the IDs that we're returning (they'll be marked as finished)
         self.stop_word_finished_request_ids -= result
         return result
+
+    def _set_finish_reason(self, request: DynamicInferenceRequest) -> None:
+        """Record final termination semantics without re-inferring them in clients."""
+        if request.finish_reason is not None or request.sampling_params.do_kv_handoff:
+            return
+        is_stop = request.request_id in self.stop_word_being_finished_ids or (
+            bool(request.generated_tokens)
+            and request.generated_tokens[-1] in self._terminating_token_ids(request)
+        )
+        request.finish_reason = "stop" if is_stop else "length"
+
+    def _terminating_token_ids(self, request: DynamicInferenceRequest) -> frozenset:
+        """Token ids that end generation for this request.
+
+        The CPU-side counterpart of the controller's per-step tensor check, resolved
+        through the controller, including explicit request stop ids.
+        Disabling model EOS (`ignore_eos`) does not disable explicit stops.
+
+        Args:
+            request (DynamicInferenceRequest): Request to resolve ids for.
+
+        Returns:
+            frozenset: Model EOS ids (unless disabled) and explicit request stop ids.
+        """
+        return self.controller.terminating_token_ids(
+            request.sampling_params.termination_id,
+            stop_token_ids=request.sampling_params.stop_token_ids,
+        )
+
+    def _truncate_at_mid_block_eos(
+        self,
+        request: DynamicInferenceRequest,
+        tokens: list[int],
+        request_log_probs: Optional[list],
+        top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]],
+        req_idx: int,
+    ) -> Tuple[list, Optional[list], bool]:
+        """Drop everything a speculative step emitted after an EOS.
+
+        An EOS can land on an *accepted* speculative token rather than on the step's
+        last token, which is the only one the controller's termination check sees
+        (`sampled_tokens_cpu` is the target model's own sample at the last accepted
+        position). Accepted tokens are verified target tokens, not rolled-back drafts,
+        so an EOS among them is real and must end the request -- otherwise the rest of
+        the block, plus every later step, is emitted after EOS. This mirrors the
+        stop-word check, which truncates a stop sequence that ends mid-block.
+
+        Trailing log probs / top-n are trimmed to match, keeping them aligned with
+        `tokens`. `top_n_logprobs` is trimmed in place; log probs are returned.
+
+        Args:
+            request (DynamicInferenceRequest): Request the tokens belong to.
+            tokens (list[int]): Tokens emitted by this step, in order.
+            request_log_probs (Optional[list]): This step's log probs, or None.
+            top_n_logprobs (Optional[Dict]): Per-request top-n log probs, or None.
+            req_idx (int): This request's index into `top_n_logprobs`.
+
+        Returns:
+            Tuple[list, Optional[list], bool]: Truncated tokens, truncated log probs,
+            and whether an EOS was found (the caller defers the finish by a step).
+        """
+        eos_idx = self._find_mid_block_eos(request, tokens)
+        if eos_idx is None:
+            return tokens, request_log_probs, False
+
+        num_trim = len(tokens) - (eos_idx + 1)
+        if num_trim > 0:
+            if request_log_probs is not None:
+                request_log_probs = request_log_probs[:-num_trim]
+            if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_trim]
+        return tokens[: eos_idx + 1], request_log_probs, True
+
+    def _find_mid_block_eos(
+        self, request: DynamicInferenceRequest, tokens: list[int]
+    ) -> Optional[int]:
+        """Locate an explicit stop token or a speculative-block model EOS.
+
+        Model EOS is scanned when a step emits more than one token. Explicit
+        request stop tokens are also checked for single-token steps, since the
+        controller does not hold their variable-length sets. Its EOS check inspects
+        just the step's last token,
+        so an EOS on an accepted draft position is otherwise missed and generation runs
+        past it. A single-token step was already checked by the controller, and a request
+        the controller has already finished does not reach here as unfinished.
+
+        Args:
+            request (DynamicInferenceRequest): Request the tokens belong to.
+            tokens (list[int]): Tokens emitted by this step, in order.
+
+        Returns:
+            Optional[int]: Index of the first EOS in `tokens`, or None if there is none.
+        """
+        if not tokens or request.request_id in self.stop_word_being_finished_ids:
+            return None
+        if len(tokens) == 1:
+            # Model EOS was checked by the controller. Explicit request stops
+            # are handled here, including the non-speculative single-token path.
+            return 0 if tokens[0] in (request.sampling_params.stop_token_ids or ()) else None
+        terminating_ids = self._terminating_token_ids(request)
+        if not terminating_ids:
+            return None
+        for idx, token in enumerate(tokens):
+            if token in terminating_ids:
+                return idx
+        return None
 
     def _check_stop_words_for_request_post_append(
         self,
@@ -3294,35 +3624,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     # than a block cannot be block-aligned; leave it unchanged).
                     if aligned_chunk_length > prefix_skip:
                         prefill_chunk_length = aligned_chunk_length
-
-                # Flash-attn guard: if this chunk would leave exactly 1 token for the
-                # final chunk, reduce by 1 (or defer if we only have 1 computed token).
-                # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                # The -1 is safe after CG snapping: is_applicable_for_batch_dim matches on
-                # cg.token_count >= real.token_count, so the snapped CG still covers token_count-1.
-                if not batch_invariant_mamba_prefill and remaining_len - prefill_chunk_length == 1:
-                    if computed_chunk > 1:
-                        prefill_chunk_length -= 1
-                    else:
-                        can_schedule = False
-                        break
-
-                # add_request recomputes the skip for this exact chunk and applies a
-                # ">= 2 computed tokens" clamp. When the chunk would compute fewer than
-                # 2 tokens (tight budget late in a batched step, or a prompt that is
-                # all-but-one cached) that clamp shrinks the skip and grows the computed
-                # count by up to one block, which can exceed the token budget
-                # (TokenOverflowError). Only then re-derive the exact effective length
-                # add_request will use and defer on overflow (a later full-budget step
-                # admits the request). For >= 2 computed tokens add_request computes
-                # exactly this chunk, which already fits the budget.
-                if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
-                    actual_effective = self.context._compute_prefix_match(
-                        req, prefill_chunk_length
-                    ).effective_prefill_chunk_length
-                    if self.context.active_token_count + actual_effective > self.context.max_tokens:
-                        can_schedule = False
-                        break
 
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:
@@ -4244,6 +4545,12 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id = data[1]
         prompt = msgpack.unpackb(message[1], raw=False)
         offload_params = msgpack.unpackb(message[3], raw=False)
+        if isinstance(offload_params, dict) and (
+            PREFIX_EXPANDED_TOKEN_COUNT_FIELD in offload_params
+        ):
+            # Multi-modal prefix and metadata for delayed
+            # post-expanded stitching. Skip prompt_preparer.
+            return message
 
         def _pack(prompt, offload_params):
             if isinstance(prompt, torch.Tensor):

@@ -461,6 +461,7 @@ def test_gpt_with_te_activation_func(num_experts, gated_linear_unit):
 class TestGPTModelWithCustomPG:
     def setup_method(self, method):
         Utils.destroy_model_parallel()
+        Utils.initialize_distributed()
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

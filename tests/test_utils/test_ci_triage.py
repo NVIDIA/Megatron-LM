@@ -229,6 +229,44 @@ def test_get_pipeline_jobs_uses_triage_collector(monkeypatch, notify_module):
     assert collector.call_args_list == [((project, 101),), ((project, 102),)]
 
 
+@pytest.mark.parametrize(
+    "status", ["created", "pending", "running", "success", "failed", "canceled", "skipped"]
+)
+def test_gb300_notification_only_reports_completed_child(
+    monkeypatch, notify_module, caplog, status
+):
+    notify = notify_module
+    child_url = "https://ci.example.com/ADLR/megatron-lm/-/pipelines/103"
+    root_pipeline = Mock()
+    root_pipeline.bridges.list.return_value = [
+        SimpleNamespace(
+            name="functional:run_dev_dgx_gb300",
+            attributes={"downstream_pipeline": {"id": 103, "status": status, "web_url": child_url}},
+        )
+    ]
+    project = Mock()
+    project.pipelines.get.return_value = root_pipeline
+    collector = Mock(return_value=[{"status": status, "gpu": "Unknown", "allow_failure": False}])
+    monkeypatch.setattr(notify.notification, "get_jobs_from_pipeline", collector)
+
+    jobs = notify.get_pipeline_jobs(123, notify.JOB_PREFIXES["functional-tests"], project=project)
+
+    if status in {"created", "pending", "running"}:
+        assert jobs == []
+        collector.assert_not_called()
+        assert child_url in caplog.text
+        assert status in caplog.text
+    else:
+        assert jobs == [
+            (
+                "functional:run_dev_dgx_gb300",
+                103,
+                [{"status": status, "gpu": "GB300", "allow_failure": False}],
+            )
+        ]
+        collector.assert_called_once_with(project, 103)
+
+
 def test_build_linear_reports_groups_matching_failures(monkeypatch):
     summarize, subcategorize, digest = _mock_llm_reporting(monkeypatch)
     pipeline_jobs = [
