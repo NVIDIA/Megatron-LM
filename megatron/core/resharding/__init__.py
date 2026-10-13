@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from .execution import execute_reshard_plan
+from .execution import execute_reshard_plan, refresh_module_caches
 from .planner import (
     build_centralized_reshard_plan,
     build_local_reshard_plan,
@@ -21,6 +21,7 @@ __all__ = [
     "build_plan_from_rosters",
     "index_metadata_rosters",
     "execute_reshard_plan",
+    "refresh_module_caches",
     "MXFP8ReshardTransform",
     "ReshardTransform",
     "swap_model_weights",

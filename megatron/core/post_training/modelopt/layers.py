@@ -163,6 +163,7 @@ class Linear(torch.nn.Linear):
                     self.config.expert_model_parallel_size > 1
                     or self.config.expert_tensor_parallel_size
                     != self.config.tensor_model_parallel_size
+                    or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
                 )
                 setattr(param, "allreduce", not use_expert_groups)
             else:

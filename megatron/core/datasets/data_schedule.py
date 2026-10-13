@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
+import enum
 from typing import Any, Dict, Optional, Type
 
 import torch
@@ -25,6 +26,16 @@ from megatron.core.packed_seq_params import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
+
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Preserve optional native-kernel registration; no API is called directly here.
+    import transformer_engine_torch as tex  # pylint: disable=unused-import
+except ImportError:
+    # TE isn't installed or the torch wrapper is missing
+    tex = None
 
 
 def _build_thd_padding_mask(
@@ -446,6 +457,13 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         return sample_id_groups
 
 
+class PackingSchedulerEnum(str, enum.Enum):
+    """Supported packing algorithms, also usable as the legacy string names."""
+
+    DP_BALANCED = "dp_balanced"
+    DEFAULT_DYNAMIC_CP = "default_dynamic_cp"
+
+
 scheduler_map: Dict[str, Type[BasePackingScheduler]] = {
     "dp_balanced": DpBalancedScheduler,
     "default_dynamic_cp": DefaultDynamicCPScheduler,
@@ -518,7 +536,7 @@ def wrap_data_iterator(
     cp_size = dp_cp_group.size() // dp_size
 
     # Look up the scheduler class by name
-    scheduler_type = config.sequence_packing_scheduler
+    scheduler_type = PackingSchedulerEnum(config.sequence_packing_scheduler).value
 
     scheduler_kwargs = {}
     if scheduler_type == 'default_dynamic_cp':
@@ -707,33 +725,12 @@ def get_batch_on_this_rank_for_sequence_packing(
             partition_total_tokens=partition_total_tokens,
         )
 
-    # Broadcast cu_seqlens_size because we need it to create placeholder for cu_seqlens and
-    # cu_seqlens_padded for non TP 0 ranks.
-    if is_tp_rank_0:
-        cu_seqlen_size = torch.tensor(batch['cu_seqlens'].size(0), dtype=torch.int32, device=dev)
-    else:
-        cu_seqlen_size = torch.empty(1, dtype=torch.int32, device=dev)
-    broadcast_tensor(cu_seqlen_size, tp_src_rank, tp_group)
-    cu_seqlen_size = cu_seqlen_size.item()
-
-    # Broadcast total_tokens because padding_mask is prepared on every PP stage.
-    # Tokens/labels/loss_mask/position_ids use the same length on stages that own them.
-    if is_tp_rank_0:
-        if contiguous_cp_local_target_len is not None:
-            total_tokens = torch.tensor(
-                [contiguous_cp_local_target_len], dtype=torch.int32, device=dev
-            )
-        else:
-            # Under VPP, the last PP stage has labels but no tokens, so derive
-            # total_tokens from cu_seqlens_padded, which is present on every
-            # stage. cu_seqlens_padded keeps the pre-CP packed length; divide
-            # by cp_size to match the already CP-sliced sequence tensors.
-            cp_world = cp_group.size()
-            total_tokens = (batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world).reshape(1)
-    else:
-        total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
-    broadcast_tensor(total_tokens, tp_src_rank, tp_group)
-    total_tokens = total_tokens.item()
+    # Broadcast both receive-buffer dimensions in one collective. The sliced mask
+    # reflects the actual local width for zigzag, contiguous and dynamic CP.
+    shapes = (
+        [batch['cu_seqlens'].size(0), batch['padding_mask'].size(0)] if is_tp_rank_0 else [0, 0]
+    )
+    cu_seqlen_size, total_tokens = broadcast_scalars(shapes, tp_group, dev, dtype=torch.int32)
 
     # Step1: Prepare "tokens", "position_ids" for first stage and stage with mtp on all TP ranks.
     if is_first_stage or mtp_on_this_rank:
@@ -824,11 +821,12 @@ def get_batch_on_this_rank_for_sequence_packing(
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
     local_cp_size = batch['local_cp_size'].item() if dynamic_cp else None
-    cp_group = (
+    runtime_cp_group = (
         parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
         if dynamic_cp
         else None
     )
+    cp_group = runtime_cp_group if dynamic_cp and local_cp_size > 1 else None
 
     # cu_seqlens_q/kv hold the original (unpadded) boundaries so downstream
     # loss paths (e.g. CSA indexer KL) can identify padding rows.
@@ -844,6 +842,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=cp_group,
+        cp_singleton_group=runtime_cp_group if local_cp_size == 1 else None,
         cp_partition_mode=cp_partition_mode,
         pad_between_seqs=True,
     )

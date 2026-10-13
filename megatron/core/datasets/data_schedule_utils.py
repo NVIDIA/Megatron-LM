@@ -109,7 +109,8 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
     we unpack the sample here to avoid unnecessarily transferring
     the entire packed sample.
 
-    Two input shapes are accepted:
+    Two mutually exclusive input shapes are accepted, and every sample in
+    ``batch`` must use the same one:
 
       * **Pre-packed** (e.g. :class:`SFTDataset`): each sample carries a
         ``cu_seqlens`` tensor and the tokens of multiple sub-samples
@@ -120,33 +121,61 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
         single sub-sample that already carries ``padded_seq_len`` (and
         usually ``original_seq_len``). We just normalize the leading batch
         dimension introduced by the default collate_fn and return as-is.
+
+    The shape is decided once for the whole batch and asserted per sample, so a
+    dataset that emits both keys cannot silently bypass the ``cu_seqlens``
+    slicing below.
     """
+    if not batch:
+        return batch
+
+    # Pick the input shape from the first sample, then validate every sample
+    # against it and normalize the collate dimension in the same pass.
+    is_unpacked = "padded_seq_len" in batch[0]
+    for i, sample in enumerate(batch):
+        assert ("padded_seq_len" in sample) == is_unpacked, (
+            f"_unpack_batch got a mixed batch: sample {i} and sample 0 disagree on "
+            "whether they carry 'padded_seq_len' (already unpacked) or not (pre-packed)."
+        )
+        assert ("cu_seqlens" in sample) != is_unpacked, (
+            f"_unpack_batch: sample {i} must carry exactly one of 'padded_seq_len' "
+            "(already unpacked, e.g. VarlenDataset) or 'cu_seqlens' (pre-packed, "
+            "e.g. SFTDataset)."
+        )
+        for key, value in sample.items():
+            if value.ndim == 2:
+                # Drop the redundant batch dimension added by the default
+                # collate_fn in the pytorch dataloader. squeeze(0) is a silent
+                # no-op when the leading dimension is not 1, so assert on it
+                # instead of slicing along the batch dimension further down.
+                # The packing path installs an identity collate_fn (see
+                # build_pretraining_data_loader), which never adds this
+                # dimension in the first place and therefore supports
+                # micro_batch_size > 1; the default collate_fn only works here
+                # with micro_batch_size == 1.
+                assert value.shape[0] == 1, (
+                    f"_unpack_batch got '{key}' with shape {tuple(value.shape)}; the "
+                    "packed-sequence path needs one sub-sample per collated entry. Use "
+                    "micro_batch_size 1 with the default collate_fn, or an identity "
+                    "collate_fn."
+                )
+                sample[key] = value.squeeze(0)
+
     # Short-circuit for datasets that already emit one sub-sample per index.
-    if batch and "padded_seq_len" in batch[0]:
+    if is_unpacked:
         for sample in batch:
-            for key in sample.keys():
-                if sample[key].ndim == 2 and sample[key].shape[0] == 1:
-                    # Drop the redundant batch dim added by collate_fn.
-                    sample[key] = sample[key].squeeze(0)
             if "original_seq_len" not in sample:
                 sample["original_seq_len"] = sample["padded_seq_len"].clone()
         return batch
 
     batch_unpacked = []
-    dev = batch[0]["cu_seqlens"].device
+    device = batch[0]["cu_seqlens"].device
     original_seq_lens = []
     padded_seq_lens = []
-    # Determine which data fields exist in the batch
-    data_keys = [k for k in ["tokens", "labels", "loss_mask", "position_ids"] if k in batch[0]]
+    data_keys = [
+        key for key in ("tokens", "labels", "loss_mask", "position_ids") if key in batch[0]
+    ]
     for sample in batch:
-        for key in sample.keys():
-            if len(sample[key].shape) == 2:
-                # squeeze the redundant batch dimension added by
-                # default collate_fn in pytorch dataloader
-                # we need a custom collate_fn for THD to avoid this
-                # current THD does not support micro_batch_size > 1 due to sft_dataset.py and
-                # data_loader in data_samples.py
-                sample[key] = sample[key].squeeze(0)
         for sub_sample in range(sample["cu_seqlens"].shape[0] - 1):
             sub_sample_dict = {}
             start_idx = sample["cu_seqlens"][sub_sample]
@@ -164,8 +193,8 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
             batch_unpacked.append(sub_sample_dict)
 
     # Single H2D transfer for all seq lens
-    original_seq_lens_cuda = torch.tensor(original_seq_lens, device=dev)
-    padded_seq_lens_cuda = torch.tensor(padded_seq_lens, device=dev)
+    original_seq_lens_cuda = torch.tensor(original_seq_lens, device=device)
+    padded_seq_lens_cuda = torch.tensor(padded_seq_lens, device=device)
     for i, sub_sample_dict in enumerate(batch_unpacked):
         sub_sample_dict["original_seq_len"] = original_seq_lens_cuda[i : i + 1]
         sub_sample_dict["padded_seq_len"] = padded_seq_lens_cuda[i : i + 1]
@@ -273,6 +302,141 @@ def broadcast_tensor(item, src_rank, group) -> None:
     """Broadcast a tensor from src_rank to all ranks in the group."""
     if item is not None:
         torch.distributed.broadcast(item, src_rank, group=group)
+
+
+def broadcast_to_pp_group(
+    new_samples,
+    num_micro_batches,
+    seqlen_sum_this_global_batch,
+    seqlen_squared_sum_this_global_batch,
+    pp_group,
+    dev,
+):
+    """
+    Broadcast num_micro_batches, seqlen_sum_this_global_batch,
+    seqlen_squared_sum_this_global_batch and metadata to middle PP stages.
+    Before this broadcast, the new_samples on middle PP stages are None,
+    after this broadcast, the new_samples on middle PP stages contain the metadata but
+    without tokens, labels, loss_mask, position_ids.
+
+    Who needs what:
+
+      * **PP rank 0 and the last PP rank** both own a data iterator (only TP rank 0
+        on the first and last PP stage does), so both run the whole schedule ->
+        reroute -> pack pipeline on the same input samples and independently end up
+        with complete ``new_samples``: tokens, labels, loss_mask, position_ids *and*
+        the packing metadata. Neither takes anything from this broadcast; the last
+        stage in particular must keep its own labels / loss_mask.
+      * **Middle PP stages** have no data iterator, so ``new_samples`` is None on
+        entry. They only need the packing metadata (max_seqlen / cu_seqlens /
+        cu_seqlens_padded) to rebuild the packed-sequence params, never the token
+        tensors.
+
+    The last PP rank still takes part in the transfer because
+    ``torch.distributed.broadcast`` is a collective over ``pp_group``: every member
+    has to call it or the group deadlocks. It therefore receives the payload and
+    drops it, which is what the ``pp_group.rank() != pp_group.size() - 1`` guard
+    below implements. Filtering it out of the transfer itself would require a
+    separate "first + middle" process group, which is not worth an extra process
+    group for a payload of a few hundred bytes per global batch.
+    """
+
+    pp_src_rank = torch.distributed.get_process_group_ranks(pp_group)[0]
+
+    # size() > 2 asks "does a middle PP stage exist at all": with 1 or 2 PP ranks
+    # every rank is a first and/or last stage and already owns its packed samples,
+    # so there is nobody to broadcast to.
+    if pp_group.size() > 2:
+        if pp_group.rank() == 0:
+            cu_seqlens_lengths = torch.tensor(
+                [sample["cu_seqlens"].numel() for sample in new_samples],
+                dtype=torch.float32,
+                device=dev,
+            )
+            cu_seqlens_padded_lengths = torch.tensor(
+                [sample["cu_seqlens_padded"].numel() for sample in new_samples],
+                dtype=torch.float32,
+                device=dev,
+            )
+            tensor_list = [
+                torch.tensor(
+                    [
+                        num_micro_batches,
+                        seqlen_sum_this_global_batch,
+                        seqlen_squared_sum_this_global_batch,
+                    ],
+                    dtype=torch.float32,
+                    device=dev,
+                )
+            ]
+            for sample in new_samples:
+                tensor_list.append(sample["max_seqlen"].reshape(1))
+            tensor_list.append(cu_seqlens_lengths)
+            tensor_list.append(cu_seqlens_padded_lengths)
+            for sample in new_samples:
+                tensor_list.append(sample["cu_seqlens"])
+                tensor_list.append(sample["cu_seqlens_padded"])
+            info_to_broadcast = torch.cat(tensor_list, dim=0).to(device=dev, dtype=torch.float32)
+            info_length_tensor = torch.tensor(
+                info_to_broadcast.shape[0], dtype=torch.int32, device=dev
+            )
+            broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
+            broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
+        else:
+            # Every non-source rank has to take part in the collective, including
+            # the last PP stage.
+            info_length_tensor = torch.tensor(0, dtype=torch.int32, device=dev)
+            broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
+            info_to_broadcast = torch.empty(
+                info_length_tensor.item(), dtype=torch.float32, device=dev
+            )
+            broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
+            if pp_group.rank() != pp_group.size() - 1:
+                # Middle PP stages receive the broadcasted info and unpack it.
+                # Cu-seqlens lengths are encoded explicitly so zero values inside
+                # the payload cannot be mistaken for tensor boundaries.
+                # The last PP stage deliberately falls through: it built its own
+                # new_samples from its own data iterator (with the labels and
+                # loss_mask this payload does not carry), so it discards what it
+                # just received rather than overwriting them.
+                num_micro_batches = int(info_to_broadcast[0].item())
+                seqlen_sum_this_global_batch = info_to_broadcast[1].item()
+                seqlen_squared_sum_this_global_batch = info_to_broadcast[2].item()
+
+                cursor = 3
+                max_seqlens = info_to_broadcast[cursor : cursor + num_micro_batches]
+                cursor += num_micro_batches
+                cu_seqlens_lengths = info_to_broadcast[cursor : cursor + num_micro_batches].to(
+                    torch.int64
+                )
+                cursor += num_micro_batches
+                cu_seqlens_padded_lengths = info_to_broadcast[
+                    cursor : cursor + num_micro_batches
+                ].to(torch.int64)
+                cursor += num_micro_batches
+
+                new_samples = []
+                for i in range(num_micro_batches):
+                    cu_seqlens_len = int(cu_seqlens_lengths[i].item())
+                    cu_seqlens_padded_len = int(cu_seqlens_padded_lengths[i].item())
+                    new_sample = {}
+                    new_sample["max_seqlen"] = max_seqlens[i].to(torch.int32)
+                    new_sample["cu_seqlens"] = info_to_broadcast[
+                        cursor : cursor + cu_seqlens_len
+                    ].to(torch.int32)
+                    cursor += cu_seqlens_len
+                    new_sample["cu_seqlens_padded"] = info_to_broadcast[
+                        cursor : cursor + cu_seqlens_padded_len
+                    ].to(torch.int32)
+                    cursor += cu_seqlens_padded_len
+                    new_samples.append(new_sample)
+
+    return (
+        new_samples,
+        num_micro_batches,
+        seqlen_sum_this_global_batch,
+        seqlen_squared_sum_this_global_batch,
+    )
 
 
 def broadcast_scalars(values: List, group, dev, dtype=torch.float32) -> List:

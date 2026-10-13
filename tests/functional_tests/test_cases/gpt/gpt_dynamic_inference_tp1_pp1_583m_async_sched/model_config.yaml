@@ -39,9 +39,8 @@ MODEL_ARGS:
   --seq-length: 1024
   --temperature: 1.0
   --top_k: 1
-  # Async scheduling only supports greedy sampling (top_k=1, top_p=0.0) and does
-  # not support log probabilities, stop words, chunked prefill, or prefix
-  # caching (see dynamic_engine._validate_async_sched_support_for_request).
+  # Keep the mode explicit so this named test always exercises async scheduling,
+  # independent of the default.
   --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-async-sched-mode: async
   --dist-ckpt-strictness: log_unexpected

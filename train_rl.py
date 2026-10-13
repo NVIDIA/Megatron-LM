@@ -9,7 +9,6 @@ import torch
 
 from gpt_builders import gpt_builder
 from hybrid_builders import hybrid_builder
-from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -28,8 +27,14 @@ from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
+    resolve_tokenizer_vocab_size,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.global_vars import (
+    get_run_config,
+    initialize_runtime_services,
+    set_run_config,
+)
 from megatron.training.utils import is_hybrid_model
 from model_provider import model_provider
 
@@ -144,9 +149,6 @@ def loss_func(
     masked_truncated_from_above = torch.sum(loss_mask_flat * truncated_from_above_flat)
     masked_truncated_from_below = torch.sum(loss_mask_flat * truncated_from_below_flat)
 
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
@@ -192,7 +194,7 @@ def loss_func(
     # Note: This information needs to be determined in forward_step where we have access to the batch data
     # The loss_func doesn't have direct access to this information
 
-    return (loss[0] * args.context_parallel_size, total_tokens.int(), output_dict)
+    return (loss[0].clone(), total_tokens.int(), output_dict)
 
 
 def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
@@ -203,7 +205,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         model (GPTModel): The GPT Model
     """
     runtime_state = get_rl_runtime_state()
-    args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
 
     timers('batch-generator', log_level=2).start()
@@ -212,7 +214,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         batch_data = next(data_iterator)
     timers('batch-generator').stop()
 
-    if args.rl_use_sequence_packing:
+    if cfg.rl.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
 
@@ -231,7 +233,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         ) = load_packed_data_by_index(
             bin_tensor.item(),
             runtime_state.packing_context,
-            args.rl_inference_logprobs_is_correction,
+            cfg.rl.rl_inference_logprobs_is_correction,
         )
 
         runtime_state.increment_sequences(len(seq_indices))
@@ -259,7 +261,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         # advantages already on GPU from prepare_data_for_update
         loss_mask = loss_mask[:, 1:].contiguous().cuda()
         inference_logprobs = (
-            inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
+            inference_logprobs.cuda() if cfg.rl.rl_inference_logprobs_is_correction else None
         )
 
         runtime_state.increment_sequences(tokens.shape[0])
@@ -268,21 +270,23 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     model_to_use = model[0] if isinstance(model, list) else model
 
     if packed_seq_params is None:
-        if args.rl_use_sequence_packing:
+        if cfg.rl.rl_use_sequence_packing:
             packed_seq_params = get_default_packed_seq_params(
                 seq_length=tokens.shape[1],
-                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+                max_sequences_per_bin=cfg.rl.rl_sequence_packing_max_sequences_per_bin,
                 device=tokens.device,
             )
         else:
             cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
+            # Make sure to omit `total_tokens` to prevent `seq_idx` from being auto-computed.
+            # That would cause a sequence packing kernel to be incorrectly used.
             packed_seq_params = PackedSeqParams(
                 qkv_format='thd',
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_kv=cu_seqlens,
                 max_seqlen_q=tokens.shape[1],
                 max_seqlen_kv=tokens.shape[1],
-                total_tokens=tokens.shape[1],
+                pad_between_seqs=False,
             )
 
     # Clear RoPE cache to avoid inference tensor errors
@@ -319,12 +323,12 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                     old_logprobs=old_logprobs,
                     ref_logprobs=ref_logprobs,
                     advantages=advantages,
-                    clamp_eps_lower=args.grpo_clamp_eps_lower,
-                    clamp_eps_upper=args.grpo_clamp_eps_upper,
-                    kl_beta=args.grpo_kl_beta,
-                    entropy_weight=args.grpo_entropy_term_weight,
+                    clamp_eps_lower=cfg.rl.grpo_clamp_eps_lower,
+                    clamp_eps_upper=cfg.rl.grpo_clamp_eps_upper,
+                    kl_beta=cfg.rl.grpo_kl_beta,
+                    entropy_weight=cfg.rl.grpo_entropy_term_weight,
                     inference_logprobs=inference_logprobs,
-                    is_truncation_coef=args.rl_importance_sampling_truncation_coef,
+                    is_truncation_coef=cfg.rl.rl_importance_sampling_truncation_coef,
                     seq_starts=seq_starts,
                     seq_lengths=seq_lengths,
                 )
@@ -419,11 +423,22 @@ if __name__ == "__main__":
             )
 
     args = parse_and_validate_args(extra_args_provider=add_inference_args, args_defaults={})
+    assert not args.reset_attention_mask, (
+        "--reset-attention-mask is not supported in RL training: "
+        "the forward pass masks via PackedSeqParams and never consumes a dense attention mask."
+    )
+    if args.batch_invariant_mode and args.rank == 0:
+        print(
+            "WARNING: batch-invariant mode is enabled, so logprobs are not computed vocab-parallel"
+        )
     if is_hybrid_model(args):
-        model_cfg = hybrid_config_from_args(args)
+        model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     else:
-        model_cfg = gpt_config_from_args(args)
+        model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    set_run_config(full_config)
+    initialize_runtime_services(args, training=True)
+    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         None,  # we don't need to build any datasets for RL training

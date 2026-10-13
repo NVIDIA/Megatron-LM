@@ -21,6 +21,8 @@ class NVSHMEMCopyService(CopyService):
     planner can schedule send/recv pairs.  Calls without a task_id will raise.
     """
 
+    supports_multiple_runs_per_plan = True
+
     def __init__(self, group=None):
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before NVSHMEMCopyService()")
@@ -132,6 +134,7 @@ class NVSHMEMCopyService(CopyService):
                     f"missing_recvs={sorted(list(missing_recvs))[:10]}"
                 )
 
+            self._local_copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.no_grad():
                 with torch.cuda.stream(self._local_copy_stream):
                     for task_id, dst in self._local_recv_ops.items():

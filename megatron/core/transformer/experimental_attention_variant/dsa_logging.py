@@ -133,6 +133,7 @@ class DSAIndexerLossLoggingHelper:
         configured_cp_size: Optional[int] = None,
         pp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """Collect and reduce the indexer losses across ranks.
 
@@ -156,6 +157,10 @@ class DSAIndexerLossLoggingHelper:
                 logging and to validate the Dynamic-CP parent domain; defaults to the legacy
                 global process-group registry when omitted.
         """
+        if pg_collection is not None:
+            pp_group = pg_collection.pp if pp_group is None else pp_group
+            dp_group = pg_collection.dp if dp_group is None else dp_group
+
         tracker = DSAIndexerLossLoggingHelper.tracker
         if pp_group is None:
             # Legacy callers may omit the collection. Training passes the owning language-model
@@ -254,6 +259,7 @@ class DSAIndexerLossLoggingHelper:
         configured_cp_size: Optional[int] = None,
         pp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -276,6 +282,10 @@ class DSAIndexerLossLoggingHelper:
             pp_group: Pipeline-parallel group that owns the language model.
             dp_group: Data-parallel group that owns the language model.
         """
+        if pg_collection is not None:
+            pp_group = pg_collection.pp if pp_group is None else pp_group
+            dp_group = pg_collection.dp if dp_group is None else dp_group
+
         DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
             num_layers=num_layers,
             dynamic_cp_parent_group=dynamic_cp_parent_group,

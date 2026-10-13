@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import fully_shard_optimizer
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer import TransformerLayer
 from megatron.core.utils import is_te_min_version
@@ -26,9 +27,6 @@ from tests.unit_tests.a2a_overlap.utils import (
     reset_model,
 )
 from tests.unit_tests.test_utilities import Utils
-
-# Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
-pytestmark = pytest.mark.flaky_in_dev
 
 SEQ_LEN = 32
 VOCAB_SIZE = 128
@@ -53,6 +51,7 @@ class TestFSDP1F1BOverlap:
         set_streams()
 
     def teardown_method(self, method):
+        PipelineOffloadManager.reset_instance()
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")

@@ -95,6 +95,35 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     inter_document_masking: bool = False
     """When True, return cu_seqlens marking document boundaries within each sample so
     that attention is restricted to individual documents."""
+    sft_mock_dataset_config_json: Optional[str] = None
+    """JSON string (or path to a JSON file) configuring the mock SFT dataset's
+    sequence-length distribution. Two modes:
+
+      * ``{"mode": "file", "path": "/path/to/seqlens.csv"}`` -- read the
+        per-sample sequence lengths from a CSV file.
+      * ``{"mode": "distribution", "type": "lognormal", "min_seq_len": 1024,
+        "max_seq_len": 8192, "mean_seq_len": 4096, "lognormal_sigma": 1.1}``
+        -- draw lengths from a clipped lognormal distribution.
+
+    Consumed by ``MockSFTLowLevelDataset`` in
+    ``megatron/training/datasets/sft_dataset.py``, which documents the fields.
+    """
+
+    varlen_mock_dataset_config_json: Optional[str] = None
+    """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
+    used by the ``--use-varlen-dataset`` path; kept separate so the varlen path
+    does not implicitly inherit SFT-specific knobs."""
+
+    varlen_sbhd_validation: bool = False
+    """When True, :class:`VarlenDataset.__getitem__` emits SBHD samples padded
+    to ``sequence_length`` (no ``cu_seqlens`` / ``original_seq_len`` /
+    ``padded_seq_len``), bypassing the packed-sequence path. Used to obtain a
+    SBHD reference run that mirrors the THD path's tokenization but skips all
+    packing — useful for THD numerical-correctness validation.
+
+    NOTE: this is a debugging/verification knob, not a training feature.
+    TODO: drop this field once a functional test covers THD-vs-SBHD numerical
+    parity in CI."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -166,7 +195,7 @@ class GPTDataset(MegatronDataset):
         self.cached_loss_mask = None
         self.cached_position_ids = None
 
-        (self.document_index, self.sample_index, self.shuffle_index) = (
+        self.document_index, self.sample_index, self.shuffle_index = (
             self._build_document_sample_shuffle_indices()
         )
 

@@ -40,6 +40,10 @@ def finalize_packed_seq_params(
     from megatron.core.parallel_state import get_context_parallel_group
 
     cp_group = resolve_cp_group(get_context_parallel_group(), packed_seq_params)
-    packed_seq_params.cp_group = cp_group
+    if packed_seq_params.local_cp_size == 1:
+        packed_seq_params.cp_singleton_group = cp_group
+        packed_seq_params.cp_group = None
+    else:
+        packed_seq_params.cp_group = cp_group
     prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
     return packed_seq_params

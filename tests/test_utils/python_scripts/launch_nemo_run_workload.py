@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import io
 import logging
@@ -146,6 +146,13 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
 @click.option("--hf-home", required=False, type=str, help="HF home directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
 @click.option(
+    "--unit-testmon-mode",
+    type=click.Choice(["full", "enforce", "baseline"]),
+    default="full",
+    show_default=True,
+    help="Selective unit-test mode.",
+)
+@click.option(
     "--enable-lightweight-mode",
     is_flag=True,
     show_default=True,
@@ -175,6 +182,7 @@ def main(
     data_dir: Optional[str] = None,
     hf_home: Optional[str] = None,
     tag: Optional[str] = None,
+    unit_testmon_mode: str = "full",
     enable_lightweight_mode: Optional[bool] = False,
     cadence: Optional[str] = None,
 ):
@@ -223,6 +231,7 @@ def main(
         shm_size="30g",
         env_vars={
             "PYTHONUNBUFFERED": "1",
+            "UNIT_TESTMON_MODE": unit_testmon_mode,
             "FORCE_COLOR": "1",
             "TERM": "xterm-256color",
             "OUTPUT_PATH": os.getcwd(),
@@ -237,6 +246,24 @@ def main(
         packager=run.Packager(),
         volumes=artifacts,
     )
+
+    if (
+        scope == "unit-tests"
+        and test_case == "tests/unit_tests/transformer/**/*.py"
+        and environment == "dev"
+        and tag == "latest"
+        and platform == "dgx_h100"
+    ):
+        # NCCL 2.31 finalization waits for peers. Nonblocking communicators let
+        # PyTorch start every communicator's finalization before waiting, avoiding
+        # cyclic waits between the CP group's P2P and collective communicators (#7744).
+        executor.env_vars["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "1"
+        executor.env_vars["PYTEST_ADDOPTS"] = "-o faulthandler_timeout=600"
+        executor.env_vars["TORCH_CPP_LOG_LEVEL"] = "INFO"
+        executor.env_vars["NCCL_DEBUG_SUBSYS"] = "INIT,BOOTSTRAP,ENV,DESTROY"
+        executor.env_vars["NCCL_DEBUG_FILE"] = (
+            "/opt/megatron-lm/assets_dir/logs/nccl_debug.%h.%p.log"
+        )
 
     n_attempts = 0
     while n_attempts < 3:

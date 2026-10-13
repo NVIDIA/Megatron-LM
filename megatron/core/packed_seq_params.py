@@ -29,14 +29,21 @@ class PackedSeqParams:
     cu_seqlens_kv_padded: Tensor = None
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
+    # Runtime dynamic context parallelism, set per microbatch by the packing scheduler.
+    # When local_cp_size is set, cp_group is the matching runtime group,
+    # including a singleton group when CP is disabled for this microbatch.
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
+    # TE represents CP-off as cp_group=None, while layout/RoPE helpers still need
+    # the actual singleton group when the build-time CP group is larger.
+    cp_singleton_group: Optional[dist.ProcessGroup] = None
     total_tokens: int = None
     seq_idx: Tensor = None
     pad_between_seqs: Optional[bool] = None
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
+    cp_scatter_cache: object = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -80,14 +87,23 @@ class PackedSeqParams:
 
 
 def resolve_cp_group(
-    static_cp_group: dist.ProcessGroup, packed_seq_params: PackedSeqParams = None
-) -> dist.ProcessGroup:
-    """Return the dynamic CP group from packed_seq_params when available, else the static one.
-
-    Dynamic CP assigns a per-microbatch CP group that may differ from the
-    process-group stored at model construction time.  This helper centralises
-    the resolution logic used by GPTModel, GatedDeltaNet, and MTP layers.
-    """
+    static_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
+) -> Optional[dist.ProcessGroup]:
+    """Resolve the runtime CP group without mutating packed metadata."""
+    if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+        runtime_group = packed_seq_params.cp_group
+        # Compatibility for the previous dev CP-off metadata representation.
+        # Main's TE adapter now translates the singleton to None only inside TE.
+        if runtime_group is None and packed_seq_params.local_cp_size == 1:
+            runtime_group = packed_seq_params.cp_singleton_group
+        assert (
+            runtime_group is not None
+        ), "packed_seq_params.cp_group must be set when local_cp_size is provided"
+        assert runtime_group.size() == packed_seq_params.local_cp_size, (
+            "packed_seq_params.cp_group size must match local_cp_size: "
+            f"{runtime_group.size()} != {packed_seq_params.local_cp_size}"
+        )
+        return runtime_group
     if packed_seq_params is not None and packed_seq_params.cp_group is not None:
         return packed_seq_params.cp_group
     return static_cp_group
@@ -726,6 +742,7 @@ def pad_sequence_for_thd(
         ),
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
+        cp_singleton_group=packed_seq_params.cp_singleton_group,
         cp_partition_mode=packed_seq_params.cp_partition_mode,
         total_tokens=local_target_len if target_cu_entries is None else None,
         pad_between_seqs=(

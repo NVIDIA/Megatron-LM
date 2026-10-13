@@ -1,5 +1,12 @@
 # Balanced DSv4 context-parallel indexer
 
+> Deferred in the main-first sync. This document describes the extension preserved
+> in review commit `aa0d61f457063dd1638ca339af9539d4b9c4cba3`. The supported DSv4 path
+> includes upstream SBHD and the static contiguous packed THD/CP path from #7469,
+> with TP1 and the cuDNN packed backend. Dynamic CP, balanced-indexer and compact
+> MXFP8 extensions remain deferred and are rejected by configuration. The historical
+> instructions below are not a current recipe. The combined draft still requires CI.
+
 The ratio-4 CSA indexer distributes each padded sequence over twice the CP
 size. Rank r scores its head chunk and the mirrored tail chunk, then returns
 the selected compressed-key IDs to contiguous query ownership. Every padded

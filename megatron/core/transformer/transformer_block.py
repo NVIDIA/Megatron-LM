@@ -22,6 +22,8 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import checkpointed_forward
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
@@ -62,14 +64,9 @@ except ImportError:
     HAVE_APEX = False
 
 get_cpu_offload_context = None
-te_checkpoint = None
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import (
-        TENorm,
-        get_cpu_offload_context,
-        te_checkpoint,
-    )
+    from megatron.core.extensions.transformer_engine import TENorm, get_cpu_offload_context
 
     LayerNormImpl = TENorm
 
@@ -288,6 +285,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
 
@@ -304,6 +302,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self.name = name
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -337,6 +336,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.config._cpu_offloading_context = None
 
         self.num_residual_streams = config.num_residual_streams
+        self.mhc_num_residual_streams = config.mhc_num_residual_streams
+        self.mhc_recompute_enabled = (
+            config.enable_mhc_connections
+            and config.recompute_granularity == 'selective'
+            and 'mhc' in config.recompute_modules
+        )
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -369,12 +374,34 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 quantization_context = nullcontext()
 
             with quantization_context:
+                # Pass names so per-module recipes choose storage before TE allocates
+                # parameters. GPTModel's later finish_init() sets quantization overrides
+                # but does not replace existing weights: under global MXFP8 storage,
+                # even BF16-selected modules would otherwise get MXFP8 parameters.
+                # Loading a BF16 checkpoint into those parameters would quantize its
+                # values; converting back to BF16 cannot recover the lost precision.
+                # HybridStack already passes names during construction. Keep unnamed
+                # custom layer specs unchanged by omitting the extra keyword argument.
+                layer_kwargs = (
+                    {"name": f"{self.name}.layers.{layer_number - 1}"}
+                    if self.name is not None
+                    else {}
+                )
                 module = build_module(
                     layer_spec,
                     config=layer_config,
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
+                    **layer_kwargs,
+                )
+            if layer_config.enable_mhc_connections and not getattr(
+                module, "supports_mhc_connections", False
+            ):
+                raise ValueError(
+                    f"{type(module).__name__} does not implement mHC residual streams. Build "
+                    "TransformerBlock with HyperConnectionTransformerLayer when "
+                    "enable_mhc_connections=True."
                 )
             return module
 
@@ -478,6 +505,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
+            # Embedding-only stages send this expanded view without executing a layer.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
 
         return hidden_states
 
@@ -593,167 +624,22 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         layer_offset: int = 0,
         input_ids: Optional[Tensor] = None,
     ):
-        """Forward method with activation checkpointing.
-
-        Args:
-            extract_layer_indices (Set[int], optional): Global layer
-                indices (across all pipeline stages) from which to
-                extract features.
-            layer_offset (int): The global layer offset for the current
-                pipeline stage. Used to convert local layer indices to
-                global indices when checking extract_layer_indices.
-
-        Returns:
-            If extract_layer_indices is empty: hidden_states tensor
-            If extract_layer_indices is non-empty: (hidden_states, intermediate_hidden_states) tuple
-        """
-        if extract_layer_indices is None:
-            extract_layer_indices = set()
-        intermediate_hidden_states: List[Tensor] = []
-
-        # Unpack dual RoPE before checkpointing because autograd only accepts
-        # tensors (or None) in save_for_backward.
-        is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
-        assert (
-            not is_dual_rope or len(rotary_pos_emb) == 2
-        ), "Dual RoPE input length is not equal to 2"
-        rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
-
-        def custom(start: int, end: int):
-            def custom_forward(
-                hidden_states,
-                attention_mask,
-                context,
-                context_mask,
-                rotary_pos_emb_local,
-                rotary_pos_emb_global,
-                padding_mask=None,
-            ):
-                rotary_pos_emb = (
-                    (rotary_pos_emb_local, rotary_pos_emb_global)
-                    if is_dual_rope
-                    else rotary_pos_emb_global
-                )
-
-                for index in range(start, end):
-                    layer = self._get_layer(index)
-
-                    # Get appropriate inner quantization context
-                    if use_inner_quantization_context:
-                        if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        # TODO: check if fp4 is supported in this case
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        else:
-                            inner_quantization_context = nullcontext()
-                    else:
-                        inner_quantization_context = nullcontext()
-
-                    with inner_quantization_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            attention_bias=attention_bias,
-                            inference_context=None,
-                            packed_seq_params=packed_seq_params,
-                            padding_mask=padding_mask,
-                            input_ids=input_ids,
-                        )
-                return hidden_states, context
-
-            return custom_forward
-
-        def checkpoint_handler(forward_func):
-            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            # TODO: check if fp4 is supported in this case
-            if self.config.fp8 or self.config.fp4:
-                return te_checkpoint(
-                    forward_func,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    *rotary_pos_emb,
-                    padding_mask,
-                )
-            else:
-                return tensor_parallel.checkpoint(
-                    forward_func,
-                    self.config.distribute_saved_activations,
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    *rotary_pos_emb,
-                    padding_mask,
-                )
-
-        if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
-            layer_idx = 0
-            while layer_idx < self.num_layers_per_pipeline_rank:
-                chunk_end = min(
-                    layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
-                )
-                hidden_states, context = checkpoint_handler(custom(layer_idx, chunk_end))
-
-                # Feature extraction for uniform recompute: collect at end of each chunk
-                # Note: Only the last layer of each chunk can have features collected
-                for idx in range(layer_idx, chunk_end):
-                    if (idx + layer_offset) in extract_layer_indices:
-                        # For uniform recompute, we can only get features at chunk boundaries
-                        # Limitation: for fine-grained extraction, use 'block'
-                        if idx == chunk_end - 1:
-                            intermediate_hidden_states.append(hidden_states)
-
-                layer_idx += self.config.recompute_num_layers
-
-        elif self.config.recompute_method == 'block':
-            # Checkpoint the input activation of only a set number of individual
-            # Transformer layers and skip the rest.
-            # A method fully use the device memory removing redundant re-computation.
-            recompute_skip_num_layers = 0
-            for layer_idx in range(self.num_layers_per_pipeline_rank):
-                # Skip recomputation when input grad computation is not needed.
-                # Need to have at least one input tensor with gradient computation
-                # for re-enterant autograd engine.
-                # TODO: check if fp4 is supported in this case
-                if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
-                    recompute_skip_num_layers += 1
-                if (
-                    layer_idx >= recompute_skip_num_layers
-                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
-                ):
-                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
-                else:
-                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, *rotary_pos_emb
-                    )
-
-                # Feature extraction: collect hidden states at specified global layer indices
-                if (layer_idx + layer_offset) in extract_layer_indices:
-                    intermediate_hidden_states.append(hidden_states)
-        else:
-            raise ValueError("Invalid activation recompute method.")
-
-        # Return intermediate hidden states if feature extraction was requested
-        if len(extract_layer_indices) > 0:
-            return hidden_states, intermediate_hidden_states
-
-        return hidden_states
+        """Delegate to the common full-recompute path, including residual observations."""
+        return checkpointed_forward(
+            self,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            context=context,
+            context_mask=context_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            use_inner_quantization_context=use_inner_quantization_context,
+            padding_mask=padding_mask,
+            extract_layer_indices=extract_layer_indices,
+            layer_offset=layer_offset,
+            input_ids=input_ids,
+        )
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -953,14 +839,19 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_inner_quantization_context = False
             outer_quantization_context = nullcontext()
 
-        # Determine if MHC recompute should be used
-        # Only enable when: training mode AND hyper connections AND 'mhc' in recompute_modules
-        use_mhc_recompute = (
-            self.training
-            and self.config.enable_hyper_connections
-            and self.config.recompute_granularity == 'selective'
-            and "mhc" in self.config.recompute_modules
-        )
+        # Managers retain per-forward checkpoint state, so allocate them for each training pass.
+        use_mhc_recompute = self.training and self.mhc_recompute_enabled
+        if use_mhc_recompute and len(extract_layer_indices) > 0:
+            # mHC recompute discards every checkpoint output in the block and restores them
+            # from a single hook on the block-end tensor. A loss taken on an extracted
+            # mid-block activation can reach those checkpoints before that hook fires and
+            # would read zero-sized storage.
+            raise NotImplementedError(
+                "'mhc' in recompute_modules is not supported together with "
+                "extract_layer_indices. The unified mHC recompute hook is registered on the "
+                "recompute-block boundary, so gradients entering from an extracted "
+                "intermediate layer can reach discarded activations before they are restored."
+            )
         mhc_layer_managers, mhc_is_last_in_recompute_block = self._build_mhc_recompute_layer_plan(
             use_mhc_recompute
         )
@@ -991,6 +882,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states = checkpointed_result
             else:
                 for l_no, layer in enumerate(self.layers):
+                    residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:
@@ -1012,6 +904,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             mhc_is_last_in_recompute_block[l_no]
                         )
 
+                    # Only thread mhc_recompute_manager when the layer is mHC and a
+                    # manager actually exists. Plain TransformerLayer (and its
+                    # MoETransformerLayer subclass) doesn't accept this kwarg, and
+                    # its CUDA-graph machinery rejects unrecognized non-tensor kwargs.
+                    extra_layer_kwargs = (
+                        {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
+                    )
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -1027,9 +926,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
-                            mhc_recompute_manager=mhc_manager,
                             input_ids=input_ids,
+                            **extra_layer_kwargs,
                         )
+                    observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,

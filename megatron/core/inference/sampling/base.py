@@ -26,6 +26,7 @@ class Sampling(ABC):
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
         output: Optional[Tensor] = None,
+        sequence_lengths: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:
@@ -37,12 +38,14 @@ class Sampling(ABC):
             context: The active DynamicInferenceContext.
             no_top_k, no_top_p: Required batch-level dispatch flags (whether NO active
                 request uses top-k / top-p). The caller computes them once from the
-                pinned CPU sampling metadata (see the controller's
-                `_active_requests_sampling_filter_flags`), so the kernel never has to.
+                pinned CPU sampling metadata (see the context's
+                `active_sampling_filter_flags`), so the kernel never has to.
             gather_indices: If provided, only sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: Per-token request mapping; when set, sampling
                 parameters are gathered per-token instead of per-request.
             output: Optional caller-owned destination tensor of shape `[n]`.
+            sequence_lengths: Positions of the pending logits, before async scheduling
+                advances the live context. Used by request-local sampling.
             eager, cache_key: Accepted for API symmetry; ignored (no CUDA graph).
 
         Returns:

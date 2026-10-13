@@ -8,13 +8,13 @@ from typing import Any
 
 import click
 import gitlab
-from nemo_ci_triage.slack_notification import notification
-from nemo_ci_triage.slack_notification.utils import repository_settings
+from cerno.slack_notification import notification
+from cerno.slack_notification.utils import repository_settings
 
 from tests.test_utils.python_scripts import linear_ci
 
-TRIAGE_CONFIG = Path(os.getenv("NEMO_CI_TRIAGE_CONFIG", ".gitlab/nemo-ci-triage.yml"))
-PROJECT_ID, REPO_NAME = repository_settings(TRIAGE_CONFIG)
+CERNO_CONFIG = Path(os.getenv("CERNO_CONFIG", ".gitlab/cerno.yml"))
+PROJECT_ID, REPO_NAME = repository_settings(CERNO_CONFIG)
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 SLACK_BOT_TOKEN = os.getenv("MCORE_SLACK_BOT_TOKEN") or os.getenv("ALERTMANAGER_TOKEN", "")
 SLACK_CHANNEL_ID = os.getenv("MCORE_SLACK_CHANNEL_ID", "")
@@ -48,7 +48,7 @@ def get_project() -> Any:
 
 
 def _bridge_gpu(bridge_name: str) -> str:
-    for gpu in ("GB200", "H100", "A100"):
+    for gpu in ("GB300", "GB200", "H100", "A100"):
         if gpu.lower() in bridge_name.lower():
             return gpu
     return "Unknown"
@@ -57,7 +57,7 @@ def _bridge_gpu(bridge_name: str) -> str:
 def get_pipeline_jobs(
     pipeline_id: int, job_prefix: str | tuple[str, ...], project: Any | None = None
 ) -> list[tuple[str, int, list[dict]]]:
-    """Collect Megatron-LM's direct child pipelines using nemo-ci-triage-2."""
+    """Collect Megatron-LM's direct child pipelines using Cerno."""
     project = project or get_project()
     root_pipeline = project.pipelines.get(pipeline_id)
     pipeline_jobs = []
@@ -68,6 +68,20 @@ def get_pipeline_jobs(
             continue
 
         child_pipeline_id = downstream["id"]
+        # GB300 runs asynchronously; the root's completion report must not
+        # classify its unfinished jobs as passed or failed.
+        if bridge.name == "functional:run_dev_dgx_gb300" and downstream.get("status") not in {
+            "success",
+            "failed",
+            "canceled",
+            "skipped",
+        }:
+            logger.info(
+                "GB300 pipeline %s is %s; excluding it from this completion report",
+                downstream.get("web_url") or f"{PROJECT_URL}/-/pipelines/{child_pipeline_id}",
+                downstream.get("status", "unknown"),
+            )
+            continue
         jobs = notification.get_jobs_from_pipeline(project, child_pipeline_id)
         bridge_gpu = _bridge_gpu(bridge.name)
         for job in jobs:
@@ -153,7 +167,7 @@ def main(
         webhook_url=WEBHOOK_URL or None,
         slack_bot_token=SLACK_BOT_TOKEN if use_bot else None,
         slack_channel_id=SLACK_CHANNEL_ID if use_bot else None,
-        config=TRIAGE_CONFIG,
+        config=CERNO_CONFIG,
     )
     write_slack_context(slack_output, thread_timestamp)
 

@@ -5,7 +5,8 @@
 import logging
 import os
 import warnings
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, Optional
 
 import torch
 
@@ -28,21 +29,18 @@ def safe_get_rank() -> int:
         return torch.distributed.get_rank()
 
     # If torch.distributed is not initialized, try to read environment variables.
-    try:
-        if "RANK" in os.environ:
-            return int(os.environ["RANK"])
+    if "RANK" in os.environ:
+        return int(os.environ["RANK"])
 
-        slurm_rank = resolve_slurm_rank()
-        if slurm_rank is not None:
-            return slurm_rank
+    slurm_rank = resolve_slurm_rank()
+    if slurm_rank is not None:
+        return slurm_rank
 
-        warnings.warn(
-            "Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. "
-            "Defaulting to rank 0."
-        )
-        return 0
-    except (ValueError, TypeError):
-        return 0
+    warnings.warn(
+        "Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. "
+        "Defaulting to rank 0."
+    )
+    return 0
 
 
 def safe_get_world_size() -> int:
@@ -74,16 +72,100 @@ def safe_get_world_size() -> int:
     return 1
 
 
-def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any) -> None:
+# Ranks that log_single_rank and warn_single_rank write on when the caller names no rank.
+# Non-colocated MIMO places the vision encoder on rank 0 and the language model at
+# --mimo-llm-offset, so a single rank can only ever describe one of the two models.
+_DEFAULT_LOG_RANKS: tuple[int, ...] = (0,)
+
+
+def set_default_log_ranks(ranks: Iterable[int]) -> None:
+    """Set the ranks that ``log_single_rank`` and ``warn_single_rank`` write on by default.
+
+    Call once, after torch distributed is initialized and before the model is built, so
+    that setup-time messages are covered. A call site that passes ``rank`` explicitly is
+    unaffected.
+
+    Args:
+        ranks: Ranks to log on. Duplicates are ignored.
+    """
+    global _DEFAULT_LOG_RANKS
+    _DEFAULT_LOG_RANKS = tuple(sorted(set(ranks)))
+
+
+def get_default_log_ranks() -> tuple[int, ...]:
+    """Return the ranks that the single-rank logging helpers write on by default."""
+    return _DEFAULT_LOG_RANKS
+
+
+def log_single_rank(
+    logger: logging.Logger,
+    level: int,
+    msg: object,
+    *args: Any,
+    rank: Optional[int] = None,
+    **kwargs: Any,
+) -> None:
     """Log a message only on a single rank.
 
     If torch distributed is initialized, write log on only one rank.
 
     Args:
         logger: The logger to write the logs.
-        *args: All logging.Logger.log positional arguments.
-        rank: The rank to write on. Defaults to 0.
-        **kwargs: All logging.Logger.log keyword arguments.
+        level: Logging level for the message.
+        msg: Message format string.
+        *args: Message format arguments.
+        rank: The rank to write on. Defaults to None, meaning the ranks configured by
+            ``set_default_log_ranks`` (rank 0 unless it has been changed).
+        **kwargs: Additional ``logging.Logger.log`` keyword arguments.
     """
-    if safe_get_rank() == rank:
-        logger.log(*args, **kwargs)
+    if not logger.isEnabledFor(level):
+        return
+
+    current_rank = safe_get_rank()
+    should_log = current_rank == rank if rank is not None else current_rank in _DEFAULT_LOG_RANKS
+    if should_log:
+        logger.log(level, msg, *args, **kwargs)
+
+
+def warn_single_rank(
+    message: str,
+    category: type[Warning] = UserWarning,
+    stacklevel: int = 2,
+    rank: Optional[int] = None,
+) -> None:
+    """Issue a warning only on a single rank.
+
+    Use for warnings that describe a property of the job rather than of the calling rank,
+    such as deprecated settings and experimental-API notices. Every rank raises those
+    identically, so a large job repeats one message thousands of times in a shared log.
+
+    ``safe_get_rank`` reads the RANK or SLURM_PROCID environment variable when torch
+    distributed is not initialized, so this also works at import time.
+
+    Args:
+        message: The warning message.
+        category: Warning category. Defaults to ``UserWarning``.
+        stacklevel: Frames to skip when attributing the warning. Defaults to 2, which
+            reports the caller of the function that warns.
+        rank: The rank to warn on. Defaults to None, meaning the ranks configured by
+            ``set_default_log_ranks`` (rank 0 unless it has been changed).
+    """
+    if torch.distributed.is_initialized():
+        current_rank = torch.distributed.get_rank()
+    else:
+        # safe_get_rank warns when it can find no rank at all, which happens on a plain
+        # import outside a launcher. Defaulting to rank 0 is the right answer here, and
+        # letting that warning through would just swap it for the one being deduplicated.
+        #
+        # Only reachable before torch distributed comes up. Entering catch_warnings bumps
+        # the global filter version, which clears every module's __warningregistry__ and
+        # so re-arms warnings that had already printed once. Paying that on a call made
+        # once per bucket per step made this helper multiply the log volume it exists to
+        # cut, so keep it off the initialized path.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            current_rank = safe_get_rank()
+
+    should_warn = current_rank == rank if rank is not None else current_rank in _DEFAULT_LOG_RANKS
+    if should_warn:
+        warnings.warn(message, category=category, stacklevel=stacklevel + 1)
