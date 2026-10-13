@@ -123,6 +123,7 @@ class DummyEngine(DynamicInferenceEngine):
     def __init__(self):
         self.waiting_request_ids = deque()
         self.requests: Dict[int, RequestEntry] = {}
+        self.finished_request_count = 0
         self.suspend_signal = False
         self.is_suspended = False
         self._loop = get_asyncio_loop()
