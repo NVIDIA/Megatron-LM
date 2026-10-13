@@ -22,6 +22,26 @@ from megatron.core.transformer.transformer_layer import HyperConnectionTransform
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _model_parallel():
+    """Initialize model parallelism once for this module.
+
+    Every initialize/destroy cycle leaves its NCCL process groups (and their watchdog
+    threads) behind for the lifetime of the pytest process, and the CI bucket already
+    runs ~1700 tests in one process. Sharing one TP=1/PP=1 initialization across this
+    file keeps its footprint at a single cycle; the tests only need the RNG tracker and
+    a default group.
+    """
+    Utils.initialize_model_parallel(1, 1)
+    yield
+    Utils.destroy_model_parallel()
+
+
+@pytest.fixture(autouse=True)
+def _reseed(_model_parallel):
+    model_parallel_cuda_manual_seed(123)
+
+
 @pytest.fixture(autouse=True)
 def _run_eagerly():
     """Run every test here with torch.compile stanced to eager.
@@ -74,13 +94,6 @@ class TestIdentityHyperConnectionConfig:
 
 
 class TestIdentityHyperConnectionModule:
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
     def _make_module(self, identity=True, hidden_size=64, num_streams=4, **extra):
         config = _make_config(identity, hidden_size, num_streams, **extra)
         module = HyperConnectionModule(config=config, layer_number=1)
@@ -284,13 +297,6 @@ class TestIdentityHyperConnectionModule:
 
 
 class TestIdentityHyperConnectionTransformerLayer:
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
     def _make_layer(self, hidden_size=64, num_streams=4, **extra):
         config = _make_config(True, hidden_size, num_streams, **extra)
         layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
