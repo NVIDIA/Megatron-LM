@@ -6135,9 +6135,9 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     torch.distributed.broadcast(flags, 0)
 
-    train_state.do_train = flags[0].item()
-    train_state.do_valid = flags[1].item()
-    train_state.do_test = flags[2].item()
+    train_state.do_train = train_state.do_train or flags[0].item()
+    train_state.do_valid = train_state.do_valid or flags[1].item()
+    train_state.do_test = train_state.do_test or flags[2].item()
 
     return train_dataloader, valid_dataloaders, test_dataloader
 
