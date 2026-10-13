@@ -9,6 +9,7 @@ the guard must reject exactly the arg combinations whose config ends up with the
 """
 
 import argparse
+import os
 
 import pytest
 import torch
@@ -110,6 +111,7 @@ def test_empty_nccl_algo_warning_is_issued_on_rank_0(rank, monkeypatch, recwarn)
     """Only rank 0 warns, and only for an empty NCCL_ALGO."""
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.setenv("RANK", str(rank))
+    monkeypatch.setattr("megatron.training.utils.get_device_arch_version", lambda: 10)
     monkeypatch.delenv("NCCL_ALGO", raising=False)
     apply_determinism_to_args(make_args())
     monkeypatch.setenv("NCCL_ALGO", "Ring")
@@ -119,3 +121,22 @@ def test_empty_nccl_algo_warning_is_issued_on_rank_0(rank, monkeypatch, recwarn)
     apply_determinism_to_args(make_args())
     warned = any("NCCL_ALGO is empty" in str(w.message) for w in recwarn)
     assert warned == (rank == 0)
+
+
+@pytest.mark.parametrize(
+    "nccl_algo, arch, error", [("", 9, "reproducible on Hopper"), ("", 10, None), (None, 9, None)]
+)
+def test_empty_nccl_algo_is_rejected_on_hopper(nccl_algo, arch, error, monkeypatch, recwarn):
+    """An empty NCCL_ALGO stops a Hopper run before the warning; unset still gets Ring there."""
+    monkeypatch.setattr("megatron.training.utils.get_device_arch_version", lambda: arch)
+    if nccl_algo is None:
+        monkeypatch.delenv("NCCL_ALGO", raising=False)
+    else:
+        monkeypatch.setenv("NCCL_ALGO", nccl_algo)
+    if error:
+        with pytest.raises(AssertionError, match=error):
+            apply_determinism_to_args(make_args())
+        assert not [w for w in recwarn if "NCCL_ALGO is empty" in str(w.message)]
+    else:
+        apply_determinism_to_args(make_args())
+        assert os.environ["NCCL_ALGO"] == ("Ring" if nccl_algo is None else nccl_algo)

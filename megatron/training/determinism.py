@@ -197,8 +197,9 @@ def apply_determinism_to_args(args) -> None:
        ``CUBLAS_WORKSPACE_CONFIG``,
        ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``,
        ``TRITON_CACHE_AUTOTUNING`` and its required ``TRITON_CACHE_DIR``) and
-       setdefaults the canonical values. If ``NCCL_ALGO`` is empty, rank 0
-       then warns that NCCL chooses the algorithms.
+       setdefaults the canonical values. If ``NCCL_ALGO`` is empty, the run
+       is rejected on Hopper; elsewhere rank 0 warns that NCCL chooses the
+       algorithms.
     3. Calls ``torch.use_deterministic_algorithms(True)``, then clears
        ``torch.utils.deterministic.fill_uninitialized_memory``, which that call
        turns on and which reproducibility does not need.
@@ -234,8 +235,15 @@ def apply_determinism_to_args(args) -> None:
     # Delegate env-var validation + setdefault to the single-source helper.
     apply_determinism_env(os.environ)
     if os.environ.get("NCCL_ALGO") == "":
-        from megatron.training.utils import warn_rank_0
+        from megatron.training.utils import get_device_arch_version, warn_rank_0
 
+        assert get_device_arch_version() != 9, (
+            'NCCL_ALGO="" under --deterministic-mode lets NCCL 2.24 and later use NVLS, which may '
+            "not be reproducible on Hopper unless the kernel driver and Fabric Manager are "
+            "550.144.03 or later in the 550 branch, or 570 or later (the 560 branch has no fix); "
+            "their versions are not checked here (NVIDIA/nccl#2360). Unset NCCL_ALGO to use the "
+            "Ring default."
+        )
         warn_rank_0(
             "Deterministic mode: NCCL_ALGO is empty, so NCCL chooses the algorithm for each "
             "collective. With NCCL >= 2.24 that includes Tree and, where available, NVLS, "
