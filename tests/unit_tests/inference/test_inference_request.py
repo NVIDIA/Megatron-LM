@@ -456,7 +456,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert finished.policy_epoch == [(0, 3)] and finished.kv_cache_epoch is None
     assert (finished.num_evictions, finished.num_tokens_to_generate) == (1, 8)
     # A live snapshot is the merged payload and record, keyed like a completion.
-    snapshot = LiveRequestSnapshot.from_record(rec)
+    snapshot = LiveRequestSnapshot.from_record(rec, finished=False)
     assert (snapshot.uid, snapshot.request_id, snapshot.record) == (a.uid, 3, finished)
     payload = snapshot.payload
     assert (payload.prompt_token_ids, payload.generated_token_ids) == ([1, 2, 3], [10, 11, 12])
@@ -877,7 +877,7 @@ def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
     record.checkpoint()
     # A live snapshot keeps the admission budget and offload params but drops the media; the
     # record keeps its continuation budget and its media.
-    snapshot = LiveRequestSnapshot.from_record(record)
+    snapshot = LiveRequestSnapshot.from_record(record, finished=False)
     assert (snapshot.uid, snapshot.offload_params) == ("chatcmpl-fixed", {"ng_capture": admission})
     assert (snapshot.record.num_tokens_to_generate, snapshot.payload.media_tensors) == (5, None)
     assert record.requests[-1].sampling_params.num_tokens_to_generate == 4
@@ -954,43 +954,56 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
 
 
 @pytest.mark.parametrize(
-    ("wire", "return_log_probs", "generation_epoch"),
+    ("wire", "return_log_probs", "generation_epoch", "reason"),
     [
-        ({**_WIRE, "token_ids": []}, False, None),
-        ({**_WIRE, "token_ids": [1, 2.0]}, False, None),
-        ({**_WIRE, "token_ids": [1, 2, 3]}, False, None),
-        ({**_WIRE, "num_tokens_to_generate": 1}, False, None),
-        ({**_WIRE, "log_probs": [-0.1, -0.2]}, False, None),
-        ({**_WIRE, "policy_epoch": [[0]]}, False, None),
-        ({**_WIRE, "kv_cache_epoch": []}, False, None),
-        ({**_WIRE, "num_evictions": -1}, False, None),
-        ({**_WIRE, "finished": 1}, False, None),
-        (_WIRE, True, None),
-        (_WIRE, False, 9),
+        ({**_WIRE, "token_ids": [1, 2.0]}, False, None, "holds non-integer tokens"),
+        ({**_WIRE, "num_tokens_to_generate": -1}, False, None, "has a malformed budget"),
+        ({**_WIRE, "num_evictions": -1}, False, None, "has a malformed eviction count"),
+        ({**_WIRE, "finished": 1}, False, None, "has a malformed finished flag"),
+        ({**_WIRE, "token_ids": [1, 2, 3]}, False, None, "holds 3 tokens over a budget of 2"),
+        (
+            {**_WIRE, "num_tokens_to_generate": 1},
+            False,
+            None,
+            "filled its budget of 1 without finishing",
+        ),
+        (
+            {**_WIRE, "log_probs": [-0.1, -0.2]},
+            False,
+            None,
+            "has log probs and tokens of different lengths, 2 and 1",
+        ),
+        (_WIRE, True, None, "carries no log probs for a request that returns them"),
+        (_WIRE, False, 9, "carries no policy epoch for an engine that stamps one"),
+        ({**_WIRE, "policy_epoch": [[0]]}, False, None, "has malformed policy_epoch boundaries"),
+        ({**_WIRE, "kv_cache_epoch": []}, False, None, "has malformed kv_cache_epoch boundaries"),
     ],
     ids=[
-        "no-tokens",
         "non-int-tokens",
+        "negative-budget",
+        "negative-evictions",
+        "non-bool-finished",
         "tokens-over-budget",
         "budget-filled-unfinished",
         "misaligned-log-probs",
-        "malformed-policy-epoch",
-        "empty-kv-cache-epoch",
-        "negative-evictions",
-        "non-bool-finished",
         "unscored-for-a-scored-request",
         "unstamped-for-a-stamping-engine",
+        "malformed-policy-epoch",
+        "empty-kv-cache-epoch",
     ],
 )
-def test_reject_resumed_generation(wire, return_log_probs, generation_epoch):
-    """One check refuses a resume that is inconsistent or lacks what the request or engine needs,
-    before the request is touched."""
+def test_reject_resumed_generation(wire, return_log_probs, generation_epoch, reason):
+    """A resume that is inconsistent or lacks what the request or engine needs is refused with its
+    reason, before the request is touched."""
     request = _make_dynamic_request(
         sampling_params=SamplingParams(num_tokens_to_generate=2, return_log_probs=return_log_probs)
     )
-    with pytest.raises(ValueError, match="invalid resumed generation"):
+    with pytest.raises(ValueError, match=f"^resumed generation {reason}$"):
         build_resumed_record(
-            request, ResumedGeneration.from_wire(wire), generation_epoch=generation_epoch
+            request,
+            ResumedGeneration.from_wire(wire),
+            prompt_length=len(request.prompt_tokens),
+            generation_epoch=generation_epoch,
         )
     assert request.generated_tokens == [] and request.sampling_params.num_tokens_to_generate == 2
 
@@ -1039,7 +1052,7 @@ def test_resumed_record_merge(new_epoch):
     first.policy_epoch, first.kv_cache_epoch = [(0, 7)], [(0, 7)]
     generate(first, *part_one, scores)
     record = DynamicInferenceRequestRecord.from_request(first)
-    snapshot = LiveRequestSnapshot.from_record(record)  # Run B's consumer copy, taken here
+    snapshot = LiveRequestSnapshot.from_record(record, finished=False)  # Run B's copy, taken here
     record.checkpoint()
     record[-1].add_event_evict()
     generate(schedule(record[-1], new_epoch), *part_two, [-9.0])
@@ -1055,10 +1068,10 @@ def test_resumed_record_merge(new_epoch):
         kv_cache_epoch=snapshot.record.kv_cache_epoch,
         num_evictions=snapshot.record.num_evictions,
     )
-    record = build_resumed_record(admitted(), resumed, generation_epoch=new_epoch)
+    record = build_resumed_record(admitted(), resumed, prompt_length=3, generation_epoch=new_epoch)
     assert len(record.requests) == 2 and record[-1].kv_cache_epoch is None
     generate(schedule(record[-1], new_epoch), *part_two, [-9.0])
-    whole = LiveRequestSnapshot.from_record(record)
+    whole = LiveRequestSnapshot.from_record(record, finished=False)
     assert (whole.payload.generated_token_ids, whole.record.num_tokens_to_generate) == (
         [*part_one[0], *part_two[0]],
         10,

@@ -8,7 +8,7 @@ import uuid
 import warnings
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Any, Dict, List, NoReturn, Optional, Protocol, Tuple, Union
 
 import numpy as np
 import torch
@@ -1465,9 +1465,12 @@ class LiveRequestSnapshot:
     offload_params: Optional[Dict[str, Any]]
     payload: OffloadedRequestPayload
     record: FinishedRequestRecord
+    finished: bool
 
     @classmethod
-    def from_record(cls, record: "DynamicInferenceRequestRecord") -> "LiveRequestSnapshot":
+    def from_record(
+        cls, record: "DynamicInferenceRequestRecord", *, finished: bool
+    ) -> "LiveRequestSnapshot":
         """Copy a live record's merged state; the record itself is left untouched."""
         merged = record.merge()
         merged.media_tensors = None
@@ -1477,6 +1480,7 @@ class LiveRequestSnapshot:
             offload_params=merged.offload_params,
             payload=OffloadedRequestPayload.from_request(merged),
             record=FinishedRequestRecord.from_request(merged),
+            finished=finished,
         )
 
 
@@ -1513,7 +1517,9 @@ class ResumedGeneration:
     def with_expanded_prompt(
         self, prompt_length: int, expanded_prompt_length: int
     ) -> "ResumedGeneration":
-        """Re-base boundary positions after the engine expanded the prompt the preparer saw."""
+        """Re-base boundary positions after the engine expanded the prompt the preparer had seen:
+        the generated stream is moved by the expansion, the prompt's own positions are not.
+        """
         shift = expanded_prompt_length - prompt_length
         if shift == 0:
             return self
@@ -1578,27 +1584,52 @@ class RequestPromptPreparationResult:
 
 
 def build_resumed_record(
-    first: "DynamicInferenceRequest", resumed: ResumedGeneration, *, generation_epoch: Optional[int]
-) -> "DynamicInferenceRequestRecord":
+    first: "DynamicInferenceRequest",
+    resumed: ResumedGeneration,
+    *,
+    prompt_length: int,
+    generation_epoch: Optional[int],
+) -> Optional["DynamicInferenceRequestRecord"]:
     """Build the record the engine admits for a request that resumes a generation."""
     tokens, budget = resumed.token_ids, resumed.num_tokens_to_generate
-    if not (
-        tokens
-        and all(type(t) is int for t in tokens)
-        and type(budget) is int
-        and type(resumed.num_evictions) is int
-        and type(resumed.finished) is bool
-        and resumed.num_evictions >= 0
-        and (len(tokens) < budget or (resumed.finished and len(tokens) == budget))
-        and (resumed.log_probs is None or len(resumed.log_probs) == len(tokens))
-        and (resumed.log_probs is not None or not first.sampling_params.return_log_probs)
-        and (resumed.policy_epoch is not None or generation_epoch is None)
-        and all(
-            bs is None or (bs and all(len(b) == 2 and all(type(v) is int for v in b) for b in bs))
-            for bs in (resumed.policy_epoch, resumed.kv_cache_epoch)
+
+    def refuse(reason: str) -> NoReturn:
+        raise ValueError(f"resumed generation {reason}")
+
+    if not all(type(t) is int for t in tokens):
+        refuse("holds non-integer tokens")
+    if type(budget) is not int or budget < 0:
+        refuse("has a malformed budget")
+    if type(resumed.num_evictions) is not int or resumed.num_evictions < 0:
+        refuse("has a malformed eviction count")
+    if type(resumed.finished) is not bool:
+        refuse("has a malformed finished flag")
+    if not tokens and not resumed.finished:
+        first.sampling_params.num_tokens_to_generate = budget
+        first.sampling_params.num_tokens_total = None
+        return None
+    if len(tokens) > budget:
+        refuse(f"holds {len(tokens)} tokens over a budget of {budget}")
+    if len(tokens) == budget and not resumed.finished:
+        refuse(f"filled its budget of {budget} without finishing")
+    if resumed.log_probs is not None and len(resumed.log_probs) != len(tokens):
+        refuse(
+            "has log probs and tokens of different lengths, "
+            f"{len(resumed.log_probs)} and {len(tokens)}"
         )
+    if resumed.log_probs is None and first.sampling_params.return_log_probs:
+        refuse("carries no log probs for a request that returns them")
+    if resumed.policy_epoch is None and generation_epoch is not None:
+        refuse("carries no policy epoch for an engine that stamps one")
+    for name, bs in (
+        ("policy_epoch", resumed.policy_epoch),
+        ("kv_cache_epoch", resumed.kv_cache_epoch),
     ):
-        raise ValueError("invalid resumed generation")
+        if bs is not None and not (
+            bs and all(len(b) == 2 and all(type(v) is int for v in b) for b in bs)
+        ):
+            refuse(f"has malformed {name} boundaries")
+    resumed = resumed.with_expanded_prompt(prompt_length, len(first.prompt_tokens))
     first.sampling_params.num_tokens_to_generate = budget
     first.sampling_params.num_tokens_total = None
     first.generated_tokens = tokens

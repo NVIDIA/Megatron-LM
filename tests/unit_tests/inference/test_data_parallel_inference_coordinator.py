@@ -228,6 +228,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.waiting_request_ids = deque()
         self.failed_request_ids: List[int] = []
         self.requests: Dict[int, RequestEntry] = {}
+        self.finished_request_count = 0
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
