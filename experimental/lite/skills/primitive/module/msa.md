@@ -51,7 +51,8 @@ def msa(task, implementation, config, reference, budget):
         "choose_when": ["layer_types[i] == 'minimax_m3_sparse'"],
         "avoid_when": ["packed/THD sequences on flex (rejected; supported by magi)", "cuDNN BSA-style per-query-block metadata (not equivalent)",
                        "magi with attention TP>1 or shapes other than 64/4/4 heads, D=128, block 128, top-16 (kernel lock)"],
-        "compose_with": ["primitive.module.gqa", "primitive.parallel.tp", "primitive.parallel.cp"],
+        "compose_with": ["primitive.module.gqa", "primitive.parallel.tp", "primitive.parallel.cp",
+                         "primitive.optimizer.distopt / primitive.optimizer.fsdp (magi: fsdp2 with cast_forward_inputs=False)"],
     }
     gqa_validation = primitive.module.gqa(task, implementation=implementation, config=config, reference=reference, budget=budget.gqa)
     if not gqa_validation.done:
@@ -70,7 +71,12 @@ def msa(task, implementation, config, reference, budget):
              "(kl_loss_coeff=0 is not a freeze) and is asserted bitwise after training; last_block_indices is None; a new cu_seqlens "
              "re-plans the runtime on the host (LRU 16, MAGI_MSA_RUNTIME_CACHE_SIZE); padding up to chunk*cp-1 tokens; "
              "recompute core_attn re-runs Magi's forward communication; dense layers run native calc_attn on FA4 (flash_attn_cute, cutlass-dsl 4.5.2); the pure-torch sdpa_ol backend is test-only (OOM beyond ~8K)",
-             "deterministic=True (ImplConfig -> MagiMsaSettings -> MsaConfig; Magi-MSA >= c829982): ordered msa_v1 backward, MSA path bitwise reproducible at CP1/2/4 (kernel bwd ~4x, all-MSA step ~1.5x); the dense layers' fa4 backward stays unordered, so full-model bitwise needs dense sdpa_ol"]
+             "deterministic=True (ImplConfig -> MagiMsaSettings -> MsaConfig; Magi-MSA >= c829982): ordered msa_v1 backward, MSA path bitwise reproducible at CP1/2/4 (kernel bwd ~4x, all-MSA step ~1.5x); the dense layers' fa4 backward stays unordered, so full-model bitwise needs dense sdpa_ol",
+             "fsdp2 (optimizer='fsdp2'): fp32 shards, bf16 compute, experts on the expert-DP mesh; FSDP2's cast_forward_inputs rebuilds every "
+             "dataclass in the forward kwargs with dataclasses.replace() and the Magi context carries init=False fields, so the protocol "
+             "disables it (inputs are int ids); the frozen indexer is sharded with no optimizer state and is asserted bitwise after "
+             "training; step-0 loss is bitwise equal to dist_opt and the dp/ep/pp/cp curves track the dist_opt baseline within 1e-4 "
+             "(proxy); FSDP2 caches one DeviceMesh per rank set, so tests must not destroy its process groups between cases"]
     if not validation.done:
         return blocked("MSA validation failed", evidence=validation)
     return done(principle=principle, implementation_contract=implementation_contract,

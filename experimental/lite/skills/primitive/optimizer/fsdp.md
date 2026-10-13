@@ -39,7 +39,10 @@ def fsdp(task, implementation, config, reference, budget):
         "compose_with": ["TP/EP/PP through explicit param ownership", "DistOpt only with clear owner split"],
     }
     validation = primitive.validate(task, primitive=implementation.fsdp, implementation=implementation, budget=budget)
-    risks = ["offload device mismatch", "optimizer state drift", "materialization timing bug"]
+    risks = ["offload device mismatch", "optimizer state drift", "materialization timing bug",
+             "cast_forward_inputs walks the forward kwargs and rebuilds dataclasses with dataclasses.replace(): protocols that pass "
+             "runtime dataclasses with init=False fields (minimax_m3 magi_ctx) must build with cast_forward_inputs=False",
+             "one DeviceMesh is cached per rank set and resolves its process group by name: destroying the group breaks the next model on the same ranks"]
     if not validation.done:
         return blocked("FSDP validation failed", evidence=validation)
     return done(principle=principle, implementation_contract=implementation_contract, usage_contract=usage_contract, validation=validation, risks=risks)
