@@ -204,23 +204,28 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Order current-stream consumers after all gradient reductions submitted so far.
+        """Run pending backward cleanup and wait on submitted gradient reductions.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
+        self._run_delayed_post_backward_callbacks()
         self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def post_backward(self) -> None:
         """Order current-stream consumers after this backward's gradient reductions."""
+        self._run_delayed_post_backward_callbacks()
+        if not self.caller_managed_grad_sync:
+            self.finish_grad_sync()
+        self._post_backward_hook_registered = False
+
+    def _run_delayed_post_backward_callbacks(self) -> None:
+        """Run deferred module completion callbacks once."""
         # Finish children before parents to close nested backward NVTX ranges.
         while self._delayed_post_backward_callbacks:
             module, callback = self._delayed_post_backward_callbacks.pop()
             callback(module)
-        if not self.caller_managed_grad_sync:
-            self.finish_grad_sync()
-        self._post_backward_hook_registered = False
 
     def register_post_backward_hook(self) -> None:
         """Register one final callback for deferred cleanup and optional gradient sync.
