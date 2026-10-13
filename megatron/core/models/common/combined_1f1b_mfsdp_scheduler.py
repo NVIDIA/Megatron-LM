@@ -21,9 +21,6 @@ def _make_unshard_backward_hook(owner: FsdpModule):
     backward."""
 
     def hook(submodule, _grad_output):
-        # Frozen units with no input gradients defer cleanup until autograd completes.
-        # This scheduler bypasses pre_backward(), so register the final callback here.
-        owner.context.register_post_backward_hook()
         owner.unshard()
 
     return hook
