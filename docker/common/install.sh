@@ -86,7 +86,8 @@ main() {
     
     # Install tools
     apt-get update
-    apt-get install -y wget curl git cmake
+    # DeepGEMM/DeepJIT requires elfutils/libdwfl.h for its exception support.
+    apt-get install -y wget curl git cmake libdw-dev
 
     # Install CUDA
     if [[ "$BASE_IMAGE" == "ubuntu" ]]; then
@@ -103,6 +104,13 @@ main() {
     apt-get clean
 
     unset PIP_CONSTRAINT
+
+    # torch-memory-saver builds CUDA-suffixed extensions and requires the CUDA major.
+    export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
+    if [[ -z "$TMS_CUDA_MAJOR" ]]; then
+        echo "Error: failed to determine CUDA major from nvcc" >&2
+        exit 1
+    fi
 
     if [[ "$USE_UV" == "true" ]]; then
         if [[ "$BASE_IMAGE" == "pytorch" ]]; then

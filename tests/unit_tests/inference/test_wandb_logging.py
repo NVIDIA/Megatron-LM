@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock, create_autospec, patch
 import pytest
 import torch
 
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -21,10 +22,15 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def set_rounder(value):
-    """Utility function to set the DynamicInferenceContext rounder."""
     DynamicInferenceContext.ROUNDER = value  # For backwards compatibility
     DynamicInferenceContext.TOKEN_ROUNDER = value
     DynamicInferenceContext.REQUEST_ROUNDER = value
+
+
+def reset_rounder():
+    DynamicInferenceContext.ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.TOKEN_ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.REQUEST_ROUNDER = 4  # the default in dynamic_context.py
 
 
 class TestInferenceWandbLogging:
@@ -40,7 +46,7 @@ class TestInferenceWandbLogging:
 
     @classmethod
     def teardown_class(cls):
-        set_rounder(64)
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     def _get_dynamic_context(
@@ -216,11 +222,14 @@ class TestInferenceWandbLogging:
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
+        mock_controller._async_sched_logits = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
         mock_controller.inference_wrapped_model.model = Mock()
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
+        mock_controller.inference_wrapped_model.model.config.moe_enable_routing_replay = False
+        mock_controller.num_mtp_depths = 0
 
         engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)
 
@@ -261,6 +270,7 @@ class TestInferenceWandbLogging:
             # Verify paused request count is included
             assert 'paused_request_count' in stats
             assert stats['paused_request_count'] >= 0
+        set_rounder(64)  # back to the class's pin
 
     @pytest.mark.internal
     def test_metrics_writer_none_handling(self):
@@ -269,11 +279,14 @@ class TestInferenceWandbLogging:
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
+        mock_controller._async_sched_logits = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
         mock_controller.inference_wrapped_model.model = Mock()
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
+        mock_controller.inference_wrapped_model.model.config.moe_enable_routing_replay = False
+        mock_controller.num_mtp_depths = 0
 
         # Should not raise error even with logging interval set
         engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)

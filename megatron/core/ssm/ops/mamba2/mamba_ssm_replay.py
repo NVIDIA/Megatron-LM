@@ -27,8 +27,8 @@
 #     the guaranteed-accepted bonus token is added inside the kernel) and a
 #     `prefill_status` gate so prefill rows never advance their cursors.
 #   * Launch configs are the hard-coded spec tables from the fork's
-#     `replayssm_config.py` (no Triton autotuning anywhere — graph-capture
-#     friendly), Blackwell detected via the device capability major version.
+#     `replayssm_config.py` (no Triton autotuning, as upstream; see below),
+#     Blackwell detected via the device capability major version.
 
 import torch
 
@@ -54,8 +54,12 @@ NULL_SLOT_ID = -1
 
 # ---------------------------------------------------------------------------
 # Launch-config selection (ported from replayssm_config.py; spec kernels only).
-# Hard-coded heuristics, no autotune: fixed configs keep CUDA-graph capture and
-# the first real decode step deterministic.
+# Hard-coded heuristics rather than @triton.autotune: autotuning benchmarks every
+# candidate config by re-running the kernel on the live arguments, and the flush
+# kernel updates the SSM checkpoint in place, so each benchmark run would fold the
+# history into it again (avoiding that needs `restore_value` copies of the whole
+# checkpoint). Fixed configs also make the selection deterministic and add no
+# tuning latency to the first eager decode step at each new batch size.
 # ---------------------------------------------------------------------------
 _config_overrides: dict = {}
 

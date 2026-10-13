@@ -23,7 +23,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
 from megatron.core.ssm.ops.common.intermediate_extraction import (
     scatter_intermediate_conv,
     scatter_intermediate_ssm,
@@ -31,12 +33,13 @@ from megatron.core.ssm.ops.common.intermediate_extraction import (
 from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 from megatron.core.ssm.ops.mamba2.mamba_ssm_replay import selective_state_update_replayssm_spec
+from megatron.core.ssm.packed_seq_helpers import build_packed_seq_idx
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -61,7 +64,6 @@ from .mamba_context_parallel import MambaContextParallel
 try:
     from causal_conv1d import causal_conv1d_fn
     from causal_conv1d import causal_conv1d_update as causal_conv1d_update_cuda
-    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 
 except ImportError:
     causal_conv1d_fn = None
@@ -140,7 +142,7 @@ class MambaMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = None
 
 
-class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
+class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLayer):
     """
     Args:
         config: The config of the model.
@@ -225,6 +227,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.cached_batch_size = None
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
+        if self.config.linear_cp_mode == "chunkwise" and self.pg_collection.cp.size() > 1:
+            raise NotImplementedError(
+                "linear_cp_mode='chunkwise' is supported only by GatedDeltaProductMixer."
+            )
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
         self.mamba_training_ssm_states_dtype = (
             config.mamba_training_ssm_states_dtype or config.params_dtype
@@ -368,6 +374,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 else:
                     nn.init.kaiming_uniform_(self.conv1d_weight, a=math.sqrt(5))
 
+        # Both of this mixer's conv layouts need it; see assert_causal_conv1d_deterministic.
+        assert_causal_conv1d_deterministic(config.deterministic_mode)
+
         self.activation = "silu"
         self.act = nn.SiLU()
 
@@ -465,50 +474,24 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             A_log_cp1=self.A_log,
             D_cp1=self.D,
             D_has_hdim=self.D_has_hdim,
+            sequence_is_contiguous=self.config.linear_cp_layout == "contiguous",
         )
         self.tp_group = pg_collection.tp
 
-    def forward(
+    def _mamba_chunk(
         self,
         hidden_states,
-        inference_context=None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        conv_state=None,
+        ssm_state=None,
+        packed_seq_params=None,
+        inference_mode=False,
     ):
-        """
-        hidden_states: (nL, B, D) / (L B D)
-        Returns: same shape as hidden_states
-        """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        in_inference_mode = InferenceMode.is_active()
-
-        _, batch, dim = hidden_states.shape
-        conv_state, ssm_state = None, None
-
-        if in_inference_mode and inference_context is not None:
-            if inference_context.is_dynamic_batching():
-                return self.ssm_dynamic_inference(hidden_states, inference_context)
-            else:
-                assert inference_context.is_static_batching()
-                assert not self.config.batch_invariant_mode, (
-                    "batch_invariant_mode for Mamba inference is only supported with "
-                    "DynamicInferenceContext."
-                )
-                assert not self.config.sequence_parallel
-                conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
-                if inference_context.seqlen_offset > 0:
-                    # The states are updated inplace
-                    out, out_bias = self._static_decode(hidden_states, conv_state, ssm_state)
-                    return out, out_bias
-
+        """Run Mamba through its normalized SSM output, before output projection."""
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
-        if in_inference_mode or not self.use_mem_eff_path:
+        if inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
             assert packed_seq_params is None, (
                 "Training with packed sequences is not supported "
@@ -519,9 +502,65 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
 
-        out, out_bias = self.out_proj(y)
+        return y
 
-        return out, out_bias
+    def forward_pre_attn_and_core_attn(
+        self,
+        hidden_states,
+        *,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        packed_sequence_cp_metadata=None,
+    ):
+        """Run the training pre-attention and core-attention stage."""
+        assert (
+            packed_sequence_cp_metadata is None
+        ), "MambaMixer does not support packed-sequence chunkwise CP metadata."
+        assert (
+            not InferenceMode.is_active()
+        ), "Two-stage mixer execution does not support inference."
+        return self._mamba_chunk(hidden_states, packed_seq_params=packed_seq_params)
+
+    def forward_post_core_attn(self, y):
+        """Apply the Mamba output projection to an SSM output tensor."""
+        return self.out_proj(y)
+
+    def forward(
+        self,
+        hidden_states,
+        inference_context=None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Run the input projection/SSM phase followed by the output projection."""
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        in_inference_mode = InferenceMode.is_active()
+
+        _, batch, _ = hidden_states.shape
+        conv_state, ssm_state = None, None
+        if in_inference_mode and inference_context is not None:
+            if inference_context.is_dynamic_batching():
+                return self.ssm_dynamic_inference(hidden_states, inference_context)
+
+            assert inference_context.is_static_batching()
+            assert not self.config.batch_invariant_mode, (
+                "batch_invariant_mode for Mamba inference is only supported with "
+                "DynamicInferenceContext."
+            )
+            assert not self.config.sequence_parallel
+            conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
+            if inference_context.seqlen_offset > 0:
+                # The states are updated in place.
+                return self._static_decode(hidden_states, conv_state, ssm_state)
+
+        y = self._mamba_chunk(
+            hidden_states,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            packed_seq_params=packed_seq_params,
+            inference_mode=in_inference_mode,
+        )
+        return self.out_proj(y)
 
     # ==================================================================
     # Static / eager inference
@@ -651,7 +690,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 if self.D_has_hdim
                 else self.cp.get_D()
             ),
-            z=z if not self.rmsnorm else None,
+            # ssm_prefill, MambaBatchInvariantDecode and the fused path this method
+            # replaces all gate inside the scan; gating in self.norm afterwards is
+            # the same algebra at different precision.
+            z=z if (self.config.batch_invariant_mode or not self.rmsnorm) else None,
             dt_bias=self.cp.get_dt_bias().float(),
             dt_softplus=True,
             return_final_states=ssm_state is not None,
@@ -669,7 +711,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         if self.rmsnorm:
             z = rearrange(z, "b l h p -> l b (h p)").contiguous()
             z = self.cp.post_conv_ssm(z)
-            y = self.norm(y, z)
+            # Already consumed by the scan above when batch-invariant.
+            y = self.norm(y, None if self.config.batch_invariant_mode else z)
 
         return y
 
@@ -697,6 +740,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             )
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = packed_seq_params.seq_idx
+            if seq_idx is None:
+                seq_idx = build_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
 
         state_dtype_kwarg = (
             {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
@@ -814,16 +859,22 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         assert batch_indices is not None
 
         # Extract initial conv states BEFORE saving new ones.
-        # causal_conv1d_varlen_states computes the final conv state from the
-        # input sequence and tensor_masked_update writes it into the conv_state
-        # buffer. If we read initial_conv_states after this write, restored
-        # requests see their own newly-computed states instead of the cached
-        # initial states from a previous request, corrupting the conv output.
-        initial_conv_states = conv_state[batch_indices, :, 1:]
+        # The state write below overwrites these rows, so reading after it would
+        # hand a restored request its own freshly-computed state instead of the
+        # cached one it must continue from, corrupting the conv output.
+        # A `-1` padding row indexes the last cache slot rather than erroring. The
+        # gathered values are never used: a padding request is zero-length, so the
+        # carry below reproduces the state it read, `tensor_masked_update` skips the
+        # `-1` rows on the write back, and the conv/scan kernels emit zeros for them.
+        previous_conv_states = conv_state[batch_indices]
+        initial_conv_states = previous_conv_states[:, :, 1:]
 
-        # Save final conv states from the input sequence
-        conv_varlen_states = causal_conv1d_varlen_states(
-            xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+        # Fold this step's slice into each request's conv state. `cu_seqlens`
+        # describes only the slice scheduled this step, so a request whose slice
+        # is shorter than d_conv keeps the columns it arrived with; see
+        # `causal_conv1d_varlen_carry_states` for the column-by-column rule.
+        conv_varlen_states = causal_conv1d_varlen_carry_states(
+            xBC.squeeze(0), cu_seqlens, previous_conv_states
         )
         tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
@@ -1023,6 +1074,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         return y
 
+    @torch.no_grad()
+    def refresh_cache(self) -> None:
+        """Refresh the existing decode-cache storage from the current ``A_log``."""
+        self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
+        self._A_neg_exp_cache_stale = False
+
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
         """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
 
@@ -1036,9 +1093,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             return base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
         # Inference path. Refill when stale
         if self._A_neg_exp_cache_stale:
-            with torch.no_grad():
-                self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
-            self._A_neg_exp_cache_stale = False
+            self.refresh_cache()
         return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
 
     def _get_batch_invariant_decoder(self) -> MambaBatchInvariantDecode:
@@ -1048,11 +1103,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         return self._batch_invariant_decoder
 
     def train(self, mode: bool = True):
-        """Mark the decode cache stale; weights may have updated."""
+        """Mark the decode cache stale in training and refresh it for evaluation."""
         if mode:
-            # only mark stale when switching to training mode.
-            # otherwise retain the staleness state.
             self._A_neg_exp_cache_stale = True
+        elif self._A_neg_exp_cache_stale:
+            # CUDA graph replay bypasses the Python lazy-refresh path.
+            self.refresh_cache()
         return super().train(mode)
 
     def ssm_decode(
@@ -1157,41 +1213,36 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             # only written on (early-)flush steps inside the kernel; rollback is the
             # commit kernel's ring-pointer move in the controller.
             context = replay_context
-            layer_idx = self.layer_number - self.pp_layer_offset
             A = self._get_decode_A_neg_exp()
             assert A.stride(-1) == 0 and A.stride(-2) == 0, (
                 "mamba_replay_ssm requires a per-head scalar A (Mamba-2 / TIE_HDIM)"
             )
+            assert seq_len == context.mamba_replay_window, (
+                f"ReplaySSM decode window mismatch: seq_len={seq_len}, "
+                f"window={context.mamba_replay_window}"
+            )
             conv_out = xBC.reshape(batch_size * seq_len, -1)
             dt_raw = dt.reshape(batch_size * seq_len, self.nheads_local_tp)
-            replay_conv_cache, replay_dt_cache = context.mamba_replay_cache(layer_idx)
-            replay_write_pos = context.mamba_replay_write_pos
-            replay_origin = context.mamba_replay_origin
-            replay_is_flush = context.mamba_replay_is_flush
-            replay_bc_pre = context.mamba_replay_bc_pre
-            replay_qsl = context.mamba_replay_qsl
-            flush_threshold = context.mamba_replay_flush_threshold
-            window = context.mamba_replay_window
-            assert seq_len == window, (
-                f"ReplaySSM decode window mismatch: seq_len={seq_len}, window={window}"
-            )
             z_replay = None
             if not self.rmsnorm:
                 z_replay = z.reshape(batch_size * seq_len, self.nheads_local_tp, self.headdim)
+            post_conv_cache, dt_cache = context.mamba_replay_cache(
+                self.layer_number - self.pp_layer_offset
+            )
             out = selective_state_update_replayssm_spec(
                 state_checkpoint=ssm_state,
-                post_conv_cache=replay_conv_cache,
-                dt_cache=replay_dt_cache,
+                post_conv_cache=post_conv_cache,
+                dt_cache=dt_cache,
                 conv_out=conv_out,
                 dt_spec=dt_raw,
                 A=A,
-                write_pos=replay_write_pos,
-                post_conv_state_pos=replay_origin,
-                is_flush=replay_is_flush,
-                query_start_loc=replay_qsl[: batch_size + 1],
+                write_pos=context.mamba_replay_write_pos,
+                post_conv_state_pos=context.mamba_replay_origin,
+                is_flush=context.mamba_replay_is_flush,
+                query_start_loc=context.mamba_replay_qsl[: batch_size + 1],
                 state_batch_indices=batch_indices,
-                max_cache_len=flush_threshold,
-                max_spec_len=window,
+                max_cache_len=context.mamba_replay_flush_threshold,
+                max_spec_len=context.mamba_replay_window,
                 d_inner=self.d_inner_local_tp,
                 ngroups=self.ngroups_local_tp,
                 dstate=self.d_state,
@@ -1199,7 +1250,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 z=z_replay,
                 dt_bias=self.dt_bias,
                 dt_softplus=True,
-                bc_pre=replay_bc_pre,
+                bc_pre=context.mamba_replay_bc_pre,
             )
             y = out.view(batch_size, seq_len, -1).to(dtype)
             if self.rmsnorm:
@@ -1319,6 +1370,17 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         conv_states_shape = (self.conv1d_weight.shape[0], self.d_conv)
         ssm_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
         return (conv_states_shape, ssm_states_shape)
+
+    @property
+    def ssm_inference_chunk_size(self) -> int:
+        """Chunk length the dynamic-inference prefill kernels actually run at.
+
+        The Mamba2 SSD kernels run at the same chunk size for training and
+        inference, so this is just `chunk_size`. It exists so callers that need
+        a chunk-aligned boundary can ask every SSM mixer the same question --
+        Gated Delta Product answers 64 regardless of its `chunk_size`.
+        """
+        return self.chunk_size
 
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.

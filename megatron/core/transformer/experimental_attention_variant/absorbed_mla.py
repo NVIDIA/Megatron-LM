@@ -147,6 +147,7 @@ class AbsorbedMLASelfAttention(Attention):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -161,6 +162,7 @@ class AbsorbedMLASelfAttention(Attention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
 
         # Resolve which classes to use for Q and KV linear up projections and norms, based on
@@ -917,6 +919,9 @@ class AbsorbedMLASelfAttention(Attention):
         """Execute weight gradient computation."""
         self._backward_kv_proj()
         self._backward_q_proj()
+        core_attention_backward_dw = getattr(self.core_attention, "backward_dw", None)
+        if core_attention_backward_dw is not None:
+            core_attention_backward_dw()
         self._backward_output_proj()
 
     def _backward_kv_proj(self):

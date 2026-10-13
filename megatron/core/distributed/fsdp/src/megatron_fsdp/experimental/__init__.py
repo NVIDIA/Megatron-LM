@@ -16,20 +16,18 @@
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .dbuffer import DBuffer
-from .fully_shard import fully_shard, fully_shard_context, microbatch
-from .optimizer import fully_shard_optimizer
-from .placement import Flat, Partial, Placement, Placements, Replicate
+from .fully_shard import Placements, fully_shard, fully_shard_context, microbatch
+from .optimizer import fully_shard_optimizer, init_optimizer_state
+from .schedule import SchedulePolicy
 
 __all__ = [
     "DBuffer",
-    "Flat",
-    "Partial",
-    "Placement",
     "Placements",
-    "Replicate",
+    "SchedulePolicy",
     "fully_shard",
     "fully_shard_context",
     "fully_shard_optimizer",
+    "init_optimizer_state",
     "load_checkpoint",
     "microbatch",
     "save_checkpoint",

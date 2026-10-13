@@ -424,6 +424,7 @@ class TestFullyParallelSaveAndLoad:
         Utils.destroy_model_parallel()
 
     def test_broadcast_sharded_objects(self, tmp_path_dist_ckpt):
+        Utils.initialize_distributed()
 
         sharded_state_dict = {
             f'Obj_{i}': ShardedObject(f'Obj_{i}', None, (1,), (0,), replica_id=abs(Utils.rank - i))

@@ -26,7 +26,12 @@ from megatron.core.parallel_state import (
     get_gtp_weight_remat_world_size,
     get_tensor_model_parallel_rank,
 )
-from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
+from megatron.core.tensor_observation import suspend_tensor_observations
+from megatron.core.utils import (
+    is_te_min_version,
+    is_torch_min_version,
+    safely_set_viewless_tensor_data,
+)
 
 # ---------------------------------------------------------------------------
 # C++ extension: zero-copy storage sharing for CheckpointWithoutOutput
@@ -443,6 +448,82 @@ def get_all_rng_states():
         return {}
 
 
+_CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION = None
+
+
+def _probe_cudagraph_needs_generator_registration() -> bool:
+    """Capture an RNG op on an unregistered generator and report whether capture rejects it."""
+    generator = torch.Generator(device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            torch.rand(1, device="cuda", generator=generator)
+    except RuntimeError:
+        # Without lazy registration, capture fails with "RNG op during graph capture but
+        # generator is not registered with the capturing graph". Treat any capture failure
+        # as needing registration: on PyTorch with lazy registration, registering anyway
+        # only costs a deprecation warning, while skipping it on older builds is fatal.
+        return True
+    finally:
+        del graph
+    return False
+
+
+def cudagraph_needs_generator_registration() -> bool:
+    """Whether generators must be registered with a `torch.cuda.CUDAGraph` before capture.
+
+    PyTorch with pytorch/pytorch#176753 lazily registers every generator whose Philox
+    state is consumed during capture, and `CUDAGraph.register_generator_state()` became a
+    deprecated no-op that prints a warning on *every* call. Skip the explicit registration
+    there: it does nothing, and with one call per layer, per graph and per generator it floods
+    stderr (tens of thousands of lines per rank for dynamic inference with CUDA graphs).
+
+    The version string cannot identify that change: 2.14.0a0 nightlies built before it landed
+    still require explicit registration. Builds older than 2.14.0a0 always require it; for
+    newer builds, a small capture probe decides, and its result is cached.
+    """
+    global _CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION
+    if _CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION is not None:
+        return _CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION
+    if not is_torch_min_version("2.14.0a0"):
+        needs_registration = True
+    elif torch.cuda.is_current_stream_capturing():
+        # The probe cannot capture while another capture is active; register to be safe
+        # and probe on a later call.
+        return True
+    else:
+        needs_registration = _probe_cudagraph_needs_generator_registration()
+    _CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION = needs_registration
+    return needs_registration
+
+
+def prime_cuda_rng_states_for_graph_capture() -> None:
+    """Create each CUDA generator's capture state at the start of a graph capture.
+
+    Call as the first operation inside a `torch.cuda.graph` capture. PyTorch >= 2.14
+    (pytorch/pytorch#176753) creates this state lazily on the generator's first Philox use in
+    the capture and allocates it on the default stream. Mid-capture, that allocation makes the
+    caching allocator record and query events for blocks freed earlier in the capture; if a
+    block's recorded stream has since joined the capture (e.g. an NCCL stream after a pipeline
+    recv), the query raises cudaErrorCapturedEvent and invalidates the capture
+    (pytorch/pytorch#193982). Priming here, while nothing is pending, restores the pre-2.14
+    behavior of `capture_begin`. Each primed generator advances by one tiny draw per replay.
+    No-op outside a capture and on PyTorch < 2.14.
+    """
+    # TODO: Remove once the minimum supported PyTorch includes the upstream fix for lazy RNG
+    # capture-state allocation (pytorch/pytorch#193993 or its successor).
+    if cudagraph_needs_generator_registration() or not torch.cuda.is_current_stream_capturing():
+        return
+    scratch = torch.empty(1, device=torch.cuda.current_device())
+    generators = [torch.cuda.default_generators[scratch.device.index]]
+    if _CUDA_RNG_STATE_TRACKER_INITIALIZED:
+        generators.extend((get_all_rng_states() or {}).values())
+    for generator in generators:
+        # Graph-safe trackers hold generators; tensor states cannot be drawn from under capture.
+        if isinstance(generator, torch.Generator) and generator.device == scratch.device:
+            scratch.uniform_(generator=generator)
+
+
 def model_parallel_cuda_manual_seed(
     seed: int,
     te_rng_tracker: bool = False,
@@ -655,7 +736,7 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
+            with torch.enable_grad(), suspend_tensor_observations():
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -705,7 +786,13 @@ def _save_args_to_ctx(ctx, args):
             continue
         non_tensor_entries.append((index, arg))
 
-    ctx.save_for_backward(*detach_variable(tuple(tensor_args)))
+    # Save the raw tensors (as torch.utils.checkpoint does) rather than
+    # detach_variable()-ed copies: detaching here creates leaf tensors that require
+    # grad, and autograd's SavedVariable keeps such leaves alive until backward even
+    # when saved-tensor hooks (e.g. fine-grained activation offload) pack them away,
+    # pinning the input storage on GPU for the whole forward-backward interval.
+    # _load_args_from_ctx() detaches the unpacked tensors before they are reused.
+    ctx.save_for_backward(*tensor_args)
     ctx._non_tensor_entries = tuple(non_tensor_entries)
     ctx._total_args_count = len(args)
 
@@ -826,8 +913,7 @@ class CheckpointWithoutOutputManager:
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
         """Discard all checkpoint outputs to save memory and register unified recompute hook."""
         for ckpt in self.checkpoints:
-            for output in ckpt.outputs:
-                output.untyped_storage().resize_(0)
+            ckpt._discard_outputs()
 
         # Register unified recompute hook
         if hook_tensor.requires_grad:
@@ -854,7 +940,7 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False, ckpt_manager=None):
+    def __init__(self, fp8=False, ckpt_manager=None, retain_input_tensors=False):
         """
         Initialize CheckpointWithoutOutput.
 
@@ -872,9 +958,12 @@ class CheckpointWithoutOutput(object):
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
+            retain_input_tensors: Whether outputs sharing storage with checkpoint inputs
+                                  should be retained when discarding outputs.
         """
         self.fp8 = fp8 is not None
         self.ckpt_manager = ckpt_manager
+        self.retain_input_tensors = retain_input_tensors
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
@@ -900,6 +989,11 @@ class CheckpointWithoutOutput(object):
         self.run_function = run_function
 
         self.rng_states = _get_all_rng_states()
+
+        if self.retain_input_tensors:
+            self._saved_input_ptrs = {
+                t.untyped_storage().data_ptr() for t in args if isinstance(t, torch.Tensor)
+            }
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
@@ -942,7 +1036,7 @@ class CheckpointWithoutOutput(object):
 
             # Reconstruct full args list from saved ctx
             inputs = _load_args_from_ctx(self.ctx)
-            with torch.enable_grad(), fp8_ctx, recompute_ctx:
+            with torch.enable_grad(), fp8_ctx, recompute_ctx, suspend_tensor_observations():
                 outputs = self.run_function(*inputs)
 
         self.run_function = None
@@ -958,12 +1052,29 @@ class CheckpointWithoutOutput(object):
         #   - No tensor version-counter bump (no autograd complaint)
         share_storage = _get_share_storage()
         for output, recomputation_output in zip(self.outputs, outputs):
-            share_storage(output, recomputation_output)
+            if (
+                output.untyped_storage().data_ptr()
+                != recomputation_output.untyped_storage().data_ptr()
+            ):
+                share_storage(output, recomputation_output)
 
         self.ctx.outputs = outputs
         self.ctx.inputs = inputs
         self.outputs = None
         self.ctx = None
+
+    def _discard_outputs(self):
+        """Release output storage, preserving outputs that alias retained inputs."""
+        if self.retain_input_tensors:
+            # Skip outputs whose storage is shared with a saved input — freeing those
+            # would destroy the data needed for recomputation (e.g. TE.ops.Sequential
+            # operations with MakeExtraOutput).
+            for output in self.outputs:
+                if output.untyped_storage().data_ptr() not in self._saved_input_ptrs:
+                    output.untyped_storage().resize_(0)
+        else:
+            for output in self.outputs:
+                output.untyped_storage().resize_(0)
 
     def discard_output_and_register_recompute(self, hook_tensor):
         """
@@ -981,10 +1092,8 @@ class CheckpointWithoutOutput(object):
         if self.ckpt_manager is not None or is_graph_warmup():
             return
 
-        # use resize to release the output tensor memory and still keep the metadata in the tensors.
-        # the metadata is still needed for backward
-        for output in self.outputs:
-            output.untyped_storage().resize_(0)
+        # Release output tensor memory while keeping metadata for backward.
+        self._discard_outputs()
 
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
         # is computed, the recomputation will be triggered. The hook_tensor should be selected

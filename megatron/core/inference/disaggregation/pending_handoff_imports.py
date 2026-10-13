@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""State records for KV-cache imports awaiting completion."""
+"""State records for KV-cache and SSM-state imports awaiting completion."""
 
 from __future__ import annotations
 
@@ -26,6 +26,14 @@ class DeferredKvHandoff:
 
 
 @dataclass(kw_only=True)
+class PendingSSMImport:
+    """Exact SSM state being transferred into a reserved live request slot."""
+
+    handles: list[Any]
+    live_slot: int
+
+
+@dataclass(kw_only=True)
 class PendingKvImport:
     """Decode request waiting for an asynchronous KV-cache import."""
 
@@ -37,6 +45,7 @@ class PendingKvImport:
     cached_prefix_block_count: int
     handle: Any
     future: asyncio.Future
+    ssm: PendingSSMImport | None = None
     resume_tokens: List[int] = field(default_factory=list)  # Sampled token, then MTP proposals.
     continuation_blocks: List[int] = field(default_factory=list)  # Empty KV for resume writes.
     local_error: Exception | None = None  # Exact local error, if this rank failed.

@@ -1,13 +1,18 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import functools
+import logging
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core._rank_utils import log_single_rank
+from megatron.core.extensions.transformer_engine import te_general_gemm
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -26,7 +31,15 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import ensure_params_ready, get_pg_size
+
+logger = logging.getLogger(__name__)
+_DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
+
+try:
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+except ImportError:
+    get_dummy_wgrad = None
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -296,32 +309,72 @@ class DSAIndexerLossLoggingHelper:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        # Hybrid MTP layer numbers can exceed ``num_layers + mtp_num_layers``
+        # because every prediction depth can contain multiple hybrid layers.
+        needed = max(num_layers, layer_number)
         if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < needed:
+            grown = torch.zeros(
+                needed, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         tracker["values"][layer_number - 1] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
     @staticmethod
-    def clean_loss_in_tracker():
+    def clean_loss_in_tracker(preserve_groups: bool = False):
         """Clear the indexer losses."""
         tracker = DSAIndexerLossLoggingHelper.tracker
+        reduce_group = tracker.get("reduce_group") if preserve_groups else None
+        avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
-        tracker["reduce_group"] = None
-        tracker["avg_group"] = None
+        tracker["reduce_group"] = reduce_group
+        tracker["avg_group"] = avg_group
 
     @staticmethod
-    def reduce_loss_in_tracker():
-        """Collect and reduce the indexer losses across ranks."""
+    def reduce_loss_in_tracker(
+        pg_collection: ProcessGroupCollection, num_layers: Optional[int] = None
+    ):
+        """Collect and reduce indexer losses across every pipeline rank.
+
+        Args:
+            pg_collection: Process groups used for pipeline and data-parallel reductions.
+            num_layers: Total number of decoder and MTP layers. When provided, ranks without
+                local indexer losses contribute zeros to the pipeline-wide reduction.
+        """
         tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
+        pp_group = pg_collection.pp
+
+        # Pipeline ranks can own different attention variants, so first agree on
+        # a common tracker size. Cache the result because layer allocation is
+        # static and the negotiation requires a device-to-host synchronization.
+        if tracker.get("agreed_size") is not None:
+            size = tracker["agreed_size"]
+        else:
+            local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
+            size_t = torch.tensor(
+                [local_size], device=torch.cuda.current_device(), dtype=torch.long
+            )
+            torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+            size = int(size_t.item())
+            tracker["agreed_size"] = size
+        if size == 0:
             return
+        if "values" not in tracker:
+            tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < size:
+            grown = torch.zeros(
+                size, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         values = tracker["values"]
 
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pp_group)
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
@@ -330,9 +383,7 @@ class DSAIndexerLossLoggingHelper:
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
         torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-            op=torch.distributed.ReduceOp.AVG,
+            values, group=pg_collection.dp, op=torch.distributed.ReduceOp.AVG
         )
 
     @staticmethod
@@ -340,9 +391,13 @@ class DSAIndexerLossLoggingHelper:
         loss_scale: float,
         iteration: int,
         writer,
+        pg_collection: ProcessGroupCollection,
         wandb_writer=None,
         total_loss_dict=None,
         per_layer_logging: bool = False,
+        num_layers: Optional[int] = None,
+        num_indexer_layers: Optional[int] = None,
+        preserve_groups: bool = False,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -350,20 +405,27 @@ class DSAIndexerLossLoggingHelper:
             loss_scale: Scale factor for the loss.
             iteration: Current training iteration.
             writer: TensorBoard writer.
+            pg_collection: Process groups used for pipeline and data-parallel reductions.
             wandb_writer: Weights & Biases writer.
             total_loss_dict: Dictionary to accumulate total losses.
             per_layer_logging: Whether to log per-layer losses.
+            num_layers: Total number of decoder and MTP layers. Passing it makes ranks
+                without a local indexer participate in the pipeline reduction.
+            num_indexer_layers: Number of layers that own an indexer. Defaults to the
+                tracker size when every tracked layer owns one.
+            preserve_groups: Keep the saved reduction groups for CUDA Graph replays.
         """
-        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
+            pg_collection=pg_collection, num_layers=num_layers
+        )
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             return
 
         indexer_loss_values = tracker["values"] * loss_scale
-        num_layers = indexer_loss_values.shape[0]
-
-        # Average across all layers (assuming all layers have sparse attention)
-        avg_indexer_loss = indexer_loss_values.sum() / num_layers
+        if num_indexer_layers is None:
+            num_indexer_layers = indexer_loss_values.shape[0]
+        avg_indexer_loss = indexer_loss_values.sum() / max(num_indexer_layers, 1)
 
         # Log average loss
         if total_loss_dict is not None:
@@ -378,7 +440,7 @@ class DSAIndexerLossLoggingHelper:
         if wandb_writer is not None:
             wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
 
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 
 
 def compute_dsa_indexer_loss(
@@ -396,6 +458,7 @@ def compute_dsa_indexer_loss(
     key_positions: Optional[torch.Tensor] = None,
     query_valid_rows: Optional[torch.Tensor] = None,
     calculate_per_token_loss: bool = False,
+    non_compressed_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute KL divergence loss between index_scores and true attention_scores.
@@ -421,6 +484,10 @@ def compute_dsa_indexer_loss(
         varlen_starts: Optional row-wise key start bounds [sq] for packed THD.
         varlen_ends: Optional row-wise key end bounds [sq] for packed THD.
         key_positions: Optional global key positions [sk] for packed THD.
+        non_compressed_lse: Optional detached FP32 log-sum-exp contribution
+            [batch, heads, seqlen_q] from teacher keys that are intentionally
+            omitted from ``key``. When provided, the selected ``key`` logits
+            are normalized with this external mass before heads are summed.
 
     Returns:
         index_loss: KL divergence loss (scalar).
@@ -489,8 +556,8 @@ def compute_dsa_indexer_loss(
     attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
 
     # [b, np, sq, sk] -> [b, np, sq, sk]
-    attention_scores = dsa_masking.masked_softmax(
-        attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
+    attention_scores = _compute_indexer_teacher_probabilities(
+        attention_scores, attention_valid_mask, non_compressed_lse=non_compressed_lse
     )
     # [b, sq, sk] -> [b, sq, sk]
     index_log_scores = dsa_masking.masked_log_softmax(
@@ -504,7 +571,7 @@ def compute_dsa_indexer_loss(
         # attention scores are scattered to TP ranks in head dimension.
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
     # The target is already non-negative because it is a sum of softmax probabilities.
-    attention_scores = dsa_indexer_loss.normalize_indexer_target(attention_scores)
+    attention_scores = _normalize_indexer_teacher_target(attention_scores, non_compressed_lse)
     return dsa_indexer_loss.indexer_loss_from_target(
         attention_scores,
         index_log_scores,
@@ -514,24 +581,98 @@ def compute_dsa_indexer_loss(
     )
 
 
+def _compute_indexer_teacher_probabilities(
+    attention_scores: torch.Tensor,
+    attention_valid_mask: torch.Tensor,
+    non_compressed_lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return selected-key teacher mass, optionally including omitted mass.
+
+    ``non_compressed_lse`` is a sufficient statistic for teacher logits that
+    must participate in the softmax denominator but must not appear in the
+    compressed-key target returned by this helper. When the absolute compressed
+    mass underflows FP32, all heads in a row receive the same log-domain shift;
+    the returned weights remain proportional and the caller L1-normalizes them.
+    """
+    b, np, sq, sk = attention_scores.shape
+    expanded_valid_mask = attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk)
+    if non_compressed_lse is None:
+        return dsa_masking.masked_softmax(attention_scores.float(), expanded_valid_mask, dim=-1)
+
+    expected_shape = (b, np, sq)
+    if tuple(non_compressed_lse.shape) != expected_shape:
+        raise ValueError(
+            "non_compressed_lse must have shape [batch, heads, seqlen_q], "
+            f"got {tuple(non_compressed_lse.shape)}, expected {expected_shape}"
+        )
+    if non_compressed_lse.device != attention_scores.device:
+        raise ValueError(
+            "non_compressed_lse and attention_scores must be on the same device, "
+            f"got {non_compressed_lse.device} and {attention_scores.device}"
+        )
+    if non_compressed_lse.requires_grad:
+        raise ValueError("non_compressed_lse must be detached")
+
+    masked_scores = attention_scores.float().masked_fill(~expanded_valid_mask, float("-inf"))
+    compressed_lse = torch.logsumexp(masked_scores, dim=-1)
+    row_has_compressed_keys = expanded_valid_mask.any(dim=-1)
+    # Avoid the undefined ``-inf - -inf`` intermediate on fully masked rows.
+    # This is only a [batch, heads, seqlen] tensor, so it does not recreate the
+    # full-size temporary that the log-domain formulation is designed to avoid.
+    safe_compressed_lse = torch.where(
+        row_has_compressed_keys, compressed_lse, torch.zeros_like(compressed_lse)
+    )
+    conditional_probabilities = torch.exp(masked_scores - safe_compressed_lse.unsqueeze(-1))
+    del masked_scores
+
+    full_lse = torch.logaddexp(non_compressed_lse.float(), compressed_lse)
+    log_compressed_mass = (compressed_lse - full_lse).masked_fill(
+        ~row_has_compressed_keys, float("-inf")
+    )
+
+    # The external window/sink mass can put every head's compressed mass below
+    # the FP32 normal range. A common per-row shift across heads
+    # preserves all relative teacher weights and cancels in the downstream L1
+    # normalization. CSA currently requires TP1, so no cross-rank MAX is needed.
+    row_max = log_compressed_mass.amax(dim=1, keepdim=True)
+    needs_rescale = torch.isfinite(row_max) & (row_max < math.log(torch.finfo(torch.float32).tiny))
+    common_shift = torch.where(needs_rescale, row_max, torch.zeros_like(row_max))
+    compressed_mass = torch.exp(log_compressed_mass - common_shift)
+    return conditional_probabilities * compressed_mass.unsqueeze(-1)
+
+
+def _normalize_indexer_teacher_target(
+    target: torch.Tensor, non_compressed_lse: torch.Tensor | None
+) -> torch.Tensor:
+    """L1-normalize teacher mass without changing the legacy DSA path."""
+    if non_compressed_lse is None:
+        return dsa_indexer_loss.normalize_indexer_target(target)
+    row_mass = target.sum(dim=-1, keepdim=True)
+    # External teacher mass can legitimately make the compressed mass smaller
+    # than INDEXER_LOSS_EPS (or even float32 tiny). Only an exactly zero row is
+    # degenerate; keep it zero rather than imposing a numerical floor.
+    safe_row_mass = torch.where(row_mass > 0, row_mass, torch.ones_like(row_mass))
+    return target / safe_row_mass
+
+
 def _compute_index_scores(
     q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor, use_relu: bool = True
 ) -> torch.Tensor:
     """
-    Perform index score using BF16 precision.
+    Perform index scoring with BF16/FP32 inputs.
 
     Reference:
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/kernel.py#L254-L274
-    This is a BF16 implementation of the `fp8_index` logic:
+    This implementation accepts BF16/FP32 inputs for the `fp8_index` scoring logic:
         1. Compute attention scores: q @ k^T;
         2. Optionally apply ReLU activation (DeepSeek V3.2 only; disabled for GLM5);
         3. Weight by attention weights;
         4. Sum across attention heads.
 
     Args:
-        q: BF16 [seqlen_q, batch, index_n_heads, index_head_dim], the query tensor.
-        weights: BF16 [seqlen_q, batch, index_n_heads], the attention weights.
-        k: BF16 [seqlen_k, batch, index_head_dim], the key tensor.
+        q: BF16/FP32 [seqlen_q, batch, index_n_heads, index_head_dim], the query tensor.
+        weights: BF16/FP32 [seqlen_q, batch, index_n_heads], the attention weights.
+        k: BF16/FP32 [seqlen_k, batch, index_head_dim], the key tensor.
 
     Returns:
         index_scores: FP32 [batch, seqlen_q, seqlen_k], the index scores.
@@ -627,6 +768,7 @@ def fwd_fused_indexer_loss_naive(
     query_valid_rows=None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
+    non_compressed_lse: torch.Tensor | None = None,
 ):
     """Naive implementation of forward pass for indexer loss."""
     index_scores, topk_indices = fused_qk_topk_naive(
@@ -656,6 +798,7 @@ def fwd_fused_indexer_loss_naive(
         key_positions=key_positions,
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
+        non_compressed_lse=non_compressed_lse,
     )
 
     return topk_indices, indexer_loss
@@ -680,6 +823,7 @@ def bwd_fused_indexer_loss_naive(
     query_valid_rows=None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
+    non_compressed_lse: torch.Tensor | None = None,
 ):
     """Naive implementation of backward pass for indexer loss."""
     query, _ = dsa_layout.ensure_sbhd(query, "query")
@@ -752,8 +896,8 @@ def bwd_fused_indexer_loss_naive(
     else:
         index_valid_mask = base_valid_mask
     attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
-    attention_scores_softmax = dsa_masking.masked_softmax(
-        attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
+    attention_scores_softmax = _compute_indexer_teacher_probabilities(
+        attention_scores, attention_valid_mask, non_compressed_lse=non_compressed_lse
     )
     # Free attention_scores immediately
     del attention_scores
@@ -776,7 +920,9 @@ def bwd_fused_indexer_loss_naive(
     # L1 normalize. Fully masked packed/varlen rows can have zero summed
     # attention mass; clamp the denominator so those rows stay finite and are
     # later zeroed by the row-valid loss mask.
-    attention_scores_normalized = dsa_indexer_loss.normalize_indexer_target(attention_scores_sum)
+    attention_scores_normalized = _normalize_indexer_teacher_target(
+        attention_scores_sum, non_compressed_lse
+    )
     # Free attention_scores_sum - no longer needed after normalization
     del attention_scores_sum
 
@@ -806,11 +952,12 @@ def bwd_fused_indexer_loss_naive(
             dtype=grad_kl_per_element.dtype
         )
 
-    # For KL(target || softmax(logits)), the exact logit gradient is predict - target.
-    # Computing it through -target / (predict + eps) incorrectly suppresses gradients when
-    # valid predicted probabilities are smaller than eps.
+    # For KL(target || softmax(logits)), the exact logit gradient is
+    # predict * target.sum(-1) - target. Positive teacher rows are L1-normalized,
+    # while a fully masked zero-mass row must have zero gradient.
+    attention_target_mass = attention_scores_normalized.sum(dim=-1, keepdim=True)
     grad_index_scores_logits = (
-        index_scores_softmax - attention_scores_normalized
+        index_scores_softmax * attention_target_mass - attention_scores_normalized
     ) * grad_kl_per_element
     del index_scores_softmax, attention_scores_normalized
 
@@ -890,6 +1037,7 @@ _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES = (
     "query_valid_rows",
     "calculate_per_token_loss",
     "use_relu",
+    "non_compressed_lse",
 )
 
 
@@ -916,6 +1064,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         query_valid_rows=None,
         calculate_per_token_loss: bool = False,
         use_relu: bool = True,
+        non_compressed_lse: torch.Tensor | None = None,
     ):
         """
         Fused forward: index_scores never materialized in full.
@@ -938,10 +1087,17 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             query_valid_rows=query_valid_rows,
             calculate_per_token_loss=calculate_per_token_loss,
             use_relu=use_relu,
+            non_compressed_lse=non_compressed_lse,
         )
 
         # Save for backward (recomputation strategy)
-        ctx.save_for_backward(q, weights, k, query, key, topk_indices)
+        saved_non_compressed_lse = (
+            non_compressed_lse
+            if non_compressed_lse is not None
+            else q.new_empty(0, dtype=torch.float32)
+        )
+        ctx.save_for_backward(q, weights, k, query, key, topk_indices, saved_non_compressed_lse)
+        ctx.has_non_compressed_lse = non_compressed_lse is not None
         ctx.softmax_scale = softmax_scale
         ctx.loss_coeff = loss_coeff
         ctx.sparse_loss = sparse_loss
@@ -953,6 +1109,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         ctx.query_valid_rows = query_valid_rows
         ctx.calculate_per_token_loss = calculate_per_token_loss
         ctx.use_relu = use_relu
+        ctx.num_inputs = len(ctx.needs_input_grad)
 
         return topk_indices, loss
 
@@ -961,7 +1118,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         """
         Backward: Recompute what we need.
         """
-        q, weights, k, query, key, topk_indices = ctx.saved_tensors
+        q, weights, k, query, key, topk_indices, saved_non_compressed_lse = ctx.saved_tensors
+        non_compressed_lse = saved_non_compressed_lse if ctx.has_non_compressed_lse else None
 
         grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
             q,
@@ -982,6 +1140,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             query_valid_rows=ctx.query_valid_rows,
             calculate_per_token_loss=ctx.calculate_per_token_loss,
             use_relu=ctx.use_relu,
+            non_compressed_lse=non_compressed_lse,
         )
 
         grad_by_name = {
@@ -991,8 +1150,10 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             # query and key are detached in forward, so return None for their gradients.
             "query": None,
             "key": None,
+            "non_compressed_lse": None,
         }
-        return tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        gradients = tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        return gradients[: ctx.num_inputs]
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
@@ -1085,6 +1246,167 @@ class DSAttentionSubmodules:
     """
 
     indexer: Union[ModuleSpec, type] = None
+
+
+def _dsa_weights_proj_te_gemm_is_unsupported(error: RuntimeError) -> bool:
+    """Return whether a TE GEMM error permits the documented FP32 fallback."""
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "cublas_status_not_supported",
+            "unable to find suitable cublas gemm algorithm",
+            "unable to find any suitable algorithms",
+        )
+    )
+
+
+def _warn_dsa_weights_proj_te_gemm_fallback(error: RuntimeError) -> None:
+    """Warn once when TE cannot provide the requested FP32 GEMM output."""
+    global _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED
+    if _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED:
+        return
+    _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = True
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        "Transformer Engine GEMM does not support BF16-input/FP32-output for the DSA indexer "
+        "weights projection on this platform; using torch.mm with FP32 operands instead. "
+        f"Original TE error: {error}",
+    )
+
+
+def _dsa_weights_proj_forward_gemm(
+    x: torch.Tensor, weight: torch.Tensor, te_gemm_supported: Optional[bool]
+) -> Tuple[torch.Tensor, Optional[bool]]:
+    """Project BF16 indexer weights with FP32 accumulation and output."""
+    x_shape = x.shape
+    x_2d = x.reshape(-1, x_shape[-1])
+
+    if te_gemm_supported is not False and te_general_gemm is not None and x_2d.is_cuda:
+        try:
+            output = te_general_gemm(weight, x_2d, out_dtype=torch.float32, layout="TN")[0]
+            return output.reshape(*x_shape[:-1], weight.size(0)), True
+        except RuntimeError as error:
+            if not _dsa_weights_proj_te_gemm_is_unsupported(error):
+                raise
+            te_gemm_supported = False
+            _warn_dsa_weights_proj_te_gemm_fallback(error)
+
+    # Do not emulate the requested precision by casting a low-precision output.
+    # Casting both operands makes the fallback a genuine FP32 linear operation.
+    output = torch.mm(x_2d.float(), weight.float().t())
+    return output.reshape(*x_shape[:-1], weight.size(0)), te_gemm_supported
+
+
+def _dsa_weights_proj_wgrad(
+    x: torch.Tensor,
+    grad_output: torch.Tensor,
+    weight: torch.Tensor,
+    linear: torch.nn.Module,
+    is_first_microbatch: Optional[bool],
+) -> Tuple[torch.Tensor, None]:
+    """Compute or accumulate the high-precision weight gradient."""
+    x_2d = x.reshape(-1, x.size(-1))
+    grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
+    grad_weight = torch.mm(grad_output_2d.float().t(), x_2d.float())
+
+    if getattr(linear, "fuse_wgrad_accumulation", False):
+        if hasattr(weight, "__fsdp_param__"):
+            main_grad = weight.get_main_grad()
+        else:
+            main_grad = getattr(weight, "main_grad", None)
+        if main_grad is not None:
+            if is_first_microbatch is True or getattr(weight, "overwrite_main_grad", False):
+                main_grad.copy_(grad_weight)
+            else:
+                main_grad.add_(grad_weight)
+            weight.main_grad = main_grad
+            if hasattr(weight, "grad_added_to_main_grad"):
+                weight.grad_added_to_main_grad = True
+            # The delayed-WGrad owner ignores this return value when accumulation is fused.
+            return grad_weight, None
+
+    return grad_weight.to(dtype=weight.dtype), None
+
+
+class _DSAWeightsProjection(torch.autograd.Function):
+    """BF16-operand, FP32-output linear used only by the DSA indexer."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        linear: torch.nn.Module,
+        indexer: torch.nn.Module,
+    ) -> torch.Tensor:
+        """Run the FP32-output projection and save operands for backward."""
+        ctx.save_for_backward(x, weight)
+        ctx.linear = linear
+        # This path does not use TE's parameter-transpose cache. Keep the
+        # first-microbatch signal solely for fused WGrad overwrite/accumulate semantics.
+        ctx.is_first_microbatch = getattr(linear, "is_first_microbatch", None)
+        if hasattr(linear, "is_first_microbatch"):
+            linear.is_first_microbatch = False
+        output, indexer._weights_proj_te_gemm_supported = _dsa_weights_proj_forward_gemm(
+            x, weight, indexer._weights_proj_te_gemm_supported
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Propagate gradients with MCore's deferred and fused-WGrad semantics."""
+        x, weight = ctx.saved_tensors
+        linear = ctx.linear
+
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
+            grad_input = torch.mm(grad_output_2d.float(), weight.float())
+            grad_input = grad_input.reshape_as(x).to(dtype=x.dtype)
+
+        grad_weight = None
+        if ctx.needs_input_grad[1]:
+            if (
+                getattr(linear, "wgrad_store", None) is not None
+                and linear.wgrad_store.delay_wgrad_compute()
+            ):
+                wgrad_func = functools.partial(
+                    _dsa_weights_proj_wgrad,
+                    weight=weight,
+                    linear=linear,
+                    is_first_microbatch=ctx.is_first_microbatch,
+                )
+                linear.wgrad_store.put([x, grad_output], wgrad_func)
+            else:
+                grad_weight, _ = _dsa_weights_proj_wgrad(
+                    x, grad_output, weight, linear, ctx.is_first_microbatch
+                )
+
+            if getattr(linear, "fuse_wgrad_accumulation", False) and hasattr(
+                weight, "grad_added_to_main_grad"
+            ):
+                # Keep a dummy grad for MCore's parameter hook, including delayed WGrad.
+                zero_dummy = getattr(weight, "zero_out_wgrad", False)
+                if get_dummy_wgrad is not None:
+                    grad_weight = get_dummy_wgrad(list(weight.shape), weight.dtype, zero=zero_dummy)
+                elif zero_dummy:
+                    grad_weight = torch.zeros_like(weight, requires_grad=False)
+                else:
+                    grad_weight = torch.empty_like(weight, requires_grad=False)
+
+        return grad_input, grad_weight, None, None
+
+
+def _dsa_weights_projection_fp32(x: torch.Tensor, indexer: torch.nn.Module) -> torch.Tensor:
+    """Apply the non-quantized DSA indexer projection with a true FP32 output."""
+    linear = indexer.linear_weights_proj
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        raise RuntimeError("DSA indexer linear_weights_proj must expose a weight parameter.")
+    ensure_params_ready([weight])
+    return _DSAWeightsProjection.apply(x, weight, linear, indexer)
 
 
 class DSAIndexer(MegatronModule):
@@ -1191,21 +1513,48 @@ class DSAIndexer(MegatronModule):
             submodules.k_norm, config=k_norm_config, hidden_size=self.index_head_dim, eps=k_norm_eps
         )
 
-        self.linear_weights_proj = build_module(
-            submodules.linear_weights_proj,
-            self.hidden_size,
-            self.index_n_heads,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
+        weights_proj_init_context = (
+            get_fp8_disabled_context(self.config, is_init=True)
+            if not self.config.dsa_indexer_weights_proj_use_quantization
+            else nullcontext()
         )
+        with weights_proj_init_context:
+            self.linear_weights_proj = build_module(
+                submodules.linear_weights_proj,
+                self.hidden_size,
+                self.index_n_heads,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+            )
+        self._weights_proj_te_gemm_supported: Optional[bool] = None
         # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
         # should be averaged during final gradient synchronization.
         for param in self.parameters():
             setattr(param, "average_gradients_across_tp_domain", True)
+
+    def _project_indexer_weights(self, x: torch.Tensor) -> torch.Tensor:
+        """Run ``linear_weights_proj`` according to the DSA-specific precision contract."""
+        weights_proj_context = (
+            get_fp8_disabled_context(self.config)
+            if not self.config.dsa_indexer_weights_proj_use_quantization
+            else nullcontext()
+        )
+        with weights_proj_context:
+            if self.config.dsa_indexer_weights_proj_output_dtype == "fp32":
+                return _dsa_weights_projection_fp32(x, self)
+
+            weights, _ = self.linear_weights_proj(x)
+            return weights.to(dtype=torch.bfloat16)
+
+    def backward_dw(self):
+        """Compute the deferred weight gradients of the indexer projections."""
+        self.linear_wq_b.backward_dw()
+        self.linear_wk.backward_dw()
+        self.linear_weights_proj.backward_dw()
 
     def _apply_rope(
         self,
@@ -1316,7 +1665,7 @@ class DSAIndexer(MegatronModule):
         # Prepare weights for index scores
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
-        weights, _ = self.linear_weights_proj(x)
+        weights = self._project_indexer_weights(x)
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
         return q, k, weights
@@ -1623,6 +1972,11 @@ class DSAttention(MegatronModule):
             holder = {}
             setattr(carrier, self._LENGTH_HOLDER_ATTR, holder)
         return holder
+
+    def backward_dw(self):
+        """Compute deferred weight gradients for the indexer owned by this layer."""
+        if self.indexer is not None:
+            self.indexer.backward_dw()
 
     def forward(
         self,

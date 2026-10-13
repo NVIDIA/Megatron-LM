@@ -30,6 +30,7 @@ except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
     pass
 
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -178,16 +179,33 @@ def get_grouped_quantized_members(
     if not is_grouped_tensor_with_quantized_storage(grouped_tensor):
         raise ValueError("get_grouped_quantized_members expects grouped quantized storage.")
 
-    quantized_members = getattr(grouped_tensor, "quantized_tensors", None)
-    if quantized_members is None:
+    return get_grouped_tensor_members(grouped_tensor, create_if_missing=create_if_missing)
+
+
+def get_grouped_tensor_members(
+    tensor: torch.Tensor, *, create_if_missing: bool = False
+) -> List[torch.Tensor]:
+    """Return cached per-member views for a high-precision or quantized GroupedTensor.
+
+    Transformer Engine uses ``quantized_tensors`` and
+    ``split_into_quantized_tensors`` for these members even when the grouped
+    storage is high precision. Keep that upstream cache convention so TE and
+    MCore share the same stable member views.
+    """
+    grouped_tensor = _unwrap_parameter_data(tensor)
+    if not is_grouped_tensor(grouped_tensor):
+        raise ValueError("get_grouped_tensor_members expects a TE GroupedTensor.")
+
+    members = getattr(grouped_tensor, "quantized_tensors", None)
+    if members is None:
         if not create_if_missing:
             raise RuntimeError(
-                "Grouped quantized parameter is missing cached member tensors. "
+                "Grouped parameter is missing cached member tensors. "
                 "Create them outside the training critical path."
             )
-        quantized_members = grouped_tensor.split_into_quantized_tensors()
-        grouped_tensor.quantized_tensors = quantized_members
-    return quantized_members
+        members = grouped_tensor.split_into_quantized_tensors()
+        grouped_tensor.quantized_tensors = members
+    return members
 
 
 def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> None:
@@ -347,11 +365,9 @@ def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, F
     try:
         custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
     except AttributeError:
-        raise ValueError(
-            """CustomRecipe recipe is not available in this version of 
+        raise ValueError("""CustomRecipe recipe is not available in this version of 
             Transformer Engine. Please make sure you are using TE version 
-            >= 2.9.0.dev0."""
-        )
+            >= 2.9.0.dev0.""")
     return custom_recipe
 
 
@@ -811,6 +827,26 @@ if HAVE_TE:
             )
         return fp8_recipe
 
+    def get_fp8_recipe_for_a2a(a2a_dtype: str):
+        """Return the fp8 recipe for quantizing an MoE dispatch/combine (a2a) payload over
+        the wire, or None for a high-precision wire.
+
+        Dedicated helper rather than get_fp8_recipe: the wire payload is E4M3
+        activations/activation-grads in both directions, independent of the compute recipe
+        (whose format selection and compute-only knobs like fp8_dpa do not apply to a
+        communication payload).
+
+        Arguments:
+            a2a_dtype (str): Wire dtype, 'bf16' (returns None) or 'mxfp8'.
+        """
+        if a2a_dtype == 'bf16':
+            return None
+        if a2a_dtype == 'mxfp8':
+            return transformer_engine.common.recipe.MXFP8BlockScaling(
+                fp8_format=transformer_engine.common.recipe.Format.E4M3
+            )
+        raise ValueError(f"Unsupported a2a wire dtype: {a2a_dtype!r}.")
+
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Return fp8 context manager.
 
@@ -899,6 +935,14 @@ else:
     def get_fp8_recipe(config: TransformerConfig):
         """Returns None since TE is not available."""
         return None
+
+    def get_fp8_recipe_for_a2a(a2a_dtype: str):
+        """Raises for a quantized wire dtype since TE is not available."""
+        if a2a_dtype == 'bf16':
+            return None
+        raise RuntimeError(
+            f"a2a wire dtype {a2a_dtype!r} requires TransformerEngine, which is not available."
+        )
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Returns dummy fp8 context manager since TE is not available."""
