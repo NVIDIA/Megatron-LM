@@ -40,7 +40,7 @@ If you override `NCCL_ALGO` with a non-empty value, the value must be a subset o
 
 ### Letting NCCL choose the algorithm
 
-Setting `NCCL_ALGO` to the empty string (`export NCCL_ALGO=`) asks NCCL to choose the algorithm for each collective; with NCCL 2.24 or later, NCCL then chooses as it does in a run without `--deterministic-mode`. `--deterministic-mode` keeps the empty value instead of filling in `Ring`, and rank 0 prints a notice at startup.
+Setting `NCCL_ALGO` to the empty string (`export NCCL_ALGO=`) asks NCCL to choose the algorithm for each collective; with NCCL 2.24 or later, NCCL then chooses as it does in a run without `--deterministic-mode`. `--deterministic-mode` keeps the empty value instead of filling in `Ring`, and rank 0 issues a warning at startup.
 
 Leaving `NCCL_ALGO` unset cannot do this: `--deterministic-mode` fills in `Ring`. Without that default, PyTorch 2.8 and later would still exclude NVLS: with `torch.use_deterministic_algorithms(True)` on, it sets `NCCL_ALGO=^NVLS` in the process environment when it creates an NCCL process group and the variable is unset, logging "disabling NVLS algorithm in NCCL". PyTorch counts an empty `NCCL_ALGO` as set and leaves it alone.
 

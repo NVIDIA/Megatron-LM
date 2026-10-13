@@ -106,12 +106,16 @@ def test_nccl_algo_is_kept_defaulted_or_rejected(nccl_algo, error):
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_empty_nccl_algo_notice_is_printed_on_rank_0(rank, monkeypatch, capsys):
-    """Only rank 0 prints the notice, and only for an empty NCCL_ALGO."""
+def test_empty_nccl_algo_warning_is_issued_on_rank_0(rank, monkeypatch, recwarn):
+    """Only rank 0 warns, and only for an empty NCCL_ALGO."""
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.setenv("RANK", str(rank))
-    apply_determinism_env({})
-    apply_determinism_env({"NCCL_ALGO": "Ring"})
-    assert "NCCL_ALGO is empty" not in capsys.readouterr().out
-    apply_determinism_env({"NCCL_ALGO": ""})
-    assert ("NCCL_ALGO is empty" in capsys.readouterr().out) == (rank == 0)
+    monkeypatch.delenv("NCCL_ALGO", raising=False)
+    apply_determinism_to_args(make_args())
+    monkeypatch.setenv("NCCL_ALGO", "Ring")
+    apply_determinism_to_args(make_args())
+    assert not [w for w in recwarn if "NCCL_ALGO is empty" in str(w.message)]
+    monkeypatch.setenv("NCCL_ALGO", "")
+    apply_determinism_to_args(make_args())
+    warned = any("NCCL_ALGO is empty" in str(w.message) for w in recwarn)
+    assert warned == (rank == 0)

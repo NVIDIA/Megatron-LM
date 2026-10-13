@@ -23,8 +23,6 @@ import torch
 # submodule, and this module writes to one of its attributes.
 import torch.utils.deterministic
 
-from megatron.training.utils import print_rank_0
-
 # Maps each arg name to the value it must hold for bit-exact execution;
 # verified by :func:`apply_determinism_to_args`.
 ARG_VALUES_REQUIRED_FOR_DETERMINISM = {
@@ -103,8 +101,8 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
 
     * ``NCCL_ALGO`` — if set, each comma-separated token must be in
       :data:`ACCEPTED_NCCL_ALGO_TOKENS`. The empty string is accepted and kept:
-      NCCL (and a tuner plugin, if one is loaded) then chooses the algorithms,
-      and rank 0 prints a notice saying so. A value of only whitespace is rejected.
+      NCCL (and a tuner plugin, if one is loaded) then chooses the algorithms.
+      A value of only whitespace is rejected.
     * ``NCCL_EP_HT_EM_AG_SCAN_MODE`` / ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` /
       ``CUBLAS_WORKSPACE_CONFIG`` —
       if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
@@ -131,13 +129,7 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     # torch.use_deterministic_algorithms(True), and NCCL 2.24 and later exclude no algorithm
     # for the empty string.
     nccl_algo = env.get("NCCL_ALGO")
-    if nccl_algo == "":
-        # print_rank_0() because this runs from validate_args, before logging is configured.
-        print_rank_0(
-            "Deterministic mode: NCCL_ALGO is empty, so NCCL chooses the algorithm for each "
-            "collective. Bit-exact reproducibility then rests on the algorithms NCCL selects."
-        )
-    elif nccl_algo is not None:
+    if nccl_algo not in (None, ""):
         assert nccl_algo.strip(), (
             f"NCCL_ALGO={nccl_algo!r} contains only whitespace, which NCCL 2.24 and later fail "
             "to parse. Set NCCL_ALGO to the empty string to let NCCL choose the algorithms, or "
@@ -205,7 +197,8 @@ def apply_determinism_to_args(args) -> None:
        ``CUBLAS_WORKSPACE_CONFIG``,
        ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``,
        ``TRITON_CACHE_AUTOTUNING`` and its required ``TRITON_CACHE_DIR``) and
-       setdefaults the canonical values.
+       setdefaults the canonical values. If ``NCCL_ALGO`` is empty, rank 0
+       then warns that NCCL chooses the algorithms.
     3. Calls ``torch.use_deterministic_algorithms(True)``, then clears
        ``torch.utils.deterministic.fill_uninitialized_memory``, which that call
        turns on and which reproducibility does not need.
@@ -240,6 +233,16 @@ def apply_determinism_to_args(args) -> None:
 
     # Delegate env-var validation + setdefault to the single-source helper.
     apply_determinism_env(os.environ)
+    if os.environ.get("NCCL_ALGO") == "":
+        from megatron.training.utils import warn_rank_0
+
+        warn_rank_0(
+            "Deterministic mode: NCCL_ALGO is empty, so NCCL chooses the algorithm for each "
+            "collective. With NCCL >= 2.24 that includes Tree and, where available, NVLS, "
+            "neither of which is an accepted NCCL_ALGO token. Bit-exact reproducibility "
+            'then rests on what NCCL selects; see "Letting NCCL choose the algorithm" in '
+            "docs/user-guide/deterministic-training.md."
+        )
 
     # Torch global state last — all assertions have already passed.
     torch.use_deterministic_algorithms(True)
