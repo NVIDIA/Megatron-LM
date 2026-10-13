@@ -24,7 +24,8 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .module import FsdpContext, FsdpModule, current_fully_shard_context
+from .context import FsdpContext, current_fully_shard_context
+from .module import FsdpModule
 from .schedule import SchedulePolicy
 
 # TODO(wujingyue): Separate fully_shard_context from FsdpContext in a follow-up PR.

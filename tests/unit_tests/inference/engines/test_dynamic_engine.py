@@ -920,6 +920,7 @@ class DynamicEngineTestConfig:
     fp8: bool = False
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
+    flash_attention_version: Optional[int] = 2
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
     # HybridModel, and only the layer pattern and stack spec (and so the
@@ -1191,6 +1192,7 @@ class DynamicInferenceEngineTestBase:
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
+                flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
@@ -1300,6 +1302,7 @@ class DynamicInferenceEngineTestBase:
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
+                flash_attention_version=test_config.flash_attention_version,
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
@@ -1603,7 +1606,8 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     engine.controller = types.SimpleNamespace(
         tokenizer=types.SimpleNamespace(
             detokenize=lambda tokens: f"<{','.join(str(token) for token in tokens)}>"
-        )
+        ),
+        terminating_token_ids=mock.Mock(return_value=frozenset()),
     )
     engine.finished_request_count = 0
     engine.evicted_request_count = 0
@@ -1630,6 +1634,8 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     assert active_ids == []
     assert merge.call_count == 1
     assert future.result() is finished
+    assert finished.finish_reason == "length"
+    engine.controller.terminating_token_ids.assert_called_with(-1, stop_token_ids=None)
     assert finished.generated_log_probs == [-0.25]
     assert finished.generated_top_n_logprobs == [{"<12>": -0.25, "<13>": -1.0}]
     assert finished.tpot == [0.25]

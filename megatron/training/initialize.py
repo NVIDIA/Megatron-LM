@@ -12,7 +12,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu, tensor_parallel, tuning
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
@@ -41,6 +41,7 @@ from megatron.training import (
     get_tensorboard_writer,
     inprocess_restart,
 )
+from megatron.training.argument_utils import _triton_autotune_config_from_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 from megatron.training.global_vars import get_run_config
@@ -126,6 +127,9 @@ def initialize_megatron(
             f"Enabling batch invariant mode globally (backend={backend}, collective={collective})"
         )
         enable_batch_invariant_mode(backend, collective)
+
+    # Before any Triton kernel runs, including the kernel warm-up before model construction.
+    tuning.install(_triton_autotune_config_from_args(args), deterministic=args.deterministic_mode)
 
     # torch.distributed initialization
     def finish_mpu_init():
@@ -410,16 +414,18 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                     "Set both --gtp_remat-weight-remat-size and "
                     "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
                 )
+            # Dense grid: world_size must be divisible by
+            # TP * PP * (runtime_CP / gtp_remat_num_sequence_shards) * GTP_remat.
+            # Expert grid: world_size must be divisible by ETP * EP * PP * EGTP_remat.
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 use_sharp=cfg.dist.use_sharp,
-                # GTP_remat/EGTP_remat need world divisible by TP*PP*CP*GTP_remat (expert grid
-                # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1.
                 gtp_remat_size=args.gtp_weight_remat_size,
                 expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
+                gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 hybrid_context_parallel=args.hybrid_context_parallel,

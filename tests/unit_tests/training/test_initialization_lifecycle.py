@@ -55,6 +55,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     args.rank, args.world_size = 0, 4
     # These topology values are normally resolved by validate_args.
     args.gtp_weight_remat_size = args.expert_gtp_weight_remat_size = 1
+    args.gtp_remat_num_sequence_shards = 1
     args.virtual_pipeline_model_parallel_size = None
     args.expert_tensor_parallel_size = 1
     original_args = vars(args).copy()
@@ -103,6 +104,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     assert kwargs["order"] == "tp-cp-ep-pp-dp"
     assert kwargs["high_priority_stream_groups"] == ["tp"]
     assert kwargs["use_sharp"] is True
+    assert kwargs["gtp_remat_num_sequence_shards"] == 1
     assert kwargs["sharp_enabled_group"] == "dp_replica"
     assert kwargs["create_gloo_process_groups"] is False
     assert vars(args) == original_args
