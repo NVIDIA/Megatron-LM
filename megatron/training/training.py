@@ -54,14 +54,14 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
@@ -115,10 +115,13 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
     DSAIndexerLossLoggingHelper,
-    is_dsa_skip_topk_layer,
+    initialize_dsa_metric_tracker,
+    resolve_dsa_metric_pg_collection,
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
@@ -153,7 +156,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
-from megatron.training.utils import is_hybrid_model
+from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -477,9 +480,10 @@ def _dsa_indexer_flops(
     only the model's defining GEMMs enter the estimate, not auxiliary-loss or
     sorting work.
 
-    Only ``num_indexer_layers`` layers pay: with cross-layer index sharing
-    (``dsa_indexer_topk_freq``) the layers in between reuse the most recent
-    top-k (see ``is_dsa_skip_topk_layer``).
+    Only ``num_indexer_layers`` indexer executions pay: with cross-layer index
+    sharing (``dsa_indexer_topk_freq``) the layers in between reuse the most
+    recent top-k (see ``is_dsa_skip_topk_layer``). Repeated MTP may execute the
+    same physical indexer multiple times.
 
     The indexer does NOT get the global fwd+bwd factor of 3. It is trained
     only by its own KL loss, so ``DSAttention.forward`` runs it under
@@ -547,19 +551,48 @@ def _dsa_indexer_flops(
     )
 
 
-def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
-    """Count layers that compute their own DSA index (the rest reuse one).
+def _standard_layer_numbers_for_execution(
+    num_decoder_layers, *, mtp_num_layers=0, mtp_use_repeated_layer=False
+):
+    """Return standard-model layer numbers in their runtime execution order.
 
-    On the standard-model path every layer is a DSA attention layer (MTP
-    layers included -- ``DSAttention.__init__`` numbers them
-    ``layer_number + config.num_layers``, which is exactly how the caller
-    extends ``num_layers``), so the predicate runs over the whole
-    ``1..num_layers`` range.
+    Decoder layers use global numbers ``1..N``. Independent MTP layers use
+    ``N+1..N+D``, while repeated MTP builds only layer ``N+1`` and executes it
+    ``D`` times.
     """
+    layer_numbers = list(range(1, num_decoder_layers + 1))
+    mtp_num_layers = mtp_num_layers or 0
+    if mtp_use_repeated_layer and mtp_num_layers > 0:
+        layer_numbers.extend([num_decoder_layers + 1] * mtp_num_layers)
+    else:
+        layer_numbers.extend(range(num_decoder_layers + 1, num_decoder_layers + mtp_num_layers + 1))
+    return layer_numbers
+
+
+def _num_dsa_indexer_layers(
+    num_decoder_layers,
+    skip_topk_offset,
+    topk_freq,
+    *,
+    mtp_num_layers=0,
+    mtp_use_repeated_layer=False,
+):
+    """Count DSA indexer executions on the standard-model path.
+
+    Cross-layer top-k sharing is tied to the physical layer number, so repeated
+    MTP either executes its one indexer ``D`` times or reuses top-k ``D`` times.
+    """
+
+    def computes_index(layer_number):
+        return not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+
     return sum(
-        1
-        for layer_number in range(1, num_layers + 1)
-        if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+        computes_index(layer_number)
+        for layer_number in _standard_layer_numbers_for_execution(
+            num_decoder_layers,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+        )
     )
 
 
@@ -696,6 +729,31 @@ def consume_vision_model_flops_stats(
     if num_reported == 0:
         return None, None, None
     return (total_patches / dedup, attention_seqlen_squared_sum / dedup, merged_tokens / dedup)
+
+
+def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, num_layers, skip_topk_offset, topk_freq):
+    """Count DSA indexer executions at actual main and nested-MTP layer numbers."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+
+    parsed = parse_hybrid_pattern(hybrid_layer_pattern)
+    main_pattern = (parsed.main_pattern or "").replace(Symbols.PIPE, "")
+
+    def is_indexer(layer_type, layer_number):
+        return layer_type == Symbols.DS_ATTENTION and not is_dsa_skip_topk_layer(
+            layer_number, skip_topk_offset or 0, topk_freq or 1
+        )
+
+    count = sum(
+        is_indexer(layer_type, layer_number)
+        for layer_number, layer_type in enumerate(main_pattern, start=1)
+    )
+    if parsed.mtp_pattern is not None:
+        indexers_per_mtp_depth = sum(
+            is_indexer(layer_type, num_layers + inner_layer_number)
+            for inner_layer_number, layer_type in enumerate(parsed.mtp_pattern, start=1)
+        )
+        count += indexers_per_mtp_depth * parsed.mtp_num_depths
+    return count
 
 
 def _dsv4_hybrid_self_attention_flops(
@@ -1317,6 +1375,7 @@ def num_floating_point_operations(
         kda_conv_kernel_dim=4,
         vocab_size=256000,
         mtp_num_layers=0,
+        mtp_loss_type="cross_entropy",
         q_lora_rank=None,
         kv_lora_rank=0,
         qk_head_dim=0,
@@ -1441,7 +1500,14 @@ def num_floating_point_operations(
             2 * mtp_num_layers * (3 * hidden_size + 2 * hidden_size * hidden_size) * total_tokens
             + 2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
         )
-        return flops_fwd * 3
+        # E2E TV projects the frozen backbone once to produce target logits.
+        # This projection has no backward pass because the target distribution
+        # is detached. Softmax/overlap elementwise work is omitted consistently
+        # with the existing cross-entropy FLOPs convention.
+        e2e_tv_target_projection_flops = (
+            2 * total_tokens * hidden_size * vocab_size if mtp_loss_type == "e2e_tv" else 0
+        )
+        return flops_fwd * 3 + e2e_tv_target_projection_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1714,6 +1780,14 @@ def num_floating_point_operations(
                 f"Invalid length of csa_compress_ratios: {len(compress_ratios)}, "
                 f"expected num_layers + mtp_num_layers ({num_layers})."
             )
+            compress_ratios = [
+                compress_ratios[layer_number - 1]
+                for layer_number in _standard_layer_numbers_for_execution(
+                    args.num_layers,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                )
+            ]
             # ratio == 0: window-only; ratio == 4: window + topk compressed KV
             # (compressor + indexer); ratio == 128: window + all compressed KV.
             dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
@@ -1780,7 +1854,11 @@ def num_floating_point_operations(
                 n_heads=args.dsa_indexer_n_heads,
                 head_dim=args.dsa_indexer_head_dim,
                 num_indexer_layers=_num_dsa_indexer_layers(
-                    num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+                    args.num_layers,
+                    args.dsa_indexer_skip_topk_offset,
+                    args.dsa_indexer_topk_freq,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
                 ),
                 dsa_indexer_loss_enabled=(args.dsa_indexer_loss_coeff or 0.0) > 0,
                 dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
@@ -1858,6 +1936,11 @@ def num_floating_point_operations(
                 * args.hidden_size
                 * args.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
+                # E2E TV target distribution: one frozen forward-only output projection.
+                + fma_expansion_factor
+                * args.hidden_size
+                * args.padded_vocab_size
+                * int(getattr(args, "mtp_loss_type", "cross_entropy") == "e2e_tv")
             )
             # Self Attention (core L^2 part). For BSHD the default
             # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
@@ -1914,8 +1997,7 @@ def num_floating_point_operations(
         # ``kw_args``, never back onto ``args``), so the attribute alone misses
         # exactly the runs this guard exists for.
         assert (
-            args.experimental_attention_variant != "dsa"
-            and layer_counts[Symbols.DS_ATTENTION] == 0
+            args.experimental_attention_variant != "dsa" and layer_counts[Symbols.DS_ATTENTION] == 0
         ), (
             "num_floating_point_operations does not support DSA "
             "('D' layers / experimental_attention_variant='dsa') on the "
@@ -1973,6 +2055,7 @@ def num_floating_point_operations(
             kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            mtp_loss_type=getattr(args, "mtp_loss_type", "cross_entropy"),
             q_lora_rank=args.q_lora_rank,
             kv_lora_rank=args.kv_lora_rank,
             qk_head_dim=args.qk_head_dim,
@@ -2028,7 +2111,7 @@ def get_start_time_from_progress_log():
     def _get_field(string, type):
         return type(string.split(': ')[1])
 
-    with open_file(progress_log_filename, 'r') as f:
+    with maybe_msc.open(progress_log_filename, 'r') as f:
         for line in f:
             line = line.strip()
             line_tokens = line.split('\t')
@@ -2097,6 +2180,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
+
             # Treat missing and explicit None identifier values as equivalent.
             # Wrap each component so None never compares directly with floats or strings.
             def key_fn(pg):
@@ -2104,6 +2188,7 @@ def preprocess_common_state_dict(common_state_dict):
                     (value is not None, value)
                     for value in (pg.get(key) for key in param_group_identifier_keys)
                 ]
+
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -2801,8 +2886,22 @@ def wrap_model_chunks_with_ddp(
                 "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
                 "the distributed-optimizer parameter layout"
             )
-            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
-            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
+            # The distributed optimizer shards each bucket over the intra-instance group, which
+            # is what DDP hands to the buffer as its data_parallel_group. Size the layout by that
+            # same group, otherwise the layout reports more shards than the reduce-scatter uses
+            # and the trailing shards of every bucket end up owned by no rank. intra_dp_cp is
+            # the full dp_cp when num_distributed_optimizer_instances is 1, so this only differs
+            # when there are several instances.
+            intra_dp_cp_group = getattr(layout_pgs, "intra_dp_cp", None)
+            intra_expt_dp_group = getattr(layout_pgs, "intra_expt_dp", None)
+            data_parallel_world_size = get_pg_size(
+                intra_dp_cp_group if intra_dp_cp_group is not None else layout_pgs.dp_cp
+            )
+            expert_data_parallel_world_size = get_pg_size(
+                intra_expt_dp_group
+                if intra_expt_dp_group is not None
+                else getattr(layout_pgs, "expt_dp", None)
+            )
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -2834,6 +2933,31 @@ def wrap_model_chunks_with_ddp(
             )
         )
     return wrapped
+
+
+def _freeze_all_model_chunks(model_list):
+    """Freeze all parameters in a list of model chunks (for logits-saving runs)."""
+    for model_module in model_list:
+        model_module.requires_grad_(False)
+        # Additionally freeze expert biases of routers
+        for module in model_module.modules():
+            if hasattr(module, "frozen_expert_bias"):
+                module.frozen_expert_bias = True
+    return model_list
+
+
+def _forward_backward_grad_context(args):
+    """Grad context for a train step's forward/backward pass.
+
+    Returns a tuple of (grad_context, forward_only).
+    grad_context is ``torch.no_grad()`` when all layers are frozen (e.g. teacher logits
+    dumps), no parameter needs gradients, so there is no reason to build the
+    autograd graph. Otherwise returns a no-op context.
+    forward_only is True when all layers are frozen, False otherwise.
+    """
+    grad_context = torch.no_grad() if getattr(args, "freeze_all_layers", False) else nullcontext()
+    forward_only = getattr(args, "freeze_all_layers", False)
+    return grad_context, forward_only
 
 
 def get_model(
@@ -2917,12 +3041,7 @@ def get_model(
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
-        for model_module in model:
-            model_module.requires_grad_(False)
-            # Additionally freeze expert biases of routers
-            for module in model_module.modules():
-                if hasattr(module, "frozen_expert_bias"):
-                    module.frozen_expert_bias = True
+        _freeze_all_model_chunks(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2938,9 +3057,12 @@ def get_model(
     )
     if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
-            ' > number of parameters on (tensor, pipeline) '
-            'model parallel rank ({}, {}): {}'.format(
-                get_pg_rank(pg_collection.tp), get_pg_rank(pg_collection.pp), num_parameters
+            ' > number of parameters on (tensor, gtp_weight_remat, pipeline) '
+            'model parallel rank ({}, {}, {}): {}'.format(
+                get_pg_rank(pg_collection.tp),
+                get_pg_rank(pg_collection.gtp_remat),
+                get_pg_rank(pg_collection.pp),
+                num_parameters,
             ),
             flush=True,
         )
@@ -3005,12 +3127,15 @@ def get_model(
             for disable in per_chunk_disable_bucketing
         ]
 
-        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
-        #  capture support with DDP, but we sync it with the current stream to avoid races.
-        ddp_stream = torch.cuda.Stream()
-        # Wait for the default stream to complete before starting ddp_stream
+        if config.cuda_graph_impl == "full_iteration":
+            # DDP initialization must use the full-iteration capture stream so its retained
+            # AccumulateGrad nodes do not reference a different, non-capturing stream.
+            ddp_stream = get_shared_capture_stream()
+        else:
+            # Preserve a dedicated initialization stream for all other implementations.
+            ddp_stream = torch.cuda.Stream()
         ddp_stream.wait_stream(torch.cuda.current_stream())
-        # Make ddp_stream start after whatever the default stream already queued
+
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
                 model,
@@ -3024,8 +3149,7 @@ def get_model(
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # End of setup_stream
-        # Critical: ensure side-stream work completes before touching params on default stream
+        # Ensure initialization-stream work completes before touching params on the default stream.
         torch.cuda.current_stream().wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -3184,6 +3308,12 @@ def setup_model_and_optimizer(
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
+
+            # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
+            # and skips grad-buffer allocation for all params (matching get_model behavior).
+            if getattr(args, "freeze_all_layers", False):
+                model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
+
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -3205,10 +3335,36 @@ def setup_model_and_optimizer(
                 pg_collection=pg_collection,
             )
 
+    # Configure GTP weight-remat padding/loss reduction before model construction (pad
+    # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
+    # also covers the config-container builder path, which does not call get_model.
+    if is_gtp_remat_active(args):
+        from megatron.core.tensor_parallel.gtp_api import configure_gtp_remat_from_recipe
+
+        configure_gtp_remat_from_recipe(
+            fp4=getattr(args, 'fp4', None) is not None,
+            fp8_recipe=getattr(args, 'fp8_recipe', None),
+            fp8=getattr(args, 'fp8', None) is not None,
+            calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False),
+        )
+
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
-    if args.logits_save_dir is not None:
+    # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
+    # first forward. Placed here (not in get_model) so it also covers the config-container
+    # builder path.
+    if is_gtp_remat_active(args):
+        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+
+        classify_gtp_remat_chains(
+            model,
+            cuda_graph_modules=getattr(args, 'cuda_graph_modules', None),
+            moe_shared_expert_overlap=getattr(args, 'moe_shared_expert_overlap', False),
+            cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
+        )
+
+    if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
@@ -3220,7 +3376,7 @@ def setup_model_and_optimizer(
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if args.logits_load_dir is not None:
+    if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
@@ -3329,7 +3485,9 @@ def setup_model_and_optimizer(
             and args.ckpt_format == "torch_dist",
             tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
             pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
-            dp_cp_group=ckpt_pgc.dp_cp if ckpt_pgc is not None else None,
+            # Replica_id must match the save path (see save_checkpoint_and_time): use the
+            # gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers collide.
+            dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
             dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
             expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
             rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
@@ -3403,6 +3561,11 @@ def setup_model_and_optimizer(
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
         torch.distributed.barrier()
         exit()
+
+    # Match training_log's activation gate so every enabled writer is reduced and cleared once
+    # per step. Establish its PP-agreed capacity before the first forward/capture.
+    if (getattr(args, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
+        initialize_dsa_metric_tracker(unwrapped_model, pg_collection)
 
     return model, optimizer, opt_param_scheduler
 
@@ -3663,20 +3826,22 @@ def train_step(
                 getattr(args, "tensorboard_dir", None) or getattr(args, "wandb_project", "")
             )
             MTPLossLoggingHelper.configure_acceptance_collection(enabled=has_acceptance_consumer)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=forward_backward_data_iterator,
-            model=model,
-            num_microbatches=num_microbatches,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            force_all_reduce=save_wgrads_in_this_iteration,
-            p2p_communicator=p2p_communicator,
-            pg_collection=pg_collection,
-        )
+        grad_context, forward_only = _forward_backward_grad_context(args)
+        with grad_context:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=forward_backward_data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=forward_only,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                force_all_reduce=save_wgrads_in_this_iteration,
+                p2p_communicator=p2p_communicator,
+                pg_collection=pg_collection,
+            )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -3765,7 +3930,9 @@ def train_step(
             getattr(pg_collection, _required, None) is not None
         ), f"model pg_collection used by train_step must define {_required}"
     mp_group = pg_collection.mp
-    dp_cp_group = pg_collection.dp_cp
+    # gtp_remat-inclusive: the reported global per-token loss must cover gtp_remat peers' distinct
+    # tokens (replicate dp_cp would report a 1/gtp_remat subsample -> per-step noisy). Display-only.
+    dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
     is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
@@ -3785,7 +3952,15 @@ def train_step(
 
     # Update learning rate.
     if update_successful:
-        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+        # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
+        # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so multiply it
+        # back in for the sample count.
+        increment = (
+            get_num_microbatches()
+            * args.micro_batch_size
+            * args.data_parallel_size
+            * args.gtp_weight_remat_size
+        )
         opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
     else:
@@ -3861,6 +4036,7 @@ def training_log(
     vision_seqlen_squared_sum_in_batch: float | None = None,
     vision_merged_tokens_in_batch: float | None = None,
     num_microbatches: int | None = None,
+    schedule_pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3943,8 +4119,15 @@ def training_log(
     if args.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
-    # Calculate batch size.
-    batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+    # Calculate batch size. data_parallel_size excludes the GTP-remat axis (it's folded into
+    # total_model_size at arguments.py:446); each gtp-remat peer consumes a distinct microbatch,
+    # so multiply it back in for the global sample count.
+    batch_size = (
+        args.micro_batch_size
+        * args.data_parallel_size
+        * args.gtp_weight_remat_size
+        * get_num_microbatches()
+    )
 
     # Track app tag & app tag ID
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
@@ -4105,21 +4288,71 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+    should_track_dsa, dsa_metric_pg_collection = resolve_dsa_metric_pg_collection(
+        pg_collection, schedule_pg_collection=schedule_pg_collection
+    )
+    if (
+        args.dsa_indexer_loss_coeff is not None
+        and args.dsa_indexer_loss_coeff > 0
+        and should_track_dsa
+    ):
+        # Sequence packing may pass the physical packed microbatch count to training_log, but
+        # Dynamic-CP metric reduction reconstructs equal weighting over the nominal global-batch
+        # samples. Normalize by the calculator's nominal scheduled count deliberately.
         indexer_loss_scale = 1 / get_num_microbatches()
+        pp_group = None
+        dp_group = None
+        dynamic_cp_parent_group = None
+        if dsa_metric_pg_collection is not None:
+            pp_group = dsa_metric_pg_collection.pp
+            dp_group = dsa_metric_pg_collection.dp
+        if args.dynamic_context_parallel:
+            if dsa_metric_pg_collection is not None:
+                dynamic_cp_parent_group = dsa_metric_pg_collection.dp_cp
+            else:
+                # Legacy training entry points without a process-group collection.
+                dynamic_cp_parent_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        tracked_layers = args.num_layers + (args.mtp_num_layers or 0)
+        if args.csa_compress_ratios is not None:
+            compress_ratios = args.csa_compress_ratios
+            if not is_hybrid_model(args):
+                compress_ratios = [
+                    compress_ratios[layer_number - 1]
+                    for layer_number in _standard_layer_numbers_for_execution(
+                        args.num_layers,
+                        mtp_num_layers=args.mtp_num_layers,
+                        mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                    )
+                ]
+            num_indexer_layers = sum(ratio == 4 for ratio in compress_ratios)
+        elif is_hybrid_model(args):
+            num_indexer_layers = _num_hybrid_dsa_indexer_layers(
+                args.hybrid_layer_pattern,
+                args.num_layers,
+                args.dsa_indexer_skip_topk_offset,
+                args.dsa_indexer_topk_freq,
+            )
+        else:
+            num_indexer_layers = _num_dsa_indexer_layers(
+                args.num_layers,
+                args.dsa_indexer_skip_topk_offset,
+                args.dsa_indexer_topk_freq,
+                mtp_num_layers=args.mtp_num_layers,
+                mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+            )
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
-            num_layers=args.num_layers + (args.mtp_num_layers or 0),
-            num_indexer_layers=(
-                sum(ratio == 4 for ratio in args.csa_compress_ratios)
-                if args.csa_compress_ratios is not None
-                else None
-            ),
+            num_layers=tracked_layers,
+            num_indexer_layers=num_indexer_layers,
             preserve_groups=args.cuda_graph_impl != "none",
+            dynamic_cp_parent_group=dynamic_cp_parent_group,
+            configured_cp_size=args.context_parallel_size,
+            pp_group=pp_group,
+            dp_group=dp_group,
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -4307,9 +4540,25 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     )
 
 
+def _assert_param_gather_overlap_model(model_chunk):
+    """Assert that a model chunk implements the parameter-gather overlap lifecycle."""
+    # MimoModel is a composite wrapper rather than a DDP instance, but delegates this
+    # interface to its active inner DDP modules.
+    required_methods = ('enable_forward_pre_hook', 'disable_forward_pre_hook', 'start_param_sync')
+    missing_methods = [
+        method_name
+        for method_name in required_methods
+        if not callable(getattr(model_chunk, method_name, None))
+    ]
+    assert not missing_methods, (
+        f'{type(model_chunk).__name__} does not support parameter-gather overlap; '
+        f'missing callable methods: {", ".join(missing_methods)}'
+    )
+
+
 def enable_forward_pre_hook(model_chunks):
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        _assert_param_gather_overlap_model(model_chunk)
         model_chunk.enable_forward_pre_hook()
 
 
@@ -4317,15 +4566,15 @@ def disable_forward_pre_hook(model_chunks, optimizer=None, param_sync=True):
     if param_sync and optimizer is not None:
         optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        _assert_param_gather_overlap_model(model_chunk)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
-def force_param_sync(model_chunks: list[DDP], optimizer=None) -> None:
+def force_param_sync(model_chunks, optimizer=None) -> None:
     if optimizer is not None:
         optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        _assert_param_gather_overlap_model(model_chunk)
         model_chunk.start_param_sync(force_sync=True)
 
 
@@ -4371,7 +4620,8 @@ def save_checkpoint_and_time(
     tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
     pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
     dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-    dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
+    # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
+    dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
     expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
     # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
     rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
@@ -4733,12 +4983,15 @@ def train(
     )
 
     def _dp_world_size():
+        # Full DP x gtp_remat degree (num_microbatches spans the full data-distribution axis).
+        gtp_remat = args.gtp_weight_remat_size
         if lang_pgc is not None:
-            return lang_pgc.dp.size()
+            return lang_pgc.dp.size() * gtp_remat
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
-        # args.data_parallel_size equals the language (llm) dp on all ranks (entry validate_args).
-        return args.data_parallel_size
+        # args.data_parallel_size is the language (llm) dp on all ranks (set in validate_args) and
+        # excludes gtp_remat, so scale by gtp_remat to span the full data-distribution axis.
+        return args.data_parallel_size * gtp_remat
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if args.perform_rl_step:
@@ -5004,6 +5257,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
 
@@ -5324,6 +5578,7 @@ def train(
             vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
             vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
             num_microbatches=num_microbatches,
+            schedule_pg_collection=pg_collection,
         )
         is_first_iteration = False
 
@@ -5427,6 +5682,13 @@ def train(
         if should_exit:
             break
 
+    # Early-exit paths (exit-duration / exit-interval / signal handler) sys.exit()
+    # below before the normal-path logging, so record the train-loop finish time here.
+    if should_exit:
+        one_logger and one_logger.log_metrics(
+            {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
+        )
+
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
         cuda_graph_helper.delete_cuda_graphs()
@@ -5476,6 +5738,9 @@ def train(
                         nccl_allocator.deregister_mem_pool(
                             buf.nccl_mem_pool, buf.data_parallel_group
                         )
+        one_logger and one_logger.log_metrics(
+            {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
+        )
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
@@ -5520,7 +5785,12 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
-    eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
+    # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
+    # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so include it in the
+    # global sample breadth we divide out to recover the microbatch count.
+    eval_num_microbatches = eval_batch_size // (
+        eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
+    )
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
@@ -5567,7 +5837,7 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
                     )
                 except StopIteration:
@@ -5865,7 +6135,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 

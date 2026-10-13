@@ -122,6 +122,9 @@ try:
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
                 stop_words=sampling_params.stop_words,
                 termination_id=sampling_params.termination_id,
+                # This endpoint always echoes prompt_token_ids in its response, so
+                # keep the prompt tokens on the payload (default is now to drop them).
+                return_prompt_tokens=True,
             )
             tasks.append(client.add_request(prompt_tokens, per_req_params))
 

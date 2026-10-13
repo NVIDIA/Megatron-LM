@@ -3,6 +3,7 @@
 import copy
 import inspect
 import os
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -16,6 +17,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, torch_chunk_gated_delta_rule
+from megatron.core.ssm.gated_delta_net.common import _GDNBase
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -841,3 +843,54 @@ class TestGDNCuSeqlensResolve:
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         with pytest.raises(ValueError, match="does not match"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("deterministic_mode", [False, True])
+@pytest.mark.parametrize("use_qk_l2norm", [False, True])
+def test_qk_l2_norm_deterministic_mode(dtype, deterministic_mode, use_qk_l2norm):
+    """Check normalization dispatch, additive epsilon, and gradients on CPU."""
+    gdn = SimpleNamespace(
+        config=SimpleNamespace(deterministic_mode=deterministic_mode),
+        use_qk_l2norm=use_qk_l2norm,
+        qk_dim_local_tp=2,
+        v_dim_local_tp=2,
+        key_head_dim=2,
+        value_head_dim=2,
+        num_key_heads=1,
+        num_value_heads=1,
+        _compute_gates=mock.Mock(return_value=(torch.empty(0), {})),
+    )
+    # Normal, small-norm, and zero rows distinguish additive epsilon from clamping.
+    qkv = torch.tensor([3.0, 4.0, -4.0, 3.0, 5.0, 6.0]).repeat(1, 3, 1)
+    qkv = (qkv * torch.tensor([1.0, 1e-4, 0.0]).view(1, 3, 1)).to(dtype)
+    qkv.requires_grad_(True)
+
+    # Exercise the eager method without constructing a model or process groups.
+    prepare = inspect.unwrap(_GDNBase._prepare_input_for_gated_delta_rule)
+    # Use a distinct mock output to verify FLA dispatch and consumption of its result.
+    with mock.patch(
+        "megatron.core.ssm.gated_delta_net.common.l2norm", side_effect=lambda x: x * 2
+    ) as fla_norm:
+        out = prepare(gdn, qkv, torch.empty(0), torch.empty(0), torch.empty(0), 1, 3)
+        if use_qk_l2norm and not deterministic_mode:
+            fla_norm.assert_called_once()
+        else:
+            fla_norm.assert_not_called()
+
+    # Check values and gradients against a higher-precision reference.
+    reference = qkv.detach().double().requires_grad_(True)
+    expected = reference[..., :4].reshape(1, 3, 2, 2)
+    if use_qk_l2norm:
+        if deterministic_mode:
+            expected = expected / torch.sqrt(expected.square().sum(-1, keepdim=True) + 1e-6)
+        else:
+            expected = expected * 2
+    expected = expected.to(dtype)
+    actual = torch.cat((out["q"], out["k"]), dim=2)
+    rtol = 1e-5 if dtype == torch.float32 else 1e-2
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=1e-6)
+
+    actual.float().sum().backward()
+    expected.float().sum().backward()
+    torch.testing.assert_close(qkv.grad, reference.grad.to(dtype), rtol=rtol, atol=1e-6)

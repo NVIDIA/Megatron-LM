@@ -60,3 +60,4 @@ MODEL_ARGS:
   # the worker-queue hang surface; test data is tiny so perf impact is nil.
   --num-workers: 0
 TEST_TYPE: ckpt-resume
+LAUNCHER: ft_launcher
