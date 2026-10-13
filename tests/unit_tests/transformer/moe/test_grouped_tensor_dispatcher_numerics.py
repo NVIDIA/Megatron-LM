@@ -578,6 +578,7 @@ class TestGroupedTensorDispatcherNumerics:
             single_grouped_bias=single_grouped_bias,
         )
 
+    @pytest.mark.skip(reason=_NCCL_EP_GROUPED_TENSOR_UNSUPPORTED_REASON)
     @pytest.mark.parametrize(
         "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
     )
@@ -609,6 +610,7 @@ class TestGroupedTensorDispatcherNumerics:
         """HybridEP fused dispatch pads, and fused combine returns the original token shape."""
         _run_padding_lifecycle_case("hybridep", monkeypatch)
 
+    @pytest.mark.skip(reason=_NCCL_EP_GROUPED_TENSOR_UNSUPPORTED_REASON)
     @pytest.mark.timeout(180)
     def test_ncclep_grouped_tensor_padding_lifecycle(self, monkeypatch):
         """NCCL-EP padding lifecycle coverage reserved for future enablement."""

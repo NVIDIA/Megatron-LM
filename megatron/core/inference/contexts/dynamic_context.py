@@ -919,6 +919,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.use_flashinfer_fused_rope = inference_config.use_flashinfer_fused_rope
         self.inference_grouped_gemm_backend = model_config.inference_grouped_gemm_backend
 
+        # Layer-scope/eager decoding has no persistent MTP hidden-state buffer.
+        # Block-scope graph allocation below replaces this placeholder when needed.
+        self.mtp_decoder_hidden_states = None
+
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
         self._bookkeeping_no_real_work = False

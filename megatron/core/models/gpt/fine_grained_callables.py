@@ -677,7 +677,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 if is_mhc_layer:
                     nvtx_range_push(suffix="mlp_hyper_connection")
                     hidden_states, mlp_h_res, mlp_hc_h_post, residual = layer.mlp_hyper_connection(
-                        hidden_states, mhc_recompute_manager=mhc_recompute_manager
+                        hidden_states,
+                        mhc_recompute_manager=mhc_recompute_manager,
+                        return_residual=True,
                     )
                     nvtx_range_pop(suffix="mlp_hyper_connection")
                 else:

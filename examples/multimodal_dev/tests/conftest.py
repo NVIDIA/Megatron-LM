@@ -91,7 +91,14 @@ _skipped_must_run = []
 
 
 def pytest_runtest_logreport(report):
-    """Record skips from modules that are required to run in this topology."""
+    """Report failures before distributed cleanup and track required-module skips."""
+    if report.failed:
+        rank = os.environ.get("RANK", "?")
+        print(
+            f"\n[rank {rank}] {report.nodeid} ({report.when})\n{report.longreprtext}",
+            file=sys.stderr,
+            flush=True,
+        )
     if report.when != "setup" or not report.skipped:
         return
     module = os.path.basename(report.nodeid.split("::")[0])

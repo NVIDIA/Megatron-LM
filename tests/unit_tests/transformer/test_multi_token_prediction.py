@@ -989,7 +989,7 @@ class TestMultiTokenPredictionLayer:
                 )
 
         embedding = FakeRotaryEmbedding()
-        rolled_input_ids, returned_position_ids, _, _, _ = mtp_layer._get_embeddings(
+        rolled_input_ids, returned_position_ids, _, _, _, _ = mtp_layer._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
             embedding=embedding,

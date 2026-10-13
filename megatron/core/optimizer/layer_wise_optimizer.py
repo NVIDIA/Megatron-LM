@@ -798,6 +798,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for per_rank_params in params_list:
                     for p in per_rank_params:
                         if hasattr(p, 'clear_high_precision_init_val'):
+                            get_init = getattr(p, 'get_high_precision_init_val', None)
+                            if callable(get_init) and get_init() is None:
+                                continue
                             p.clear_high_precision_init_val()
 
         self.tp_group = getattr(self.pg_collection, 'tp', None)

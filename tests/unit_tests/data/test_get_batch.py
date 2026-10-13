@@ -191,6 +191,7 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
         pipeline_model_parallel_layout=None,
         mtp_num_layers=0,
         virtual_pipeline_model_parallel_size=None,
+        linear_cp_layout="contiguous",
         dsa_cp_balance_indexer=enabled,
         dsa_cp_balance_indexer_graph_dynamic_packs=enabled,
         pad_packed_seq_alignment="max",
@@ -198,7 +199,7 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
         max_seqlen_per_dp_cp_rank=1024,
         context_parallel_size=4,
     )
-    packed_seq_params = SimpleNamespace(cp_group=object())
+    packed_seq_params = SimpleNamespace(cp_group=object(), cp_singleton_group=None)
     scheduler_batch = (
         object(),  # tokens
         object(),  # labels
@@ -222,8 +223,10 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
 
     result = pretrain_hybrid.get_batch(None)
 
-    assert result[-1] is packed_seq_params
+    assert result.get_packed_seq_params() is packed_seq_params
+    assert result.get_batch()["tokens"] is scheduler_batch[0]
     scheduler.assert_called_once()
+    assert scheduler.call_args.kwargs["config"] is config
     finalize.assert_called_once_with(packed_seq_params)
     if enabled:
         prebuild.assert_called_once_with(
@@ -260,7 +263,7 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
         max_seqlen_per_dp_cp_rank=1024,
         context_parallel_size=4,
     )
-    packed_seq_params = SimpleNamespace(cp_group=object())
+    packed_seq_params = SimpleNamespace(cp_group=object(), cp_singleton_group=None)
     scheduler_batch = (
         object(),  # tokens
         object(),  # labels

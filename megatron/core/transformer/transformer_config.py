@@ -5614,10 +5614,10 @@ class MLATransformerConfig(TransformerConfig):
         if (
             self.multi_latent_attention
             and self.apply_rope_fusion
-            and self.rope_type != "yarn"
+            and self.rope_type not in ("rope", "yarn")
             and self.experimental_attention_variant != "dsv4_hybrid"
         ):
-            raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+            raise ValueError("apply_rope_fusion for MLA requires standard or YARN RoPE.")
 
         if self.use_fused_mla_q_uproj and (
             self.fp8 is None

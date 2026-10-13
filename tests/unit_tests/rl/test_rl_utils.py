@@ -890,7 +890,7 @@ class TestRLUtils:
             assert all(p.grad is not None for p in mtp_params.values())
             results[batch_invariant] = (
                 logprobs.detach().float(),
-                {k: tracker[k].clone() for k in ("loss_values", "correct_values", "total_values")},
+                {k: tracker[k].clone() for k in ("loss_sums", "correct_values", "total_values")},
                 {name: p.grad.clone() for name, p in mtp_params.items()},
             )
 
@@ -902,7 +902,7 @@ class TestRLUtils:
         # One MTP layer: the labels roll once (derived from the tokens), the layer rolls again.
         expected_total = torch.full_like(vp_metrics["total_values"], batch_size * (seq_length - 2))
         torch.testing.assert_close(vp_metrics["total_values"], expected_total)
-        for key in ("loss_values", "correct_values", "total_values"):
+        for key in ("loss_sums", "correct_values", "total_values"):
             torch.testing.assert_close(vp_metrics[key], gathered_metrics[key], atol=1e-3, rtol=1e-3)
         # MTP-layer parameters get their gradient from the MTP loss alone.
         for name, grad in vp_grads.items():

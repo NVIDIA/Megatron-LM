@@ -13,6 +13,20 @@ from megatron.core.transformer import multi_latent_attention as mla_module
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
+from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+
+@pytest.mark.parametrize("rope_type", ["rope", "yarn"])
+def test_mla_config_accepts_implemented_fused_rope_variants(rope_type):
+    config = MLATransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        rope_type=rope_type,
+        apply_rope_fusion=True,
+    )
+    assert config.apply_rope_fusion
+    assert config.rope_type == rope_type
 
 
 @pytest.mark.parametrize(

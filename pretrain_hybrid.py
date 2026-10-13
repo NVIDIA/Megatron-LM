@@ -145,7 +145,10 @@ def get_batch(data_iterator, vp_stage=None):
                 vp_stage=vp_stage,
             ),
             vp_stage=vp_stage,
+            dynamic_cp=args.dynamic_context_parallel,
+            config=config,
         )
+        packed_seq_params = prepare_packed_seq_params(packed_seq_params, config)
         return ContextParallelBatch.from_single_layout(
             config.linear_cp_layout,
             {
@@ -171,39 +174,6 @@ def get_batch(data_iterator, vp_stage=None):
         vp_stage=vp_stage,
     )
     is_dynamic_cp = args.dynamic_context_parallel
-
-    if args.sequence_packing_scheduler is not None:
-        (
-            tokens,
-            labels,
-            loss_mask,
-            attention_mask,
-            position_ids,
-            packed_seq_params,
-            padding_mask,
-        ) = get_batch_on_this_rank_for_sequence_packing(
-            data_iterator,
-            vpp_size=config.virtual_pipeline_model_parallel_size,
-            mtp_on_this_rank=mtp_on_this_rank,
-            vp_stage=vp_stage,
-            dynamic_cp=is_dynamic_cp,
-            config=config,
-        )
-        prepare_packed_seq_params(packed_seq_params, config)
-        return (
-            attention_mask,
-            None,
-            None,
-            None,
-            labels,
-            None,
-            loss_mask,
-            None,
-            position_ids,
-            tokens,
-            padding_mask,
-            packed_seq_params,
-        )
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)

@@ -3278,6 +3278,19 @@ class DynamicInferenceEngine(AbstractEngine):
             return 0
         return computed_tokens
 
+    def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
+        """Find the farthest cached full-prompt Mamba boundary for scheduler planning.
+
+        The context separately bounds restore matching to the admitted chunk's KV range.
+        """
+        allocator = self.context.mamba_slot_allocator
+        if allocator is None or not req.precomputed_block_hashes:
+            return 0
+        for index in range(len(req.precomputed_block_hashes) - 1, -1, -1):
+            if req.precomputed_block_hashes[index] in allocator.hash_to_block_id:
+                return index + 1
+        return 0
+
     def schedule_waiting_requests(self) -> None:
         """Try to schedule requests from the waiting pool."""
         # Keep track of which requests get scheduled.

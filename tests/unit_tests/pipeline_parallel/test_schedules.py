@@ -518,6 +518,7 @@ def test_schedule_enables_grad_sync_on_first_stage(
     config = SimpleNamespace(
         overlap_p2p_comm=False,
         variable_seq_lengths=True,
+        pipeline_p2p_fixed_shape=False,
         finalize_model_grads_func=None,
         timers=None,
         no_sync_func=no_sync,

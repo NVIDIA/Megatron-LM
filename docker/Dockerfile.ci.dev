@@ -108,14 +108,20 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
     bash -ex <<"EOF"
     export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
     test -n "$TMS_CUDA_MAJOR"
+    # Keep the base image's assembler at a stable runtime path, independent of
+    # CUDA alternative symlinks exposed by the workload container launcher.
+    install -D -m 0755 /usr/local/cuda/bin/ptxas /opt/cuda-tools/ptxas
     # flash-mla (no_pypi_wheels group) has no PyPI wheel and is built from source by uv. Point the
     # compilers at the CCCL/libcu++ headers (under cccl/ in this base image, not the default CUDA
     # include path) and scope the build to the target archs. Skipped for the LTS image.
     FLASH_MLA_GROUP=""
     if [ "$IMAGE_TYPE" != "lts" ]; then
         FLASH_MLA_GROUP="--group no_pypi_wheels"
-        export FLASH_MLA_DISABLE_SM90=1 NVCC_THREADS=16 \
+        export FLASH_MLA_DISABLE_SM90=0 NVCC_THREADS=16 \
             CFLAGS="-I/usr/local/cuda/include/cccl" CXXFLAGS="-I/usr/local/cuda/include/cccl"
+        # Restored dev CSA executes on H100 too. Discard old SM90-disabled wheels
+        # before rebuilding the pinned package with Hopper kernels enabled.
+        uv cache clean flash-mla
     fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
@@ -274,6 +280,8 @@ RUN uv pip install --no-build-isolation --no-deps -e /workspace
 
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
+ENV TRITON_PTXAS_PATH=/opt/cuda-tools/ptxas
+RUN ${TRITON_PTXAS_PATH} --version
 
 ARG RUNTIME_UID=65532
 ARG RUNTIME_GID=65532
