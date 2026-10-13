@@ -41,7 +41,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type, contiguous=False):
+def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type):
     """All-gather K and V along the sequence dimension over the context-parallel group.
 
     Context parallelism shards the sequence, so a rank holds only its slice of Q, K and V. The
@@ -60,8 +60,7 @@ def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type, contiguo
     holds chunks r and 2*cp-r-1, so rank order is not position order, while the causal masks
     downstream compare raw offsets. The reorder restores global position order; it is an indexing
     op rather than an in-place write, so autograd permutes the gradient back before the
-    reduce-scatter sees it. ``contiguous=True`` (attention_cp_layout='contiguous') is the case
-    where rank order already is position order and neither step is needed.
+    reduce-scatter sees it.
 
     Returns the gathered key and value plus this rank's global query positions, or ``None`` for
     those positions when context parallelism is off.
@@ -83,18 +82,6 @@ def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type, contiguo
     gathered_value = gather_from_sequence_parallel_region(
         value, tensor_parallel_output_grad=True, group=cp_group
     )
-    if contiguous:
-        # attention_cp_layout='contiguous' shards the sequence in rank order, so the all-gather
-        # already lands in global position order and a rank's queries are one contiguous span:
-        # no reorder, no zigzag mapping. Setting it alongside linear_cp_layout='contiguous' --
-        # the layout the Mamba mixers want for their scan -- also removes the per-layer layout
-        # conversion a hybrid stack would otherwise run around every attention layer.
-        cp_rank = cp_group.rank()
-        query_positions = torch.arange(
-            cp_rank * sq_local, (cp_rank + 1) * sq_local, device=key.device, dtype=torch.int64
-        )
-        return gathered_key, gathered_value, query_positions
-
     reorder = build_zigzag_allgather_cp_key_reorder(sq_local, cp_size, key.device)
     query_positions = build_zigzag_cp_local_positions(
         sq_local * cp_size, cp_size, cp_group.rank(), key.device
@@ -1043,7 +1030,6 @@ class DSGQACoreAttention(MegatronModule):
             # Unlike pg_collection, a missing comm type cannot fail silently: the helper only
             # reads it when the CP group is real, and rejects anything but all-gather there.
             getattr(self, "cp_comm_type", None),
-            contiguous=getattr(self.config, "attention_cp_layout", "zigzag") == "contiguous",
         )
         if dense_warmup and getattr(self.config, "dsa_indexer_use_sparse_loss", False):
             raise NotImplementedError(
@@ -1168,10 +1154,6 @@ class DSGQACoreAttention(MegatronModule):
             cache_selected_scores=_dsa_caches_selected_scores(self.config),
             use_triton=dsa_kernel_backend == "min-memory-triton",
             query_positions=query_positions,
-            # The same layout the K/V gather above used. The kernel's learned-K gather has to
-            # reorder on exactly this rule and cannot recover it from local positions.
-            cp_layout_contiguous=getattr(self.config, "attention_cp_layout", "zigzag")
-            == "contiguous",
         )
         if sparse_fwd_dense_loss:
             indexer_loss = dsa_dense_indexer_loss(

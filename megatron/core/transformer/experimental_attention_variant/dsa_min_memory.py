@@ -772,7 +772,6 @@ def _project_full_indexer_k(
     use_indexer_rope,
     simplified_input_norm,
     pg_collection,
-    contiguous: bool = False,
 ):
     """Project the indexer's learned K for the whole sequence.
 
@@ -787,9 +786,8 @@ def _project_full_indexer_k(
     before would need the rank's global positions threaded in, and rotary is pointwise as well, so
     the order is free to choose.
 
-    ``contiguous`` mirrors the K/V gather: under attention_cp_layout='contiguous' the all-gather
-    already lands in global position order, so the zigzag reorder must be skipped or it would
-    permute an already-ordered tensor.
+    The reorder mirrors the K/V gather: both land in rank order, which is not position order under
+    the zigzag layout this path requires.
     """
     cp_size = _cp_group_size(pg_collection)
     sq_local = hidden_states.size(0)
@@ -811,9 +809,8 @@ def _project_full_indexer_k(
     k_index = gather_from_sequence_parallel_region(
         k_index, tensor_parallel_output_grad=True, group=pg_collection.cp
     )
-    if not contiguous:
-        reorder = build_zigzag_allgather_cp_key_reorder(sq_local, cp_size, k_index.device)
-        k_index = k_index[reorder]
+    reorder = build_zigzag_allgather_cp_key_reorder(sq_local, cp_size, k_index.device)
+    k_index = k_index[reorder]
     if use_indexer_rope:
         positions = torch.arange(k_index.size(0), device=k_index.device, dtype=torch.long)
         k_index = _apply_rope_at_positions(
@@ -1257,7 +1254,6 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         cache_indexer_k: bool = False,
         use_triton: bool = True,
         query_positions: Optional[torch.Tensor] = None,
-        cp_layout_contiguous: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the sparse forward, streaming index scores so the full score matrix is never held."""
         key_chunk_size = _plan_execution(
@@ -1294,7 +1290,6 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         use_indexer_rope,
                         simplified_input_norm,
                         pg_collection,
-                        contiguous=cp_layout_contiguous,
                     )
                     if learned_k_weight is not None
                     else None
@@ -1353,9 +1348,6 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         ctx.use_triton = use_triton
         ctx.query_positions = query_positions
         ctx.cp_group = getattr(pg_collection, "cp", None) if pg_collection else None
-        # The backward recomputes the learned-K index when it was not retained, and has to
-        # reorder the gather exactly as the forward did.
-        ctx.cp_layout_contiguous = cp_layout_contiguous
         return output, indexer_loss
 
     @staticmethod
@@ -1397,7 +1389,6 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     ctx.use_indexer_rope,
                     ctx.simplified_input_norm,
                     ctx.pg_collection,
-                    contiguous=ctx.cp_layout_contiguous,
                 )
         grad_output = grad_output.reshape(sq, batch_size, num_query_heads, value.size(-1))
         grad_query = _grad_accumulator(query) if ctx.needs_input_grad[0] else None
@@ -1733,8 +1724,6 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             None,
             None,
             None,
-            None,
-            # cp_layout_contiguous
             None,
         )
 
@@ -2310,11 +2299,6 @@ def dsa_min_memory_gqa(
     use_triton: bool = True,
     simplified_input_norm=None,
     query_positions: Optional[torch.Tensor] = None,
-    # Which CP layout the caller gathered K/V under. This cannot be recovered from
-    # query_positions: under zigzag the last rank holds two *adjacent* chunks, so its positions
-    # form one ascending run and look exactly like the contiguous layout. Inferring it locally
-    # made that rank skip the reorder and read its learned-K index in raw all-gather order.
-    cp_layout_contiguous: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the minimum-activation DSA-GQA training backend."""
     _plan = _plan_execution(
@@ -2357,5 +2341,4 @@ def dsa_min_memory_gqa(
             cache_indexer_k,
             use_triton,
             query_positions,
-            cp_layout_contiguous,
         )

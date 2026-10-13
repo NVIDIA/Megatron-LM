@@ -1629,30 +1629,13 @@ class TransformerConfig(ModelParallelConfig):
         new_config.__dict__ = deepcopy(config.__dict__, {id(config): new_config})
         return new_config
 
-    def _attention_cp_is_allgather_dsa(self) -> bool:
-        """Whether softmax attention runs the all-gather CP path of DSA over GQA.
-
-        Ring and striped attention need the zigzag layout: it is what balances the causal
-        triangle across ranks and what the half-block masks assume. DSA over GQA instead
-        all-gathers K and V, so every rank holds the full key set and the layout only decides
-        which global positions that rank's queries carry. Both layouts are then equally correct,
-        and the contiguous one additionally lets a hybrid stack skip the per-layer conversion
-        that a contiguous linear layout would otherwise require.
-        """
-        return self.experimental_attention_variant == "dsa" and not self.multi_latent_attention
-
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
-        if (
-            self.context_parallel_size > 1
-            and self.attention_cp_layout == "contiguous"
-            and not self._attention_cp_is_allgather_dsa()
-        ):
+        if self.context_parallel_size > 1 and self.attention_cp_layout == "contiguous":
             raise ValueError(
-                "attention_cp_layout='contiguous' is not yet supported with context parallelism, "
-                "except for DSA over GQA, whose context parallelism all-gathers K and V."
+                "attention_cp_layout='contiguous' is not yet supported with context parallelism."
             )
         if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
             raise ValueError(
@@ -1684,6 +1667,7 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        self._validate_cp_layouts()
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
@@ -1749,10 +1733,6 @@ class TransformerConfig(ModelParallelConfig):
             self.dsa_kernel_backend = (
                 "cudnn" if self.experimental_attention_variant == "dsv4_hybrid" else "none"
             )
-
-        # After normalization: the CP layout rules ask which attention variant is in play, and
-        # deprecated spellings would otherwise miss the DSA exemption.
-        self._validate_cp_layouts()
 
         if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
             self.moe_use_grouped_tensor = True
