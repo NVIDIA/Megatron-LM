@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch._dynamo
 
 from megatron.core.models.common.model_chunk_schedule_plan import (
     TransformerLayerSchedulePlan,
@@ -463,6 +464,18 @@ class TestMhcA2AOverlapNumerics:
     def test_identity_hyper_connections_schedule_matches_eager(self, recompute):
         """iHC's H_res is a constant: the schedule's detach bridges must skip it, not
         hand a tensor without grad_fn to run_backward."""
+        # The constant H_res adds a requires_grad=False guard variant to the shared
+        # torch.compile'd mHC kernels (native_h_post_bda, apply_h_res). With the default
+        # recompile limit of 8, leaving those variants behind can push a later mHC test
+        # over the limit mid-comparison, so one arm runs compiled and the other eager.
+        # Start from and leave behind an empty compile cache.
+        torch._dynamo.reset()
+        try:
+            self._run_identity_hyper_connections_schedule_case(recompute)
+        finally:
+            torch._dynamo.reset()
+
+    def _run_identity_hyper_connections_schedule_case(self, recompute):
         ihc = {"enable_identity_hyper_connections": True}
         reference_config = _make_mhc_numerical_config(
             overlap=False, recompute=recompute, extra_config=ihc
