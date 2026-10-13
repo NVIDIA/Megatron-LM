@@ -9,7 +9,13 @@ from typing import Any, Callable
 import torch
 import torch.distributed as dist
 
-from .v3_format import digest, mismatched_settings
+from .v3_format import (
+    attention_mode_for_layout,
+    digest,
+    index_bits_for_vocab,
+    mismatched_settings,
+    validate_metadata,
+)
 from .v3_replay import ReplayIterator, ReplayReader, describe_hole, discover_groups, layout_options
 from .v3_storage import (
     Storage,
@@ -208,9 +214,19 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
         "reset_attention_mask": bool(args.reset_attention_mask),
         "tokenizer": tokenizer_identity(),
         "padded_vocab_size": args.padded_vocab_size,
-        "targets": {**saver.metadata_dict["saver"], "format_version": 3},
+        "targets": {
+            **saver.metadata_dict["saver"],
+            "format_version": 3,
+            "index_bits": index_bits_for_vocab(args.padded_vocab_size),
+        },
         "dataset_identity": saver.metadata_dict["identifiers"],
-        "boundary_convention": "exact_dataset_boundaries_may_include_padding",
+        "attention_mode": attention_mode_for_layout(
+            sft=args.sft,
+            inter_document_masking=args.dataloader_inter_document_masking,
+            reset_attention_mask=args.reset_attention_mask,
+            create_attention_mask=args.create_attention_mask_in_dataloader,
+        ),
+        "padding_policy": "preserve",
     }
     # Compare exactly what a JSON round trip through a tar's _meta.json preserves.
     return json.loads(json.dumps(settings))
@@ -236,6 +252,7 @@ def initialize_dump_metadata(saver: Any) -> dict:
             first_sample = 0 if frozen else args.consumed_train_samples
             if tars:
                 existing = read_meta(storage, tars[0].name)
+                validate_metadata(existing)
                 mismatched = mismatched_settings(
                     existing, {**expected, "first_sample": existing.get("first_sample")}
                 )
@@ -276,6 +293,7 @@ def initialize_dump_metadata(saver: Any) -> dict:
 
 
 def _check_student_compatibility(args: Any, metadata: dict) -> None:
+    validate_metadata(metadata)
     if metadata.get("format_version") != 3 or metadata["tokenizer"] != tokenizer_identity():
         raise ValueError("Offline KD v3 tokenizer/vocabulary mismatch")
     if args.padded_vocab_size != metadata["padded_vocab_size"]:
@@ -290,6 +308,14 @@ def _check_student_compatibility(args: Any, metadata: dict) -> None:
         raise ValueError("Student packing flags must match the saved v3 layout")
     if bool(args.reset_attention_mask) != metadata["reset_attention_mask"]:
         raise ValueError("Student attention isolation differs from the teacher cache")
+    mode = attention_mode_for_layout(
+        sft=args.sft,
+        inter_document_masking=args.dataloader_inter_document_masking,
+        reset_attention_mask=args.reset_attention_mask,
+        create_attention_mask=args.create_attention_mask_in_dataloader,
+    )
+    if mode != metadata["attention_mode"]:
+        raise ValueError("Student attention_mode differs from the teacher cache")
     packed = metadata["sft"] or metadata["inter_document_masking"]
     if args.seq_length > metadata["seq_length"] or (
         packed and args.seq_length != metadata["seq_length"]

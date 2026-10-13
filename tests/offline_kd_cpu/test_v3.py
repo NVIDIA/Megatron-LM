@@ -61,12 +61,25 @@ def settings(dp=2, mbs=2, gbs=8, **overrides):
         "inter_document_masking": False,
         "reset_attention_mask": False,
         "tokenizer": None,
-        "padded_vocab_size": 3,
+        "padded_vocab_size": 1 << 17,
         "targets": {"k": 1},
         "dataset_identity": {"seed": 7},
-        "boundary_convention": "exact_dataset_boundaries_may_include_padding",
+        "padding_policy": "preserve",
     }
     result.update(overrides)
+    result["targets"] = {
+        "index_bits": codec.index_bits_for_vocab(result["padded_vocab_size"]),
+        **result["targets"],
+    }
+    result.setdefault(
+        "attention_mode",
+        codec.attention_mode_for_layout(
+            sft=result["sft"],
+            inter_document_masking=result["inter_document_masking"],
+            reset_attention_mask=result["reset_attention_mask"],
+            create_attention_mask=True,
+        ),
+    )
     return result
 
 
@@ -83,7 +96,9 @@ def write_flush(storage, metadata, rank, begin, finish, *, packed=False, generat
         ]
         captured = codec.capture_batch(inputs(ids, packed=packed))
         target_ids = captured["tokens"].to(torch.int64).reshape(-1, 1)
-        targets = codec.pack_targets(target_ids.float(), target_ids)
+        targets = codec.pack_targets(
+            target_ids.float(), target_ids, vocab_size=metadata["padded_vocab_size"]
+        )
         captured["record_id"] = targets["record_id"] = f"{generation}:dp{rank}:{start}-{end}"
         for kind, payload in (("inputs", captured), ("targets", targets)):
             members[kind].append(
@@ -114,7 +129,7 @@ def write_cache(
     generation="gen",
 ):
     storage = Storage(str(root))
-    metadata = settings(dp, mbs, gbs, **(extra_metadata or {}))
+    metadata = settings(dp, mbs, gbs, **{"sft": packed, **(extra_metadata or {})})
     for begin in range(start, iterations, bundle):
         finish = min(begin + bundle, iterations)
         for rank in range(dp):
@@ -167,15 +182,136 @@ def test_fractional_mask_and_integer_overflow():
 def test_17_bit_indices_and_zstd_checksums():
     indices = torch.tensor([[0, 65535, 65536, 131071, -1]])
     values = torch.tensor([[0.0, -1.0, -2.0, -3.0, -1000.0]])
-    encoded = codec.pack_targets(values, indices)
+    encoded = codec.pack_targets(values, indices, vocab_size=1 << 17)
     restored_values, restored_indices = codec.unpack_targets(encoded)
     assert torch.equal(restored_values, values)
     assert torch.equal(restored_indices[:, :4], indices[:, :4])
     with pytest.raises(ValueError, match="vocabulary"):
-        codec.pack_targets(values, indices + (1 << 17))
+        codec.pack_targets(values, indices + (1 << 17), vocab_size=1 << 17)
     raw = codec.encode(encoded)
     with pytest.raises(ValueError, match="checksum"):
         codec.decode(raw[:-1] + bytes([raw[-1] ^ 1]))
+
+
+@pytest.mark.parametrize(
+    "vocab_size,bits",
+    [
+        (1, 16),
+        (65535, 16),
+        (65536, 16),
+        (65537, 17),
+        (1 << 17, 17),
+        ((1 << 17) + 1, 18),
+        (1 << 18, 18),
+        ((1 << 18) + 1, 19),
+        (1 << 19, 19),
+        (1 << 24, 24),
+    ],
+)
+def test_variable_width_indices_roundtrip(vocab_size, bits):
+    indices = torch.tensor([[0, vocab_size - 1, -1, 0, vocab_size - 1]])
+    values = torch.tensor([[-1.0, -2.0, -1000.0, -3.0, -4.0]])
+    payload = codec.pack_targets(values, indices, vocab_size=vocab_size)
+    assert payload["index_bits"] == bits
+    assert payload["indices_low"].dtype == torch.uint16
+    assert payload["indices_high"].shape == (bits - 16, 1)
+    restored, ids = codec.unpack_targets(codec.decode(codec.encode(payload)), vocab_size=vocab_size)
+    assert torch.equal(restored, values)
+    keep = values != -1000.0
+    assert torch.equal(ids[keep], indices[keep])
+    assert ids[0, 2] == (1 << bits) - 1  # Validity is carried by the logprob sentinel.
+
+
+@pytest.mark.parametrize("vocab_size", [0, -1, (1 << 24) + 1, 1.5, True])
+def test_index_width_rejects_invalid_vocab_size(vocab_size):
+    with pytest.raises(ValueError, match="vocabulary size"):
+        codec.index_bits_for_vocab(vocab_size)
+
+
+def test_high_bit_plane_order_and_padding():
+    indices = torch.tensor([[0, 1 << 16, 1 << 17, (1 << 16) | (1 << 17), 0]])
+    payload = codec.pack_targets(torch.zeros_like(indices).float(), indices, vocab_size=1 << 18)
+    assert payload["indices_high"].tolist() == [[0b01010000], [0b00110000]]
+    payload["indices_high"][0, 0] |= 1
+    with pytest.raises(ValueError, match="plane padding"):
+        codec.unpack_targets(payload)
+
+
+@pytest.mark.parametrize(
+    "case", ["width", "width_type", "width_mismatch", "planes", "dtype", "bounds"]
+)
+def test_malformed_target_encoding_rejected(case):
+    payload = codec.pack_targets(torch.zeros(1, 2), torch.tensor([[0, 1]]), vocab_size=65537)
+    kwargs = {}
+    if case == "width":
+        payload["index_bits"] = 25
+    elif case == "width_type":
+        payload["index_bits"] = 17.0
+    elif case == "width_mismatch":
+        kwargs["vocab_size"] = 65536
+    elif case == "planes":
+        payload["indices_high"] = torch.zeros(1, 2, dtype=torch.uint8)
+    elif case == "dtype":
+        payload["indices_low"] = payload["indices_low"].long()
+    else:
+        payload["indices_low"][0, 1] = 2
+        payload["indices_high"][0, 0] = 0b01000000  # ID 65538 exceeds declared vocabulary.
+        kwargs["vocab_size"] = 65537
+    with pytest.raises(ValueError):
+        codec.unpack_targets(payload, **kwargs)
+
+
+@pytest.mark.parametrize("index,value", [(-2, -1000.0), (-1, -1.0), (65537, -1.0)])
+def test_target_encoder_rejects_invalid_ids(index, value):
+    with pytest.raises(ValueError, match="vocabulary index"):
+        codec.pack_targets(torch.tensor([[value]]), torch.tensor([[index]]), vocab_size=65537)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"attention_mode": "unknown"},
+        {"padding_policy": "strip"},
+        {"attention_mode": "isolated_segments"},
+        {"sft": True, "attention_mode": "causal"},
+        {"attention_mode": "causal_eod_reset"},
+        {"targets": {"index_bits": 18}},
+    ],
+)
+def test_unsupported_context_and_encoding_metadata_rejected(overrides):
+    with pytest.raises(ValueError):
+        codec.validate_metadata(settings(**overrides))
+
+
+@pytest.mark.parametrize(
+    "sft,inter_document,reset,create,expected",
+    [
+        (False, False, False, False, "causal"),
+        (False, False, False, True, "causal"),
+        (False, False, True, False, "causal"),
+        (False, False, True, True, "causal_eod_reset"),
+        (True, False, False, False, "isolated_segments"),
+        (False, True, False, False, "isolated_segments"),
+    ],
+)
+def test_effective_attention_mode(sft, inter_document, reset, create, expected):
+    assert (
+        codec.attention_mode_for_layout(
+            sft=sft,
+            inter_document_masking=inter_document,
+            reset_attention_mask=reset,
+            create_attention_mask=create,
+        )
+        == expected
+    )
+    codec.validate_metadata(
+        settings(
+            sft=sft,
+            inter_document_masking=inter_document,
+            reset_attention_mask=reset,
+            attention_mode=expected,
+        )
+    )
 
 
 def test_tars_are_self_describing_and_immutable(tmp_path):
@@ -593,7 +729,7 @@ def runtime_environment(monkeypatch):
         micro_batch_size=2,
         global_batch_size=8,
         logits_load_kd_loss_alpha=0.9,
-        padded_vocab_size=3,
+        padded_vocab_size=1 << 17,
         save="/progress",
         save_interval=2,
         exit_interval=None,
@@ -1001,6 +1137,57 @@ def teacher_cache(tmp_path, runtime, args, **kwargs):
     return write_cache(tmp_path, extra_metadata=shared, **kwargs)
 
 
+@pytest.mark.parametrize("create_attention_mask", [False, True])
+def test_teacher_and_student_use_effective_attention_mode(
+    tmp_path, runtime_environment, create_attention_mask
+):
+    args, runtime, _ = runtime_environment
+    args.reset_attention_mask = True
+    args.create_attention_mask_in_dataloader = create_attention_mask
+    metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
+    expected = "causal_eod_reset" if create_attention_mask else "causal"
+    assert metadata["attention_mode"] == expected
+    assert metadata["padding_policy"] == "preserve"
+    assert metadata["targets"]["index_bits"] == 17
+    runtime._check_student_compatibility(args, metadata)
+    args.create_attention_mask_in_dataloader = not create_attention_mask
+    with pytest.raises(ValueError, match="attention_mode"):
+        runtime._check_student_compatibility(args, metadata)
+
+
+def test_packed_reader_requires_segment_boundaries(tmp_path):
+    storage, metadata = write_cache(tmp_path, extra_metadata={"sft": True})
+    live = reader(storage, metadata)
+    try:
+        with pytest.raises(ValueError, match="requires saved cu_seqlens"):
+            live.samples([0], 1)
+    finally:
+        live.close()
+
+
+def test_reader_checks_target_width_against_tar_metadata(tmp_path):
+    storage, metadata = write_cache(tmp_path)
+    live = reader(storage, metadata)
+    input_stream = iter(
+        storage_module.iter_tar(storage, storage_module.tar_name(0, 0, 16, "inputs"))
+    )
+    target_stream = iter(
+        storage_module.iter_tar(storage, storage_module.tar_name(0, 0, 16, "targets"))
+    )
+    try:
+        next(input_stream)
+        next(target_stream)
+        raw_inputs = next(input_stream)[1]
+        payload = codec.decode(next(target_stream)[1])
+        payload["index_bits"] = 18
+        with pytest.raises(ValueError, match="index_bits"):
+            live.decode_record(0, 0, 8, "gen", raw_inputs, codec.encode(payload))
+    finally:
+        input_stream.close()
+        target_stream.close()
+        live.close()
+
+
 @pytest.mark.parametrize(
     "override,exit_interval,expected",
     [
@@ -1146,7 +1333,9 @@ def test_saver_writes_paired_tars_readable_by_replay(tmp_path, runtime_environme
             ids = [start + (mb * 2 + rank) * 2 + j for mb in range(2) for j in range(2)]
             captured = codec.capture_batch(inputs(ids))
             target_ids = captured["tokens"].long().reshape(-1, 1)
-            targets = codec.pack_targets(target_ids.float(), target_ids)
+            targets = codec.pack_targets(
+                target_ids.float(), target_ids, vocab_size=metadata["padded_vocab_size"]
+            )
             captured["record_id"] = targets["record_id"] = f"gen:dp{rank}:{start}-{end}"
             writes.setdefault(rank, {})[(start, end)] = {
                 "start": start,
@@ -1258,6 +1447,50 @@ def legacy_saver_methods():
     return namespace
 
 
+def test_only_v3_extracts_vocabularies_above_17_bits(runtime_environment):
+    module = importlib.import_module(f"{_namespace}.v3_saver")
+    method = legacy_saver_methods()["_process_single_microbatch"]
+    saver = types.SimpleNamespace(tp_size=1, k=2, p=None, _save_dtype=torch.float32)
+    logits = torch.arange((1 << 17) + 1, dtype=torch.float32).reshape(1, 1, -1)
+    with pytest.raises(AssertionError, match="maximum supported"):
+        method(saver, logits)
+    saver._max_vocab_size = module.PairedLogitsSaver._max_vocab_size
+    values, indices = method(saver, logits)
+    assert indices.tolist() == [[[1 << 17, (1 << 17) - 1]]]
+    payload = codec.pack_targets(
+        values.reshape(1, 2), indices.reshape(1, 2), vocab_size=logits.shape[-1]
+    )
+    assert payload["index_bits"] == 18
+    restored, ids = codec.unpack_targets(payload, vocab_size=logits.shape[-1])
+    assert torch.equal(ids, indices.reshape(1, 2))
+    assert torch.equal(restored, values.reshape(1, 2))
+
+
+@pytest.mark.parametrize("local_vocab_size", [4, 1 << 23])
+def test_tp_transport_preserves_wide_indices(local_vocab_size, monkeypatch):
+    method = legacy_saver_methods()["_compute_global_topk"]
+    remote_id = 2 * local_vocab_size - 1
+
+    def gather(tensor, outputs, dst, group):
+        assert tensor.dtype == torch.float32
+        outputs[0].copy_(tensor)
+        outputs[1].copy_(torch.tensor([[[[6.0, -0.5, remote_id]]]], dtype=torch.float32))
+
+    monkeypatch.setattr(torch.distributed, "gather", gather)
+    saver = types.SimpleNamespace(tp_rank=0, tp_size=2, _tp_dst_rank_global=0, tp_group=None)
+    values, ids = method(
+        saver,
+        torch.tensor([[[5.0]]]),
+        torch.tensor([[[-1.0]]]),
+        torch.tensor([[[1]]]),
+        1,
+        local_vocab_size,
+    )
+    assert ids.item() == remote_id
+    assert values.item() == -0.5
+    assert values.dtype == torch.float32
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_inherited_tp_top_p_survives_v3_codec(dtype, monkeypatch):
     helpers = legacy_saver_methods()
@@ -1303,7 +1536,7 @@ def test_inherited_tp_top_p_survives_v3_codec(dtype, monkeypatch):
     keep = (probs.cumsum(-1) - probs < 0.7) | (torch.arange(4) < 2)
     assert torch.equal(indices, torch.where(keep, expected_ids, -1))
     assert torch.allclose(values, torch.where(keep, expected, -1e3).to(dtype), atol=1e-6)
-    encoded = codec.pack_targets(values.reshape(-1, 4), indices.reshape(-1, 4))
+    encoded = codec.pack_targets(values.reshape(-1, 4), indices.reshape(-1, 4), vocab_size=6)
     restored, restored_ids = codec.unpack_targets(codec.decode(codec.encode(encoded)))
     assert torch.equal(restored, values.reshape(-1, 4))
     assert torch.equal(
@@ -1526,7 +1759,9 @@ def test_top_p_encoded_sentinel_is_excluded_from_kl_and_ghost_mass():
     # -1 encodes as 131071, which is a real vocabulary ID at the format limit.
     values, indices = codec.unpack_targets(
         codec.pack_targets(
-            torch.tensor([[0.7, 0.0]]).log().clamp_min(-1e3), torch.tensor([[0, -1]])
+            torch.tensor([[0.7, 0.0]]).log().clamp_min(-1e3),
+            torch.tensor([[0, -1]]),
+            vocab_size=1 << 17,
         )
     )
     assert indices[0, 1] == 131071

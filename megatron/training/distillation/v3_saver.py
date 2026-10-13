@@ -14,13 +14,15 @@ from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
 
 from .logits_saver import LogitsSaverHooks
-from .v3_format import capture_batch, encode, join_inputs, pack_targets
+from .v3_format import MAX_VOCAB_SIZE, capture_batch, encode, join_inputs, pack_targets
 from .v3_replay import layout_options, token_map
 from .v3_storage import KINDS, Storage, member_name, parse_tar_name, tar_name, write_tar
 
 
 class PairedLogitsSaver(LogitsSaverHooks):
     """Reuse teacher top-K extraction while persisting full CPU input records."""
+
+    _max_vocab_size = MAX_VOCAB_SIZE
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -130,8 +132,10 @@ class PairedLogitsSaver(LogitsSaverHooks):
             all_indices.append(full_indices)
         if self.cp_rank == 0:
             inputs = join_inputs(batches)
-            targets = pack_targets(torch.cat(all_values), torch.cat(all_indices))
             args = get_args()
+            targets = pack_targets(
+                torch.cat(all_values), torch.cat(all_indices), vocab_size=args.padded_vocab_size
+            )
             start = args.consumed_train_samples
             end = start + get_num_microbatches() * self.dp_size * args.micro_batch_size
             record_id = f'{self.metadata_dict["generation"]}:dp{self.dp_rank}:{start}-{end}'

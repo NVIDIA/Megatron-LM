@@ -15,6 +15,8 @@ import torch
 import zstandard
 
 FORMAT_VERSION = 3
+MAX_VOCAB_SIZE = 1 << 24
+LOGPROB_SENTINEL = -1000.0
 TOKEN_FIELDS = ("tokens", "labels", "position_ids", "loss_mask")
 BOUNDARY_FIELDS = ("cu_seqlens", "cu_seqlens_padded")
 # Settings every tar in a cache must share, whichever dump job wrote it.
@@ -35,8 +37,53 @@ SHARED_KEYS = (
     "padded_vocab_size",
     "targets",
     "dataset_identity",
-    "boundary_convention",
+    "attention_mode",
+    "padding_policy",
 )
+
+
+def index_bits_for_vocab(vocab_size: int) -> int:
+    """Choose the smallest index width with a uint16 low word."""
+    if type(vocab_size) is not int or not 1 <= vocab_size <= MAX_VOCAB_SIZE:
+        raise ValueError("Offline KD vocabulary size must be an integer in [1, 2**24]")
+    return max(16, (vocab_size - 1).bit_length())
+
+
+def attention_mode_for_layout(
+    *,
+    sft: bool,
+    inter_document_masking: bool,
+    reset_attention_mask: bool,
+    create_attention_mask: bool,
+) -> str:
+    """Describe the effective dataset attention path, excluding loss masking."""
+    if sft or inter_document_masking:
+        return "isolated_segments"
+    if reset_attention_mask and create_attention_mask:
+        return "causal_eod_reset"
+    return "causal"
+
+
+def validate_metadata(meta: dict[str, Any]) -> None:
+    """Reject unsupported or internally inconsistent V3 encoding/context declarations."""
+    if meta.get("format_version") != FORMAT_VERSION:
+        raise ValueError("Expected offline KD v3 metadata")
+    bits = index_bits_for_vocab(meta.get("padded_vocab_size"))
+    if (
+        type(meta.get("targets", {}).get("index_bits")) is not int
+        or meta["targets"]["index_bits"] != bits
+    ):
+        raise ValueError("Offline KD target index_bits disagrees with padded_vocab_size")
+    mode = meta.get("attention_mode")
+    if mode not in ("causal", "causal_eod_reset", "isolated_segments"):
+        raise ValueError("Unsupported offline KD attention_mode")
+    packed = bool(meta.get("sft") or meta.get("inter_document_masking"))
+    if (mode == "isolated_segments") != packed:
+        raise ValueError("Offline KD attention_mode disagrees with packing flags")
+    if mode == "causal_eod_reset" and not meta.get("reset_attention_mask"):
+        raise ValueError("Offline KD causal_eod_reset requires reset_attention_mask")
+    if meta.get("padding_policy") != "preserve":
+        raise ValueError("Offline KD v3 requires padding_policy=preserve")
 
 
 def mismatched_settings(meta: dict[str, Any], expected: dict[str, Any]) -> list[str]:
@@ -136,30 +183,62 @@ def join_inputs(batches: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def pack_targets(values: torch.Tensor, indices: torch.Tensor) -> dict[str, Any]:
-    """Encode canonical [tokens, K] targets with the existing 17-bit layout."""
+def pack_targets(values: torch.Tensor, indices: torch.Tensor, *, vocab_size: int) -> dict[str, Any]:
+    """Encode [tokens, K] indices as uint16 low words and packed high-bit planes."""
+    bits = index_bits_for_vocab(vocab_size)
     if values.shape != indices.shape or values.ndim != 2:
         raise ValueError("Offline KD targets must have matching [tokens, K] shapes")
-    if indices.numel() and (indices.min() < -1 or indices.max() >= (1 << 17)):
-        raise ValueError("Offline KD 17-bit encoding cannot represent this vocabulary index")
-    indices = indices.to(device="cpu", dtype=torch.int64)
-    bits = np.packbits(((indices.reshape(-1).numpy() >> 16) & 1).astype(np.uint8))
+    if not values.is_floating_point() or indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Offline KD targets require floating values and int32/int64 indices")
+    values = values.detach().cpu().contiguous()
+    indices = indices.detach().to(device="cpu", dtype=torch.int64)
+    if indices.numel() and (
+        (indices < -1).any()
+        or (indices >= vocab_size).any()
+        or ((indices == -1) & (values != LOGPROB_SENTINEL)).any()
+    ):
+        raise ValueError("Offline KD vocabulary index is out of range or has an unmasked sentinel")
+    flat = indices.reshape(-1).numpy()
+    high = np.empty((bits - 16, (flat.size + 7) // 8), dtype=np.uint8)
+    for plane in range(bits - 16):
+        high[plane] = np.packbits(((flat >> (16 + plane)) & 1).astype(np.uint8), bitorder="big")
     return {
         "format_version": FORMAT_VERSION,
-        "values": values.detach().cpu().contiguous(),
+        "index_bits": bits,
+        "values": values,
         "indices_low": (indices & 0xFFFF).to(torch.uint16),
-        "bit_17": torch.from_numpy(bits),
+        "indices_high": torch.from_numpy(high),
     }
 
 
-def unpack_targets(payload: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+def unpack_targets(
+    payload: dict[str, Any], *, vocab_size: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Reconstruct vocabulary indices in canonical token order."""
-    low = payload["indices_low"].to(torch.int64)
-    high = np.unpackbits(payload["bit_17"].numpy(), count=low.numel()).copy()
-    indices = low | (torch.from_numpy(high).to(torch.int64).reshape(low.shape) << 16)
+    bits = payload.get("index_bits")
+    if type(bits) is not int or not 16 <= bits <= 24:
+        raise ValueError("Malformed offline KD target index_bits")
+    if vocab_size is not None and bits != index_bits_for_vocab(vocab_size):
+        raise ValueError("Offline KD target index_bits disagrees with padded vocabulary")
+    low, high = payload["indices_low"], payload["indices_high"]
     values = payload["values"]
-    if values.shape != indices.shape or values.ndim != 2:
+    if (
+        values.shape != low.shape
+        or values.ndim != 2
+        or not values.is_floating_point()
+        or low.dtype != torch.uint16
+        or high.dtype != torch.uint8
+        or tuple(high.shape) != (bits - 16, (low.numel() + 7) // 8)
+    ):
         raise ValueError("Malformed offline KD target tensors")
+    indices = low.to(torch.int64)
+    for plane, packed in enumerate(high.numpy()):
+        if low.numel() % 8 and packed[-1] & ((1 << (8 - low.numel() % 8)) - 1):
+            raise ValueError("Malformed offline KD high-bit plane padding")
+        unpacked = np.unpackbits(packed, count=low.numel(), bitorder="big").copy()
+        indices |= torch.from_numpy(unpacked).to(torch.int64).reshape(low.shape) << (16 + plane)
+    if vocab_size is not None and ((indices >= vocab_size) & (values != LOGPROB_SENTINEL)).any():
+        raise ValueError("Offline KD target vocabulary index is out of range")
     return values, indices
 
 

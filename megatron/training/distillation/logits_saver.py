@@ -536,8 +536,9 @@ class LogitsSaverHooks:
         local_vocab_size = logits.shape[-1]
         global_vocab_size = local_vocab_size * self.tp_size
 
-        assert global_vocab_size <= _MAX_VOCAB_SIZE, (
-            f"Global vocab size {global_vocab_size} exceeds maximum supported {_MAX_VOCAB_SIZE} (17 bits)"
+        max_vocab_size = getattr(self, "_max_vocab_size", _MAX_VOCAB_SIZE)
+        assert global_vocab_size <= max_vocab_size, (
+            f"Global vocab size {global_vocab_size} exceeds maximum supported {max_vocab_size}"
         )
 
         effective_k = min(self.k, global_vocab_size)
@@ -659,8 +660,8 @@ class LogitsSaverHooks:
         global_indices = local_indices + vocab_offset
 
         # Pack logits, log-probs, and indices into a single tensor.
-        # fp32 can exactly represent integers up to 2^24, sufficient for
-        # 17-bit vocab indices.  Shape: (seq, batch, local_k, 3)
+        # fp32 exactly represents integers through 2^24, covering all supported
+        # vocabularies. Shape: (seq, batch, local_k, 3)
         combined = torch.stack(
             [local_logit_vals,
              local_logprob_vals.float(),

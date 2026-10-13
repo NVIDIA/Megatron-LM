@@ -182,15 +182,90 @@ Each data member is one zstd frame whose built-in content checksum is verified o
 
 Sample IDs are derived from the saved DP/microbatch layout rather than stored.
 Targets are canonical `[total_tokens, K]` tensors using the existing log probability
-dtype and 17-bit vocabulary indices. Sample offsets address the same flattened token
+dtype and variable-width vocabulary indices. Sample offsets address the same flattened token
 space. Storage is independent of the teacher's microbatch tensor shape. Boundary
 metadata records the dataset's processed, potentially padded layout; it does not claim
 to recover original unpadded documents.
 
+### Target contract
+
+These are fixed V3 schema rules, not configurable modes:
+
+- Target row `t` stores the distribution from the captured output-layer logits at
+  input position `t`, predicting the next token. Stored labels and loss weights are
+  already aligned to that output position. A producer using prompt-token scores must
+  convert their offsets to this convention before writing V3.
+- Values are full-vocabulary-normalized log probabilities at **T=1**, followed by
+  top-K selection and optional top-P masking. They are never renormalized over K.
+  Temperature scaling is deferred.
+- `padded_vocab_size` describes the softmax normalization domain, including padded
+  vocabulary slots, matching Megatron's vocabulary-parallel CE and the student KD
+  softmax. The tokenizer's vocabulary size is recorded separately in `tokenizer`.
+- The loss derives ghost residual mass as `1 - sum(exp(retained_logprobs))`, with
+  the existing numerical guard. No additional residual tensor is stored.
+- A logprob value of `-1000` identifies a masked or unavailable target entry. Its
+  decoded index must be ignored, even if that index is a valid vocabulary ID.
+
+### Vocabulary-index encoding
+
+The writer selects one width per dump:
+
+```text
+index_bits = max(16, (padded_vocab_size - 1).bit_length())
+```
+
+V3 supports padded vocabularies from 1 through `2**24` entries. V1/V2 retain their
+existing 17-bit encoding and vocabulary limit. Widths are recorded in both
+`_meta.json`'s `targets.index_bits` and each target payload's `index_bits`.
+
+| Target field | Encoding |
+| --- | --- |
+| `values` | `[total_tokens, K]`, selected floating dtype |
+| `indices_low` | `[total_tokens, K]`, uint16 lower words |
+| `indices_high` | `[index_bits - 16, ceil(total_tokens * K / 8)]`, uint8 packed planes |
+| `index_bits` | Integer width from 16 through 24 |
+
+Indices flatten in token-major, then K order. High-plane row 0 stores bit 16,
+row 1 bit 17, and so on. Each plane uses `packbits(bitorder="big")`: its first
+index occupies the first byte's most significant bit. Unused trailing bits are zero.
+Widths of 16 use a zero-row `indices_high` tensor. The `-1` selection sentinel
+encodes as all ones across the chosen width; validity is determined by the logprob
+sentinel, so the maximum valid index remains usable.
+
+Readers validate widths, tensor dtypes/shapes, unused bits and unmasked index bounds.
+TP gathering uses FP32 transport, which represents every supported vocabulary
+index exactly. Vocabularies exceeding `2**24` entries are rejected.
+
+### Context contract
+
+Every tar declares `padding_policy: "preserve"` and one machine-readable
+`attention_mode`, checked against its packing/reset flags:
+
+| `attention_mode` | Context construction |
+| --- | --- |
+| `causal` | Causal attention over each saved sample's physical positions |
+| `causal_eod_reset` | Causal attention isolated after EOD tokens using the dataset attention mask |
+| `isolated_segments` | Causal attention within the saved `cu_seqlens` segments |
+
+The writer records the effective dataset path: setting `reset_attention_mask`
+without creating a dataset attention mask still yields `causal`. Students must
+reproduce the saved mode. Packed records require `cu_seqlens`.
+
+Positions, physical padding and segment boundaries are preserved as captured.
+`position_ids` is explicit; `loss_mask` controls scoring, not attention visibility.
+A prompt with zero loss weight still supplies context. Boundary endpoints may
+include dataset padding; they do not assert that padding is excluded from attention.
+No separate attention-validity tensor or dense attention matrix is stored. Removing
+padding, arbitrary attention masks and repacking contexts are outside this schema's
+current supported adapters. Changing attention isolation would change the teacher
+context and invalidate the cached targets.
+
 The uncompressed input overhead is approximately **13 bytes per token** with a binary
 mask, or 16 with fractional weights, plus sample/document offsets and container overhead.
-FP16/BF16 targets with 17-bit indices take about `4.125 * K` bytes per token, so binary
-inputs add about 2.46% at K=128 before compression. Compression ratios depend on the data.
+FP16/BF16 targets take approximately `(2 + index_bits / 8) * K` bytes per token,
+plus per-plane rounding and container overhead. At 17 bits this is `4.125 * K`, so
+binary inputs add about 2.46% at K=128 before compression. Compression ratios depend
+on the data.
 
 ### Object storage
 

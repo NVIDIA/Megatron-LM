@@ -19,6 +19,7 @@ from .v3_format import (
     mismatched_settings,
     unpack_targets,
     validate_inputs,
+    validate_metadata,
 )
 from .v3_storage import (
     DEFAULT_CHUNK_BYTES,
@@ -152,6 +153,7 @@ def discover_groups(
     ``hole`` is ``(gap_start, next_published_start, later_groups)`` when published
     ranges exist beyond a gap (e.g. parallel dump jobs that are still writing).
     """
+    validate_metadata(metadata)
     ranges = complete_ranges(list_tars(storage), metadata["dp_size_save"])
     gbs = metadata["gbs_save"]
     previous = None
@@ -323,6 +325,7 @@ class ReplayReader:
         prefetch_depth: int = 2,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     ):
+        validate_metadata(metadata)
         self.storage = storage
         self.metadata = metadata
         self.gbs = metadata["gbs_save"]
@@ -385,6 +388,7 @@ class ReplayReader:
     def check_meta(self, raw: bytes, kind: str, dp_rank: int, span: tuple[int, int]) -> str:
         """Validate a tar's ``_meta.json`` against the cache and return its job generation."""
         meta = json.loads(raw)
+        validate_metadata(meta)
         mismatched = mismatched_settings(meta, self.metadata)
         if mismatched:
             raise ValueError(
@@ -412,6 +416,11 @@ class ReplayReader:
         record_id = f"{generation}:dp{dp_rank}:{start}-{end}"
         inputs = decode(raw_inputs)
         validate_inputs(inputs)
+        if (
+            self.metadata["attention_mode"] == "isolated_segments"
+            and inputs.get("cu_seqlens") is None
+        ):
+            raise ValueError("Offline KD isolated_segments requires saved cu_seqlens")
         if inputs.get("record_id") != record_id:
             raise ValueError(f"Offline KD input record {inputs.get('record_id')} != {record_id}")
         if inputs["sample_offsets"].numel() - 1 != (end - start) // self.dp:
@@ -421,7 +430,7 @@ class ReplayReader:
             payload = decode(raw_targets)
             if payload.get("record_id") != record_id:
                 raise ValueError("Offline KD inputs and targets belong to different records")
-            targets = unpack_targets(payload)
+            targets = unpack_targets(payload, vocab_size=self.metadata["padded_vocab_size"])
             if targets[0].shape[0] != inputs["tokens"].numel():
                 raise ValueError("Offline KD input/target token counts disagree")
         return inputs, targets
