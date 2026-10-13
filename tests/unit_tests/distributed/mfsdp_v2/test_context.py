@@ -11,6 +11,7 @@ from weakref import ref
 
 import pytest
 import torch
+import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
@@ -331,3 +332,15 @@ def test_microbatch_scopes_context(distributed_setup):
         assert not context.is_last_microbatch
 
     assert context.is_last_microbatch
+
+
+def test_delayed_wgrad_requires_caller_managed_sync(distributed_setup):
+    """Delayed weight gradients require explicit gradient synchronization."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = te.Linear(16, 16, device=device, delay_wgrad_compute=True)
+    with (
+        fully_shard_context(device=device),
+        pytest.raises(ValueError, match="caller_managed_grad_sync=True"),
+    ):
+        fully_shard(model, mesh=mesh, placements=_default_placements())
