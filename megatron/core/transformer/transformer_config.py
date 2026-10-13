@@ -3855,12 +3855,23 @@ class TransformerConfig(ModelParallelConfig):
                     f"'min-memory-torch', 'reference'); got {self.dsa_kernel_backend!r}. "
                     "'tilelang' and 'cudnn' select fused kernels and are MLA-only."
                 )
-                # DSA over MLA supports CP/SP (upstream gates CP on cp_comm_type=allgather
-                # below). The GQA path does not: its min-memory kernels have no
-                # sequence-parallel gather and no CP support yet.
-                assert (
-                    self.context_parallel_size == 1
-                ), "Context parallelism is not supported by DSA over GQA."
+                # Context parallelism all-gathers K and V so each rank runs the indexer and
+                # attention locally against the full key set, which is what keeps the indexer's
+                # top-k a global selection rather than a distributed merge. That requires the
+                # gather semantics, so it is gated the same way the MLA path is below.
+                if self.context_parallel_size > 1:
+                    cp_comm_types = (
+                        self.cp_comm_type
+                        if isinstance(self.cp_comm_type, list)
+                        else [self.cp_comm_type]
+                    )
+                    assert all(
+                        cp_comm_type is not None
+                        and cp_comm_type.replace("_", "").lower() == "allgather"
+                        for cp_comm_type in cp_comm_types
+                    ), "DSA over GQA context parallelism supports cp_comm_type=allgather only."
+                # Sequence parallelism remains unsupported: the min-memory path has no
+                # sequence-parallel gather for the attention tensors.
                 assert (
                     not self.sequence_parallel
                 ), "Sequence parallelism is not supported by DSA over GQA."
