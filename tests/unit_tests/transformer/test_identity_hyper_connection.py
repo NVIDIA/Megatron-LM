@@ -10,7 +10,6 @@ is skipped, while the downstream H_res / H_post / BDA kernels are unchanged.
 
 import pytest
 import torch
-import torch._dynamo
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import (
@@ -21,6 +20,23 @@ from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.fixture(autouse=True)
+def _run_eagerly():
+    """Run every test here with torch.compile stanced to eager.
+
+    iHC's constant H_res carries requires_grad=False, so letting these tests compile
+    would add guard variants to the mHC kernels (native_h_post_bda, native_h_aggregate,
+    ...) that every mHC test in this process shares. Under torch's default recompile
+    limit of 8 those extra variants can push a later mHC eager-vs-graph comparison into
+    the compiled-to-eager fallback on one side only (seen in CI on
+    test_mhc_attention_graph_split). The eager stance leaves the shared compile caches
+    exactly as the mHC tests expect them; the compiled kernels themselves are covered by
+    the mHC tests.
+    """
+    with torch.compiler.set_stance("force_eager"):
+        yield
 
 
 def _make_config(identity, hidden_size=64, num_streams=4, **extra):
@@ -64,10 +80,6 @@ class TestIdentityHyperConnectionModule:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        # iHC's constant H_res adds requires_grad=False guard variants to the shared
-        # torch.compile'd mHC kernels; drop them so later tests in the same process do
-        # not hit the recompile limit and silently fall back to eager mid-comparison.
-        torch._dynamo.reset()
 
     def _make_module(self, identity=True, hidden_size=64, num_streams=4, **extra):
         config = _make_config(identity, hidden_size, num_streams, **extra)
@@ -278,10 +290,6 @@ class TestIdentityHyperConnectionTransformerLayer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        # iHC's constant H_res adds requires_grad=False guard variants to the shared
-        # torch.compile'd mHC kernels; drop them so later tests in the same process do
-        # not hit the recompile limit and silently fall back to eager mid-comparison.
-        torch._dynamo.reset()
 
     def _make_layer(self, hidden_size=64, num_streams=4, **extra):
         config = _make_config(True, hidden_size, num_streams, **extra)
