@@ -13,10 +13,12 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement imp
     RowAtomic,
 )
 
-QuantizedDBuffer = pytest.importorskip(
+quantized_dbuffer = pytest.importorskip(
     "megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer",
     reason="Transformer Engine MXFP8 support is required.",
-).QuantizedDBuffer
+)
+QuantizedDBuffer = quantized_dbuffer.QuantizedDBuffer
+update_mxfp8_tensor = quantized_dbuffer.update_mxfp8_tensor
 
 import transformer_engine_torch as tex
 from transformer_engine.pytorch import is_mxfp8_available
@@ -102,7 +104,7 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup, placements
 
 
 @requires_mxfp8
-def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup):
+def test_quantized_dbuffer_updated_tensor_supports_gemm(distributed_setup):
     """Compute tensors prepare gathered scales for rowwise and columnwise GEMMs."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -118,7 +120,9 @@ def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup):
     gathered_main = main_weight.redistribute([Replicate()])
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
     for index, shape in enumerate(shapes):
-        compute_tensor = gathered.get_tensor(index)
+        tensor_view = gathered.get_tensor_view(index)
+        compute_tensor = tensor_view.detach()
+        update_mxfp8_tensor(tensor_view, compute_tensor)
         reference = quantizer(gathered_main.get_tensor_view(index))
         for layout, inner_dim in (("TN", shape[1]), ("NN", shape[0])):
             activation = quantizer(torch.randn((64, inner_dim), device=device))
@@ -194,7 +198,7 @@ def test_quantized_dbuffer_redistributes_selected_planes(distributed_setup, roww
     assert destination.is_rowwise_allocated == rowwise
     assert destination.is_columnwise_allocated == columnwise
     for index in range(len(shapes)):
-        tensor = destination.get_tensor(index)
+        tensor = destination.get_tensor_view(index)
         assert tensor.shape == shapes[index]
         assert (tensor._rowwise_data is not None) == rowwise
         assert (tensor._rowwise_scale_inv is not None) == rowwise
@@ -208,11 +212,12 @@ def test_quantized_dbuffer_redistributes_selected_planes(distributed_setup, roww
         source.redistribute([Replicate()], rowwise=rowwise, columnwise=columnwise)
     destination.release_storage()
     with pytest.raises(RuntimeError, match="no allocated"):
-        destination.get_tensor(0)
+        destination.get_tensor_view(0)
 
 
+@requires_mxfp8
 @pytest.mark.parametrize("rowwise", [True, False], ids=["rowwise", "columnwise"])
-def test_quantized_dbuffer_partial_get_tensor_supports_gemm(distributed_setup, rowwise):
+def test_quantized_dbuffer_partial_updated_tensor_supports_gemm(distributed_setup, rowwise):
     """Compute tensors carrying only gathered rowwise or columnwise planes support their GEMMs.
 
     Forward GEMMs (TN) read rowwise planes and backward data-gradient GEMMs (NN)
@@ -238,7 +243,9 @@ def test_quantized_dbuffer_partial_get_tensor_supports_gemm(distributed_setup, r
 
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
     for index, shape in enumerate(shapes):
-        compute_tensor = gathered.get_tensor(index)
+        tensor_view = gathered.get_tensor_view(index)
+        compute_tensor = tensor_view.detach()
+        update_mxfp8_tensor(tensor_view, compute_tensor)
         reference = quantizer(gathered_main.get_tensor_view(index))
         layout, inner_dim = ("TN", shape[1]) if rowwise else ("NN", shape[0])
         activation = quantizer(torch.randn((64, inner_dim), device=device))
