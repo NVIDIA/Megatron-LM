@@ -46,6 +46,7 @@ import os
 import sys
 
 import pytest
+import torch
 import torch.distributed
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
@@ -53,6 +54,11 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from megatron.core import config  # noqa: E402
+
+
+def _report_stderr(message):
+    sys.stderr.write(message + "\n")
+    sys.stderr.flush()
 
 
 def pytest_addoption(parser):
@@ -75,11 +81,18 @@ def cleanup():
     """Tear the process group down before exit, as the unit-test suite does."""
     yield
     if torch.distributed.is_initialized():
+        rank = os.environ.get("RANK", "?")
+        _report_stderr(f"[rank {rank}] session cleanup: barrier")
         try:
-            torch.distributed.barrier()
+            if torch.cuda.is_available():
+                torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+            else:
+                torch.distributed.barrier()
         except Exception:
             return
+        _report_stderr(f"[rank {rank}] session cleanup: destroy process group")
         torch.distributed.destroy_process_group()
+        _report_stderr(f"[rank {rank}] session cleanup: complete")
 
 
 # Tests that must actually execute -- not merely be collected -- whenever the
@@ -94,11 +107,7 @@ def pytest_runtest_logreport(report):
     """Report failures before distributed cleanup and track required-module skips."""
     if report.failed:
         rank = os.environ.get("RANK", "?")
-        print(
-            f"\n[rank {rank}] {report.nodeid} ({report.when})\n{report.longreprtext}",
-            file=sys.stderr,
-            flush=True,
-        )
+        _report_stderr(f"\n[rank {rank}] {report.nodeid} ({report.when})\n{report.longreprtext}")
     if report.when != "setup" or not report.skipped:
         return
     module = os.path.basename(report.nodeid.split("::")[0])
@@ -134,7 +143,7 @@ def pytest_sessionfinish(session, exitstatus):
     # these tests to run and they skipped anyway, the bucket is not testing
     # what it claims to.
     if _skipped_must_run:
-        print(
+        _report_stderr(
             "\nERROR: tests that must run in this topology were skipped "
             f"(WORLD_SIZE={os.environ.get('WORLD_SIZE', '1')}):\n  "
             + "\n  ".join(_skipped_must_run)

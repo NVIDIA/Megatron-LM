@@ -1409,9 +1409,9 @@ class TestMultiTokenPredictionLayer:
         seq_len = 5
         rolled = []
 
-        def capture_roll(tensor, *args, **kwargs):
-            rolled.append((tensor.shape, kwargs.get("return_sum", True)))
-            return roll_tensor(tensor, *args, **kwargs)
+        def capture_roll(tensors, *args, **kwargs):
+            rolled.append([tensor.shape for tensor in tensors])
+            return roll_tensor(tensors, *args, **kwargs)
 
         monkeypatch.setattr(mtp_module, "roll_tensor", capture_roll)
         process_mtp_loss(
@@ -1430,13 +1430,11 @@ class TestMultiTokenPredictionLayer:
             config=config,
         )
 
-        assert len(rolled) == 2 * config.mtp_num_layers
+        assert len(rolled) == config.mtp_num_layers
         if with_mtp_input_mask:
-            assert [shape[0] for shape, _ in rolled] == [1, 2, 1, 2]
-            assert all(not return_sum for _, return_sum in rolled)
+            assert rolled == [[(1, seq_len), (2, seq_len)]] * config.mtp_num_layers
         else:
-            assert [shape[0] for shape, _ in rolled] == [1, 1, 1, 1]
-            assert [return_sum for _, return_sum in rolled] == [False, True, False, True]
+            assert rolled == [[(1, seq_len), (1, seq_len)]] * config.mtp_num_layers
 
     def test_process_mtp_loss_preserves_main_layout_hidden_states(self):
         config = TransformerConfig(

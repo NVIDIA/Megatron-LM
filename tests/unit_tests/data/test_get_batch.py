@@ -11,7 +11,7 @@ import torch
 import pretrain_gpt
 import pretrain_hybrid
 from megatron.core import mpu
-from megatron.core.context_parallel import get_batches_on_this_cp_rank
+from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.context_parallel.utils import (
     _build_packed_seq_params,
     _get_batch_on_this_cp_rank_contiguous,
@@ -199,7 +199,7 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
         max_seqlen_per_dp_cp_rank=1024,
         context_parallel_size=4,
     )
-    packed_seq_params = SimpleNamespace(cp_group=object(), cp_singleton_group=None)
+    packed_seq_params = PackedSeqParams(cp_group=object())
     scheduler_batch = (
         object(),  # tokens
         object(),  # labels
@@ -263,7 +263,7 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
         max_seqlen_per_dp_cp_rank=1024,
         context_parallel_size=4,
     )
-    packed_seq_params = SimpleNamespace(cp_group=object(), cp_singleton_group=None)
+    packed_seq_params = PackedSeqParams(cp_group=object())
     scheduler_batch = (
         object(),  # tokens
         object(),  # labels
@@ -318,6 +318,7 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
         pipeline_model_parallel_layout=None,
         mtp_num_layers=0,
         virtual_pipeline_model_parallel_size=None,
+        linear_cp_layout="contiguous",
         dsa_cp_balance_indexer=True,
         dsa_cp_balance_indexer_graph_dynamic_packs=False,
         pad_packed_seq_alignment="max",
@@ -326,7 +327,7 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
         max_seqlen_per_dp_cp_rank=1024,
         context_parallel_size=4,
     )
-    packed_seq_params = SimpleNamespace(cp_group=object())
+    packed_seq_params = PackedSeqParams(cp_group=object())
     scheduler_batch = (
         object(),
         object(),
@@ -356,7 +357,7 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
         monkeypatch.setattr(module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
         monkeypatch.setattr(module, "mtp_on_this_rank_func", lambda **_kwargs: False)
         result = module.get_batch(None)
-        assert result[-1] is packed_seq_params
+        assert result.get_packed_seq_params() is packed_seq_params
 
     finalize.assert_called_once_with(packed_seq_params)
     prebuild.assert_called_once_with(
@@ -369,8 +370,8 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
     )
 
 
-def test_hybrid_legacy_thd_prebuilds_after_forward_constructs_params(monkeypatch):
-    """Raw-cu Hybrid batches get their sole prebuild after PackedSeqParams exists."""
+def test_hybrid_thd_forward_prebuilds_batch_metadata_once(monkeypatch):
+    """Prepare the real metadata from the Hybrid batch interface before model execution."""
     config = SimpleNamespace(
         dsa_cp_balance_indexer=True,
         dsa_cp_balance_indexer_graph_dynamic_packs=False,
@@ -381,24 +382,24 @@ def test_hybrid_legacy_thd_prebuilds_after_forward_constructs_params(monkeypatch
     cu_seqlens = torch.tensor([[0, 1024, 4096]], dtype=torch.int32)
     loss_mask = torch.ones(4096)
     tokens = torch.zeros(4096, dtype=torch.long)
-    batch = (
-        None,  # attention_mask
-        cu_seqlens,
-        None,  # cu_seqlens_padded
-        object(),  # hybrid_cp_group
-        torch.zeros_like(tokens),  # labels
-        torch.tensor(4),  # local_cp_size
-        loss_mask,
-        torch.tensor(3072),  # max_seqlen
-        torch.arange(4096),  # position_ids
-        tokens,
-        None,  # padding_mask
-        None,  # packed_seq_params: constructed in forward_step
-    )
+    batch = {
+        "attention_mask": None,
+        "cu_seqlens": cu_seqlens,
+        "hybrid_cp_group": object(),
+        "labels": torch.zeros_like(tokens),
+        "local_cp_size": torch.tensor(4),
+        "loss_mask": loss_mask,
+        "max_seqlen": torch.tensor(3072),
+        "position_ids": torch.arange(4096),
+        "tokens": tokens,
+        "padding_mask": None,
+    }
+    expected_params = _build_packed_seq_params(batch, "contiguous", 4, tokens_per_sample=None)
+    cp_batch = ContextParallelBatch.from_single_layout("contiguous", batch, expected_params)
 
     monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
     monkeypatch.setattr(pretrain_hybrid, "get_timers", MagicMock(return_value=MagicMock()))
-    monkeypatch.setattr(pretrain_hybrid, "get_batch", MagicMock(return_value=batch))
+    monkeypatch.setattr(pretrain_hybrid, "get_batch", MagicMock(return_value=cp_batch))
     finalize = MagicMock(side_effect=lambda params: params)
     monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
     monkeypatch.setattr(pretrain_hybrid, "update_seqlen_stats_from_cu_seqlens", MagicMock())
@@ -417,9 +418,10 @@ def test_hybrid_legacy_thd_prebuilds_after_forward_constructs_params(monkeypatch
     (packed_seq_params,), kwargs = prebuild.call_args
     finalize.assert_called_once_with(packed_seq_params)
     prebuild.assert_called_once()
+    assert packed_seq_params is expected_params
     assert packed_seq_params.cu_seqlens_q.tolist() == [0, 1024, 4096]
     assert kwargs == {
-        "cp_group": batch[3],
+        "cp_group": batch["hybrid_cp_group"],
         "pad_alignment": 12,
         "capacity": None,
         "graphs_enabled": True,

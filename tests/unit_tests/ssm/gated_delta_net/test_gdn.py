@@ -857,6 +857,7 @@ def test_qk_l2_norm_deterministic_mode(dtype, deterministic_mode, use_qk_l2norm)
     """Check normalization dispatch, additive epsilon, and gradients on CPU."""
     gdn = SimpleNamespace(
         config=SimpleNamespace(deterministic_mode=deterministic_mode),
+        cp_size=1,
         use_qk_l2norm=use_qk_l2norm,
         qk_dim_local_tp=2,
         v_dim_local_tp=2,
@@ -897,5 +898,16 @@ def test_qk_l2_norm_deterministic_mode(dtype, deterministic_mode, use_qk_l2norm)
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=1e-6)
 
     actual.float().sum().backward()
-    expected.float().sum().backward()
-    torch.testing.assert_close(qkv.grad, reference.grad.to(dtype), rtol=rtol, atol=1e-6)
+    if use_qk_l2norm and deterministic_mode:
+        # FLA's backward uses the saved, dtype-rounded output, not the derivative
+        # of an unrounded norm. Keep a high-precision oracle for that same contract.
+        values = reference[..., :4].reshape(1, 3, 2, 2)
+        rstd = torch.rsqrt(values.square().sum(-1, keepdim=True) + 1e-6)
+        saved_output = (values * rstd).to(dtype).double()
+        normalized_grad = rstd * (1 - saved_output * saved_output.sum(-1, keepdim=True))
+        expected_grad = torch.zeros_like(reference)
+        expected_grad[..., :4] = normalized_grad.reshape(1, 3, 4)
+    else:
+        expected.float().sum().backward()
+        expected_grad = reference.grad
+    torch.testing.assert_close(qkv.grad, expected_grad.to(dtype), rtol=rtol, atol=1e-6)

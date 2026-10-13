@@ -4,6 +4,7 @@ import torch
 
 from megatron.core.models.common import fine_grained_callables as common_callables
 from megatron.core.models.common.fine_grained_callables import build_layer_callables
+from megatron.core.models.gpt import fine_grained_callables as gpt_callables
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -183,6 +184,51 @@ def test_mtp_pre_dispatch_applies_hybrid_empty_decoder_final_norm(monkeypatch):
 
     torch.testing.assert_close(output, expected)
     torch.testing.assert_close(node.chunk_state.mtp_hidden_states[0], expected)
+
+
+def test_gpt_mtp_schedule_preserves_six_field_embedding_contract(monkeypatch):
+    from types import SimpleNamespace
+
+    mask = torch.tensor([[True, False, True]])
+    rolled_mask = torch.tensor([[False, True, False]])
+
+    def embeddings(**kwargs):
+        assert kwargs["mtp_input_mask"] is mask
+        return (
+            kwargs["input_ids"],
+            kwargs["position_ids"],
+            kwargs["padding_mask"],
+            rolled_mask,
+            torch.zeros_like(kwargs["hidden_states"]),
+            kwargs["hidden_states"] + 2,
+        )
+
+    monkeypatch.setattr(
+        gpt_callables,
+        "build_transformer_layer_callables",
+        lambda _layer: ([lambda _node, hidden: hidden, None, None, None, None, None], {"attn": []}),
+    )
+    layer = SimpleNamespace(
+        config=SimpleNamespace(sequence_parallel=False, enable_hyper_connections=False),
+        mtp_model_layer=SimpleNamespace(mlp=gpt_callables.MoELayer.__new__(gpt_callables.MoELayer)),
+        eh_proj=object(),
+        _get_embeddings=embeddings,
+        _concat_embeddings=lambda hidden, decoder_input: hidden + decoder_input,
+    )
+    state = SimpleNamespace(
+        input_ids=torch.arange(3).unsqueeze(0),
+        position_ids=torch.arange(3).unsqueeze(0),
+        model=SimpleNamespace(embedding=object()),
+        packed_seq_params=None,
+        padding_mask=None,
+        mtp_input_mask=mask,
+        context=None,
+    )
+    node = SimpleNamespace(is_first_layer=False, chunk_state=state)
+    hidden = torch.zeros(3, 1, 2)
+    forwards, _ = gpt_callables.build_mtp_layer_callables(layer)
+    torch.testing.assert_close(forwards[0](node, hidden), hidden + 2)
+    assert state.mtp_input_mask is rolled_mask
 
 
 class TestTransformerLayerSubmoduleCallables:

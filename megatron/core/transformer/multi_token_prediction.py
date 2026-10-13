@@ -1584,13 +1584,8 @@ class MTPLossLoggingHelper:
 
     @staticmethod
     def clean_metrics_in_tracker():
-        """Clear the mtp metrics."""
-        tracker = MTPLossLoggingHelper.tracker
-        if "loss_values" in tracker:
-            tracker["loss_values"].zero_()
-        tracker["reduce_group"] = None
-        tracker["avg_group"] = None
-        MTPLossLoggingHelper._clean_acceptance_in_tracker()
+        """Clear all MTP metrics through the legacy entry point."""
+        MTPLossLoggingHelper.clean_loss_in_tracker()
 
     @staticmethod
     def reduce_metrics_in_tracker():
@@ -2331,30 +2326,50 @@ def process_mtp_loss(
     if mtp_input_mask is not None:
         assert mtp_input_mask.shape == loss_mask.shape, "MTP input mask must match loss mask."
         mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+    contiguous_roll = config.attention_cp_layout == "contiguous" or (
+        packed_seq_params is not None and packed_seq_params.cp_partition_mode == "contiguous"
+    )
     for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_labels, loss_mask = roll_tensor(
-            [mtp_labels, loss_mask],
+        roll_fields = [mtp_labels, loss_mask]
+        sequence_fields = ["input_ids" if derived_labels_from_input_ids else "labels", "loss_mask"]
+        if mtp_input_mask is not None:
+            if contiguous_roll:
+                # Contiguous CP exchanges all fields in one grouped P2P batch.
+                roll_fields.append(mtp_input_mask)
+                sequence_fields.append("mtp_input_mask")
+            else:
+                # Zigzag CP rolls each field separately. Co-roll both masks so
+                # conditioning validity adds no communication round trip.
+                roll_fields[1] = torch.cat(
+                    (loss_mask, mtp_input_mask.to(dtype=loss_mask.dtype)), dim=0
+                )
+        # RL labels have already rolled once; conditioning validity has not.
+        # A grouped fallback preserves those distinct depths without reusing a
+        # label-depth prefetched halo for the conditioning mask.
+        roll_context = (
+            None
+            if derived_labels_from_input_ids and mtp_input_mask is not None
+            else sequence_roll_context
+        )
+        rolled_fields = roll_tensor(
+            roll_fields,
             shifts=-1,
             dims=-1,
             cp_group=cp_group,
             packed_seq_params=packed_seq_params,
             cp_layout=config.attention_cp_layout,
-            roll_context=sequence_roll_context,
-            sequence_fields=[
-                "input_ids" if derived_labels_from_input_ids else "labels",
-                "loss_mask",
-            ],
+            roll_context=roll_context,
+            sequence_fields=sequence_fields,
             roll_depth=mtp_layer_number + int(derived_labels_from_input_ids),
         )
+        mtp_labels, loss_mask = rolled_fields[:2]
         layer_loss_mask = loss_mask
         if mtp_input_mask is not None:
-            mtp_input_mask, _ = roll_tensor(
-                mtp_input_mask,
-                cp_group=cp_group,
-                packed_seq_params=packed_seq_params,
-                cp_layout=config.attention_cp_layout,
-                return_sum=False,
-            )
+            if contiguous_roll:
+                mtp_input_mask = rolled_fields[2]
+            else:
+                loss_mask, mtp_input_mask = loss_mask.chunk(2, dim=0)
+                mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
             cumulative_mtp_input_mask = (
                 mtp_input_mask
                 if cumulative_mtp_input_mask is None

@@ -120,6 +120,9 @@ def _make_csa_config(delay_wgrad=True):
         # Indexer top-k is non-differentiable: the indexer linears ONLY receive
         # gradients through the indexer KL loss.  coeff=0 would make this test vacuous.
         dsa_indexer_loss_coeff=1.0,
+        # Exercise TE projection wgrads with the portable dense DSA reference;
+        # fused dense-loss DSA is unsupported on the H100 unit-test platform.
+        dsa_kernel_backend='none',
         # Deferred wgrads must land in param.grad, not main_grad.
         gradient_accumulation_fusion=False,
     )

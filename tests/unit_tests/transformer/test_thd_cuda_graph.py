@@ -1327,6 +1327,10 @@ class TestStaticInputs:
 
         assert static_inputs["padding_mask"].shape == (1, 128)
         assert not static_inputs["padding_mask"].any()
+        assert layer._cuda_graph_padding_mask_shape == (1, 128)
+        mask = static_inputs["padding_mask"]
+        assert layer._te_cuda_graph_padding_mask(mask, mask.device) is mask
+        torch.testing.assert_close(layer._te_cuda_graph_padding_mask(None, mask.device), mask)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

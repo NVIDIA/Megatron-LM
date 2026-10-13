@@ -5656,7 +5656,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits[:, :, 0] = 100.0  # High probability for token 0
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -5792,7 +5792,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -5887,7 +5887,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -5992,7 +5992,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -6273,7 +6273,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
                 base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
-                model._decoder_hidden_states_cache = torch.zeros(
+                env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                     s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
                 )
                 if test_config.materialize_only_last_token_logits:
@@ -6394,7 +6394,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits[:, :, 0] = 100.0  # Force model to deterministically pick token 0
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -6596,7 +6596,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 dtype=torch.bfloat16,
             )
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -6749,7 +6749,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             # Make token 0 very likely so speculative tokens get accepted.
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -6870,7 +6870,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
             )
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -7001,7 +7001,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
             )
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -7263,7 +7263,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -7366,7 +7366,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits

@@ -1898,6 +1898,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 static_inputs["padding_mask"] = torch.zeros(
                     mask_shape, dtype=torch.bool, device=torch.cuda.current_device()
                 )
+        # THD reserves this input even for attention-only capture. Replay must
+        # preserve every captured kwarg, not only masks observed by a MoE router.
+        if "padding_mask" in static_inputs:
+            self._cuda_graph_padding_mask_shape = tuple(static_inputs["padding_mask"].shape)
         return static_inputs
 
     def _uses_graph_dynamic_dsa_route(self):
