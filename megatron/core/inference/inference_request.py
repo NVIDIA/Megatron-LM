@@ -8,7 +8,7 @@ import uuid
 import warnings
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from typing import Any, Dict, List, NoReturn, Optional, Protocol, Tuple, Union
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 import torch
@@ -1148,6 +1148,48 @@ class DynamicInferenceRequestRecord:
         record.requests.append(request)
         return record
 
+    @classmethod
+    def from_resumed_generation(
+        cls,
+        first: DynamicInferenceRequest,
+        resumed: "ResumedGeneration",
+        *,
+        prompt_length: int,
+        generation_epoch: Optional[int],
+    ) -> "DynamicInferenceRequestRecord":
+        """Build the record the engine admits for a request that resumes a generation."""
+        if resumed.log_probs is None and first.sampling_params.return_log_probs:
+            raise ValueError(
+                "resumed generation carries no log probs for a request that returns them"
+            )
+        if resumed.policy_epoch is None and generation_epoch is not None:
+            raise ValueError(
+                "resumed generation carries no policy epoch for an engine that stamps one"
+            )
+        resumed = resumed.with_expanded_prompt(prompt_length, len(first.prompt_tokens))
+        tokens = resumed.token_ids
+        first.sampling_params.num_tokens_to_generate = resumed.num_tokens_to_generate
+        first.sampling_params.num_tokens_total = None
+        first.generated_tokens = tokens
+        first.generated_length = len(tokens)
+        first.generated_log_probs = resumed.log_probs
+        first.prompt_log_probs = resumed.prompt_log_probs
+        first.policy_epoch = resumed.policy_epoch
+        first.kv_cache_epoch = resumed.kv_cache_epoch
+        for _ in range(resumed.num_evictions):
+            first.add_event_evict()
+        record = cls.from_request(first)
+        if resumed.finished:
+            first.status = Status.COMPLETED
+            return record
+        first.add_event_evict()
+        record.checkpoint()
+        continuation = record[-1]
+        if generation_epoch is not None and continuation.policy_epoch[-1][1] != generation_epoch:
+            cut = len(first.prompt_tokens) + len(tokens) - 1
+            continuation.policy_epoch.append((cut, generation_epoch))
+        return record
+
     def __getitem__(self, idx: int) -> DynamicInferenceRequest:
         """Get request by index.
 
@@ -1514,6 +1556,37 @@ class ResumedGeneration:
     num_evictions: int = 0
     finished: bool = False
 
+    def __post_init__(self):
+        tokens, budget = self.token_ids, self.num_tokens_to_generate
+        if not all(type(t) is int for t in tokens):
+            raise ValueError("resumed generation holds non-integer tokens")
+        if type(budget) is not int or budget < 0:
+            raise ValueError("resumed generation has a malformed budget")
+        if type(self.num_evictions) is not int or self.num_evictions < 0:
+            raise ValueError("resumed generation has a malformed eviction count")
+        if type(self.finished) is not bool:
+            raise ValueError("resumed generation has a malformed finished flag")
+        if len(tokens) > budget:
+            raise ValueError(
+                f"resumed generation holds {len(tokens)} tokens over a budget of {budget}"
+            )
+        if len(tokens) == budget and not self.finished:
+            raise ValueError(f"resumed generation filled its budget of {budget} without finishing")
+        if self.log_probs is not None and len(self.log_probs) != len(tokens):
+            raise ValueError(
+                "resumed generation has log probs and tokens of different lengths, "
+                f"{len(self.log_probs)} and {len(tokens)}"
+            )
+        for name, boundaries in (
+            ("policy_epoch", self.policy_epoch),
+            ("kv_cache_epoch", self.kv_cache_epoch),
+        ):
+            if boundaries is not None and not (
+                boundaries
+                and all(len(b) == 2 and all(type(v) is int for v in b) for b in boundaries)
+            ):
+                raise ValueError(f"resumed generation has malformed {name} boundaries")
+
     def with_expanded_prompt(
         self, prompt_length: int, expanded_prompt_length: int
     ) -> "ResumedGeneration":
@@ -1563,16 +1636,21 @@ class ResumedGeneration:
             value = obj[name]
             return None if value is None else [tuple(boundary) for boundary in value]
 
-        return cls(
-            token_ids=list(obj["token_ids"]),
-            num_tokens_to_generate=obj["num_tokens_to_generate"],
-            log_probs=obj["log_probs"],
-            prompt_log_probs=obj["prompt_log_probs"],
-            policy_epoch=boundaries("policy_epoch"),
-            kv_cache_epoch=boundaries("kv_cache_epoch"),
-            num_evictions=obj["num_evictions"],
-            finished=obj["finished"],
-        )
+        try:
+            return cls(
+                token_ids=list(obj["token_ids"]),
+                num_tokens_to_generate=obj["num_tokens_to_generate"],
+                log_probs=obj["log_probs"],
+                prompt_log_probs=obj["prompt_log_probs"],
+                policy_epoch=boundaries("policy_epoch"),
+                kv_cache_epoch=boundaries("kv_cache_epoch"),
+                num_evictions=obj["num_evictions"],
+                finished=obj["finished"],
+            )
+        except (KeyError, TypeError) as unreadable:
+            raise ValueError(
+                f"resumed generation wire is malformed: {type(unreadable).__name__}: {unreadable}"
+            ) from unreadable
 
 
 @dataclass(frozen=True)
@@ -1581,76 +1659,6 @@ class RequestPromptPreparationResult:
 
     prompt: Union[str, List[int], torch.Tensor]
     offload_params: Optional[Dict[str, Any]] = None
-
-
-def build_resumed_record(
-    first: "DynamicInferenceRequest",
-    resumed: ResumedGeneration,
-    *,
-    prompt_length: int,
-    generation_epoch: Optional[int],
-) -> Optional["DynamicInferenceRequestRecord"]:
-    """Build the record the engine admits for a request that resumes a generation."""
-    tokens, budget = resumed.token_ids, resumed.num_tokens_to_generate
-
-    def refuse(reason: str) -> NoReturn:
-        raise ValueError(f"resumed generation {reason}")
-
-    if not all(type(t) is int for t in tokens):
-        refuse("holds non-integer tokens")
-    if type(budget) is not int or budget < 0:
-        refuse("has a malformed budget")
-    if type(resumed.num_evictions) is not int or resumed.num_evictions < 0:
-        refuse("has a malformed eviction count")
-    if type(resumed.finished) is not bool:
-        refuse("has a malformed finished flag")
-    if not tokens and not resumed.finished:
-        first.sampling_params.num_tokens_to_generate = budget
-        first.sampling_params.num_tokens_total = None
-        return None
-    if len(tokens) > budget:
-        refuse(f"holds {len(tokens)} tokens over a budget of {budget}")
-    if len(tokens) == budget and not resumed.finished:
-        refuse(f"filled its budget of {budget} without finishing")
-    if resumed.log_probs is not None and len(resumed.log_probs) != len(tokens):
-        refuse(
-            "has log probs and tokens of different lengths, "
-            f"{len(resumed.log_probs)} and {len(tokens)}"
-        )
-    if resumed.log_probs is None and first.sampling_params.return_log_probs:
-        refuse("carries no log probs for a request that returns them")
-    if resumed.policy_epoch is None and generation_epoch is not None:
-        refuse("carries no policy epoch for an engine that stamps one")
-    for name, bs in (
-        ("policy_epoch", resumed.policy_epoch),
-        ("kv_cache_epoch", resumed.kv_cache_epoch),
-    ):
-        if bs is not None and not (
-            bs and all(len(b) == 2 and all(type(v) is int for v in b) for b in bs)
-        ):
-            refuse(f"has malformed {name} boundaries")
-    resumed = resumed.with_expanded_prompt(prompt_length, len(first.prompt_tokens))
-    first.sampling_params.num_tokens_to_generate = budget
-    first.sampling_params.num_tokens_total = None
-    first.generated_tokens = tokens
-    first.generated_length = len(tokens)
-    first.generated_log_probs = resumed.log_probs
-    first.prompt_log_probs = resumed.prompt_log_probs
-    first.policy_epoch = resumed.policy_epoch
-    first.kv_cache_epoch = resumed.kv_cache_epoch
-    for _ in range(resumed.num_evictions):
-        first.add_event_evict()
-    record = DynamicInferenceRequestRecord.from_request(first)
-    if resumed.finished:
-        first.status = Status.COMPLETED
-        return record
-    first.add_event_evict()
-    record.checkpoint()
-    continuation = record[-1]
-    if generation_epoch is not None and continuation.policy_epoch[-1][1] != generation_epoch:
-        cut = len(first.prompt_tokens) + len(tokens) - 1
-        continuation.policy_epoch.append((cut, generation_epoch))
-    return record
 
 
 class RequestPromptPreparer(Protocol):

@@ -59,7 +59,6 @@ from megatron.core.inference.inference_request import (
     RequestPromptPreparer,
     ResumedGeneration,
     Status,
-    build_resumed_record,
     compute_media_cache_key,
     merge_multimodal_data,
     resolve_multimodal_data_for_engine,
@@ -2255,17 +2254,23 @@ class DynamicInferenceEngine(AbstractEngine):
         # Resumed request path.
         try:
             resumed = ResumedGeneration.from_wire(wire)
-            record = build_resumed_record(
-                request,
-                resumed,
-                prompt_length=prompt_length,
-                generation_epoch=self._generation_epoch,
+            record = (
+                DynamicInferenceRequestRecord.from_resumed_generation(
+                    request,
+                    resumed,
+                    prompt_length=prompt_length,
+                    generation_epoch=self._generation_epoch,
+                )
+                if resumed.token_ids or resumed.finished
+                else None  # nothing generated yet
             )
         except ValueError as invalid:
             # Refused the way rank zero refuses a prompt: _add_request fails the request.
             params[_PROMPT_PREPARATION_ERROR_FIELD] = str(invalid)
             return self._add_request(request)
-        if record is None:  # nothing generated yet
+        if record is None:  # admitted fresh, under the banked budget
+            request.sampling_params.num_tokens_to_generate = resumed.num_tokens_to_generate
+            request.sampling_params.num_tokens_total = None
             return self._add_request(request)
 
         entry = RequestEntry(record=record, future=self._loop.create_future())

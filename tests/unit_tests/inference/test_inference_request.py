@@ -19,7 +19,6 @@ from megatron.core.inference.inference_request import (
     OffloadedRequestPayload,
     ResumedGeneration,
     Status,
-    build_resumed_record,
     compute_block_hashes_batched,
     compute_media_cache_key,
     deserialize_ndarray,
@@ -954,29 +953,27 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
 
 
 @pytest.mark.parametrize(
-    ("wire", "return_log_probs", "generation_epoch", "reason"),
+    ("wire", "reason"),
     [
-        ({**_WIRE, "token_ids": [1, 2.0]}, False, None, "holds non-integer tokens"),
-        ({**_WIRE, "num_tokens_to_generate": -1}, False, None, "has a malformed budget"),
-        ({**_WIRE, "num_evictions": -1}, False, None, "has a malformed eviction count"),
-        ({**_WIRE, "finished": 1}, False, None, "has a malformed finished flag"),
-        ({**_WIRE, "token_ids": [1, 2, 3]}, False, None, "holds 3 tokens over a budget of 2"),
-        (
-            {**_WIRE, "num_tokens_to_generate": 1},
-            False,
-            None,
-            "filled its budget of 1 without finishing",
-        ),
+        ({**_WIRE, "token_ids": [1, 2.0]}, "holds non-integer tokens"),
+        ({**_WIRE, "num_tokens_to_generate": -1}, "has a malformed budget"),
+        ({**_WIRE, "num_evictions": -1}, "has a malformed eviction count"),
+        ({**_WIRE, "finished": 1}, "has a malformed finished flag"),
+        ({**_WIRE, "token_ids": [1, 2, 3]}, "holds 3 tokens over a budget of 2"),
+        ({**_WIRE, "num_tokens_to_generate": 1}, "filled its budget of 1 without finishing"),
         (
             {**_WIRE, "log_probs": [-0.1, -0.2]},
-            False,
-            None,
             "has log probs and tokens of different lengths, 2 and 1",
         ),
-        (_WIRE, True, None, "carries no log probs for a request that returns them"),
-        (_WIRE, False, 9, "carries no policy epoch for an engine that stamps one"),
-        ({**_WIRE, "policy_epoch": [[0]]}, False, None, "has malformed policy_epoch boundaries"),
-        ({**_WIRE, "kv_cache_epoch": []}, False, None, "has malformed kv_cache_epoch boundaries"),
+        ({**_WIRE, "policy_epoch": [[0]]}, "has malformed policy_epoch boundaries"),
+        ({**_WIRE, "kv_cache_epoch": []}, "has malformed kv_cache_epoch boundaries"),
+        (
+            {k: v for k, v in _WIRE.items() if k != "token_ids"},
+            "wire is malformed: KeyError: 'token_ids'",
+        ),
+        (list(_WIRE.values()), "wire is malformed: TypeError: .*"),
+        ({**_WIRE, "token_ids": 1}, "wire is malformed: TypeError: .*"),
+        ({**_WIRE, "policy_epoch": [3]}, "wire is malformed: TypeError: .*"),
     ],
     ids=[
         "non-int-tokens",
@@ -986,22 +983,39 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         "tokens-over-budget",
         "budget-filled-unfinished",
         "misaligned-log-probs",
-        "unscored-for-a-scored-request",
-        "unstamped-for-a-stamping-engine",
         "malformed-policy-epoch",
         "empty-kv-cache-epoch",
+        "missing-field",
+        "not-a-mapping",
+        "unlistable-tokens",
+        "unlistable-boundary",
     ],
 )
-def test_reject_resumed_generation(wire, return_log_probs, generation_epoch, reason):
-    """A resume that is inconsistent or lacks what the request or engine needs is refused with its
-    reason, before the request is touched."""
+def test_reject_malformed_resumed_generation(wire, reason):
+    """A payload that does not read back as a consistent resumed generation is refused with its
+    reason as it is rebuilt, whether a field is inconsistent or the wire itself is unreadable."""
+    with pytest.raises(ValueError, match=f"^resumed generation {reason}$"):
+        ResumedGeneration.from_wire(wire)
+
+
+@pytest.mark.parametrize(
+    ("return_log_probs", "generation_epoch", "reason"),
+    [
+        (True, None, "carries no log probs for a request that returns them"),
+        (False, 9, "carries no policy epoch for an engine that stamps one"),
+    ],
+    ids=["unscored-for-a-scored-request", "unstamped-for-a-stamping-engine"],
+)
+def test_reject_resumed_generation(return_log_probs, generation_epoch, reason):
+    """A consistent resume that lacks what the request or engine needs is refused with its reason,
+    before the request is touched."""
     request = _make_dynamic_request(
         sampling_params=SamplingParams(num_tokens_to_generate=2, return_log_probs=return_log_probs)
     )
     with pytest.raises(ValueError, match=f"^resumed generation {reason}$"):
-        build_resumed_record(
+        DynamicInferenceRequestRecord.from_resumed_generation(
             request,
-            ResumedGeneration.from_wire(wire),
+            ResumedGeneration.from_wire(_WIRE),
             prompt_length=len(request.prompt_tokens),
             generation_epoch=generation_epoch,
         )
@@ -1068,7 +1082,9 @@ def test_resumed_record_merge(new_epoch):
         kv_cache_epoch=snapshot.record.kv_cache_epoch,
         num_evictions=snapshot.record.num_evictions,
     )
-    record = build_resumed_record(admitted(), resumed, prompt_length=3, generation_epoch=new_epoch)
+    record = DynamicInferenceRequestRecord.from_resumed_generation(
+        admitted(), resumed, prompt_length=3, generation_epoch=new_epoch
+    )
     assert len(record.requests) == 2 and record[-1].kv_cache_epoch is None
     generate(schedule(record[-1], new_epoch), *part_two, [-9.0])
     whole = LiveRequestSnapshot.from_record(record, finished=False)
