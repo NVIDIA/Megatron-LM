@@ -233,6 +233,36 @@ class MultiGroupUBRAllocator:
             backend.register_mem_pool(self.pool)
 
 
+@dataclasses.dataclass(frozen=True)
+class FSDPUnitTypeFilter:
+    """``fsdp_unit_filter`` that selects instances of the given module classes.
+
+    This is what an ``fsdp_unit_modules`` class list means; a class keeps the filter
+    picklable, unlike a lambda.
+    """
+
+    module_types: Tuple[type, ...]
+
+    def __call__(self, module: torch.nn.Module) -> bool:
+        return isinstance(module, self.module_types)
+
+
+def resolve_fsdp_unit_filter(
+    fsdp_unit_modules: Optional[List[type]],
+    fsdp_unit_filter: Optional[Callable[[torch.nn.Module], bool]],
+) -> Optional[Callable[[torch.nn.Module], bool]]:
+    """Return the single predicate that selects FSDP unit modules.
+
+    ``fsdp_unit_modules`` is shorthand for a filter that matches instances of those
+    classes, so callers pass one or the other. Returns None when there are no FSDP units.
+    """
+    if fsdp_unit_modules:
+        if fsdp_unit_filter is not None:
+            raise ValueError("Pass either fsdp_unit_modules or fsdp_unit_filter, not both.")
+        return FSDPUnitTypeFilter(tuple(fsdp_unit_modules))
+    return fsdp_unit_filter
+
+
 @dataclasses.dataclass
 class BucketingPolicy:
     """
@@ -240,14 +270,17 @@ class BucketingPolicy:
 
     Attributes:
         suggested_bucket_size (int): The suggested size of each bucket in num of elements.
-        fsdp_unit_modules (list): A list of module classes that are treated as a
-            single unit for FSDP bucketing.
+        fsdp_unit_modules (list): Shorthand for an ``fsdp_unit_filter`` that selects
+            instances of these module classes. Mutually exclusive with fsdp_unit_filter.
         data_parallel_sharding_strategy (str): The strategy used for sharding
             data parallel modules. Applies to non-expert parameters only when
             expert_data_parallel_sharding_strategy is set.
         expert_data_parallel_sharding_strategy (Optional[str]): The strategy used for
             sharding expert parameters. When None, data_parallel_sharding_strategy
             applies to every parameter.
+        fsdp_unit_filter (Optional[Callable]): Predicate that returns True for modules that
+            are treated as a single unit for FSDP bucketing. The outermost matching module
+            wins; its submodules are not considered.
 
     Note:
         This policy is used to configure the bucketing behavior in FSDP training.
@@ -257,6 +290,12 @@ class BucketingPolicy:
     fsdp_unit_modules: List[torch.nn.Module] = dataclasses.field(default_factory=list)
     data_parallel_sharding_strategy: str = "no_shard"
     expert_data_parallel_sharding_strategy: Optional[str] = None
+    fsdp_unit_filter: Optional[Callable[[torch.nn.Module], bool]] = None
+
+    def __post_init__(self):
+        self.fsdp_unit_filter = resolve_fsdp_unit_filter(
+            self.fsdp_unit_modules, self.fsdp_unit_filter
+        )
 
 
 class BufferDistribution(NamedTuple):
@@ -1816,17 +1855,17 @@ def _get_parameter_groups(
     param_to_name = {p: name for name, p in module.named_parameters()}
     # fsdp_units is a list of lists of parameter names, one list per FSDP unit module.
     fsdp_units = []
-    if policy.fsdp_unit_modules:
+    if policy.fsdp_unit_filter is not None:
         fsdp_modules = []
         # Loop through all sub-modules of the module.
         for m in module.modules():
             # Skip nested FSDP module, i.e. FSDP modules already have their
             # sub-module parameters registered.
-            if any(is_submodule(module, fsdp_module) for fsdp_module in fsdp_modules):
+            if any(is_submodule(m, fsdp_module) for fsdp_module in fsdp_modules):
                 continue
             # If the sub-module is a FSDP unit module, add its parameter (names)
             # to the list of FSDP units.
-            if isinstance(m, tuple(policy.fsdp_unit_modules)):
+            if policy.fsdp_unit_filter(m):
                 fsdp_units.append([param_to_name[p] for p in m.parameters()])
                 fsdp_modules.append(m)
 
@@ -2589,7 +2628,10 @@ class ParamAndGradBuffer:
         # Set ParameterGroup.grad_dtype.
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
-        if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
+        if (
+            self.ddp_config.fsdp_double_buffer
+            and self.bucketing_policy.fsdp_unit_filter is not None
+        ):
             # Double Buffering
             UB_BUFFER_NUM = 2
             # Double Buffer Allocator Choice
