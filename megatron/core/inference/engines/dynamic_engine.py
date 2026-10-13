@@ -4659,7 +4659,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Called from the engine loop's finally block after the loop exits.
         """
-        # Staged replies still in flight must go out before the socket closes.
+        # Send staged replies still in flight before the socket closes. NeMo RL never calls
+        # this (it kills the worker instead), so the unbounded wait only affects a clean shutdown.
         await self._drain_staging_tasks()
         self.state = EngineState.STOPPED
 
