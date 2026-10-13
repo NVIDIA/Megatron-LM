@@ -363,21 +363,21 @@ class FsdpModule:
             raise ValueError(
                 f"Unsharding requires a FORWARD, BACKWARD, or None phase, got {phase!r}."
             )
-        phases = (
-            (phase,)
-            if phase is not None and self._per_phase_unshard_groups
-            else (Phase.FORWARD, Phase.BACKWARD)
-        )
-        if all(requested_phase in self._unshard_events for requested_phase in phases):
+        requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
+        if all(requested_phase in self._unshard_events for requested_phase in requested_phases):
             return
 
+        # Each group reports the phases it can now serve, e.g. both for BF16 weights.
+        ready_phases = {Phase.FORWARD, Phase.BACKWARD}
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters(phase)
+                ready_phases &= group.unshard_parameters(phase)
             event = allgather_stream.record_event()
-        for ready_phase in phases:
-            self._unshard_events[ready_phase] = event
+        assert ready_phases.issuperset(requested_phases)
+        for ready_phase in ready_phases:
+            # Keep earlier events so compute does not wait for this materialization.
+            self._unshard_events.setdefault(ready_phase, event)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -385,7 +385,7 @@ class FsdpModule:
         if is_recomputing:
             # Backward reuses BF16 weights and any gathered MXFP8 columnwise planes,
             # but no longer needs the MXFP8 rowwise planes used for recomputation.
-            groups = self._per_phase_unshard_groups
+            groups = [group for group in self._parameter_groups if group.has_forward_only_planes]
             if groups:
                 allgather_stream = self.context.allgather_stream
                 allgather_stream.wait_stream(self.context.current_stream())
@@ -494,11 +494,6 @@ class FsdpModule:
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
         """Parameter groups owned by this FsdpModule."""
         return self._parameter_groups
-
-    @property
-    def _per_phase_unshard_groups(self) -> tuple[FsdpParameterGroup, ...]:
-        """Parameter groups that unshard different data for forward and backward."""
-        return tuple(group for group in self._parameter_groups if group.needs_per_phase_unshard)
 
     @property
     def num_parameter_elements(self) -> int:

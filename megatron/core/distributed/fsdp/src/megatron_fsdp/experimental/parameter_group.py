@@ -440,10 +440,18 @@ class FsdpParameterGroup:
         return self.model_weight.placements == self._unsharded_model_weight.placements
 
     @property
-    def needs_per_phase_unshard(self) -> bool:
-        """Whether forward and backward unshard different data."""
-        return isinstance(self.model_weight, QuantizedDBuffer) and not (
-            self._is_model_weight_unsharded()
+    def has_forward_only_planes(self) -> bool:
+        """Whether unsharded storage holds planes that only forward compute reads.
+
+        True when sharded MXFP8 compute weights have rowwise planes allocated;
+        backward reads only columnwise planes. Other groups need all unsharded
+        storage in both phases.
+        """
+        unsharded_model_weight = self._unsharded_model_weight
+        return (
+            isinstance(unsharded_model_weight, QuantizedDBuffer)
+            and not self._is_model_weight_unsharded()
+            and unsharded_model_weight.is_rowwise_allocated
         )
 
     def _mxfp8_planes_to_unshard(self, phase: Phase | None) -> tuple[bool, bool]:
@@ -455,33 +463,48 @@ class FsdpParameterGroup:
             phase is not Phase.FORWARD and not unsharded_model_weight.is_columnwise_allocated,
         )
 
-    def unshard_parameters(self, phase: Phase | None = None) -> None:
-        """Gather and install full parameters for compute in ``phase``."""
+    def unshard_parameters(self, phase: Phase | None = None) -> set[Phase]:
+        """Gather and install full parameters for compute in ``phase``.
+
+        Returns the phases whose compute the installed parameters now serve: both
+        for regular and replicated compute weights, and those with allocated planes
+        for sharded MXFP8 compute weights.
+        """
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight
             )
             self._model_weight_is_stale = False
 
+        unsharded_model_weight = self._unsharded_model_weight
         if self._is_model_weight_unsharded():
             # Reinstall so parameters see the latest optimizer update; MXFP8 padded
             # scales are copies.
             self._install_unsharded_parameters(self.model_weight)
-        elif isinstance(self.model_weight, DBuffer):
+            ready_phases = {Phase.FORWARD, Phase.BACKWARD}
+        elif isinstance(unsharded_model_weight, DBuffer):
             # Data that is already unsharded will not be gathered again.
-            if not self._unsharded_model_weight.is_allocated:
+            if not unsharded_model_weight.is_allocated:
                 self._install_unsharded_parameters(self._materialize_unsharded_model_weight())
+            ready_phases = {Phase.FORWARD, Phase.BACKWARD}
         else:
             rowwise, columnwise = self._mxfp8_planes_to_unshard(phase)
-            if rowwise or columnwise:
-                self._install_unsharded_parameters(
-                    self._materialize_unsharded_model_weight(
-                        rowwise=rowwise, columnwise=columnwise
-                    ),
-                    rowwise=rowwise,
-                    columnwise=columnwise,
+            self._install_unsharded_parameters(
+                self._materialize_unsharded_model_weight(rowwise=rowwise, columnwise=columnwise),
+                rowwise=rowwise,
+                columnwise=columnwise,
+            )
+            # Forward GEMMs read rowwise planes; backward dgrad GEMMs read columnwise planes.
+            ready_phases = {
+                ready_phase
+                for ready_phase, allocated in (
+                    (Phase.FORWARD, unsharded_model_weight.is_rowwise_allocated),
+                    (Phase.BACKWARD, unsharded_model_weight.is_columnwise_allocated),
                 )
+                if allocated
+            }
         self._switch_to_unsharded_parameters()
+        return ready_phases
 
     def _install_unsharded_parameters(
         self, unsharded_model_weight: "DBuffer | QuantizedDBuffer", **mxfp8_planes: bool
