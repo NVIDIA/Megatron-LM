@@ -857,6 +857,11 @@ the registered KV/SSM buffers. Under memory pressure, evicted decode requests
 recover through the engine's local recomputation path; new requests still
 route to prefill.
 
+For RL, only the final decode completion writes to the request metadata ledger
+or payload stager. Handoffs preserve the request UID, policy/KV epoch history,
+and prefill eviction history. MoE routing replay is not supported: transfer
+setup rejects it because handoffs do not transfer the prompt's routing buffers.
+
 ---
 
 ## Customizing the Pipeline

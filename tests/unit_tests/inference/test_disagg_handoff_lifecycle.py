@@ -7,6 +7,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
+import msgpack
 import pytest
 import torch
 
@@ -16,6 +17,10 @@ from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
     admit_prefilled_decode,
     can_admit_prefilled_decode,
+)
+from megatron.core.inference.disaggregation.engine import (
+    DisaggDynamicInferenceEngine,
+    StateHandoffDynamicInferenceEngine,
 )
 from megatron.core.inference.disaggregation.handoff_completion_tracker import (
     HandoffCompletionTracker,
@@ -33,6 +38,8 @@ from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngin
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    FinishedRequestRecord,
+    RequestPayloadStageResult,
     Status,
     compute_block_hashes_batched,
 )
@@ -170,6 +177,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
         self.track_generated_token_events = False
         self.use_coordinator = False
         self.is_mp_coordinator = False
+        self._generation_epoch = None
 
     async def _notify_cond_for_new_request(self):
         return None
@@ -393,6 +401,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
     engine.context = SimpleNamespace(
         config=SimpleNamespace(kv_transport_backend="nccl"),
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        moe_enable_routing_replay=False,
         kv_block_allocator=allocator,
         memory_buffer=torch.empty(2, 1, 8, 4, 1, 1),
         is_hybrid_model=False,
@@ -448,6 +457,7 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     engine.context = SimpleNamespace(
         config=SimpleNamespace(kv_transport_backend="nixl"),
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        moe_enable_routing_replay=False,
         kv_block_allocator=SimpleNamespace(
             enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
         ),
@@ -542,6 +552,108 @@ def test_handoff_salt_is_used_for_lookup_and_retained_after_import(handoff_loop)
     assert record[-1].precomputed_block_hashes == compute_block_hashes_batched(
         torch.tensor([*prompt, 99, 98, 97, 96]), 4, cache_salt="weights-v2"
     )
+    _drain_loop(handoff_loop)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("decode_epoch, budget", [(3, 3), (4, 3), (4, 1)])
+def test_handoff_records_rl_metadata_only_on_final_decode(
+    handoff_loop, native, decode_epoch, budget
+):
+    cls = DisaggDynamicInferenceEngine if native else StateHandoffDynamicInferenceEngine
+    prefill = object.__new__(cls)
+    prefill._initialize_disaggregation_state()
+    prefill._disagg_config = object() if native else None
+    prefill._kv_transfer_role = "prefill"
+    prefill.local_metadata_ledger_enabled = True
+    prefill.local_metadata_ledger = {}
+    prefill.payload_stager = mock.Mock()
+    prefill.socket_for_receiving_requests = mock.Mock()
+    source = DynamicInferenceRequest(
+        request_id=7,
+        uid="chatcmpl-source",
+        prompt_tokens=torch.tensor([1, 2, 3, 4]),
+        sampling_params=SamplingParams(num_tokens_to_generate=0, do_kv_handoff=True),
+        offload_params={"destination": "training-store"},
+        policy_epoch=[(0, 2)],
+        kv_cache_epoch=[(0, 2)],
+    )
+    source.add_event_evict()
+    record = DynamicInferenceRequestRecord.from_request(source)
+    record.checkpoint()
+    record[-1].policy_epoch.append((2, 3))
+    record[-1].kv_cache_epoch = [(0, 3)]
+    record[-1].status = Status.COMPLETED
+    record[-1].disaggregated_params = {
+        "request_id": 7,
+        "block_ids": [100],
+        "kv_meta": {"resume_tokens": [99]},
+    }
+    completed = prefill._complete_request(
+        RequestEntry(record=record, future=handoff_loop.create_future())
+    )
+    prefill._send_requests_to_coordinator([completed])
+    assert prefill.local_metadata_ledger == {}
+    prefill.payload_stager.stage.assert_not_called()
+    wire = msgpack.unpackb(
+        prefill.socket_for_receiving_requests.send_multipart.call_args.args[0][1]
+    )
+    kv_meta = wire["disaggregated_params"]["kv_meta"]
+
+    decode = _HandoffHarness(handoff_loop)
+    decode._generation_epoch = decode_epoch
+    decode._complete_handoff_request_without_forward = mock.Mock()
+    decode.add_request_with_kv_handoff(
+        70,
+        [1, 2, 3, 4],
+        SamplingParams(num_tokens_to_generate=budget),
+        kv_meta,
+        [100],
+        offload_params=completed.offload_params,
+    )
+    with mock.patch(
+        "megatron.core.inference.disaggregation.inference_state_handoff.admit_prefilled_decode"
+    ):
+        decode._finalize_kv_handoff_import(decode._pending_kv_imports[0])
+    request = decode.get_request(70)
+    boundary = [(4, decode_epoch)] if budget > 1 and decode_epoch != 3 else []
+    assert request.uid == source.uid
+    assert request.policy_epoch == [(0, 2), (2, 3)] + boundary
+    assert request.kv_cache_epoch == [(0, 3)] + boundary
+    assert FinishedRequestRecord.from_request(request).num_evictions == 1
+    assert request.generated_tokens == [99]
+    assert source.policy_epoch == [(0, 2)]  # Restoring did not mutate the source record.
+
+    if budget > 1:
+        # A later decode eviction must retain policy history and both eviction
+        # events, while replacing the KV epoch on recomputation as usual.
+        request.add_event_evict()
+        decoded_record = DynamicInferenceRequestRecord.from_request(request)
+        decoded_record.checkpoint()
+        assert decoded_record[-1].kv_cache_epoch is None
+        decoded_record[-1].kv_cache_epoch = [(0, decode_epoch)]
+        request = decoded_record.merge()
+        assert request.policy_epoch == [(0, 2), (2, 3)] + boundary
+
+    # Final completion owns one ledger entry and one complete staged payload.
+    sink = object.__new__(cls)
+    sink._initialize_disaggregation_state()
+    sink.local_metadata_ledger_enabled = True
+    sink.local_metadata_ledger = {}
+    sink.payload_stager = mock.Mock()
+    sink.payload_stager.stage.return_value = RequestPayloadStageResult()
+    sink.socket_for_receiving_requests = mock.Mock()
+    request.status = Status.COMPLETED
+    sink._send_requests_to_coordinator([request])
+    sink.payload_stager.stage.assert_called_once()
+    stage = sink.payload_stager.stage.call_args
+    assert stage.args[0] == source.uid
+    assert stage.args[1].prompt_token_ids == [1, 2, 3, 4]
+    assert stage.args[1].generated_token_ids == [99]
+    assert stage.kwargs["offload_params"] == source.offload_params
+    assert list(sink.local_metadata_ledger) == [source.uid]
+    assert stage.kwargs["finished_metadata"] is sink.local_metadata_ledger[source.uid]
+    assert stage.kwargs["finished_metadata"].num_evictions == (2 if budget > 1 else 1)
     _drain_loop(handoff_loop)
 
 
@@ -1537,13 +1649,24 @@ def test_decode_role_rejects_prompt_scheduling(handoff_loop):
     assert not engine.waiting_request_ids
 
 
-@pytest.mark.parametrize("mode", [KVCacheManagementMode.OFFLOAD, KVCacheManagementMode.RECOMPUTE])
+@pytest.mark.parametrize(
+    "mode, routing_replay, error",
+    [
+        (KVCacheManagementMode.OFFLOAD, False, "requires kv_cache_management_mode='persist'"),
+        (KVCacheManagementMode.RECOMPUTE, False, "requires kv_cache_management_mode='persist'"),
+        (KVCacheManagementMode.PERSIST, True, "does not support MoE routing replay"),
+    ],
+)
 @pytest.mark.parametrize("role", ["prefill", "decode"])
-def test_transfer_rejects_reallocating_cache_buffers(mode, role):
+def test_transfer_rejects_unsupported_cache_state(mode, routing_replay, error, role):
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
-    engine.context = SimpleNamespace(is_hybrid_model=False, kv_cache_management_mode=mode)
-    with pytest.raises(ValueError, match="requires kv_cache_management_mode='persist'"):
+    engine.context = SimpleNamespace(
+        is_hybrid_model=False,
+        kv_cache_management_mode=mode,
+        moe_enable_routing_replay=routing_replay,
+    )
+    with pytest.raises(ValueError, match=error):
         engine.setup_kv_transfer(role)
     assert engine._kv_transfer_agent is None
     assert engine._kv_transfer_role is None

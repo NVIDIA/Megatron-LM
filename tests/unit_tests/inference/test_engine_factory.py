@@ -37,8 +37,9 @@ def test_prefill_reply_registers_external_ownership_or_sends_compact_native_meta
     engine._require_handoff_claim = require_claim
     engine._disagg_config = object() if native else None
     engine._kv_transfer_role = "prefill"
-    engine.local_metadata_ledger_enabled = False
-    engine.payload_stager = None
+    engine.local_metadata_ledger_enabled = True
+    engine.local_metadata_ledger = {}
+    engine.payload_stager = MagicMock()
     engine.socket_for_receiving_requests = MagicMock()
     handoff = {"request_id": 7, "block_ids": [1], "kv_meta": {"agent": "prefill"}}
     serialized = {"request_id": 7, "prompt_tokens": [1] * 16384, "disaggregated_params": handoff}
@@ -51,6 +52,8 @@ def test_prefill_reply_registers_external_ownership_or_sends_compact_native_meta
         serialize=MagicMock(return_value=serialized),
     )
     engine._send_requests_to_coordinator([request])
+    assert engine.local_metadata_ledger == {}
+    engine.payload_stager.stage.assert_not_called()
     calls = engine.socket_for_receiving_requests.mock_calls
     if native:
         assert len(calls) == 1

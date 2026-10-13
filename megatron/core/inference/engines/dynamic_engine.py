@@ -1791,22 +1791,20 @@ class DynamicInferenceEngine(AbstractEngine):
             if request.status == Status.FAILED:
                 serialized.append(request.serialize())
                 continue
-            # One metadata record per completed request serves both the ledger and the stager.
-            finished_metadata = None
-            if self.local_metadata_ledger_enabled or self.payload_stager is not None:
-                finished_metadata = FinishedRequestRecord.from_request(request)
-            if self.local_metadata_ledger_enabled:
-                assert (
-                    request.uid not in self.local_metadata_ledger
-                ), f"finished-request ledger: duplicate uid {request.uid!r}"
-                self.local_metadata_ledger[request.uid] = finished_metadata
-            serialized.append(self._serialize_finished_request(request, finished_metadata))
+            serialized.append(self._serialize_finished_request(request))
         self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
 
-    def _serialize_finished_request(
-        self, request: DynamicInferenceRequest, finished_metadata: Optional[FinishedRequestRecord]
-    ) -> Dict:
-        """Stage a non-streaming accepted payload before constructing its coordinator reply."""
+    def _serialize_finished_request(self, request: DynamicInferenceRequest) -> Dict:
+        """Record completion and stage an accepted payload before constructing its reply."""
+        # One metadata record per completed request serves both the ledger and the stager.
+        finished_metadata = None
+        if self.local_metadata_ledger_enabled or self.payload_stager is not None:
+            finished_metadata = FinishedRequestRecord.from_request(request)
+        if self.local_metadata_ledger_enabled:
+            assert (
+                request.uid not in self.local_metadata_ledger
+            ), f"finished-request ledger: duplicate uid {request.uid!r}"
+            self.local_metadata_ledger[request.uid] = finished_metadata
         stage_result = None
         if self.payload_stager is not None and not getattr(
             request.sampling_params, "streaming", False

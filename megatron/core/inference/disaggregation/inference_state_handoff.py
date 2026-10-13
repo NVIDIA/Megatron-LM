@@ -8,7 +8,7 @@ import asyncio
 import logging
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Dict
 
 import torch
@@ -28,6 +28,7 @@ from megatron.core.inference.disaggregation.handoff_wire_protocol import (
 )
 from megatron.core.inference.disaggregation.pending_handoff_imports import (
     DeferredKvHandoff,
+    HandoffRequestMetadata,
     PendingKvImport,
     PendingSSMImport,
 )
@@ -49,6 +50,7 @@ from megatron.core.inference.inference_request import (
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 if TYPE_CHECKING:
+    from megatron.core.inference.engines.dynamic_engine import RequestEntry
     from megatron.core.inference.inference_request import DynamicInferenceRequest
     from megatron.core.inference.sampling_params import SamplingParams
 
@@ -71,6 +73,17 @@ class InferenceStateHandoffMixin:
     """Optional KV/SSM handoff behavior composed into the dynamic engine."""
 
     requires_recurrent_state_dummy_slot = True
+
+    def _complete_request(self, request_entry: RequestEntry) -> DynamicInferenceRequest:
+        """Attach merged RL history before the completion is consumed or sent."""
+        request = super()._complete_request(request_entry)
+        if request.disaggregated_params:
+            # The merged record includes evictions from all prefill checkpoints.
+            # No await intervenes before the completion future's consumers resume.
+            request.disaggregated_params["kv_meta"]["request_metadata"] = asdict(
+                HandoffRequestMetadata.from_request(request)
+            )
+        return request
 
     def _initialize_disaggregation_state(self) -> None:
         """Initialize state without importing or constructing a transfer backend."""
@@ -284,6 +297,11 @@ class InferenceStateHandoffMixin:
             raise ValueError(
                 "Disaggregated KV transfer requires kv_cache_management_mode='persist'; "
                 "offload and recompute invalidate registered transfer buffers"
+            )
+        if self.context.moe_enable_routing_replay:
+            raise ValueError(
+                "Disaggregated KV transfer does not support MoE routing replay; "
+                "handoffs do not transfer the prompt's routing-replay buffers"
             )
         self._kv_transfer_role = role
         self._require_handoff_claim = require_handoff_claim
@@ -862,6 +880,7 @@ class InferenceStateHandoffMixin:
                 f"expected {expected_blocks}, got {num_blocks}"
             )
         future = self._loop.create_future()
+        request_metadata = kv_meta.get("request_metadata")
         handoff = DeferredKvHandoff(
             request_id=request_id,
             prompt=prompt,
@@ -874,6 +893,9 @@ class InferenceStateHandoffMixin:
             num_blocks=num_blocks,
             future=future,
             offload_params=offload_params,
+            request_metadata=(
+                HandoffRequestMetadata(**request_metadata) if request_metadata is not None else None
+            ),
         )
         # Preserve receive order under backpressure. This is required by NCCL's
         # two-sided transport and also prevents a stream of small handoffs from
@@ -1005,6 +1027,7 @@ class InferenceStateHandoffMixin:
             local_blocks=local_blocks,
             hashes=handoff.hashes,
             block_hash_salt=handoff.kv_meta.get("block_hash_salt"),
+            request_metadata=handoff.request_metadata,
             cached_prefix_block_count=len(cached_blocks),
             handle=handle,
             future=handoff.future,
@@ -1270,9 +1293,14 @@ class InferenceStateHandoffMixin:
                     request.finish_reason = "stop"
 
             request.num_cached_tokens = len(pending.prompt)
-            if request.finish_reason == "stop" or (
+            finished = request.finish_reason == "stop" or (
                 len(request.generated_tokens) >= request.sampling_params.num_tokens_to_generate
-            ):
+            )
+            if pending.request_metadata is not None:
+                pending.request_metadata.restore(
+                    request, None if finished else self._generation_epoch
+                )
+            if finished:
                 self._release_pending_kv_import(pending)
                 self._complete_handoff_request_without_forward(pending.request_id)
             else:

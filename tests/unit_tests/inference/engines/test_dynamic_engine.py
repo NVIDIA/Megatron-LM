@@ -2197,7 +2197,8 @@ def test_finished_vlm_reply_omits_input_only_tensors():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.payload_stager = None
 
-    serialized = engine._serialize_finished_request(request, None)
+    engine.local_metadata_ledger_enabled = False
+    serialized = engine._serialize_finished_request(request)
 
     assert serialized["generated_tokens"] == [7]
     for key in (

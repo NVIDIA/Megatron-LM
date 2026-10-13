@@ -8,7 +8,7 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
 )
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.headers import Headers
-from megatron.core.inference.inference_request import DynamicInferenceRequest, FinishedRequestRecord
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.utils import internal_api
 
 try:
@@ -24,6 +24,12 @@ class StateHandoffDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInfe
     transfer role with :meth:`setup_kv_transfer`. It intentionally does not
     install the coordinator-native registration protocol below.
     """
+
+    def _serialize_finished_request(self, request: DynamicInferenceRequest) -> dict:
+        """A prefill handoff is intermediate, not a ledger/stager completion."""
+        if request.disaggregated_params:
+            return request.serialize()
+        return super()._serialize_finished_request(request)
 
     def _send_requests_to_coordinator(self, requests: list[DynamicInferenceRequest]) -> None:
         """Register external handoffs before publishing their source descriptors."""
@@ -52,9 +58,7 @@ class DisaggDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
     control planes should use :class:`StateHandoffDynamicInferenceEngine`.
     """
 
-    def _serialize_finished_request(
-        self, request: DynamicInferenceRequest, finished_metadata: FinishedRequestRecord | None
-    ) -> dict:
+    def _serialize_finished_request(self, request: DynamicInferenceRequest) -> dict:
         """Send handoff metadata and canonical tokens on the internal decode hop."""
         if self._is_disaggregated_role("prefill") and request.disaggregated_params:
             return {
@@ -65,7 +69,7 @@ class DisaggDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
                 "prompt_frame": msgpack.packb(request.prompt_tokens.tolist(), use_bin_type=True),
                 "offload_frame": msgpack.packb(request.offload_params, use_bin_type=True),
             }
-        return super()._serialize_finished_request(request, finished_metadata)
+        return super()._serialize_finished_request(request)
 
     @internal_api
     def set_disaggregation_config(
