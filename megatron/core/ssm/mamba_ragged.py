@@ -16,11 +16,10 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from causal_conv1d import causal_conv1d_fn
 from einops import rearrange
 
 from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
-from megatron.core.ssm.mamba_mixer import MAMBA_HAS_STATE_DTYPE, MambaMixer
+from megatron.core.ssm.mamba_mixer import MAMBA_HAS_STATE_DTYPE, MambaMixer, causal_conv1d_fn
 
 
 # IDX is tl.int32, or tl.int64 when a tensor reaches 2^31 elements (see _index_dtype).
@@ -211,6 +210,8 @@ def scan_mamba_ragged_forest(
     save_intermediates = os.environ.get("NRL_SP_MAMBA_SAVE_INTERMEDIATES", "0")
     if save_intermediates not in ("0", "1"):
         raise ValueError("NRL_SP_MAMBA_SAVE_INTERMEDIATES must be exactly '0' or '1'")
+    if causal_conv1d_fn is None:
+        raise ImportError("Ragged Mamba requires causal_conv1d")
 
     from megatron.core.ssm.mamba_ragged_scan import mamba_chunk_scan_forest
 

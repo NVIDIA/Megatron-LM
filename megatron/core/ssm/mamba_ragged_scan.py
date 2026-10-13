@@ -19,23 +19,29 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_bwd, _bmm_chunk_fwd
-from mamba_ssm.ops.triton.ssd_chunk_scan import (
-    _chunk_scan_bwd_dC,
-    _chunk_scan_bwd_dcb,
-    _chunk_scan_bwd_ddAcs_stable,
-    _chunk_scan_bwd_dstates,
-    _chunk_scan_fwd,
-)
-from mamba_ssm.ops.triton.ssd_chunk_state import (
-    _chunk_cumsum_bwd,
-    _chunk_cumsum_fwd,
-    _chunk_state_bwd_db,
-    _chunk_state_fwd,
-)
-from mamba_ssm.ops.triton.ssd_combined import _chunk_scan_chunk_state_bwd_dx
 from torch import Tensor
 from torch.autograd.function import once_differentiable
+
+try:
+    from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_bwd, _bmm_chunk_fwd
+    from mamba_ssm.ops.triton.ssd_chunk_scan import (
+        _chunk_scan_bwd_dC,
+        _chunk_scan_bwd_dcb,
+        _chunk_scan_bwd_ddAcs_stable,
+        _chunk_scan_bwd_dstates,
+        _chunk_scan_fwd,
+    )
+    from mamba_ssm.ops.triton.ssd_chunk_state import (
+        _chunk_cumsum_bwd,
+        _chunk_cumsum_fwd,
+        _chunk_state_bwd_db,
+        _chunk_state_fwd,
+    )
+    from mamba_ssm.ops.triton.ssd_combined import _chunk_scan_chunk_state_bwd_dx
+
+    HAVE_MAMBA_SSM = True
+except ImportError:
+    HAVE_MAMBA_SSM = False
 
 _STATE_BLOCK = 256
 
@@ -463,6 +469,8 @@ def mamba_chunk_scan_forest(
         responsibility. No gate, external states, or second derivatives are
         provided. Padding must be excluded from downstream loss/output maps.
     """
+    if not HAVE_MAMBA_SSM:
+        raise ImportError("Forest scan requires mamba_ssm")
     if x.ndim != 4 or x.shape[0] != 1 or x.shape[1] == 0:
         raise ValueError("Forest scan requires nonempty x with shape [1, T, H, P]")
     if chunk_size < 1 or chunk_size & (chunk_size - 1) or x.shape[1] % chunk_size:

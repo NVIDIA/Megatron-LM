@@ -6,12 +6,12 @@ from functools import lru_cache
 from itertools import accumulate
 
 import torch
-from causal_conv1d import causal_conv1d_fn
 from einops import rearrange
 
 from megatron.core.ssm.mamba_mixer import (
     MAMBA_HAS_STATE_DTYPE,
     MambaMixer,
+    causal_conv1d_fn,
     mamba_chunk_scan_combined,
 )
 
@@ -45,6 +45,8 @@ def scan_mamba_packed_recurrence(
     Returns canonical y without a gate, normalization or CP transform. Each
     complete sequence starts at recurrence state zero and a chunk boundary.
     """
+    if causal_conv1d_fn is None or mamba_chunk_scan_combined is None:
+        raise ImportError("Packed Mamba recurrence requires causal_conv1d and mamba_ssm")
     if recurrent.ndim != 3 or recurrent.shape[1] != 1:
         raise ValueError("Packed recurrence requires [sequence, 1, channels]")
     if not lengths or min(lengths) < 1 or sum(lengths) != recurrent.shape[0]:
