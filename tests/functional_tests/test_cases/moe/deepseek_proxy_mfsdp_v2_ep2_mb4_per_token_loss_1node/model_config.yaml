@@ -1,4 +1,5 @@
-# DeepSeek-style proxy with EP=2 and two accumulated microbatches.
+# DeepSeek-style proxy with EP=2 on one GB200 node (4 GPUs).
+# Global batch size 512 / (microbatch size 32 * DP size 4) = four microbatches.
 # EOD loss masking gives ranks and microbatches different valid-token counts.
 # Normalize accumulated gradients by the global valid-token count through
 # the standard training schedule. This case requires its own masked-loss goldens.
