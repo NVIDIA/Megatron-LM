@@ -215,8 +215,9 @@ class FsdpContext:
 
     def post_backward(self) -> None:
         """Order current-stream consumers after this backward's gradient reductions."""
-        self._run_delayed_post_backward_callbacks()
-        if not self.caller_managed_grad_sync:
+        if self.caller_managed_grad_sync:
+            self._run_delayed_post_backward_callbacks()
+        else:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
 
