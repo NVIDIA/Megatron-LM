@@ -9,18 +9,22 @@ the guard must reject exactly the arg combinations whose config ends up with the
 """
 
 import argparse
+import ctypes
 import os
 
 import pytest
 import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_torch_min_version
 from megatron.training.determinism import (
     ARG_VALUES_REQUIRED_FOR_DETERMINISM,
     DETERMINISM_ENV_VAR_DEFAULTS,
     apply_determinism_env,
     apply_determinism_to_args,
+    assert_nccl_algo_still_empty,
 )
+from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.fixture(autouse=True)
@@ -140,3 +144,60 @@ def test_empty_nccl_algo_is_rejected_on_hopper(nccl_algo, arch, error, monkeypat
     else:
         apply_determinism_to_args(make_args())
         assert os.environ["NCCL_ALGO"] == ("Ring" if nccl_algo is None else nccl_algo)
+
+
+def test_assert_nccl_algo_still_empty(monkeypatch):
+    """Passes while libc still sees "", fails once a C++ write (PyTorch's) changes it."""
+    monkeypatch.setenv("NCCL_ALGO", "")  # putenv, so libc agrees with os.environ
+    assert_nccl_algo_still_empty()
+    ctypes.CDLL(None).setenv(b"NCCL_ALGO", b"^NVLS", 1)  # what PyTorch does in C++
+    with pytest.raises(AssertionError, match="NVLS exclusion applied anyway"):
+        assert_nccl_algo_still_empty()
+
+
+def test_assert_nccl_algo_still_empty_ignores_unset(monkeypatch):
+    """Unset NCCL_ALGO is not checked, although PyTorch then writes ^NVLS."""
+    monkeypatch.delenv("NCCL_ALGO", raising=False)
+    libc = ctypes.CDLL(None)
+    libc.setenv(b"NCCL_ALGO", b"^NVLS", 1)
+    try:
+        assert_nccl_algo_still_empty()
+    finally:
+        libc.unsetenv(b"NCCL_ALGO")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize(
+    "nccl_algo, expected",
+    [
+        pytest.param(
+            None,
+            b"^NVLS",
+            marks=pytest.mark.skipif(
+                not is_torch_min_version("2.8.0"), reason="PyTorch writes ^NVLS from 2.8"
+            ),
+        ),
+        ("", b""),
+    ],
+)
+def test_pytorch_leaves_empty_nccl_algo_alone(nccl_algo, expected, monkeypatch):
+    """Unset gets ^NVLS from PyTorch (the negative control); an empty NCCL_ALGO is left alone.
+
+    Without the control, the "" case could pass because PyTorch stopped banning NVLS.
+    """
+    Utils.initialize_distributed()
+    libc = ctypes.CDLL(None)
+    libc.getenv.restype = ctypes.c_char_p
+    libc.getenv.argtypes = [ctypes.c_char_p]
+    if nccl_algo is None:
+        monkeypatch.delenv("NCCL_ALGO", raising=False)
+    else:
+        monkeypatch.setenv("NCCL_ALGO", nccl_algo)
+    try:
+        torch.use_deterministic_algorithms(True)  # the autouse fixture restores it
+        group = torch.distributed.new_group(list(range(torch.distributed.get_world_size())))
+        assert libc.getenv(b"NCCL_ALGO") == expected
+        assert_nccl_algo_still_empty()  # unset: a no-op even though libc holds ^NVLS
+        torch.distributed.destroy_process_group(group)
+    finally:
+        libc.unsetenv(b"NCCL_ALGO")  # PyTorch's C++ write bypasses monkeypatch

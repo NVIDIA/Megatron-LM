@@ -2,7 +2,7 @@
 
 """Reusable helpers for enabling bit-exact-reproducible execution.
 
-Two entry points:
+Three entry points:
 
 * :func:`apply_determinism_env` — validate env-var settings and setdefault
   the canonical values. Must run BEFORE the first cuBLAS / Transformer
@@ -10,10 +10,13 @@ Two entry points:
 * :func:`apply_determinism_to_args` — validate a parsed ``args`` Namespace,
   call :func:`apply_determinism_env` on ``os.environ``, and flip
   ``torch.use_deterministic_algorithms(True)``.
+* :func:`assert_nccl_algo_still_empty` — after the first NCCL process group,
+  check that PyTorch left an empty ``NCCL_ALGO`` alone.
 """
 
 from __future__ import annotations
 
+import ctypes
 import os
 from typing import MutableMapping
 
@@ -268,3 +271,21 @@ def apply_determinism_to_args(args) -> None:
     # — roughly 15% TFLOP/s on large configs. Set back to True only to debug a
     # suspected uninitialized-memory read.
     torch.utils.deterministic.fill_uninitialized_memory = False
+
+
+def assert_nccl_algo_still_empty() -> None:
+    """No-op unless NCCL_ALGO was set empty. Call after the first NCCL process group.
+
+    PyTorch writes NCCL_ALGO from C++, which ``os.environ`` does not see, so the value is
+    read back through libc.
+    """
+    if os.environ.get("NCCL_ALGO") != "":
+        return
+    libc = ctypes.CDLL(None)
+    libc.getenv.restype = ctypes.c_char_p
+    libc.getenv.argtypes = [ctypes.c_char_p]
+    actual = libc.getenv(b"NCCL_ALGO")
+    assert actual == b"", (
+        f'NCCL_ALGO was "" but is {actual!r} after process-group creation, so '
+        "PyTorch's NVLS exclusion applied anyway. Unset NCCL_ALGO to use the Ring default."
+    )
