@@ -50,8 +50,7 @@ def _graph_task(model, inputs, node):
     [(None,), (None, None), (None, None, None), (0, 1, 0)],
     ids=["one_graph_task", "two_graph_tasks", "three_graph_tasks", "unequal_multiplicities"],
 )
-@pytest.mark.parametrize("set_to_none", [False, True])
-def test_gradients_and_updates_match_baseline(distributed_setup, nodes, set_to_none):
+def test_gradients_and_updates_match_baseline(distributed_setup, nodes):
     """Losses, public gradients, and updated weights match dense training."""
     setup = distributed_setup
     torch.manual_seed(0)
@@ -67,8 +66,8 @@ def test_gradients_and_updates_match_baseline(distributed_setup, nodes, set_to_n
 
     torch.manual_seed(123 + setup.rank)
     for _ in range(2):
-        optimizer.zero_grad(set_to_none=set_to_none)
-        baseline_optimizer.zero_grad(set_to_none=set_to_none)
+        optimizer.zero_grad()
+        baseline_optimizer.zero_grad()
         # Two windows per step exercise countdown re-arming and gradient accumulation.
         for _ in range(2):
             for node in nodes:

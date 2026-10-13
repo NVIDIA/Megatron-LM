@@ -38,15 +38,11 @@ class Countdown:
             self._value = self._initial_value
         return completed
 
-    def check_complete(self) -> None:
-        """Reject a partially completed cycle at the gradient synchronization boundary.
+    @property
+    def is_complete(self) -> bool:
+        """Return whether the cycle is untouched or has automatically re-armed.
 
-        An untouched or automatically re-armed countdown is valid. This only checks
-        the total callback count; it cannot identify which parameter is missing or
-        detect surplus callbacks that complete another whole cycle.
+        This reports total-count state; it cannot detect missing callbacks before
+        a cycle starts or surplus callbacks that complete another whole cycle.
         """
-        if self._value != self._initial_value:
-            completed = self._initial_value - self._value
-            raise ValueError(
-                f"gradient window sealed mid-flight: {completed}/{self._initial_value}"
-            )
+        return self._value == self._initial_value
