@@ -53,6 +53,16 @@ try:
 except ImportError:
     _grad_accum_fusion_available = False
 
+# embedding_backward_feature_kernel (<=3072 indices) can drop or double-count a
+# row for 2017..3072 CUDA indices under GPU contention, even when deterministic
+# algorithms are on. pytorch/pytorch#199569 fixes that and landed on main on
+# 2026-10-05. It is not in any release through 2.15, including 2.9. Nightlies
+# still sort below 2.16.0, so they keep the index gather as well.
+try:
+    _EMBEDDING_BACKWARD_FEATURE_KERNEL_FIXED = is_torch_min_version("2.16.0")
+except ImportError:
+    _EMBEDDING_BACKWARD_FEATURE_KERNEL_FIXED = False
+
 try:
     import transformer_engine  # pylint: disable=unused-import
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -347,6 +357,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
         self.config = config
+        self.deterministic_mode = config.deterministic_mode
 
         self.use_inference_optimized_reduce_scatter = (
             getattr(config, 'transformer_impl', None) == 'inference_optimized'
@@ -429,9 +440,13 @@ class VocabParallelEmbedding(torch.nn.Module):
 
             weight = GTPEmbeddingWeight.apply(self.weight)
 
-        # Row gather. F.embedding backward is deterministic under
-        # torch.use_deterministic_algorithms(True) (--deterministic-mode).
-        output_parallel = F.embedding(masked_input, weight)
+        # Row gather. Both ops read the same rows (no padding_idx, scale_grad_by_freq,
+        # or sparse). deterministic_mode keeps the index gather until the torch build
+        # includes pytorch/pytorch#199569; F.embedding is safe once that fix is present.
+        if self.deterministic_mode and not _EMBEDDING_BACKWARD_FEATURE_KERNEL_FIXED:
+            output_parallel = weight[masked_input]
+        else:
+            output_parallel = F.embedding(masked_input, weight)
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0

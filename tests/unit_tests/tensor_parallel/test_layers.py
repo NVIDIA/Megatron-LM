@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel.layers import (
     linear_with_grad_accumulation_and_async_allreduce,
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -537,12 +538,12 @@ class TestWgradGemmAccumulate:
 
 
 class TestVocabParallelEmbeddingLookup:
-    """VocabParallelEmbedding used to fork on deterministic_mode (weight[idx] vs F.embedding).
+    """VocabParallelEmbedding gather: weight[idx] vs F.embedding.
 
-    This layer never sets padding_idx, scale_grad_by_freq, or sparse, so both ops gather
-    the same rows. F.embedding's CUDA backward is deterministic when
-    torch.use_deterministic_algorithms(True) is set (--deterministic-mode), so the
-    lookup is unified on F.embedding.
+    This layer never sets padding_idx, scale_grad_by_freq, or sparse, so both ops
+    gather the same rows. deterministic_mode keeps the index gather until torch 2.16,
+    because embedding_backward_feature_kernel races on 2017..3072 CUDA indices before
+    pytorch/pytorch#199569. Forward values still match F.embedding.
     """
 
     def test_embedding_matches_advanced_indexing_on_cpu(self):
@@ -565,6 +566,8 @@ class TestVocabParallelEmbeddingLookup:
     def test_forward_matches_f_embedding(self, deterministic_mode):
         Utils.initialize_model_parallel(1, 1)
         try:
+            # GPU init forks model-parallel-rng. initialize_model_parallel does not add it.
+            model_parallel_cuda_manual_seed(123)
             cfg = TransformerConfig(
                 num_layers=1,
                 hidden_size=8,

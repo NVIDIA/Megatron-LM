@@ -256,7 +256,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
         ),
         kind="torch-op",
-        notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding) and local Column/RowParallelLinear "
+        notes="VocabParallelEmbedding (weight[idx] until torch 2.16, else F.embedding) and local TP linears "
         "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion.",
     ),
     KernelEntry(
