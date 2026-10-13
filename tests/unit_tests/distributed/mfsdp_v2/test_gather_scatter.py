@@ -51,7 +51,7 @@ def _known_full_tensors(dbuffer: DBuffer) -> list[torch.Tensor]:
 @pytest.mark.parametrize("subgroup", [False, True])
 @pytest.mark.parametrize("placement", [RowAtomic(), BlockAtomic(2), TensorAtomic()])
 def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
-    """Gather computed inputs and scatter noncontiguous results into remote buffer views."""
+    """Gather computed inputs into contiguous tensors and scatter the results."""
     if distributed_setup.world_size < 2:
         pytest.skip("Needs at least two ranks.")
     device = distributed_setup.device
@@ -80,7 +80,7 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
     original = dbuffer.local_buffer.clone()
     this_rank = mesh.get_rank()
     tensor_to_owner = assign_owner_work(dbuffer, [0, 1])
-    # Dictionary insertion order can differ across ranks; P2P must still match by tensor index.
+    # Reverse traversal on odd ranks to check that P2P is independent of dictionary order.
     if this_rank % 2:
         tensor_to_owner = dict(reversed(list(tensor_to_owner.items())))
 
@@ -92,8 +92,7 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
 
     owned = {i for i, owner in tensor_to_owner.items() if owner == this_rank}
     destination = {
-        i: torch.empty((*full_tensors[i].shape, 2), dtype=dbuffer.dtype, device=device)[..., 0]
-        for i in owned
+        i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
     gather(source, destination, tensor_to_owner=tensor_to_owner)
     for i in owned:
