@@ -204,8 +204,18 @@ class _RecordingDSA:
         self.calls = []
 
     def sparse_attention_backward_wrapper(
-        self, q, kv, out, dout, lse, attn_sink, topk_idxs, softmax_scale, topk_length,
-        deterministic=False, workspace=None,
+        self,
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale,
+        topk_length,
+        deterministic=False,
+        workspace=None,
     ):
         self.calls.append(dict(deterministic=deterministic, workspace=workspace))
         return {
@@ -293,7 +303,9 @@ def test_csa_sparse_attn_honours_config_flag_without_torch_switch(monkeypatch, d
             patch.object(dk, "_csa_fwd_flash_mla", fake_fwd),
             patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
         ):
-            out = dk.csa_sparse_attn(q, kv, sink, idx, 0.5, is_thd=True, deterministic=deterministic)
+            out = dk.csa_sparse_attn(
+                q, kv, sink, idx, 0.5, is_thd=True, deterministic=deterministic
+            )
             out.backward(torch.ones_like(out))
     finally:
         torch.use_deterministic_algorithms(prior)
