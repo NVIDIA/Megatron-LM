@@ -12,16 +12,29 @@ carries several draft tokens and the kernels snapshot the conv and recurrent sta
 each of them -- and the torch gated-delta-rule path that ``--deterministic-mode`` selects
 instead of FLA.
 
-Autotuning is the mechanism that can break replay here: ``ops/common/determinism.py`` pins a
-single config and a zero-initialised, ordered-sum workspace when ``MAMBA_DETERMINISTIC`` (or
-``torch.use_deterministic_algorithms``) is on. Each kernel is replayed in that mode.
+Autotuning is the mechanism that can break replay here: ``megatron.core.tuning`` pins a
+single config, while ``ops/common/determinism.py`` selects a zero-initialised, ordered-sum
+workspace when the explicit deterministic policy (or ``torch.use_deterministic_algorithms``) is on.
+Each kernel is replayed in that mode, including with Triton's autotune cache enabled.
 """
 
 import pytest
 import torch
 
+from megatron.core.ssm import mamba_mixer as mamba_mixer_module
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from megatron.core.tuning import autotune_configs, choice_log
+from megatron.core.tuning import policy as tuning_policy
+from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
+    _build_mixer,
+    requires_deterministic_conv1d,
+)
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
+    seeded,
+)
+from tests.unit_tests.test_utilities import Utils
 
 try:
     import triton  # noqa: F401
@@ -36,11 +49,40 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def ssm_deterministic():
+def ssm_deterministic(monkeypatch):
     """Pin the SSM autotuner / workspace path like ``--deterministic-mode`` does."""
-    ssm_determinism.set_deterministic_mode(True)
-    yield
-    ssm_determinism.set_deterministic_mode(None)
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
+
+
+def _autotuner(kernel):
+    """The ``Autotuner`` under ``kernel``; ``@triton.heuristics`` wraps it in another object."""
+    from triton.runtime.autotuner import Autotuner
+
+    while not isinstance(kernel, Autotuner):
+        kernel = kernel.fn
+    return kernel
+
+
+def _forbid_benchmarks(monkeypatch, *tuners, cache_results=False):
+    """Fail if any tuner times a config, including through Triton's autotune disk cache."""
+
+    def forbid_benchmark(*args, **kwargs):
+        raise AssertionError("deterministic SSM execution benchmarked a config")
+
+    for tuner in tuners:
+        # Training imports these kernels before determinism is enabled, so they keep every
+        # candidate and only the runtime adapter stands between them and timed selection.
+        assert len(tuner.configs) > 1, "expected the full candidate list at import"
+        monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
+        # Triton < 3.4 has no autotune disk cache.
+        monkeypatch.setattr(tuner, "cache_results", cache_results, raising=False)
+
+
+def _assert_pinned(*tuners):
+    for tuner in tuners:
+        name = tuner.base_fn.__name__
+        choices = [value for key, value in choice_log().items() if f".{name}|" in key]
+        assert choices and all(value.endswith(";pinned") for value in choices), choices
 
 
 # --- Mamba2 --------------------------------------------------------------------------------
@@ -200,8 +242,27 @@ def test_causal_conv1d_update_spec_decode_replays():
     )
 
 
-def test_causal_conv1d_varlen_replays():
-    from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
+@pytest.mark.parametrize("cache_autotuning", [False, True], ids=["no_cache", "autotune_cache"])
+def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
+    from megatron.core.ssm.ops.common import causal_conv1d_varlen
+
+    monkeypatch.setenv("TRITON_CACHE_AUTOTUNING", "1" if cache_autotuning else "0")
+    assert ssm_determinism.autotune_configs is autotune_configs
+    assert ssm_determinism.use_deterministic_mode()
+    # Kernels decorated under deterministic mode are reduced to one config at import,
+    # whatever the autotune cache setting.
+    decorated = autotune_configs(
+        [
+            triton.Config({"BLOCK_T": 8, "BLOCK_C": 256}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_T": 128, "BLOCK_C": 128}, num_warps=4),
+        ]
+    )
+    assert len(decorated) == 1
+
+    # Replay the real module-level autotuner, which keeps every candidate because it was
+    # imported before determinism was enabled, as in training.
+    tuner = _autotuner(causal_conv1d_varlen._causal_conv1d_varlen_kernel)
+    _forbid_benchmarks(monkeypatch, tuner, cache_results=cache_autotuning)
 
     seeded()
     dim, width = 2048, 4
@@ -214,37 +275,20 @@ def test_causal_conv1d_varlen_replays():
         len(bounds) - 1, dim, width - 1, device="cuda", dtype=torch.bfloat16
     )
     assert_replays_bit_exact(
-        lambda x, w, b, s: causal_conv1d_varlen_fn(x, w, b, cu_seqlens, s),
+        lambda x, w, b, s: causal_conv1d_varlen.causal_conv1d_varlen_fn(x, w, b, cu_seqlens, s),
         (x, weight, bias, initial_states),
         replays=4,
         backward=False,
         what="causal_conv1d_varlen_fn",
     )
+    _assert_pinned(tuner)
 
 
 # --- Gated Delta Product ----------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="GDP varlen chunk scan replays differ on GB300 / Triton 3.7 even with the autotune "
-    "pinned to one config and the ordered workspace (measured 2026-09-04: ~0.15% of output "
-    "elements, max |diff| 3.6e-2 bf16; final state ~0.13%, 2.9e-4). Recorded for the hybrid "
-    "model owners; not gated until root-caused.",
-)
-def test_chunk_gated_delta_product_varlen_replays():
-    from megatron.core.ssm.ops.gdp import chunk_h, chunk_o
+def _gdp_case():
     from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
-
-    # The deterministic policy must have pinned the autotuners at import; otherwise the
-    # replay would measure Triton's timing-based config search, not the kernels.
-    for kernel in (
-        chunk_h.chunk_gated_delta_product_fwd_kernel_h_blockdim64,
-        chunk_o.chunk_fwd_kernel_o,
-    ):
-        configs = getattr(kernel, "configs", None)
-        if configs is not None and len(configs) != 1:
-            pytest.skip("GDP autotuners were imported before the deterministic policy was set")
 
     seeded()
     T, H, K, V, M = 4096, 16, 128, 128, 2
@@ -271,12 +315,36 @@ def test_chunk_gated_delta_product_varlen_replays():
             use_qk_l2norm_in_kernel=True,
         )
 
+    return fn, (q, k, v, g, beta, initial_state)
+
+
+def test_chunk_gated_delta_product_varlen_is_pinned(monkeypatch):
+    """Runtime pinning covers the GDP autotuners, which training imports before determinism."""
+    from megatron.core.ssm.ops.gdp import chunk_h, chunk_o
+
+    tuners = (
+        _autotuner(chunk_h.chunk_gated_delta_product_fwd_kernel_h_blockdim64),
+        _autotuner(chunk_o.chunk_fwd_kernel_o),
+    )
+    _forbid_benchmarks(monkeypatch, *tuners)
+    fn, args = _gdp_case()
+    fn(*args)
+    torch.cuda.synchronize()
+    _assert_pinned(*tuners)
+
+
+@pytest.mark.xfail(
+    strict=False,
+    raises=AssertionError,
+    reason="GDP varlen chunk scan replays differ on GB300 / Triton 3.7 even with the autotune "
+    "pinned to one config and the ordered workspace (measured 2026-09-04: ~0.15% of output "
+    "elements, max |diff| 3.6e-2 bf16; final state ~0.13%, 2.9e-4). Recorded for the hybrid "
+    "model owners; not gated until root-caused.",
+)
+def test_chunk_gated_delta_product_varlen_replays():
+    fn, args = _gdp_case()
     assert_replays_bit_exact(
-        fn,
-        (q, k, v, g, beta, initial_state),
-        replays=4,
-        backward=False,
-        what="chunk_gated_delta_product_varlen",
+        fn, args, replays=4, backward=False, what="chunk_gated_delta_product_varlen"
     )
 
 
@@ -364,6 +432,54 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
     )
 
 
+def test_fused_recurrent_gated_delta_rule_update_padding_replays():
+    """Single-token decode whose ``-1`` padding rows hold NaN/Inf inputs.
+
+    The kernel zeroes padding rows in its output store, so they must come out as ``+0.0``
+    bytes on every replay while real rows and the slot-indexed state cache replay exactly.
+    """
+    from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+
+    seeded()
+    B, H, K, V = 128, 16, 128, 128
+    slots = B + 8
+    q = torch.randn(B, 1, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, 1, H, K, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, 1, H, V, device="cuda", dtype=torch.bfloat16)
+    g = -torch.rand(B, 1, H, device="cuda") * 0.1
+    beta = torch.rand(B, 1, H, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(slots, H, K, V, device="cuda")
+    state_indices = torch.randperm(slots, device="cuda")[:B].to(torch.int32)
+    state_indices[::16] = -1
+    padding = state_indices < 0
+    q[padding] = float("nan")
+    v[padding] = float("inf")
+
+    def fn(q, k, v, g, beta, state, state_indices):
+        return fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            use_qk_l2norm_in_kernel=True,
+            state=state,
+            state_indices=state_indices,
+        )
+
+    ref_out, _ = assert_replays_bit_exact(
+        fn,
+        (q, k, v, g, beta, state, state_indices),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="fused_recurrent_gated_delta_rule_update (padding rows)",
+    )
+    padded_out = ref_out["out[0]"][padding]
+    assert torch.equal(padded_out, torch.zeros_like(padded_out))
+    assert not torch.signbit(padded_out).any()
+
+
 @pytest.mark.parametrize("S", [1, 4])
 def test_gdp_decode_prepare_replays(S):
     """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
@@ -404,6 +520,41 @@ def test_gdp_l2norm_and_cumsum_replay():
 
 
 # --- Gated Delta Net (deterministic torch path vs FLA) ---------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [32, 128])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
+    """Preserve FLA's output/gradient contract while removing autotune-dependent rounding."""
+    from fla.modules.l2norm import l2norm
+
+    from megatron.core.ssm.gated_delta_net.common import torch_l2norm
+
+    seeded()
+    x = torch.randn(2, 256, head_dim, device="cuda", dtype=dtype)
+    # A zero row distinguishes additive epsilon from clamping the norm itself.
+    x[0, 0].zero_()
+    dy = torch.randn_like(x)
+    if dtype == torch.bfloat16:
+        # With an exactly parallel upstream gradient, differentiating an
+        # unrounded norm would erase FLA's saved-rounded-output contribution.
+        x[0, 1].fill_(0.5)
+        dy[0, 1].fill_(32.0)
+    actual_input = x.clone().requires_grad_(True)
+    expected_input = x.clone().requires_grad_(True)
+    normalize = torch.compile(torch_l2norm) if compiled else torch_l2norm
+    actual = normalize(actual_input)
+    expected = l2norm(expected_input)
+    actual.backward(dy)
+    expected.backward(dy)
+    if dtype == torch.bfloat16:
+        assert expected_input.grad[0, 1].abs().min().item() > 1e-4
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_input.grad, expected_input.grad)
+    assert_replays_bit_exact(
+        normalize, (x.requires_grad_(True),), replays=3, contention=True, what="GDN torch L2 norm"
+    )
 
 
 def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
@@ -456,3 +607,71 @@ def test_fla_chunk_gated_delta_rule_replays_fwd_bwd():
         return o, state
 
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=4, what="fla chunk_gated_delta_rule")
+
+
+# --- Mamba mixer: the batch-invariant unfused training path (_static_prefill) ----------------
+
+
+@pytest.mark.skipif(mamba_mixer_module.mamba_chunk_scan_combined is None, reason="needs mamba_ssm")
+@pytest.mark.parametrize("batch_invariant", [True, False], ids=["batch-invariant", "default"])
+def test_unfused_mixer_applies_the_gate_exactly_once(monkeypatch, batch_invariant):
+    """Batch-invariant mode gates inside the scan (as ssm_prefill does), else in the norm.
+
+    The kernel tests above call the scan with ``z`` supplied, so they cannot see which side of
+    the mixer applies it.
+    """
+    mixer = _build_mixer(deterministic_mode=False)
+    try:
+        mixer.use_mem_eff_path = False  # dispatch to _static_prefill
+        mixer.config.batch_invariant_mode = batch_invariant
+        assert mixer.rmsnorm, "the gate placement under test only exists with an RMSNorm"
+
+        scan_gates, norm_gates = [], []
+        real_scan = mamba_mixer_module.mamba_chunk_scan_combined
+        real_norm_forward = mixer.norm.forward
+
+        def scan(*args, **kwargs):
+            scan_gates.append(kwargs.get("z"))
+            return real_scan(*args, **kwargs)
+
+        def norm_forward(x, z=None):
+            norm_gates.append(z)
+            return real_norm_forward(x, z)
+
+        monkeypatch.setattr(mamba_mixer_module, "mamba_chunk_scan_combined", scan)
+        monkeypatch.setattr(mixer.norm, "forward", norm_forward)
+
+        with torch.no_grad():
+            mixer(torch.randn(256, 2, mixer.config.hidden_size, device="cuda"))
+
+        assert len(scan_gates) == 1 and len(norm_gates) == 1
+        gated_in_scan, gated_in_norm = scan_gates[0] is not None, norm_gates[0] is not None
+        assert gated_in_scan != gated_in_norm, "the gate must be applied exactly once"
+        assert gated_in_scan == batch_invariant, (
+            f"batch_invariant_mode={batch_invariant}: the gate went "
+            f"{'into the scan' if gated_in_scan else 'into the norm'}"
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@requires_deterministic_conv1d
+def test_batch_invariant_unfused_mixer_replays_bit_exactly(monkeypatch):
+    """Forward and backward through the batch-invariant unfused training path replay bitwise."""
+    monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    mixer = _build_mixer()
+    try:
+        mixer.use_mem_eff_path = False  # dispatch to _static_prefill
+        mixer.config.batch_invariant_mode = True
+        hidden_states = torch.randn(1024, 4, mixer.config.hidden_size, device="cuda")
+        hidden_states.requires_grad_()
+        assert_module_replays_bit_exact(
+            mixer,
+            (hidden_states,),
+            replays=3,
+            contention=True,
+            what="batch-invariant Mamba mixer (_static_prefill)",
+        )
+    finally:
+        Utils.destroy_model_parallel()

@@ -94,9 +94,8 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
 
     destroy_global_vars()
     destroy_num_microbatches_calculator()
-    set_global_variables(args, build_tokenizer=False)
-
     cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+    set_global_variables(args, cfg_container, build_tokenizer=False)
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     model, optimizer, _ = setup_model_and_optimizer(
         model_type=ModelType.encoder_or_decoder,

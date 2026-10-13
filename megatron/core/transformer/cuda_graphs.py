@@ -24,6 +24,7 @@ from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
+    cudagraph_needs_generator_registration,
     get_all_rng_states,
     get_cuda_rng_tracker,
     is_checkpointing,
@@ -1268,9 +1269,9 @@ class _CudaGraphRunner(torch.nn.Module):
         rng_states = get_all_rng_states()
         with torch.inference_mode(mode=False):
             for gen in rng_states.values():
-                self.fwd_graph.register_generator_state(
-                    _ensure_generator_state_is_cudagraph_safe(gen)
-                )
+                gen = _ensure_generator_state_is_cudagraph_safe(gen)
+                if cudagraph_needs_generator_registration():
+                    self.fwd_graph.register_generator_state(gen)
 
         args_to_clear_buffers = []
 
@@ -1390,10 +1391,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 # before capture begins, to avoid inference-tensor state issues during capture.
                 with torch.inference_mode(mode=False):
                     for device_idx in range(torch.cuda.device_count()):
-                        default_gen = torch.cuda.default_generators[device_idx]
-                        self.fwd_graph.register_generator_state(
-                            _ensure_generator_state_is_cudagraph_safe(default_gen)
+                        default_gen = _ensure_generator_state_is_cudagraph_safe(
+                            torch.cuda.default_generators[device_idx]
                         )
+                        if cudagraph_needs_generator_registration():
+                            self.fwd_graph.register_generator_state(default_gen)
 
                 # Freeze GC, to speed up capture time ~15-20x.
                 if FREEZE_GC:
@@ -1513,8 +1515,9 @@ class _CudaGraphRunner(torch.nn.Module):
         self.bwd_graph = torch.cuda.CUDAGraph()
 
         # For cases with multiple active RNG states, e.g. TP.
-        for _, state in get_all_rng_states().items():
-            self.bwd_graph.register_generator_state(state)
+        if cudagraph_needs_generator_registration():
+            for _, state in get_all_rng_states().items():
+                self.bwd_graph.register_generator_state(state)
 
         self.static_grad_outputs = []
         args_to_clear_buffers = []

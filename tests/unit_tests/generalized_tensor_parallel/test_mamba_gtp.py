@@ -171,7 +171,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
                     p.grad.zero_()
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
     FP8GlobalStateManager.reset()
 
     # -------------------------------------------------------------------------
@@ -231,7 +231,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
                     p.grad.zero_()
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
     FP8GlobalStateManager.reset()
 
     # -------------------------------------------------------------------------
@@ -314,7 +314,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
     FP8GlobalStateManager.reset()
 
     # -------------------------------------------------------------------------

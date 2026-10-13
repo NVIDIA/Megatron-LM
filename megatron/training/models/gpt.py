@@ -4,12 +4,17 @@ import inspect
 import logging
 from typing import Any, Callable, ClassVar, Literal, override
 
-from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import get_gpt_heterogeneous_layer_spec
-from megatron.core.transformer.heterogeneous.heterogeneous_config import HeterogeneousTransformerConfig
 import torch
+
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+    get_gpt_heterogeneous_layer_spec,
+)
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -18,20 +23,20 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.module import Float16Module, MegatronModule
-from megatron.core.transformer.dot_product_attention import DotProductAttention as MCoreDotProductAttention
-from megatron.core.transformer.enums import AttnBackend
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_transformer_block_with_experimental_attention_variant_spec,
+from megatron.core.transformer.dot_product_attention import (
+    DotProductAttention as MCoreDotProductAttention,
 )
-
-from megatron.training.models.base import ModelConfig, ModelBuilder, compose_hooks
-from megatron.training.vocab_utils import calculate_padded_vocab_size
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+    HeterogeneousTransformerConfig,
+)
+from megatron.core.transformer.module import Float16Module, MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
-
-from megatron.core.transformer.transformer_config import  TransformerConfig
-
+from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +45,8 @@ from dataclasses import dataclass
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
-    get_gpt_decoder_layer_specs,
-    get_gpt_layer_with_inference_spec,
     get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 
@@ -405,7 +409,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
 
 def mtp_block_spec(
     config: "GPTModelConfig",
-    transformer_layer_spec: ModuleSpec,
+    transformer_layer_spec: ModuleSpec | TransformerBlockSubmodules,
     vp_stage: int | None = None,
     pp_rank: int | None = None,
 ) -> ModuleSpec | None:
@@ -413,7 +417,7 @@ def mtp_block_spec(
 
     Args:
         config: full model config
-        transformer_layer_spec: decoder layer specification
+        transformer_layer_spec: resolved decoder layer or block specification
         vp_stage: virtual pipeline stage
         pp_rank: pipeline rank from the model process group
 
@@ -426,13 +430,15 @@ def mtp_block_spec(
     if config.transformer.mtp_num_layers is not None:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
-        if hasattr(transformer_layer_spec, "layer_specs") and len(transformer_layer_spec.layer_specs) == 0:
-            # Get the decoder layer spec explicitly if no decoder layer in the last stage,
-            # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-            spec = _te_or_local_layer_spec(config, vp_stage)
+        if isinstance(transformer_layer_spec, TransformerBlockSubmodules):
+            if transformer_layer_spec.layer_specs:
+                # Reuse the resolved spec: the generic decoder builder rejects experimental attention.
+                spec = transformer_layer_spec.layer_specs[-1]
+            else:
+                # A pipeline stage with no decoder layers still needs a decoder spec for MTP.
+                spec = _te_or_local_layer_spec(config, vp_stage)
         else:
-            decoder_specs = get_gpt_decoder_layer_specs(transformer_cfg, use_transformer_engine=use_te, normalization=transformer_cfg.normalization, qk_l2_norm=transformer_cfg.qk_l2_norm, vp_stage=vp_stage)
-            spec = decoder_specs[-1]
+            spec = transformer_layer_spec
 
         return get_gpt_mtp_block_spec(
             transformer_cfg,

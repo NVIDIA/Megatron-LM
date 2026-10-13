@@ -10,7 +10,7 @@ from torch.distributed.tensor import Replicate
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
-    Flat,
+    RowAtomic,
 )
 
 QuantizedDBuffer = pytest.importorskip(
@@ -129,7 +129,7 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
     view = source.view([BlockAtomic(32)])
     assert view.view([BlockAtomic(32)]) is view
     for index, (actual, original) in enumerate(zip(view.planes, source.planes)):
-        assert actual.placements == ((Flat(),) if index == 3 else (BlockAtomic(32),))
+        assert actual.placements == ((RowAtomic(),) if index == 3 else (BlockAtomic(32),))
         chunks = original.local_buffer.view(mesh.size(), -1)
         expected = chunks[mesh.get_local_rank()]
         assert actual.local_buffer.shape == expected.shape

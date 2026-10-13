@@ -167,6 +167,36 @@ def test_build_communicator_wires_bridge_receive_shape(
         assert shape_fns is None
 
 
+@pytest.mark.parametrize("skip_shape_exchange", [False, True])
+def test_llm_only_communicator_has_no_encoder_bridges(monkeypatch, skip_shape_exchange):
+    import examples.mimo.model_providers.nemotron_moe_vlm as provider
+
+    language_grid = object()
+    topology = SimpleNamespace(grids={MIMO_LANGUAGE_MODULE_KEY: language_grid})
+    language_config = SimpleNamespace(hidden_size=2688, params_dtype=torch.bfloat16)
+    # No vision configuration is needed when the topology contains only the LLM.
+    args = SimpleNamespace(mimo_llm_only=True, mimo_bridge_skip_shape_exchange=skip_shape_exchange)
+    monkeypatch.setattr(
+        provider,
+        "language_model_spec",
+        lambda args, pg_collection, grid: SimpleNamespace(params={"config": language_config}),
+    )
+    communicator_cls = provider.MultiModulePipelineCommunicator
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(communicator_cls, "_build_rank_module_info_map", lambda self: None)
+
+    communicator = build_nemotron_communicator(args, topology)
+
+    assert communicator.module_to_grid_map == topology.grids
+    assert communicator.topology == {MIMO_LANGUAGE_MODULE_KEY: []}
+    assert communicator.config is language_config
+    assert communicator.bridge_comms == []
+    assert communicator.module_output_ndim == {}
+    assert communicator.bridge_comm_dtypes == {}
+    assert communicator.bridge_recv_shape_fns == {}
+    assert communicator.bridge_requires_backward == {}
+
+
 # --- Config parity gate (requires torch; runs in CI) ----------------------
 
 pytest.importorskip("torch")
@@ -377,7 +407,9 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
         moe_shortcut_post_norm=True,
         is_hybrid_model=True,
         use_fused_weighted_squared_relu=True,
-        recompute_modules=["moe_act", "shortcut_pre_mlp_layernorm"],
+        wide_residual=object(),
+        residual_stream_recompute_num_layers=4,
+        recompute_modules=["moe_act", "shortcut_pre_mlp_layernorm", "residual_stream"],
         offload_modules=["core_attn", "shortcut_post_norm"],
     )
 
@@ -400,6 +432,8 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
     assert config.moe_shortcut_post_norm is False
     assert config.is_hybrid_model is False
     assert config.use_fused_weighted_squared_relu is False
+    assert config.wide_residual is None
+    assert config.residual_stream_recompute_num_layers is None
     assert config.recompute_modules == ["moe_act"]
     assert config.offload_modules == ["core_attn"]
 
@@ -440,6 +474,7 @@ def test_modality_configs_do_not_inherit_language_fp32_residuals():
 def test_language_model_spec_builds_mamba():
     """language_model_spec returns a MambaModel spec carrying the preset config."""
     from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+    from megatron.core.models.hybrid.hybrid_layer_specs import mamba_stack_spec
     from megatron.core.models.mamba.mamba_model import MambaModel
 
     args = _parse_validate(_build_argv(*_PRESET_20L))
@@ -453,6 +488,19 @@ def test_language_model_spec_builds_mamba():
     assert spec.params["config"].expert_tensor_parallel_size == 2
     assert spec.params["max_sequence_length"] == args.seq_length
     assert spec.params["logit_dtype"] is None
+    assert spec.params["mamba_stack_spec"] is mamba_stack_spec
+
+
+def test_language_model_spec_selects_static_wide_residual_stack():
+    """Wide-residual language configs select the matching static HybridStack spec."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+    from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
+
+    args = _parse_validate(_build_argv(*_PRESET_20L) + ["--wide-residual", "3"])
+    spec = language_model_spec(args, pg_collection=None, llm_grid=None)
+
+    assert spec.params["config"].wide_residual.num_streams == 3
+    assert spec.params["mamba_stack_spec"] is wide_residual_hybrid_stack_spec
 
 
 @pytest.mark.parametrize(

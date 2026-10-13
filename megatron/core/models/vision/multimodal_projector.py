@@ -37,6 +37,7 @@ class MultimodalProjector(MegatronModule):
     ):
         super().__init__(config=config)
         self.projector_type = projector_type
+        self.pg_collection = pg_collection
         tp_group = pg_collection.tp if pg_collection is not None else tp_group
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group)
 

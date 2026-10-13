@@ -28,7 +28,9 @@ from tools.run_dynamic_text_generation_server import add_text_generation_server_
 @pytest.mark.parametrize(
     ("serve_args", "expected_defaults"),
     [
-        ([], (1.0, 1.0, 0, False)),
+        # Both CLIs leave these unset so the model's generation_config.json can
+        # apply; a hardcoded default here would make that tier unreachable.
+        ([], (None, None, None, False)),
         (
             [
                 "--default-temperature",

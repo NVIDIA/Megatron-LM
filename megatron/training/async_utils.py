@@ -15,6 +15,7 @@ from megatron.core.dist_checkpointing.strategies.nvrx import (
 )
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
+from megatron.training.global_vars import get_run_config
 
 
 def _tag_current_span_call_idx(call_idx):
@@ -80,11 +81,12 @@ def build_otel_worker_bootstrap(args):
     class instance there would tie correctness to an import path staying
     resolvable in a separate process.
     """
+    cfg = get_run_config()
     import os
 
     from megatron.training.global_vars import build_telemetry_resource_attrs
 
-    service_name = getattr(args, 'otel_service_name', None)
+    service_name = cfg.logger.otel_service_name
     if not service_name and not os.environ.get('OTEL_SERVICE_NAME', '').strip():
         service_name = 'megatron-lm'
 
@@ -104,7 +106,7 @@ def build_otel_worker_bootstrap(args):
     #       set_enabled_span_groups() with this AFTER setup_telemetry, overriding
     #       the base-safe set -- giving it trace_region etc. (save-side
     #       checkpoint internals). An OLD worker ignores this key.
-    worker_span_groups = getattr(args, 'otel_span_groups', None)
+    worker_span_groups = cfg.logger.otel_span_groups
     resolved_span_groups = None
     if worker_span_groups:
         try:
@@ -120,7 +122,7 @@ def build_otel_worker_bootstrap(args):
             # rather than risk handing the worker something it can't resolve.
             worker_span_groups = 'per_step'
 
-    enabled = bool(getattr(args, 'otel_enabled', False))
+    enabled = bool(cfg.logger.otel_enabled)
     return {
         'enabled': enabled,
         'service_name': service_name,
