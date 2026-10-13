@@ -248,6 +248,7 @@ def test_frozen_weights_without_input_gradients(distributed_setup):
     frozen_linear = nn.Linear(4, 4, bias=False).requires_grad_(False)
     model = nn.Sequential(trainable_linear, frozen_linear).to(device)
     nn.init.ones_(frozen_linear.weight)
+    frozen_weight = frozen_linear.weight
     with fully_shard_context(device=device) as context:
         fully_shard(trainable_linear, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
@@ -258,15 +259,14 @@ def test_frozen_weights_without_input_gradients(distributed_setup):
             pytest.fail("Frozen weight was resharded before backward consumed it", pytrace=False)
         return tensor
 
-    # pack_hook preserves the original storage; unpack_hook checks that it still
-    # exists before backward reads it, so a copy cannot hide premature release.
+    # pack_hook saves the tensor without copying it. unpack_hook checks that its
+    # storage has not been freed when backward needs it.
     with torch.autograd.graph.saved_tensors_hooks(
         pack_hook=lambda tensor: tensor, unpack_hook=unpack
     ):
         for is_last in (False, True):
             with microbatch(context, is_last=is_last):
                 model(torch.ones(2, 4, device=device)).sum().backward()
-            frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
             assert frozen_weight.untyped_storage().nbytes() == 0
     torch.testing.assert_close(
         trainable_linear.weight.grad.full_tensor(), torch.full((4, 4), 16.0, device=device)
