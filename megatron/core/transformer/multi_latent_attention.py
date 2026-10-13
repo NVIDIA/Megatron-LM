@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
@@ -51,10 +52,12 @@ from megatron.core.utils import (
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        _FusedMLARoPEKVSplit,
         fused_apply_mla_rope_for_kv,
         fused_apply_mla_rope_for_q,
     )
 except:
+    _FusedMLARoPEKVSplit = None
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
 
@@ -79,6 +82,14 @@ if HAVE_TE:
         FusedMLAQUpProjRopeQuant = None
         mxfp8_quantize_only = None
         mxfp8_transpose_swizzle = None
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            fused_mla_kv_rope_mxfp8,
+        )
+    except ImportError:
+        # Older TE lacks the fused MLA key/value split + RoPE + MXFP8 quantize kernel.
+        fused_mla_kv_rope_mxfp8 = None
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
     from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
@@ -103,9 +114,11 @@ else:
         FusedMLAQUpProjRopeQuant,
         mxfp8_quantize_only,
         mxfp8_transpose_swizzle,
+        fused_mla_kv_rope_mxfp8,
+        FP8GlobalStateManager,
         QuantizedTensor,
         MXFP8Quantizer,
-    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
@@ -127,6 +140,58 @@ class _QuantizeKVForFusedAttn(torch.autograd.Function):
     def backward(ctx, dk, dv):
         """Attention returns bf16 tensors, so no need to quantize/unquantize in bwd"""
         return dk, dv
+
+
+class _QuantizeQueryForFusedAttn(torch.autograd.Function):
+    """Quantize the RoPE'd query to MXFP8 as attention would; its gradient passes through."""
+
+    @staticmethod
+    def forward(ctx, query):
+        """Quantize the query"""
+        quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        return mxfp8_quantize_only([(query.contiguous(), quantizer)], "sbhd")[0]
+
+    @staticmethod
+    def backward(ctx, dq):
+        """Attention returns a bf16 query gradient"""
+        return dq
+
+
+class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
+    """Split kv, apply RoPE to the key and quantize key and value to MXFP8 in one TE kernel.
+
+    The outputs are those of fused_apply_mla_rope_for_kv quantized by mxfp8_quantize_only. The
+    backward is that of the key/value split RoPE, given the same saved state.
+    """
+
+    @staticmethod
+    def forward(ctx, kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim):
+        """Split kv, apply RoPE to k_pos_emb and quantize key and value"""
+        key, value = fused_mla_kv_rope_mxfp8(kv, k_pos_emb, cos, sin, v_dim)
+        ctx.save_for_backward(cos, sin)
+        ctx.emb_dim, ctx.k_dim, ctx.v_dim = emb_dim, k_dim, v_dim
+        ctx.cu_seqlens_kv, ctx.cp_rank, ctx.cp_size = None, 0, 1
+        ctx.remove_interleaving = False
+        return key, value
+
+    @staticmethod
+    def backward(ctx, dk, dv):
+        """Attention returns bf16 key and value gradients"""
+        d_kv, d_emb = _FusedMLARoPEKVSplit.backward(ctx, dk, dv)[:2]
+        return d_kv, d_emb, None, None, None, None, None
+
+
+def _is_mxfp8_attention_active() -> bool:
+    """Whether attention runs in MXFP8 here: in an FP8 autocast with an MXFP8 recipe and FP8 DPA
+    (layers kept in BF16 run outside it), with an FP8 backward. With NVTE_FP8_DPA_BWD=0, attention
+    keeps the BF16 q/k/v for its backward, which pre-quantized inputs would replace by their
+    dequantized values."""
+    if not FP8GlobalStateManager.is_fp8_enabled():
+        return False
+    if int(os.getenv("NVTE_FP8_DPA_BWD", "1")) == 0:
+        return False
+    recipe = FP8GlobalStateManager.get_fp8_recipe()
+    return recipe.mxfp8() and recipe.fp8_dpa
 
 
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
@@ -247,6 +312,21 @@ class MultiLatentAttention(Attention):
             and get_pg_size(self.tp_group) == 1
             and self.config.qk_layernorm
             and self.config.normalization == "RMSNorm"
+        )
+        # Key/value split, key RoPE and MXFP8 quantization in one TE kernel, for the head
+        # dimensions it supports; q, k and v then reach the attention pre-quantized, as on the
+        # fused Q up-projection path.
+        self._use_fused_kv_rope_quant = (
+            getattr(self.config, "use_fused_mla_kv_rope_quant", False)
+            and fused_mla_kv_rope_mxfp8 is not None
+            and mxfp8_quantize_only is not None
+            and mxfp8_transpose_swizzle is not None
+            and _FusedMLARoPEKVSplit is not None
+            and get_pg_size(self.tp_group) == 1
+            and self.num_attention_heads_per_partition % 2 == 0
+            and self.config.qk_head_dim == 128
+            and self.config.qk_pos_emb_head_dim == 64
+            and self.config.v_head_dim == 128
         )
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
@@ -451,7 +531,10 @@ class MultiLatentAttention(Attention):
         core_attention_extra_kwargs = {}
         if getattr(self.core_attention, "requires_dsa_inputs", False):
             core_attention_extra_kwargs = {"x": hidden_states, "qr": q_compressed}
-        if self._use_fused_q_uproj and self.training:
+        if self.training and (
+            self._use_fused_q_uproj
+            or (self._use_fused_kv_rope_quant and isinstance(query, QuantizedTensor))
+        ):
             # Fused path fed pre-quantized MXFP8 q/k/v (is_input_fp8). Return bf16
             # grads (skip attention's backward re-quantize) so the Q/KV backward
             # paths receive plain bf16 gradients -- no swizzled-fp8 dequant needed.
@@ -1023,6 +1106,47 @@ class MLASelfAttention(MultiLatentAttention):
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
+
+            use_fused_kv_rope_quant = (
+                self._use_fused_kv_rope_quant
+                and self.training
+                and self.config.apply_rope_fusion
+                and not self.recompute_up_proj
+                and not self.checkpoint_core_attention
+                and kv.ndim == 4
+                and cu_seqlens_kv is None
+                and self.pg_collection.cp.size() == 1
+                and kv.shape[0] % 128 == 0
+                and kv.dtype == torch.bfloat16
+                and k_pos_emb.dtype == torch.bfloat16
+                and _is_mxfp8_attention_active()
+            )
+            if use_fused_kv_rope_quant:
+                # RoPE'd q quantized as attention would; k and v split, RoPE'd and quantized in
+                # one kernel. Same MXFP8 q/k/v as the unfused path gives attention.
+                if use_fused_q_uproj:
+                    quantized_query = query
+                else:
+                    quantized_query = _QuantizeQueryForFusedAttn.apply(
+                        fused_apply_mla_rope_for_q(
+                            q,
+                            rotary_pos_cos,
+                            rotary_pos_sin,
+                            self.config.qk_head_dim,
+                            self.config.qk_pos_emb_head_dim,
+                        )
+                    )
+                key, value = _FusedKVRoPEQuantForFusedAttn.apply(
+                    kv,
+                    k_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_pos_emb_head_dim,
+                    self.config.qk_head_dim,
+                    self.config.v_head_dim,
+                )
+                mxfp8_transpose_swizzle([quantized_query, key, value], "sbhd")
+                return quantized_query, key, value
 
             # todo add assert about fusions and caching
             if self.config.apply_rope_fusion:
