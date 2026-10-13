@@ -2542,6 +2542,8 @@ class TestDynamicContext:
     def test_gqa_high_tp_partition_heads(self):
         """Tests that TP > GQA results in 1 attention head per partition."""
         tp_size = 8
+        if Utils.world_size < tp_size:
+            pytest.skip(f"requires {tp_size} ranks, got {Utils.world_size}")
         self._setup_model_parallel_group(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
 
         model_config = TransformerConfig(
