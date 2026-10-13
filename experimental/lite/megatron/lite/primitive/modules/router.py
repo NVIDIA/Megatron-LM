@@ -177,6 +177,7 @@ class SigmoidTopKRouter(nn.Module):
         moe_router_fusion: bool = False,
         router_dtype: torch.dtype | None = None,
         expert_bias_persistent: bool = False,
+        gate_fp32: bool = False,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -199,6 +200,7 @@ class SigmoidTopKRouter(nn.Module):
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
         self.router_dtype = router_dtype
+        self.gate_fp32 = gate_fp32
         self.router_replay: RouterReplay | None = None
 
         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
@@ -213,6 +215,8 @@ class SigmoidTopKRouter(nn.Module):
     def _apply(self, fn):
         super()._apply(fn)
         self.expert_bias.data = self.expert_bias.data.float()
+        if self.gate_fp32:
+            self.gate.weight.data = self.gate.weight.data.float()
         return self
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
