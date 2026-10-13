@@ -228,9 +228,8 @@ def test_register_post_backward_hook_handles_parameterless_module(distributed_se
     model = nn.Sequential(nn.Linear(4, 4, bias=False)).to(device)
 
     with fully_shard_context(device=device, caller_managed_grad_sync=True) as context:
-        fully_shard(model[0], mesh=mesh, placements=_default_placements(), register_hooks=False)
+        fully_shard(model[0], mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements(), register_hooks=False)
-    model[0].unshard()
 
     callback_modules = []
     model.register_post_backward_hook(callback_modules.append)
