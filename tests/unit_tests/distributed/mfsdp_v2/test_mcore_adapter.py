@@ -968,11 +968,13 @@ class TestMcoreAdapterExpertParallel:
                             model_parameter.data.copy_(reference_parameter.data)
         reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
         fsdp_unit_modules = None
-        if shortcut:
-            # Select boundaries explicitly; default shortcut wrapping is covered by #7781.
-            fsdp_unit_modules = [ShortcutMoEBlock]
-            if custom_units:
-                fsdp_unit_modules.append(type(model.decoder.layers[0].shortcut_pre_mlp_layernorm))
+        if custom_units:
+            fsdp_unit_modules = [
+                TransformerLayer,
+                MoETransformerLayer,
+                MoELayer,
+                type(model.decoder.layers[0].shortcut_pre_mlp_layernorm),
+            ]
         model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
