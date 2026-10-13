@@ -67,16 +67,16 @@ def _make_context(
 def _dirty_cursors(context, slots):
     """Leave a previous occupant's non-empty ring (mid-ring, flush pending) on each slot."""
     for slot in slots:
-        context.mamba_replay_write_pos[slot] = 5
-        context.mamba_replay_origin[slot] = 3
-        context.mamba_replay_is_flush[slot] = 1
+        context.mamba_replay.write_pos[slot] = 5
+        context.mamba_replay.origin[slot] = 3
+        context.mamba_replay.is_flush[slot] = 1
 
 
 def _cursors(context, slot):
     return (
-        int(context.mamba_replay_write_pos[slot]),
-        int(context.mamba_replay_origin[slot]),
-        int(context.mamba_replay_is_flush[slot]),
+        int(context.mamba_replay.write_pos[slot]),
+        int(context.mamba_replay.origin[slot]),
+        int(context.mamba_replay.is_flush[slot]),
     )
 
 
@@ -96,8 +96,8 @@ class TestMambaReplayStartupValidation:
 
     def test_mamba2_hybrid_is_accepted(self):
         context = _make_context()
-        assert context.mamba_replay_ssm
-        assert context.mamba_replay_write_pos.shape == (context.max_requests,)
+        assert context.mamba_replay is not None
+        assert context.mamba_replay.write_pos.shape == (context.max_requests,)
 
     @pytest.mark.parametrize(
         "kwargs,reason",
@@ -115,7 +115,8 @@ class TestMambaReplayStartupValidation:
             _make_context(**kwargs)
 
     def test_validation_is_skipped_when_disabled(self):
-        _make_context(layer_type_list=GDN_HYBRID, mamba_replay_ssm=False)
+        context = _make_context(layer_type_list=GDN_HYBRID, mamba_replay_ssm=False)
+        assert context.mamba_replay is None
 
 
 class TestMambaReplayCursorResets:

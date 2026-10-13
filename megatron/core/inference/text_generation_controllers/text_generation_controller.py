@@ -72,7 +72,6 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
-from megatron.core.ssm.ops.mamba2.mamba_ssm_replay import commit_replayssm_spec
 
 
 @dataclass
@@ -977,21 +976,14 @@ class TextGenerationController(MTPControllerMixin):
             )
             # SSM state rollback: ReplaySSM ring-pointer commit, or the full
             # intermediate-state copy.
-            if context.mamba_replay_ssm:
+            if context.mamba_replay is not None:
                 # ReplaySSM: no state copy at all. Advance each slot's ring cursor by
                 # (accepted drafts + bonus token); rejected drafts are simply left
-                # behind the new write_pos and get overwritten next step. Also
-                # precomputes the next step's per-slot flush flag on device.
-                commit_replayssm_spec(
-                    write_pos=context.mamba_replay_write_pos,
-                    post_conv_state_pos=context.mamba_replay_origin,
-                    is_flush=context.mamba_replay_is_flush,
+                # behind the new write_pos and get overwritten next step.
+                context.mamba_replay.commit(
                     accepted_draft_counts=accepted_counts_gpu,
                     prefill_status=prefill_status_gpu,
                     state_batch_indices=mamba_state_idx,
-                    max_cache_len=context.mamba_replay_flush_threshold,
-                    max_spec_len=context.mamba_replay_window,
-                    cache_buf_len=context.mamba_replay_cache_buf_len,
                 )
             else:
                 mamba_state_selective_copy(
