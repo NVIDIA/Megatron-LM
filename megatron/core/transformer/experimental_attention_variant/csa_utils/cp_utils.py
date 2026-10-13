@@ -320,11 +320,9 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
     """
     if config.dsa_kernel_backend != "cudnn":
         raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
-    if config.deterministic_mode:
-        raise NotImplementedError(
-            "Packed DSv4 attention does not yet support deterministic_mode; "
-            "deterministic THD/CP backward is tracked in #7921."
-        )
+    # Deterministic kernel availability and sparse-indexer loss compatibility are
+    # checked by the attention/indexer wrappers. The packed layout contract below
+    # applies to both modes.
     if packed_seq_params.qkv_format != "thd":
         raise ValueError("DSv4 packed attention requires qkv_format='thd'.")
     if cp_group is None:

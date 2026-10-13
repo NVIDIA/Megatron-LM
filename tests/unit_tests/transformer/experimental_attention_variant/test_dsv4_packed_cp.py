@@ -109,19 +109,26 @@ class _CP1:
         return 0
 
 
-def test_packed_deterministic_mode_is_rejected():
-    """Do not silently run external nondeterministic backward for an explicit mode request."""
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_packed_deterministic_mode_preserves_layout_validation(deterministic):
+    """The deterministic path supports packed inputs without weakening layout checks."""
     cu = torch.tensor([0, 4], dtype=torch.int32)
     packed = PackedSeqParams(
         qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=4, max_seqlen_kv=4
     )
     config = SimpleNamespace(
-        dsa_kernel_backend="cudnn", deterministic_mode=True, attention_cp_layout="contiguous"
+        dsa_kernel_backend="cudnn",
+        deterministic_mode=deterministic,
+        attention_cp_layout="contiguous",
     )
-    with pytest.raises(NotImplementedError, match="does not yet support deterministic_mode"):
-        cp_utils.validate_packed_inputs(packed, config, _CP1())
-    config.deterministic_mode = False
     cp_utils.validate_packed_inputs(packed, config, _CP1())
+    packed.qkv_format = "sbhd"
+    with pytest.raises(ValueError, match="qkv_format='thd'"):
+        cp_utils.validate_packed_inputs(packed, config, _CP1())
+    packed.qkv_format = "thd"
+    config.dsa_kernel_backend = "none"
+    with pytest.raises(ValueError, match="requires dsa_kernel_backend='cudnn'"):
+        cp_utils.validate_packed_inputs(packed, config, _CP1())
 
 
 def _similarities(actual, expected):
