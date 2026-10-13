@@ -3,6 +3,7 @@
 import logging
 import warnings
 from argparse import ArgumentParser, Namespace
+from copy import copy
 from typing import Literal, Optional
 
 import torch
@@ -20,7 +21,7 @@ from megatron.core.inference.quantization.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import log_single_rank, unwrap_model
+from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_wandb_writer
@@ -45,7 +46,10 @@ logger = logging.getLogger(__name__)
 
 
 def get_model_builder(
-    args: Namespace, provider: Optional[Literal["gpt", "hybrid", "mamba"]] = None
+    args: Namespace,
+    provider: Optional[Literal["gpt", "hybrid", "mamba"]] = None,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> ModelBuilder:
     """Construct a :class:`ModelBuilder` for the requested model provider.
 
@@ -60,10 +64,27 @@ def get_model_builder(
         provider: Optional override for the model provider name. Must be one of
             ``"gpt"``, ``"hybrid"``, or the deprecated ``"mamba"``. When omitted,
             falls back to ``args.model_provider`` (set by ``add_inference_args``).
+        pg_collection: Optional inference-shard groups. Derive parallel sizes
+            before constructing and validating the config, without changing the
+            global training arguments.
 
     Returns:
         A :class:`ModelBuilder` instance bound to a config derived from ``args``.
     """
+    if pg_collection is not None:
+        args = copy(args)
+        if getattr(args, "yaml_cfg", None) is not None:
+            args.model_parallel = copy(args.model_parallel)
+        for field, group in (
+            ("tensor_model_parallel_size", pg_collection.tp),
+            ("pipeline_model_parallel_size", pg_collection.pp),
+            ("context_parallel_size", pg_collection.cp),
+            ("expert_model_parallel_size", pg_collection.ep),
+            ("expert_tensor_parallel_size", pg_collection.expt_tp),
+        ):
+            setattr(args, field, get_pg_size(group))
+            if getattr(args, "yaml_cfg", None) is not None:
+                setattr(args.model_parallel, field, get_pg_size(group))
     if provider is None:
         provider = args.model_provider
     if provider == "gpt":
@@ -166,9 +187,9 @@ def get_model_for_inference(
         # care of running the modelopt-checkpoint auto-detection side effect.
         model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
     else:
-        builder = get_model_builder(args)
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        builder = get_model_builder(args, pg_collection=pg_collection)
         model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
     # Load checkpoint.

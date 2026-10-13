@@ -1,12 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Shard spec parsing/validation (CPU; no torch.distributed)."""
+"""Shard spec validation and shard-specific serving/RL model construction."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from megatron.core.enums import ModelType
 from megatron.core.inference import shards as shards_module
 from megatron.core.inference.disaggregation.coordinator_setup import validate_disaggregation_shards
 from megatron.core.inference.shards_spec import (
@@ -16,6 +19,72 @@ from megatron.core.inference.shards_spec import (
     parse_inference_shards_spec,
     resolve_inference_shard,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.utils import unwrap_model
+from tests.unit_tests.test_utilities import Utils
+
+
+def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch):
+    from megatron.inference import utils
+    from megatron.rl.inference import disagg
+    from megatron.training.arguments import validate_args
+    from tests.unit_tests.test_argument_utils import _minimal_training_args
+
+    Utils.initialize_model_parallel()
+    try:
+        args = _minimal_training_args(monkeypatch)
+        args.freeze_base_model_for_mtp = False
+        args.gradient_accumulation_fusion = False
+        args.world_size = max(4, Utils.world_size)
+        args.tensor_model_parallel_size = 2
+        args.pipeline_model_parallel_size = 2
+        args.expert_tensor_parallel_size = 2
+        args.bf16 = True
+        args = validate_args(args)
+        args.model_provider = "gpt"
+        args.padded_vocab_size = 1024
+        args.load = "unused-test-checkpoint"
+        args.inference_ckpt_non_strict = False
+        args.inference_dynamic_batching_enable_prefix_caching = True
+        args.inference_shards = "tp=1,role=prefill+tp=1,role=decode"
+        args.use_tp_pp_dp_mapping = False
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(123)
+        monkeypatch.setattr(utils, "get_args", lambda: args)
+        load = Mock()
+        monkeypatch.setattr(utils, "load_checkpoint", load)
+        serving = utils.get_model_for_inference(pg_collection=pg, checkpoint_group=pg.mp)
+
+        # Exercise the separate RL builder too, starting with the training config.
+        training_config = utils.get_model_builder(args)._model_config
+        shard = SimpleNamespace(pg_collection=pg, spec=InferenceShardSpec(tp=1, role="decode"))
+        monkeypatch.setattr(
+            disagg, "build_inference_pg_collections_for_shards", lambda **kw: [shard]
+        )
+        rl = disagg.build_disagg_inference_model(
+            args,
+            ModelType.encoder_or_decoder,
+            training_config.transformer,
+            cfg_container=SimpleNamespace(model=training_config),
+            model_alloc_ctx=nullcontext(),
+        )[0]
+        for model in (serving, rl):
+            config = unwrap_model(model).config
+            assert config.tensor_model_parallel_size == 1
+            assert config.pipeline_model_parallel_size == 1
+            assert config.expert_tensor_parallel_size == 1
+            assert len(unwrap_model(model).decoder.layers) == args.num_layers
+            tokens = torch.tensor([[1, 2, 3]], device="cuda")
+            with torch.no_grad():
+                output = model(tokens, torch.arange(3, device="cuda")[None], attention_mask=None)
+            assert output.shape == (1, 3, 1024)
+            assert torch.isfinite(output).all()
+        assert args.tensor_model_parallel_size == args.pipeline_model_parallel_size == 2
+        assert training_config.transformer.tensor_model_parallel_size == 2
+        assert load.call_args.kwargs["tp_group"] is pg.tp
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_shard_builder_keeps_replica_process_group(monkeypatch):
