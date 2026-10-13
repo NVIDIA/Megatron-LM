@@ -301,6 +301,41 @@ def sharded_state_dict_default(
 _sequence_parallel_attr_cache = None
 
 
+def set_model_config_attribute(model: Any, attribute: str, value: Any) -> None:
+    """Set a config attribute on a model and all distinct child-module configs.
+
+    Some models give individual layers separate config objects. Runtime model-wide
+    toggles must update those configs just as they did when every layer shared the
+    model's root config.
+
+    Args:
+        model: Model whose configs should be updated.
+        attribute: Config attribute to set.
+        value: Value to assign. The same value object is assigned to every config.
+    """
+    root_config = model.config
+    setattr(root_config, attribute, value)
+    updated_config_ids = {id(root_config)}
+
+    module_root = model
+    visited_wrapper_ids = set()
+    while not isinstance(module_root, torch.nn.Module) or not hasattr(module_root, "_modules"):
+        visited_wrapper_ids.add(id(module_root))
+        module_root = getattr(module_root, "module", None)
+        if module_root is None or id(module_root) in visited_wrapper_ids:
+            return
+
+    for module in module_root.modules():
+        config = getattr(module, "config", None)
+        if (
+            config is not None
+            and id(config) not in updated_config_ids
+            and hasattr(config, attribute)
+        ):
+            setattr(config, attribute, value)
+            updated_config_ids.add(id(config))
+
+
 def _init_sequence_parallel_cache(model, exclude_modules):
     """
     Initialize the cache of modules with sequence parallel attributes.

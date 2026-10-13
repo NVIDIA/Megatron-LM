@@ -12,6 +12,7 @@ import torch
 
 from megatron.core.inference.moe.activations import (
     padded_squared_relu,
+    padded_swiglu,
     squared_relu_and_quantize_mxfp8,
 )
 from megatron.core.inference.moe.permute import (
@@ -20,6 +21,8 @@ from megatron.core.inference.moe.permute import (
     unpermute_tokens,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+from . import batch_invariant
 
 try:
     from torch.nn.functional import grouped_mm
@@ -42,6 +45,7 @@ class ActivationType(Enum):
     """Activation functions supported by mcore_fused_moe."""
 
     SQUARED_RELU = "squared_relu"
+    SWIGLU = "swiglu"
 
 
 def _bf16_grouped_mm(
@@ -75,6 +79,10 @@ def _get_activation_func(activation_type: ActivationType, fused_quant: bool = Fa
     """
     if activation_type == ActivationType.SQUARED_RELU:
         return squared_relu_and_quantize_mxfp8 if fused_quant else padded_squared_relu
+    elif activation_type == ActivationType.SWIGLU:
+        if fused_quant:
+            raise NotImplementedError("SWIGLU + MXFP8 fused-quant not implemented (bf16 only)")
+        return padded_swiglu
     else:
         raise ValueError(f"Unsupported activation type: {activation_type}")
 
@@ -130,8 +138,17 @@ def mcore_fused_moe(
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
     # Fused quant kernels only apply to MXFP8 path
     use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
+    batch_invariant_mode = batch_invariant.enabled()
 
-    if use_mxfp8:
+    if batch_invariant_mode:
+        # The MXFP8 path uses scaled_grouped_mm and is not batch invariant.
+        assert not use_mxfp8, (
+            "batch_invariant_mode requires the bf16 grouped GEMM path; got "
+            "MXFP8 weights. Disable mxfp8 or batch_invariant_mode."
+        )
+        mm_fn = batch_invariant.grouped_mm
+        expert_alignment = batch_invariant.grouped_mm_alignment()
+    elif use_mxfp8:
         assert (
             HAVE_SCALED_GMM
         ), "torch.nn.functional.scaled_grouped_mm not available. Install PyTorch 2.10+."
@@ -152,6 +169,7 @@ def mcore_fused_moe(
     # --- Pre-processing: permute ---
     if use_fused_quant:
         # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
+        batch_invariant_inverse_map = None
         hidden_states, permuted_probs, permutation_map, offs = permute_and_quantize_mxfp8(
             hidden_states,
             probs,
@@ -162,7 +180,7 @@ def mcore_fused_moe(
             alignment=expert_alignment,
         )
     else:
-        hidden_states, permuted_probs, permutation_map, offs = permute_tokens(
+        permuted = permute_tokens(
             hidden_states,
             probs,
             routing_map,
@@ -170,7 +188,12 @@ def mcore_fused_moe(
             num_local_experts,
             valid_tokens,
             alignment=expert_alignment,
+            return_batch_invariant_inverse_map=batch_invariant_mode,
         )
+        hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
+        # Maps each (token, local expert) pair to its row in the expert-grouped buffer,
+        # allowing batch-invariant unpermute to read contributions in fixed expert order.
+        batch_invariant_inverse_map = permuted[4] if batch_invariant_mode else None
 
     # --- FC1 -> activation -> FC2 ---
     # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant
@@ -183,7 +206,13 @@ def mcore_fused_moe(
     # number of rows actually used by experts this iteration (valid tokens + alignment
     # padding within expert blocks). Passed to activation and unpermute to skip unused rows.
     n_used = offs[-1:]
-    activation_out = activation_func(fc1_output, permutation_map, n_used)
+    if batch_invariant_mode:
+        # Match training: BF16 activation, FP32 probability multiply, then BF16 before FC2.
+        activation_out = batch_invariant.squared_relu_with_probs(
+            fc1_output, permutation_map, n_used, permuted_probs
+        )
+    else:
+        activation_out = activation_func(fc1_output, permutation_map, n_used)
     # Fused activation+quant returns MXFP8Tensor; otherwise quantize separately.
     if use_mxfp8 and not isinstance(activation_out, MXFP8Tensor):
         activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
@@ -191,5 +220,12 @@ def mcore_fused_moe(
 
     # --- Post-processing: unpermute ---
     return unpermute_tokens(
-        fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens, out=out
+        fc2_output,
+        None if batch_invariant_mode else permuted_probs,
+        permutation_map,
+        max_tokens,
+        n_used,
+        valid_tokens,
+        out=out,
+        batch_invariant_inverse_map=batch_invariant_inverse_map,
     )

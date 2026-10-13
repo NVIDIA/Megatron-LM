@@ -700,6 +700,7 @@ class MimoModel(MegatronModule):
                 position_ids=position_ids,
                 decoder_input=combined_embeddings,
                 labels=labels,
+                loss_mask=loss_mask,
                 attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
             )
@@ -729,6 +730,7 @@ class MimoModel(MegatronModule):
                 position_ids=position_ids,
                 decoder_input=None,
                 labels=labels,
+                loss_mask=loss_mask,
                 attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
             )
@@ -850,6 +852,7 @@ class MimoModel(MegatronModule):
             position_ids=position_ids,
             decoder_input=combined_embeddings,
             labels=labels,
+            loss_mask=loss_mask,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
         )
