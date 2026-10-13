@@ -120,3 +120,27 @@ def test_chained_optimizer_combines_device_norms_in_float64():
         + torch.tensor([0.3], dtype=torch.float32) ** 2
     )
     assert norm.item() == math.sqrt(squares)
+
+
+def test_chained_optimizer_combines_python_float_norms_and_skips_missing_ones():
+    """Optimizers that report Python floats keep the ``math.sqrt`` form; optimizers that report no
+    norm (``None``) are left out, and no norms at all give 0.0."""
+
+    class MockOptimizer:
+        def __init__(self, norm, group):
+            self.config = OptimizerConfig(clip_grad=1.0)
+            self.norm = norm
+            self.group = group
+            self.is_stub_optimizer = False
+            self.model_chunks = []
+
+        def get_grad_stats_parallel_group(self):
+            return self.group
+
+        def get_grad_norm(self):
+            return self.norm
+
+    norm = ChainedOptimizer([MockOptimizer(3.0, "dp"), MockOptimizer(4.0, "dp-ep")]).get_grad_norm()
+    assert isinstance(norm, float) and norm == 5.0
+    assert ChainedOptimizer([MockOptimizer(None, "dp"), MockOptimizer(4.0, "dp-ep")]).get_grad_norm() == 4.0
+    assert ChainedOptimizer([MockOptimizer(None, "dp"), MockOptimizer(None, "dp-ep")]).get_grad_norm() == 0.0
