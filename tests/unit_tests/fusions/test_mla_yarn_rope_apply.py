@@ -105,6 +105,114 @@ class TestApplyRotaryPosEmbTHD:
         fused_mock.assert_not_called()
         torch.testing.assert_close(output, expected)
 
+    def test_fused_per_token_freqs_rotate_each_token_by_its_row(self):
+        cp_group = FakeCPGroup()
+        cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
+        t = torch.randn(7, 2, 8)
+        freqs = torch.randn(7, 1, 1, 8)
+        config = TransformerConfig(
+            num_attention_heads=2, num_layers=1, apply_rope_fusion=True, rotary_interleaved=True
+        )
+        expected = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, rotary_interleaved=True, cp_group=cp_group, max_seqlen=4
+        )
+
+        def sbhd_kernel(x, f, interleaved):
+            return rope_utils_module._apply_rotary_pos_emb_bshd(
+                x, f, rotary_interleaved=interleaved
+            )
+
+        thd_mock = MagicMock()
+        with (
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb", sbhd_kernel),
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb_thd", thd_mock),
+        ):
+            output = apply_rotary_pos_emb(
+                t, freqs, config, cu_seqlens=cu_seqlens, cp_group=cp_group, max_seqlen=4
+            )
+
+        thd_mock.assert_not_called()
+        torch.testing.assert_close(output, expected)
+
+    @pytest.mark.parametrize(
+        ("cp_size", "cu_seqlens", "num_tokens"),
+        [(1, [0, 4, 8], 10), (2, [0, 4, 8, 12, 16], 8)],
+        ids=["padding_tokens", "context_parallel"],
+    )
+    def test_fused_per_token_freqs_use_unfused(self, cp_size, cu_seqlens, num_tokens):
+        cp_group = FakeCPGroup(size=cp_size, rank=0)
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+        t = torch.randn(num_tokens, 2, 8)
+        freqs = torch.randn(8, 1, 1, 8)
+        config = TransformerConfig(num_attention_heads=2, num_layers=1, apply_rope_fusion=True)
+        expected = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=4
+        )
+
+        sbhd_mock, thd_mock = MagicMock(), MagicMock()
+        with (
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb", sbhd_mock),
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb_thd", thd_mock),
+            pytest.warns(UserWarning, match="per-token RoPE frequencies"),
+        ):
+            output = apply_rotary_pos_emb(
+                t, freqs, config, cu_seqlens=cu_seqlens, cp_group=cp_group, max_seqlen=4
+            )
+
+        sbhd_mock.assert_not_called()
+        thd_mock.assert_not_called()
+        torch.testing.assert_close(output, expected)
+
+    def test_fused_max_seqlen_freqs_use_thd_kernel(self):
+        cp_group = FakeCPGroup()
+        cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
+        t = torch.randn(7, 2, 8)
+        freqs = torch.randn(4, 1, 1, 8)
+        config = TransformerConfig(num_attention_heads=2, num_layers=1, apply_rope_fusion=True)
+
+        sbhd_mock, thd_mock = MagicMock(), MagicMock(return_value=t)
+        with (
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb", sbhd_mock),
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb_thd", thd_mock),
+            warnings.catch_warnings(),
+        ):
+            warnings.simplefilter("error")
+            apply_rotary_pos_emb(
+                t, freqs, config, cu_seqlens=cu_seqlens, cp_group=cp_group, max_seqlen=4
+            )
+
+        sbhd_mock.assert_not_called()
+        thd_mock.assert_called_once()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        rope_utils_module.fused_apply_rotary_pos_emb is None, reason="TE fused RoPE not available"
+    )
+    def test_fused_per_token_freqs_match_unfused(self):
+        cp_group = FakeCPGroup()
+        lengths = [6, 20, 12]
+        cu_seqlens = torch.tensor([0, 6, 26, 38], dtype=torch.int32, device="cuda")
+        t = torch.randn(sum(lengths), 4, 64, device="cuda", dtype=torch.bfloat16)
+        freqs = torch.randn(sum(lengths), 1, 1, 32, device="cuda").repeat_interleave(2, dim=-1)
+        grad = torch.randn_like(t)
+        outputs = []
+        for fused in (False, True):
+            config = TransformerConfig(
+                num_attention_heads=4,
+                num_layers=1,
+                apply_rope_fusion=fused,
+                rotary_interleaved=True,
+            )
+            x = t.clone().requires_grad_(True)
+            y = apply_rotary_pos_emb(
+                x, freqs, config, cu_seqlens=cu_seqlens, cp_group=cp_group, max_seqlen=20
+            )
+            y.backward(grad)
+            outputs.append((y, x.grad))
+
+        torch.testing.assert_close(outputs[1][0], outputs[0][0], **dtype_tols(torch.bfloat16))
+        torch.testing.assert_close(outputs[1][1], outputs[0][1], **dtype_tols(torch.bfloat16))
+
     def test_packed_freqs_returns_offset_mapped_output_for_context_parallel(self):
         cp_group = FakeCPGroup(size=2, rank=0)
         cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
