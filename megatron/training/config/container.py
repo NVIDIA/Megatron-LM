@@ -271,11 +271,11 @@ class PretrainConfigContainer(ConfigContainerBase):
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
 
-    def finalize_batch_sizes(self, data_parallel_size: int, gtp_weight_remat_size: int = 1) -> None:
+    def finalize_batch_sizes(self, batch_parallel_size: int) -> None:
         """Resolve training and evaluation batch sizes before initializing runtime services."""
         assert self.train.micro_batch_size is not None and self.train.micro_batch_size > 0
         if self.train.global_batch_size is None:
-            self.train.global_batch_size = self.train.micro_batch_size * data_parallel_size
+            self.train.global_batch_size = self.train.micro_batch_size * batch_parallel_size
         assert self.train.global_batch_size > 0
         if self.validation.eval_global_batch_size is None:
             self.validation.eval_global_batch_size = self.train.global_batch_size
@@ -283,8 +283,8 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.validation.eval_micro_batch_size = self.train.micro_batch_size
         assert self.validation.eval_micro_batch_size > 0
         assert self.validation.eval_global_batch_size % (
-            self.validation.eval_micro_batch_size * data_parallel_size * gtp_weight_remat_size
-        ) == 0, "Evaluation global batch size must be divisible by its microbatch size times DP size"
+            self.validation.eval_micro_batch_size * batch_parallel_size
+        ) == 0, "Evaluation global batch size must be divisible by its microbatch size times batch parallel size"
 
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""

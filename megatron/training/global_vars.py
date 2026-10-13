@@ -18,6 +18,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
@@ -203,7 +204,7 @@ def initialize_runtime_services(
 def initialize_training_runtime_services(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
     cfg = get_run_config()
-    cfg.finalize_batch_sizes(args.data_parallel_size, args.gtp_weight_remat_size)
+    cfg.finalize_batch_sizes(get_batch_parallel_size(args))
     if cfg.train.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
         # into megatron.training, which imports this module.
@@ -214,8 +215,8 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         rank=args.rank,
         global_batch_size=cfg.train.global_batch_size,
         micro_batch_size=cfg.train.micro_batch_size,
-        # Full DP x gtp_remat degree (args.data_parallel_size is the gtp_remat-excluded replicate).
-        data_parallel_size=args.data_parallel_size * args.gtp_weight_remat_size,
+        # Independent sequences, including when CP and weight sharding share ranks.
+        data_parallel_size=get_batch_parallel_size(args),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
         seq_length=args.seq_length,

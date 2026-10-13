@@ -300,9 +300,9 @@ def test_native_batch_defaults_preserve_explicit_eval_sizes(run_config, eval_bat
             run_config.validation.eval_global_batch_size,
             run_config.validation.eval_micro_batch_size,
         ) = eval_batch_sizes
-    run_config.finalize_batch_sizes(data_parallel_size=2)
+    run_config.finalize_batch_sizes(batch_parallel_size=2)
     # Repeated finalization also accepts the resolved GBS alongside a step schedule.
-    run_config.finalize_batch_sizes(data_parallel_size=2)
+    run_config.finalize_batch_sizes(batch_parallel_size=2)
     assert run_config.train.global_batch_size == 4
     assert (
         run_config.validation.eval_global_batch_size,
