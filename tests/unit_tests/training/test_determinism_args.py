@@ -16,6 +16,7 @@ import torch
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.determinism import (
     ARG_VALUES_REQUIRED_FOR_DETERMINISM,
+    DETERMINISM_ENV_VAR_DEFAULTS,
     apply_determinism_env,
     apply_determinism_to_args,
 )
@@ -80,3 +81,37 @@ def test_nccl_ep_scan_mode_is_required_before_group_creation(scan_mode):
     else:
         apply_determinism_env(env)
         assert env["NCCL_EP_HT_EM_AG_SCAN_MODE"] == "1"
+
+
+@pytest.mark.parametrize(
+    "nccl_algo, error",
+    [(None, None), ("", None), ("^NVLS", None), (" ", "only whitespace"), ("Tree", "each token")],
+)
+def test_nccl_algo_is_kept_defaulted_or_rejected(nccl_algo, error):
+    """Unset becomes Ring, "" and ^NVLS are kept, and whitespace and Tree are rejected.
+
+    The accepted cases still get the other defaults; a rejected value leaves env unchanged.
+    """
+    env = {} if nccl_algo is None else {"NCCL_ALGO": nccl_algo}
+    if error:
+        with pytest.raises(AssertionError, match=error):
+            apply_determinism_env(env)
+        assert env == {"NCCL_ALGO": nccl_algo}
+    else:
+        apply_determinism_env(env)
+        assert env == {
+            **DETERMINISM_ENV_VAR_DEFAULTS,
+            "NCCL_ALGO": "Ring" if nccl_algo is None else nccl_algo,
+        }
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_empty_nccl_algo_notice_is_printed_on_rank_0(rank, monkeypatch, capsys):
+    """Only rank 0 prints the notice, and only for an empty NCCL_ALGO."""
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setenv("RANK", str(rank))
+    apply_determinism_env({})
+    apply_determinism_env({"NCCL_ALGO": "Ring"})
+    assert "NCCL_ALGO is empty" not in capsys.readouterr().out
+    apply_determinism_env({"NCCL_ALGO": ""})
+    assert ("NCCL_ALGO is empty" in capsys.readouterr().out) == (rank == 0)

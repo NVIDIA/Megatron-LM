@@ -23,11 +23,11 @@ When enabled, Megatron applies the env vars and config overrides below via `mega
 
 ## Environment variables
 
-Each variable may be set by the launcher or left unset. If set, the value must be one that has been validated as deterministic — anything else fails hard with an assertion. If unset, `apply_determinism_env` fills the canonical default (except `MAMBA_DETERMINISTIC` and `CAUSAL_CONV1D_DETERMINISTIC`, which the external `mamba_ssm` and `causal_conv1d` packages auto-detect from `torch.are_deterministic_algorithms_enabled()`). Must be set before the first cuBLAS / Transformer Engine call — `apply_determinism_to_args` runs early in `validate_args` to guarantee this.
+Each variable may be set by the launcher or left unset. If set, the value must be one that has been validated as deterministic — anything else fails hard with an assertion. An empty `NCCL_ALGO` is accepted without that validation; see [Letting NCCL choose the algorithm](#letting-nccl-choose-the-algorithm). If unset, `apply_determinism_env` fills the canonical default (except `MAMBA_DETERMINISTIC` and `CAUSAL_CONV1D_DETERMINISTIC`, which the external `mamba_ssm` and `causal_conv1d` packages auto-detect from `torch.are_deterministic_algorithms_enabled()`). Must be set before the first cuBLAS / Transformer Engine call — `apply_determinism_to_args` runs early in `validate_args` to guarantee this.
 
 | Variable | Accepted values (or unset) | Default filled if unset | Reason |
 |---|---|---|---|
-| `NCCL_ALGO` | subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}` | `Ring` | Conservative default — `Ring`'s reduction order is fixed by topology, so it is bit-exact across runs on every supported NCCL version |
+| `NCCL_ALGO` | subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}`, or the empty string | `Ring` | Conservative default — `Ring`'s reduction order is fixed by topology, so it is bit-exact across runs on every supported NCCL version. The empty string lets NCCL choose — see [Letting NCCL choose the algorithm](#letting-nccl-choose-the-algorithm) |
 | `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | `0` | `0` | Forces Transformer Engine to use deterministic algorithms |
 | `CUBLAS_WORKSPACE_CONFIG` | `:4096:8` or `:16:8` | `:4096:8` | Deterministic cuBLAS workspace (both sizes are reproducible per NVIDIA docs; `:4096:8` is faster, `:16:8` uses less memory) |
 | `TRITON_CACHE_AUTOTUNING` | `0` or `1` | *(none — opt-in)* | Persists Triton autotune winners for autotuners **outside** the pinned scope, so ranks reuse one choice instead of re-timing it. Kernels inside the scope are pinned without timing either way — see [Triton autotuning](#triton-autotuning) |
@@ -36,7 +36,17 @@ Each variable may be set by the launcher or left unset. If set, the value must b
 | `MAMBA_DETERMINISTIC` | any string starting with `'1'` | *(none — SSM auto-detects)* | Controls the external `mamba_ssm` package, which auto-follows `torch.are_deterministic_algorithms_enabled()` when unset; only an explicit non-deterministic override is rejected. Megatron's in-tree SSM kernels (`megatron.core.ssm.ops`) do not read it and follow `--deterministic-mode` instead |
 | `CAUSAL_CONV1D_DETERMINISTIC` | any string starting with `'1'` | *(none — the kernel auto-detects)* | causal_conv1d ≥ 1.6.0 auto-follows `torch.are_deterministic_algorithms_enabled()` when unset, reducing the conv weight/bias gradients through a workspace instead of `atomicAdd`; the Mamba and GDP mixers reject a deterministic run without it |
 
-If you override `NCCL_ALGO`, the value must be a subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}`. `Tree` is intentionally excluded: its intra-node chain reduction order is not user-controllable, and the inter-node tree topology can vary across runs without a pinned topology file, so it cannot be vouched for as bit-exact across stacks. `^NVLS` is accepted (banning NVLS is a legitimate user choice on hardware that exposes it); the user is responsible for ensuring whatever NCCL falls back to is deterministic on their environment.
+If you override `NCCL_ALGO` with a non-empty value, the value must be a subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}`. `Tree` is intentionally excluded: its intra-node chain reduction order is not user-controllable, and the inter-node tree topology can vary across runs without a pinned topology file, so it cannot be vouched for as bit-exact across stacks. `^NVLS` is accepted (banning NVLS is a legitimate user choice on hardware that exposes it); the user is responsible for ensuring whatever NCCL falls back to is deterministic on their environment.
+
+### Letting NCCL choose the algorithm
+
+Setting `NCCL_ALGO` to the empty string (`export NCCL_ALGO=`) asks NCCL to choose the algorithm for each collective; with NCCL 2.24 or later, NCCL then chooses as it does in a run without `--deterministic-mode`. `--deterministic-mode` keeps the empty value instead of filling in `Ring`, and rank 0 prints a notice at startup.
+
+Leaving `NCCL_ALGO` unset cannot do this: `--deterministic-mode` fills in `Ring`. Without that default, PyTorch 2.8 and later would still exclude NVLS: with `torch.use_deterministic_algorithms(True)` on, it sets `NCCL_ALGO=^NVLS` in the process environment when it creates an NCCL process group and the variable is unset, logging "disabling NVLS algorithm in NCCL". PyTorch counts an empty `NCCL_ALGO` as set and leaves it alone.
+
+NCCL 2.24 and later read no algorithm from the empty string and so exclude none: the cost model chooses among every algorithm the hardware and the other NCCL settings allow, `Tree` and NVLS included, and a tuner plugin, if one is loaded, is still called for every collective. NCCL 2.23 and earlier instead read the empty string as a list that enables no algorithm, then enable `Ring` and `Tree` again (only `Ring` when CollNet is available), so NVLS is not used. With `NCCL_DEBUG=INFO`, NCCL logs `NCCL_ALGO set by environment to` followed by the empty value; that line is expected.
+
+Bit-exact reproducibility then rests on the algorithms NCCL selects, which Megatron does not check. PyTorch adds that NVLS exclusion because NVLS reductions can be non-deterministic, so make sure the algorithms NCCL chooses on your hardware and NCCL version are deterministic. A value of only whitespace is rejected, because NCCL 2.24 and later fail to parse it. The discussion and measurements are in [issue #8138](https://github.com/NVIDIA/Megatron-LM/issues/8138).
 
 ## Config requirements
 

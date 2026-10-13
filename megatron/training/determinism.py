@@ -23,6 +23,8 @@ import torch
 # submodule, and this module writes to one of its attributes.
 import torch.utils.deterministic
 
+from megatron.training.utils import print_rank_0
+
 # Maps each arg name to the value it must hold for bit-exact execution;
 # verified by :func:`apply_determinism_to_args`.
 ARG_VALUES_REQUIRED_FOR_DETERMINISM = {
@@ -65,6 +67,9 @@ DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
 # ``Tree`` is intentionally NOT accepted: its intra-node chain reduction
 # order is not user-controllable and its multi-node inter-tree topology can
 # vary across runs without a pinned topology file, so we cannot vouch for it.
+#
+# An empty ``NCCL_ALGO`` is accepted as well and lets NCCL choose; see
+# :func:`apply_determinism_env`.
 ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset({"Ring", "CollnetDirect", "CollnetChain", "^NVLS"})
 
 # Env vars whose valid deterministic values are a small fixed exact-match set
@@ -97,7 +102,9 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     Semantics per key:
 
     * ``NCCL_ALGO`` — if set, each comma-separated token must be in
-      :data:`ACCEPTED_NCCL_ALGO_TOKENS`.
+      :data:`ACCEPTED_NCCL_ALGO_TOKENS`. The empty string is accepted and kept:
+      NCCL (and a tuner plugin, if one is loaded) then chooses the algorithms,
+      and rank 0 prints a notice saying so. A value of only whitespace is rejected.
     * ``NCCL_EP_HT_EM_AG_SCAN_MODE`` / ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` /
       ``CUBLAS_WORKSPACE_CONFIG`` —
       if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
@@ -119,9 +126,23 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     (NCCL at communicator init, cuBLAS at handle creation, TE at first
     attention forward), so the call must happen BEFORE any of those events.
     """
-    # NCCL_ALGO subset check.
+    # NCCL_ALGO subset check. The empty string is an explicit request to let NCCL choose:
+    # PyTorch counts it as set and so does not write NCCL_ALGO=^NVLS under
+    # torch.use_deterministic_algorithms(True), and NCCL 2.24 and later exclude no algorithm
+    # for the empty string.
     nccl_algo = env.get("NCCL_ALGO")
-    if nccl_algo is not None:
+    if nccl_algo == "":
+        # print_rank_0() because this runs from validate_args, before logging is configured.
+        print_rank_0(
+            "Deterministic mode: NCCL_ALGO is empty, so NCCL chooses the algorithm for each "
+            "collective. Bit-exact reproducibility then rests on the algorithms NCCL selects."
+        )
+    elif nccl_algo is not None:
+        assert nccl_algo.strip(), (
+            f"NCCL_ALGO={nccl_algo!r} contains only whitespace, which NCCL 2.24 and later fail "
+            "to parse. Set NCCL_ALGO to the empty string to let NCCL choose the algorithms, or "
+            f"to a subset of {sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
+        )
         tokens = [t.strip() for t in nccl_algo.split(",") if t.strip()]
         assert tokens and all(t in ACCEPTED_NCCL_ALGO_TOKENS for t in tokens), (
             f"NCCL_ALGO={nccl_algo!r}: each token must be in "
