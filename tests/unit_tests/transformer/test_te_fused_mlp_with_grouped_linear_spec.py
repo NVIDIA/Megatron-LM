@@ -89,7 +89,6 @@ def _patch_fake_te_ops(monkeypatch):
     monkeypatch.setattr(te_ext.te.pytorch, "LayerNormLinear", FakeLayerNormLinear, raising=False)
     monkeypatch.setattr(te_ext.te.pytorch, "Linear", FakeLinear, raising=False)
     monkeypatch.setattr(te_ext.te.pytorch, "ops", fake_ops, raising=False)
-    monkeypatch.setattr(te_ext, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(
         te_ext, "get_cuda_rng_tracker", lambda: SimpleNamespace(is_initialized=lambda: True)
     )
@@ -103,9 +102,19 @@ def _patch_fake_te_ops(monkeypatch):
     )
 
 
+def _set_tp_size(monkeypatch, module, tp_size):
+    """Give `module` a TP group that reports `tp_size` ranks."""
+    import megatron.core.extensions.transformer_engine as te_ext
+
+    tp_group = object()
+    module.tp_group = tp_group
+    monkeypatch.setattr(te_ext, "get_pg_size", lambda group: tp_size if group is tp_group else 1)
+
+
 def _make_fake_grouped_mlp(fake_te, normalization="LayerNorm"):
     module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
     torch.nn.Module.__init__(module)
+    module.tp_group = None
 
     fc1 = fake_te.LayerNormLinear()
     fc1.normalization = normalization
@@ -173,7 +182,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         sentinel = object()
         module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
 
-        monkeypatch.setattr(te_ext, "get_tensor_model_parallel_world_size", lambda: 2)
+        _set_tp_size(monkeypatch, module, 2)
         monkeypatch.setattr(te_ext.TEFusedMLP, "_make_fused_impl", lambda self: sentinel)
 
         assert TEFusedMLPWithGroupedLinear._make_fused_impl(module) is sentinel
@@ -359,7 +368,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         def fake_forward(self, hidden_states, **kwargs):
             return hidden_states, kwargs
 
-        monkeypatch.setattr(te_ext, "get_tensor_model_parallel_world_size", lambda: 2)
+        _set_tp_size(monkeypatch, module, 2)
         monkeypatch.setattr(te_ext.TEFusedMLP, "forward", fake_forward)
 
         assert TEFusedMLPWithGroupedLinear.forward(module, hidden_states, flag=True) == (
@@ -377,6 +386,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         recipe_calls = []
         fused_impl = lambda hidden_states, *args: hidden_states
         module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
+        module.tp_group = None
         module._fused_impl = None
         module._norm_seq = (lambda hidden_states: hidden_states,)
         module.linear_fc2 = SimpleNamespace(te_return_bias=True, bias=torch.empty(0))
@@ -392,7 +402,6 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
             recipe_calls.append(name)
             return recipe
 
-        monkeypatch.setattr(te_ext, "get_tensor_model_parallel_world_size", lambda: 1)
         monkeypatch.setattr(
             te_ext.te.common.recipe,
             "NVFP4BlockScaling",
@@ -485,11 +494,11 @@ class TestTEFusedMLPWithGroupedLinearSpec:
             calls["kwargs"] = kwargs
             return "output", "bias"
 
-        monkeypatch.setattr(te_ext, "get_tensor_model_parallel_world_size", lambda: 2)
         monkeypatch.setattr(te_ext.TEFusedMLP, "forward", fake_forward)
 
         config = _make_config()
         mlp = TEFusedMLPWithGroupedLinear(config, _make_submodules())
+        _set_tp_size(monkeypatch, mlp, 2)
         hidden_states = object()
 
         assert mlp.forward(hidden_states, test_kwarg=True) == ("output", "bias")
