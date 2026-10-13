@@ -30,7 +30,11 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
+from megatron.core.optimizer.grad_scaler import DynamicGradScaler
+from megatron.core.optimizer.optimizer import (
+    Float16OptimizerWithFloat16Params,
+    copy_optimizer_param_metadata,
+)
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -1593,3 +1597,68 @@ def test_synchronize_steps_aligns_lagging_group():
     assert outer._synchronize_steps() == 7
     assert dense.param_groups[0]['step'] == 7
     assert 'step' not in expert.param_groups[0]
+
+
+@pytest.mark.parametrize("layout", ["flat", "nested", "shared-scaler", "restored", "standalone"])
+def test_chained_optimizer_uses_one_loss_scale(layout):
+    Utils.initialize_model_parallel()
+    try:
+
+        def run_step():
+            config = OptimizerConfig(fp16=True, clip_grad=0.0)
+            params = [
+                torch.nn.Parameter(torch.ones(4, device="cuda", dtype=torch.float16))
+                for _ in range(2)
+            ]
+            scalers = [DynamicGradScaler(8, 1, 2, 0.5, 1, 1) for _ in params]
+            if layout == "shared-scaler":
+                scalers[1] = scalers[0]
+            if layout == "restored":
+                state = scalers[1].state_dict()
+                state["scale"] = torch.tensor([32.0], device="cuda")
+                scalers[1].load_state_dict(state)
+            leaves = [
+                Float16OptimizerWithFloat16Params(SGD([param], lr=0.25), config, scaler, None)
+                for param, scaler in zip(params, scalers)
+            ]
+            optimizer = ChainedOptimizer(
+                [ChainedOptimizer(leaves[:1]), leaves[1]] if layout == "nested" else leaves
+            )
+            if layout == "standalone":
+                optimizer = leaves[0]
+                leaves, params, scalers = leaves[:1], params[:1], scalers[:1]
+
+            # Only one part of the model overflows, but the whole update is skipped.
+            params[0].grad = torch.full_like(params[0], float("inf"))
+            if len(params) > 1:
+                params[1].grad = torch.full_like(params[1], optimizer.get_loss_scale().item())
+            assert optimizer.prepare_grads()
+            assert [scaler.scale.item() for scaler in scalers] == [4] * len(scalers)
+
+            overflow_scales = [scaler.scale.clone() for scaler in scalers]
+
+            for param in params:
+                param.grad = torch.full_like(param, optimizer.get_loss_scale().item())
+            assert not optimizer.prepare_grads()
+            assert [scaler.scale.item() for scaler in scalers] == [8] * len(scalers)
+            for leaf, param in zip(leaves, params):
+                torch.testing.assert_close(
+                    leaf.get_parameters()[0].grad, torch.ones(4, device="cuda"), rtol=0, atol=0
+                )
+                assert leaf.step_with_ready_grads()
+                torch.testing.assert_close(param, torch.full_like(param, 0.75), rtol=0, atol=0)
+            return {
+                "parameters": params,
+                "gradients": [leaf.get_parameters()[0].grad for leaf in leaves],
+                "overflow_scales": overflow_scales,
+                "scales": [scaler.scale for scaler in scalers],
+            }
+
+        reference = run_step()
+        for _ in range(2):
+            replay = run_step()
+            for name, tensors in reference.items():
+                for expected, actual in zip(tensors, replay[name]):
+                    assert torch.equal(expected.view(torch.uint8), actual.view(torch.uint8)), name
+    finally:
+        Utils.destroy_model_parallel()
