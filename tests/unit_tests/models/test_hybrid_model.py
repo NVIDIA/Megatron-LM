@@ -424,7 +424,11 @@ def test_hybrid_fused_linear_cross_entropy_branch_scales_output_layer_input():
             labels=None,
         ):
             self.calls.append(
-                dict(input_=input_, output_cross_entropy_loss=output_cross_entropy_loss, labels=labels)
+                dict(
+                    input_=input_,
+                    output_cross_entropy_loss=output_cross_entropy_loss,
+                    labels=labels,
+                )
             )
             return input_.float().sum(dim=-1)
 

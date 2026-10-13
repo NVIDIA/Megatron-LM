@@ -507,6 +507,57 @@ class TestMultiTokenPredictionLayer:
         else:
             assert weight_to_check.grad is not None
 
+    def test_process_mtp_loss_fused_linear_cross_entropy_scales_output_layer_input(self):
+        """With the fused linear + cross-entropy path the logits are never materialised, so the
+        muP output scaling (``scale_logits_fn``) has to be applied to the output layer's input."""
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+        )
+        config.cross_entropy_loss_fusion = True
+        config.cross_entropy_fusion_impl = "linear"
+        seq_len, batch_size, vocab_size = 4, 2, 16
+        hidden_states = torch.randn((1 + config.mtp_num_layers) * seq_len, batch_size, 64)
+        labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+        seen_inputs = []
+
+        class _OutputLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(vocab_size, 64))
+
+            def forward(
+                self,
+                hidden,
+                weight=None,
+                runtime_gather_output=None,
+                output_cross_entropy_loss=False,
+                labels=None,
+            ):
+                assert output_cross_entropy_loss and labels is not None
+                seen_inputs.append(hidden)
+                return torch.matmul(hidden, self.weight.t()).sum(dim=-1).transpose(0, 1)
+
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=torch.ones(batch_size, seq_len),
+            output_layer=_OutputLayer(),
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.sum(dim=-1).transpose(0, 1),
+            config=config,
+            scale_logits_fn=lambda t: t * 0.5,
+        )
+        (mtp_input,) = seen_inputs
+        torch.testing.assert_close(mtp_input, hidden_states[seq_len:] * 0.5)
+
 
 class TestMultiTokenPrediction:
     def setup_method(self, method):
