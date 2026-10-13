@@ -7,7 +7,7 @@
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 -->
 
-# Observability
+# Observability Overview
 
 Megatron-LM is instrumented with [OpenTelemetry](https://opentelemetry.io/) via the [`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens) library, emitting **traces** at training-framework boundaries and **metrics** for loss, throughput, and gradient norm.
 
@@ -15,15 +15,11 @@ Telemetry exports to any OTLP-compatible backend (Jaeger, Grafana Tempo, W&B Wea
 
 ## What's in this section
 
-```{toctree}
-:maxdepth: 1
-
-configuration
-span-groups
-metrics
-pipeline-parallel
-extending
-```
+- [Configuration](configuration.md)
+- [Span Groups](span-groups.md)
+- [Metrics](metrics.md)
+- [Pipeline-Parallel Trace Correlation](pipeline-parallel.md)
+- [Extending Instrumentation](extending.md)
 
 ## Scope
 

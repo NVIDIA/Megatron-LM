@@ -1410,12 +1410,14 @@ class TestHybridBlock:
         """With the "gdn2" variant, 'G' builds GatedDeltaNet2 while '*' still wraps
         SelfAttention.
 
-        `deterministic_mode` selects GDN2's pure-torch kernel fallback so this test
-        also runs without flash-linear-attention; the env var is Transformer Engine's
-        requirement for deterministic mode.
+        `gdn_kernel_backend="torch"` selects GDN2's pure-torch kernel so this test also
+        runs without flash-linear-attention; deterministic mode requires that backend,
+        and the env var is Transformer Engine's requirement for deterministic mode.
         """
         monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-        block = self.get_gdn2_hybrid_block(Symbols.GDN + Symbols.ATTENTION, deterministic_mode=True)
+        block = self.get_gdn2_hybrid_block(
+            Symbols.GDN + Symbols.ATTENTION, deterministic_mode=True, gdn_kernel_backend="torch"
+        )
         layers = block.layers
         assert isinstance(layers[0], TransformerLayer)
         assert isinstance(layers[0].self_attention, GatedDeltaNet2)

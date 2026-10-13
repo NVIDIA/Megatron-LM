@@ -1,6 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for the minimal Megatron-FSDP path."""
+"""Unit tests for MFSDP v2.
+
+Use this file only as a last resort when no focused test file fits.
+"""
 
 import logging
 from typing import NamedTuple
@@ -59,19 +62,6 @@ class CheckpointedTinyModel(TinyModel):
         return checkpoint(self.fc2, self.relu(x), use_reentrant=self.use_reentrant)
 
 
-class NestedModel(nn.Module):
-    """Model with direct and child-owned parameters."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.bias = nn.Parameter(torch.ones(4))
-        self.inner = nn.Linear(4, 4, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the nested model."""
-        return self.inner(x) + self.bias
-
-
 class MultiChildModel(nn.Module):
     """Model with direct parameters and multiple child FsdpModules."""
 
@@ -86,51 +76,6 @@ class MultiChildModel(nn.Module):
         for layer in self.layers:
             x = torch.relu(layer(x))
         return x
-
-
-class TiedLM(nn.Module):
-    """Tiny language model with shared input and output embedding weights."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.embed_tokens = nn.Embedding(8, 4, dtype=torch.bfloat16)
-        self.lm_head = nn.Linear(4, 8, bias=False, dtype=torch.bfloat16)
-        self.lm_head.weight = self.embed_tokens.weight
-
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Compute a scalar loss using both aliases of the shared weight."""
-        return self.lm_head(self.embed_tokens(token_ids)).float().sum()
-
-
-class SaveNonLeafWeightView(torch.autograd.Function):
-    """Autograd function that saves a non-leaf parameter view for backward."""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, weight_view: torch.Tensor) -> torch.Tensor:
-        """Save the non-leaf weight view and run a simple elementwise op."""
-        ctx.save_for_backward(x, weight_view)
-        return x * weight_view
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Use the saved non-leaf weight view during backward."""
-        x, weight_view = ctx.saved_tensors
-        return grad_output * weight_view, grad_output * x
-
-
-class NonLeafViewModel(nn.Module):
-    """Model that saves a non-leaf parameter view across forward and backward."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(8))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run using a non-leaf view of the parameter."""
-        weight_view = self.weight.view_as(self.weight)
-        assert self.weight.is_leaf
-        assert not weight_view.is_leaf
-        return SaveNonLeafWeightView.apply(x, weight_view)
 
 
 def _default_placements() -> Placements:
@@ -274,8 +219,8 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
-    """TE's callback, not AccumulateGrad, completes MFSDP backward."""
+def test_rejects_delayed_te_weight_gradient(distributed_setup):
+    """Default automatic synchronization rejects weight gradients produced after autograd."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
@@ -297,10 +242,8 @@ def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
     assert model.weight.grad is None
     assert model.phase is FsdpModule.Phase.BACKWARD
 
-    model.backward_dw()
-
-    assert model.weight.grad is not None
-    assert model.phase is FsdpModule.Phase.RESTING
+    with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
+        model.backward_dw()
 
 
 def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
@@ -648,86 +591,6 @@ def test_hfsdp_reduce_scatters_dp_outer_on_last_microbatch(distributed_setup):
     )
 
 
-def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
-    """An outer FsdpModule owns direct parameters but not nested child FsdpModule parameters."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = NestedModel().to(device)
-
-    with fully_shard_context(device=device):
-        fully_shard(model.inner, mesh=mesh, placements=_default_placements())
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
-    (inner_group,) = model.inner.parameter_groups
-    (outer_group,) = model.parameter_groups
-
-    assert [parameter.fqns for parameter in inner_group.fsdp_parameters] == [("weight",)]
-    assert [parameter.fqns for parameter in outer_group.fsdp_parameters] == [("bias",)]
-
-
-def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
-    """Tied registrations should allocate one DBuffer entry and optimizer parameter."""
-    model = TiedLM()
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=distributed_setup.device):
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
-    (parameter_group,) = model.parameter_groups
-    (parameter,) = parameter_group.fsdp_parameters
-    assert parameter.fqns == ("embed_tokens.weight", "lm_head.weight")
-    assert parameter_group.main_weight.layout.size == 8 * 4
-    # Both aliases must expose the same optimizer-visible sharded parameter.
-    assert len(list(model.parameters())) == 1
-
-
-def test_parameterless_parent_with_child_modules_trains(distributed_setup):
-    """A parent with no unowned parameters should still root trainable child FsdpModules."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    torch.manual_seed(5678)
-    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 2, bias=False)).to(device)
-
-    with fully_shard_context(device=device):
-        fully_shard(model[0], mesh=mesh, placements=_default_placements())
-        fully_shard(model[1], mesh=mesh, placements=_default_placements())
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
-    assert model.parameter_groups == ()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    x = torch.randn(3, 4, device=device)
-
-    optimizer.zero_grad(set_to_none=True)
-    loss = model(x).sum()
-    loss.backward()
-    optimizer.step()
-
-
-def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
-    """A non-trainable parameter group should not allocate persistent main gradients."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Linear(4, 4, bias=False).to(device)
-    model.weight.requires_grad_(False)
-
-    with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
-    (group,) = model.parameter_groups
-    assert not group.requires_grad
-    assert group.main_grad is None
-
-
 def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_setup):
     """Each backward averages over DP ranks; repeated backwards accumulate by summing."""
     rank = distributed_setup.rank
@@ -754,63 +617,6 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     torch.testing.assert_close(local_grad, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    "parameter_placements",
-    [
-        pytest.param([Replicate(), Shard(0)], id="hfsdp"),  # ZeRO-1 / ZeRO-3
-        pytest.param([Replicate(), Replicate()], id="hybrid_zero2"),  # ZeRO-1 / ZeRO-2
-        pytest.param([Shard(0), Shard(0)], id="fsdp"),  # ZeRO-3 / ZeRO-3
-    ],
-)
-@pytest.mark.parametrize("inner_dp_size", [1, 2])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_next_forward_uses_optimizer_updated_weights(
-    distributed_setup, parameter_placements, inner_dp_size, dtype
-):
-    """The next forward should observe weights updated by the previous optimizer step."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2 or world_size % inner_dp_size:
-        pytest.skip("Requires at least two ranks and a world size divisible by inner_dp_size.")
-
-    mesh = init_device_mesh(device.type, (world_size // inner_dp_size, inner_dp_size))
-    placements = Placements(
-        dp_axes=[0, 1],
-        parameter=parameter_placements,
-        # Reduce gradients inner-then-outer into the optimizer's two-axis shards.
-        gradient=[Partial("avg"), Shard(0)],
-        optimizer=[Shard(0), Shard(0)],
-    )
-    # Uneven rows and a bias exercise padding in both gather stages.
-    model = nn.Linear(5, 7, device=device, dtype=dtype)
-    nn.init.ones_(model.weight)
-    nn.init.zeros_(model.bias)
-
-    with fully_shard_context(device=device):
-        fully_shard(
-            model,
-            mesh=mesh,
-            placements=placements,
-            mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
-        )
-    # SGD's foreach/fused CUDA paths require matching parameter and gradient dtypes.
-    # Use the scalar path to exercise FP32 main weights with default BF16 main grads.
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
-    fully_shard_optimizer(optimizer)
-    x = torch.ones(1, 5, device=device, dtype=dtype)
-
-    def train_iteration() -> torch.Tensor:
-        optimizer.zero_grad(set_to_none=True)
-        loss = model(x).sum()
-        loss.backward()
-        optimizer.step()
-        return loss.detach().float()
-
-    # Each step subtracts 0.25 from all five weights and the bias of each row.
-    for expected in (35.0, 24.5, 14.0):
-        torch.testing.assert_close(train_iteration(), torch.tensor(expected, device=device))
-
-
 def test_rejects_optimizer_placements_larger_than_model_weight_placements(distributed_setup):
     """Optimizer placements must fit within the model-weight placements."""
     world_size = distributed_setup.world_size
@@ -829,49 +635,6 @@ def test_rejects_optimizer_placements_larger_than_model_weight_placements(distri
                 placements=placements,
                 mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
             )
-
-
-def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, monkeypatch):
-    """Optimizer synchronization should run once per group, not once per microbatch."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = TinyModel().to(device=device, dtype=torch.bfloat16)
-    with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
-        fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
-    parameter_groups = (*model.fc1.parameter_groups, *model.fc2.parameter_groups)
-    sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
-
-    def make_count_sync(parameter_group):
-        sync_model_weight = parameter_group.sync_model_weight_from_main_weight
-
-        def count_sync():
-            sync_counts[parameter_group] += 1
-            sync_model_weight()
-
-        return count_sync
-
-    for parameter_group in parameter_groups:
-        monkeypatch.setattr(
-            parameter_group, "sync_model_weight_from_main_weight", make_count_sync(parameter_group)
-        )
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    fully_shard_optimizer(optimizer)
-    inputs = torch.randn(3, 2, 8, device=device, dtype=torch.bfloat16)
-
-    for step in range(3):
-        optimizer.zero_grad(set_to_none=True)
-        for microbatch_input in inputs:
-            (model(microbatch_input).sum() / len(inputs)).backward()
-
-        assert all(sync_count == step for sync_count in sync_counts.values())
-        optimizer.step()
-        assert all(sync_count == step + 1 for sync_count in sync_counts.values())
 
 
 def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setup):
@@ -908,50 +671,6 @@ def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setu
         loss.backward()
         baseline_optimizer.step()
         optimizer.step()
-
-
-def test_microbatch_scopes_context(distributed_setup):
-    """microbatch() should scope state on the supplied FSDP context."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
-    with fully_shard_context(device=device) as context:
-        for layer in model:
-            fully_shard(layer, mesh=mesh, placements=_default_placements())
-
-    with microbatch(context, is_last=False):
-        assert not context.is_last_microbatch
-
-    assert context.is_last_microbatch
-
-
-def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
-    """A CPU model should support sharding a child before moving the full model to CUDA."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
-    nn.init.constant_(model[0].weight, 2.0)
-    nn.init.constant_(model[1].weight, 3.0)
-    x = torch.ones(1, 4)
-    expected_output = model(x).to(device)
-
-    # Shard the second layer's parameters onto the mesh device; the unwrapped
-    # first layer's parameters remain on CPU until model.to(device) below.
-    with fully_shard_context(device=device):
-        fully_shard(model[1], mesh=mesh, placements=_default_placements())
-
-    assert model[0].weight.device.type == "cpu"
-    assert isinstance(model[1].weight, DTensor)
-    assert model[1].weight.device == device
-
-    model.to(device)
-
-    output = model(x.to(device))
-    torch.testing.assert_close(output, expected_output)
 
 
 def test_fully_shard_shares_class_stream(distributed_setup):
@@ -1006,58 +725,6 @@ def test_fully_shard_preserves_parameter_attributes(distributed_setup):
 
     for name, value in attributes.items():
         assert getattr(model.weight, name) == value, name
-
-
-def test_meta_parameters_shard_to_mesh_device(distributed_setup):
-    """A sharded meta model should support initialization and forward."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Sequential(
-        nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
-        nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
-    )
-
-    with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
-    nn.init.constant_(model[0].weight, 2.0)
-    nn.init.constant_(model[1].weight, 3.0)
-    # The exposed parameters update FP32 main weights, while forward uses separate BF16
-    # model weights. This simulates load_checkpoint() until
-    # https://github.com/NVIDIA/Megatron-LM/pull/6024 lands and syncs after loading.
-    for parameter_group in model.parameter_groups:
-        parameter_group.sync_model_weight_from_main_weight()
-
-    output = model(torch.ones(1, 4, device=device, dtype=torch.bfloat16))
-    torch.testing.assert_close(output, torch.full_like(output, 96.0))
-
-
-def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
-    """A non-leaf parameter view saved for backward should survive full-storage resize."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = NonLeafViewModel().to(device)
-    with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
-    group = model.parameter_groups[0]
-    x = torch.randn(8, device=device, requires_grad=True)
-    loss = model(x).sum()
-
-    assert group._unsharded_model_weight is not None
-    assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
-
-    loss.backward()
-
-    assert group.main_grad is not None
-    assert group._unsharded_model_weight is not None
-    assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
 
 def test_fully_shard_validates_tensor_atomic_owner_mapping(distributed_setup):
