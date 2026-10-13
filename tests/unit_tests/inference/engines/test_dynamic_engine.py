@@ -2461,7 +2461,9 @@ def _reply_engine(stager):
         ("records", True, False),
         ("raises", False, False),
         # Metadata that cannot be serialized breaks the reply after a successful write.
-        ("unsendable", False, None),
+        ("unsendable", False, "failed_reply"),
+        # A reply that cannot be built even without the metadata.
+        ("unserializable", False, "exit"),
     ],
 )
 async def test_payload_offload_stages_only_eligible_completed_replies(
@@ -2470,12 +2472,14 @@ async def test_payload_offload_stages_only_eligible_completed_replies(
     """A stager offloads completed non-streaming replies only.
 
     Failed and streaming requests are neither staged nor stripped, and replies are untouched
-    without a stager or when its write raises; a staged reply that cannot be sent exits
-    the process instead of leaving the client waiting. An offloaded reply never carries the prompt
+    without a stager or when its write raises. A staged reply that cannot be sent is
+    replaced by a FAILED reply, or exits the process if even that fails, so the client is
+    never left waiting. An offloaded reply never carries the prompt
     tensors, even when the request opted into return_prompt_tokens (the stager holds the
     prompt ids); a reply that is not offloaded still honours the opt-in. The ledger is a
     separate mechanism and stays off here.
     """
+    stager_kind = stager
     if stager is not None:
         stager = _RecordingStager(
             error=RuntimeError("write failed") if stager == "raises" else None,
@@ -2491,17 +2495,26 @@ async def test_payload_offload_stages_only_eligible_completed_replies(
     )
     failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
 
+    if stager_kind == "unserializable":
+        engine._serialize_finished_request = mock.Mock(side_effect=RuntimeError("bad request"))
+
     with mock.patch("megatron.core.utils.sys.exit") as exit_process:
         engine._send_requests_to_coordinator([completed, failed])
         await engine._drain_staging_tasks()
 
     wires = {wire["uid"]: wire for wire in _sent_replies(engine)}
     assert wires["chatcmpl-failed"]["payload_offloaded"] is False
-    if expected_offloaded is None:
+    if expected_offloaded == "exit":
         exit_process.assert_called_once_with(1)
         assert "chatcmpl-ok" not in wires
         return
     exit_process.assert_not_called()
+    if expected_offloaded == "failed_reply":
+        ok_wire = wires["chatcmpl-ok"]
+        assert ok_wire["status"] == Status.FAILED.name
+        assert ok_wire["payload_offloaded"] is False
+        assert ok_wire["payload_stage_metadata"] == {}
+        return
     ok_wire = wires["chatcmpl-ok"]
     assert engine.local_metadata_ledger == {}
     assert ok_wire["payload_offloaded"] is expected_offloaded

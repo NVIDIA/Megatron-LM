@@ -1752,8 +1752,9 @@ class DynamicInferenceEngine(AbstractEngine):
         for this request's write, so its stage metadata describes a durable write. The
         reply is sent after the await, back on the engine loop's thread, which is the
         only thread that uses the ZMQ socket. A failed write keeps the payload on the
-        reply. Nothing awaits this task, so any other error exits the process (like the
-        engine loop) instead of vanishing and leaving the client waiting forever.
+        reply, and a reply that cannot be built or sent is replaced by a FAILED reply.
+        Nothing awaits this task, so any other error exits the process (like the engine
+        loop) instead of vanishing and leaving the client waiting forever.
         """
         try:
             stage_result = await asyncio.to_thread(
@@ -1766,8 +1767,16 @@ class DynamicInferenceEngine(AbstractEngine):
         except Exception:  # pylint: disable=broad-except
             logger.exception("Payload staging failed for request %s", request.uid)
             stage_result = None
-        reply = self._serialize_finished_request(request, stage_result)
-        self.socket_for_receiving_requests.send_multipart(_engine_reply_frames([reply]))
+        try:
+            reply = self._serialize_finished_request(request, stage_result)
+            self.socket_for_receiving_requests.send_multipart(_engine_reply_frames([reply]))
+        except Exception:  # pylint: disable=broad-except
+            # Most likely stage metadata that cannot be serialized: fail only this request,
+            # without the metadata. If this raises too, trace_async_exceptions exits.
+            logger.exception("Sending the staged reply failed for request %s", request.uid)
+            request.status = Status.FAILED
+            reply = self._serialize_finished_request(request, None)
+            self.socket_for_receiving_requests.send_multipart(_engine_reply_frames([reply]))
 
     async def _drain_staging_tasks(self) -> None:
         """Wait for in-flight staging tasks so their replies are sent before teardown."""
