@@ -16,16 +16,12 @@
 
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary
 
 import torch
 from torch import nn
 
 from .indexed_order import IndexedOrder
-
-if TYPE_CHECKING:
-    from .module import FsdpModule
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -104,7 +100,7 @@ class FsdpContext:
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
-            tuple[FsdpModule, Callable[[FsdpModule], None]]
+            tuple[nn.Module, Callable[[nn.Module], None]]
         ] = []
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
