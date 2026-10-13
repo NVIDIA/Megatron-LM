@@ -272,6 +272,45 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
+    def test_uneven_shards_pack_parameter_groups_without_padding(self):
+        """megatron_fsdp_uneven_shards reaches every parameter group and rejects nccl_ub."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        ddp_config = DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            data_parallel_sharding_strategy="optim_grads_params",
+            megatron_fsdp_uneven_shards=True,
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=ddp_config,
+            module=torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+                device="cuda", dtype=config.params_dtype
+            ),
+            pg_collection=self.pg_collection,
+        )
+        [group] = model.module.parameter_groups
+        assert group.uneven_shards
+        # Weight and bias share one bf16 group and pack back to back without padding.
+        assert group.main_weight.layout.size == config.hidden_size * config.hidden_size + 16
+
+        with pytest.raises(ValueError, match="incompatible with nccl_ub"):
+            FullyShardedDataParallel(
+                config=config,
+                ddp_config=replace(ddp_config, nccl_ub=True),
+                module=torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+                    device="cuda", dtype=config.params_dtype
+                ),
+                pg_collection=self.pg_collection,
+            )
+
     def test_rejects_shared_context_without_caller_managed_grad_sync(self, distributed_setup):
         """The adapter rejects an incompatible shared context before sharding the model."""
         config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)

@@ -71,6 +71,7 @@ def fully_shard(
     grad_divisor: int = 1,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
+    uneven_shards: bool = False,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -99,6 +100,9 @@ def fully_shard(
             hooks on ``module``. Disable this when an external scheduler invokes the
             corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
             is registered independently.
+        uneven_shards: Pack each parameter group without padding for RowAtomic/BlockAtomic,
+            and split it into generally unequal per-rank shards at row boundaries
+            (32-row block boundaries for MXFP8) instead of padding every group to equal shards.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -130,6 +134,7 @@ def fully_shard(
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
+            uneven_shards=uneven_shards,
         )
     except Exception:
         module.__class__ = original_cls
