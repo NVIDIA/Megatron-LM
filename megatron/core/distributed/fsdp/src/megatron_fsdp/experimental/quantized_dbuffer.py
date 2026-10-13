@@ -123,6 +123,8 @@ def update_mxfp8_tensor(
         if rowwise:
             tensor_view._rowwise_scale_inv = _pad_rowwise_scale(tensor_view._rowwise_scale_inv)
         else:
+            # Allocated but not newly gathered: the other phase installed these planes.
+            assert tensor._rowwise_data is not None, "Expected previously installed rowwise planes."
             tensor_view._rowwise_data = tensor._rowwise_data
             tensor_view._rowwise_scale_inv = tensor._rowwise_scale_inv
     if tensor_view._columnwise_data is not None:
@@ -131,6 +133,10 @@ def update_mxfp8_tensor(
                 tensor_view._columnwise_scale_inv
             )
         else:
+            # Allocated but not newly gathered: the other phase installed these planes.
+            assert (
+                tensor._columnwise_data is not None
+            ), "Expected previously installed columnwise planes."
             tensor_view._columnwise_data = tensor._columnwise_data
             tensor_view._columnwise_scale_inv = tensor._columnwise_scale_inv
     tensor.data = tensor_view
