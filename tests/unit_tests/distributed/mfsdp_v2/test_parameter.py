@@ -12,6 +12,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
+    microbatch,
 )
 
 
@@ -247,7 +248,7 @@ def test_frozen_weights_without_input_gradients(distributed_setup):
     frozen_linear = nn.Linear(4, 4, bias=False).requires_grad_(False)
     model = nn.Sequential(trainable_linear, frozen_linear).to(device)
     nn.init.ones_(frozen_linear.weight)
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device) as context:
         fully_shard(trainable_linear, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
@@ -262,9 +263,11 @@ def test_frozen_weights_without_input_gradients(distributed_setup):
     with torch.autograd.graph.saved_tensors_hooks(
         pack_hook=lambda tensor: tensor, unpack_hook=unpack
     ):
-        model(torch.ones(2, 4, device=device)).sum().backward()
+        for is_last in (False, True):
+            with microbatch(context, is_last=is_last):
+                model(torch.ones(2, 4, device=device)).sum().backward()
+            frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
+            assert frozen_weight.untyped_storage().nbytes() == 0
     torch.testing.assert_close(
-        trainable_linear.weight.grad.full_tensor(), torch.full((4, 4), 8.0, device=device)
+        trainable_linear.weight.grad.full_tensor(), torch.full((4, 4), 16.0, device=device)
     )
-    frozen_weight = model.parameter_groups[0].fsdp_parameters[0].unsharded
-    assert frozen_weight.untyped_storage().nbytes() == 0

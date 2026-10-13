@@ -214,8 +214,8 @@ class FsdpContext:
         self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def post_backward(self) -> None:
-        """Order current-stream consumers after this backward's gradient reductions."""
-        if self.caller_managed_grad_sync:
+        """Finish backward cleanup and automatically synchronize the last microbatch."""
+        if self.caller_managed_grad_sync or not self.is_last_microbatch:
             self._run_delayed_post_backward_callbacks()
         else:
             self.finish_grad_sync()

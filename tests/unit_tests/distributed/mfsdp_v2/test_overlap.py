@@ -205,6 +205,10 @@ def test_overlaps_communication_and_compute(
         expected_allgather_overlap_count,
         expected_reduce_scatter_overlap_count,
     ) = expected_collective_counts[placements_factory]
+    if placements_factory is _zero2_placements and not unify_communication_stream:
+        # The first microbatch's final reduction can overlap the next forward,
+        # which needs no new all-gather with ZeRO-2.
+        expected_reduce_scatter_overlap_count += 1
 
     assert len(allgather_groups) == expected_allgather_count, (
         f"Expected {expected_allgather_count} all-gather groups, got "
