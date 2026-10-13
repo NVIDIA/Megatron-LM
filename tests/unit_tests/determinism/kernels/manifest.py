@@ -371,10 +371,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="moe_experts",
-        sources=("megatron/core/transformer/moe/experts.py",),
-        tests=(K + "test_moe_kernels.py",),
+        sources=(
+            "megatron/core/transformer/moe/experts.py",
+            "megatron/core/ops/moe/weighted_activation.py",
+        ),
+        tests=(K + "test_moe_kernels.py", K + "test_weighted_activation.py"),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert. "
+        "Chunked mixed-precision router weighting replays outputs and both input gradients.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
