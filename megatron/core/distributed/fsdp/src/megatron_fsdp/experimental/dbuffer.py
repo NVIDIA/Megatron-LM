@@ -138,6 +138,7 @@ class DBuffer:
         device: torch.device | str,
         *,
         block_size: int = 1,
+        uneven_shards: bool = False,
     ) -> "DBuffer":
         """Build a RowAtomic or BlockAtomic layout and allocate its local buffer.
 
@@ -151,10 +152,16 @@ class DBuffer:
             dtype: Dtype for the local buffer.
             device: Device for the local buffer.
             block_size: Number of consecutive rows kept together on one rank.
+            uneven_shards: Pack tensors without padding and let rank segments differ in
+                size (``layout_builder.build_for_row_atomic_unpadding``) instead of
+                padding to equal segments (``layout_builder.build_for_row_atomic``).
         """
-        layout = layout_builder.build_for_row_atomic(
-            tensor_shapes, dp_size=mesh.size(), block_size=block_size
+        build = (
+            layout_builder.build_for_row_atomic_unpadding
+            if uneven_shards
+            else layout_builder.build_for_row_atomic
         )
+        layout = build(tensor_shapes, dp_size=mesh.size(), block_size=block_size)
         return cls(mesh, placements, layout, dtype, device)
 
     @property
@@ -204,6 +211,15 @@ class DBuffer:
 
     def _resize_storage(self, numel: int) -> None:
         self.local_buffer.untyped_storage().resize_(numel * self.local_buffer.element_size())
+
+    def _peer_chunks(
+        self, buffer: "DBuffer", placements: Iterable[Placement], mesh_axis: int
+    ) -> list[torch.Tensor]:
+        """Slice ``buffer`` into each peer's range under ``placements`` along ``mesh_axis``."""
+        return [
+            buffer.local_buffer.narrow(0, peer_range.start - buffer.offset, peer_range.numel)
+            for peer_range in self.layout.get_peer_ranges(self.mesh, placements, mesh_axis)
+        ]
 
     def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
         """Return this buffer's owned range for logical tensor ``tensor_index``."""
@@ -495,6 +511,7 @@ class DBuffer:
         # the combined process group's lifetime and cleanup. Revisit this as a
         # potential performance optimization.
         for axis in axes:
+            input_placements = tuple(placements)
             placements[axis] = Replicate()
             view = out.view(placements)
             group = self.mesh.get_group(axis)
@@ -513,14 +530,7 @@ class DBuffer:
                     raise NotImplementedError(
                         "Symmetric-memory allgather() requires equal shard sizes."
                     )
-                # Unequal segments only arise with TensorAtomic on a 1-D mesh, so ``view``
-                # spans the whole global buffer and the layout's rank segments index it.
-                chunks = [
-                    view.local_buffer.narrow(
-                        0, self.layout.rank_to_offset[rank], self.layout.rank_size(rank)
-                    )
-                    for rank in range(self.layout.dp_size)
-                ]
+                chunks = self._peer_chunks(view, input_placements, axis)
                 dist.all_gather(chunks, local_buffer, group=group)
             local_buffer = view.local_buffer
         return out
@@ -577,14 +587,7 @@ class DBuffer:
                 output=out.local_buffer, input=self.local_buffer, op=reduce_op, group=group
             )
         else:
-            # Non-uniform segments: the Partial input spans the whole global
-            # buffer (without padding), so the layout's rank segments index it directly.
-            chunks = [
-                self.local_buffer.narrow(
-                    0, self.layout.rank_to_offset[rank], self.layout.rank_size(rank)
-                )
-                for rank in range(self.layout.dp_size)
-            ]
+            chunks = self._peer_chunks(self, placements, axis)
             dist.reduce_scatter(out.local_buffer, chunks, op=reduce_op, group=group)
 
         if self.is_symmetric_memory and partial_placement.reduce_op == "avg":

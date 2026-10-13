@@ -53,7 +53,13 @@ def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
 
 
 def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
-    """Derive rowwise scales from the layout shared by rowwise_data and columnwise_data."""
+    """Derive rowwise scales from the layout shared by rowwise_data and columnwise_data.
+
+    Scale coordinates are data coordinates divided by 32. This is exact for both the
+    padded and the unpadded BlockAtomic(32) layouts: every tensor has dims that are
+    multiples of 32, so its numel is a multiple of 32 * 32 and every 32-row block
+    boundary is a multiple of 32 elements from the tensor's start.
+    """
     return GlobalLayout(
         tensor_shapes=(
             (shape[0], shape[1] // _MXFP8_BLOCK_SIZE) for shape in data_layout.tensor_shapes
@@ -65,7 +71,10 @@ def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
 
 
 def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
-    """Derive columnwise scales from the layout shared by rowwise_data and columnwise_data."""
+    """Derive columnwise scales from the layout shared by rowwise_data and columnwise_data.
+
+    See ``_rowwise_scale_layout`` for why dividing coordinates by 32 is exact.
+    """
     return GlobalLayout(
         tensor_shapes=(
             (shape[0] // _MXFP8_BLOCK_SIZE, shape[1]) for shape in data_layout.tensor_shapes
@@ -205,11 +214,25 @@ class QuantizedDBuffer:
         placements: Iterable[Placement],
         tensor_shapes: Iterable[Shape],
         device: torch.device | str,
+        *,
+        uneven_shards: bool = False,
     ) -> "QuantizedDBuffer":
-        """Build an MXFP8 layout from logical tensor shapes and allocate its planes."""
-        layout = layout_builder.build_for_row_atomic(
-            tensor_shapes, dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
+        """Build an MXFP8 layout from logical tensor shapes and allocate its planes.
+
+        Args:
+            mesh: Device mesh whose dimensions correspond to ``placements``.
+            placements: Per-mesh-axis DBuffer placements.
+            tensor_shapes: Logical 2D shapes that the buffer manages.
+            device: Device for the local planes.
+            uneven_shards: Pack tensors without padding and split them at 32-row block
+                boundaries into generally unequal rank segments; see ``DBuffer.empty``.
+        """
+        build = (
+            layout_builder.build_for_row_atomic_unpadding
+            if uneven_shards
+            else layout_builder.build_for_row_atomic
         )
+        layout = build(tensor_shapes, dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE)
         return cls(mesh, placements, layout, device)
 
     @property

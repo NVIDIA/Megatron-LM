@@ -72,6 +72,7 @@ def fully_shard(
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
     grad_accumulation_count: int | None = None,
+    uneven_shards: bool = False,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -106,6 +107,9 @@ def fully_shard(
         grad_accumulation_count: Total parameter-gradient callbacks per reduction
             window, including contributions from separate GraphTasks and delayed
             weight gradients. Defaults to one per owned trainable parameter.
+        uneven_shards: Pack each parameter group without padding for RowAtomic/BlockAtomic,
+            and split it into generally unequal per-rank shards at row boundaries
+            (32-row block boundaries for MXFP8) instead of padding every group to equal shards.
             The scheduler must declare the complete count before sharding the unit.
     """
     if isinstance(module, FsdpModule):
@@ -139,6 +143,7 @@ def fully_shard(
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
             grad_accumulation_count=grad_accumulation_count,
+            uneven_shards=uneven_shards,
         )
     except Exception:
         module.__class__ = original_cls

@@ -80,12 +80,15 @@ class FsdpModule:
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
         grad_accumulation_count: int | None = None,
+        uneven_shards: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module.
 
         Args:
             grad_accumulation_count: Total parameter-gradient callbacks per reduction
                 window. Defaults to one per owned trainable parameter.
+            uneven_shards: Pack each parameter group without padding into generally
+                unequal rank shards. See ``fully_shard``.
         """
         self._context = context
         self._unshard_events = {}
@@ -114,6 +117,7 @@ class FsdpModule:
                     grad_scale=grad_scale,
                     use_symmetric_memory=use_symmetric_memory,
                     parameter_to_owner=context.parameter_to_owner,
+                    uneven_shards=uneven_shards,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)

@@ -269,6 +269,12 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    megatron_fsdp_uneven_shards: bool = False
+    """Megatron-FSDP v2 only. If true, pack each parameter group without padding and
+    split it into generally unequal per-rank shards at row boundaries (32-row block
+    boundaries for MXFP8).
+    """
+
     megatron_fsdp_max_pool_double_buffer: bool = False
     """
     Builds a double buffer maxpool that can be recycled across asymmetric / hybrid

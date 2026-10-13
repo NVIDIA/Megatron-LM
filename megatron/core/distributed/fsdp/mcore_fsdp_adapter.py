@@ -691,6 +691,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             mixed_precision_policy=self.mp_policy,
             schedule_policy=schedule_policy,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
+            uneven_shards=ddp_config.megatron_fsdp_uneven_shards,
         )
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
@@ -889,6 +890,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if ddp_config.nccl_ub and ddp_config.disable_symmetric_registration:
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
+        if ddp_config.nccl_ub and ddp_config.megatron_fsdp_uneven_shards:
+            raise ValueError(
+                "MFSDP v2 megatron_fsdp_uneven_shards is incompatible with nccl_ub: "
+                "symmetric-memory collectives require equal shard sizes."
+            )
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
         if ddp_config.num_buckets is not None:

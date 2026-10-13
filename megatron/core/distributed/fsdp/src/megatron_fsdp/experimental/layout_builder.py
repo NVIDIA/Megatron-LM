@@ -14,6 +14,7 @@
 
 """Build global tensor layouts for DBuffer."""
 
+import bisect
 import itertools
 import math
 from collections.abc import Iterable
@@ -165,6 +166,91 @@ def build_for_row_atomic(
         tensor_to_offset=tensor_to_offset,
         size=size,
         rank_to_offset=(segment * rank for rank in range(dp_size)),
+    )
+    layout.validate_for_row_atomic(block_size=block_size)
+    return layout
+
+
+def build_for_row_atomic_unpadding(
+    shapes: Iterable[Shape], dp_size: int, *, block_size: int = 1
+) -> GlobalLayout:
+    """Build padding-free, generally unequal rank segments for RowAtomic or BlockAtomic.
+
+    Unlike ``build_for_row_atomic``, this never pads. Tensors are packed back to
+    back in tensor-id order, so ``size`` is the sum of all tensor numels.
+    Each rank boundary is then placed as close as possible to an even
+    ``size / dp_size`` split while landing on a row (or ``block_size``-row)
+    boundary of the tensor it falls in, so every rank still owns whole rows
+    or blocks. Segment sizes therefore differ by at most one row or block,
+    and DBuffer uses list-based (uneven) collectives.
+
+    For example, with shapes P0=(2, 6), P1=(4, 4), P2=(1, 2) on 2 ranks, the even
+    split at 15 is rounded to P1's row boundary at 16:
+
+    ```
+    rank 0 [ 0, 16): | P0 row 0              | P0 row 1               | P1 row 0      |
+    rank 1 [16, 30): | P1 row 1      | P1 row 2      | P1 row 3      | P2    |
+    ```
+
+    The padded layout would instead use ``chunk_size = LCM(6, 4, 2) = 12``, pad the
+    total to a multiple of ``12 * 2``, and allocate 48 elements for 30 elements of data.
+
+    Args:
+        shapes: Logical tensor shapes in tensor-id order.
+        dp_size: Data-parallel shard count for this global layout.
+        block_size: Number of consecutive rows kept on one rank. Defaults to
+            one for RowAtomic; larger values build a BlockAtomic layout.
+
+    Returns:
+        Global layout whose ``size`` is the total number of logical elements and
+        whose rank boundaries never split a row or block.
+    """
+    if dp_size <= 0:
+        raise ValueError(f"DP size must be positive, got {dp_size}.")
+    if block_size <= 0:
+        raise ValueError(f"Block size must be positive, got {block_size}.")
+
+    tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
+    tensor_to_offset: list[int] = []
+    # (start, end, alignment) of every nonempty tensor, in ascending start order.
+    aligned_spans: list[tuple[int, int, int]] = []
+    next_offset = 0
+    for shape in tensor_shapes:
+        row_size = non_leading_numel(shape)
+        if row_size <= 0:
+            raise ValueError(f"Cannot compute a layout for zero-sized non-leading dims: {shape}.")
+        if shape[0] % block_size != 0:
+            raise ValueError(
+                f"Tensor dim 0 ({shape[0]}) must be divisible by block size {block_size}."
+            )
+        tensor_to_offset.append(next_offset)
+        if shape.numel() > 0:
+            aligned_spans.append((next_offset, next_offset + shape.numel(), block_size * row_size))
+        next_offset += shape.numel()
+    size = next_offset
+
+    def nearest_aligned_boundary(target: int) -> int:
+        # Snap ``target`` to the closest row/block boundary of the tensor containing it.
+        span_index = bisect.bisect_right([span[0] for span in aligned_spans], target) - 1
+        start, end, alignment = aligned_spans[span_index]
+        lower = start + ((target - start) // alignment) * alignment
+        upper = min(lower + alignment, end)
+        return lower if target - lower <= upper - target else upper
+
+    rank_to_offset = [0]
+    if size > 0:
+        for rank in range(1, dp_size):
+            # Round the even split to the nearest element before snapping.
+            target = (size * rank + dp_size // 2) // dp_size
+            rank_to_offset.append(nearest_aligned_boundary(target))
+    else:
+        rank_to_offset.extend([0] * (dp_size - 1))
+
+    layout = GlobalLayout(
+        tensor_shapes=tensor_shapes,
+        tensor_to_offset=tensor_to_offset,
+        size=size,
+        rank_to_offset=rank_to_offset,
     )
     layout.validate_for_row_atomic(block_size=block_size)
     return layout

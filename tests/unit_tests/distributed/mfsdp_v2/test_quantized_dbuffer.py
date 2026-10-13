@@ -51,7 +51,10 @@ requires_mxfp8 = pytest.mark.skipif(
         pytest.param(lambda num_ranks: [(32, 128)] * num_ranks, id="short_tensors"),
     ],
 )
-def test_quantized_dbuffer_quantization_matches_te(distributed_setup, placements, make_shapes):
+@pytest.mark.parametrize("uneven_shards", [False, True], ids=["padded", "uneven"])
+def test_quantized_dbuffer_quantization_matches_te(
+    distributed_setup, placements, make_shapes, uneven_shards
+):
     """Quantizing a sharded view matches TE and writes only this rank's shard.
 
     The view is taken from a replicated buffer filled with a canary, so any write
@@ -67,7 +70,11 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup, placements
         mesh = init_device_mesh(device.type, (2, world_size // 2))
     shapes = make_shapes(mesh.size())
     canary = 0xAA
-    replicated = QuantizedDBuffer.empty(mesh, [Replicate()] * mesh.ndim, shapes, device)
+    replicated = QuantizedDBuffer.empty(
+        mesh, [Replicate()] * mesh.ndim, shapes, device, uneven_shards=uneven_shards
+    )
+    if uneven_shards:
+        assert replicated.rowwise_data.layout.size == sum(rows * cols for rows, cols in shapes)
     for plane in replicated.planes:
         plane.local_buffer.fill_(canary)
     quantized = replicated.view(placements)
@@ -281,26 +288,48 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
 
 
 @pytest.mark.parametrize("use_out", [False, True])
-def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out):
-    """All-gather preserves rank order in every plane, with or without an output buffer."""
+@pytest.mark.parametrize("uneven_shards", [False, True], ids=["padded", "uneven"])
+def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, uneven_shards):
+    """All-gather preserves rank order in every plane, with or without an output buffer.
+
+    Unpadded planes have unequal, possibly empty, rank segments; the scale planes
+    follow the data partition in 32x smaller coordinates.
+    """
     if distributed_setup.world_size < 2:
         pytest.skip("QuantizedDBuffer all-gather requires at least two ranks.")
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     shapes = [(128, 64), (32, 128)]
-    source = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
+    source = QuantizedDBuffer.empty(
+        mesh, [BlockAtomic(32)], shapes, distributed_setup.device, uneven_shards=uneven_shards
+    )
+    data_layout = source.rowwise_data.layout
+    assert source.columnwise_data.layout == data_layout
+    assert data_layout.has_equal_shard_sizes != uneven_shards
+    if uneven_shards:
+        assert data_layout.size == 128 * 64 + 32 * 128
+    for scale_plane in (source.rowwise_scale, source.columnwise_scale):
+        assert scale_plane.layout.size == data_layout.size // 32
+        assert scale_plane.layout.rank_to_offset == tuple(
+            offset // 32 for offset in data_layout.rank_to_offset
+        )
     for index, plane in enumerate(source.planes):
         plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
     if use_out:
-        destination = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, distributed_setup.device)
+        destination = QuantizedDBuffer.empty(
+            mesh, [Replicate()], shapes, distributed_setup.device, uneven_shards=uneven_shards
+        )
         result = source.allgather(0, out=destination)
         assert result is destination
     else:
         result = source.allgather(0)
     for index, plane in enumerate(result.planes):
         assert plane.placements == (Replicate(),)
-        chunks = plane.local_buffer.view(mesh.size(), -1)
+        layout = plane.layout
         for rank in range(mesh.size()):
-            assert chunks[rank].eq(index * mesh.size() + rank).all()
+            chunk = plane.local_buffer.narrow(
+                0, layout.rank_to_offset[rank], layout.rank_size(rank)
+            )
+            assert chunk.eq(index * mesh.size() + rank).all()
 
 
 @pytest.mark.parametrize("use_out", [False, True])
