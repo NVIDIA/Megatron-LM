@@ -1,7 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import inspect
 import os
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -17,6 +19,7 @@ from megatron.core.distributed.finalize_model_grads import (
     finalize_model_grads,
     reset_model_temporary_tensors,
 )
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
@@ -146,9 +149,243 @@ class TestFinalizeModelGradsMoEExpertBias:
 
         for pg_collection in pg_collections:
             model = _RouterExpertBiasModel(config, torch.tensor([1.0, 0.0], device=device))
-            with pytest.raises(AssertionError, match="tp_dp_cp"):
+            with pytest.raises(ValueError, match="tp_dp_cp"):
                 finalize_model_grads([model], pg_collection=pg_collection)
             assert model.finish_grad_sync_calls == 0
+
+
+_PIPELINE_SIZE = 4
+_UNSET = object()
+
+
+@contextmanager
+def _forbid_global_groups():
+    """Fail on any read of the global parallel grid or any collective over the default group."""
+
+    def _forbidden(name):
+        def _raise(*args, **kwargs):
+            raise AssertionError(f"read parallel_state.{name}")
+
+        return _raise
+
+    def _without_default_group(collective):
+        signature = inspect.signature(collective)
+
+        def _checked(*args, **kwargs):
+            group = signature.bind(*args, **kwargs).arguments.get('group')
+            assert group is not None, f"{collective.__name__} over the default (WORLD) group"
+            return collective(*args, **kwargs)
+
+        return _checked
+
+    accessors = [
+        name
+        for name in dir(parallel_state)
+        if name.startswith('get_')
+        and name.endswith(('_group', '_groups', '_gloo', '_rank', '_ranks', '_world_size'))
+    ]
+    with ExitStack() as stack:
+        for name in accessors + ['is_pipeline_first_stage', 'is_pipeline_last_stage']:
+            stack.enter_context(mock.patch.object(parallel_state, name, _forbidden(name)))
+        for name in ('all_reduce', 'broadcast'):
+            stack.enter_context(
+                mock.patch.object(dist, name, _without_default_group(getattr(dist, name)))
+            )
+        yield
+
+
+def _pipeline_pg_collection():
+    """Groups of a TP=1 x DP x PP=4 grid, built without parallel_state.
+
+    The word embeddings live on the first and last stage and the position embeddings on the first
+    stage; ranks outside those groups hold None.
+    """
+    grid = HyperCommGrid(
+        [1, dist.get_world_size() // _PIPELINE_SIZE, _PIPELINE_SIZE], ["tp", "dp", "pp"]
+    )
+    pg_collection = ProcessGroupCollection(
+        tp=grid.create_pg("tp"),
+        pp=grid.create_pg("pp"),
+        dp_cp=grid.create_pg("dp"),
+        embd=None,
+        pos_embd=None,
+    )
+    # new_group is collective: every rank creates every group in the same order.
+    for stage_ranks in grid.get_rank_enum("pp"):
+        embd_ranks = [stage_ranks[0], stage_ranks[-1]]
+        embd = dist.new_group(embd_ranks)
+        pos_embd = dist.new_group(stage_ranks[:1])
+        if dist.get_rank() in embd_ranks:
+            pg_collection.embd = embd
+        if dist.get_rank() == stage_ranks[0]:
+            pg_collection.pos_embd = pos_embd
+    return pg_collection
+
+
+def _stage_config(sync_replicated_params=False, **kwargs):
+    config = TransformerConfig(
+        num_layers=1, hidden_size=8, num_attention_heads=1, use_cpu_initialization=True, **kwargs
+    )
+    # Conditional embedders and Flextron routers are replicated on every pipeline stage, and
+    # finalize_model_grads all-reduces their gradients across the pipeline.
+    config.has_cond_embedder = sync_replicated_params
+    config.flextron = sync_replicated_params
+    return config
+
+
+def _num_tokens(chunk, dp_cp_group):
+    """Only the last stage counts tokens; finalize_model_grads broadcasts the count to the other
+    stages before reducing it across data-parallel replicas."""
+    count = 5 + dp_cp_group.rank() if chunk.post_process else 1000
+    return torch.tensor(count, dtype=torch.int, device="cuda")
+
+
+def _assert_finalized(chunk, num_tokens, pp_group, dp_cp_group):
+    total_tokens = sum(5 + dp_rank for dp_rank in range(dp_cp_group.size()))
+    assert num_tokens.item() == total_tokens
+    stage_sum = sum(range(1, pp_group.size() + 1))
+    expected = {'cond_embedder': stage_sum / total_tokens, 'router': 10 * stage_sum / total_tokens}
+    if chunk.word_embedding is not None:
+        expected['word_embedding'] = (1 + pp_group.size()) / total_tokens
+    for name, value in expected.items():
+        main_grad = getattr(chunk, name).main_grad
+        torch.testing.assert_close(main_grad, torch.full_like(main_grad, value))
+    assert chunk.finish_grad_sync_calls == 1
+
+
+class _StageChunk(torch.nn.Module):
+    """One pipeline stage with the attributes and hooks that finalize_model_grads uses."""
+
+    def __init__(self, config, pp_group):
+        super().__init__()
+        self.config = config
+        self.ddp_config = DistributedDataParallelConfig()
+        self.pre_process = pp_group.rank() == 0
+        self.post_process = pp_group.rank() == pp_group.size() - 1
+        self.share_embeddings_and_output_weights = True
+        stage = pp_group.rank() + 1
+        device = torch.cuda.current_device()
+        # The tied word embedding has a copy on the first and the last stage.
+        self.word_embedding = (
+            self._parameter(stage, device) if self.pre_process or self.post_process else None
+        )
+        self.cond_embedder = self._parameter(stage, device)
+        self.cond_embedder.pipeline_parallel = True
+        self.router = self._parameter(10 * stage, device)
+        self.router.flextron_router_pp_sync = True
+        self.finish_grad_sync_calls = 0
+
+    @staticmethod
+    def _parameter(grad_value, device):
+        param = torch.nn.Parameter(torch.zeros(4, device=device))
+        param.main_grad = torch.full_like(param, float(grad_value))
+        return param
+
+    def shared_embedding_or_output_weight(self):
+        return self.word_embedding
+
+    def finish_grad_sync(self, force_all_reduce=False):
+        del force_all_reduce
+        self.finish_grad_sync_calls += 1
+
+    def scale_gradients(self, scaling_factor):
+        for param in self.parameters():
+            param.main_grad.mul_(scaling_factor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    Utils.world_size < _PIPELINE_SIZE or Utils.world_size % _PIPELINE_SIZE != 0,
+    reason=f"needs a multiple of {_PIPELINE_SIZE} ranks",
+)
+class TestFinalizeModelGradsProcessGroups:
+    """An explicit collection is the only source of groups; without one, the global grid is."""
+
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+        Utils.initialize_distributed()
+        parallel_state.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_reads_no_global_groups(self):
+        assert not parallel_state.model_parallel_is_initialized()
+        pg_collection = _pipeline_pg_collection()
+        chunk = _StageChunk(_stage_config(sync_replicated_params=True), pg_collection.pp)
+        num_tokens = _num_tokens(chunk, pg_collection.dp_cp)
+
+        with _forbid_global_groups():
+            finalize_model_grads([chunk], num_tokens=num_tokens, pg_collection=pg_collection)
+
+        _assert_finalized(chunk, num_tokens, pg_collection.pp, pg_collection.dp_cp)
+
+    def test_without_collection_uses_global_groups(self):
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=_PIPELINE_SIZE)
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        chunk = _StageChunk(_stage_config(sync_replicated_params=True), pp_group)
+        num_tokens = _num_tokens(chunk, dp_cp_group)
+
+        finalize_model_grads([chunk], num_tokens=num_tokens)
+
+        _assert_finalized(chunk, num_tokens, pp_group, dp_cp_group)
+
+    def test_ignores_global_grid_with_other_layout(self):
+        # On the global grid every rank is the first or last of two stages, so a lookup there
+        # would pair the stages of the explicit four-stage pipeline differently.
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+        pg_collection = _pipeline_pg_collection()
+        pp_group = pg_collection.pp
+        chunk = _StageChunk(_stage_config(sync_replicated_params=True), pp_group)
+        is_middle_stage = not (chunk.pre_process or chunk.post_process)
+        assert (pg_collection.embd is None) == is_middle_stage
+
+        finalize_model_grads([chunk], pg_collection=pg_collection)
+
+        stage_sum = sum(range(1, pp_group.size() + 1))
+        torch.testing.assert_close(
+            chunk.router.main_grad, torch.full_like(chunk.router.main_grad, 10.0 * stage_sum)
+        )
+        if not is_middle_stage:
+            main_grad = chunk.word_embedding.main_grad
+            torch.testing.assert_close(main_grad, torch.full_like(main_grad, 1.0 + pp_group.size()))
+
+    @pytest.mark.parametrize(
+        "field,value,config_kwargs",
+        [
+            ("tp", _UNSET, {}),
+            ("tp", None, {}),
+            ("pp", _UNSET, {}),
+            ("pp", None, {}),
+            ("embd", _UNSET, {}),
+            ("dp_cp", _UNSET, {"moe_router_load_balancing_type": "quantile_balancing"}),
+        ],
+        ids=["tp-unset", "tp-none", "pp-unset", "pp-none", "embd-unset", "dp_cp-unset-qb"],
+    )
+    def test_rejects_missing_group(self, field, value, config_kwargs):
+        pg_collection = _pipeline_pg_collection()
+        chunk = _StageChunk(_stage_config(**config_kwargs), pg_collection.pp)
+        if value is _UNSET:
+            delattr(pg_collection, field)
+        else:
+            setattr(pg_collection, field, value)
+
+        with _forbid_global_groups(), pytest.raises(ValueError, match=f"pg_collection.{field}"):
+            finalize_model_grads([chunk], pg_collection=pg_collection)
+        assert chunk.finish_grad_sync_calls == 0
+
+    def test_num_tokens_requires_data_parallel_group(self):
+        """Without a DP x CP group, num_tokens must not be all-reduced over every rank."""
+        pg_collection = _pipeline_pg_collection()
+        delattr(pg_collection, 'dp_cp')
+        chunk = _StageChunk(_stage_config(), pg_collection.pp)
+        num_tokens = torch.tensor(8, dtype=torch.int, device="cuda")
+
+        with pytest.raises(ValueError, match="dp_cp"):
+            finalize_model_grads([chunk], num_tokens=num_tokens, pg_collection=pg_collection)
+        assert num_tokens.item() == 8
+        assert chunk.finish_grad_sync_calls == 0
 
 
 class TestUpdateRouterQBBeta:
