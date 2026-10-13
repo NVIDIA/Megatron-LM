@@ -2469,7 +2469,14 @@ class CompressedSparseAttention(MegatronModule):
 
         nvtx_range_push("sparse_attn_kernel")
         output = csa_sparse_attn(
-            query, kv_full, self.attn_sink.float(), flat_idxs, self.softmax_scale, out_rope=out_rope
+            query,
+            kv_full,
+            self.attn_sink.float(),
+            flat_idxs,
+            self.softmax_scale,
+            out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -2529,6 +2536,8 @@ class CompressedSparseAttention(MegatronModule):
             self.softmax_scale,
             topk_length=flat_tlen,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -2590,6 +2599,7 @@ class CompressedSparseAttention(MegatronModule):
             compact_workspace=compact_workspace,
             indexer_precision=self.config.dsa_indexer_precision,
             deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
             out_rope=out_rope,
         )
         nvtx_range_pop("sparse_attn_kernel")
@@ -2936,6 +2946,8 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=flat_tlen,
             is_thd=True,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         return output.unsqueeze(1)
 
@@ -3045,6 +3057,8 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=flat_tlen,
             is_thd=True,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         return output.unsqueeze(1)
 
@@ -3153,6 +3167,7 @@ class CompressedSparseAttention(MegatronModule):
             compact_workspace=compact_workspace,
             indexer_precision=self.config.dsa_indexer_precision,
             deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
             thd_window_size=self.window_size,
             thd_compressed_is_sequence_major=True,
             out_rope=out_rope,
@@ -3707,6 +3722,8 @@ class CompressedSparseAttention(MegatronModule):
                     self.window_size,
                     kv_reconstruction_parts,
                     fused_out_rope,
+                    self.config.deterministic_mode,
+                    self.config.cuda_graph_impl != "none",
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
@@ -3737,6 +3754,8 @@ class CompressedSparseAttention(MegatronModule):
                 is_thd=True,
                 kv_reconstruction_parts=kv_reconstruction_parts,
                 out_rope=fused_out_rope,
+                deterministic=self.config.deterministic_mode,
+                cuda_graph=self.config.cuda_graph_impl != "none",
             )
         else:
             output = unfused_compressed_sparse_attn(

@@ -229,6 +229,12 @@ def test_fused_forward_deterministic_mode_applies_probs_on_fc2_output():
 
     with pytest.raises(RuntimeError, match="FC2 without bias"):
         make_module(fc2_bias=True)._fused_forward(hidden_states, tokens_per_expert, probs)
+    # NCCL-EP zero-copy hands the fused op a symmetric output buffer that the combine reads
+    # directly; the post-multiply cannot target it, so the combination is rejected.
+    with pytest.raises(RuntimeError, match="zero_copy"):
+        make_module(fc2_bias=False)._fused_forward(
+            hidden_states, tokens_per_expert, probs, output_buffer=torch.empty_like(hidden_states)
+        )
 
 
 @pytest.mark.parametrize("fc2_bias", [False, True], ids=["no_fc2_bias", "fc2_bias"])

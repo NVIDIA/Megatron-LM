@@ -1515,9 +1515,18 @@ def _align_topk_width(topk_idxs: Tensor) -> Tensor:
 
 # Query-head counts supported by cuDNN's deterministic sparse-attention backward.
 _DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS = frozenset((16, 32, 64, 96, 128))
-# Retained per-(device, size) scratch buffers for that kernel; grow-only and never freed so a
-# pointer captured into an earlier CUDA graph stays valid.
+# One retained scratch buffer per device for that kernel, grown on demand. Its size is a function
+# of the static problem shape only (total_s_q, total_s_kv, head_dim, num_heads; see cuDNN's
+# ``flash_attn_bwd_sm100_workspace_size``), so with fixed THD capacities (CUDA-graph mode) it is
+# allocated once during eager warmup and every captured graph reuses it. When CUDA graphs are
+# enabled (``TransformerConfig.cuda_graph_impl != "none"``) a buffer replaced by a larger one is
+# kept alive because a captured graph may hold its pointer; without graphs it is released. The
+# decision is taken from the config rather than from ``torch.cuda.is_current_stream_capturing()``
+# so that it does not depend on which stream the probe runs on or on unrelated capturers
+# (e.g. torch.compile cudagraph trees); graphs created outside the Megatron config are not a
+# supported way of graphing this module.
 _DETERMINISTIC_SPARSE_BWD_WORKSPACES: dict = {}
+_DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES: list = []
 
 
 def _deterministic_requested(flag: bool = False) -> bool:
@@ -1559,6 +1568,7 @@ def _get_deterministic_sparse_attention_workspace(
     topk_idxs: Tensor,
     topk_length: Optional[Tensor],
     softmax_scale: float,
+    retain_replaced: bool = False,
 ) -> Tensor:
     """Scratch buffer for cuDNN's deterministic sparse-attention backward (sized by cuDNN)."""
     backward_api = _DSA.SparseAttentionBackward(
@@ -1582,12 +1592,16 @@ def _get_deterministic_sparse_attention_workspace(
     device = q_flat.device
     if device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    key = (device, required_bytes)
-    workspace = _DETERMINISTIC_SPARSE_BWD_WORKSPACES.get(key)
-    if workspace is None:
+    workspace = _DETERMINISTIC_SPARSE_BWD_WORKSPACES.get(device)
+    if workspace is None or workspace.numel() < required_bytes:
+        if workspace is not None and retain_replaced:
+            _DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES.append(workspace)
         workspace = torch.empty(required_bytes, dtype=torch.uint8, device=device)
-        _DETERMINISTIC_SPARSE_BWD_WORKSPACES[key] = workspace
-    return workspace
+        _DETERMINISTIC_SPARSE_BWD_WORKSPACES[device] = workspace
+    # The kernel runs on the caller's stream and the workspace is scratch, so sharing one buffer
+    # per device is safe as long as calls on that device are stream-ordered, which autograd
+    # backward on a single stream guarantees. Hand out exactly the requested size.
+    return workspace[:required_bytes]
 
 
 def _deterministic_sparse_bwd_kwargs(
@@ -1600,8 +1614,12 @@ def _deterministic_sparse_bwd_kwargs(
     topk_length: Optional[Tensor],
     softmax_scale: float,
     requested: bool = False,
+    cuda_graph: bool = False,
 ) -> dict:
     """Extra kwargs that switch ``sparse_attention_backward_wrapper`` to its deterministic kernel.
+
+    ``cuda_graph`` mirrors ``TransformerConfig.cuda_graph_impl != "none"`` and selects the
+    workspace retention policy (see ``_get_deterministic_sparse_attention_workspace``).
 
     Returns ``{}`` unless deterministic execution was requested. When it was requested but the
     installed cuDNN frontend / GPU / head count cannot provide the kernel, raise instead of
@@ -1635,7 +1653,15 @@ def _deterministic_sparse_bwd_kwargs(
     return {
         "deterministic": True,
         "workspace": _get_deterministic_sparse_attention_workspace(
-            q_flat, kv_flat, out_flat, lse, attn_sink, topk_idxs, topk_length, softmax_scale
+            q_flat,
+            kv_flat,
+            out_flat,
+            lse,
+            attn_sink,
+            topk_idxs,
+            topk_length,
+            softmax_scale,
+            retain_replaced=cuda_graph,
         ),
     }
 
@@ -1812,6 +1838,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
         indexer_topk: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
         out_rope: Optional[OutputRopeParams] = None,
+        deterministic: bool = False,
+        cuda_graph: bool = False,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         # cuDNN backward keys its compile cache on the saved top-k width. Align
@@ -1842,6 +1870,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.topk_length = topk_length
         ctx.out_rope = out_rope
+        ctx.deterministic = deterministic
+        ctx.cuda_graph = cuda_graph
         return out, lse, lse_indexer
 
     @staticmethod
@@ -1870,11 +1900,20 @@ class CSASparseAttnFunc(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             topk_length=ctx.topk_length,
             **_deterministic_sparse_bwd_kwargs(
-                q, kv, out, lse, attn_sink, topk_idxs, ctx.topk_length, ctx.softmax_scale
+                q,
+                kv,
+                out,
+                lse,
+                attn_sink,
+                topk_idxs,
+                ctx.topk_length,
+                ctx.softmax_scale,
+                requested=getattr(ctx, "deterministic", False),
+                cuda_graph=getattr(ctx, "cuda_graph", False),
             ),
         )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
-        return dq, dkv, d_sink, None, None, None, None, None, None
+        return dq, dkv, d_sink, None, None, None, None, None, None, None, None
 
 
 def csa_sparse_attn(
@@ -1888,6 +1927,8 @@ def csa_sparse_attn(
     is_thd: bool = False,
     kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
     out_rope: Optional[OutputRopeParams] = None,
+    deterministic: bool = False,
+    cuda_graph: bool = False,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -1964,6 +2005,8 @@ def csa_sparse_attn(
         indexer_topk,
         kv_reconstruction_parts,
         out_rope,
+        deterministic,
+        cuda_graph,
     )  # (rows, np, d_v)
 
     # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),
@@ -2874,6 +2917,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         thd_window_size: int | None = None,
         thd_compressed_is_sequence_major: bool = False,
         out_rope: Optional[OutputRopeParams] = None,  # inverse-RoPE fused onto the output
+        cuda_graph: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -3386,6 +3430,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         )
         ctx.softmax_scale = softmax_scale
         ctx.deterministic = deterministic
+        ctx.cuda_graph = cuda_graph
         ctx.is_thd = is_thd
         ctx.padding_row_mask = padding_row_mask
         ctx.np_ = np_
@@ -3458,7 +3503,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                 global_idxs,
                 topk_length,
                 ctx.softmax_scale,
-                requested=ctx.deterministic,
+                requested=getattr(ctx, "deterministic", False),
+                cuda_graph=getattr(ctx, "cuda_graph", False),
             ),
         )
         if is_thd:
@@ -3485,7 +3531,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         #   max_seqlen_q, max_seqlen_compressed_idx,
         #   compressed_kv, cu_seqlens_q_unpadded, compact_workspace,
         #   indexer_precision, deterministic,
-        #   thd_window_size, thd_compressed_is_sequence_major, out_rope
+        #   thd_window_size, thd_compressed_is_sequence_major, out_rope, cuda_graph
         return (
             grad_query,
             grad_kv_full,
@@ -3494,6 +3540,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -3558,6 +3605,8 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         logical_window_width: int | None = None,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
         out_rope: Optional[OutputRopeParams] = None,
+        deterministic: bool = False,
+        cuda_graph: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Run fused sparse attention using caller-supplied top-k indices."""
         _ensure_dsa_namespace()
@@ -3647,7 +3696,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 bwd_idx = predict.view(1, total_q, indexer_topk)
                 bwd_topk = indexer_topk_idxs_for_loss.view(1, total_q, indexer_topk)
                 det_w = det_k = None
-                if _deterministic_requested() and ctx.needs_input_grad[0]:
+                if _deterministic_requested(deterministic) and ctx.needs_input_grad[0]:
                     # See FusedCSAIndexerSparseAttnFunc: atomic-free dK/dW before the cuDNN call.
                     det_w, det_k = _deterministic_sparse_indexer_grads_wk(
                         bwd_q,
@@ -3825,6 +3874,8 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.q_padding_mask = q_padding_mask
         ctx.out_rope = out_rope
+        ctx.deterministic = deterministic
+        ctx.cuda_graph = cuda_graph
 
         return out_flat.reshape(total_q, np_ * out_flat.shape[-1]), indexer_loss
 
@@ -3901,7 +3952,16 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             topk_length=topk_length,
             **_deterministic_sparse_bwd_kwargs(
-                query, kv_full, out_flat, lse, attn_sink, topk_idxs, topk_length, ctx.softmax_scale
+                query,
+                kv_full,
+                out_flat,
+                lse,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                ctx.softmax_scale,
+                requested=getattr(ctx, "deterministic", False),
+                cuda_graph=getattr(ctx, "cuda_graph", False),
             ),
         )
         nvtx_range_pop("dsv4_cp_sparse_attention_backward")
@@ -3992,6 +4052,8 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
         # Older call sites omit the optional CP-overlap inputs. PyTorch expects
         # exactly one backward result for every argument passed to ``apply``.
@@ -4029,6 +4091,7 @@ def fused_csa_indexer_sparse_attn(
     thd_window_size: int | None = None,
     thd_compressed_is_sequence_major: bool = False,
     out_rope: Optional[OutputRopeParams] = None,
+    cuda_graph: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
@@ -4175,6 +4238,7 @@ def fused_csa_indexer_sparse_attn(
         thd_window_size,
         thd_compressed_is_sequence_major,
         out_rope,
+        cuda_graph,
     )
 
 

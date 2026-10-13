@@ -852,6 +852,15 @@ class TEGroupedMLP(MegatronModule):
                         "MLP requires FC2 without bias: the routing probabilities are applied on "
                         "the FC2 output, which is only exact when FC2 has no bias."
                     )
+                if output_buffer is not None:
+                    # NCCL-EP zero-copy has the combine read the FC2 output straight out of the
+                    # symmetric buffer the fused op writes; applying the probs afterwards would
+                    # leave that buffer unscaled.
+                    raise RuntimeError(
+                        "deterministic_mode is not supported with moe_ncclep_zero_copy: the "
+                        "routing probabilities are applied on the FC2 output outside the fused "
+                        "op, which cannot target the zero-copy symmetric output buffer."
+                    )
                 post_probs = permuted_probs
                 permuted_probs = torch.ones_like(permuted_probs)
             with stash_context:

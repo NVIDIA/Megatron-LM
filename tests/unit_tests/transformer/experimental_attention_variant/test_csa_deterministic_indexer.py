@@ -195,39 +195,42 @@ class _FakeBackwardApi:
         return type(self).workspace_bytes
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_sparse_bwd_kwargs_select_deterministic_kernel_and_cache_workspace(monkeypatch):
-    def sparse_attention_backward_wrapper(
-        q,
-        kv,
-        out,
-        dout,
-        lse,
-        attn_sink,
-        topk_idxs,
-        softmax_scale,
-        topk_length,
-        deterministic=False,
-        workspace=None,
-    ):  # signature only; never called here
-        raise AssertionError
+class _RecordingDSA:
+    """Stub DSA namespace whose backward wrapper has the deterministic kernel and records kwargs."""
 
-    monkeypatch.setattr(
-        dk,
-        "_DSA",
-        types.SimpleNamespace(
-            sparse_attention_backward_wrapper=sparse_attention_backward_wrapper,
-            SparseAttentionBackward=_FakeBackwardApi,
-        ),
-    )
-    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACES", {})
-    device = torch.device("cuda", torch.cuda.current_device())
+    SparseAttentionBackward = _FakeBackwardApi
+
+    def __init__(self):
+        self.calls = []
+
+    def sparse_attention_backward_wrapper(
+        self, q, kv, out, dout, lse, attn_sink, topk_idxs, softmax_scale, topk_length,
+        deterministic=False, workspace=None,
+    ):
+        self.calls.append(dict(deterministic=deterministic, workspace=workspace))
+        return {
+            "dq": torch.zeros_like(q),
+            "dkv": torch.zeros_like(kv),
+            "d_sink": torch.zeros_like(attn_sink),
+        }
+
+
+def _sparse_attn_sample(device):
     q = torch.zeros(8, 64, 16, device=device, dtype=torch.bfloat16)
     kv = torch.zeros(32, 16, device=device, dtype=torch.bfloat16)
     lse = torch.zeros(8, 64, device=device)
     sink = torch.zeros(64, device=device)
     idx = torch.zeros(8, 4, device=device, dtype=torch.int32)
-    args = (q, kv, q, lse, sink, idx)
+    return q, kv, q, lse, sink, idx
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_sparse_bwd_kwargs_select_deterministic_kernel_and_bound_workspace(monkeypatch):
+    monkeypatch.setattr(dk, "_DSA", _RecordingDSA())
+    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACES", {})
+    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES", [])
+    _FakeBackwardApi.workspace_bytes = 4096
+    args = _sparse_attn_sample(torch.device("cuda", torch.cuda.current_device()))
 
     # Not requested: the default (atomic) kernel, no extra kwargs.
     assert dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5) == {}
@@ -236,7 +239,64 @@ def test_sparse_bwd_kwargs_select_deterministic_kernel_and_cache_workspace(monke
         assert kwargs["deterministic"] is True
         workspace = kwargs["workspace"]
         assert workspace.is_cuda and workspace.dtype == torch.uint8 and workspace.numel() == 4096
-        # Same device and size -> the retained buffer is reused, so a pointer captured into a
-        # CUDA graph stays valid.
+        # Same size again: the retained per-device buffer is reused (same storage).
         again = dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
-        assert again["workspace"] is workspace
+        assert again["workspace"].data_ptr() == workspace.data_ptr()
+        # Smaller request: a slice of the same buffer, no new allocation.
+        _FakeBackwardApi.workspace_bytes = 1024
+        smaller = dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+        assert smaller["workspace"].numel() == 1024
+        assert smaller["workspace"].data_ptr() == workspace.data_ptr()
+        # Larger request without CUDA graphs (config): the buffer is replaced and released.
+        _FakeBackwardApi.workspace_bytes = 8192
+        bigger = dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+        assert bigger["workspace"].numel() == 8192
+        assert len(dk._DETERMINISTIC_SPARSE_BWD_WORKSPACES) == 1
+        assert dk._DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES == []
+        # With CUDA graphs enabled (TransformerConfig.cuda_graph_impl != "none") a replaced
+        # buffer is kept alive: a captured graph may hold its pointer.
+        _FakeBackwardApi.workspace_bytes = 16384
+        grown = dk._deterministic_sparse_bwd_kwargs(
+            *args, None, 0.5, requested=True, cuda_graph=True
+        )
+        assert grown["workspace"].numel() == 16384
+        assert len(dk._DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES) == 1
+        assert (
+            dk._DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES[0].data_ptr()
+            == bigger["workspace"].data_ptr()
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_csa_sparse_attn_honours_config_flag_without_torch_switch(monkeypatch, deterministic):
+    """``deterministic`` (TransformerConfig.deterministic_mode) alone must select the
+    deterministic backward kernel; the torch global switch is off here."""
+    recorder = _RecordingDSA()
+    monkeypatch.setattr(dk, "_DSA", recorder)
+    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_WORKSPACES", {})
+    monkeypatch.setattr(dk, "_DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES", [])
+    _FakeBackwardApi.workspace_bytes = 4096
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    def fake_fwd(q, kv, topk_idxs, softmax_scale, attn_sink=None, topk_length=None, indexer_topk=0):
+        return torch.zeros_like(q), torch.zeros(q.shape[0], q.shape[1], device=device), None
+
+    q = torch.zeros(8, 64, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.zeros(32, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
+    sink = torch.zeros(64, device=device)
+    idx = torch.zeros(8, 4, device=device, dtype=torch.int32)
+    prior = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(False)
+    try:
+        with (
+            patch.object(dk, "_csa_fwd_flash_mla", fake_fwd),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+        ):
+            out = dk.csa_sparse_attn(q, kv, sink, idx, 0.5, is_thd=True, deterministic=deterministic)
+            out.backward(torch.ones_like(out))
+    finally:
+        torch.use_deterministic_algorithms(prior)
+    (call,) = recorder.calls
+    assert call["deterministic"] is deterministic
+    assert (call["workspace"] is not None) is deterministic
