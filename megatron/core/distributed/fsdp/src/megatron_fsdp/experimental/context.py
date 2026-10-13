@@ -214,10 +214,7 @@ class FsdpContext:
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
-        # Finish children before parents to close nested backward NVTX ranges.
-        while self._delayed_post_backward_callbacks:
-            module, callback = self._delayed_post_backward_callbacks.pop()
-            callback(module)
+        self._run_delayed_post_backward_callbacks()
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
@@ -225,6 +222,13 @@ class FsdpContext:
         if not self.caller_managed_grad_sync and self.is_last_microbatch:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
+
+    def _run_delayed_post_backward_callbacks(self) -> None:
+        """Run deferred module completion callbacks once."""
+        # Finish children before parents to close nested backward NVTX ranges.
+        while self._delayed_post_backward_callbacks:
+            module, callback = self._delayed_post_backward_callbacks.pop()
+            callback(module)
 
     def register_post_backward_hook(self) -> None:
         """Register one final callback for deferred cleanup and optional gradient sync.
