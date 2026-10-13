@@ -619,6 +619,7 @@ def _build_absorbed_mla(config, state_dict=None):
     return model
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("quant_overrides", _QUANT_RECIPES)
 @pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
 def test_quantized_up_proj_recompute_parity(quant_overrides: dict, qkv_format: str):
