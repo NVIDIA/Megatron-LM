@@ -1240,6 +1240,10 @@ class TransformerConfig(ModelParallelConfig):
     See https://sustcsonglin.github.io/blog/2024/deltanet-2/#a-chunkwise-algorithm-for-deltanet.
     "headwise": Scatter heads across the CP group with all-to-all (Ulysses-style); each rank runs
     the linear-attention kernel on the full sequence for a shard of heads. Correct but memory-heavy.
+    GDN2 (experimental_attention_variant="gdn2") has no chunkwise implementation: its layers always
+    run headwise CP, whatever this field says. With context parallelism, validation therefore
+    requires GDN2 head counts to be multiples of TP x CP and rejects cp_partition_mode="contiguous"
+    and Dynamic CP for GDN2. GDN and KDA layers follow this field unchanged.
     """
 
     ##################
@@ -1864,6 +1868,12 @@ class TransformerConfig(ModelParallelConfig):
                         "cp_partition_mode='contiguous' is incompatible with "
                         "GDN-family linear_cp_mode='headwise'."
                     )
+                if self.experimental_attention_variant == "gdn2":
+                    # GDN2 always runs headwise CP; see linear_cp_mode.
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is incompatible with "
+                        "experimental_attention_variant='gdn2', which supports only headwise CP."
+                    )
             elif self.cp_partition_mode == "zigzag":
                 if self.experimental_attention_variant == "dsv4_hybrid":
                     raise ValueError(
@@ -2026,6 +2036,12 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if has_context_parallelism:
+                if self.experimental_attention_variant == "gdn2" and self.dynamic_context_parallel:
+                    raise ValueError(
+                        "experimental_attention_variant='gdn2' does not support "
+                        "dynamic_context_parallel=True: GDN2 shards heads over the static CP "
+                        "group and does not follow the per-microbatch CP group."
+                    )
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
@@ -2034,17 +2050,22 @@ class TransformerConfig(ModelParallelConfig):
                         "chunk numerics."
                     )
             # Check tensor parallelism compatibility. Headwise CP splits linear-attention heads
-            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank.
+            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank. GDN2 has no
+            # chunkwise path and always splits its heads across CP ranks.
             linear_head_parallel_size = self.tensor_model_parallel_size
-            if self.context_parallel_size > 1 and self.linear_cp_mode == "headwise":
+            if self.context_parallel_size > 1 and (
+                self.linear_cp_mode == "headwise" or self.experimental_attention_variant == "gdn2"
+            ):
                 linear_head_parallel_size *= self.context_parallel_size
             assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
-                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
+                f"and {self.experimental_attention_variant=}."
             )
             assert self.linear_num_value_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_value_heads=} must be a multiple of "
-                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
+                f"and {self.experimental_attention_variant=}."
             )
         if self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
