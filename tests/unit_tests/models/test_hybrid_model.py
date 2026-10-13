@@ -403,6 +403,76 @@ def test_hybrid_fused_linear_cross_entropy_matches_plain_loss_under_mup():
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="HybridModel forward needs a GPU")
+def test_hybrid_fused_linear_cross_entropy_branch_scales_output_layer_input():
+    """With ``--cross-entropy-fusion-impl linear`` HybridModel.forward hands the loss to the output
+    layer (``output_cross_entropy_loss=True``) and applies muP's output scaling to the layer input,
+    because the fused kernel never materialises the logits. A recording output layer stands in
+    for the kernel so this runs on any GPU."""
+
+    class RecordingOutputLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def forward(
+            self,
+            input_,
+            weight=None,
+            runtime_gather_output=None,
+            output_cross_entropy_loss=False,
+            labels=None,
+        ):
+            self.calls.append(
+                dict(input_=input_, output_cross_entropy_loss=output_cross_entropy_loss, labels=labels)
+            )
+            return input_.float().sum(dim=-1)
+
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_mup=True,
+            mup_base_hidden_size=64,
+            cross_entropy_loss_fusion=True,
+            cross_entropy_fusion_impl="linear",
+        )
+        assert config.mup_output_mult == 0.5
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=_get_dummy_hybrid_stack_spec(),
+            vocab_size=64,
+            max_sequence_length=8,
+            hybrid_layer_pattern="M-",
+        ).cuda()
+        recorder = RecordingOutputLayer().cuda()
+        model.output_layer = recorder
+        tokens = torch.arange(model.max_sequence_length, device="cuda").repeat(2, 1)
+        labels = torch.roll(tokens, -1, dims=-1)
+
+        loss = model(input_ids=tokens, position_ids=tokens, attention_mask=None, labels=labels)
+        (call,) = recorder.calls
+        assert call["output_cross_entropy_loss"] is True and call["labels"] is labels
+        assert loss.shape == call["input_"].shape[:-1]  # the output layer's loss is returned as is
+        scaled_input = call["input_"]
+
+        # Same forward without output scaling: the fused path's input is 1/mup_output_mult larger.
+        config.mup_output_mult = 1.0
+        recorder.calls.clear()
+        model(input_ids=tokens, position_ids=tokens, attention_mask=None, labels=labels)
+        (plain,) = recorder.calls
+        torch.testing.assert_close(scaled_input, plain["input_"] * 0.5)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 class TestHybridModel:
 
     def setup_method(self, method):
