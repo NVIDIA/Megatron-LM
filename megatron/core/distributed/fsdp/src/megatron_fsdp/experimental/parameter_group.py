@@ -368,14 +368,9 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            # MXFP8 uses get_tensor() to pad scales for TE GEMM. get_tensor_view()
-            # exposes compact unswizzled scales, which TE GEMM does not yet accept:
-            # https://github.com/NVIDIA/TransformerEngine/issues/3518
-            unsharded_tensor = (
-                self._unsharded_model_weight.get_tensor_view(index)
-                if isinstance(self._unsharded_model_weight, DBuffer)
-                else self._unsharded_model_weight.get_tensor(index)
-            )
+            # No GEMM runs during initialization. MXFP8 scales stay compact until
+            # the first unshard installs padded scales for compute.
+            unsharded_tensor = self._unsharded_model_weight.get_tensor_view(index)
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
@@ -449,14 +444,6 @@ class FsdpParameterGroup:
             phase is not Phase.FORWARD and not unsharded_model_weight.is_columnwise_allocated,
         )
 
-    def needs_unshard(self, phase: Phase | None = None) -> bool:
-        """Whether unshard_parameters(phase) must gather weights that are not unsharded yet."""
-        if self._is_model_weight_unsharded():
-            return False
-        if isinstance(self.model_weight, DBuffer):
-            return not self._unsharded_model_weight.is_allocated
-        return any(self._mxfp8_planes_to_unshard(phase))
-
     def unshard_parameters(self, phase: Phase | None = None) -> None:
         """Gather and install full parameters for compute in ``phase``."""
         if self._model_weight_is_stale:
@@ -477,23 +464,29 @@ class FsdpParameterGroup:
             rowwise, columnwise = self._mxfp8_planes_to_unshard(phase)
             if rowwise or columnwise:
                 self._install_unsharded_parameters(
-                    self._materialize_unsharded_model_weight(rowwise=rowwise, columnwise=columnwise)
+                    self._materialize_unsharded_model_weight(
+                        rowwise=rowwise, columnwise=columnwise
+                    ),
+                    rowwise=rowwise,
+                    columnwise=columnwise,
                 )
         self._switch_to_unsharded_parameters()
 
     def _install_unsharded_parameters(
-        self, unsharded_model_weight: "DBuffer | QuantizedDBuffer"
+        self, unsharded_model_weight: "DBuffer | QuantizedDBuffer", **mxfp8_planes: bool
     ) -> None:
         """Point unsharded parameters' data at ``unsharded_model_weight``."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            tensor_view = unsharded_model_weight.get_tensor_view(index)
             # TE saves an MXFP8 Parameter itself for backward and reads its planes when
-            # backward runs. Assigning .data updates that Parameter in place, so expose
-            # every unsharded plane, not only the newly gathered ones.
-            fsdp_parameter.unsharded.data = (
-                unsharded_model_weight.get_tensor_view(index)
-                if isinstance(unsharded_model_weight, DBuffer)
-                else unsharded_model_weight.get_tensor(index)
-            )
+            # backward runs. Update that Parameter in place, preserving any planes
+            # that were already gathered for the other phase.
+            if isinstance(unsharded_model_weight, DBuffer):
+                fsdp_parameter.unsharded.data = tensor_view
+            else:
+                from .quantized_dbuffer import update_mxfp8_tensor
+
+                update_mxfp8_tensor(tensor_view, fsdp_parameter.unsharded, **mxfp8_planes)
 
     def _materialize_unsharded_model_weight(
         self, **mxfp8_planes: bool
@@ -529,17 +522,30 @@ class FsdpParameterGroup:
         """Install sharded DTensor parameters on the owning modules."""
         self._switch_to_sharded_parameters()
 
-    def release_unsharded_storage(self) -> None:
-        """Release this group's full-parameter storage."""
-        # This method is shared by the post-forward and post-backward release
-        # paths. Post-forward must release storage because autograd may have
-        # saved forward views into the unsharded parameters. Post-backward could
-        # replace unsharded parameter .data with size-0 empty tensors, instead
-        # of releasing storage, because autograd has consumed those saved views.
-        # That alternative is not much cleaner, and splitting post-forward and
-        # post-backward reshard behavior would make the caller code less clean,
-        # so keep the shared storage-release path.
-        self._unsharded_model_weight.release_storage()
+    def release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
+        """Release all full-parameter storage, or only MXFP8 rowwise storage."""
+        unsharded_model_weight = self._unsharded_model_weight
+        if isinstance(unsharded_model_weight, DBuffer):
+            assert not rowwise_only
+            unsharded_model_weight.release_storage()
+            return
+        unsharded_model_weight.release_storage(rowwise_only=rowwise_only)
+        # Replicated compute parameters reference persistent model_weight storage.
+        if self._is_model_weight_unsharded():
+            return
+        for parameter in self.fsdp_parameters:
+            weight = parameter.unsharded
+            # TE #3518 requires padded scale copies on the Parameter, separate
+            # from the buffer's compact scales. Release these copies too.
+            # https://github.com/NVIDIA/TransformerEngine/issues/3518
+            if weight._rowwise_scale_inv is not None:
+                weight._rowwise_scale_inv.untyped_storage().resize_(0)
+            if not rowwise_only and weight._columnwise_scale_inv is not None:
+                weight._columnwise_scale_inv.untyped_storage().resize_(0)
+            # Keep an empty data view for TE's device queries when neither plane
+            # remains. Otherwise, remove the released plane from the tensor.
+            if rowwise_only and weight._columnwise_data is not None:
+                weight.update_usage(rowwise_usage=False)
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""

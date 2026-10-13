@@ -108,6 +108,34 @@ def _pad_columnwise_scale(scale: torch.Tensor) -> torch.Tensor:
     return F.pad(scale, (0, shape[1] - scale.shape[1], 0, shape[0] - scale.shape[0]))
 
 
+def update_mxfp8_tensor(
+    tensor_view: MXFP8Tensor, tensor: MXFP8Tensor, *, rowwise: bool = True, columnwise: bool = True
+) -> None:
+    """Install a compact view, padding selected scales and preserving the other orientation."""
+    # Work around TE rejecting compact MXFP8 scales in GEMM:
+    # https://github.com/NVIDIA/TransformerEngine/issues/3518
+    # Pad only newly installed planes. Repadding the other phase's scales
+    # would replace them with a new copy not covered by its readiness event.
+    # TODO: Remove update_mxfp8_tensor once TE accepts compact scales.
+    # Callers can assign tensor.data = tensor_view directly; there will be
+    # no padded copies to preserve across phases.
+    if tensor_view._rowwise_data is not None:
+        if rowwise:
+            tensor_view._rowwise_scale_inv = _pad_rowwise_scale(tensor_view._rowwise_scale_inv)
+        else:
+            tensor_view._rowwise_data = tensor._rowwise_data
+            tensor_view._rowwise_scale_inv = tensor._rowwise_scale_inv
+    if tensor_view._columnwise_data is not None:
+        if columnwise:
+            tensor_view._columnwise_scale_inv = _pad_columnwise_scale(
+                tensor_view._columnwise_scale_inv
+            )
+        else:
+            tensor_view._columnwise_data = tensor._columnwise_data
+            tensor_view._columnwise_scale_inv = tensor._columnwise_scale_inv
+    tensor.data = tensor_view
+
+
 class QuantizedDBuffer:
     """The MFSDP storage and lifecycle for one TE MXFP8 tensor.
 
@@ -231,23 +259,6 @@ class QuantizedDBuffer:
             device=data.device,
         )
 
-    def get_tensor(self, index: int) -> MXFP8Tensor:
-        """Return an unswizzled compute tensor with scales padded for TE's GEMM path.
-
-        Only allocated planes are included. Data planes remain views. Scale planes
-        alias storage only when no padding is needed; otherwise they are copied into
-        padded allocations.
-        """
-        tensor = self.get_tensor_view(index)
-        # GEMM requires padded scales. Pad here until TE fuses padding into its
-        # scale-swizzle kernel, avoiding these separate allocations and copies:
-        # https://github.com/NVIDIA/TransformerEngine/issues/3518
-        if tensor._rowwise_scale_inv is not None:
-            tensor._rowwise_scale_inv = _pad_rowwise_scale(tensor._rowwise_scale_inv)
-        if tensor._columnwise_scale_inv is not None:
-            tensor._columnwise_scale_inv = _pad_columnwise_scale(tensor._columnwise_scale_inv)
-        return tensor
-
     def quantize_(self, main_weight: DBuffer) -> None:
         """Quantize a local master shard with matching mesh, placements, layout, and device."""
         for attribute in ("mesh", "placements", "layout", "device"):
@@ -264,12 +275,13 @@ class QuantizedDBuffer:
             # is not a multiple of 64 rows, so quantizing into them is an
             # out-of-bounds write: into the next rank's chunk of a replicated plane,
             # or beyond the end of the local buffer. This is the producer-side
-            # counterpart of the GEMM padding in get_tensor() (TE issue 3518):
-            # quantize into the padded scales that get_tensor() builds and copy the
-            # compact region back. Once TE quantizes into compact scales in bounds,
-            # this loop body reduces to:
+            # counterpart of the GEMM padding in update_mxfp8_tensor() (TE issue 3518):
+            # quantize into padded scales and copy the compact region back. Once TE
+            # quantizes into compact scales in bounds, this loop body reduces to:
             #   self.get_tensor_view(index).quantize_(main_weight.get_tensor_view(index))
-            tensor = self.get_tensor(index)
+            tensor = self.get_tensor_view(index)
+            tensor._rowwise_scale_inv = _pad_rowwise_scale(tensor._rowwise_scale_inv)
+            tensor._columnwise_scale_inv = _pad_columnwise_scale(tensor._columnwise_scale_inv)
             tensor.quantize_(main_weight.get_tensor_view(index))
             for plane, padded in (
                 (self.rowwise_scale, tensor._rowwise_scale_inv),
@@ -303,9 +315,10 @@ class QuantizedDBuffer:
         for plane in self.planes:
             plane.reallocate_storage()
 
-    def release_storage(self) -> None:
-        """Release every plane's backing storage while retaining aliases."""
-        for plane in self.planes:
+    def release_storage(self, *, rowwise_only: bool = False) -> None:
+        """Release all plane storage, or only rowwise storage, while retaining aliases."""
+        # Preserve Storage aliases that autograd may have saved for backward.
+        for plane in self.planes_for(rowwise=True, columnwise=not rowwise_only):
             plane.release_storage()
 
     def view(self, placements: Iterable[Placement]) -> "QuantizedDBuffer":
