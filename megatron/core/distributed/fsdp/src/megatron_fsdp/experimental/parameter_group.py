@@ -124,6 +124,8 @@ class FsdpParameterGroup:
     _unsharded_model_weight: "DBuffer | QuantizedDBuffer"
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
+    # Whether RowAtomic/BlockAtomic layouts pack without padding into unequal shards.
+    uneven_shards: bool
 
     def __init__(
         self,
@@ -138,6 +140,7 @@ class FsdpParameterGroup:
         use_symmetric_memory: bool = False,
         # TODO: Revisit passing owner assignments into the group constructor in a future PR.
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        uneven_shards: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -157,6 +160,9 @@ class FsdpParameterGroup:
             parameter_to_owner: Construction-time mapping from original parameters to
                 owner ranks in ``mesh``. Every TensorAtomic parameter needs an entry;
                 entries for other parameters and non-TensorAtomic groups are ignored.
+            uneven_shards: Build RowAtomic/BlockAtomic layouts without padding, splitting
+                the packed parameters at row/block boundaries into generally unequal rank
+                segments.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
             fqn_to_parameter
@@ -164,6 +170,12 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
+        self.uneven_shards = uneven_shards
+        if uneven_shards and use_symmetric_memory:
+            raise ValueError(
+                "uneven_shards is incompatible with use_symmetric_memory: NCCL symmetric-memory "
+                "collectives require equal shard sizes."
+            )
         parameters = tuple(parameter_to_fqns)
 
         if parameter_to_owner is not None and _contains_any_placement_type(
@@ -238,7 +250,14 @@ class FsdpParameterGroup:
         shapes = (parameter.shape for parameter in parameters)
         if not _contains_any_placement_type(*placement_groups, placement_types=TensorAtomic):
             # MXFP8 groups keep 32-row blocks on one rank; other dtypes pack rows.
-            return GlobalLayout.build_for_row_atomic(
+            # Padded layouts give equal shards for all_gather_into_tensor and symmetric
+            # memory; uneven layouts trade those for zero padding.
+            build = (
+                GlobalLayout.build_for_row_atomic_unpadding
+                if self.uneven_shards
+                else GlobalLayout.build_for_row_atomic
+            )
+            return build(
                 shapes, dp_size=self.mesh.size(), block_size=32 if self.dtype == torch.uint8 else 1
             )
         if _contains_any_placement_type(

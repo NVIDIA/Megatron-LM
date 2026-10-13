@@ -29,12 +29,17 @@ if not is_mxfp8_available():
     pytest.skip("MXFP8 quantization is not available.", allow_module_level=True)
 
 
-def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
+@pytest.mark.parametrize("uneven_shards", [False, True], ids=["padded", "uneven"])
+def test_quantized_dbuffer_quantization_matches_te(distributed_setup, uneven_shards):
     """Quantized tensor views match TE's data and scales."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
-    quantized = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
+    quantized = QuantizedDBuffer.empty(
+        mesh, [BlockAtomic(32)], shapes, device, uneven_shards=uneven_shards
+    )
+    if uneven_shards:
+        assert quantized.rowwise_data.layout.size == sum(rows * cols for rows, cols in shapes)
     main_weight = DBuffer(
         mesh, [BlockAtomic(32)], quantized.rowwise_data.layout, torch.float32, device
     )
@@ -163,3 +168,41 @@ def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out):
         chunks = plane.local_buffer.view(mesh.size(), -1)
         for rank in range(mesh.size()):
             assert chunks[rank].eq(index * mesh.size() + rank).all()
+
+
+@pytest.mark.parametrize("use_out", [False, True])
+def test_quantized_dbuffer_uneven_allgathers_every_plane(distributed_setup, use_out):
+    """Unpadded planes have unequal, possibly empty, rank segments that all-gather in order."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("QuantizedDBuffer all-gather requires at least two ranks.")
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    shapes = [(128, 64), (32, 128)]
+    source = QuantizedDBuffer.empty(
+        mesh, [BlockAtomic(32)], shapes, distributed_setup.device, uneven_shards=True
+    )
+    data_layout = source.rowwise_data.layout
+    assert data_layout.size == 128 * 64 + 32 * 128
+    assert not data_layout.has_equal_shard_sizes
+    # Scale planes follow the data partition in 32x smaller coordinates.
+    assert source.columnwise_data.layout == data_layout
+    for scale_plane in (source.rowwise_scale, source.columnwise_scale):
+        assert scale_plane.layout.size == data_layout.size // 32
+        assert scale_plane.layout.rank_to_offset == tuple(
+            offset // 32 for offset in data_layout.rank_to_offset
+        )
+    for index, plane in enumerate(source.planes):
+        plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
+    if use_out:
+        destination = QuantizedDBuffer(mesh, [Replicate()], data_layout, distributed_setup.device)
+        result = source.allgather(0, out=destination)
+        assert result is destination
+    else:
+        result = source.allgather(0)
+    for index, plane in enumerate(result.planes):
+        assert plane.placements == (Replicate(),)
+        layout = plane.layout
+        for rank in range(mesh.size()):
+            chunk = plane.local_buffer.narrow(
+                0, layout.rank_to_offset[rank], layout.rank_size(rank)
+            )
+            assert chunk.eq(index * mesh.size() + rank).all()

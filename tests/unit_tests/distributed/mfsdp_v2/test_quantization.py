@@ -47,8 +47,13 @@ def _make_mlp(device):
     ],
     ids=["zero3", "zero2", "no_shard"],
 )
-def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
-    """MXFP8 MLP losses track an independently trained unsharded model."""
+@pytest.mark.parametrize("uneven_shards", [False, True], ids=["padded", "uneven"])
+def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements, uneven_shards):
+    """MXFP8 MLP losses track an independently trained unsharded model.
+
+    With ``uneven_shards`` the two weights (128x64 and 32x128) pack into 12288 elements
+    split at 32-row block boundaries, so on 8 ranks some ranks own no weight rows at all.
+    """
     device = distributed_setup.device
     if distributed_setup.world_size < 2:
         pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
@@ -61,7 +66,7 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
         reference = _make_mlp(device)
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=placements)
+        fully_shard(model, mesh=mesh, placements=placements, uneven_shards=uneven_shards)
 
     # MLP weights share one quantized group; biases use a regular DBuffer.
     [weight_group] = [
@@ -70,6 +75,12 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
     assert len(weight_group.fsdp_parameters) == 2
     if isinstance(placements.optimizer[0], Shard):
         assert weight_group.main_weight.placements == (BlockAtomic(32),)
+    weight_layout = weight_group.main_weight.layout
+    if uneven_shards:
+        assert weight_layout.size == 128 * 64 + 32 * 128
+    else:
+        assert weight_layout.size >= 128 * 64 + 32 * 128
+        assert weight_layout.has_equal_shard_sizes
     [bias_group] = [g for g in model.parameter_groups if g is not weight_group]
     assert isinstance(bias_group.model_weight, DBuffer)
 
