@@ -3,6 +3,7 @@
 import torch
 
 from .barrier import symm_mem_sync
+from .kernel_config import SYMM_MEM_KERNEL_CONFIG
 from .multimem_asm import add_v8_bf16_from_u32, asm_rsqrt, ld_128, st_128
 from .utils import sync_threads
 
@@ -160,11 +161,11 @@ def _multimem_reduce_scatter_residual_add_kernel(
             res_out_ptrs = residual_output_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
             res_in_ptrs = residual_input_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
             # reduce-scatter
-            (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True)
+            x, y, z, w = ld_128(multicast_ptrs, mask=mask, multicast_op=True)
             # load residual
-            (rx, ry, rz, rw) = ld_128(res_in_ptrs, mask=mask, multicast_op=False)
+            rx, ry, rz, rw = ld_128(res_in_ptrs, mask=mask, multicast_op=False)
             # add residual
-            (x, y, z, w) = add_v8_bf16_from_u32(x, y, z, w, rx, ry, rz, rw)
+            x, y, z, w = add_v8_bf16_from_u32(x, y, z, w, rx, ry, rz, rw)
             # store residual
             st_128(res_out_ptrs, x, y, z, w, mask=mask, multicast_op=False)
             # update squared sum for computing the norm later
@@ -191,9 +192,9 @@ def _multimem_reduce_scatter_residual_add_kernel(
                 rms_norm_weights_ptr.to(tl.pointer_type(tl.uint64)) + (thread_offset + tid) * 2
             )
 
-            (rx, ry, rz, rw) = ld_128(res_out_ptrs, mask=mask, multicast_op=False)
-            (wx, wy, wz, ww) = ld_128(rms_norm_weights_ptrs, mask=mask, multicast_op=False)
-            (nx, ny, nz, nw) = apply_norm(rx, ry, rz, rw, wx, wy, wz, ww, rrms, mask)
+            rx, ry, rz, rw = ld_128(res_out_ptrs, mask=mask, multicast_op=False)
+            wx, wy, wz, ww = ld_128(rms_norm_weights_ptrs, mask=mask, multicast_op=False)
+            nx, ny, nz, nw = apply_norm(rx, ry, rz, rw, wx, wy, wz, ww, rrms, mask)
             st_128(multicast_ptrs, nx, ny, nz, nw, mask=mask, multicast_op=True)
 
     sync_threads()
@@ -230,9 +231,12 @@ def fused_multimem_rs_add_norm_ag(
     Returns:
         residual_output_tensor: torch.Tensor, the output of the full fused operation.
     """
-    WARP_SIZE = 32
-    MAX_NUM_BLOCKS = 128
-    MAX_BLOCK_SIZE = 1024
+    # Do not autotune the number of blocks with Triton: every rank must launch the same grid
+    # of at most max_num_blocks blocks, or the barrier overflows the signal pad or hangs.
+    # See kernel_config.py.
+    WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
+    MAX_NUM_BLOCKS = SYMM_MEM_KERNEL_CONFIG.max_num_blocks
+    MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
     BYTES_PER_THREAD = 16
 
     assert input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
@@ -259,6 +263,7 @@ def fused_multimem_rs_add_norm_ag(
         block_size = MAX_BLOCK_SIZE
         num_warps = MAX_BLOCK_SIZE // WARP_SIZE
         num_blocks = min(triton.cdiv(num_threads, MAX_BLOCK_SIZE), MAX_NUM_BLOCKS)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     hsize = input_tensor.size(-1)
     _multimem_reduce_scatter_residual_add_kernel[(num_blocks, 1, 1)](
