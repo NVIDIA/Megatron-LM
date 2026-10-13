@@ -855,12 +855,17 @@ class TestMhcA2AOverlapNumerics:
         """iHC's H_res is a constant: the schedule's detach bridges must skip it, not
         hand a tensor without grad_fn to run_backward.
 
-        Kept as the last test of this class on purpose. The constant H_res adds
-        requires_grad=False guard variants to the torch.compile'd mHC kernels shared by
-        every test in this process; with the default recompile limit of 8, seeing them
-        earlier changes which later mHC comparison straddles the compiled-to-eager
-        fallback (observed on test_full_recompute_carries_the_mhc_bridge_gradient).
+        Kept as the last test of this class and run with torch.compile stanced to eager:
+        the constant H_res adds requires_grad=False guard variants to the torch.compile'd
+        mHC kernels shared by every test in this process, and with the default recompile
+        limit of 8 that can push a later mHC comparison into the compiled-to-eager
+        fallback on one side only (observed on
+        test_full_recompute_carries_the_mhc_bridge_gradient).
         """
+        with torch.compiler.set_stance("force_eager"):
+            self._run_identity_hyper_connections_schedule_case(recompute)
+
+    def _run_identity_hyper_connections_schedule_case(self, recompute):
         ihc = {"enable_identity_hyper_connections": True}
         reference_config = _make_mhc_numerical_config(
             overlap=False, recompute=recompute, extra_config=ihc
