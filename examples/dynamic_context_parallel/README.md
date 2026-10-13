@@ -1,5 +1,66 @@
 # Dynamic Context Parallel Benchmark
 
+## Bounded CPU runtime planner (PP1/VPP1)
+
+The optional runtime planner replaces the native arbitrary-CP heuristic with the
+reviewed `dcp-scheduler` lightweight planner. Install the audited source revision:
+
+```bash
+pip install 'dcp-scheduler[acceleration] @ git+https://github.com/xiaoyao0115/dcp-scheduler.git@a55b345f20462182b2c4bb00fbc488a414dd5961'
+```
+
+For the provisional Qwen3.5 cost adapter, use:
+
+```bash
+--dynamic-cp-runtime-model dcp_scheduler.adapters:qwen35_new_core_model \
+--dynamic-cp-runtime-model-options /path/to/model-options.json \
+--dynamic-cp-runtime-solver-options /path/to/solver-options.json \
+--dynamic-cp-runtime-trace-dir /path/to/telemetry
+```
+
+`model-options.json` contains `{"fa_remainder": <contents of fa_remainder.json>,
+"kernel_backend": "numba"}`. The model is specific to W32/EP4/local16K and the
+Qwen3.5 4+1 proxy; do not use it as a universal predictor or treat mixed-stack
+predictions as GPU measurements. Other models can supply the same pure-CPU
+factory contract. The solver retains the original powers packing as its incumbent,
+uses a cooperative 0.8-second budget and scores at most four candidates. This is
+not a hard deadline: mandatory scoring can overrun, and late plans wait at consumption.
+`solver-options.json` configures `LightweightOptions`, e.g. `time_budget_s`,
+`max_scored_candidates`, `max_guide_candidates` and `cp_floors`.
+`--dynamic-cp-runtime-solver module:factory` can instead inject a CPU planner
+factory called as `factory(geometry, model, **solver_options)`. It must provide
+`geometry`, `plan_padded(padded, logical_lengths=..., incumbent_rows=...)` and
+`last_statistics`. Physical dataset padding and logical costs remain separate.
+
+The existing DataLoader keeps each DP rank's sample stream. `wrap_data_iterator`
+buffers one future global batch on the host and gathers its logical/physical lengths
+on the training thread, using the existing DP collective. A persistent CPU executable
+on the DPxCP leader solves it while the current batch trains. Only lengths, options
+and incumbent rows enter the worker; CUDA visibility is disabled. It does not import
+the training entry point or call CUDA/NCCL. An I/O-only thread handles the worker
+protocol; the training thread broadcasts the completed rows when consumed. No new
+process group is created, and the rerun iterator retains its original consumption order.
+
+`--no-dynamic-cp-runtime-async` is a same-solver synchronous control;
+`--dynamic-cp-runtime-force-powers` selects the configured powers packing. To compare
+against a particular historical revision, set `--dynamic-cp-runtime-baseline
+module:factory`; this factory takes the geometry dictionary and returns a
+`padded_pairs -> rank_rows` callable. Without it the baseline is the current
+checkout's non-arbitrary scheduler, **not** an authenticated historical dev SHA. Legacy
+transport and configurations without a runtime model keep their existing path.
+The runtime requires PP1/no VPP and sequence-parallel size one. The injected cost
+model must match the model's layouts, including contiguous or zigzag partitioning. Training
+lookahead is enabled for the in-tree Varlen path or worker-backed loaders; external
+iterators and evaluation do not read ahead. Stochastic transforms must run in
+DataLoader workers so speculative reads do not change training-process RNG state.
+
+Per-rank JSONL includes submit/solve-start/solve-end/consume monotonic and wall
+timestamps, global logical/physical length digest, rows, residual CPU wait,
+worker CUDA/distributed initialization status, and queue depth (at most one). Global
+IDs are step-local in DP-rank order, **not dataset indices**. Compare leader monotonic
+timestamps on the same host and use GPU traces to establish compute overlap. The
+first step waits for initialization; subsequent steps wait only for unfinished work.
+
 This example compares regular DP-balanced packed-sequence training against
 Dynamic Context Parallelism (DCP) on the same variable-length mock workload.
 
@@ -70,6 +131,73 @@ local CP sizes:
 The baseline keeps the full fixed CP size for the packed workload. DCP can
 spread short samples over the DPxCP domain instead of making every sample occupy
 the full CP group.
+
+## Automatic native transport
+
+For the default GPT builder with TE full attention, eager FP16/BF16 and P2P CP,
+Megatron automatically uses native transport when the installed TE extension and
+the DP×CP parent communicator support it. No additional transport flag is needed.
+TE must be built with `NVTE_WITH_NCCL_DEVICE_CP=1` and matching NCCL headers/runtime.
+All ranks agree before dynamic CP groups are created. This enables arbitrary
+integer CP sizes and routes attention, MoE auxiliary reductions and MTP through
+one parent communicator. The log reports `dynamic CP transport: native (automatic)`.
+
+Old TE builds, custom/hybrid attention, unsupported precision or CUDA Graphs
+retain the legacy ProcessGroup path, with the reason logged at startup. Failures
+after native initialization begins are errors, not runtime transport fallbacks.
+
+## NVLink-aware native DCP scheduling
+
+For a Cartesian rank layout with each consecutive eight global GPU ranks in
+one NVLink domain, add these arguments to a native DCP training command:
+
+```text
+--dynamic-context-parallel
+--dynamic-cp-nvlink-domain-size 8
+--dynamic-cp-communication-cost 1024 2304
+```
+
+The domain size is an explicit placement contract, **not** GPUs per Slurm host
+or automatic topology discovery. Use 72 only when consecutive 72-rank blocks
+really describe NVL72 domains. The scheduler maps global ranks to DP×CP
+positions and takes the common boundaries across TP/PP planes so all stages
+choose the same schedule. Custom non-Cartesian process-group layouts are not
+supported by this option. Omitting the domain size preserves compute-only
+scheduling; legacy multi-ProcessGroup DCP is unchanged.
+Explicit topology-aware scheduling requires native transport; initialization
+reports an error if automatic selection cannot provide it.
+
+The lightweight score retains the padded compute proxy `Q = sum(L_i²) / CP`.
+For a group crossing a domain boundary, it adds only the extra exposed ring
+communication, using `CP - 1` overlapping exchanges:
+
+```text
+q = Q / CP
+u_local, u_cross = communication_cost * payload_tokens_per_rank
+score = Q + (CP - 1) * (max(q, u_cross) - max(q, u_local))
+```
+
+Both terms use the same token-squared units; the communication coefficients
+are equivalent-token weights, not milliseconds or bandwidths. They apply to
+the complete pack, not separately to each sequence. Fully hidden traffic is
+only a tie-break. Payload size follows the existing `pad_packed_seq_alignment`
+setting (including full-capacity `max` padding), not just the valid tokens.
+The two default weights are a rounded H100/Qwen3 attention
+reference, not native-transport calibration; override them for a different
+model, payload or interconnect. Equal weights or a single NVLink domain preserve
+the existing packing/filling policy, including its full-parent packing fallback.
+
+All integer CP sizes remain eligible, including groups that must cross a
+domain. Spare ranks are distributed across packs by a bounded dynamic program,
+instead of all being assigned to one pack. It minimizes the slowest group, then
+total rank-work and cross-domain traffic, exactly for each fixed pack order.
+Only two orders are tried for rank allocation (original and topology-greedy),
+so this is not a globally optimal packing solver. Each order costs O(groups × ranks²); VPP
+splits use the same allocator before committing an expansion.
+The training path loads no predictor, uses no external solver, and creates no
+process groups or topology-probing collectives. This heuristic does not guarantee an
+E2E improvement: EP imbalance, communication overlap and native timings still
+need offline prediction or measurement for the workload of interest.
 
 ## Output
 

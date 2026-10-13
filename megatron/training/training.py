@@ -2283,6 +2283,7 @@ def pretrain(
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
+        model_config=getattr(cfg_container, "model", None),
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
@@ -3809,7 +3810,18 @@ def train_step(
                     num_microbatches,
                     seqlen_sum_this_global_batch,
                     seqlen_squared_sum_this_global_batch,
-                ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+                ) = wrap_data_iterator(
+                    data_iterator,
+                    config,
+                    get_num_microbatches(),
+                    pg_collection=pg_collection,
+                    prefetch_next=(
+                        iteration is not None
+                        and iteration + 1 < args.train_iters
+                        and args.dataloader_type != 'external'
+                        and (args.num_workers > 0 or args.use_varlen_dataset)
+                    ),
+                )
                 has_wrapped_data_iterator = True
                 rerun_data_iterator = packed_data_iterator
             forward_backward_data_iterator = packed_data_iterator
@@ -4271,6 +4283,7 @@ def training_log(
             mtp_num_layers=mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
+            total_real_tokens=total_real_tokens_in_batch,
         )
 
     # Log MTP metrics.

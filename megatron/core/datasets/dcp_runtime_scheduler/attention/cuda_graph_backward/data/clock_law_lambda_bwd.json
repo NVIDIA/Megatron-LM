@@ -1,0 +1,34 @@
+{
+ "02c_disagreement_with_0p58_in_se": 0.10735845622300305,
+ "02c_only_kernel_step_clock": {
+  "lambda": 4.0715892750418054e-11,
+  "n": 6,
+  "note": "the 02c pairs barely constrain lambda (s_form 0.97-0.99 for any lambda in [0, 1]) - they TEST the law's large-kernel prediction, they do not set lambda",
+  "se": 5.402462184762777
+ },
+ "B1_only": {
+  "lambda": 0.5758416163811111,
+  "n": 96,
+  "se": 0.03158702125033901
+ },
+ "estimator": "least squares on ln(t_slow / t_fast) over the pairs; se = Gauss-Newton; golden section on lambda in [0, 6]",
+ "f0_mhz": 1600.0,
+ "inputs_sha12": {
+  "01_probe_b1_s_bwd.json": "0a7292881281",
+  "cp1_model_f5b1_bwd_f0.json": "73dac4e60957",
+  "ograph_bwd.json": "7b4c4e8a6f43"
+ },
+ "lambda": 0.575713246335817,
+ "law": "k_step(f) = tile_step x f0 / f + (1 - lambda) C_step x f0 / f + lambda C_step; C_step = k0 + b_S S_q + tau rho n_chain + static(n) - U (the F5b-1 form's non-tile part at the step geometry minus U = O_graph_bwd - H_traced), tile_step = tau x critical-slot tiles of the served greedy makespan; equivalently s_step = tile_step / (lambda C_step + tile_step) in k(f) = k(f0) [s_step f0 / f + 1 - s_step]; helper classes keep their class s (0.711 / 0.798), accumulate 0.339, prep 0.521, exchange unscaled (A25); f0 = 1600 MHz (B0.2)",
+ "n_pairs": 102,
+ "rms_joint_at_0p58": 0.030282993500731503,
+ "rms_joint_at_lambda": 0.03028016485067311,
+ "rms_joint_lambda_0": 0.09686521850713918,
+ "rms_joint_lambda_1": 0.044099374476223516,
+ "se": 0.030830650884731442,
+ "source_sets": "B1 96 nocomm flash_bprop kernel pairs (llama3_70b-p4096-cp4, arm a 1465 vs arm d 1938 MHz; 01_probe_b1_s_bwd.json) + stage 02c 6 kernel-level pairs (cp1_bwd_sread p16384 rect, three geometries, arm b ~1280-1340 vs arm d ~1320-1600 MHz, nsys bprop sums, step attention-phase telemetry)",
+ "status": "DIAGNOSTIC read for the fit chain (report 15); not served until the coordinator pins it",
+ "tool": "phase2/tools/diag/clock_law_structure.py",
+ "tool_sha12": "db8e230143b2",
+ "utc": "2026-10-07T04:59:12Z"
+}

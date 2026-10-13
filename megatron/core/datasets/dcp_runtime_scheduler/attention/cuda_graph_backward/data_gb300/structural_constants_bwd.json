@@ -1,0 +1,634 @@
+{
+ "_comment": "WP-G3B structural constants (PREREGISTRATION_BWD.md 3.1): `read` = cp1_bwd_struct_read.py on the CP1 nsys lanes (never fit rows); `pinned` = the coordinator's amendment (B1.1 / B3) - the chain takes pinned over read over the defaults; the slot is left for the coordinator, the reader never writes it",
+ "pinned": {},
+ "pinned_doc": {
+  "K_call_by_head_dim": {
+   "128": "int",
+   "256": "int"
+  },
+  "P_bwd_by_head_dim": {
+   "128": "int",
+   "256": "int"
+  },
+  "R_bwd_rows": "int",
+  "roles": {
+   "<kernel name>": "dq | dkv | helper_q | helper_kv | kv_parallel | q_parallel | symmetric"
+  },
+  "s_bwd": "float (A25 two-term share at f0_bwd)"
+ },
+ "read": {
+  "K_call_by_head_dim": {
+   "128": 1,
+   "256": 3
+  },
+  "K_call_consistent": true,
+  "O_graph_bwd": {
+   "o0_us": 92.05968653,
+   "o_kv_us_per_token": 0.006481335432,
+   "o_n_us_per_sequence": 0.3441999698,
+   "o_q_us_per_token": 0.02102527701
+  },
+  "O_graph_bwd_alternative_storage_mib": {
+   "o0_us": 81.0410242,
+   "o1_us_per_MiB": 1.081170742
+  },
+  "O_graph_bwd_form": "tokens",
+  "P_bwd_by_head_dim": {
+   "128": 152,
+   "256": 76
+  },
+  "P_bwd_source": {
+   "128": "persistent grid x units (grid / cluster_x)",
+   "256": "persistent grid x units (grid / cluster_x)"
+  },
+  "R_bwd_rows": 128,
+  "R_bwd_rows_by_head_dim": {
+   "128": 128,
+   "256": 256
+  },
+  "R_bwd_source": "alternation period 1 of the timed singleton steps ({1: 5, 3: 1, 2: 1, 4: 2}); GLOBAL majority - the per-head_dim read is R_bwd_rows_by_head_dim (B3 (ii))",
+  "R_bwd_source_by_head_dim": {
+   "128": "head_dim 128: votes {1: 6} tiles per block -> 128 rows; per curve: llama3_70b|4096: first-wave alternation period 1 (15 diffs); llama3_70b|8192: first-wave alternation period 1 (31 diffs); llama3_70b|16384: first-wave alternation period 1 (63 diffs); qwen3_30b|4096: wave boundary t* = 5 with P 152 and 32 heads -> 1 tile(s) per block (first wave too short (3 consecutive-tile differences below t* = 5): the block alternation is not readable here); qwen3_30b|8192: wave boundary t* = 5 with P 152 and 32 heads -> 1 tile(s) per block (first wave too short (3 consecutive-tile differences below t* = 5): the block alternation is not readable here); qwen3_30b|16384: wave boundary t* = 5 with P 152 and 32 heads -> 1 tile(s) per block (first wave too short (3 consecutive-tile differences below t* = 5): the block alternation is not readable here)",
+   "256": "head_dim 256: votes {2: 3} tiles per block -> 256 rows; per curve: qwen3_5_397b|4096: wave boundary t* = 5 with P 76 and 32 heads -> 2 tile(s) per block (first wave too short (3 consecutive-tile differences below t* = 5): the block alternation is not readable here); qwen3_5_397b|8192: wave boundary t* = 5 with P 76 and 32 heads -> 2 tile(s) per block (first wave too short (3 consecutive-tile differences below t* = 5): the block alternation is not readable here); qwen3_5_397b|16384: wave boundary t* = 5 with P 76 and 32 heads -> 2 tile(s) per block (first wave too short (3 consecutive-tile differences below t* = 5): the block alternation is not readable here)"
+  },
+  "bprop_names_by_head_dim": {
+   "128": [
+    "cudnn_generated_fort_native_sdpa_sm100_flash_bprop_f16_knob_2_128x128x128_1x4x1_cga1x1x1_kernel0_0"
+   ],
+   "256": [
+    "cudnn_generated_fort_native_sdpa_sm100_flash_bprop_f16_knob_2_128x128x256_1x4x1_cga2x1x1_kernel0_0",
+    "cudnn_generated_fort_native_sdpa_sm100_flash_bprop_f16_knob_2_128x128x256_1x4x1_cga2x1x1_kernel1_0",
+    "cudnn_generated_fort_native_sdpa_sm100_flash_bprop_f16_knob_2_128x128x256_1x4x1_cga2x1x1_kernel2_0"
+   ]
+  },
+  "files": {
+   "cp1_bwd_struct.json": "475edbe9f0ddb7bae4ca4304e3b67f41cea5f92883a78e87acd11ba7384af3fb",
+   "ograph_bwd.json": "adc41ec5123c27bdbb114ab1b1035a60ae47f916a32779186111f2d094129b71"
+  },
+  "floor_us_per_kv_unit_by_geometry": {
+   "llama3_70b": 0.046453125,
+   "qwen3_30b": 0.051078125,
+   "qwen3_5_397b": 0.3429206349
+  },
+  "generated_utc": "2026-10-07T17:52:44Z",
+  "helper_terms_alternatives": {
+   "per_headdim_token": {
+    "128": {
+     "H_kv": {
+      "as_traced": {
+       "coef": {
+        "o0_us": 18.39100272,
+        "o_kv_us_per_token": 0.004541775837,
+        "o_n_us_per_sequence": 0.2524828968,
+        "o_q_us_per_token": 9.957532736e-05
+       },
+       "form": "token",
+       "note": "no clock normalization (the run-3 by_class convention)",
+       "wape": 16.59
+      },
+      "as_two_term_heater": {
+       "coef": {
+        "o0_us": 17.18991096,
+        "o_kv_us_per_token": 0.004130275363,
+        "o_n_us_per_sequence": 0.2612556626,
+        "o_q_us_per_token": 2.28657272e-05
+       },
+       "form": "token",
+       "note": "the B4 convention: two-term law at the heater f_crit",
+       "wape": 16.331
+      },
+      "bias": 0.0,
+      "class": "bwd_helper_kv",
+      "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+      "coef": {
+       "o0_us": 16.60167709,
+       "o_kv_us_per_token": 0.003907510522,
+       "o_n_us_per_sequence": 0.2651459457,
+       "o_q_us_per_token": 1.791046268e-05
+      },
+      "form": "token",
+      "kernel_names": "fmha_reduce_head_ragged (x2 per call)",
+      "n_packs": 232,
+      "p90_ape": 22.132,
+      "rmse_us": 8.343616747,
+      "share_of_window": 0.04678064081,
+      "sum_us_at_f0": 8642.878661,
+      "wape": 16.477
+     },
+     "H_q": {
+      "as_traced": {
+       "coef": {
+        "o0_us": 16.67632411,
+        "o_kv_us_per_token": 0.0006738741464,
+        "o_n_us_per_sequence": 0.1440369991,
+        "o_q_us_per_token": 0.02145294198
+       },
+       "form": "token",
+       "note": "no clock normalization (the run-3 by_class convention)",
+       "wape": 28.478
+      },
+      "as_two_term_heater": {
+       "coef": {
+        "o0_us": 16.03196573,
+        "o_kv_us_per_token": 0.000498056257,
+        "o_n_us_per_sequence": 0.2220114308,
+        "o_q_us_per_token": 0.01944246067
+       },
+       "form": "token",
+       "note": "the B4 convention: two-term law at the heater f_crit",
+       "wape": 28.263
+      },
+      "bias": 0.0,
+      "class": "bwd_helper_q",
+      "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+      "coef": {
+       "o0_us": 15.66291416,
+       "o_kv_us_per_token": 0.0003802960379,
+       "o_n_us_per_sequence": 0.2678621686,
+       "o_q_us_per_token": 0.01853063706
+      },
+      "form": "token",
+      "kernel_names": "compute_dot_do_o_ragged_specialized + convert_dq_to_16bits_ragged (d128 plan; d256: compute_dot_do_o only)",
+      "n_packs": 232,
+      "p90_ape": 44.419,
+      "rmse_us": 44.51140265,
+      "share_of_window": 0.1318613563,
+      "sum_us_at_f0": 24361.82323,
+      "wape": 28.361
+     },
+     "form": "token",
+     "geometries": [
+      "llama3_70b",
+      "qwen3_30b"
+     ],
+     "n_packs": 232
+    },
+    "256": {
+     "H_kv": {
+      "as_traced": {
+       "coef": {
+        "o0_us": 18.69238089,
+        "o_kv_us_per_token": 0.005041627504,
+        "o_n_us_per_sequence": 0.1833803809,
+        "o_q_us_per_token": 0.0002534963926
+       },
+       "form": "token",
+       "note": "no clock normalization (the run-3 by_class convention)",
+       "wape": 3.083
+      },
+      "as_two_term_heater": {
+       "coef": {
+        "o0_us": 17.47488805,
+        "o_kv_us_per_token": 0.004527794695,
+        "o_n_us_per_sequence": 0.1945529188,
+        "o_q_us_per_token": 0.0001806368088
+       },
+       "form": "token",
+       "note": "the B4 convention: two-term law at the heater f_crit",
+       "wape": 3.142
+      },
+      "bias": 0.0,
+      "class": "bwd_helper_kv",
+      "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+      "coef": {
+       "o0_us": 17.14785817,
+       "o_kv_us_per_token": 0.004307916352,
+       "o_n_us_per_sequence": 0.2049915671,
+       "o_q_us_per_token": 0.0001123558046
+      },
+      "form": "token",
+      "kernel_names": "fmha_reduce_head_ragged (x2 per call)",
+      "n_packs": 116,
+      "p90_ape": 10.104,
+      "rmse_us": 2.087985245,
+      "share_of_window": 0.03582318397,
+      "sum_us_at_f0": 4554.489044,
+      "wape": 3.86
+     },
+     "H_q": {
+      "as_traced": {
+       "coef": {
+        "o0_us": 5.787864732,
+        "o_kv_us_per_token": 0.0001432718561,
+        "o_n_us_per_sequence": 0.06385370918,
+        "o_q_us_per_token": 0.01564732763
+       },
+       "form": "token",
+       "note": "no clock normalization (the run-3 by_class convention)",
+       "wape": 2.138
+      },
+      "as_two_term_heater": {
+       "coef": {
+        "o0_us": 5.71599643,
+        "o_kv_us_per_token": 4.072968619e-05,
+        "o_n_us_per_sequence": 0.1101726482,
+        "o_q_us_per_token": 0.01414409044
+       },
+       "form": "token",
+       "note": "the B4 convention: two-term law at the heater f_crit",
+       "wape": 2.378
+      },
+      "bias": -0.0,
+      "class": "bwd_helper_q",
+      "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+      "coef": {
+       "o0_us": 5.884123494,
+       "o_kv_us_per_token": 1.360158881e-05,
+       "o_n_us_per_sequence": 0.1357097364,
+       "o_q_us_per_token": 0.01342990919
+      },
+      "form": "token",
+      "kernel_names": "compute_dot_do_o_ragged_specialized + convert_dq_to_16bits_ragged (d128 plan; d256: compute_dot_do_o only)",
+      "n_packs": 116,
+      "p90_ape": 37.226,
+      "rmse_us": 2.95212728,
+      "share_of_window": 0.06273293748,
+      "sum_us_at_f0": 7975.742097,
+      "wape": 2.951
+     },
+     "form": "token",
+     "geometries": [
+      "qwen3_5_397b"
+     ],
+     "n_packs": 116
+    }
+   }
+  },
+  "helper_terms_by_head_dim": {
+   "128": {
+    "H_kv": {
+     "as_traced": {
+      "coef": {
+       "c_n_us_per_sequence": 0.2555895204,
+       "c_us_per_head_token": 0.0007672729318,
+       "h0_us": 18.53210029
+      },
+      "form": "head_token",
+      "note": "no clock normalization (the run-3 by_class convention)",
+      "wape": 2.798
+     },
+     "as_two_term_heater": {
+      "coef": {
+       "c_n_us_per_sequence": 0.2635953337,
+       "c_us_per_head_token": 0.0006872700394,
+       "h0_us": 17.29468382
+      },
+      "form": "head_token",
+      "note": "the B4 convention: two-term law at the heater f_crit",
+      "wape": 3.168
+     },
+     "bias": 0.0,
+     "class": "bwd_helper_kv",
+     "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+     "coef": {
+      "c_n_us_per_sequence": 0.267046463,
+      "c_us_per_head_token": 0.0006502378227,
+      "h0_us": 16.68676522
+     },
+     "form": "head_token",
+     "kernel_names": "fmha_reduce_head_ragged (x2 per call)",
+     "n_packs": 232,
+     "p90_ape": 8.059,
+     "rmse_us": 1.907403348,
+     "share_of_window": 0.04678064081,
+     "sum_us_at_f0": 8642.878661,
+     "wape": 3.692
+    },
+    "H_q": {
+     "as_traced": {
+      "coef": {
+       "c_n_us_per_sequence": 0.1556811597,
+       "c_us_per_head_token": 0.000457634229,
+       "h0_us": 17.17981835
+      },
+      "form": "head_token",
+      "note": "no clock normalization (the run-3 by_class convention)",
+      "wape": 5.016
+     },
+     "as_two_term_heater": {
+      "coef": {
+       "c_n_us_per_sequence": 0.2327621886,
+       "c_us_per_head_token": 0.0004123969643,
+       "h0_us": 16.50030479
+      },
+      "form": "head_token",
+      "note": "the B4 convention: two-term law at the heater f_crit",
+      "wape": 5.114
+     },
+     "bias": -0.0,
+     "class": "bwd_helper_q",
+     "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+     "coef": {
+      "c_n_us_per_sequence": 0.2772470294,
+      "c_us_per_head_token": 0.0003913561564,
+      "h0_us": 16.07327584
+     },
+     "form": "head_token",
+     "kernel_names": "compute_dot_do_o_ragged_specialized + convert_dq_to_16bits_ragged (d128 plan; d256: compute_dot_do_o only)",
+     "n_packs": 232,
+     "p90_ape": 24.185,
+     "rmse_us": 18.05451167,
+     "share_of_window": 0.1318613563,
+     "sum_us_at_f0": 24361.82323,
+     "wape": 5.63
+    },
+    "form": "head_token",
+    "geometries": [
+     "llama3_70b",
+     "qwen3_30b"
+    ],
+    "n_packs": 232
+   },
+   "256": {
+    "H_kv": {
+     "as_traced": {
+      "coef": {
+       "c_n_us_per_sequence": 0.1870008498,
+       "c_us_per_head_token": 0.002627060031,
+       "h0_us": 18.86074807
+      },
+      "form": "head_token",
+      "note": "no clock normalization (the run-3 by_class convention)",
+      "wape": 3.308
+     },
+     "as_two_term_heater": {
+      "coef": {
+       "c_n_us_per_sequence": 0.1971327976,
+       "c_us_per_head_token": 0.002339606468,
+       "h0_us": 17.59486337
+      },
+      "form": "head_token",
+      "note": "the B4 convention: two-term law at the heater f_crit",
+      "wape": 3.207
+     },
+     "bias": 0.0,
+     "class": "bwd_helper_kv",
+     "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+     "coef": {
+      "c_n_us_per_sequence": 0.2065962475,
+      "c_us_per_head_token": 0.002201049127,
+      "h0_us": 17.22248262
+     },
+     "form": "head_token",
+     "kernel_names": "fmha_reduce_head_ragged (x2 per call)",
+     "n_packs": 116,
+     "p90_ape": 10.19,
+     "rmse_us": 2.108361867,
+     "share_of_window": 0.03582318397,
+     "sum_us_at_f0": 4554.489044,
+     "wape": 3.914
+    },
+    "H_q": {
+     "as_traced": {
+      "coef": {
+       "c_n_us_per_sequence": 0.0659684154,
+       "c_us_per_head_token": 0.0004925323566,
+       "h0_us": 5.878719802
+      },
+      "form": "head_token",
+      "note": "no clock normalization (the run-3 by_class convention)",
+      "wape": 2.13
+     },
+     "as_two_term_heater": {
+      "coef": {
+       "c_n_us_per_sequence": 0.1107738223,
+       "c_us_per_head_token": 0.0004430129869,
+       "h0_us": 5.741824939
+      },
+      "form": "head_token",
+      "note": "the B4 convention: two-term law at the heater f_crit",
+      "wape": 2.386
+     },
+     "bias": -0.0,
+     "class": "bwd_helper_q",
+     "clock_normalization": "PB B6 (ii): alpha 1 at the CP1 lane's attention-phase clock (f0 / f_att): the helpers are tile-like",
+     "coef": {
+      "c_n_us_per_sequence": 0.1359104971,
+      "c_us_per_head_token": 0.0004200220031,
+      "h0_us": 5.892748868
+     },
+     "form": "head_token",
+     "kernel_names": "compute_dot_do_o_ragged_specialized + convert_dq_to_16bits_ragged (d128 plan; d256: compute_dot_do_o only)",
+     "n_packs": 116,
+     "p90_ape": 37.373,
+     "rmse_us": 2.952328222,
+     "share_of_window": 0.06273293748,
+     "sum_us_at_f0": 7975.742097,
+     "wape": 2.952
+    },
+    "form": "head_token",
+    "geometries": [
+     "qwen3_5_397b"
+    ],
+    "n_packs": 116
+   }
+  },
+  "helper_terms_per_geometry_class_wape": {
+   "128": {
+    "H_kv": {
+     "llama3_70b": {
+      "after_head_token_form": 3.674,
+      "before_token_form": 14.527,
+      "kv_heads": 8,
+      "n_packs": 116,
+      "q_heads": 64
+     },
+     "pooled": {
+      "after_head_token_form": 3.692,
+      "before_token_form": 16.477
+     },
+     "qwen3_30b": {
+      "after_head_token_form": 3.717,
+      "before_token_form": 19.174,
+      "kv_heads": 4,
+      "n_packs": 116,
+      "q_heads": 32
+     }
+    },
+    "H_q": {
+     "llama3_70b": {
+      "after_head_token_form": 5.624,
+      "before_token_form": 22.099,
+      "kv_heads": 8,
+      "n_packs": 116,
+      "q_heads": 64
+     },
+     "pooled": {
+      "after_head_token_form": 5.63,
+      "before_token_form": 28.361
+     },
+     "qwen3_30b": {
+      "after_head_token_form": 5.641,
+      "before_token_form": 39.401,
+      "kv_heads": 4,
+      "n_packs": 116,
+      "q_heads": 32
+     }
+    }
+   },
+   "256": {
+    "H_kv": {
+     "pooled": {
+      "after_head_token_form": 3.914,
+      "before_token_form": 3.86
+     },
+     "qwen3_5_397b": {
+      "after_head_token_form": 3.914,
+      "before_token_form": 3.86,
+      "kv_heads": 2,
+      "n_packs": 116,
+      "q_heads": 32
+     }
+    },
+    "H_q": {
+     "pooled": {
+      "after_head_token_form": 2.952,
+      "before_token_form": 2.951
+     },
+     "qwen3_5_397b": {
+      "after_head_token_form": 2.952,
+      "before_token_form": 2.951,
+      "kv_heads": 2,
+      "n_packs": 116,
+      "q_heads": 32
+     }
+    }
+   }
+  },
+  "helper_terms_rule": "PB B4.1: wall = H_q + H_kv + [3.1 candidate]; H read per HEAD-TOKEN class-wise per (hardware, head_dim) from the CP1 nsys traces at f0 (fixed terms; two-term law); B4 per-head_dim token form kept as the frozen alternative 'per_headdim_token'",
+  "helper_terms_variant": "head_token",
+  "kernel_classes": "v2 (BD/kernel_classes_bwd_v2.json)",
+  "kernel_classes_v2_present": true,
+  "mechanism_admissible": {
+   "F5b-1": true,
+   "F5b-1+jmax": true,
+   "F5b-3": false,
+   "F5b-Q": false,
+   "F5b-Q+jmax": false,
+   "F5b-sum": false,
+   "F5b-sum+jmax": false,
+   "null-ratio": true
+  },
+  "n_nsys_cells": 18,
+  "n_timed_singleton_curves": 9,
+  "roles": {
+   "128": {
+    "class:bwd_helper_kv": "helper_kv (dkv side, KV-sized)",
+    "class:bwd_helper_q": "helper_q (dq side, Q-sized)",
+    "cudnn_generated_fort_native_sdpa_sm100_flash_bprop_f16_knob_2_128x128x128_1x4x1_cga1x1x1_kernel0_0": "kv_parallel"
+   },
+   "256": {
+    "class:bwd_helper_kv": "helper_kv ratio 4.14 (expected ~0.5: KV-sized)",
+    "class:bwd_helper_q": "helper_q (dq side, Q-sized)",
+    "cudnn_generated_fort_native_sdpa_sm100_flash_bprop_f16_knob_2_128x128x256_1x4x1_cga2x1x1_kernel0_0": "unclear",
+    "cudnn_generated_fort_native_sdpa_sm100_flash_bprop_f16_knob_2_128x128x256_1x4x1_cga2x1x1_kernel1_0": "symmetric",
+    "cudnn_generated_fort_native_sdpa_sm100_flash_bprop_f16_knob_2_128x128x256_1x4x1_cga2x1x1_kernel2_0": "unclear"
+   }
+  },
+  "s_bwd": null,
+  "s_bwd_note": "the two-term share is not read here (probe B1 arm a / d pairs: probe_b1_two_term_s_bwd.py -> the profile / the pin)",
+  "source": "cp1_bwd_struct_read.py on results/cp1_bwd_nsys (parsed R5.1 records) + results/cp1_bwd causal singletons (timed per-tile steps); PB 2a_bwd (1)-(5) / 2b_bwd; never fit rows of the wall",
+  "static_bwd_read": {
+   "128": {
+    "n_groups": 22,
+    "n_rows": 52,
+    "proxy_spread_factor": null,
+    "se_us": 0.07745483567,
+    "slope_only_us_per_sequence": -1.268773751,
+    "status": "read (makespan rho 0 proxy); RECORDED, NOT APPLIED (the n-slope depends on the work proxy: at fixed tokens the mask / wave work changes with n far more than the per-sequence cost, so the read is a fit of a work model, not a trace reading - PB B3 (iv) not implementable as written; the forward's static form stays)",
+    "us_per_sequence": 0.08101104703,
+    "variants_by_work_proxy": {
+     "makespan_rho0": {
+      "se_us": 0.07745483567,
+      "us_per_sequence": 0.08101104703,
+      "work_coef_us_per_tile": 2.953670374
+     },
+     "makespan_rho2": {
+      "se_us": 0.1267142865,
+      "us_per_sequence": -0.9792650107,
+      "work_coef_us_per_tile": 2.610745574
+     },
+     "slope_only": {
+      "se_us": 0.8476408122,
+      "us_per_sequence": -1.268773751,
+      "work_coef_us_per_tile": null
+     },
+     "sum_tiles": {
+      "se_us": 0.0856555889,
+      "us_per_sequence": 0.05223147841,
+      "work_coef_us_per_tile": 0.01983092453
+     }
+    },
+    "work_us_per_tile": 2.953670374
+   },
+   "256": {
+    "n_groups": 11,
+    "n_rows": 26,
+    "proxy_spread_factor": null,
+    "se_us": 0.6938838196,
+    "slope_only_us_per_sequence": 3.309229502,
+    "status": "read (makespan rho 0 proxy); RECORDED, NOT APPLIED (the n-slope depends on the work proxy: at fixed tokens the mask / wave work changes with n far more than the per-sequence cost, so the read is a fit of a work model, not a trace reading - PB B3 (iv) not implementable as written; the forward's static form stays)",
+    "us_per_sequence": 4.086525086,
+    "variants_by_work_proxy": {
+     "makespan_rho0": {
+      "se_us": 0.6938838196,
+      "us_per_sequence": 4.086525086,
+      "work_coef_us_per_tile": 8.596506355
+     },
+     "makespan_rho2": {
+      "se_us": 0.8207064745,
+      "us_per_sequence": -0.8905815844,
+      "work_coef_us_per_tile": 6.926432626
+     },
+     "slope_only": {
+      "se_us": 2.496047179,
+      "us_per_sequence": 3.309229502,
+      "work_coef_us_per_tile": null
+     },
+     "sum_tiles": {
+      "se_us": 0.7362843318,
+      "us_per_sequence": 3.934620841,
+      "work_coef_us_per_tile": 0.1165616072
+     }
+    },
+    "work_us_per_tile": 8.596506355
+   }
+  },
+  "static_bwd_us_per_sequence_by_head_dim": {},
+  "static_spec": {
+   "form": "forward_slots",
+   "text": "the forward's static term 0.155 us x (64 - n) (PB 3.1 as written; B3 (iv) frozen alternative)",
+   "thd_max": 64,
+   "us_per_slot": 0.155
+  },
+  "wave_quantization": {
+   "128": {
+    "contrast_period4_max": 0.3404825073,
+    "curves": [
+     "llama3_70b|4096",
+     "llama3_70b|8192",
+     "llama3_70b|16384",
+     "qwen3_30b|4096",
+     "qwen3_30b|8192",
+     "qwen3_30b|16384"
+    ],
+    "known_limit": false,
+    "max_nonmonotonic_drop_frac": 0.0,
+    "text": "d128: monotonic within 5 % (largest drop 0.0 %)",
+    "worst_curve": null
+   },
+   "256": {
+    "contrast_period4_max": 1.975107917,
+    "curves": [
+     "qwen3_5_397b|4096",
+     "qwen3_5_397b|8192",
+     "qwen3_5_397b|16384"
+    ],
+    "known_limit": true,
+    "max_nonmonotonic_drop_frac": 0.2092201055,
+    "text": "d256: the singleton walls are NON-monotonic in L (largest drop 21 % at qwen3_5_397b|16384; period-4 contrast up to 1.98) - a wave quantization of the kernel no rho-smoothed makespan form follows: KNOWN LIMIT of every 3.1 candidate at this head_dim (PB B3 (ii))",
+    "worst_curve": "qwen3_5_397b|16384"
+   }
+  }
+ }
+}

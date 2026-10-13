@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 
 import megatron.core.transformer.moe.fused_a2a as fused_a2a
-import megatron.core.transformer.moe.token_dispatcher as token_dispatcher
 from megatron.core import config, parallel_state
 from megatron.core.extensions.transformer_engine import (
     fused_topk_with_score_function_supports_topk_indices,
@@ -101,6 +100,7 @@ def test_set_cudagraph_attr_supports_nested_paths():
 
 def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     manager = object.__new__(_HybridEPManager)
+    manager._fused_a2a = fused_a2a
     manager.config = SimpleNamespace(
         moe_hybridep_pad_variable_tokens=True, moe_hybridep_routing_map_mode="bool"
     )
@@ -132,9 +132,31 @@ def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     assert not manager.token_probs[local_num_tokens:].any()
 
 
+@pytest.mark.parametrize("available", [False, True])
+def test_deepepv2_initializes_optional_transport_without_v1(monkeypatch, available):
+    # A v2-only module deliberately provides no v1 Buffer/dispatch symbols.
+    fused_a2a = SimpleNamespace(deepepv2_dispatch=object() if available else None)
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.token_dispatcher._get_fused_a2a_module", lambda: fused_a2a
+    )
+    config = SimpleNamespace(
+        moe_router_dtype="fp32",
+        moe_expert_capacity_factor=None,
+        moe_permute_fusion=False,
+        moe_flex_dispatcher_num_sms=None,
+    )
+    if not available:
+        with pytest.raises(ImportError, match="DeepEP v2 is not installed"):
+            _DeepepV2Manager(object(), 4, 2, 8, config)
+    else:
+        manager = _DeepepV2Manager(object(), 4, 2, 8, config)
+        assert manager._fused_a2a is fused_a2a
+
+
 def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
-    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
     manager = object.__new__(_HybridEPManager)
+    manager._fused_a2a = fused_a2a
     manager.config = SimpleNamespace(
         moe_hybridep_pad_variable_tokens=False, moe_hybridep_routing_map_mode="indices"
     )
@@ -153,8 +175,9 @@ def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
 
 
 def test_hybridep_dense_input_requires_backend_support(monkeypatch):
-    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
     manager = object.__new__(_HybridEPManager)
+    manager._fused_a2a = fused_a2a
     manager.config = SimpleNamespace(
         moe_hybridep_pad_variable_tokens=False, moe_hybridep_routing_map_mode="indices"
     )
