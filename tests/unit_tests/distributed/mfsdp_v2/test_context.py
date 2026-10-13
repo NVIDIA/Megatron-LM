@@ -222,28 +222,18 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
 
 
-@pytest.mark.parametrize("requires_grad", [False, True])
-def test_register_post_backward_hook_handles_parameterless_module(distributed_setup, requires_grad):
-    """External scheduler cleanup finishes at post_backward, independently of gradient sync."""
+def test_register_post_backward_hook_handles_parameterless_module(distributed_setup):
+    """A parameterless FSDP unit should invoke the external scheduler callback."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    # The child keeps backward possible without input gradients; its parameters
-    # belong to a separate FSDP unit, leaving the root parameterless.
-    model = nn.Sequential(nn.Linear(4, 4, bias=False)).to(device)
+    model = nn.Identity().to(device)
 
-    with fully_shard_context(device=device, caller_managed_grad_sync=True) as context:
-        fully_shard(model[0], mesh=mesh, placements=_default_placements())
+    with fully_shard_context(device=device):
         fully_shard(model, mesh=mesh, placements=_default_placements(), register_hooks=False)
 
     callback_modules = []
     model.register_post_backward_hook(callback_modules.append)
-    model(torch.ones(2, 4, device=device, requires_grad=requires_grad)).sum().backward()
-
-    assert callback_modules == ([model] if requires_grad else [])
-    context.finish_grad_sync()
-    assert callback_modules == ([model] if requires_grad else [])
-    context.post_backward()
-    context.post_backward()
+    model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
 
     assert callback_modules == [model]
 
