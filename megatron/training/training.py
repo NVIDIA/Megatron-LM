@@ -4927,12 +4927,7 @@ def train(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = any(
-            isinstance(optim_instance, DistributedOptimizer)
-            and optim_instance.reuse_grad_buffer_for_param_ag
-            and optim_instance.ddp_config.overlap_param_gather
-            for optim_instance in getattr(optimizer, 'chained_optimizers', [optimizer])
-        )
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
@@ -5706,8 +5701,7 @@ def evaluate(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        # Evaluation has no optimizer from which to restage master parameters.
-        copy_main_params = False
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
