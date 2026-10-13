@@ -224,7 +224,7 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
 
 @pytest.mark.parametrize("requires_grad", [False, True])
 def test_register_post_backward_hook_handles_parameterless_module(distributed_setup, requires_grad):
-    """External scheduler callbacks run during backward or at explicit completion."""
+    """External scheduler cleanup finishes at post_backward, independently of gradient sync."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     # The child keeps backward possible without input gradients; its parameters
@@ -241,7 +241,9 @@ def test_register_post_backward_hook_handles_parameterless_module(distributed_se
 
     assert callback_modules == ([model] if requires_grad else [])
     context.finish_grad_sync()
-    context.finish_grad_sync()
+    assert callback_modules == ([model] if requires_grad else [])
+    context.post_backward()
+    context.post_backward()
 
     assert callback_modules == [model]
 
