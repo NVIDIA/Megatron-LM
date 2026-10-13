@@ -27,10 +27,14 @@ class _DynamicEngine:
         self.context = context
 
 
-@pytest.mark.parametrize("native", [False, True])
-def test_prefill_reply_registers_external_ownership_or_sends_compact_native_metadata(native):
+@pytest.mark.parametrize("native, require_claim", [(True, False), (False, False), (False, True)])
+def test_prefill_reply_registers_external_ownership_or_sends_compact_native_metadata(
+    native, require_claim
+):
     cls = DisaggDynamicInferenceEngine if native else StateHandoffDynamicInferenceEngine
     engine = object.__new__(cls)
+    engine._initialize_disaggregation_state()
+    engine._require_handoff_claim = require_claim
     engine._disagg_config = object() if native else None
     engine._kv_transfer_role = "prefill"
     engine.local_metadata_ledger_enabled = False
@@ -58,7 +62,7 @@ def test_prefill_reply_registers_external_ownership_or_sends_compact_native_meta
             "offload_frame": msgpack.packb(request.offload_params, use_bin_type=True),
         }
     else:
-        assert msgpack.unpackb(calls[0].args[0]) == [Headers.REGISTER_KV.value, 7]
+        assert msgpack.unpackb(calls[0].args[0]) == [Headers.REGISTER_KV.value, 7, require_claim]
         expected = serialized
     reply = calls[-1].args[0]
     assert msgpack.unpackb(reply[0]) == [Headers.ENGINE_REPLY.value, [[7, False]]]

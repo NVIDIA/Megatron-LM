@@ -395,6 +395,23 @@ class DataParallelInferenceCoordinator:
                 return False
             raise
 
+    def _send_to_client(self, frames):
+        """Best-effort reply to a client that may have disconnected.
+
+        Frames include the ROUTER identity. Request bookkeeping must still finish
+        when the consumer has gone away; transport errors other than an absent
+        route remain fatal.
+        """
+        try:
+            self.router_socket.send_multipart(frames)
+            return True
+        except zmq.ZMQError as error:
+            if error.errno != zmq.EHOSTUNREACH:
+                raise
+            self.known_clients.discard(frames[0])
+            logging.warning("Coordinator: client %r disconnected before its reply", frames[0])
+            return False
+
     def _broadcast_to_engines(self, payload):
         """Send a deserialized payload to every connected data parallel rank."""
         serialized = msgpack.packb(payload, use_bin_type=True)
@@ -607,13 +624,28 @@ class DataParallelInferenceCoordinator:
         A handler that returns a truthy value stops the loop.
         """
         # Todo [Siddharth]: Make this more robust to handle invalid messages.
+        self.router_socket.setsockopt(zmq.RCVTIMEO, 1000)
+        next_handoff_sweep = 0.0
         while True:
+            now = time.monotonic()
+            if now >= next_handoff_sweep:
+                for request_id, engine in self.handoff_ownership.expired_unclaimed():
+                    if self._send_to_engine(
+                        engine,
+                        [msgpack.packb([Headers.RELEASE_KV.value, request_id])],
+                        remove_unreachable=False,
+                    ):
+                        self.handoff_ownership.release(request_id)
+                next_handoff_sweep = now + 1.0
             # Messages are one or more frames. frames[0] is the metadata frame:
             # a header plus whatever the coordinator needs to route the message.
             # Any later frames are opaque payload bodies, forwarded without ever
             # being decoded here -- that is what keeps this loop's cost
             # independent of prompt length.
-            sender_identity, *frames = self.router_socket.recv_multipart()
+            try:
+                sender_identity, *frames = self.router_socket.recv_multipart()
+            except zmq.Again:
+                continue
 
             # An empty payload is a data parallel rank (re-)registering itself.
             if frames[0] == b"":

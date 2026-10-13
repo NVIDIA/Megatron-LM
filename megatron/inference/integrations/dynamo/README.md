@@ -113,6 +113,14 @@ remote read. The source keeps this ownership in memory alongside the lifetime
 of its GPU allocations; no database or persistent volume is required.
 Successful imports and storage-safe aborts release normally, with failed
 releases retried while the adapter is alive.
+Unclaimed offers expire after five minutes; late claims are rejected before
+any remote read is submitted. Claimed transfers do not expire: a cancellation
+response deadline does not cancel background cleanup waiting for a storage-safe
+acknowledgement.
+The Dynamo engine service opts into this with
+`setup_kv_transfer(..., require_handoff_claim=True)`. Generic Core consumers
+retain explicit-release lifetimes unless their control plane makes the same
+claim-before-read guarantee.
 Claims are single-use, including within one adapter, so duplicate delivery
 cannot start two reads sharing one release. If a claim acknowledgement is lost,
 decode is not submitted and supervisor cleanup reclaims that attempt's state.
@@ -158,8 +166,12 @@ intentionally leaves unsafe source memory pinned; timeouts never reclaim it.
 Source coordinators and their engines must restart as a single lifecycle
 unit: stop the old engines before replacing their coordinator. Ownership
 is not replicated, and a new coordinator cannot adopt surviving allocations.
-Upgrade source and decode together for the ownership protocol. Recovery covers
-handoffs claimed by decode, not frontend failure before delivery to decode.
+Upgrade source and decode together for the ownership protocol. Offer expiration
+also reclaims state orphaned by frontend failure before delivery to decode.
+
+Both roles currently require the default `persist` KV-cache management mode.
+`offload` and `recompute` are rejected at transfer setup because suspend/resume
+can invalidate the registered KV/SSM buffers.
 
 ## Tests
 

@@ -56,13 +56,14 @@ async def test_killed_owner_recovery_restores_prefill_capacity_and_fences_replac
         instance_id="prefill",
         known_clients=set(),
         router_socket=router,
+        _send_to_client=router.send_multipart,
         identities_of_data_parallel_ranks={b"prefill-engine"},
         handoff_ownership=ownership,
         _send_to_engine=send,
     )
     for request_id in (7, 8, 9):
         HANDLERS[Headers.REGISTER_KV](
-            coordinator, b"prefill-engine", [Headers.REGISTER_KV.value, request_id], []
+            coordinator, b"prefill-engine", [Headers.REGISTER_KV.value, request_id, True], []
         )
 
     async def serve():
@@ -128,6 +129,25 @@ signal.pause()
         await asyncio.gather(server, return_exceptions=True)
         router.close(linger=0)
         context.term()
+
+
+@pytest.mark.asyncio
+async def test_abort_deadline_does_not_cancel_eventual_safe_release():
+    engine = MegatronLLMEngine(_config("decode"))
+    engine.config.drain_timeout = 0.001
+    ack = asyncio.get_running_loop().create_future()
+    engine.client = SimpleNamespace(abort_request_and_wait=MagicMock(return_value=ack))
+    engine._release_completed_handoff = AsyncMock()
+    engine._request_ids["dynamo-request"] = 4
+    release = asdict(HandoffRelease("tcp://prefill:5000", "prefill", 7))
+    engine._schedule_cleanup(engine._release_aborted_handoff(4, release))
+    with pytest.raises(TimeoutError):
+        await engine.abort(_Context())
+    assert not ack.done()
+    engine._release_completed_handoff.assert_not_awaited()
+    ack.set_result(True)
+    await asyncio.gather(*engine._cleanup_tasks)
+    engine._release_completed_handoff.assert_awaited_once_with(release)
 
 
 @pytest.mark.asyncio

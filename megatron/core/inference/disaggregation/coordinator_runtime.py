@@ -206,12 +206,13 @@ class DisaggCoordinatorRuntime:
         self.requests[request_id] = _RequestState(
             prompt_frame, sampling_params, block_hashes, offload_frame
         )
-        if sampling_params.get("return_log_probs") and not sampling_params.get(
-            "skip_prompt_log_probs", True
+        if sampling_params.get("top_n_logprobs") or (
+            sampling_params.get("return_log_probs")
+            and not sampling_params.get("skip_prompt_log_probs", False)
         ):
             self.drop_request(
                 request_id,
-                "prompt log probabilities are not supported by native disaggregation",
+                "prompt and top-N log probabilities are not supported by native disaggregation",
                 source_safe=True,
             )
             return
@@ -446,7 +447,7 @@ class DisaggCoordinatorRuntime:
         client_identity = coordinator.request_id_to_client_id.get(request_id)
         client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
         if client_identity is not None and client_request_id is not None:
-            coordinator.router_socket.send_multipart(
+            coordinator._send_to_client(
                 [
                     client_identity,
                     msgpack.packb(
@@ -513,7 +514,7 @@ class DisaggCoordinatorRuntime:
         self.terminating_request_ids.discard(request_id)
         coordinator._forget_client_request(request_id)
         if client_identity is not None and client_request_id is not None:
-            coordinator.router_socket.send_multipart(
+            coordinator._send_to_client(
                 [
                     client_identity,
                     msgpack.packb(

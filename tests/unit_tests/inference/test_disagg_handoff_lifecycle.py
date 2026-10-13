@@ -10,7 +10,7 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.inference.config import KVCacheManagementMode, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
@@ -305,8 +305,7 @@ def test_prefilled_decode_admission_uses_exact_ssm_state_without_prompt_tokens()
     )
 
     context.chunked_prefill_request_id = 9
-    with pytest.raises(RuntimeError, match="decode-only engine"):
-        can_admit_prefilled_decode(context, 3)
+    assert not can_admit_prefilled_decode(context, 3)
     context.chunked_prefill_request_id = -1
     assert additional_decode_blocks(3, 3, 4) == 1
     admit_prefilled_decode(context, request, [10], [11], [40, 41, 42], 10)
@@ -393,6 +392,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
     )
     engine.context = SimpleNamespace(
         config=SimpleNamespace(kv_transport_backend="nccl"),
+        kv_cache_management_mode=KVCacheManagementMode.PERSIST,
         kv_block_allocator=allocator,
         memory_buffer=torch.empty(2, 1, 8, 4, 1, 1),
         is_hybrid_model=False,
@@ -447,6 +447,7 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     engine._initialize_disaggregation_state()
     engine.context = SimpleNamespace(
         config=SimpleNamespace(kv_transport_backend="nixl"),
+        kv_cache_management_mode=KVCacheManagementMode.PERSIST,
         kv_block_allocator=SimpleNamespace(
             enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
         ),
@@ -504,6 +505,44 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     assert _Backend.instances[1].kwargs["memory_buffer"] is engine.context.mamba_conv_states
     assert _Backend.instances[2].kwargs["memory_buffer"] is engine.context.mamba_ssm_states
     assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [9, 9]
+
+
+def test_handoff_salt_is_used_for_lookup_and_retained_after_import(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    prompt = [1, 2, 3, 4]
+    stale_hashes = compute_block_hashes_batched(torch.tensor(prompt), 4)
+    engine.context.kv_block_allocator.kv_hash_to_block_id[stale_hashes[0]] = 4
+    engine.add_request_with_kv_handoff(
+        7,
+        prompt,
+        SamplingParams(num_tokens_to_generate=3),
+        {"resume_tokens": [99], "block_hash_salt": "weights-v2"},
+        [100],
+    )
+    pending = engine._pending_kv_imports[0]
+    assert pending.hashes == compute_block_hashes_batched(
+        torch.tensor(prompt), 4, cache_salt="weights-v2"
+    )
+    assert pending.cached_prefix_block_count == 0
+    # Other evicted requests may still be waiting when an import completes.
+    engine.waiting_request_ids.append(8)
+    with mock.patch(
+        "megatron.core.inference.disaggregation.inference_state_handoff.admit_prefilled_decode"
+    ):
+        engine._finalize_kv_handoff_import(pending)
+    request = engine.get_request(7)
+    assert request.block_hash_salt == "weights-v2"
+    assert list(engine.waiting_request_ids) == [8]
+    request.block_size_tokens = 4
+    request.enable_prefix_caching = True
+    request.generated_tokens.extend([98, 97, 96])
+    record = DynamicInferenceRequestRecord.from_request(request)
+    record.checkpoint()
+    assert record[-1].block_hash_salt == "weights-v2"
+    assert record[-1].precomputed_block_hashes == compute_block_hashes_batched(
+        torch.tensor([*prompt, 99, 98, 97, 96]), 4, cache_salt="weights-v2"
+    )
+    _drain_loop(handoff_loop)
 
 
 def test_capacity_miss_defers_before_any_transfer(handoff_loop):
@@ -1119,6 +1158,7 @@ def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch
         SimpleNamespace(
             request_id=7,
             prompt_tokens=torch.arange(8),
+            block_hash_salt="weights-v2",
             sampling_params=SamplingParams(
                 do_kv_handoff=True, return_log_probs=True, skip_prompt_log_probs=True
             ),
@@ -1127,6 +1167,7 @@ def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch
         SimpleNamespace(
             request_id=8,
             prompt_tokens=torch.arange(12),
+            block_hash_salt=None,
             sampling_params=SamplingParams(do_kv_handoff=True),
             disaggregated_params=None,
         ),
@@ -1153,6 +1194,7 @@ def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch
         "block_ids": [10, 11],
         "kv_meta": {
             "resume_tokens": [71],
+            "block_hash_salt": "weights-v2",
             "resume_log_probs": [-0.1],
             "pp_metas": [
                 {"tp_metas": {"global_rank": 0}, "block_ids": [10, 11]},
@@ -1213,6 +1255,7 @@ def test_hybrid_handoff_keeps_partial_block_for_exact_decode_resume():
     request = SimpleNamespace(
         request_id=7,
         prompt_tokens=torch.arange(10),
+        block_hash_salt=None,
         sampling_params=SamplingParams(do_kv_handoff=True),
         disaggregated_params=None,
     )
@@ -1478,10 +1521,32 @@ def test_fully_cached_transformer_handoff_skips_transfer(handoff_loop, is_push):
 def test_decode_role_rejects_prompt_scheduling(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine._kv_transfer_role = "decode"
-    engine.waiting_request_ids.append(3)
+    engine.add_request(3, [1, 2, 3], SamplingParams())
 
     with pytest.raises(RuntimeError, match="cannot schedule prompt prefill"):
         engine.schedule_waiting_requests()
+
+    # Eviction recovery reuses the base scheduler, including partial re-prefill.
+    engine.get_request(3).add_event_evict()
+    engine.blocks_to_bind[3] = [10]
+    engine.partial_admissions.add(3)
+    engine.schedule_waiting_requests()
+    assert list(engine.waiting_request_ids) == [3]
+    engine.partial_admissions.clear()
+    engine.schedule_waiting_requests()
+    assert not engine.waiting_request_ids
+
+
+@pytest.mark.parametrize("mode", [KVCacheManagementMode.OFFLOAD, KVCacheManagementMode.RECOMPUTE])
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_transfer_rejects_reallocating_cache_buffers(mode, role):
+    engine = object.__new__(InferenceStateHandoffMixin)
+    engine._initialize_disaggregation_state()
+    engine.context = SimpleNamespace(is_hybrid_model=False, kv_cache_management_mode=mode)
+    with pytest.raises(ValueError, match="requires kv_cache_management_mode='persist'"):
+        engine.setup_kv_transfer(role)
+    assert engine._kv_transfer_agent is None
+    assert engine._kv_transfer_role is None
 
 
 def test_push_handoff_uses_final_pinned_blocks_ssm_slot():
@@ -1586,12 +1651,14 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
         SimpleNamespace(
             request_id=2,
             prompt_tokens=[0] * 16,
+            block_hash_salt=None,
             sampling_params=SamplingParams(do_kv_handoff=True),
             disaggregated_params=None,
         ),
         SimpleNamespace(
             request_id=3,
             prompt_tokens=[0] * 12,
+            block_hash_salt=None,
             sampling_params=SamplingParams(do_kv_handoff=True),
             disaggregated_params=None,
         ),

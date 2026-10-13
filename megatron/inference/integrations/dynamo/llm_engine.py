@@ -446,16 +446,15 @@ class MegatronLLMEngine(LLMEngine):
         finally:
             self._request_ids.pop(context_id, None)
             if not released and self.config.role == "decode":
-                try:
-                    if not source_safe:
-                        source_safe = await asyncio.wait_for(
-                            self.client.abort_request_and_wait(stream.request_id),
-                            timeout=self.config.drain_timeout,
-                        )
-                    if source_safe:
-                        self._schedule_cleanup(self._release_completed_handoff(release))
-                except Exception:
-                    logger.exception("Failed to finish cancelled Megatron handoff")
+                if source_safe:
+                    self._schedule_cleanup(self._release_completed_handoff(release))
+                else:
+                    # Cleanup outlives the response deadline and consumer task.
+                    # Only a source-safe ACK (or the deployment's termination
+                    # barrier) permits the prefill allocation to be released.
+                    self._schedule_cleanup(
+                        self._release_aborted_handoff(stream.request_id, release)
+                    )
 
     async def _stream_chunks(
         self, stream, prompt_token_ids: list[int], params: SamplingParams
@@ -550,6 +549,11 @@ class MegatronLLMEngine(LLMEngine):
         if disagg:
             # This is the engine's request ID, not the client's local stream ID.
             self.client.release_handoff(int(disagg["request_id"]))
+
+    async def _release_aborted_handoff(self, request_id: int, release: dict) -> None:
+        source_safe = await asyncio.shield(self.client.abort_request_and_wait(request_id))
+        if source_safe:
+            await self._release_completed_handoff(release)
 
     def _schedule_cleanup(self, coroutine) -> None:
         task = asyncio.create_task(coroutine)
@@ -691,7 +695,8 @@ class MegatronLLMEngine(LLMEngine):
         request_id = self._request_ids.pop(str(context.id()), None)
         if request_id is not None and self.client is not None:
             await asyncio.wait_for(
-                self.client.abort_request_and_wait(request_id), timeout=self.config.drain_timeout
+                asyncio.shield(self.client.abort_request_and_wait(request_id)),
+                timeout=self.config.drain_timeout,
             )
 
     async def drain(self) -> None:

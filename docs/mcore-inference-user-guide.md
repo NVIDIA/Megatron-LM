@@ -851,6 +851,12 @@ currently accepts text/token prompts, not multimodal inputs. Generated-token
 log-probs are supported with `skip_prompt_log_probs=True`; prompt and top-N
 log-probs are not.
 
+Use the default `persist` KV-cache management mode. Disaggregated transfers
+currently reject `offload` and `recompute` because suspend/resume can invalidate
+the registered KV/SSM buffers. Under memory pressure, evicted decode requests
+recover through the engine's local recomputation path; new requests still
+route to prefill.
+
 ---
 
 ## Customizing the Pipeline

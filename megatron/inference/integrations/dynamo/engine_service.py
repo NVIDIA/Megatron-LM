@@ -58,7 +58,7 @@ async def _serve() -> None:
         )
 
     if disaggregated:
-        engine.setup_kv_transfer(role=args.role)
+        engine.setup_kv_transfer(role=args.role, require_handoff_claim=True)
 
     reporter = EngineEventReporter(engine, args.dynamo_parent_event_address)
     if disaggregated:

@@ -100,7 +100,7 @@ def handle_connect(coordinator, sender_identity, metadata, bodies):
     ``bodies``: empty.
     """
     coordinator.known_clients.add(sender_identity)
-    coordinator.router_socket.send_multipart(
+    coordinator._send_to_client(
         [
             sender_identity,
             msgpack.packb([Headers.CONNECT_ACK.value, coordinator.instance_id], use_bin_type=True),
@@ -171,7 +171,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         if media_meta or media_frame != b"\xc0":
             # Native handoffs do not support VLM/media state yet. Reject only
             # this request, before allocating an ID or reserving engine capacity.
-            coordinator.router_socket.send_multipart(
+            coordinator._send_to_client(
                 [
                     sender_identity,
                     msgpack.packb(
@@ -326,7 +326,7 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     if coordinator.is_disaggregated_inference():
         # No engine has read the source state. Reject before allocating an ID
         # or bypassing the native runtime's role routing and reservations.
-        coordinator.router_socket.send_multipart(
+        coordinator._send_to_client(
             [
                 sender_identity,
                 msgpack.packb(
@@ -414,7 +414,7 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
     # ACK successful releases and stale-instance no-ops. Acknowledging a stale
     # instance retires the caller's retry without releasing allocations that
     # belong to the current coordinator incarnation.
-    coordinator.router_socket.send_multipart(
+    coordinator._send_to_client(
         [
             sender_identity,
             msgpack.packb(
@@ -427,8 +427,13 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
 @message_handler(Headers.REGISTER_KV)
 def handle_register_kv(coordinator, sender_identity, metadata, bodies):
     """Register source state before its engine publishes handoff metadata."""
-    if sender_identity in coordinator.identities_of_data_parallel_ranks and len(metadata) == 2:
-        coordinator.handoff_ownership.offer(int(metadata[1]), sender_identity)
+    if sender_identity in coordinator.identities_of_data_parallel_ranks and len(metadata) in (2, 3):
+        # Two-field registrations predate the claim protocol. Do not expire a
+        # source whose consumers can submit reads without claiming first.
+        require_claim = len(metadata) == 3 and metadata[2] is True
+        coordinator.handoff_ownership.offer(
+            int(metadata[1]), sender_identity, require_claim=require_claim
+        )
 
 
 @message_handler(Headers.CLAIM_KV, Headers.RELEASE_KV_OWNER)
@@ -467,9 +472,7 @@ def handle_handoff_owner(coordinator, sender_identity, metadata, bodies):
             if not delivered:
                 return  # Keep failed releases indexed by owner for supervisor retry.
         reply = [Headers.RELEASE_KV_OWNER_ACK.value, instance_id, owner]
-    coordinator.router_socket.send_multipart(
-        [sender_identity, msgpack.packb(reply, use_bin_type=True)]
-    )
+    coordinator._send_to_client([sender_identity, msgpack.packb(reply, use_bin_type=True)])
 
 
 @message_handler(
@@ -592,7 +595,7 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         reply_metadata = msgpack.packb(
             [Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True
         )
-        coordinator.router_socket.send_multipart([client_identity, reply_metadata, body])
+        coordinator._send_to_client([client_identity, reply_metadata, body])
 
 
 @message_handler(Headers.KV_READ_DONE)
@@ -632,7 +635,7 @@ def handle_request_error(coordinator, sender_identity, metadata, bodies):
     client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
     if client_identity is None or client_request_id is None:
         return
-    coordinator.router_socket.send_multipart(
+    coordinator._send_to_client(
         [
             client_identity,
             msgpack.packb(
@@ -668,7 +671,7 @@ def handle_request_aborted(coordinator, sender_identity, metadata, bodies):
             coordinator._pending_counts[index] -= 1
     if client_identity is None or client_request_id is None:
         return
-    coordinator.router_socket.send_multipart(
+    coordinator._send_to_client(
         [
             client_identity,
             msgpack.packb(
@@ -707,7 +710,7 @@ def handle_engine_reply_partial(coordinator, sender_identity, metadata, bodies):
             continue
         # Partial tokens are detokenized incrementally by the client-facing
         # streaming layer, so the body is always forwarded untouched.
-        coordinator.router_socket.send_multipart(
+        coordinator._send_to_client(
             [
                 client_identity,
                 msgpack.packb(

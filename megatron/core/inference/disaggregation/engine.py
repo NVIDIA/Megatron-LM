@@ -34,7 +34,13 @@ class StateHandoffDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInfe
             for request in requests:
                 if request.disaggregated_params:
                     self.socket_for_receiving_requests.send(
-                        msgpack.packb([Headers.REGISTER_KV.value, request.request_id])
+                        msgpack.packb(
+                            [
+                                Headers.REGISTER_KV.value,
+                                request.request_id,
+                                self._require_handoff_claim,
+                            ]
+                        )
                     )
         super()._send_requests_to_coordinator(requests)
 

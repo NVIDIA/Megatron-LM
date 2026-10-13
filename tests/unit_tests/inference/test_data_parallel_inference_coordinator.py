@@ -23,6 +23,7 @@ from megatron.core.inference.data_parallel_inference_coordinator.handlers import
     HANDLERS,
     handle_engine_reply,
 )
+from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
@@ -53,6 +54,50 @@ except ImportError:
 NUM_REQUESTS = 10
 NUM_TOKENS = 2
 DEFAULT_PORT = 46581
+
+
+def test_unclaimed_offer_expiry_fences_claims_but_not_live_readers(monkeypatch):
+    clock = unittest.mock.Mock(return_value=10.0)
+    monkeypatch.setattr(
+        "megatron.core.inference.disaggregation.handoff_ownership.time.monotonic", clock
+    )
+    ownership = HandoffOwnership(offer_timeout=5)
+    ownership.offer(1, b"prefill", require_claim=True)
+    ownership.offer(2, b"prefill", require_claim=True)
+    ownership.offer(3, b"unfenced-source")
+    assert ownership.claim(2, "decode")
+    clock.return_value = 15.0
+    assert not ownership.claim(1, "late")
+    assert ownership.expired_unclaimed() == [(1, b"prefill")]
+    assert ownership.expired_unclaimed() == [(1, b"prefill")]  # failed send must retry
+    ownership.release(1)
+    assert not ownership.expired_unclaimed()
+    assert ownership.confirm_terminated("decode") == [(2, b"prefill")]
+    assert ownership.source_engine(3) == b"unfenced-source"
+
+
+def test_disconnected_client_does_not_interrupt_reply_bookkeeping():
+    from tests.unit_tests.inference.coordinator_test_utils import make_coordinator_direct
+
+    coord = make_coordinator_direct()
+    coord.known_clients = {b"client"}
+    coord.router_socket = unittest.mock.Mock()
+    coord.router_socket.send_multipart.side_effect = zmq.ZMQError(zmq.EHOSTUNREACH)
+    coord.request_id_to_client_id = {7: b"client"}
+    coord.request_id_to_client_request_id = {7: 70}
+    coord.client_request_to_request_id = {(b"client", 70): 7}
+    coord.request_id_to_rank = {7: b"rank_0"}
+    coord._pending_counts[0] = 1
+    coord.disaggregated_runtime = None
+    HANDLERS[Headers.REQUEST_ERROR](
+        coord, b"rank_0", [Headers.REQUEST_ERROR.value, 7, "failed", True], []
+    )
+    assert not coord.known_clients
+    assert not coord.request_id_to_client_id
+    assert coord._pending_counts[0] == 0
+    coord.router_socket.send_multipart.side_effect = zmq.ZMQError(zmq.EINVAL)
+    with pytest.raises(zmq.ZMQError):
+        coord._send_to_client([b"client", b"payload"])
 
 
 def test_coordinator_registers_client_kv_handoff_handlers():
@@ -86,6 +131,9 @@ def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator()
     )
 
     coordinator.is_disaggregated_inference.return_value = True
+    coordinator._send_to_client = DataParallelInferenceCoordinator._send_to_client.__get__(
+        coordinator
+    )
     coordinator._handlers = HANDLERS
     submissions = [
         [
@@ -124,6 +172,7 @@ class _StubCoordinator:
     """Minimal stand-in exposing only what the submit handlers touch."""
 
     is_disaggregated_inference = DataParallelInferenceCoordinator.is_disaggregated_inference
+    _send_to_client = DataParallelInferenceCoordinator._send_to_client
 
     def __init__(self, identity=b"engine-0"):
         self.disaggregated_runtime = None

@@ -10,6 +10,7 @@ from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator.handlers import HANDLERS
 from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.sampling_params import SamplingParams
 from tests.unit_tests.inference.coordinator_test_utils import make_coordinator_direct
 
 
@@ -135,15 +136,26 @@ def test_request_routes_prefill_then_decode():
     assert runtime.requests[5].block_hashes == []
 
 
-def test_prompt_log_probs_are_rejected_before_prefill():
+@pytest.mark.parametrize(
+    "sampling_params",
+    [
+        {"return_log_probs": True, "skip_prompt_log_probs": False},
+        {"return_log_probs": True},
+        vars(SamplingParams(top_n_logprobs=8)),
+    ],
+)
+def test_unsupported_log_probs_are_rejected_before_prefill(sampling_params):
     runtime, sent = _runtime()
 
-    _submit(runtime, 5, [1, 2, 3], {"return_log_probs": True, "skip_prompt_log_probs": False})
+    _submit(runtime, 5, [1, 2, 3], sampling_params)
 
     assert all(identity not in (b"prefill", b"decode") for identity, _ in sent)
     response = msgpack.unpackb(sent[-1][1][1], raw=False)
     assert Headers(response[0]) == Headers.REQUEST_ERROR
-    assert "prompt log probabilities" in response[2]
+    assert "log probabilities" in response[2]
+    assert not runtime.requests
+    _submit(runtime, 6, [1, 2, 3], {})
+    assert sent[-1][0] == b"prefill"
 
 
 @pytest.mark.parametrize(

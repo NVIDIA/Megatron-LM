@@ -411,6 +411,7 @@ async def test_release_reregisters_after_coordinator_replacement():
                 instance_id=instance_id,
                 known_clients=set(),
                 router_socket=router,
+                _send_to_client=router.send_multipart,
                 _broadcast_to_engines=MagicMock(),
                 handoff_ownership=HandoffOwnership(),
             )

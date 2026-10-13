@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
+from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.disaggregation.coordinator_setup import NativeDisaggregationConfig
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
@@ -75,6 +76,7 @@ class InferenceStateHandoffMixin:
         """Initialize state without importing or constructing a transfer backend."""
 
         self._disagg_config: NativeDisaggregationConfig | None = None
+        self._require_handoff_claim = False
         self._pinned_handoff_blocks: Dict[int, list] = {}  # Request ID -> pinned KV block IDs.
         self._pinned_handoff_ssm_slots: Dict[int, int] = {}  # Request ID -> detached live slot.
         self._kv_transfer_agent = None
@@ -234,22 +236,31 @@ class InferenceStateHandoffMixin:
         self._pending_handoff_hash_owners.clear()
 
     def schedule_waiting_requests(self) -> None:
-        """Reject prompt scheduling on a dedicated disaggregated decode engine.
+        """Recover evicted decodes locally, but reject new prompt submissions.
 
         Side: decode engine; pull and push transport paths.
         """
 
         if self._kv_transfer_role == "decode":
+            for request_id in self.waiting_request_ids:
+                if not any(
+                    event.type == DynamicInferenceEventType.EVICT
+                    for event in self.get_request(request_id).events
+                ):
+                    raise RuntimeError(
+                        "A disaggregated decode engine cannot schedule prompt prefill requests"
+                    )
+            # The base engine checkpoints an evicted request's prompt + output.
+            # Reuse its recovery path (including hybrid state and logprobs) for
+            # both native and external control planes. No new source read is needed.
+            super().schedule_waiting_requests()
             # Async scheduling reaches this point after consuming the previous
             # forward's logits. The legacy path does not retain logits across steps.
             self._admit_pending_kv_imports()
-            if self.waiting_request_ids:
-                raise RuntimeError(
-                    "A disaggregated decode engine cannot schedule prompt prefill requests"
-                )
+            return
         super().schedule_waiting_requests()
 
-    def setup_kv_transfer(self, role: str) -> None:
+    def setup_kv_transfer(self, role: str, *, require_handoff_claim: bool = False) -> None:
         """Bring up the KV transfer agents for this engine.
 
         This method must be called collectively by every model-parallel rank in
@@ -257,6 +268,9 @@ class InferenceStateHandoffMixin:
 
         Args:
             role: "prefill" or "decode"; used to name the local transfer agent.
+            require_handoff_claim: The external control plane guarantees a
+                successful source-coordinator claim before every remote read.
+                Enables expiration of unclaimed offers; never expires readers.
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
@@ -266,7 +280,13 @@ class InferenceStateHandoffMixin:
                     "A hybrid decode handoff writes directly into live SSM state; "
                     "do not configure prefix_caching_mamba_gb on the decode engine"
                 )
+        if self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST:
+            raise ValueError(
+                "Disaggregated KV transfer requires kv_cache_management_mode='persist'; "
+                "offload and recompute invalidate registered transfer buffers"
+            )
         self._kv_transfer_role = role
+        self._require_handoff_claim = require_handoff_claim
         backend_cls = construct_kv_transfer_backend_class(self.context.config.kv_transport_backend)
 
         # Prefill output blocks stay pinned until the peer finishes reading
@@ -691,6 +711,8 @@ class InferenceStateHandoffMixin:
             # request-specific SSM metadata out of that shared object.
             kv_meta = dict(kv_meta)
         kv_meta["resume_tokens"] = prepared.resume_tokens
+        if request.block_hash_salt is not None:
+            kv_meta["block_hash_salt"] = request.block_hash_salt
         if prepared.resume_log_probs:
             kv_meta["resume_log_probs"] = prepared.resume_log_probs
         if ssm_meta is not None:
@@ -824,7 +846,9 @@ class InferenceStateHandoffMixin:
             )
 
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
-        hashes = compute_block_hashes_batched(prompt_tensor, self.context.block_size_tokens)
+        hashes = compute_block_hashes_batched(
+            prompt_tensor, self.context.block_size_tokens, cache_salt=kv_meta.get("block_hash_salt")
+        )
         num_blocks = transfer_block_count(kv_meta, src_block_ids)
         expected_blocks = (
             len(prompt) + self.context.block_size_tokens - 1
@@ -980,6 +1004,7 @@ class InferenceStateHandoffMixin:
             sampling_params=handoff.sampling_params,
             local_blocks=local_blocks,
             hashes=handoff.hashes,
+            block_hash_salt=handoff.kv_meta.get("block_hash_salt"),
             cached_prefix_block_count=len(cached_blocks),
             handle=handle,
             future=handoff.future,
@@ -1205,17 +1230,20 @@ class InferenceStateHandoffMixin:
         )
 
         request = self.get_request(pending.request_id)
+        # The precomputed hashes already use this salt. Retain it for extending
+        # the chain after eviction, without hashing the same prompt twice.
+        request.block_hash_salt = pending.block_hash_salt
         if request.status == Status.FAILED:
             # add_request() reports validation failures through its own future.
             self._release_pending_kv_import(pending)
         else:
-            queued_request_id = self.waiting_request_ids[0]
+            queued_request_id = self.waiting_request_ids[-1]
             if queued_request_id != pending.request_id:
                 raise RuntimeError(
                     "Decode-only admission expected the imported request at the waiting queue "
-                    f"head: expected {pending.request_id}, got {queued_request_id}"
+                    f"tail: expected {pending.request_id}, got {queued_request_id}"
                 )
-            self.waiting_request_ids.popleft()
+            self.waiting_request_ids.pop()
             self._validate_decode_ready_handoff(pending)
             first_token = pending.resume_tokens[0]
             if request.sampling_params.num_tokens_to_generate > 0:
