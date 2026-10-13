@@ -321,16 +321,16 @@ class FsdpModule:
                 with multiple GraphTasks must include every shared-parameter
                 contribution, including delayed TE weight-gradient callbacks. The
                 count must be zero exactly when there are no trainable parameters.
+                Register before starting backward work; the caller must check that
+                the previous window is complete before changing this count.
         """
         module = cast(nn.Module, self)
         if grad_accumulation_count is not None:
-            has_trainable_parameters = any(self._trainable_fsdp_parameters())
-            if bool(grad_accumulation_count) != has_trainable_parameters:
+            if (grad_accumulation_count > 0) != any(self._trainable_fsdp_parameters()):
                 raise ValueError(
                     "grad_accumulation_count must be zero exactly when the module "
                     "owns no trainable parameters."
                 )
-            self._trainable_parameter_countdown.check_complete()
             self._trainable_parameter_countdown = Countdown(grad_accumulation_count)
         if self._trainable_parameter_countdown.initial_value == 0:
             module.register_full_backward_hook(

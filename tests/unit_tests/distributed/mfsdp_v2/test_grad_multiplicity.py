@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Countdown-based gradient completion across combined 1F1B GraphTasks."""
+"""Gradient and update parity across independently executed GraphTasks."""
 
 import copy
 
@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
@@ -18,129 +18,76 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import _module_post_backward_hook
 
 
-class TwoNodeUnit(nn.Module):
-    """Two parameters behind two graph nodes, one FSDP unit."""
-
-    def __init__(self) -> None:
-        """Build the two projections."""
-        super().__init__()
-        self.first = nn.Linear(16, 16, bias=False)
-        self.second = nn.Linear(16, 16, bias=False)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Project twice so each parameter owns a distinct graph node."""
-        return self.second(self.first(inputs))
-
-
-def _sharded_unit(setup, grad_accumulation_count=None, model=None):
-    """Install the scheduler's reduction callback behind a completion spy."""
-    torch.manual_seed(0)
-    if model is None:
-        model = TwoNodeUnit().to(setup.device)
+def _sharded_unit(setup, model, grad_accumulation_count):
+    """Shard one unit with caller-managed execution and gradient synchronization."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    placements = Placements(
-        dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
-    )
-    with fully_shard_context(device=setup.device):
+    placements = Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
+    with fully_shard_context(device=setup.device, caller_managed_grad_sync=True):
         fully_shard(model, mesh=mesh, placements=placements, register_hooks=False)
-    finalized = []
-
-    def post_backward(hooked_module):
-        _module_post_backward_hook(hooked_module)
-        finalized.append(hooked_module)
-
+    # The test drives materialization around each GraphTask; the completion hook
+    # only reduces gradients once all declared contributions have accumulated.
     model.register_post_backward_hook(
-        post_backward, grad_accumulation_count=grad_accumulation_count
+        FsdpModule._reduce_gradient_groups, grad_accumulation_count=grad_accumulation_count
     )
-    return model, finalized
+    return model
 
 
-def _graph_task(model: FsdpModule, inputs, submodule_name=None) -> torch.Tensor:
-    """Run one independently gathered forward/backward schedule node."""
+def _graph_task(model, inputs, node):
+    """Materialize one unit for an independently executed forward/backward node."""
     model.context.allgather_stream.wait_stream(model.context.current_stream())
     model.unshard()
-    consumer = model if submodule_name is None else getattr(model, submodule_name)
+    consumer = model if node is None else model[node]
     loss = consumer(inputs).square().mean()
     loss.backward()
     model.reshard()
     return loss.detach()
 
 
-class TestPostBackwardHookAcrossGraphTasks:
-    """Real reductions wait for every declared wgrad callback, not each dgrad."""
+@pytest.mark.parametrize(
+    "nodes",
+    [(None,), (None, None), (None, None, None), (0, 1, 0)],
+    ids=["one_graph_task", "two_graph_tasks", "three_graph_tasks", "unequal_multiplicities"],
+)
+@pytest.mark.parametrize("set_to_none", [False, True])
+def test_gradients_and_updates_match_baseline(distributed_setup, nodes, set_to_none):
+    """Losses, public gradients, and updated weights match dense training."""
+    setup = distributed_setup
+    torch.manual_seed(0)
+    baseline = nn.Sequential(nn.Linear(16, 16, bias=False), nn.Linear(16, 16, bias=False)).to(
+        setup.device
+    )
+    model = _sharded_unit(
+        setup, copy.deepcopy(baseline), sum(2 if node is None else 1 for node in nodes)
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    fully_shard_optimizer(optimizer)
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.1)
 
-    @pytest.mark.parametrize("num_graph_tasks", [1, 2, 3])
-    @pytest.mark.parametrize("set_to_none", [False, True])
-    def test_gradients_and_updates_match_baseline(
-        self, distributed_setup, num_graph_tasks, set_to_none
-    ):
-        """Shared contributions match SGD across steps and microbatch windows."""
-        setup = distributed_setup
-        torch.manual_seed(0)
-        baseline = TwoNodeUnit().to(setup.device)
-        model, finalized = _sharded_unit(
-            setup, grad_accumulation_count=2 * num_graph_tasks, model=copy.deepcopy(baseline)
-        )
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        fully_shard_optimizer(optimizer)
-        baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.1)
+    torch.manual_seed(123 + setup.rank)
+    for _ in range(2):
+        optimizer.zero_grad(set_to_none=set_to_none)
+        baseline_optimizer.zero_grad(set_to_none=set_to_none)
+        # Two windows per step exercise countdown re-arming and gradient accumulation.
+        for _ in range(2):
+            for node in nodes:
+                inputs = torch.randn(4, 16, device=setup.device)
+                consumer = baseline if node is None else baseline[node]
+                baseline_loss = consumer(inputs).square().mean()
+                baseline_loss.backward()
+                torch.testing.assert_close(_graph_task(model, inputs, node), baseline_loss.detach())
+        model.context.finish_grad_sync()
+        for reference, parameter in zip(baseline.parameters(), model.parameters()):
+            dist.all_reduce(reference.grad, op=dist.ReduceOp.AVG)
+            torch.testing.assert_close(parameter.grad.full_tensor(), reference.grad)
+        optimizer.step()
+        baseline_optimizer.step()
+        for reference, parameter in zip(baseline.parameters(), model.parameters()):
+            torch.testing.assert_close(parameter.full_tensor(), reference)
 
-        torch.manual_seed(123 + setup.rank)
-        for step in range(3):
-            optimizer.zero_grad(set_to_none=set_to_none)
-            baseline_optimizer.zero_grad(set_to_none=set_to_none)
-            for microbatch_index in range(2):
-                previous_finalizations = len(finalized)
-                for graph_index in range(num_graph_tasks):
-                    inputs = torch.randn(4, 16, device=setup.device)
-                    baseline_loss = baseline(inputs).square().mean()
-                    baseline_loss.backward()
-                    loss = _graph_task(model, inputs)
-                    torch.testing.assert_close(loss, baseline_loss.detach())
-                    if graph_index < num_graph_tasks - 1:
-                        assert len(finalized) == previous_finalizations
-                        with pytest.raises(ValueError, match="mid-flight"):
-                            model._trainable_parameter_countdown.check_complete()
-                assert len(finalized) == step * 2 + microbatch_index + 1
-                model._trainable_parameter_countdown.check_complete()
 
-            model.context.post_backward()
-            for group in model.parameter_groups:
-                replicated_grads = group.main_grad.redistribute((Replicate(),) * group.mesh.ndim)
-                for parameter_index, parameter in enumerate(group.fsdp_parameters):
-                    reference = baseline.get_parameter(parameter.fqns[0])
-                    dist.all_reduce(reference.grad)
-                    reference.grad.div_(setup.world_size)
-                    torch.testing.assert_close(
-                        replicated_grads.get_tensor_view(parameter_index), reference.grad
-                    )
-            optimizer.step()
-            baseline_optimizer.step()
-            for group in model.parameter_groups:
-                replicated_weights = group.main_weight.redistribute(
-                    (Replicate(),) * group.mesh.ndim
-                )
-                for parameter_index, parameter in enumerate(group.fsdp_parameters):
-                    torch.testing.assert_close(
-                        replicated_weights.get_tensor_view(parameter_index),
-                        baseline.get_parameter(parameter.fqns[0]),
-                    )
-
-    def test_different_parameter_multiplicities(self, distributed_setup):
-        """The unit total includes two callbacks for first and one for second."""
-        setup = distributed_setup
-        model, finalized = _sharded_unit(setup, grad_accumulation_count=3)
-        for node_index, name in enumerate(["first", "second", "first"]):
-            inputs = torch.randn(4, 16, device=setup.device)
-            _graph_task(model, inputs, submodule_name=name)
-            assert len(finalized) == (1 if node_index == 2 else 0)
-        model.context.post_backward()
-        model._trainable_parameter_countdown.check_complete()
-
-    def test_parameter_free_module_rejects_nonzero_count(self, distributed_setup):
-        """A parameter-free unit cannot wait for callbacks that never arrive."""
-        with pytest.raises(ValueError, match="owns no trainable parameters"):
-            _sharded_unit(distributed_setup, grad_accumulation_count=1, model=nn.ReLU())
+def test_parameter_free_module_rejects_nonzero_count(distributed_setup):
+    """A parameter-free unit cannot wait for callbacks that never arrive."""
+    with pytest.raises(ValueError, match="owns no trainable parameters"):
+        _sharded_unit(distributed_setup, nn.ReLU(), grad_accumulation_count=1)
