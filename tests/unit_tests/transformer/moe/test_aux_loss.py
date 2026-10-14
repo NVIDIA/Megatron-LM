@@ -655,18 +655,12 @@ class TestRouterAuxLoss:
         assert router.get_aux_loss_coeff("global_aux_loss") == 2.0
         assert router.get_aux_loss_coeff("non_existent_type") == 0.0
 
+    # Intermittent Gloo timeout: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
-        "tp_size,ep_size,cp_size",
-        [
-            # Intermittent Gloo timeout: https://github.com/NVIDIA/Megatron-LM/issues/7745
-            pytest.param(8, 1, 1, marks=pytest.mark.flaky_in_dev),
-            (4, 2, 1),
-            (1, 1, 8),
-            (2, 1, 4),
-            (2, 2, 2),
-        ],
+        "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
     def test_force_balanced_aux_loss(self, tp_size, ep_size, cp_size):
         """Test if aux loss is 1.0 when using uniform routing"""
