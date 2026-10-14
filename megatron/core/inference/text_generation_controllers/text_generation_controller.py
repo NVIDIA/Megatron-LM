@@ -38,6 +38,7 @@ from megatron.core.inference.utils import (
     get_attention_mask,
     get_language_model,
     model_eos_token_ids,
+    resolve_logits_dtype,
     set_decode_expert_padding,
     set_moe_metadata_sync,
 )
@@ -317,6 +318,10 @@ class TextGenerationController(MTPControllerMixin):
         self._language_model = get_language_model(unwrap_model(self.inference_wrapped_model.model))
         # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
         self.vocab_size = self._language_model.vocab_size
+        # Logits live in the dtype the LM head emits, not necessarily `params_dtype`.
+        self._logits_dtype = resolve_logits_dtype(
+            self.inference_wrapped_model.model, self.model_config.params_dtype
+        )
 
         if getattr(self.inference_wrapped_model.inference_context, "enable_mtp_kv_cache", False):
             language_model = self._language_model
@@ -397,7 +402,7 @@ class TextGenerationController(MTPControllerMixin):
         self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
-        logits_dtype = self.inference_wrapped_model.config.params_dtype
+        logits_dtype = self._logits_dtype
 
         self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
@@ -997,10 +1002,7 @@ class TextGenerationController(MTPControllerMixin):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
 
             logits = broadcast_from_last_pipeline_stage(
-                logits_shape,
-                dtype=self.model_config.params_dtype,
-                tensor=logits,
-                pp_group=self.pp_group,
+                logits_shape, dtype=self._logits_dtype, tensor=logits, pp_group=self.pp_group
             )
 
         # Copy logits to contiguous buffer.
@@ -3934,10 +3936,12 @@ class TextGenerationController(MTPControllerMixin):
                     # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, logits_seq_len, self.vocab_size],
-                        dtype=self.model_config.params_dtype,
+                        dtype=self._logits_dtype,
                         tensor=logits,
                         pp_group=self.pp_group,
                     )
+
+                logits = logits.float()
 
                 # Turn on symmetric all reduce kernels for decode stage
                 # if we turned it off for prefill
