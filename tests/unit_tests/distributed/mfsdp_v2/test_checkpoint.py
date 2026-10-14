@@ -43,7 +43,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import MoETransformerLayer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -515,7 +514,8 @@ def test_ep_fsdp_checkpoint_roundtrip(tmp_path_dist_ckpt, ep_size):
                 moe_ffn_hidden_size=128,
                 add_bias_linear=False,
                 gradient_accumulation_fusion=False,
-                use_cpu_initialization=True,
+                # GPU initialization uses the expert-parallel RNG stream.
+                use_cpu_initialization=False,
                 bf16=True,
                 params_dtype=torch.bfloat16,
                 hidden_dropout=0.0,
@@ -530,15 +530,6 @@ def test_ep_fsdp_checkpoint_roundtrip(tmp_path_dist_ckpt, ep_size):
                 hybrid_layer_pattern="*E",
                 pg_collection=groups,
             ).cuda()
-            # CPU initialization otherwise gives different EP ranks identical local
-            # experts. Make each global expert distinguishable before checkpointing.
-            with torch.no_grad():
-                for layer in model.modules():
-                    if isinstance(layer, MoETransformerLayer):
-                        for fc in ("linear_fc1", "linear_fc2"):
-                            linear = getattr(layer.mlp.experts, fc)
-                            for local, global_ in enumerate(layer.mlp.local_expert_indices):
-                                getattr(linear, f"weight{local}").add_(global_ * 0.01)
             model = FullyShardedDataParallel(
                 config=config,
                 ddp_config=DistributedDataParallelConfig(
