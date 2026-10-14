@@ -32,7 +32,7 @@ def test_prefetch_replays_occurrences(budget):
         modules.append(module)
     first, second, third = modules
     sequence = [first, second, first, third]
-    order = ExecutionOrder(sequence, recorded=True)
+    order = ExecutionOrder(sequence)
     expected = [[second], [first], [third], []]
     if budget == 0:
         expected = [[], [], [], []]
@@ -46,83 +46,69 @@ def test_prefetch_replays_occurrences(budget):
     with pytest.raises(RuntimeError, match='diverged'):
         order.advance(third)
     order.advance(first)
-    assert order.next_item(first) is second
+    assert order.next_item() is second
 
 
-def test_static_order_lookup():
-    """Construction orders remain unique and independent of demand-call order."""
-    first, second, third = (object.__new__(FsdpModule) for _ in range(3))
+def test_append_preserves_repeated_occurrences():
+    """Appending the same module records distinct calls with distinct successors."""
+    first, second = nn.Module(), nn.Module()
     order = ExecutionOrder()
-    for module in (first, second, third):
+    for module in (first, second, first, first):
         order.append(module)
-    with pytest.raises(ValueError, match='duplicate'):
-        order.append(first)
-    order.advance(third)
-    assert order.next_item(first) is second
-    assert order.next_item(first, offset=2) is third
-    assert order.next_item(third) is None
+    assert list(order) == [first, second, first, first]
+    for module, successor in ((first, second), (second, first), (first, first), (first, None)):
+        order.advance(module)
+        assert order.next_item() is successor
 
 
 @pytest.mark.parametrize('budget', [None, 0, 2])
-def test_construction_prefetch_tolerates_reordered_calls(budget):
-    """Inferred order remains a prefetch hint when calls skip or reorder modules."""
+def test_prefetch_rejects_skipped_or_reordered_calls(budget):
+    """Even with prefetch disabled, calls must follow the expected sequence."""
     first, second, third = (object.__new__(FsdpModule) for _ in range(3))
-    prefetched = []
-    order = ExecutionOrder()
+    order = ExecutionOrder([first, second, third])
     for module in (first, second, third):
         parameter = SimpleNamespace(unsharded=torch.empty(1))
         module._parameter_groups = (SimpleNamespace(fsdp_parameters=[parameter]),)
-        module._unshard_parameter_groups = Mock(
-            side_effect=lambda target=module: prefetched.append(target)
-        )
-        order.append(module)
-    # Start at the last module, skip the middle module, and reuse the first.
-    for module in (third, first, first, second):
-        prefetched.clear()
-        module._prefetch_parameter_groups(order, budget)
-        expected = []
-        if budget != 0:
-            if module is first:
-                expected = [second, third] if budget == 2 else [second]
-            elif module is second:
-                expected = [third]
-        assert prefetched == expected
+        module._unshard_parameter_groups = Mock()
+    with pytest.raises(RuntimeError, match='diverged'):
+        third._prefetch_parameter_groups(order, budget)
+    first._prefetch_parameter_groups(order, budget)
+    with pytest.raises(RuntimeError, match='diverged'):
+        third._prefetch_parameter_groups(order, budget)
+    second._prefetch_parameter_groups(order, budget)
+    third._prefetch_parameter_groups(order, budget)
+    assert order.next_item() is None
 
 
-def test_construction_cursor_restarts_without_search(monkeypatch):
-    """Expected calls and prefetch lookahead use the cursor across iterations."""
+def test_lookahead_preserves_demand_cursor():
+    """Repeated lookahead does not consume calls or wrap across the sequence end."""
     first, second, third = (nn.Module() for _ in range(3))
     order = ExecutionOrder([first, second, third])
-    search = Mock(side_effect=AssertionError('Unexpected construction-order search'))
-    monkeypatch.setattr(order, '_find_index', search)
     for _ in range(2):
-        for module, successor in ((first, second), (second, third), (third, None)):
-            order.advance(module)
-            assert order.next_item(module) is successor
-            # Looking ahead twice must not consume the next demand call.
-            assert order.next_item(module) is successor
-    search.assert_not_called()
+        order.advance(first)
+        assert order.next_item() is second
+        assert order.next_item(2) is third
+        assert order.next_item(3) is None
+        assert order.next_item() is second
+        order.advance(second)
+        assert order.next_item() is third
+        order.advance(third)
+        assert order.next_item() is None
 
 
-def test_construction_lookup_preserves_demand_cursor(monkeypatch):
-    """An unrelated successor lookup cannot change the next expected demand call."""
-    first, second, third = (nn.Module() for _ in range(3))
-    order = ExecutionOrder([first, second, third])
-    order.advance(first)
-    assert order.next_item(third) is None
-    search = Mock(side_effect=AssertionError('Lookup moved the demand cursor'))
-    monkeypatch.setattr(order, '_find_index', search)
-    order.advance(second)
-    assert order.next_item(second) is third
-    search.assert_not_called()
+def test_empty_order_rejects_demand_calls():
+    """An empty sequence has no successor and cannot consume a module call."""
+    order = ExecutionOrder()
+    assert order.next_item() is None
+    with pytest.raises(RuntimeError, match='diverged'):
+        order.advance(nn.Module())
 
 
-@pytest.mark.parametrize('recorded', [False, True])
-def test_membership_reverse_and_weak_references(recorded):
-    """Topology lookups and traversal preserve weak ownership in both modes."""
+def test_membership_reverse_and_weak_references():
+    """Topology lookups and traversal preserve weak ownership and occurrences."""
     first, second = nn.Module(), nn.Module()
-    sequence = [first, second, first] if recorded else [first, second]
-    order = ExecutionOrder(sequence, recorded=recorded)
+    sequence = [first, second, first]
+    order = ExecutionOrder(sequence)
     assert first in order
     assert second in order
     assert list(reversed(order)) == list(reversed(sequence))
@@ -132,11 +118,13 @@ def test_membership_reverse_and_weak_references(recorded):
     gc.collect()
     assert second_ref() is None
     assert None not in order
-    expected = [first, first] if recorded else [first]
-    assert list(order) == expected
-    assert list(reversed(order)) == expected
-    if not recorded:
-        assert order.next_item(first) is None
+    assert list(order) == [first, first]
+    assert list(reversed(order)) == [first, first]
+    order.advance(first)
+    # A deleted occurrence cannot be silently skipped by the demand cursor.
+    assert order.next_item() is None
+    with pytest.raises(RuntimeError, match='diverged'):
+        order.advance(first)
 
 
 def test_context_finalizes_construction_orders(monkeypatch):

@@ -22,33 +22,19 @@ T = TypeVar("T")
 
 
 class ExecutionOrder(Generic[T]):
-    """Store inferred construction order or recorded runtime occurrences.
+    """Track module-call occurrences with weak references and a strict cursor.
 
-    Construction order contains unique modules and looks up successors from the
-    module being called, tolerating skipped or reordered execution. Recorded
-    order preserves repeated calls and validates each occurrence with a cursor.
-    Prefetch lookahead never advances the demand-call cursor.
+    Repeated modules occupy distinct positions. Every demand call must match
+    the next occurrence; prefetch lookahead never advances the cursor.
     """
 
-    def __init__(self, items: Iterable[T] = (), *, recorded: bool = False) -> None:
-        """Create a construction order or a strict recorded sequence.
-
-        Args:
-            items: Initial module sequence.
-            recorded: Preserve repeated occurrences and validate demand-call order.
-                Otherwise, resynchronize the cursor when construction order differs
-                from actual execution.
-        """
-        self._items: list[ref[T]] = []
-        self._recorded = recorded
+    def __init__(self, items: Iterable[T] = ()) -> None:
+        """Create an execution sequence, preserving repeated occurrences."""
+        self._items: list[ref[T]] = [ref(item) for item in items]
         self._position = 0
-        for item in items:
-            self.append(item)
 
     def append(self, item: T) -> None:
-        """Append a module; repeated occurrences are allowed only in recorded order."""
-        if not self._recorded and item in self:
-            raise ValueError("Construction execution order does not support duplicate items.")
+        """Append one occurrence, including repeated calls to the same module."""
         self._items.append(ref(item))
 
     def __contains__(self, item: object) -> bool:
@@ -69,38 +55,17 @@ class ExecutionOrder(Generic[T]):
             if item is not None:
                 yield item
 
-    def _find_index(self, item: T) -> int:
-        """Find a construction-order module by identity when the cursor differs."""
-        for index, item_ref in enumerate(self._items):
-            if item_ref() is item:
-                return index
-        raise KeyError(item)
-
     def advance(self, item: T) -> None:
-        """Consume a demand call, resynchronizing only construction-order mismatches.
+        """Consume the next expected call, restarting after the sequence ends."""
+        if not self._items or self._items[self._position]() is not item:
+            raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
+        self._position = (self._position + 1) % len(self._items)
 
-        Calls following the sequence advance in constant time. Construction-order
-        mismatches search the sequence; recorded-order mismatches raise instead.
-        """
-        if self._items and self._items[self._position]() is item:
-            index = self._position
-        elif self._recorded:
-            raise RuntimeError("FSDP module calls diverged from the recorded prefetch order.")
-        else:
-            index = self._find_index(item)
-        self._position = (index + 1) % len(self._items)
-
-    def next_item(self, item: T, offset: int = 1) -> T | None:
-        """Look ahead without advancing the demand-call cursor.
-
-        Recorded orders use the last consumed occurrence. Construction orders
-        also support lookup from a different module without moving the cursor.
-        """
+    def next_item(self, offset: int = 1) -> T | None:
+        """Look ahead from the last consumed occurrence without moving the cursor."""
         if not self._items:
-            raise KeyError(item)
+            return None
         index = (self._position - 1) % len(self._items)
-        if not self._recorded and self._items[index]() is not item:
-            index = self._find_index(item)
         next_index = index + offset
         if next_index >= len(self._items):
             return None
