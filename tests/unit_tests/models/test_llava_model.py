@@ -411,6 +411,111 @@ class TestLLaVAModel:
             )
 
     @pytest.mark.internal
+    def test_forward_passes_expanded_loss_mask_to_language_model(self):
+        """The decoder needs the expanded mask to exclude vision positions from MTP loss."""
+        self.model.cuda()
+
+        image_token_index = self.model.image_token_index
+        input_ids = torch.tensor([[10, image_token_index, 11, 12]], device="cuda")
+        position_ids = torch.arange(input_ids.shape[1], device="cuda").unsqueeze(0)
+        labels = torch.tensor([[image_token_index, 11, 12, 13]], device="cuda")
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float)
+        captured = {}
+
+        def capture_language_inputs(module, args, kwargs):
+            captured["loss_mask"] = kwargs["loss_mask"]
+
+        hook = self.model.language_model.register_forward_pre_hook(
+            capture_language_inputs, with_kwargs=True
+        )
+        try:
+            output, expanded_loss_mask = self.model(
+                torch.randn((1, 3, 336, 336), device="cuda"),
+                input_ids,
+                position_ids,
+                attention_mask=None,
+                labels=labels,
+                loss_mask=loss_mask,
+                num_image_tiles=torch.ones(1, dtype=torch.int, device="cuda"),
+            )
+        finally:
+            hook.remove()
+
+        assert torch.equal(captured["loss_mask"], expanded_loss_mask)
+        assert output.shape == expanded_loss_mask.shape
+        assert torch.count_nonzero(expanded_loss_mask[0, : self.model.img_seq_len + 1]) == 0
+        assert torch.all(expanded_loss_mask[0, self.model.img_seq_len + 1 :] == 1)
+
+    @pytest.mark.internal
+    def test_forward_masks_image_only_sequence(self):
+        """An image placeholder expands to visual embeddings with no supervised positions."""
+        self.model.cuda()
+
+        image_token_index = self.model.image_token_index
+        input_ids = torch.tensor([[image_token_index]], device="cuda")
+        captured = {}
+
+        def capture_language_inputs(module, args, kwargs):
+            captured["loss_mask"] = kwargs["loss_mask"]
+
+        hook = self.model.language_model.register_forward_pre_hook(
+            capture_language_inputs, with_kwargs=True
+        )
+        try:
+            output, expanded_loss_mask = self.model(
+                torch.randn((1, 3, 336, 336), device="cuda"),
+                input_ids,
+                torch.zeros_like(input_ids),
+                attention_mask=None,
+                labels=torch.full_like(input_ids, -100),
+                loss_mask=torch.ones_like(input_ids, dtype=torch.float),
+                num_image_tiles=torch.ones(1, dtype=torch.int, device="cuda"),
+            )
+        finally:
+            hook.remove()
+
+        assert torch.equal(captured["loss_mask"], expanded_loss_mask)
+        assert output.shape == expanded_loss_mask.shape == (1, self.model.img_seq_len)
+        assert torch.count_nonzero(expanded_loss_mask) == 0
+
+    @pytest.mark.internal
+    def test_forward_preserves_all_masked_sample_in_mixed_batch(self):
+        """A fully masked image sample stays masked beside a sample with valid text."""
+        self.model.cuda()
+
+        image_token_index = self.model.image_token_index
+        input_ids = torch.tensor(
+            [[image_token_index, 20, 21, 22], [10, image_token_index, 11, 12]], device="cuda"
+        )
+        loss_mask = torch.tensor([[1, 0, 0, 0], [1, 1, 1, 1]], dtype=torch.float, device="cuda")
+        captured = {}
+
+        def capture_language_inputs(module, args, kwargs):
+            captured["loss_mask"] = kwargs["loss_mask"]
+
+        hook = self.model.language_model.register_forward_pre_hook(
+            capture_language_inputs, with_kwargs=True
+        )
+        try:
+            _, expanded_loss_mask = self.model(
+                torch.randn((2, 3, 336, 336), device="cuda"),
+                input_ids,
+                torch.arange(input_ids.shape[1], device="cuda").expand_as(input_ids),
+                attention_mask=None,
+                labels=torch.tensor(
+                    [[20, 21, 22, -100], [image_token_index, 11, 12, 13]], device="cuda"
+                ),
+                loss_mask=loss_mask,
+                num_image_tiles=torch.ones(2, dtype=torch.int, device="cuda"),
+            )
+        finally:
+            hook.remove()
+
+        assert torch.equal(captured["loss_mask"], expanded_loss_mask)
+        assert torch.count_nonzero(expanded_loss_mask[0]) == 0
+        assert torch.count_nonzero(expanded_loss_mask[1]) == 2
+
+    @pytest.mark.internal
     def test_forward_fsdp(self):
         """Test FSDP workaround for text-only data.
 

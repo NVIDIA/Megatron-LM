@@ -86,3 +86,4 @@ AFTER_SCRIPT: |
   check_log -F "Setting rerun_state_machine.current_iteration to 0..."
   EXIT_CODE=0
 TEST_TYPE: regular
+LAUNCHER: ft_launcher

@@ -2,6 +2,7 @@
 
 import inspect
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,9 +14,52 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     is_layer_window_attention,
+    set_model_config_attribute,
     set_model_to_sequence_parallel,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+class _TrackingConfig:
+    def __init__(self, value):
+        self._runtime_value = value
+        self.update_count = 0
+
+    @property
+    def runtime_value(self):
+        return self._runtime_value
+
+    @runtime_value.setter
+    def runtime_value(self, value):
+        self._runtime_value = value
+        self.update_count += 1
+
+
+class _ConfigModule(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+
+def test_set_model_config_attribute_updates_distinct_configs_once():
+    root_config = _TrackingConfig("original")
+    child_config = _TrackingConfig("original")
+    unsupported_config = SimpleNamespace()
+
+    module = _ConfigModule(root_config)
+    module.first_child = _ConfigModule(child_config)
+    module.second_child = _ConfigModule(child_config)
+    module.unsupported_child = _ConfigModule(unsupported_config)
+    model = SimpleNamespace(config=root_config, module=SimpleNamespace(module=module))
+    new_value = object()
+
+    set_model_config_attribute(model, "runtime_value", new_value)
+
+    assert root_config.runtime_value is new_value
+    assert child_config.runtime_value is new_value
+    assert root_config.update_count == 1
+    assert child_config.update_count == 1
+    assert not hasattr(unsupported_config, "runtime_value")
 
 
 class TestGPTModel:

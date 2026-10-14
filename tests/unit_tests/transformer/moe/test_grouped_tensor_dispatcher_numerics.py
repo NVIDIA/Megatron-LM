@@ -118,10 +118,9 @@ def _dispatcher_options(dispatcher: str) -> Dict[str, object]:
             "moe_token_dispatcher_type": "flex",
             "moe_flex_dispatcher_backend": "ncclep",
             "moe_permute_fusion": True,
-            "moe_expert_rank_capacity_factor": 8.0,
-            # The lifecycle assertions inspect the dynamically narrowed expert buffer. Static
-            # NCCL-EP intentionally exposes the full receive-capacity buffer instead.
-            "moe_ncclep_static_shape": False,
+            # The lifecycle assertions inspect the dynamically narrowed expert buffer, so leave
+            # moe_expert_rank_capacity_factor unset to select NCCL-EP eager mode. Setting it
+            # selects static shapes, which expose the full receive-capacity buffer instead.
         }
     raise ValueError(f"Unknown dispatcher {dispatcher!r}")
 

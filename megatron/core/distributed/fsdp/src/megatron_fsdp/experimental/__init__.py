@@ -14,8 +14,10 @@
 
 """Experimental Megatron-FSDP implementation."""
 
+from .checkpoint import load_checkpoint, save_checkpoint
 from .dbuffer import DBuffer
-from .fully_shard import fully_shard, microbatch
+from .fully_shard import fully_shard, fully_shard_context, microbatch
+from .optimizer import fully_shard_optimizer
 from .placement import Flat, Partial, Placement, Placements, Replicate
 
 __all__ = [
@@ -26,5 +28,9 @@ __all__ = [
     "Placements",
     "Replicate",
     "fully_shard",
+    "fully_shard_context",
+    "fully_shard_optimizer",
+    "load_checkpoint",
     "microbatch",
+    "save_checkpoint",
 ]
