@@ -151,6 +151,7 @@ def _train_step(
     optimizer.zero_grad(set_to_none=True)
     batch = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
     model(hidden_states=batch, attention_mask=None).square().mean().backward()
+    model.finish_grad_sync()
     success, _, _ = optimizer.step()
     assert success
 
@@ -203,6 +204,8 @@ def _snapshot_optimizer_state(optimizer: FullyShardedOptimizer) -> dict[str, dic
     """Clone this rank's optimizer state, keyed by globally unique parameter name."""
     snapshot: dict[str, dict[str, Any]] = {}
     for param, state in optimizer.optimizer.state.items():
+        assert not isinstance(param, DTensor), "Checkpoint wrapper leaked into runtime parameters"
+        assert all(not isinstance(value, DTensor) for value in state.values())
         fqn = get_global_unique_param_name(optimizer.model_chunks, param)
         snapshot[fqn] = {
             key: (value.clone() if torch.is_tensor(value) else value)
@@ -303,6 +306,10 @@ class TestOptimizerCheckpoint:
             _train_step(config, source_model, source_optimizer)
 
         model_snapshot = _snapshot_model_state(source_model)
+        assert model_snapshot and all(
+            isinstance(model_snapshot[name], DTensor)
+            for name, _ in source_model.module.named_parameters()
+        )
         state_snapshot = _snapshot_optimizer_state(source_optimizer)
         param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
         assert {group["step"] for group in param_group_snapshot} == {source_steps}
@@ -315,9 +322,7 @@ class TestOptimizerCheckpoint:
             empty_local = sum(
                 1
                 for param in source_model.parameters()
-                if param.requires_grad
-                and isinstance(param, DTensor)
-                and param.to_local().numel() == 0
+                if param.requires_grad and _local_numel(param) == 0
             )
             empty_local_counts = [None] * world_size
             torch.distributed.all_gather_object(empty_local_counts, empty_local)
@@ -350,6 +355,7 @@ class TestOptimizerCheckpoint:
             # optimizer's momentum buffers are restored by this call alone; load_state_dict
             # then reinstalls the param-group hyperparameters.
             dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
+            destination_model.load_state_dict(load_state_dict["model"])
             destination_optimizer.load_state_dict(load_state_dict["optimizer"])
 
         local_nonempty = _assert_model_matches_snapshot(destination_model, model_snapshot)
@@ -404,6 +410,10 @@ class TestOptimizerCheckpoint:
             _train_step(config, source_model, source_optimizer)
 
         model_snapshot = _snapshot_model_state(source_model)
+        assert model_snapshot and all(
+            isinstance(model_snapshot[name], DTensor)
+            for name, _ in source_model.module.named_parameters()
+        )
         state_snapshot = _snapshot_optimizer_state(source_optimizer)
         param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
 
@@ -441,6 +451,7 @@ class TestOptimizerCheckpoint:
             }
             preprocess_state_dict_for_uneven_dtensor(load_state_dict)
             dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
+            destination_model.load_state_dict(load_state_dict["model"])
             destination_optimizer.load_state_dict(load_state_dict["optimizer"])
 
         _assert_model_matches_snapshot(destination_model, model_snapshot)

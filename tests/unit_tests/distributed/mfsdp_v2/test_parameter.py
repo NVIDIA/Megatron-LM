@@ -175,7 +175,7 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
         fully_shard(model[1], mesh=mesh, placements=_default_placements())
 
     assert model[0].weight.device.type == "cpu"
-    assert isinstance(model[1].weight, DTensor)
+    assert not isinstance(model[1].weight, DTensor)
     assert model[1].weight.device == device
 
     model.to(device)

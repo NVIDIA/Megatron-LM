@@ -10,8 +10,7 @@ import pytest
 import torch
 import transformer_engine.pytorch as te
 from torch.distributed.distributed_c10d import _world
-from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.distributed.tensor.debug import _clear_sharding_prop_cache
+from torch.distributed.tensor import Replicate
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
@@ -19,6 +18,10 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -65,10 +68,6 @@ def _destroy_model_parallel():
     reference to the rest, so their NCCL communicators -- and, with NVLS enabled, their
     multicast reservations -- would outlive the test. See #6897.
     """
-    # TODO(#7322): Remove this workaround when runtime parameters become local tensors.
-    # Clear both sharding caches (Python and C++) before destroying groups; otherwise
-    # nn.Parameter(DTensor) can reuse stale meshes in later tests through detach().
-    _clear_sharding_prop_cache()
     Utils.destroy_model_parallel()
     for group in list(_world.pg_map):
         if group is not torch.distributed.group.WORLD:
@@ -122,7 +121,7 @@ class TestMcoreAdapterDense:
             module=block,
             pg_collection=self.pg_collection,
         )
-        # FSDP installs DTensor shards; check the parameters used for compute.
+        # FSDP installs local shards; check the parameters used for compute.
         parameters = []
         for module in model.module.modules():
             if not isinstance(module, FsdpModule):
@@ -176,7 +175,7 @@ class TestMcoreAdapterDense:
         parameters = dict(wrapped.module.named_parameters())
         assert parameters
         for name, parameter in parameters.items():
-            local_parameter = parameter.to_local()
+            local_parameter = parameter
 
             # Some parameters use module-specific initializers, so only check those
             # initialized by the configured init method.
@@ -659,8 +658,14 @@ class TestMcoreAdapterDense:
         parameters = [
             parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
         ]
-        assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
-        expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
+
+        def local_grads():
+            return [p.grad for p in parameters]
+
+        expected_pre_clip_norm = global_norm(local_grads())
+        zeros = sum((g == 0).sum() for g in local_grads())
+        torch.distributed.all_reduce(zeros)
+        assert optimizer.count_zeros() == zeros.item()
         assert (
             expected_pre_clip_norm > clip_grad
         ), "Test gradients must exceed the clipping threshold to exercise clipping."
@@ -669,9 +674,7 @@ class TestMcoreAdapterDense:
 
         assert success
         torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
-        torch.testing.assert_close(
-            global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
-        )
+        torch.testing.assert_close(global_norm(local_grads()), clip_grad, rtol=1e-3, atol=0)
 
 
 class TestMcoreAdapterCudaGraph:
@@ -1127,12 +1130,13 @@ class TestMcoreAdapterHybrid:
 
         run_forward_backward_on_microbatches(model, forward)
 
-        expected_outer = Replicate() if outer_strategy == "no_shard" else Shard(0)
+        expected_outer = Replicate() if outer_strategy == "no_shard" else RowAtomic()
         graded = [p for p in model.parameters() if p.grad is not None]
         assert graded, "no gradients to inspect"
         for parameter in graded:
-            assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
-            assert parameter.grad.placements == (expected_outer, Shard(0))
+            gradient_buffer = get_containing_parameter_group(parameter).pre_optimizer_main_grad
+            assert gradient_buffer.mesh.mesh_dim_names == ("dp_outer", "dp_shard")
+            assert gradient_buffer.placements == (expected_outer, RowAtomic())
 
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
     def test_hybrid_matches_single_instance_accumulating(self, outer_strategy):
@@ -1251,7 +1255,7 @@ class TestMcoreAdapterHybrid:
         assert success
 
         mesh_dim_names = {
-            parameter.grad.device_mesh.mesh_dim_names
+            get_containing_parameter_group(parameter).pre_optimizer_main_grad.mesh.mesh_dim_names
             for parameter in model.parameters()
             if parameter.grad is not None
         }
@@ -1267,10 +1271,12 @@ class TestMcoreAdapterHybrid:
                 expert_parameters.append((name, parameter))
             else:
                 dense_parameters.append((name, parameter))
-        dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
+        dense_outer = Replicate() if dense_outer_strategy == "no_shard" else RowAtomic()
         for name, parameter in dense_parameters:
-            assert parameter.grad.placements == (dense_outer, Shard(0)), name
+            gradient_buffer = get_containing_parameter_group(parameter).pre_optimizer_main_grad
+            assert gradient_buffer.placements == (dense_outer, RowAtomic()), name
 
-        expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
+        expert_outer = Replicate() if expert_outer_strategy == "no_shard" else RowAtomic()
         for name, parameter in expert_parameters:
-            assert parameter.grad.placements == (expert_outer, Shard(0)), name
+            gradient_buffer = get_containing_parameter_group(parameter).pre_optimizer_main_grad
+            assert gradient_buffer.placements == (expert_outer, RowAtomic()), name

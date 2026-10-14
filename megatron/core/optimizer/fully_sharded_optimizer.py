@@ -11,7 +11,11 @@ from torch.distributed.tensor import DTensor, Shard
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental import init_optimizer_state
+from ..distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import wrap_optimizer_state
+from ..distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    FsdpParameterGroup,
+    get_containing_parameter_group,
     sync_model_weights_from_main_weights,
 )
 from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
@@ -22,25 +26,19 @@ from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
 
 
-def count_replication(tensor: DTensor) -> int:
-    """Return how many ranks hold an identical copy of ``tensor``'s local shard.
-
-    A sharded mesh axis holds disjoint pieces that must all be counted; a replicated
-    axis holds identical copies that must be counted once, so a gradient statistic
-    summed over the grad-stats group has to divide by this.
-
-    MFSDP v2 gradients are always DTensors, so this takes one rather than accepting
-    a plain tensor and guessing a layout for it.
-    """
+def count_gradient_replication(parameter: torch.nn.Parameter) -> int:
+    """Compute gradient replication from the owning MFSDP group's optimizer layout."""
+    group = get_containing_parameter_group(parameter)
+    if group is None:
+        raise RuntimeError("Missing MFSDP gradient layout for local optimizer parameter.")
+    # Statistics are computed after gradient reduction, in the optimizer layout.
+    buffer = group.pre_optimizer_main_grad
     replication = 1
-    for axis, placement in enumerate(tensor.placements):
+    for axis, placement in enumerate(buffer.placements):
         if placement.is_replicate():
-            replication *= tensor.device_mesh.size(axis)
+            replication *= buffer.mesh.size(axis)
         elif placement.is_partial():
-            raise RuntimeError(
-                "MFSDP v2 gradient is still Partial when gradient statistics are taken; "
-                "the reduction must be finalized first."
-            )
+            raise RuntimeError("MFSDP gradient reduction must finish before computing statistics.")
     return replication
 
 
@@ -138,6 +136,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             "(--ckpt-format fsdp_dtensor)."
         )
 
+    def _parameter_groups(self) -> Iterator[FsdpParameterGroup]:
+        """Yield the FSDP parameter groups owned by the model chunks."""
+        for model_chunk in self.model_chunks:
+            for module in model_chunk.modules():
+                if isinstance(module, FsdpModule):
+                    yield from module.parameter_groups
+
     def _trainable_parameters(self) -> Iterator[torch.nn.Parameter]:
         """Yield the parameters the base optimizer owns before the empty-shard filter.
 
@@ -166,10 +171,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 is what expert parallelism produces. Not yet supported rather than refused
                 on principle; training under expert parallelism is unaffected.
         """
-        sharded_parameters = [
-            param for param in self._trainable_parameters() if isinstance(param, DTensor)
-        ]
-        if len({param.device_mesh for param in sharded_parameters}) > 1:
+        buffers = {group.main_weight for group in self._parameter_groups() if group.requires_grad}
+        if len({buffer.mesh for buffer in buffers}) > 1:
             # MFSDP v2 shards expert parameters over the expert-DP mesh and everything else
             # over the DP mesh (see FullyShardedDataParallelV2). Expert parallelism also gives
             # each rank a different set of expert FQNs, so the DTensor keyspace this method
@@ -180,22 +183,22 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 "MFSDP v2 optimizer checkpointing does not support expert parallelism yet: "
                 "its parameters span more than one device mesh."
             )
-        if not sharded_parameters:
+        if not buffers:
             return []
 
         # Union over every parameter rather than reading the first one's layout: a mesh
         # dimension that one parameter replicates and another sharded still has to be gathered
         # over, or the rank that solely describes an FQN never reaches the ranks that need it.
-        mesh = sharded_parameters[0].device_mesh
+        mesh = next(iter(buffers)).mesh
         sharded_dims = set()
-        for param in sharded_parameters:
-            for mesh_dim, placement in enumerate(param.placements):
+        for buffer in buffers:
+            for mesh_dim, placement in enumerate(buffer.placements):
                 if isinstance(placement, Shard) and mesh.size(mesh_dim) > 1:
                     sharded_dims.add(mesh_dim)
         return [mesh.get_group(mesh_dim) for mesh_dim in sorted(sharded_dims)]
 
     def _gather_state_keys_by_fqn(self) -> dict[str, list[str]]:
-        """Map every parameter's FQN to the keys of its ``DTensor`` optimizer state entries.
+        """Map every parameter's FQN to the keys of its elementwise optimizer state entries.
 
         The keys are read off live state (``exp_avg``/``exp_avg_sq`` for Adam) rather than
         hard-coded, so any base optimizer works. They are gathered because a parameter that
@@ -212,7 +215,9 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """
         state_keys_by_fqn = {
             self._param_to_fqn[param]: sorted(
-                key for key, value in state.items() if isinstance(value, DTensor)
+                key
+                for key, value in state.items()
+                if isinstance(value, torch.Tensor) and value.ndim > 0
             )
             for param, state in self.optimizer.state.items()
         }
@@ -282,10 +287,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Load optimizer state produced by :meth:`sharded_state_dict`.
 
         By the time this runs DCP has already written the checkpoint's tensors into the
-        resting optimizer-state DTensors in place, since ``sharded_state_dict(is_loading=True)``
-        exposed them as the load destinations. What is left is to restore the param-group
-        hyperparameters (including the group-level ``step``) and re-bind the FQN-keyed state
-        to the current parameters, mirroring the Megatron-FSDP branch of
+        checkpoint DTensor views of the local optimizer state in place, since
+        ``sharded_state_dict(is_loading=True)`` exposed them as the load destinations.
+        Unwrap those views before reinstalling the state, restore the param-group
+        hyperparameters (including the group-level ``step``), and re-bind the FQN-keyed
+        state to the current parameters, mirroring the Megatron-FSDP branch of
         :meth:`DistributedOptimizer.load_state_dict`.
         """
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
@@ -295,7 +301,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 # Drop the empty-local placeholders synthesized for save-time rank
                 # consistency; keep only what this rank's optimizer owns.
                 "state": {
-                    fqn: param_state
+                    fqn: {
+                        key: value.to_local() if isinstance(value, DTensor) else value
+                        for key, value in param_state.items()
+                    }
                     for fqn, param_state in state_dict["state"].items()
                     if fqn in owned_fqns
                 },
@@ -353,55 +362,51 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         }
 
         packed_state: dict[str, Any] = {}
-        for param in self._trainable_parameters():
-            fqn = self._param_to_fqn[param]
-            if fqn in state_by_fqn:
-                packed_state[fqn] = state_by_fqn[fqn]
-            elif fqn in state_keys_by_fqn:
-                # Filtered out of this rank's optimizer because its local shard is empty. The
-                # rank owning a non-empty shard saves the real state; this placeholder has the
-                # same global shape and dtype but no local rows, so it contributes no data and
-                # only keeps the DTensor keyspace identical on every rank.
-                # TODO: delete this branch, together with _gather_state_keys_by_fqn and the
-                # owned_fqns filter in load_state_dict, once MFSDP v2 drops support for
-                # TE < 2.18. The filter that makes them necessary is applied only there
-                # (see get_megatron_optimizer), working around
-                # https://github.com/NVIDIA/TransformerEngine/issues/3207, which
-                # https://github.com/NVIDIA/TransformerEngine/pull/3212 fixed in 2.18. On a
-                # newer TE every rank already holds every parameter, so no placeholder is
-                # ever synthesized and this branch is dead -- it is left unconditional
-                # rather than version-gated so there is one keyspace to reason about
-                # instead of two.
-                packed_state[fqn] = {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]}
-            # A parameter absent from the gathered keyspace has no state on any rank, because
-            # nothing has stepped yet. Emitting it as an empty mapping would be rank-consistent
-            # but wrong in a subtler way: the fsdp_dtensor handlers in fsdp_dtensor_checkpoint
-            # test ``state`` for emptiness as a whole and then index ``exp_avg`` per entry, so
-            # a dict of empty dicts raises where an empty dict is handled. v1 emits nothing
-            # here for the same reason, so nothing is emitted here either.
+        for group in self._parameter_groups():
+            if not group.requires_grad:
+                continue
+            for index, parameter in enumerate(group.fsdp_parameters):
+                param = parameter.sharded
+                fqn = self._param_to_fqn[param]
+                if fqn in state_by_fqn:
+                    state = state_by_fqn[fqn]
+                elif fqn in state_keys_by_fqn:
+                    # Filtered out of this rank's optimizer because its local shard is empty.
+                    # The owning rank saves the real state; this placeholder contributes no
+                    # data and keeps the DTensor keyspace identical on every rank.
+                    # TODO: remove this branch, _gather_state_keys_by_fqn and the owned_fqns
+                    # filter in load_state_dict when MFSDP v2 drops TE < 2.18 support.
+                    # get_megatron_optimizer filters empty shards only for those versions:
+                    # https://github.com/NVIDIA/TransformerEngine/issues/3207 was fixed by
+                    # https://github.com/NVIDIA/TransformerEngine/pull/3212 in TE 2.18.
+                    state = {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]}
+                else:
+                    # No rank has state for this parameter yet. The checkpoint handlers
+                    # expect an empty state dict, not entries with empty per-parameter dicts.
+                    continue
+                packed_state[fqn] = wrap_optimizer_state(
+                    state, group.main_weight.get_dtensor(index)
+                )
 
         return {"state": packed_state, "param_to_group_meta": self._param_to_group_meta()}
 
     @override
     def get_grad_norm(self):
-        """Compute the global gradient L2 norm from each gradient's own DTensor layout.
+        """Compute the global gradient L2 norm from each gradient's recorded layout.
 
-        MFSDP v2 gradients are DTensors that record how they are distributed, and the
-        dense and expert gradients do not share a device mesh: with EP=2 over eight
+        Layout comes from the owning buffer's metadata. Dense and expert
+        gradients do not share a device mesh: with EP=2 over eight
         ranks the dense gradients live on all eight while the expert gradients live on
-        the four-rank expert-DP stripe. Reading the layout off each gradient keeps the
+        the four-rank expert-DP stripe. Reading each buffer's layout keeps the
         norm correct without assuming a single mesh for all of them.
 
         Each rank contributes ``||local||^2`` divided by the product of its replicated
         mesh-axis sizes. A sharded axis holds disjoint pieces that must all be added; a
         replicated axis holds identical copies that must be counted once. Summing that
-        over the grad-stats group is then exact, because every shard is held by exactly
-        one rank in that group.
+        over the grad-stats group counts every logical element once.
 
-        ``get_grad_norm_fp32`` cannot do this: ``get_main_grads_for_grad_norm``
-        replaces each DTensor with ``grad._local_tensor`` before it runs, so
-        ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
-        and the layout is gone by the time the norm is taken.
+        ``get_grad_norm_fp32`` cannot infer these layouts from plain local tensors;
+        the buffer metadata is needed to account for replication correctly.
         """
         total_norm_squared = torch.zeros(
             (), dtype=torch.float32, device=torch.cuda.current_device()
@@ -412,10 +417,9 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             grad = parameter.grad
             if grad is None:
                 continue
-            replication = count_replication(grad)
-            local_grad = grad.to_local()
-            if local_grad.numel() > 0:
-                total_norm_squared += local_grad.float().pow(2).sum() / replication
+            replication = count_gradient_replication(parameter)
+            if grad.numel() > 0:
+                total_norm_squared += grad.float().pow(2).sum() / replication
 
         torch.distributed.all_reduce(
             total_norm_squared,
@@ -426,23 +430,21 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
     @override
     def count_zeros(self) -> float:
-        """Count zero gradient entries from each gradient's own DTensor layout.
+        """Count zero gradient entries from each gradient's recorded layout.
 
-        ``count_zeros_fp32`` has the same single-mesh assumption as the grad-norm path,
-        and additionally rejects the combination of a Megatron-FSDP parameter with a
-        DTensor-derived data-parallel group. Counting here keeps MFSDP v2 off that path,
-        and matches how ``get_grad_norm`` reduces: each rank contributes its own shard,
-        divided by the size of any replicated mesh axis, summed over the grad-stats group.
+        Plain local tensors do not describe dense/expert meshes or replication.
+        Use the owning buffer's metadata, as in ``get_grad_norm``: each rank contributes
+        its own shard, divided by the size of any replicated mesh axis, summed over the
+        grad-stats group.
         """
         total_zeros = torch.zeros((), dtype=torch.float32, device=torch.cuda.current_device())
         for parameter in self.get_parameters():
             grad = parameter.grad
             if grad is None:
                 continue
-            replication = count_replication(grad)
-            local_grad = grad.to_local()
-            if local_grad.numel() > 0:
-                zeros = local_grad.numel() - torch.count_nonzero(local_grad)
+            replication = count_gradient_replication(parameter)
+            if grad.numel() > 0:
+                zeros = grad.numel() - torch.count_nonzero(grad)
                 total_zeros += zeros.float() / replication
 
         torch.distributed.all_reduce(
