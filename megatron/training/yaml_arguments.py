@@ -215,12 +215,12 @@ def validate_yaml(args, defaults={}):
         # sample-based options are off.
         assert args.train_samples is None, \
             'expected iteration-based training'
-        assert args.lr_decay_samples is None, \
+        assert cfg.scheduler.lr_decay_samples is None, \
             'expected iteration-based learning rate decay'
-        assert args.lr_warmup_samples == 0, \
+        assert cfg.scheduler.lr_warmup_samples == 0, \
             'expected iteration-based learning rate warmup'
-        if args.lr_warmup_fraction is not None:
-            assert args.lr_warmup_iters == 0, \
+        if cfg.scheduler.lr_warmup_fraction is not None:
+            assert cfg.scheduler.lr_warmup_iters == 0, \
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
 
     # Sample-based training.
@@ -229,12 +229,12 @@ def validate_yaml(args, defaults={}):
         # iteration-based options are off.
         assert args.train_iters is None, \
             'expected sample-based training'
-        assert args.lr_decay_iters is None, \
+        assert cfg.scheduler.lr_decay_iters is None, \
             'expected sample-based learning rate decay'
-        assert args.lr_warmup_iters == 0, \
+        assert cfg.scheduler.lr_warmup_iters == 0, \
             'expected sample-based learnig rate warmup'
-        if args.lr_warmup_fraction is not None:
-            assert args.lr_warmup_samples == 0, \
+        if cfg.scheduler.lr_warmup_fraction is not None:
+            assert cfg.scheduler.lr_warmup_samples == 0, \
                 'can only specify one of lr-warmup-fraction ' \
                 'and lr-warmup-samples'
 
@@ -298,14 +298,14 @@ def validate_yaml(args, defaults={}):
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
-    if args.weight_decay_incr_style == 'constant':
-        assert args.start_weight_decay is None
-        assert args.end_weight_decay is None
-        args.start_weight_decay = args.weight_decay
-        args.end_weight_decay = args.weight_decay
+    if cfg.scheduler.weight_decay_incr_style == 'constant':
+        assert cfg.scheduler.start_weight_decay is None
+        assert cfg.scheduler.end_weight_decay is None
+        cfg.scheduler.start_weight_decay = args.weight_decay
+        cfg.scheduler.end_weight_decay = args.weight_decay
     else:
-        assert args.start_weight_decay is not None
-        assert args.end_weight_decay is not None
+        assert cfg.scheduler.start_weight_decay is not None
+        assert cfg.scheduler.end_weight_decay is not None
 
     # Persistent fused layer norm.
     if not is_torch_min_version("1.11.0a0"):
