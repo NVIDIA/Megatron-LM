@@ -407,17 +407,27 @@ class TestMoEModules:
         moe_utils.get_moe_metrics_tracker().clear()
 
     @pytest.mark.parametrize(
-        "balancing,score,expert_bias,hash_routing",
+        "balancing,score,expert_bias,hash_routing,per_token_loss",
         [
-            ("aux_loss", "softmax", False, False),
-            ("seq_aux_loss", "sigmoid", True, False),
-            ("sinkhorn", "softmax", False, False),
-            ("none", "sigmoid", False, True),
-            ("none", "softmax", False, True),
+            ("aux_loss", "softmax", False, False, False),
+            ("seq_aux_loss", "sigmoid", True, False, False),
+            ("sinkhorn", "softmax", False, False, False),
+            ("none", "sigmoid", False, True, False),
+            ("none", "softmax", False, True, False),
+            ("seq_aux_loss", "softmax", False, False, True),
         ],
-        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid", "hash+softmax"],
+        ids=[
+            "aux_loss",
+            "seq_aux_loss+sigmoid+bias",
+            "sinkhorn",
+            "hash+sigmoid",
+            "hash+softmax",
+            "seq_aux_loss+per_token_loss",
+        ],
     )
-    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing):
+    def test_topk_router_replays(
+        self, balancing, score, expert_bias, hash_routing, per_token_loss, monkeypatch
+    ):
         self._init()
         seeded()
         config = _moe_config(
@@ -430,11 +440,19 @@ class TestMoEModules:
             moe_aux_loss_coeff=0.0 if balancing in ("sinkhorn", "none") else 0.01,
             moe_num_hash_layers=int(hash_routing),
             hash_moe_vocab_size=128 if hash_routing else None,
+            calculate_per_token_loss=per_token_loss,
         )
         router = TopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         router.set_layer_number(0)
+        if per_token_loss:
+            # Without a padding mask, seq aux loss uses the Python-int token-count branch.
+            monkeypatch.setattr(
+                moe_utils.MoEAuxLossAutoScaler,
+                "main_loss_backward_scale",
+                torch.ones((), device="cuda"),
+            )
         hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         inputs = (hidden,)
         if expert_bias:
