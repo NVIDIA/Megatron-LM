@@ -337,3 +337,120 @@ def test_cp_layout_uses_main_packed_metadata():
     assert layout.valid_tokens.tolist() == [True] * 7 + [False]
     assert layout.position_ids.tolist() == list(range(7)) + [0]
     assert layout.for_compression(2).valid_groups.sum() == 5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, ratio):
+    """Exercise real Full/Reindex/Reuse kernels with shared producer gradients."""
+    import os
+    from dataclasses import replace
+
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+
+    pytest.importorskip("cudnn")
+    pytest.importorskip("flash_mla")
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    monkeypatch.setattr(DSAIndexerLossLoggingHelper, "save_loss_to_tracker", lambda **kwargs: None)
+    cfg, _ = _setup()
+    cfg = replace(
+        cfg,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        num_attention_heads=64,
+        v_head_dim=512,
+        q_lora_rank=128,
+        qk_pos_emb_head_dim=64,
+        csa_compress_ratios=[ratio] * 3,
+        dsa_indexer_n_heads=64,
+        dsa_indexer_head_dim=128,
+        dsa_indexer_topk=32,
+        csa_window_size=8,
+        csa2_candidate_source_layer=0,
+        csa2_candidate_topk_blocks=4,
+        csa2_candidate_block_size=8,
+    )
+    g = Group()
+    groups = ProcessGroupCollection(tp=g, cp=g)
+    modules = CompressedSparseAttentionSubmodules(
+        compressor=partial(
+            CSA2Compressor,
+            submodules=CompressorSubmodules(linear_wkv=Linear, linear_wgate=Linear, norm=Norm),
+        ),
+        indexer=partial(
+            CSA2Indexer,
+            submodules=CSA2IndexerSubmodules(
+                linear_wq_b=Linear, linear_wk=Linear, k_norm=Norm, linear_weights_proj=Linear
+            ),
+        ),
+    )
+    rope = RotaryEmbedding(64, rotary_percent=1.0, cp_group=g)
+    native = (
+        nn.ModuleList(
+            [
+                CompressedSparseAttention2(
+                    cfg, modules, i + 1, AttnMaskType.causal, 'self', groups, rotary_pos_emb=rope
+                )
+                for i in range(3)
+            ]
+        )
+        .cuda()
+        .bfloat16()
+    )
+    fused = (
+        nn.ModuleList(
+            [
+                CompressedSparseAttention2(
+                    replace(cfg, dsa_kernel_backend='cudnn'),
+                    modules,
+                    i + 1,
+                    AttnMaskType.causal,
+                    'self',
+                    groups,
+                    rotary_pos_emb=rope,
+                )
+                for i in range(3)
+            ]
+        )
+        .cuda()
+        .bfloat16()
+    )
+    # Attention sinks are FP32 in the real module, including BF16 training.
+    for layers in (native, fused):
+        for layer in layers:
+            layer.attn_sink.data = layer.attn_sink.data.float()
+    fused.load_state_dict(native.state_dict())
+    shapes = ((32, 2, 64, 512), (32, 2, 1, 512), (32, 2, 16), (32, 2, 128))
+    inputs = [
+        tuple(torch.randn(shape, device='cuda', dtype=torch.bfloat16) for shape in shapes)
+        for _ in range(3)
+    ]
+    results = []
+    for layers in (native, fused):
+        state, outputs, leaves = CSA2State(), [], []
+        for layer, values in zip(layers, inputs):
+            q, kv, x, qr = [v.detach().clone().requires_grad_() for v in values]
+            leaves.extend((q, kv, x, qr))
+            outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state))
+        sum(y.float().square().mean() for y in outputs).backward()
+        grads = [p.grad for p in layers.parameters()] + [x.grad for x in leaves]
+        results.append((outputs, grads))
+    for actual, expected in zip(results[1][0], results[0][0]):
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        )
+        assert cosine > 0.999
+    for actual, expected in zip(results[1][1], results[0][1]):
+        if expected is None:
+            assert actual is None
+            continue
+        assert actual is not None and torch.isfinite(actual).all()
+        norm = expected.float().norm()
+        if norm < 1e-7:
+            assert actual.float().norm() < 1e-6
+            continue
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        )
+        assert cosine > 0.99
+        assert (actual.float() - expected.float()).norm() / norm < 0.03
