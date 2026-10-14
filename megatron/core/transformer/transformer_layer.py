@@ -55,8 +55,31 @@ from megatron.core.utils import (
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
+    from megatron.core.transformer.attention import InferenceProjectedAttention
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class InferenceAttentionLayerProjectState:
+    """State carried from a dynamic inference attention projection to its core step."""
+
+    attention: InferenceProjectedAttention
+    residual: Tensor
+    context: Optional[Tensor]
+    context_mask: Optional[Tensor]
+    inference_context: BaseInferenceContext
+    attn_state: Any
+    padding_mask: Optional[Tensor]
+    packed_seq_params: Optional[PackedSeqParams]
+
+
+@dataclass(frozen=True)
+class InferenceAttentionLayerCoreState:
+    """State carried from dynamic core attention to output projection and residual."""
+
+    core_output: Tensor
+    project: InferenceAttentionLayerProjectState
 
 
 def _get_offloading_interface():
@@ -926,6 +949,109 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """Return an optional architecture-owned MLP connection."""
 
         return None
+
+    def supports_staged_dynamic_inference(
+        self, inference_context: BaseInferenceContext | None
+    ) -> bool:
+        """Check the staged attention capability without touching tensors or cache state."""
+        return (
+            InferenceMode.is_active()
+            and not self.training
+            and self.supports_two_stage_attention()
+            and self.self_attention.supports_staged_dynamic_inference(inference_context)
+        )
+
+    def forward_inference_project(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor | None,
+        *,
+        inference_context: BaseInferenceContext,
+        rotary_pos_emb: Tensor | None = None,
+        rotary_pos_cos: Tensor | None = None,
+        rotary_pos_sin: Tensor | None = None,
+        rotary_pos_cos_sin: Tensor | None = None,
+        attention_bias: Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        sequence_len_offset: Tensor | None = None,
+        context: Tensor | None = None,
+        context_mask: Tensor | None = None,
+        padding_mask: Tensor | None = None,
+    ) -> InferenceAttentionLayerProjectState:
+        """Run the input norm and cache-aware QKV projection for dynamic inference.
+
+        The attention module checks the supported dynamic attention/TP1/CP1 configuration. The
+        ordinary ``forward`` remains the path for every other configuration.
+        """
+        if not self.supports_staged_dynamic_inference(inference_context):
+            raise RuntimeError(
+                "Staged inference requires an evaluation dynamic attention-only layer "
+                "with TP=CP=1."
+            )
+        input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+        if self.config.inference_fuse_tp_communication:
+            self._set_proj_residual(residual)
+
+        nvtx_range_push(suffix="self_attention")
+        with _otel_managed_span('layer', 'megatron.layer.self_attention'):
+            projected = self.self_attention.forward_inference_project(
+                input_layernorm_output,
+                attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+        nvtx_range_pop(suffix="self_attention")
+        return InferenceAttentionLayerProjectState(
+            attention=projected,
+            residual=residual,
+            context=context,
+            context_mask=context_mask,
+            inference_context=inference_context,
+            attn_state=attn_state,
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
+        )
+
+    def forward_inference_core(
+        self, projected: InferenceAttentionLayerProjectState
+    ) -> InferenceAttentionLayerCoreState:
+        """Run dynamic FlashAttention on an earlier staged projection."""
+        if not isinstance(projected, InferenceAttentionLayerProjectState):
+            raise TypeError("Expected InferenceAttentionLayerProjectState.")
+        core_output = self.self_attention.forward_inference_core(projected.attention)
+        return InferenceAttentionLayerCoreState(core_output=core_output, project=projected)
+
+    def forward_inference_post_core(
+        self, core: InferenceAttentionLayerCoreState
+    ) -> tuple[Tensor, Tensor | None]:
+        """Finish the attention-only layer, matching its atomic ``forward`` output."""
+        if not isinstance(core, InferenceAttentionLayerCoreState):
+            raise TypeError("Expected InferenceAttentionLayerCoreState.")
+        projected = core.project
+        attention_output_with_bias = self.self_attention.forward_post_core_attn(core.core_output)
+        hidden_states, context = self.attention_bda_and_cross_attention(
+            attention_output_with_bias,
+            projected.residual,
+            context=projected.context,
+            context_mask=projected.context_mask,
+            inference_context=projected.inference_context,
+            attn_state=projected.attn_state,
+        )
+        return (
+            self._forward_mlp(
+                hidden_states,
+                projected.inference_context,
+                padding_mask=projected.padding_mask,
+                packed_seq_params=projected.packed_seq_params,
+            ),
+            context,
+        )
 
     def _run_input_layernorm(
         self,

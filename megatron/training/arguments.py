@@ -1136,6 +1136,8 @@ def validate_args(args, defaults={}):
         assert not args.check_for_nan_in_loss_and_grad, \
         "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-impl=full_iteration for training."
 
+    _validate_shortcut_moe_inference_args(args)
+
     if args.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
         if args.fp8 is not None:
             assert args.transformer_impl == "inference_optimized", \
@@ -2028,8 +2030,44 @@ def _add_transformer_engine_args(parser):
                        'See TransformerEngineMixedPrecision.md')
     return parser
 
+def _validate_shortcut_moe_inference_args(args: argparse.Namespace) -> None:
+    """Validate inference-only settings before constructing the language config."""
+    if getattr(args, "inference_shortcut_moe_expert_max_blocks", 304) < 0:
+        raise ValueError("--inference-shortcut-moe-expert-max-blocks must be nonnegative")
+    if not getattr(args, "inference_shortcut_moe_overlap", False):
+        return
+    if args.transformer_impl != "inference_optimized":
+        raise ValueError(
+            "--inference-shortcut-moe-overlap requires inference_optimized language layers; "
+            "set --transformer-impl inference_optimized"
+        )
+    if not args.inference_dynamic_batching or args.use_legacy_static_engine:
+        raise ValueError(
+            "--inference-shortcut-moe-overlap requires dynamic batching without the legacy "
+            "static engine"
+        )
+    if args.num_speculative_tokens:
+        raise ValueError("--inference-shortcut-moe-overlap does not support speculative decoding")
+
+
 def _add_inference_args(parser):
     group = parser.add_argument_group(title='inference')
+
+    group.add_argument(
+        '--inference-shortcut-moe-overlap',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Overlap Shortcut MoE inference with its unsplit GDP or attention '
+        'predecessor. Requires dynamic BF16 inference_optimized language '
+        'layers, TP=CP=1, vLLM expert GEMMs, and NVLS.',
+    )
+    group.add_argument(
+        '--inference-shortcut-moe-expert-max-blocks',
+        type=int,
+        default=304,
+        help='Maximum routed-expert GEMM thread blocks in overlap inference '
+        'for prefill, mixed and decode. Zero uses ordinary launch grids.',
+    )
 
     group.add_argument('--inference-batch-times-seqlen-threshold',
                        type=int, default=-1,
@@ -2333,6 +2371,9 @@ def _add_inference_args(parser):
 
 def _add_network_size_args(parser):
     exclude = [
+        # Production overlap controls are registered in the inference argument group.
+        "inference_shortcut_moe_overlap",
+        "inference_shortcut_moe_expert_max_blocks",
         # cannot provide callables over CLI
         "timers",
         "finalize_model_grads_func",
