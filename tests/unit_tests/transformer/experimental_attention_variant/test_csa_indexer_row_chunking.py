@@ -5,9 +5,13 @@
 The cuDNN indexer kernels are replaced by a PyTorch reference with the same
 contract, so these tests check the chunking logic itself: row slicing,
 per-chunk ``cu_seqlens``, causal offsets, padding and score gathering.
-Kernel numerics are covered by the GPU tests in
+Real multi-chunk kernel numerics are
+``TestRealKernelIndexerTopk.test_real_indexer_topk_row_chunked_matches_single_pass``
+and ``test_real_indexer_topk_thd_row_chunked_matches_single_pass`` in
 ``test_csa_fused_sparse_attention.py``.
 """
+
+import gc
 
 import pytest
 import torch
@@ -227,6 +231,95 @@ def test_peak_score_block_is_bounded(ref_dsa, monkeypatch):
     assert ref_dsa.max_score_elems <= 32 * sk
     assert ref_dsa.max_score_elems * 16 == full_elems
     assert ref_dsa.forward_calls == 2 * 256 // 32
+
+
+class _CudaScoreStub:
+    """Device-aware stand-in so the peak check can run the real chunk loop on CUDA."""
+
+    def indexer_forward_wrapper(
+        self,
+        q,
+        k,
+        w,
+        ratio,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        q_causal_offsets=None,
+    ):
+        device = q.device
+        if cu_seqlens_q is None:
+            logits = torch.einsum("bshd,btd->bsht", q.float(), k[:, :, 0].float())
+            scores = (logits.relu() * w.float().unsqueeze(-1)).sum(dim=2)
+            sq, sk = scores.shape[1:]
+            q_pos = torch.arange(sq, device=device).view(sq, 1)
+            k_pos = torch.arange(sk, device=device).view(1, sk)
+            valid = (q_pos + 1) // ratio
+            return {"scores": scores.masked_fill(k_pos >= valid, float("-inf"))}
+
+        total_q = q.shape[0]
+        scores = torch.full((total_q, int(max_seqlen_k)), float("-inf"), device=device)
+        num_segments = cu_seqlens_q.numel() - 1
+        for seg in range(num_segments):
+            q0, q1 = int(cu_seqlens_q[seg]), int(cu_seqlens_q[seg + 1])
+            k0, k1 = int(cu_seqlens_k[seg]), int(cu_seqlens_k[seg + 1])
+            if q1 <= q0 or k1 <= k0:
+                continue
+            logits = torch.einsum("shd,td->sht", q[q0:q1].float(), k[k0:k1, 0].float())
+            seg_scores = (logits.relu() * w[q0:q1].float().unsqueeze(-1)).sum(dim=1)
+            offset = int(q_causal_offsets[seg]) if q_causal_offsets is not None else 0
+            positions = torch.arange(q1 - q0, device=device).view(-1, 1) + offset
+            keys = torch.arange(k1 - k0, device=device).view(1, -1)
+            seg_scores = seg_scores.masked_fill(keys >= (positions + 1) // ratio, float("-inf"))
+            scores[q0:q1, : k1 - k0] = seg_scores
+        return {"scores": scores}
+
+    @staticmethod
+    def indexer_top_k_wrapper(scores, seq_lens, top_k, next_n=1, return_val=False):
+        rows, cols = scores.shape
+        device = scores.device
+        keep = torch.arange(cols, device=device).view(1, cols) < seq_lens.view(rows, 1)
+        masked = scores.masked_fill(~keep, float("-inf"))
+        values, indices = masked.topk(top_k, dim=-1)
+        indices = indices.masked_fill(values == float("-inf"), -1).to(torch.int32)
+        return {"indices": indices}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_chunked_topk_prealloc_peak_is_one_output(monkeypatch):
+    """Returned Top-K indices and scores fit in one buffer each.
+
+    The measured peak also includes one chunk of dense scores, the length
+    buffer, and per-chunk gather temps.
+    """
+    b, sq, sk, topk, chunk_rows = 4, 2048, 256, 128, 64
+    q, k, w = _bshd_inputs(b=b, sq=sq, sk=sk, nh=4, hd=8)
+    q, k, w = q.cuda(), k.cuda(), w.cuda()
+    monkeypatch.setattr(fsa, "_DSA", _CudaScoreStub())
+    _force_chunk_rows(monkeypatch, chunk_rows, sk)
+
+    # Warm GEMM and Triton workspaces before the measured call.
+    _core(q, k, w, topk, ratio=4, scores_output="topk")
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    baseline = torch.cuda.memory_allocated()
+    idx, length, topk_scores = _core(q, k, w, topk, ratio=4, scores_output="topk")
+    torch.cuda.synchronize()
+    delta = torch.cuda.max_memory_allocated() - baseline
+
+    total_q = b * sq
+    output_bytes = total_q * topk * 8
+    chunk_score_bytes = chunk_rows * sk * 4
+    slack = (2 << 20) + total_q * 4 + chunk_rows * topk * 32
+    limit = output_bytes + chunk_score_bytes + slack
+    assert idx.shape == (b, sq, topk) and idx.dtype == torch.int32
+    assert length.shape == (b, sq) and length.dtype == torch.int32
+    assert topk_scores is not None and topk_scores.shape == (b, sq, topk)
+    assert (
+        output_bytes <= delta <= limit
+    ), f"peak delta {delta} bytes, expected {output_bytes}..{limit}"
 
 
 def test_small_problem_uses_single_pass(ref_dsa):

@@ -2176,6 +2176,7 @@ def _indexer_topk_row_chunked(
     row position so the ``ratio`` causal rule is evaluated at true positions.
     BSHD inputs are viewed as THD with ``b`` equal-length segments. The chunk
     count depends only on tensor shapes, so the loop is CUDA-graph friendly.
+    Index, length, and score outputs are allocated once and filled in place.
     """
     is_thd = cu_seqlens_q is not None
     if is_thd:
@@ -2230,9 +2231,14 @@ def _indexer_topk_row_chunked(
         q_causal_offsets if q_causal_offsets is not None else torch.zeros_like(segment_starts)
     )
 
-    index_chunks = []
-    length_chunks = []
-    score_chunks = [] if return_topk_scores else None
+    # Fill preallocated outputs in place so the chunk results have one home.
+    topk_indices = torch.empty((total_q, topk), dtype=torch.int32, device=device)
+    topk_length = torch.empty((total_q,), dtype=torch.int32, device=device)
+    topk_scores = (
+        torch.empty((total_q, topk), dtype=torch.float32, device=device)
+        if return_topk_scores
+        else None
+    )
     for row_start in range(0, total_q, chunk_rows):
         row_end = min(row_start + chunk_rows, total_q)
         # Clip every segment to [row_start, row_end) and re-base it to the chunk.
@@ -2251,15 +2257,14 @@ def _indexer_topk_row_chunked(
             q_causal_offsets=chunk_offsets,
             **core_kwargs,
         )
-        index_chunks.append(chunk_indices)
-        length_chunks.append(chunk_length)
-        if return_topk_scores:
-            score_chunks.append(_gather_topk_scores(chunk_scores, chunk_indices))
-        del chunk_scores
+        topk_indices[row_start:row_end].copy_(chunk_indices)
+        topk_length[row_start:row_end].copy_(chunk_length)
+        if topk_scores is not None:
+            gathered_scores = _gather_topk_scores(chunk_scores, chunk_indices)
+            topk_scores[row_start:row_end].copy_(gathered_scores)
+            del gathered_scores
+        del chunk_scores, chunk_indices, chunk_length
 
-    topk_indices = torch.cat(index_chunks, dim=0)
-    topk_length = torch.cat(length_chunks, dim=0)
-    topk_scores = torch.cat(score_chunks, dim=0) if return_topk_scores else None
     if not is_thd:
         topk_indices = topk_indices.view(b, sq, topk)
         topk_length = topk_length.view(b, sq)
@@ -2823,10 +2828,11 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             topk_max_seqlen_k = int(max_seqlen_compressed_idx) + 2
 
         # Pass the original ``indexer_topk`` (not min(indexer_topk, n_comp)) so
-        # that the output is always padded to a fixed size. Top-K dispatch is
-        # independent of the configured loss: SM100 always uses the compact
-        # wrapper, while an enabled dense KL loss separately recomputes the
-        # full score tensor it needs below.
+        # that the output is always padded to a fixed size. SM100 uses the
+        # compact wrapper and, when the sparse loss is enabled, its Top-K
+        # softmax. The dense fallback scores nothing when the loss is off,
+        # the selected scores when the sparse loss is on, and the full matrix
+        # for the dense KL loss.
         topk_indices_cmp, _, indexer_scores, compact_predict = _indexer_topk_core(
             q_indexer_flat,
             topk_k_indexer,
@@ -3024,16 +3030,9 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                             indexer_physical_idxs = indexer_physical_idxs.masked_fill(row_mask, -1)
                     predict = _sparse_indexer_predict(indexer_topk_scores, topk_indices_cmp)
                 else:
-                    assert indexer_scores is not None
-                    # The fused row kernel invalidates CUDA-graph padding rows
-                    # in both index spaces and computes gather + masked softmax.
-                    predict, topk_indices_cmp, indexer_physical_idxs = (
-                        csa_indexer_loss_kernels.prepare_sparse_loss(
-                            indexer_scores,
-                            topk_indices_cmp,
-                            padding_row_mask,
-                            indexer_physical_idxs,
-                        )
+                    raise RuntimeError(
+                        "Sparse indexer loss needs the compact Top-K softmax or "
+                        "the dense-fallback Top-K scores; neither was produced."
                     )
 
                 # THD: _compute_attn_target's kernel addresses K by flat ids over
