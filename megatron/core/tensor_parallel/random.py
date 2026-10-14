@@ -26,6 +26,7 @@ from megatron.core.parallel_state import (
     get_gtp_weight_remat_world_size,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.tensor_parallel.recompute_gather_cache import recompute_phase
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
 
 # ---------------------------------------------------------------------------
@@ -755,7 +756,9 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
+            # the re-run builds the graph for a backward that follows right away: a linear inside
+            # it may keep its gathered input for its weight gradient (recompute_gather_cache.py)
+            with torch.enable_grad(), recompute_phase():
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -1159,7 +1162,7 @@ class CheckpointWithoutOutput(object):
 
             # Reconstruct full args list from saved ctx
             inputs = _load_args_from_ctx(self.ctx)
-            with torch.enable_grad(), fp8_ctx, recompute_ctx:
+            with torch.enable_grad(), fp8_ctx, recompute_ctx, recompute_phase():
                 outputs = self.run_function(*inputs)
 
         self.run_function = None
