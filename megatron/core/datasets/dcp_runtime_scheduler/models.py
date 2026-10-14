@@ -7,14 +7,12 @@ The imported kernels only perform CPU arithmetic; their names identify the
 calibration regime and do not execute CUDA Graphs.
 """
 
-import hashlib
-import json
 import math
 from functools import lru_cache
-from pathlib import Path
 
-from .attention.cuda_graph_attention_predictor import load_cuda_graph_model
+from .attention.backward import BackwardModel
 from .attention.dispatch import dispatch_backend
+from .attention.predictor import ForwardModel, load_parameters
 
 
 class CorePredictor:
@@ -43,10 +41,7 @@ class CorePredictor:
         self.tokens_per_rank = tokens_per_rank
         self.dataset_alignment = dataset_alignment
         self.kernel_backend = kernel_backend
-        self.models = {
-            phase: load_cuda_graph_model(hardware, direction=phase)
-            for phase in ('forward', 'backward')
-        }
+        self.models = {'forward': ForwardModel(hardware), 'backward': BackwardModel(hardware)}
         for model in self.models.values():
             model.geometry_profile(*self.geometry)
 
@@ -77,13 +72,7 @@ class CorePredictor:
                 use_production_default_clock=True,
             )
             for phase, model in self.models.items():
-                scalar = getattr(model, 'predict_time_ms', None)
-                value = (
-                    scalar(lengths, cp, **options)
-                    if scalar is not None
-                    else model.predict_with_details(lengths, cp, **options)['time_ms']
-                )
-                result[phase + '_ms'] = float(value)
+                result[phase + '_ms'] = float(model.predict_time_ms(lengths, cp, **options))
         if any(not math.isfinite(value) or value <= 0 for value in result.values()):
             raise ValueError('Invalid frozen attention prediction')
         return result
@@ -96,11 +85,9 @@ class CorePredictor:
             clock_input='production_default',
             heads={p: m.head for p, m in self.models.items()},
             model_sha256={p: m.data_sha256 for p, m in self.models.items()},
+            runtime_parameters_sha256={p: m.parameter_sha256 for p, m in self.models.items()},
             head_status={p: m.head_status for p, m in self.models.items()},
-            known_limits={
-                p: (m.block.get('sealed_status') or {}).get('known_limits', m.status_marker)
-                for p, m in self.models.items()
-            },
+            known_limits={p: m.known_limits for p, m in self.models.items()},
             kernel_backend=self.kernel_backend,
             provisional=True,
             scalar_execution='same_frozen_formula_as_full_trace',
@@ -217,16 +204,10 @@ class AttentionCostModel:
 
 def qwen35_new_core_model(*, fa_remainder=None, non_attention=None, kernel_backend='python'):
     """The exact a55 Qwen3.5 model, with its paired frozen inputs in this package."""
-    from .e2e.models.qwen35_core import Qwen35CoreCostModel
+    from .qwen35 import Qwen35CoreCostModel
 
     if fa_remainder is None:
-        raw = (Path(__file__).parent / 'e2e/models/fa_remainder.json').read_bytes()
-        if (
-            hashlib.sha256(raw).hexdigest()
-            != '5a36d8f33258b5720d3a2bc80acf2a36d20e0a451aee6eb888a96d5956b57f0b'
-        ):
-            raise ValueError('Frozen FA remainder hash mismatch')
-        fa_remainder = json.loads(raw)
+        fa_remainder = load_parameters('qwen35.json')[0]['fa_remainder']
     predictor = CorePredictor(
         query_heads=32, kv_heads=2, head_dim=256, kernel_backend=kernel_backend
     )

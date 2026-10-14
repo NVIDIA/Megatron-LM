@@ -3,9 +3,10 @@
 This package contains the lightweight planner, physical-capacity and rank-row
 contracts, CP/EP forward/backward timeline, and the frozen timing-model kernels
 and parameters. It does not need the external `dcp-scheduler` repository.
-`ORIGIN.json` records the source commit and original hashes. The large attention
-JSON is whitespace-compacted; its decoded parameters are unchanged and its local
-hash is pinned by the loader. Other calibration files retain their original bytes.
+`ORIGIN.json` identifies the source commit, original parameter artifacts and
+hashes of the three runtime parameter files. Only selected formulas and consumed
+coefficients are packaged; historical heads, calibration reports and detailed
+prediction traces stay in the source repository. Coefficients are unchanged.
 
 The worker runs this package directly by file path, without importing the
 Megatron/PyTorch parent packages. A persistent leader-only CPU process solves one

@@ -1,0 +1,168 @@
+{
+  "schema": 1,
+  "gdn": {
+    "profile": "gb200-parent32-native-local16384-7319138",
+    "hardware": "gb200",
+    "domain_size": 72,
+    "transport": "native",
+    "world_size": 32,
+    "local_tokens": 16384,
+    "phase_split": "measured_separately",
+    "geometry": {
+      "chunk_size": 64,
+      "hidden_size": 4096,
+      "kv_channels": 256,
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 64,
+      "linear_value_head_dim": 128,
+      "num_attention_heads": 32,
+      "num_query_groups": 2,
+      "projection_width": 20608
+    },
+    "gdn_features": [
+      "bias",
+      "cp_enabled",
+      "summary_hops",
+      "max_prefix_chain",
+      "boundary_summary_chunks_per_64",
+      "extra_local_sequences"
+    ],
+    "source_sha256": "b507ae5571bfa6c8a82d7de0538ebd593d9d80b44cc3e23e0a7ff47b8b6cadc7",
+    "gdn": {
+      "plain": {
+        "forward_gpu_ms": {
+          "bias": 5.996953670044394,
+          "cp_enabled": 0.08253532449106013,
+          "summary_hops": 0.07361277245634132,
+          "max_prefix_chain": 0.0,
+          "boundary_summary_chunks_per_64": 0.2987288836182756,
+          "extra_local_sequences": 0.012967703700590064
+        },
+        "backward_gpu_ms": {
+          "bias": 11.093872597558569,
+          "cp_enabled": 0.6735830646348724,
+          "summary_hops": 0.06819325621576038,
+          "max_prefix_chain": 0.0,
+          "boundary_summary_chunks_per_64": 0.5995736947514847,
+          "extra_local_sequences": 0.0013791460644109017
+        },
+        "forward_backward_gpu_ms": {
+          "bias": 17.106405238310483,
+          "cp_enabled": 0.7756056997950883,
+          "summary_hops": 0.07042018610097163,
+          "max_prefix_chain": 3.773255936371701e-05,
+          "boundary_summary_chunks_per_64": 0.44287142780308775,
+          "extra_local_sequences": 0.0
+        }
+      }
+    }
+  },
+  "non_attention": {
+    "profile": "gb200-ep4-local16384-7319138",
+    "status": "PAIRED_MODULE_PROFILE_PASS",
+    "excludes": "attention_module",
+    "attention_profile": "gb200-parent32-native-local16384-7319138",
+    "recompute": false,
+    "world_size": 32,
+    "ep_size": 4,
+    "tokens_per_rank": 16384,
+    "cost_ms": {
+      "layer_forward": 6.238022422790527,
+      "layer_backward": 11.71869525909424,
+      "microbatch_outer": 307.20630836486816,
+      "iteration_tail": 32.573150634765625
+    },
+    "scope": "32GB200 EP4 fixed local16384; native mock; eager; no recomputation",
+    "estimator_status": "Measured paired non-attention events; arbitrary packing contention provisional",
+    "statistic": "median over 32 ranks x 15 timed steps (5 warmup) of paired CUDA-event differences: layer minus enclosed self_attention module per layer and round (layer_forward/layer_backward), (forward_backward - sum of layer events)/rounds (microbatch_outer), train_step - forward_backward (iteration_tail)",
+    "mock_config": {
+      "lognormal_sigma": 1.1,
+      "max_seq_len": 131073,
+      "mean_seq_len": 131073,
+      "min_seq_len": 131073,
+      "mode": "distribution",
+      "type": "lognormal"
+    },
+    "gbs": 4,
+    "warmup_steps": 5,
+    "timed_steps": 15,
+    "source": {
+      "path": "results/model-scan-7319138/fits/non-attention-128k.json",
+      "sha256": "45fb4b01b03a79db2e73f681b1cbbecbb2a33c35995283e467044f965535088d",
+      "raw": "results/calibration-7319102/profile-128k",
+      "gpu_job": "7319102",
+      "analysis_job": "7319138",
+      "reader_sha256": "244ef554703e9e2e6f3b69452ae0de3f535fb598634a4ccf42076fc72ca48f1c"
+    },
+    "software_stack": {
+      "image_sha256": "047032f79b80ad0be37db116001870bafd1ed6e5a30f0c88b8aa822e4680a7b9",
+      "image_content_manifest_sha256": "12b082b104c2a083efcdfc4df1a62f29bf673f7615d3befad419a8deafb78c03",
+      "commits": {
+        "fla": "ade1f500fb1067cef486c69742b854769b5a743d",
+        "library": "1551ac843bcf0e595add0357729173d4afb13faf",
+        "mcore": "dbf96650c427f4963e3e72c6e7aaba80fe41ec0a",
+        "te": "c6188347e7de79d7261b9e0113114482998541bf"
+      },
+      "te_note": "TE commit c6188347 plus the pre-existing SM103 head-dim-256 overlay; the commit sha does not cover the overlay (runtime-manifest.json records per-file source hashes and extension binary hashes)",
+      "torch": "2.12.0a0+0291f960b6.nv26.04.48445190",
+      "cuda": "13.2",
+      "gpu": "NVIDIA GB200",
+      "gpu_capability": [
+        10,
+        0
+      ],
+      "mcore_root": "/opt/q35-runtime/mcore",
+      "runtime_manifest_sha256": "9d782501c3cc1584479fb34601bd50b1a40b6db7a2ce0b756157d3a2bc1f5d29",
+      "runtime_manifest_local_copy": "results/fa-gate-r2-7318815/runtime/runtime-manifest.json"
+    },
+    "campaign": {
+      "experiment": "dcp_benchmark/experiments/qwen35-mock81-mr208-20260921",
+      "cluster": "oci-hsg, 32x NVIDIA GB200 (8 nodes x 4 GPUs), one NVL72 domain",
+      "megatron": "agentic-mcore-dev MR208, frozen head 34b57bbd52e80f4ec39c69393c72c8e47f6585a2, snapshot experiments/2026-09-17_qwen35-4l-mtp-thd512k-cp32-gb200-hybridep_687b0b58",
+      "jobs": {
+        "gpu_calibration": "7319102",
+        "gdn_fit": "7319448",
+        "fa_fit": "7319860",
+        "model_scan": "7319138"
+      },
+      "raw_results_root": "/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/tailaim/dcp-benchmark/qwen35-mock81-mr208-20260921"
+    }
+  },
+  "fa_remainder": {
+    "status": "PAIRED_FA_REMAINDER_PASS",
+    "hardware": "gb200",
+    "tokens_per_rank": 16384,
+    "geometry": [
+      32,
+      2,
+      256
+    ],
+    "cp_measured": 1,
+    "cost_ms": {
+      "forward": 3.174031972885132,
+      "backward": 5.083328008651733
+    },
+    "statistic": "median of same-iteration module CUDA events minus enclosed core CUDA events",
+    "samples_per_phase": {
+      "forward": 640,
+      "backward": 640
+    },
+    "case_median_relative_spread": {
+      "forward": 0.058429169588341545,
+      "backward": 0.10699760982388129
+    },
+    "source_hashes": {
+      "/lustre/fsw/portfolios/coreai/users/tailaim/dcp-benchmark/qwen35-runtime-matrix-20261009/results/profile-7833515/rank00.jsonl": "e494f48e9dc6355510fa8905c0b6efa1e3e776c1d9e87636924a515fe036dc53",
+      "/lustre/fsw/portfolios/coreai/users/tailaim/dcp-benchmark/qwen35-runtime-matrix-20261009/results/profile-7833515/rank01.jsonl": "cf18f2df6d349d9bb4d5059bac4081123044bd7c084051d9f2bfc9a07be3f815",
+      "/lustre/fsw/portfolios/coreai/users/tailaim/dcp-benchmark/qwen35-runtime-matrix-20261009/results/profile-7833515/rank02.jsonl": "a73b21fa51f3aaa943a74624bef3a9693277839d09967d2b9c1eb2464d5379a2",
+      "/lustre/fsw/portfolios/coreai/users/tailaim/dcp-benchmark/qwen35-runtime-matrix-20261009/results/profile-7833515/rank03.jsonl": "57207e151ad5652a8950a25ac1e3c49667b178ea2ae14934ca107d7fdbd5ddd9"
+    },
+    "scope": "FA projections, gate, QK norms, RoPE and layout; no non-attention fit or E2E residual",
+    "provisional_reasons": [
+      "CP1 remainder transferred to CP2..32 with local16K",
+      "hook event scope may add measurement overhead"
+    ]
+  }
+}

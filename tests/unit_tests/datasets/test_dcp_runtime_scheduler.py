@@ -2,6 +2,8 @@
 
 """Contracts of the in-tree CPU runtime and its frozen timing models."""
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +11,7 @@ import pytest
 from megatron.core.datasets import dcp_schedule_prefetch as prefetch
 from megatron.core.datasets.dcp_runtime_scheduler.models import (
     AttentionCostModel,
+    CorePredictor,
     qwen35_new_core_model,
 )
 from megatron.core.datasets.dcp_runtime_scheduler.runtime.cost_model import QuadraticCostModel
@@ -72,6 +75,17 @@ def test_frozen_models_include_both_phases_for_odd_cp(model_name):
         assert model.backward(values, cp, ranks=ranks) > 0
         assert model.program_costs(values, cp, ranks=ranks)
     assert model.metadata()['provisional']
+
+
+@pytest.mark.parametrize(
+    'case', json.loads(Path(__file__).with_name('dcp_frozen_costs.json').read_text())['cases']
+)
+def test_scalar_costs_match_the_frozen_reference(case):
+    hardware, geometry, cp, lengths, forward_ms, backward_ms = case
+    predictor = CorePredictor(
+        hardware=hardware, query_heads=geometry[0], kv_heads=geometry[1], head_dim=geometry[2]
+    )
+    assert predictor(lengths, cp) == {'forward_ms': forward_ms, 'backward_ms': backward_ms}
 
 
 def test_prediction_scope_is_not_silently_claimed_as_calibrated():
