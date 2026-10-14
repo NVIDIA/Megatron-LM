@@ -246,6 +246,15 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # KDA has independent cold JIT compilation; keep its unchanged cases out of
+  # the broad SSM bucket so both complete within the same per-job time limit.
+  - test_case: [tests/unit_tests/ssm/gated_delta_net/test_kda.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ssm/test_gated_delta_net_recompute.py]
     products:
       - environment: [lts, dev]

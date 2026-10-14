@@ -415,7 +415,9 @@ def _assert_close_grads(overlap_gradients, reference_gradients, rtol=5e-3, atol=
             reference_gradients[name],
             rtol=rtol,
             atol=atol,
-            msg=f"Gradient mismatch for {name}",
+            msg=lambda detail, parameter_name=name: (
+                f"Gradient mismatch for {parameter_name}:\n{detail}"
+            ),
         )
 
 

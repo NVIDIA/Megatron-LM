@@ -1359,7 +1359,7 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         packed_seq_params,
         padding_mask,
     )
-    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced")
+    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced", dynamic_context_parallel=False)
     config = SimpleNamespace(
         virtual_pipeline_model_parallel_size=None,
         pipeline_model_parallel_layout=None,
@@ -1372,6 +1372,9 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
         patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
         patch.object(
+            packed_seq_utils, "finalize_packed_seq_params", return_value=packed_seq_params
+        ) as finalize,
+        patch.object(
             pretrain_hybrid,
             "get_batch_on_this_rank_for_sequence_packing",
             return_value=scheduler_batch,
@@ -1379,6 +1382,7 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     ):
         cp_batch = get_batch(None)
 
+    finalize.assert_called_once_with(packed_seq_params)
     assert set(cp_batch.batches_by_layout) == {"zigzag"}
     assert cp_batch.get_packed_seq_params() is packed_seq_params
     batch = cp_batch.get_batch()

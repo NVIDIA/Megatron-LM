@@ -2713,7 +2713,7 @@ class TestMultiTokenPrediction:
 
         assert torch.isfinite(output).all()
         tracker = MTPLossLoggingHelper.tracker
-        assert torch.isfinite(tracker['loss_values']).all()
+        assert torch.isfinite(tracker['loss_sums']).all()
 
         output.mean().backward()
         trainable_numel = sum(
@@ -2790,8 +2790,8 @@ class TestMultiTokenPrediction:
         assert torch.isfinite(output).all()
 
         tracker = MTPLossLoggingHelper.tracker
-        assert "loss_values" in tracker
-        mtp_loss = tracker['loss_values'].clone()
+        assert "loss_sums" in tracker
+        mtp_loss = tracker['loss_sums'].clone()
         assert mtp_loss.shape[0] == args.mtp_num_layers
         assert torch.isfinite(mtp_loss).all()
 
@@ -3384,7 +3384,7 @@ class TestMultiTokenPrediction:
             ).sum().backward()
             tracker = MTPLossLoggingHelper.tracker
             metrics = torch.cat(
-                [tracker[key] for key in ("loss_values", "correct_values", "total_values")]
+                [tracker[key] for key in ("loss_sums", "correct_values", "total_values")]
             )
             results[gather_output] = (metrics, output_layer.weight.grad, hidden.grad)
 

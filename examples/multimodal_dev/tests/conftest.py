@@ -8,6 +8,8 @@ This suite runs as its own CI bucket (see
 and none of its hooks apply here.  The hooks and fixtures the CI runner
 (``tests/unit_tests/run_ci_test.sh``) depends on are reproduced below:
 
+* ``pytest_configure`` — the NCCL unit-test defaults moved out of the shell
+  runner into the main conftest; this independent bucket needs them too;
 * ``--experimental`` — the runner invokes pytest a second time with this
   flag, which would otherwise be rejected as an unknown option;
 * ``pytest_sessionfinish`` — that second invocation collects nothing in
@@ -59,6 +61,12 @@ from megatron.core import config  # noqa: E402
 def _report_stderr(message):
     sys.stderr.write(message + "\n")
     sys.stderr.flush()
+
+
+def pytest_configure(config):
+    """Match the main unit suite's NCCL defaults before any group is created."""
+    os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
+    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
 
 def pytest_addoption(parser):

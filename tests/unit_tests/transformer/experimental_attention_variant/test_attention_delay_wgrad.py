@@ -207,6 +207,8 @@ def _assert_flushed_grads_match_eager(
     layer_number,
     hidden,
     pg_collection,
+    *,
+    delayed_output,
 ):
     """Delay-vs-eager gradient equality: the flush must not change the math.
 
@@ -231,6 +233,11 @@ def _assert_flushed_grads_match_eager(
 
     eager_hidden = hidden.detach().clone().requires_grad_(True)
     output, _ = eager_attn(hidden_states=eager_hidden, attention_mask=None)
+    torch.testing.assert_close(
+        output,
+        delayed_output,
+        msg=lambda detail: f"delayed and eager forwards differ before wgrad comparison:\n{detail}",
+    )
     output.sum().backward()
 
     for name, _ in delayed_named_linears:
@@ -239,7 +246,9 @@ def _assert_flushed_grads_match_eager(
         torch.testing.assert_close(
             delayed_grads[name],
             eager_linear.weight.grad,
-            msg=f"delayed-flushed wgrad differs from eager inline wgrad for {name}",
+            msg=lambda detail, linear_name=name: (
+                f"delayed-flushed wgrad differs from eager inline wgrad for {linear_name}:\n{detail}"
+            ),
         )
 
 
@@ -331,6 +340,7 @@ class TestDSv4HybridCSADelayedWgradFlush:
 
         output, bias = attn(hidden_states=hidden, attention_mask=None)
         assert output.shape == (seq_len, batch_size, config.hidden_size)
+        delayed_output = output.detach().clone()
         # The indexer KL loss is attached to `output` via DSAIndexerLossAutoScaler,
         # so backward through the output alone reaches the indexer subgraph.
         output.sum().backward()
@@ -359,6 +369,7 @@ class TestDSv4HybridCSADelayedWgradFlush:
             2,
             hidden,
             pg,
+            delayed_output=delayed_output,
         )
 
 
@@ -431,6 +442,7 @@ class TestDSADelayedWgradFlush:
         # its own causal float mask, so attention_mask=None is valid here.
         output, bias = attn(hidden_states=hidden, attention_mask=None)
         assert output.shape == (seq_len, batch_size, config.hidden_size)
+        delayed_output = output.detach().clone()
         # The indexer KL loss is attached to `output` via DSAIndexerLossAutoScaler,
         # so backward through the output alone reaches the (detached-x) indexer.
         output.sum().backward()
@@ -471,4 +483,5 @@ class TestDSADelayedWgradFlush:
             1,
             hidden,
             pg,
+            delayed_output=delayed_output,
         )
