@@ -26,6 +26,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -143,6 +144,27 @@ class MixedDtypeNet(torch.nn.Module):
     def forward(self, x):
         y = self.linear2(self.linear1(x))
         return y.float() * self.alpha.mean()
+
+
+class NativeFp32Model(torch.nn.Module):
+    """Parameters for an interleaved trainable/frozen BF16 and FP32 group."""
+
+    def __init__(self):
+        super().__init__()
+        self.pre = torch.nn.Linear(8, 8, bias=False)
+        self.frozen = torch.nn.Linear(8, 8, bias=False)
+        self.frozen.weight.requires_grad_(False)
+        self.gate = torch.nn.Parameter(torch.zeros(24, dtype=torch.float32))
+        self.post = torch.nn.Linear(8, 8, bias=False)
+        self.config = TransformerConfig(
+            hidden_size=8, num_attention_heads=1, num_layers=1, bf16=True
+        )
+
+    def sharded_state_dict(self):
+        return {
+            key: ShardedTensor.from_rank_offsets(key, value)
+            for key, value in self.state_dict(keep_vars=True).items()
+        }
 
 
 class SwigluFactoryModel(torch.nn.Module):
@@ -270,6 +292,17 @@ def get_param_state_dp_zero(optimizer):
     return optim_param_state_A
 
 
+def step_hybrid_device_optimizer(optimizer, num_steps):
+    hybrid_optimizer = optimizer.optimizer
+    assert isinstance(hybrid_optimizer, HybridDeviceOptimizer)
+    for _ in range(num_steps):
+        for group in hybrid_optimizer.param_groups:
+            for param in group['params']:
+                param.grad = torch.ones_like(param)
+        hybrid_optimizer.step()
+        hybrid_optimizer.zero_grad()
+
+
 class TestOptimizer:
     def setup_method(self, method):
         pass
@@ -348,6 +381,65 @@ class TestOptimizer:
                 sh_ten = state[param_id][state_key]
                 assert sh_ten.key == f'optimizer.state.{state_key}.{model_key}', sh_ten.key
                 assert tuple(sh_ten.data.shape) == shape, (param_id, sh_ten.key, sh_ten.data.shape)
+
+    def test_float16_optimizer_with_native_fp32_and_frozen_params(self):
+        """Native FP32 and frozen param ids must not shift BF16 checkpoint state."""
+        from megatron.core.optimizer import OptimizerConfig
+        from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+        from megatron.core.transformer.module import (
+            convert_module_to_dtype_except_fp32_marked,
+            mark_keep_in_fp32,
+        )
+
+        Utils.initialize_model_parallel(1, 1)
+        model = NativeFp32Model().cuda()
+        model.gate = mark_keep_in_fp32(model.gate)
+        convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
+        assert model.pre.weight.dtype == torch.bfloat16
+        assert model.frozen.weight.dtype == torch.bfloat16
+        assert not model.frozen.weight.requires_grad
+        assert model.gate.dtype == torch.float32
+        assert model.post.weight.dtype == torch.bfloat16
+
+        # Use an explicit trainable BF16/frozen BF16/FP32/trainable BF16 order.
+        # Module.parameters() would yield the root gate before child parameters.
+        ordered_params = [model.pre.weight, model.frozen.weight, model.gate, model.post.weight]
+        for param in ordered_params:
+            if param.requires_grad:
+                param.grad = torch.zeros_like(param)
+        inner_optim = Adam(ordered_params)
+        inner_optim.step()
+
+        optim = Float16OptimizerWithFloat16Params(
+            inner_optim,
+            OptimizerConfig(optimizer='adam', lr=1e-4, bf16=True),
+            None,
+            lambda opt, cfg: None,
+        )
+        sharded_state_dict = optim.sharded_state_dict(model.sharded_state_dict())
+
+        # FP32 main copies pair with the BF16 params only, in optimizer order.
+        fp32_params = sharded_state_dict['fp32_from_fp16_params'][0]
+        assert [(sharded.key, tuple(sharded.data.shape)) for sharded in fp32_params] == [
+            ('optimizer.state.fp32_param.pre.weight', (8, 8)),
+            ('optimizer.state.fp32_param.post.weight', (8, 8)),
+        ]
+
+        # The frozen parameter has neither optimizer state nor an fp32 main copy.
+        state = sharded_state_dict['optimizer']['state']
+        assert 1 not in state
+
+        # Per-param state maps every trainable param, including native FP32, to the right key.
+        expected = {0: ('pre.weight', (8, 8)), 2: ('gate', (24,)), 3: ('post.weight', (8, 8))}
+        for param_id, (model_key, shape) in expected.items():
+            for state_key in ('exp_avg', 'exp_avg_sq'):
+                sharded = state[param_id][state_key]
+                assert sharded.key == f'optimizer.state.{state_key}.{model_key}', sharded.key
+                assert tuple(sharded.data.shape) == shape, (
+                    param_id,
+                    sharded.key,
+                    sharded.data.shape,
+                )
 
 
 class TestMixedDtypeParamGroups:
@@ -605,6 +697,62 @@ class TestDistributedOptimizer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
+    )
+    def test_hdo_dp_reshardable_preserves_step(self, tmp_path_dist_ckpt):
+        """HDO restores its canonical step without copying the local template value."""
+        tp_pp = (4, 1)
+        optimizer_config_kwargs = {
+            'optimizer_cpu_offload': True,
+            'optimizer_offload_fraction': 1.0,
+            'overlap_cpu_optimizer_d2h_h2d': False,
+            'lr': 1.0e-4,
+        }
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+
+        Utils.initialize_model_parallel(*tp_pp, order='tp-pp-dp')
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_hdo_dp_reshardable_preserves_step', sync=True
+        ) as ckpt_dir:
+            model_a, optimizer_a = setup_model_and_optimizer(
+                seed=2,
+                tp=tp_pp[0],
+                pp=tp_pp[1],
+                initialize_optimizer_state=False,
+                optimizer_config_kwargs=optimizer_config_kwargs,
+            )
+            step_hybrid_device_optimizer(optimizer_a, num_steps=3)
+
+            model_sharded_state = model_a[0].sharded_state_dict()
+            optimizer_sharded_state = optimizer_a.sharded_state_dict(
+                model_sharded_state, metadata=metadata
+            )
+            save(optimizer_sharded_state, ckpt_dir)
+
+            model_b, optimizer_b = setup_model_and_optimizer(
+                seed=3,
+                tp=tp_pp[0],
+                pp=tp_pp[1],
+                initialize_optimizer_state=False,
+                optimizer_config_kwargs=optimizer_config_kwargs,
+            )
+            step_hybrid_device_optimizer(optimizer_b, num_steps=1)
+
+            model_sharded_state = model_b[0].sharded_state_dict()
+            load_template = optimizer_b.sharded_state_dict(
+                model_sharded_state, metadata=metadata, is_loading=True
+            )
+            loaded_state = load(load_template, ckpt_dir)
+            loaded_group_steps = {
+                group['step'] for group in loaded_state['optimizer']['param_groups']
+            }
+            assert loaded_group_steps == {3}
+            optimizer_b.load_state_dict(loaded_state)
+
+            loaded_steps = {state['step'].item() for state in optimizer_b.optimizer.state.values()}
+            assert loaded_steps == {3}
 
     @pytest.mark.parametrize(
         ("source_offload", "destination_offload"), [(False, True), (True, False)]

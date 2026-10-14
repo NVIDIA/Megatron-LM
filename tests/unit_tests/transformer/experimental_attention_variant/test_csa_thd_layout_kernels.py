@@ -373,6 +373,75 @@ def test_sanitize_indexer_topk_matches_native():
     assert torch.equal(actual[1], expected[1])
 
 
+def _compiled_triton_variants(kernel) -> int:
+    """Count in-memory compiled variants of a ``triton.jit`` function."""
+    return sum(len(entry[0]) for entry in kernel.device_caches.values())
+
+
+def _reset_triton_kernels(*kernels):
+    for kernel in kernels:
+        kernel.device_caches.clear()
+
+
+def _cu_seqlens_from_lengths(lengths):
+    cumulative = [0]
+    for length in lengths:
+        cumulative.append(cumulative[-1] + length)
+    return torch.tensor(cumulative, dtype=torch.int32, device="cuda")
+
+
+# Distinct packed geometries at ratio 4. Avoid 1 and multiples of 16 so Triton
+# divisibility specialization cannot collapse keys and hide a regression.
+_JIT_SEGMENT_LAYOUTS = ([68, 36], [52, 52, 20], [100, 44, 36, 20])
+_JIT_RATIO = 4
+
+
+def test_build_seq_lens_compiles_once_across_packed_geometries():
+    """Packed segment count must not enter the Triton JIT key."""
+    _require_triton_cuda()
+    kernel = thd_indexer_kernels._dsv4_thd_build_seq_lens_kernel
+    _reset_triton_kernels(kernel)
+
+    for lengths in _JIT_SEGMENT_LAYOUTS:
+        cu_seqlens_q = _cu_seqlens_from_lengths(lengths)
+        cu_seqlens_kv = _cu_seqlens_from_lengths([length // _JIT_RATIO for length in lengths])
+        total_q = sum(lengths)
+
+        seq_lens = thd_indexer_kernels.build_seq_lens(
+            cu_seqlens_q, cu_seqlens_kv, total_q, _JIT_RATIO
+        )
+        expected = thd_indexer_kernels._build_seq_lens_fallback(
+            cu_seqlens_q, cu_seqlens_kv, total_q, _JIT_RATIO, None
+        )
+        assert torch.equal(seq_lens, expected)
+
+    assert _compiled_triton_variants(kernel) == 1
+
+
+def test_sanitize_topk_compiles_once_across_score_widths():
+    """Per-microbatch score/candidate widths must stay off the Triton JIT key."""
+    _require_triton_cuda()
+    kernel = thd_indexer_kernels._dsv4_thd_sanitize_topk_kernel
+    _reset_triton_kernels(kernel)
+
+    # Widths share a power-of-two bucket so ``BLOCK_TOPK`` stays fixed.
+    for rows, width, score_width in ((104, 33, 50), (124, 37, 54), (200, 41, 58)):
+        candidates = torch.randint(
+            -1, score_width + 4, (rows, width), dtype=torch.int32, device="cuda"
+        )
+        scores = torch.randn(rows, score_width, dtype=torch.float32, device="cuda")
+        seq_lens = torch.randint(0, score_width, (rows,), dtype=torch.int32, device="cuda")
+
+        sanitized, topk_length = thd_indexer_kernels.sanitize_topk(candidates, scores, seq_lens)
+        expected_sanitized, expected_length = thd_indexer_kernels._sanitize_topk_fallback(
+            candidates, scores, seq_lens
+        )
+        assert torch.equal(sanitized, expected_sanitized)
+        assert torch.equal(topk_length, expected_length)
+
+    assert _compiled_triton_variants(kernel) == 1
+
+
 def test_compressor_input_compact_matches_native_forward_backward():
     _require_cute_cuda()
     cu = _make_e2e_like_cu_seqlens()
@@ -594,6 +663,47 @@ def test_build_attention_indices_matches_native():
         padded[0][8:10], torch.tensor([[0, -1], [0, -1]], dtype=torch.int32, device="cuda")
     )
     assert torch.equal(padded[1][8:10], torch.tensor([1, 1], dtype=torch.int32, device="cuda"))
+
+
+def test_attention_indices_cache_reuses_shapes_and_separates_broadcasts(monkeypatch):
+    _require_cute_cuda()
+    monkeypatch.setattr(thd_layout_kernels, "_COMPILED_LAUNCH_CACHE", {})
+    compile_calls = []
+    original_compile = thd_layout_kernels.cute.compile
+
+    def record_compile(*args, **kwargs):
+        compile_calls.append(args[0])
+        return original_compile(*args, **kwargs)
+
+    monkeypatch.setattr(thd_layout_kernels.cute, "compile", record_compile)
+    for lengths, width in [([32, 32], 8), ([16, 32, 48], 12), ([64, 64], 16)]:
+        cu = torch.tensor(
+            [0] + torch.tensor(lengths).cumsum(0).tolist(), dtype=torch.int32, device="cuda"
+        )
+        cu_comp = _compressed_cu_seqlens(cu, 4)
+        mapping = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda")
+        rows = sum(lengths)
+        expanded = torch.arange(width, dtype=torch.int32, device="cuda").expand(rows, -1)
+        for logical_ids in (expanded, expanded.contiguous()):
+            actual = thd_layout_kernels.build_attention_indices(
+                cu,
+                0,
+                rows,
+                0,
+                16,
+                4,
+                width,
+                logical_ids,
+                cu_seqlens_compressed=cu_comp,
+                seq_to_rank_row=mapping,
+                compressed_rows=mapping.numel(),
+            )
+            expected = _native_attention_indices(
+                cu, cu_comp, 0, rows, 0, 16, 4, width, mapping, rows, logical_ids
+            )
+            assert torch.equal(actual[0], expected[0])
+            assert torch.equal(actual[1], expected[1])
+        assert len(compile_calls) == 2
 
 
 def test_build_attention_indices_writes_aligned_width():

@@ -41,7 +41,10 @@ if _TRITON_AVAILABLE:
         softmax_scale,
         num_heads: tl.constexpr,
         head_dim: tl.constexpr,
-        total_kv: tl.constexpr,
+        # ``total_kv`` is only an out-of-range bound. It is the packed KV row
+        # count, which varies per microbatch under THD, so keep it a runtime
+        # scalar rather than part of the JIT key.
+        total_kv,
         window_width: tl.constexpr,
         BLOCK_H: tl.constexpr,
         BLOCK_D: tl.constexpr,
@@ -214,9 +217,13 @@ if _TRITON_AVAILABLE:
         stride_out_row: tl.constexpr,
         stride_out_head: tl.constexpr,
         softmax_scale,
-        num_sequences: tl.constexpr,
-        max_seqlen_q: tl.constexpr,
-        max_seqlen_k: tl.constexpr,
+        # Packed-THD geometry is data-dependent: the segment count and both
+        # maxima change with every microbatch. They only size a grid division
+        # and a loop bound, so keep them runtime scalars — as ``tl.constexpr``
+        # they put a full Triton JIT compile on the critical path of every step.
+        num_sequences,
+        max_seqlen_q,
+        max_seqlen_k,
         num_heads: tl.constexpr,
         head_dim: tl.constexpr,
         ratio: tl.constexpr,

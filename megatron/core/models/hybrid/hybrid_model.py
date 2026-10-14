@@ -302,6 +302,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
 
         # MLA (also used by DeepSeek Sparse Attention) uses its own decoupled RoPE, therefore we do
@@ -408,6 +409,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
 
         if self.pre_process or self.post_process or self.mtp_process:
@@ -743,6 +745,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config=self.config,
                     cp_group=mtp_cp_group,
                     tp_group=self.tp_group,
+                    dp_cp_group=self.pg_collection.dp_cp,
                     packed_seq_params=packed_seq_params,
                     sequence_roll_context=sequence_roll_context,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,

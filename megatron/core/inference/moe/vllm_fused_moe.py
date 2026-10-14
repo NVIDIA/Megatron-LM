@@ -29,6 +29,7 @@ if not HAVE_TRITON:
     triton.jit = null_decorator
     tl = MagicMock()
 
+from megatron.core.inference.moe.activations import bounded_silu_mul
 from megatron.core.inference.moe.fused_moe import ActivationType
 from megatron.core.inference.moe.permute import (
     _get_num_sms,
@@ -621,7 +622,11 @@ def vllm_fused_moe(
     topk_weights_flat = probs.reshape(-1).contiguous()
 
     # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]
-    assert activation_type == ActivationType.SQUARED_RELU
+    # SQUARED_RELU fuses into the GEMM epilogue (elementwise). SwiGLU pairs column c
+    # with c+N/2 across tiles and cannot, so FC1 runs unfused to the 2N-wide
+    # intermediate and gate/up is applied separately below.
+    assert activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
+    is_swiglu = activation_type == ActivationType.SWIGLU
     intermediate1 = torch.empty(
         num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
     )
@@ -637,8 +642,13 @@ def vllm_fused_moe(
         top_k=topk,
         config=config,
         grid_size=grid_size_fc1,
-        fuse_squared_relu=True,
+        fuse_squared_relu=not is_swiglu,
     )
+    if is_swiglu:
+        # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
+        # SiLU(gate) * up over the valid_tokens*topk live rows only.
+        n_rows = (valid_tokens * topk).to(torch.int32)
+        intermediate1 = bounded_silu_mul(intermediate1, n_rows)
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], without routing weights.
     # Routing weights are applied in the reduction kernel to avoid an extra

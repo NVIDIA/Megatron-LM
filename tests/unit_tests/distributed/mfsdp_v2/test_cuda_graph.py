@@ -12,6 +12,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+    fully_shard_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,9 +52,10 @@ def test_captures_full_iteration(distributed_setup):
     static_target = torch.zeros_like(static_input)
 
     placements = _flat_placements()
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=placements)
-    fully_shard(model, mesh=mesh, placements=placements)
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements)
+        fully_shard(model, mesh=mesh, placements=placements)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
 

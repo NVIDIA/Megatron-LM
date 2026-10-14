@@ -16,7 +16,7 @@
 
 set -ex
 
-NCCL_VER="2.30.4-1+cuda13.2"
+NCCL_VER="2.30.7-1+cuda13.3"
 
 for i in "$@"; do
     case $i in
