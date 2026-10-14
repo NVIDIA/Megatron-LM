@@ -32,6 +32,8 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
     from megatron.training.arguments import validate_args
     from tests.unit_tests.test_argument_utils import _minimal_training_args
 
+    # The TP=2 training configuration requires this on Hopper and earlier.
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     Utils.initialize_model_parallel()
     try:
         args = _minimal_training_args(monkeypatch)
