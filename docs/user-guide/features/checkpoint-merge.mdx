@@ -1,3 +1,8 @@
+---
+title: Weighted Checkpoint Merge
+description: Explains how to merge several Megatron torch_dist checkpoints into a new checkpoint by using manual or range-based weights.
+---
+
 {/*
    Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -6,8 +11,6 @@
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 */}
-
-# Weighted Checkpoint Merge
 
 `tools/checkpoint/weighted_merge.py` applies either exact user-provided weights
 or weights computed by range mode to the model tensors in several Megatron

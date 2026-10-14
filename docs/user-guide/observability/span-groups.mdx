@@ -1,3 +1,8 @@
+---
+title: Span Groups
+description: Explains how to control the granularity of Megatron tracing spans with span group presets and group names.
+---
+
 {/*
    Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -6,8 +11,6 @@
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 */}
-
-# Span Groups
 
 Span granularity in Megatron is controlled by the `MEGATRON_OTEL_SPAN_GROUPS` env var (or `--otel-span-groups` CLI flag). The spec accepts preset keywords, individual group names, or a mix.
 

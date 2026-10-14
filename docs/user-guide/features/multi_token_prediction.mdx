@@ -1,3 +1,8 @@
+---
+title: Multi-Token Prediction (MTP)
+description: Explains Multi-Token Prediction (MTP) in Megatron Core, which predicts several future tokens at each position, and how to configure it.
+---
+
 {/*
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -6,8 +11,6 @@
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 */}
-
-# Multi-Token Prediction (MTP)
 
 Multi-Token Prediction (MTP) extends the prediction scope to several future tokens at each position. An MTP objective adds extra prediction targets, which can improve data efficiency. It may also encourage representations that anticipate later tokens. This implementation predicts additional tokens in sequence and preserves the causal dependency chain at each depth. The following figure illustrates MTP as used in [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3/).
 

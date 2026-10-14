@@ -1,3 +1,8 @@
+---
+title: Distributed Optimizer
+description: Explains how the Megatron Core distributed optimizer saves memory by sharding optimizer state across data-parallel ranks.
+---
+
 {/*
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -6,8 +11,6 @@
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 */}
-
-# Distributed Optimizer
 
 The distributed optimizer saves memory by sharding optimizer state across data parallel ranks instead of replicating it on every rank, as described in the [ZeRO paper](https://arxiv.org/abs/1910.02054).
 

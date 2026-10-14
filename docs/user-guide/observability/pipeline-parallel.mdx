@@ -1,3 +1,8 @@
+---
+title: Pipeline-Parallel Trace Correlation
+description: Explains how Megatron links traces across pipeline-parallel stages so that cross-stage causality is visible in a single trace.
+---
+
 {/*
    Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -6,8 +11,6 @@
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 */}
-
-# Pipeline-Parallel Trace Correlation
 
 When pipeline parallel size > 1, each rank normally creates an independent trace per iteration — making cross-stage causality invisible in Jaeger. Megatron solves this by broadcasting rank 0's trace context to all ranks and linking each stage's receive operation to that context.
 

@@ -1,3 +1,8 @@
+---
+title: Context Parallel Overview
+description: Explains how context parallelism in Megatron Core splits network inputs and activations along the sequence dimension to train long sequences.
+---
+
 {/*
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -6,8 +11,6 @@
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 */}
-
-# Context Parallel Overview
 
 ![Diagram of a transformer layer with tensor parallelism 2 and context parallelism 2, showing CP and TP communication patterns around attention and other blocks.](../../images/context_parallel/CP_overview.png)
 
