@@ -215,6 +215,9 @@ def test_real_graph_slots_preserve_two_outstanding_microbatches(backend, dtype):
             torch.testing.assert_close(x.grad, y.grad)
         for p, q in zip(actual.parameters(), reference.parameters()):
             torch.testing.assert_close(p.grad, q.grad)
+    pending.clear()
+    del hidden, state, expected, ref_state, loss, ref_loss
+    graphs.close()
 
 
 def test_graph_rejects_changed_profile_and_unused_differentiable_output():
@@ -226,6 +229,9 @@ def test_graph_rejects_changed_profile_and_unused_differentiable_output():
     hidden, _ = graphs.run(x, {})
     with pytest.raises(RuntimeError, match="Every differentiable"):
         hidden.sum().backward()
+    graphs.abort()
+    del hidden, _
+    graphs.close()
 
 
 def test_te_graph_rejects_legacy_rng_before_capture_and_recovers(te_rng_tracker):

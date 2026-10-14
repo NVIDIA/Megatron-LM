@@ -22,6 +22,9 @@ from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.test_stateful_module import (  # pylint: disable=unused-import
+    te_rng_tracker,
+)
 
 FIELDS = (
     TensorField("memory", (8, 2), torch.float32, "contiguous", True),
