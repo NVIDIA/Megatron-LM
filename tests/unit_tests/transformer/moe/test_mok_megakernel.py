@@ -42,7 +42,11 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
 
     assert output is hidden and bias is None
     layer.route.assert_called_once_with(hidden, padding_mask, input_ids, packed_seq_params=packed)
-    layer.megakernel_experts.forward.assert_called_once_with(hidden, probs, routes)
+    layer.megakernel_experts.forward.assert_called_once()
+    backend_hidden, backend_probs, backend_routes = layer.megakernel_experts.forward.call_args.args
+    assert backend_hidden is hidden
+    # The backend receives copies with the padding routes dropped; no token here is padding.
+    assert torch.equal(backend_probs, probs) and torch.equal(backend_routes, routes)
     assert checkpoint.call_count == int(recompute)
 
 
