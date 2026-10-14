@@ -3038,6 +3038,9 @@ def _add_distributed_args(parser):
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
 
+    group.add_argument('--use-megatron-fsdp', action='store_true', default=False,
+                       help="Use Megatron's Fully Sharded Data Parallel.")
+
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
                        help=('The number of transformer layers on the first pipeline stage of the decoder. '

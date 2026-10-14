@@ -68,7 +68,7 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
 
 
 @pytest.mark.parametrize("restored_samples", [0, 8, 32])
-def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restored_samples):
+def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restored_samples, run_config):
     from megatron.training import training
 
     parser = ArgumentParser()

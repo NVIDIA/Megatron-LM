@@ -10,7 +10,7 @@ from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 LSQ_SCALE_PARAM_NAMES = ("*_amax_pre", "*_amax_post")
 
 
-def get_lsq_config_overrides(args) -> Dict[ParamKey, ParamGroupOverride]:
+def get_lsq_config_overrides(args, *, base_lr=None) -> Dict[ParamKey, ParamGroupOverride]:
     """Optimizer overrides for scale-learning QAD (LSQ).
 
     Puts the learnable scale (amax) params in their own param group with
@@ -19,7 +19,7 @@ def get_lsq_config_overrides(args) -> Dict[ParamKey, ParamGroupOverride]:
     and the two would collide on resume.
     """
     lsq_scale_lr = getattr(args, "lsq_scale_lr", None)
-    if lsq_scale_lr is None or lsq_scale_lr == args.lr:
+    if lsq_scale_lr is None or lsq_scale_lr == (args.lr if base_lr is None else base_lr):
         return {}
     return {ParamKey(name=LSQ_SCALE_PARAM_NAMES): ParamGroupOverride(max_lr=lsq_scale_lr)}
 
@@ -39,9 +39,11 @@ def install_lsq_optimizer_overrides():
     if getattr(orig, "_lsq_wrapped", False):
         return
 
-    def get_megatron_optimizer_config(args):
-        config, config_overrides = orig(args)
-        config_overrides = {**(config_overrides or {}), **get_lsq_config_overrides(args)}
+    def get_megatron_optimizer_config(args, *, config=None):
+        config, config_overrides = orig(args, config=config)
+        config_overrides = {
+            **(config_overrides or {}), **get_lsq_config_overrides(args, base_lr=config.lr)
+        }
         return config, config_overrides
 
     get_megatron_optimizer_config._lsq_wrapped = True

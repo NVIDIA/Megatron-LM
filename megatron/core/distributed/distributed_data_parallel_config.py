@@ -30,6 +30,15 @@ class DistributedDataParallelConfig:
     PP stage will independently launch as needed.
     """
 
+    create_all_gather_group: bool = False
+    """Create separate data-parallel process groups for parameter all-gathers."""
+
+    use_layer_wise_param_layout: bool = True
+    """Use shard-aligned parameter layouts with the layer-wise distributed optimizer."""
+
+    gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
+    """Accumulate the GTP weight-rematerialization reduce-scatter in FP32."""
+
     use_distributed_optimizer: bool = False
     """If true, issue reduce-scatter collectives to aggregate gradients and clean up
        originally allocated model parameters, otherwise issue all-reduce collectives.
