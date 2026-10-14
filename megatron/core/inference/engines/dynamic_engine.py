@@ -986,6 +986,10 @@ class DynamicInferenceEngine(AbstractEngine):
         context = self.context
         controller = self.controller
 
+        # Pre-compile the ReplaySSM commit kernel, which runs eagerly outside the graphs.
+        if getattr(context, "mamba_replay", None) is not None:
+            context.mamba_replay.warmup_commit()
+
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 

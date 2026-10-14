@@ -144,6 +144,7 @@ class SSMDynamicInferenceMixin:
         batch_indices: torch.Tensor,
         intermediate_conv_state: torch.Tensor = None,
         intermediate_ssm_state: torch.Tensor = None,
+        replay_context: Optional[DynamicInferenceContext] = None,
     ) -> torch.Tensor:
         """Run the single-token-per-request decode kernels.
 
@@ -158,6 +159,10 @@ class SSMDynamicInferenceMixin:
                 intermediate sequence steps (speculative decoding).
             intermediate_ssm_state: Optional buffer for storing SSM states at
                 intermediate sequence steps (speculative decoding).
+            replay_context: The dynamic inference context when ReplaySSM is enabled
+                (`context.mamba_replay` is set), else None. Mamba-2 reads its ring buffers
+                and cursors from `context.mamba_replay`; other variants must assert it is
+                None.
 
         Returns `[decode_req_count, seq_len, d_inner]`; updates state in place.
         Variants that do not yet support speculative decoding should assert
@@ -241,6 +246,9 @@ class SSMDynamicInferenceMixin:
                 batch_indices=context.mamba_metadata.batch_indices_decode,
                 intermediate_conv_state=int_conv_state,
                 intermediate_ssm_state=int_ssm_state,
+                replay_context=(
+                    context if getattr(context, "mamba_replay", None) is not None else None
+                ),
             )
             # Flatten back to [N*S, 1, d] to match the merge logic. reshape, not view: with
             # speculative decoding, some kernels (e.g. GatedDeltaProduct) return a

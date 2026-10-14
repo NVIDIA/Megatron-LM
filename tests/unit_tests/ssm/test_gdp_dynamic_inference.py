@@ -208,6 +208,7 @@ class _FakeSSM(SSMDynamicInferenceMixin):
         batch_indices,
         intermediate_conv_state=None,
         intermediate_ssm_state=None,
+        replay_context=None,
     ):
         self.decode_inputs.append((zxBCdt.clone(), batch_indices.clone()))
         return zxBCdt[..., :2]

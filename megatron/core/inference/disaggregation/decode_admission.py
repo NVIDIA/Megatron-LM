@@ -148,6 +148,11 @@ def admit_prefilled_decode(
     if context.is_hybrid_model:
         assert ssm_state_idx is not None
         context.mamba_metadata.request_to_mamba_state_idx[current_id] = ssm_state_idx
+        # The imported state is exact (the prefill engine hands off before any decode step),
+        # but a recycled slot may still hold the previous occupant's ReplaySSM ring cursors.
+        replay = getattr(context, "mamba_replay", None)
+        if replay is not None:
+            replay.reset_slots([ssm_state_idx])
 
     context.active_token_count = token_end
     context.total_request_count += 1
