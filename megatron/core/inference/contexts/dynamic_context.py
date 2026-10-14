@@ -491,6 +491,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         # Persistent logits destination the controller installs under CUDA graphs.
         self.logits_output_buffer = None
+        self.logits_buffer_multicast_handle = None
 
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
