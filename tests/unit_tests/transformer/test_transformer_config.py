@@ -1,11 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import argparse
+from copy import deepcopy
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from megatron.core.activations import squared_relu
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
+from megatron.training.arguments import (
+    _add_inference_args,
+    _add_network_size_args,
+    _validate_shortcut_moe_inference_args,
+)
 
 
 def _make_glu_interleave_config(**overrides):
@@ -602,3 +612,157 @@ class TestTransformerConfig:
         # num_query_groups then defaults to 0 and the check is skipped.
         config = TransformerConfig(num_layers=1, kv_channels=1)
         assert config.num_query_groups == 0
+
+
+def _make_transformer_config(**kwargs) -> TransformerConfig:
+    return TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, **kwargs)
+
+
+def _make_shortcut_inference_overlap_config(**overrides) -> TransformerConfig:
+    settings = {
+        "num_layers": 2,
+        "hidden_size": 128,
+        "num_attention_heads": 4,
+        "num_moe_experts": 2,
+        "moe_router_topk": 1,
+        "moe_router_pre_softmax": True,
+        "moe_router_dtype": "fp32",
+        "moe_shortcut_connection": True,
+        "expert_tensor_parallel_size": 1,
+        "transformer_impl": "inference_optimized",
+        "normalization": "RMSNorm",
+        "add_bias_linear": False,
+        "params_dtype": torch.bfloat16,
+        "bf16": True,
+        "inference_grouped_gemm_backend": "vllm",
+        "inference_moe_token_dispatcher_type": "nvls",
+        "inference_shortcut_moe_overlap": True,
+    }
+    settings.update(overrides)
+    return TransformerConfig(**settings)
+
+
+def test_shortcut_inference_overlap_is_opt_in_with_expert_cap_default():
+    config = _make_transformer_config()
+
+    assert config.inference_shortcut_moe_overlap is False
+    assert config.inference_shortcut_moe_expert_max_blocks == 304
+
+
+@pytest.mark.parametrize("max_blocks", [0, 304])
+def test_shortcut_inference_overlap_accepts_supported_config_and_cap(max_blocks):
+    config = _make_shortcut_inference_overlap_config(
+        inference_shortcut_moe_expert_max_blocks=max_blocks,
+        cuda_graph_impl="local",
+        inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+    )
+
+    assert config.inference_shortcut_moe_overlap
+    assert config.inference_shortcut_moe_expert_max_blocks == max_blocks
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"moe_shortcut_connection": False}, "requires Shortcut MoE"),
+        ({"transformer_impl": "transformer_engine"}, "for the language model"),
+        ({"params_dtype": torch.float32}, "requires BF16"),
+        ({"fp8": "e4m3"}, "requires BF16"),
+        ({"fp4": "e2m1"}, "requires BF16"),
+        ({"tensor_model_parallel_size": 2}, "requires TP=1 and CP=1"),
+        ({"context_parallel_size": 2}, "requires TP=1 and CP=1"),
+        ({"inference_grouped_gemm_backend": "torch"}, "requires the vllm expert backend"),
+        ({"inference_moe_token_dispatcher_type": "nccl"}, "requires the NVLS dispatcher"),
+        ({"inference_disable_triton_nvls_kernels": True}, "requires Triton NVLS kernels"),
+        (
+            {"fine_grained_activation_offloading": True, "offload_modules": ["attn_norm"]},
+            "fine_grained_activation_offloading=False",
+        ),
+        ({"batch_invariant_mode": True}, "does not support batch-invariant mode"),
+        ({"gdp_cutedsl_kernel": True}, "CuTeDSL GDP kernels"),
+        ({"moe_shared_expert_overlap": True}, "mutually exclusive"),
+    ],
+)
+def test_shortcut_inference_overlap_rejects_unsupported_configuration(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _make_shortcut_inference_overlap_config(**overrides)
+
+
+def test_shortcut_inference_expert_cap_rejects_negative_values():
+    with pytest.raises(ValueError, match="must be nonnegative"):
+        _make_transformer_config(inference_shortcut_moe_expert_max_blocks=-1)
+
+
+def test_shortcut_inference_overlap_is_cleared_from_vision_config():
+    from examples.mimo.model_providers.radio_encoder import _make_dense_non_hybrid
+
+    language_config = _make_shortcut_inference_overlap_config()
+    vision_config = deepcopy(language_config)
+    _make_dense_non_hybrid(vision_config)
+
+    assert language_config.inference_shortcut_moe_overlap
+    assert vision_config.inference_shortcut_moe_overlap is False
+    assert vision_config.moe_shortcut_connection is False
+
+
+def test_shortcut_inference_overlap_cli_has_only_production_controls():
+    parser = argparse.ArgumentParser()
+    _add_network_size_args(parser)
+    _add_inference_args(parser)
+    required = ["--num-layers", "2", "--hidden-size", "128", "--num-attention-heads", "4"]
+    defaults = parser.parse_args(required)
+    enabled = parser.parse_args(required + ["--inference-shortcut-moe-overlap"])
+    disabled = parser.parse_args(
+        required
+        + [
+            "--inference-shortcut-moe-overlap",
+            "--no-inference-shortcut-moe-overlap",
+            "--inference-shortcut-moe-expert-max-blocks",
+            "0",
+        ]
+    )
+
+    assert defaults.inference_shortcut_moe_overlap is False
+    assert defaults.inference_shortcut_moe_expert_max_blocks == 304
+    assert enabled.inference_shortcut_moe_overlap
+    assert disabled.inference_shortcut_moe_overlap is False
+    assert disabled.inference_shortcut_moe_expert_max_blocks == 0
+
+
+def _shortcut_inference_cli_args(**overrides) -> SimpleNamespace:
+    settings = {
+        "inference_shortcut_moe_overlap": True,
+        "inference_shortcut_moe_expert_max_blocks": 304,
+        "transformer_impl": "inference_optimized",
+        "inference_dynamic_batching": True,
+        "use_legacy_static_engine": False,
+        "num_speculative_tokens": 0,
+    }
+    settings.update(overrides)
+    return SimpleNamespace(**settings)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"transformer_impl": "transformer_engine"}, "inference_optimized language layers"),
+        ({"inference_dynamic_batching": False}, "requires dynamic batching"),
+        ({"use_legacy_static_engine": True}, "legacy static engine"),
+        ({"num_speculative_tokens": 1}, "speculative decoding"),
+        ({"inference_shortcut_moe_expert_max_blocks": -1}, "must be nonnegative"),
+    ],
+)
+def test_shortcut_inference_overlap_cli_rejects_unsupported_engine(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _validate_shortcut_moe_inference_args(_shortcut_inference_cli_args(**overrides))
+
+
+def test_shortcut_inference_overlap_cli_disabled_preserves_existing_engines():
+    _validate_shortcut_moe_inference_args(
+        _shortcut_inference_cli_args(
+            inference_shortcut_moe_overlap=False,
+            transformer_impl="transformer_engine",
+            inference_dynamic_batching=False,
+            num_speculative_tokens=1,
+        )
+    )
