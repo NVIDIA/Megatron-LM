@@ -3258,18 +3258,16 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
-    def _mamba_batch_invariant_prefill_chunk_length(
-        self, req: DynamicInferenceRequest, capacity: int, prefix_skip_tokens: int = 0
-    ) -> int:
-        """Raw prefill length that computes an aligned chunk within `capacity`.
+    def _mamba_batch_invariant_prefill_chunk_length(self, remaining: int, capacity: int) -> int:
+        """Number of prompt tokens to compute this step, at most `capacity`.
 
-        Non-final calls must start and end at SSM chunk boundaries. The final
-        prompt call may be shorter because it seeds the decode replay tail.
-        A cached prefix contributes to the returned span, not to compute capacity.
+        `remaining` counts the prompt tokens still to compute (excluding any
+        cached prefix). Non-final calls must start and end at SSM chunk
+        boundaries. The final prompt call may be shorter because it seeds the
+        decode replay tail.
         """
-        remaining = len(req.remaining_prompt_tokens) - prefix_skip_tokens
         if capacity >= remaining:
-            return prefix_skip_tokens + remaining
+            return remaining
 
         alignment = self.context.ssm_chunk_alignment
         computed_tokens = (capacity // alignment) * alignment
@@ -3277,7 +3275,7 @@ class DynamicInferenceEngine(AbstractEngine):
             computed_tokens -= alignment
         if computed_tokens <= 0:
             return 0
-        return prefix_skip_tokens + computed_tokens
+        return computed_tokens
 
     def schedule_waiting_requests(self) -> None:
         """Try to schedule requests from the waiting pool."""
@@ -3588,14 +3586,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     computed_chunk = computed_budget
 
                 if batch_invariant_mamba_prefill:
-                    prefill_chunk_length = self._mamba_batch_invariant_prefill_chunk_length(
-                        req, computed_chunk, prefix_skip_tokens=prefix_skip
+                    computed_chunk = self._mamba_batch_invariant_prefill_chunk_length(
+                        remaining_len - prefix_skip, computed_chunk
                     )
-                    if prefill_chunk_length == 0:
+                    if computed_chunk == 0:
                         can_schedule = False
                         break
-                else:
-                    prefill_chunk_length = prefix_skip + computed_chunk
+                prefill_chunk_length = prefix_skip + computed_chunk
 
                 # Mamba prefix caching: keep chunk boundaries block-aligned.
                 # compute_and_store_offsets() records a recurrent-state snapshot at a
