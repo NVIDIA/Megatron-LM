@@ -3030,11 +3030,12 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
-    group.add_argument('--output-logit-dtype', type=str, choices=['bf16', 'fp32'], default=None,
-                       dest='logit_dtype',
+    group.add_argument('--output-logit-dtype', type=str, choices=['bf16', 'fp16', 'fp32'],
+                       default=None, dest='logit_dtype',
                        help='Output dtype for the language-model output-layer GEMM. When the '
                        'requested dtype differs from the input dtype, Transformer Engine '
-                       'general_gemm is used. By default, logits use the output-layer input dtype.')
+                       'general_gemm is used. By default, training logits use the output-layer '
+                       'input dtype, and models built for inference use fp32 when possible.')
     group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
                        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
     group.add_argument('--mamba-training-ssm-states-dtype', type=str,
