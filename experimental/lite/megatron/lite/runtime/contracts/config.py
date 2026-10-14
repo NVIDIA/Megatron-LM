@@ -67,6 +67,11 @@ class OptimizerConfig:
     offload_fraction: float | None = None
     use_precision_aware_optimizer: bool | None = None
     decoupled_weight_decay: bool | None = None
+    # Overlap fsdp2 CPU-offload optimizer D2H/H2D with the fused CPU AdamW kernel
+    # (pipelined step). Matches the dist_opt / Megatron-Core knob name. Opt-in: only
+    # takes effect when the optimizer is CPU-offloaded AND this is explicitly True;
+    # None/False keep the serial path.
+    overlap_cpu_optimizer_d2h_h2d: bool | None = None
 
 
 @dataclass

@@ -702,6 +702,7 @@ class MegatronLiteEngine(BaseEngine):
             offload_fraction=offload_fraction,
             use_precision_aware_optimizer=override.get("use_precision_aware_optimizer"),
             decoupled_weight_decay=override.get("decoupled_weight_decay"),
+            overlap_cpu_optimizer_d2h_h2d=override.get("overlap_cpu_optimizer_d2h_h2d"),
         )
 
     @staticmethod
