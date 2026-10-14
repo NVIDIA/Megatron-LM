@@ -12,6 +12,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
+from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
@@ -589,6 +590,16 @@ class TopKRouter(Router):
         if seq_aux_loss_coeff == 0:
             return probs
 
+        if (
+            bsz == 1
+            and packed_seq_params is not None
+            and packed_seq_params.tokens_per_sample is None
+            and packed_seq_params.cu_seqlens_q is not None
+        ):
+            return self._apply_packed_seq_aux_loss(
+                probs, scores_for_aux_loss, routing_map, seq_aux_loss_coeff, packed_seq_params
+            )
+
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
         routing_map = routing_map.reshape(seq_length, -1)
 
@@ -632,6 +643,106 @@ class TopKRouter(Router):
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
         )
         return probs
+
+    def _apply_packed_seq_aux_loss(
+        self,
+        probs: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        routing_map: torch.Tensor,
+        seq_aux_loss_coeff: float,
+        packed_seq_params: PackedSeqParams,
+    ) -> torch.Tensor:
+        """Apply sequence-level auxiliary loss to a variable-length THD pack."""
+        num_local_tokens = routing_map.shape[0]
+        num_sequence_slots = packed_seq_params.cu_seqlens_q.numel() - 1
+        sequence_ids = packed_seq_params.moe_seq_idx
+
+        tp_size = self.tp_group.size() if self.config.sequence_parallel else 1
+        expected_tokens = num_local_tokens * tp_size
+        if sequence_ids is None:
+            physical_cu_seqlens = (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
+            )
+            if int(physical_cu_seqlens[-1].item()) != expected_tokens:
+                raise ValueError(
+                    "Packed sequence boundaries do not describe the local pre-SP token stream; "
+                    "provide PackedSeqParams.moe_seq_idx in the local context-parallel order."
+                )
+            sequence_ids = torch.searchsorted(
+                physical_cu_seqlens[1:],
+                torch.arange(
+                    expected_tokens,
+                    dtype=physical_cu_seqlens.dtype,
+                    device=physical_cu_seqlens.device,
+                ),
+                right=True,
+            )
+
+        sequence_ids = sequence_ids.reshape(-1).to(device=routing_map.device)
+        if sequence_ids.numel() != num_local_tokens:
+            if not self.config.sequence_parallel or sequence_ids.numel() != expected_tokens:
+                raise ValueError(
+                    "Packed sequence IDs must match the local token count or the local pre-SP "
+                    f"token count: {sequence_ids.numel()} not in "
+                    f"({num_local_tokens}, {expected_tokens})."
+                )
+            tp_rank = torch.distributed.get_rank(self.tp_group)
+            sequence_ids = sequence_ids.chunk(tp_size)[tp_rank]
+
+        valid_sequence = (sequence_ids >= 0) & (sequence_ids < num_sequence_slots)
+        sequence_ids = sequence_ids[valid_sequence].long()
+        local_prob_sums = scores_for_aux_loss.new_zeros(
+            (num_sequence_slots, self.config.num_moe_experts)
+        )
+        local_prob_sums.index_add_(0, sequence_ids, scores_for_aux_loss[valid_sequence])
+
+        local_tokens_per_expert = torch.zeros(
+            (num_sequence_slots, self.config.num_moe_experts),
+            dtype=torch.int64,
+            device=routing_map.device,
+        )
+        local_tokens_per_expert.index_add_(
+            0, sequence_ids, routing_map[valid_sequence].to(torch.int64)
+        )
+
+        aux_loss_groups = self._get_aux_loss_groups(packed_seq_params)
+        global_tokens_per_expert = local_tokens_per_expert
+        for group in aux_loss_groups.loss_reduce_groups:
+            global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+                global_tokens_per_expert, group
+            )
+
+        num_sequences = (global_tokens_per_expert.sum(dim=1) > 0).sum().clamp_min(1)
+        total_num_tokens = global_tokens_per_expert.sum() // (self.topk * num_sequences)
+        total_num_tokens = total_num_tokens.clamp_min(1)
+        aux_loss = (
+            switch_load_balancing_loss_func(
+                probs=local_prob_sums.reshape(1, -1),
+                tokens_per_expert=global_tokens_per_expert.reshape(-1),
+                total_num_tokens=total_num_tokens,
+                topk=self.topk,
+                num_experts=self.config.num_moe_experts,
+                moe_aux_loss_coeff=seq_aux_loss_coeff,
+                fused=self.config.moe_router_aux_loss_fusion,
+            )
+            / num_sequences
+        )
+        num_valid_tokens = routing_map.sum() // self.topk
+
+        return self.attach_and_log_load_balancing_loss(
+            probs,
+            seq_aux_loss_coeff,
+            aux_loss,
+            "seq_load_balancing_loss",
+            aux_loss_groups.metric_reduce_group,
+            avg_group=aux_loss_groups.metric_avg_group,
+            needs_dp_avg=aux_loss_groups.metric_needs_dp_avg,
+            valid_token_count=num_valid_tokens,
+            aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
+            aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
+        )
 
     def _apply_global_aux_loss(
         self,
