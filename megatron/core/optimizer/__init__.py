@@ -54,7 +54,10 @@ from megatron.core.optimizer_param_scheduler import (
     param_group_override_to_tuple,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
+from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+    get_ep_rank_and_size,
+    get_global_unique_param_name,
+)
 
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
@@ -1230,6 +1233,8 @@ def get_megatron_optimizer(
     if dump_param_to_param_group_map is not None:
         param_to_param_group = {}
         param_group_id = 0
+        # Expert names come from the caller's expert-parallel layout when it passes a collection.
+        ep_rank, ep_size = get_ep_rank_and_size(pg_collection)
     for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
         all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
     ):
@@ -1249,7 +1254,9 @@ def get_megatron_optimizer(
         if dump_param_to_param_group_map is not None:
             for param_group in param_groups:
                 for param in param_group["params"]:
-                    param_name = get_global_unique_param_name(model_chunks, param)
+                    param_name = get_global_unique_param_name(
+                        model_chunks, param, ep_rank=ep_rank, ep_size=ep_size
+                    )
                     param_to_param_group[param_name] = param_group_id
                 param_group_id += 1
 
@@ -1283,7 +1290,9 @@ def get_megatron_optimizer(
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:
             for param in param_group["params"]:
-                param_name = get_global_unique_param_name(model_chunks, param)
+                param_name = get_global_unique_param_name(
+                    model_chunks, param, ep_rank=ep_rank, ep_size=ep_size
+                )
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
     if len(moe_param_groups) > 0:
