@@ -96,7 +96,6 @@ class _MoKAutograd(torch.autograd.Function):
                 "MOK autograd parameter count mismatch: "
                 f"got {len(parameters)}, expected {num_routed_parameters + 2}"
             )
-        routed_parameters = parameters[:num_routed_parameters]
         shared_fc1, shared_fc2 = parameters[num_routed_parameters:]
         workspace = functional.get_workspace(
             module.mok_config,
@@ -141,9 +140,10 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.schedule = schedule
         ctx.forward_context = forward_context
         ctx.routed_weight_views = (fc1_weight_view, fc2_weight_view)
-        ctx.save_for_backward(
-            x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2
-        )
+        # Backward reads routed weights through ctx.routed_weight_views and their main grads
+        # through ctx.module; the routed parameters are inputs only so autograd delivers a
+        # gradient to each one's AccumulateGrad node, which fires the DDP hooks.
+        ctx.save_for_backward(x, router_weights, shared_output_gate_weight, shared_fc1, shared_fc2)
         return output
 
     @staticmethod
@@ -151,9 +151,7 @@ class _MoKAutograd(torch.autograd.Function):
         """Run MOK backward and return gradients for its autograd inputs."""
         from mok import functional
 
-        x, router_weights, shared_output_gate_weight, *parameters = ctx.saved_tensors
-        num_routed_parameters = len(ctx.module.autograd_routed_parameters)
-        shared_fc1, shared_fc2 = parameters[num_routed_parameters:]
+        x, router_weights, shared_output_gate_weight, shared_fc1, shared_fc2 = ctx.saved_tensors
         fc1_weight_view, fc2_weight_view = ctx.routed_weight_views
         if ctx.module.use_mxfp8_weights and ctx.module.native_single_grouped_weights:
             # FC1 backward may need rowwise weights for recompute and columnwise weights for

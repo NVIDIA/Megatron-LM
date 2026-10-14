@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import sys
+import types
+from contextlib import contextmanager, nullcontext
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -90,18 +92,102 @@ def test_gate_up_main_grad_arguments_preserve_fc1_aliases():
     assert tables == (fc1_table, fc1_table, fc2_table)
 
 
-def test_parameter_bridge_uses_main_grad_without_allocating_dummy_storage():
+def test_parameter_bridge_uses_main_grad_and_a_cached_dummy_gradient():
     param = torch.nn.Parameter(torch.zeros((4, 8), dtype=torch.bfloat16))
     param.main_grad = torch.full((4, 8), 0.25, dtype=torch.float32)
     param.grad_added_to_main_grad = False
 
     assert parameter_bridge.main_grad_buffer(param) is param.main_grad
     dummy = parameter_bridge.finish_weight_gradient(param)
+    again = parameter_bridge.dummy_weight_gradient(param)
+    buffer = parameter_bridge.dummy_weight_gradient_buffer(param)
 
-    assert dummy.data_ptr() == param.data_ptr()
+    # Fresh aliases of one buffer cached per (shape, dtype, device), never of the parameter.
+    assert dummy is not again and dummy is not buffer
+    assert dummy.data_ptr() == again.data_ptr() == buffer.data_ptr()
+    assert dummy.data_ptr() != param.data_ptr()
+    assert (dummy.shape, dummy.dtype, dummy.device) == (param.shape, param.dtype, param.device)
+    assert dummy.is_contiguous()
     assert not dummy.requires_grad
     assert param.grad_added_to_main_grad
     torch.testing.assert_close(param.main_grad, torch.full_like(param.main_grad, 0.25))
+
+
+class _FinishWeightGradient(torch.autograd.Function):
+    """Return the parameter bridge's sentinel as the weight gradient, as MOK backward does."""
+
+    @staticmethod
+    def forward(ctx, x, weight):
+        ctx.weight = weight
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, parameter_bridge.finish_weight_gradient(ctx.weight)
+
+
+def _assert_accumulate_grad_steals_sentinel(param, backward_context=nullcontext):
+    """Check that AccumulateGrad stores the sentinel itself, with a DDP-style post hook."""
+    param.grad_added_to_main_grad = False
+    seen = []
+    # MCore DDP registers its hook on the AccumulateGrad node the same way; the hook's extra
+    # reference must still let AccumulateGrad steal the sentinel instead of copying it.
+    grad_accumulator = param.expand_as(param).grad_fn.next_functions[0][0]
+
+    def hook(*unused):
+        seen.append((type(param.grad), param.grad.data_ptr(), param.grad_added_to_main_grad))
+        param.grad = None
+
+    grad_accumulator.register_hook(hook)
+    x = torch.ones(4, device=param.device, requires_grad=True)
+    loss = _FinishWeightGradient.apply(x, param).sum()
+    with backward_context():
+        loss.backward()
+
+    buffer = parameter_bridge.dummy_weight_gradient_buffer(param)
+    assert seen == [(torch.Tensor, buffer.data_ptr(), True)]
+    assert param.grad is None
+
+
+def test_accumulate_grad_steals_dummy_gradient():
+    _assert_accumulate_grad_steals_sentinel(
+        torch.nn.Parameter(torch.zeros((4, 8), dtype=torch.bfloat16))
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 parameters need a Blackwell GPU",
+)
+def test_accumulate_grad_steals_dummy_gradient_for_mxfp8_parameter(monkeypatch):
+    te = pytest.importorskip("transformer_engine.pytorch")
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+
+    from megatron.core.fp8_utils import is_mxfp8tensor
+
+    with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+        linear = te.Linear(128, 256, bias=False, params_dtype=torch.bfloat16)
+    param = linear.weight
+    assert is_mxfp8tensor(param)
+
+    constructed = []
+    make_like = QuantizedTensor.make_like.__func__
+
+    def counting_make_like(cls, *args, **kwargs):
+        constructed.append(cls)
+        return make_like(cls, *args, **kwargs)
+
+    @contextmanager
+    def count_quantized_tensor_constructions():
+        with monkeypatch.context() as patch:
+            patch.setattr(QuantizedTensor, "make_like", classmethod(counting_make_like))
+            yield
+
+    # A plain BF16 sentinel serves the quantized parameter: autograd neither casts nor copies it
+    # (either would change its address), and backward constructs no quantized tensor for it.
+    _assert_accumulate_grad_steals_sentinel(param, count_quantized_tensor_constructions)
+    assert constructed == []
 
 
 def test_aliased_parameter_metadata_survives_dtype_conversion():
@@ -119,8 +205,14 @@ def test_aliased_parameter_metadata_survives_dtype_conversion():
     backend = mok_backend.MoKMegakernel.__new__(mok_backend.MoKMegakernel)
     torch.nn.Module.__init__(backend)
     backend.register_parameter("routed_fc1_weight", parameter)
-    backend._routed_weight_view_cache = object()
-    backend._split_main_grad_descriptor_cache = object()
+    derived_state = (
+        "_routed_weight_view_cache",
+        "_routed_parameter_cache",
+        "_routed_dummy_gradient_buffers",
+        "_main_grad_arguments_cache",
+    )
+    for name in derived_state:
+        setattr(backend, name, object())
     backend.is_first_microbatch = False
 
     # TE quantized parameters use this swap path when model.cuda()/to() visits
@@ -139,8 +231,7 @@ def test_aliased_parameter_metadata_survives_dtype_conversion():
     assert owner.weight.tensor_model_parallel is True
     assert owner.weight.get_high_precision_init_val() is high_precision_init
     assert owner.weight.get_high_precision_init_val.__self__ is owner.weight
-    assert backend._routed_weight_view_cache is None
-    assert backend._split_main_grad_descriptor_cache is None
+    assert all(getattr(backend, name) is None for name in derived_state)
     assert backend.is_first_microbatch
 
 
@@ -270,8 +361,7 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
     torch.nn.Module.__init__(module)
     module.native_single_grouped_weights = True
     module.use_mxfp8_weights = True
-    module.is_first_microbatch = True
-    module._routed_weight_view_cache = None
+    module._reset_derived_state()
     module.routed_fc1_weight = object()
     module.routed_fc2_weight = object()
     module.num_local_experts = 2
@@ -305,8 +395,7 @@ def _split_module(*, use_mxfp8_weights):
     torch.nn.Module.__init__(module)
     module.native_single_grouped_weights = False
     module.use_mxfp8_weights = use_mxfp8_weights
-    module.is_first_microbatch = True
-    module._routed_weight_view_cache = None
+    module._reset_derived_state()
     module.intermediate_size = 4
     module.hidden_size = 8
     module._routed_fc1_parameter_names = ("routed_fc1_weight0", "routed_fc1_weight1")
@@ -434,8 +523,14 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped, gated):
     mok.native_single_grouped_weights = single_grouped
     mok.intermediate_size = 4
     mok.hidden_size = 8
-    mok._routed_weight_view_cache = object()
-    mok._split_main_grad_descriptor_cache = object()
+    derived_state = (
+        "_routed_weight_view_cache",
+        "_routed_parameter_cache",
+        "_routed_dummy_gradient_buffers",
+        "_main_grad_arguments_cache",
+    )
+    for name in derived_state:
+        setattr(mok, name, object())
     mok.is_first_microbatch = False
     if single_grouped:
         mok.register_parameter("routed_fc1_weight", routed_fc1)
@@ -472,8 +567,7 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped, gated):
     if gated:
         torch.testing.assert_close(gate_weight, checkpoint["shared_experts.gate_weight"])
         assert mok.shared_output_gate_weight is shared.gate_weight
-    assert mok._routed_weight_view_cache is None
-    assert mok._split_main_grad_descriptor_cache is None
+    assert all(getattr(mok, name) is None for name in derived_state)
     assert mok.is_first_microbatch
 
 
@@ -490,7 +584,6 @@ def test_output_gate_autograd_preserves_native_main_grad(monkeypatch, gated, mai
     )
     module._register_shared_weights(shared, use_output_gate=gated)
     module.mok_config = module.ep_group = object()
-    module._split_main_grad_descriptor_cache = None
     module.num_local_experts = module.topk = 2
     module.swiglu_limit = None
     parameters = tuple(module.parameters())
@@ -568,3 +661,144 @@ def test_output_gate_autograd_preserves_native_main_grad(monkeypatch, gated, mai
     finally:
         for handle in handles:
             handle.remove()
+
+
+def test_routed_parameter_tuples_are_resolved_once_until_apply():
+    module = _split_module(use_mxfp8_weights=False)
+    routed = module.autograd_routed_parameters
+    expected = [module.get_parameter(name) for name in module._routed_fc1_parameter_names]
+    expected += [module.get_parameter(name) for name in module._routed_fc2_parameter_names]
+
+    assert module.autograd_routed_parameters is routed
+    assert module.routed_fc1_parameters is module.routed_fc1_parameters
+    assert all(actual is param for actual, param in zip(routed, expected, strict=True))
+
+    # Device and dtype conversions may replace parameter objects, so they drop the tuples.
+    module.float()
+    assert module.autograd_routed_parameters is not routed
+    assert all(
+        actual is module.get_parameter(name)
+        for actual, name in zip(
+            module.autograd_routed_parameters,
+            module._routed_fc1_parameter_names + module._routed_fc2_parameter_names,
+            strict=True,
+        )
+    )
+
+
+def _split_module_with_main_grads(monkeypatch):
+    """Return a split BF16 module with main grads and a fake ``mok.ops`` recording tables."""
+    module = _split_module(use_mxfp8_weights=False)
+    module.register_parameter(
+        "shared_fc1_weight", torch.nn.Parameter(torch.randn((8, 8), dtype=torch.bfloat16))
+    )
+    module.register_parameter(
+        "shared_fc2_weight", torch.nn.Parameter(torch.randn((8, 4), dtype=torch.bfloat16))
+    )
+    for param in module.parameters():
+        param.main_grad = torch.zeros(param.shape, dtype=torch.float32)
+
+    tables = []
+
+    def make_routed_d_weight_storage_table(main_grads):
+        tables.append(tuple(main_grads))
+        return object()
+
+    fake_mok = types.ModuleType("mok")
+    fake_mok.ops = SimpleNamespace(
+        make_routed_d_weight_storage_table=make_routed_d_weight_storage_table
+    )
+    monkeypatch.setitem(sys.modules, "mok", fake_mok)
+    return module, fake_mok, tables
+
+
+def test_main_grad_arguments_are_reused_until_a_main_grad_changes(monkeypatch):
+    module, _, tables = _split_module_with_main_grads(monkeypatch)
+    validated = []
+    main_grad_buffer = parameter_bridge.main_grad_buffer
+
+    def counting_main_grad_buffer(param):
+        validated.append(param)
+        return main_grad_buffer(param)
+
+    monkeypatch.setattr(mok_backend, "_main_grad_buffer", counting_main_grad_buffer)
+    fc1, fc2 = module.routed_fc1_parameters, module.routed_fc2_parameters
+
+    first = module.main_grad_arguments()
+    assert module.main_grad_arguments() is first
+    assert len(validated) == 6 and len(tables) == 2
+    main_grads, storage_tables = first
+    expected = (
+        module.shared_fc1_weight.main_grad,
+        fc1[0].main_grad,
+        module.shared_fc2_weight.main_grad,
+        fc2[0].main_grad,
+    )
+    assert all(actual is grad for actual, grad in zip(main_grads, expected, strict=True))
+    assert len(storage_tables) == 2
+    assert all(actual is param.main_grad for actual, param in zip(tables[0] + tables[1], fc1 + fc2))
+
+    # A replaced main_grad (for example, rebuilt DDP buffers) is revalidated and redescribed.
+    fc1[1].main_grad = torch.zeros_like(fc1[1].main_grad)
+    second = module.main_grad_arguments()
+    assert second is not first
+    assert len(validated) == 12 and len(tables) == 4
+    assert tables[2][1] is fc1[1].main_grad
+    assert module.main_grad_arguments() is second
+
+    # Storage that moves under the same main_grad object (grad-buffer offload and reload) too.
+    fc2[0].main_grad.set_(torch.zeros_like(fc2[0].main_grad))
+    third = module.main_grad_arguments()
+    assert third is not second and len(tables) == 6
+
+    # A missing main_grad still raises the validation error instead of reusing the cache.
+    del fc2[1].main_grad
+    with pytest.raises(RuntimeError, match="requires DDP to assign param.main_grad"):
+        module.main_grad_arguments()
+
+
+def test_mok_autograd_saves_only_backward_inputs_and_grads_every_routed_parameter(monkeypatch):
+    module, fake_mok, _ = _split_module_with_main_grads(monkeypatch)
+    module.mok_config = object()
+    module.ep_group = None
+    module.num_local_experts = 2
+    module.swiglu_limit = None
+    monkeypatch.setattr(mok_backend, "_native_split_weight_view", lambda *a, **k: object())
+
+    def forward(config, workspace, schedule, x, router_weights, *weights, swiglu_limit):
+        return x * 2, "forward_context"
+
+    def backward(config, workspace, schedule, forward_context, grad_output, *args, **kwargs):
+        x, router_weights = args[:2]
+        return (2 * grad_output, torch.ones_like(router_weights)) + (None,) * 6
+
+    fake_mok.functional = SimpleNamespace(
+        get_workspace=lambda *args, **kwargs: "workspace",
+        build_schedule=lambda *args, **kwargs: "schedule",
+        forward=forward,
+        backward=backward,
+    )
+    x = torch.randn((4, 8), dtype=torch.bfloat16, requires_grad=True)
+    router_weights = torch.rand((4, 2), requires_grad=True)
+    top_experts = torch.zeros((4, 2), dtype=torch.int32)
+    routed = module.autograd_routed_parameters
+    shared = (module.shared_fc1_weight, module.shared_fc2_weight)
+
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: saved.append(t) or t, lambda t: t):
+        output = mok_runtime._MoKAutograd.apply(
+            module, x, router_weights, top_experts, None, *routed, *shared
+        )
+    # Backward reaches routed weights through the module, so only these are saved.
+    assert len(saved) == 4
+    assert all(actual is t for actual, t in zip(saved, (x, router_weights, *shared)))
+
+    output.float().sum().backward()
+
+    torch.testing.assert_close(x.grad, torch.full_like(x, 2))
+    torch.testing.assert_close(router_weights.grad, torch.ones_like(router_weights))
+    # Every parameter input still receives a gradient, so each DDP AccumulateGrad hook fires.
+    for param in routed + shared:
+        assert param.grad_added_to_main_grad
+        buffer = parameter_bridge.dummy_weight_gradient_buffer(param)
+        assert param.grad is not None and param.grad.data_ptr() == buffer.data_ptr()

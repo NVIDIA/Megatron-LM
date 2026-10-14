@@ -8,6 +8,8 @@ replaces dispatch, routed/shared expert computation, and combine.
 
 from __future__ import annotations
 
+import operator
+from dataclasses import dataclass
 from types import MethodType
 from typing import TYPE_CHECKING
 
@@ -23,7 +25,7 @@ from megatron.core.transformer.moe.megakernel.mok.weights import (
     _native_split_weight_view,
 )
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
-    finish_weight_gradient as _finish_weight_gradient,
+    dummy_weight_gradient_buffer as _dummy_weight_gradient_buffer,
 )
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     main_grad_buffer as _main_grad_buffer,
@@ -31,6 +33,29 @@ from megatron.core.transformer.moe.megakernel.parameter_bridge import (
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+_get_main_grad = operator.attrgetter("main_grad")
+
+
+@dataclass(frozen=True, eq=False)
+class _MainGradArguments:
+    """Validated MOK main-grad arguments and the buffers they were built from."""
+
+    parameters: tuple[nn.Parameter, ...]
+    main_grads: tuple[torch.Tensor, ...]
+    data_ptrs: tuple[int, ...]
+    arguments: tuple
+
+    def is_current(self) -> bool:
+        """Return whether every parameter still owns the same ``main_grad`` at the same address."""
+        try:
+            current = map(_get_main_grad, self.parameters)
+            if not all(map(operator.is_, current, self.main_grads)):
+                return False
+        except AttributeError:
+            return False
+        return self.data_ptrs == tuple(map(torch.Tensor.data_ptr, self.main_grads))
 
 
 class MoKMegakernel(MegakernelBackend):
@@ -140,55 +165,98 @@ class MoKMegakernel(MegakernelBackend):
         # storage. BF16 weights update in place; MXFP8 converted scales refresh
         # once per optimizer iteration while retaining graph-captured addresses.
         self._routed_weight_view_cache = None
-        self._split_main_grad_descriptor_cache = None
+        # Host-side state resolved once instead of on every call, which matters with
+        # 2 * num_local_experts split routed parameters. _reset_derived_state clears
+        # these and the weight views.
+        self._routed_parameter_cache = None
+        self._routed_dummy_gradient_buffers = None
+        self._main_grad_arguments_cache = None
+
+    def _routed_parameter_groups(self) -> tuple[tuple[nn.Parameter, ...], ...]:
+        """Return the (FC1, FC2, FC1 + FC2) routed parameter aliases, resolved once."""
+        groups = self._routed_parameter_cache
+        if groups is None:
+            if self.native_single_grouped_weights:
+                fc1 = (self.routed_fc1_weight,)
+                fc2 = (self.routed_fc2_weight,)
+            else:
+                fc1 = tuple(getattr(self, name) for name in self._routed_fc1_parameter_names)
+                fc2 = tuple(getattr(self, name) for name in self._routed_fc2_parameter_names)
+            groups = (fc1, fc2, fc1 + fc2)
+            self._routed_parameter_cache = groups
+        return groups
 
     @property
     def routed_fc1_parameters(self) -> tuple[nn.Parameter, ...]:
         """Return the MCore-owned routed FC1 parameters."""
-        if self.native_single_grouped_weights:
-            return (self.routed_fc1_weight,)
-        return tuple(getattr(self, name) for name in self._routed_fc1_parameter_names)
+        return self._routed_parameter_groups()[0]
 
     @property
     def routed_fc2_parameters(self) -> tuple[nn.Parameter, ...]:
         """Return the MCore-owned routed FC2 parameters."""
-        if self.native_single_grouped_weights:
-            return (self.routed_fc2_weight,)
-        return tuple(getattr(self, name) for name in self._routed_fc2_parameter_names)
+        return self._routed_parameter_groups()[1]
 
     @property
     def autograd_routed_parameters(self) -> tuple[nn.Parameter, ...]:
         """Return routed parameters tracked by the MOK autograd bridge."""
-        return self.routed_fc1_parameters + self.routed_fc2_parameters
+        return self._routed_parameter_groups()[2]
 
     def main_grad_arguments(self):
-        """Return MOK logical main grads and optional per-expert descriptors."""
-        shared_fc1_grad = _main_grad_buffer(self.shared_fc1_weight)
-        shared_fc2_grad = _main_grad_buffer(self.shared_fc2_weight)
-        fc1_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc1_parameters)
-        fc2_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc2_parameters)
-        main_grads = (shared_fc1_grad, fc1_main_grads[0], shared_fc2_grad, fc2_main_grads[0])
+        """Return MOK logical main grads and optional per-expert descriptors.
+
+        DDP assigns each ``main_grad`` once, so the validation and descriptor tables are reused
+        until a parameter's ``main_grad`` is replaced or its storage moves (for example, a
+        grad-buffer offload and reload).
+        """
+        cached = self._main_grad_arguments_cache
+        if cached is not None and cached.is_current():
+            return cached.arguments
+
+        routed = self.autograd_routed_parameters
+        parameters = (self.shared_fc1_weight, self.shared_fc2_weight, *routed)
+        main_grads = tuple(_main_grad_buffer(param) for param in parameters)
+        num_routed_fc1 = len(self.routed_fc1_parameters)
+        fc1_main_grads = main_grads[2 : 2 + num_routed_fc1]
+        fc2_main_grads = main_grads[2 + num_routed_fc1 :]
+        logical_main_grads = (main_grads[0], fc1_main_grads[0], main_grads[1], fc2_main_grads[0])
         if self.native_single_grouped_weights:
-            return main_grads, None
+            arguments = (logical_main_grads, None)
+        else:
+            from mok import ops
 
-        from mok import ops
-
-        fingerprint = tuple(
-            (grad.data_ptr(), grad.dtype, tuple(grad.shape))
-            for grad in fc1_main_grads + fc2_main_grads
-        )
-        if (
-            self._split_main_grad_descriptor_cache is None
-            or self._split_main_grad_descriptor_cache[0] != fingerprint
-        ):
             fc1_table = ops.make_routed_d_weight_storage_table(list(fc1_main_grads))
             fc2_table = ops.make_routed_d_weight_storage_table(list(fc2_main_grads))
-            self._split_main_grad_descriptor_cache = (fingerprint, (fc1_table, fc2_table))
-        return main_grads, self._split_main_grad_descriptor_cache[1]
+            arguments = (logical_main_grads, (fc1_table, fc2_table))
+        self._main_grad_arguments_cache = _MainGradArguments(
+            parameters=parameters,
+            main_grads=main_grads,
+            data_ptrs=tuple(grad.data_ptr() for grad in main_grads),
+            arguments=arguments,
+        )
+        return arguments
 
     def finish_routed_weight_gradients(self) -> tuple[torch.Tensor, ...]:
-        """Finalize and return routed weight gradients."""
-        return tuple(_finish_weight_gradient(param) for param in self.autograd_routed_parameters)
+        """Finalize and return routed weight gradients.
+
+        Same contract as ``parameter_bridge.finish_weight_gradient``, with each parameter's
+        gradient-sentinel buffer looked up once rather than on every backward.
+        """
+        parameters = self.autograd_routed_parameters
+        buffers = self._routed_dummy_gradient_buffers
+        if buffers is None:
+            buffers = tuple(_dummy_weight_gradient_buffer(param) for param in parameters)
+            self._routed_dummy_gradient_buffers = buffers
+        for param in parameters:
+            param.grad_added_to_main_grad = True
+        return tuple(map(torch.Tensor.detach, buffers))
+
+    def _reset_derived_state(self) -> None:
+        """Drop all state derived from the aliased parameters and their main grads."""
+        self._routed_weight_view_cache = None
+        self._routed_parameter_cache = None
+        self._routed_dummy_gradient_buffers = None
+        self._main_grad_arguments_cache = None
+        self.is_first_microbatch = True
 
     @torch.no_grad()
     def _register_shared_weights(self, shared: nn.Module, *, use_output_gate: bool = False) -> None:
@@ -314,9 +382,7 @@ class MoKMegakernel(MegakernelBackend):
         """Skip parameter aliases and invalidate state derived from native weights."""
         del state_dict, prefix, local_metadata, strict
         del missing_keys, unexpected_keys, error_msgs
-        self._routed_weight_view_cache = None
-        self._split_main_grad_descriptor_cache = None
-        self.is_first_microbatch = True
+        self._reset_derived_state()
 
     def _apply(self, *args, **kwargs):
         """Preserve externally attached parameter attributes across device/dtype moves.
@@ -332,6 +398,9 @@ class MoKMegakernel(MegakernelBackend):
         ``_high_precision_init_val`` are lost. DDP / the layer-wise optimizer then treat the routed
         experts as data-parallel replicas (grads all-reduced across EP ranks, master weights
         sharded over dp_cp, identical experts across the EP group). Mirror TE's fix here.
+
+        The conversion can also replace parameter objects or their storage, so all derived state
+        is reset.
         """
         snapshots = {
             name: (param, dict(param.__dict__))
@@ -349,10 +418,7 @@ class MoKMegakernel(MegakernelBackend):
                 if isinstance(value, MethodType) and value.__self__ is old_param:
                     value = MethodType(value.__func__, new_param)
                 setattr(new_param, key, value)
-        # Device/dtype conversion invalidates cached storage views and descriptors.
-        self._routed_weight_view_cache = None
-        self._split_main_grad_descriptor_cache = None
-        self.is_first_microbatch = True
+        self._reset_derived_state()
         return out
 
     def forward(
