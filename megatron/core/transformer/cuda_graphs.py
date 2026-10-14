@@ -35,6 +35,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     ensure_params_ready,
     get_attr_wrapped_model,
+    get_pg_size,
     get_torch_version,
     is_te_min_version,
     log_on_each_pipeline_stage,
@@ -1905,6 +1906,9 @@ class CudaGraphManager(torch.nn.Module):
         Args:
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
+            pg_collection: Process groups whose pipeline group decides whether graphs are
+                reused across microbatches. Defaults to the collection of the module being
+                graphed, looked up on the first call.
             inline_capture: Normally, whether the inline capture path is taken depends on whether
                 `inference_context` is present in the kwargs of the forward call.
                 Setting this argument to True always forces the inline capture path to be taken.
@@ -1912,8 +1916,9 @@ class CudaGraphManager(torch.nn.Module):
         """
         self._inline_capture = inline_capture
         self._num_warmup_steps = num_warmup_steps
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Modules create their manager in GraphableMegatronModule.__init__, before they store
+        # their own pg_collection, so the module's collection is looked up on the first call
+        # (see _resolve_reuse_cudagraphs).
         self.pg_collection = pg_collection
         rng_tracker = get_cuda_rng_tracker()
         self.need_backward = need_backward
@@ -1953,10 +1958,8 @@ class CudaGraphManager(torch.nn.Module):
         self.custom_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
         self.is_first_microbatch = False
 
-        # Without pipeline parallelism, microbatches execute one at a time.
-        # Therefore modules will always execute in the same order, so cudagraphs
-        # can both be reused and share a single mempool.
-        self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
+        # Decided on the first call; see _resolve_reuse_cudagraphs.
+        self.reuse_cudagraphs = None
         if CudaGraphManager.global_mempool is None:
             CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
             # Register the pool so GTP allocates GRAPHED-chain buffers + quantized
@@ -1971,6 +1974,25 @@ class CudaGraphManager(torch.nn.Module):
         # idempotent, and graph creation removes the hook before capture begins.
         if need_backward:
             _CudagraphGlobalRecord._enable_saved_tensors_observer()
+
+    def _resolve_reuse_cudagraphs(self, megatron_module):
+        """Return whether cudagraphs are reused across microbatches, deciding it on the first call.
+
+        Without pipeline parallelism, microbatches execute one at a time. Therefore modules
+        will always execute in the same order, so cudagraphs can both be reused and share a
+        single mempool. The pipeline group comes from `pg_collection` if it was given, else from
+        the collection of the graphed module, where a `pp` set to None means no pipeline
+        parallelism. The global parallel state is used only when neither collection sets `pp`.
+        """
+        if self.reuse_cudagraphs is None:
+            pg_collection = self.pg_collection
+            if pg_collection is None:
+                pg_collection = getattr(megatron_module, "pg_collection", None)
+            if pg_collection is None or "pp" not in vars(pg_collection):
+                # Compatibility fallback for graphed modules without a pipeline group.
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['pp'])
+            self.reuse_cudagraphs = get_pg_size(pg_collection.pp) == 1
+        return self.reuse_cudagraphs
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -2087,7 +2109,11 @@ class CudaGraphManager(torch.nn.Module):
                     self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(
-                megatron_module, args, kwargs, self.reuse_cudagraphs, cache_key=cache_key
+                megatron_module,
+                args,
+                kwargs,
+                self._resolve_reuse_cudagraphs(megatron_module),
+                cache_key=cache_key,
             )
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
@@ -2141,7 +2167,7 @@ class CudaGraphManager(torch.nn.Module):
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
             elif self.training or is_in_checkpoint_fwd:
                 runner = self.get_cudagraph_runner(
-                    megatron_module, args, kwargs, self.reuse_cudagraphs
+                    megatron_module, args, kwargs, self._resolve_reuse_cudagraphs(megatron_module)
                 )
                 out = runner.record_graph_capture(args, kwargs)
             else:
