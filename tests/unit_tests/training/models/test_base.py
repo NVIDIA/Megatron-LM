@@ -55,7 +55,7 @@ class DummySubConfig:
     y: str = "sub"
 
 
-def _dummy_callable() -> None:
+def _dummy_callable(value=None, *, sub=None) -> None:
     """Placeholder callable used as a field default in DummyNestedModelConfig."""
 
 
@@ -275,6 +275,23 @@ class TestModelConfigFromDict:
         assert cfg.sub.y == "nested"
         # Encoded callable fields resolve back to the original function.
         assert cfg.fn_field is _dummy_callable
+
+    def test_round_trip_partial_with_nested_dataclasses(self):
+        from functools import partial
+
+        import yaml
+
+        from megatron.training.config.yaml_utils import safe_yaml_representers
+
+        original = DummyNestedModelConfig(
+            fn_field=partial(_dummy_callable, DummySubConfig(x=7), sub=DummySubConfig(x=9))
+        )
+        with safe_yaml_representers():
+            saved = yaml.safe_load(yaml.safe_dump(original.as_dict()))
+        restored = ModelConfig.from_dict(saved)
+        assert restored.fn_field.func is _dummy_callable
+        assert restored.fn_field.args == (DummySubConfig(x=7),)
+        assert restored.fn_field.keywords == {'sub': DummySubConfig(x=9)}
 
 
 # =============================================================================

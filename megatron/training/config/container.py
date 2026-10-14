@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
 from typing import Any, Type, TypeVar
@@ -34,7 +34,8 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import Serializable
+from megatron.training.models.base import ModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -255,7 +256,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    model: HybridModelConfig | GPTModelConfig
+    model: ModelConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
@@ -271,10 +272,32 @@ class PretrainConfigContainer(ConfigContainerBase):
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
 
+    def finalize(self) -> None:
+        """Resolve model-owned precision inputs before runtime initialization."""
+        self.optimizer = self.finalize_optimizer_config(self.optimizer)
+
+    def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> OptimizerConfig:
+        """Derive shared precision for the configured or legacy-built optimizer."""
+        # Reconstruct so optimizer-local derived precision settings are recomputed too.
+        return replace(
+            optimizer,
+            fp16=self.model.transformer.fp16,
+            bf16=self.model.transformer.bf16,
+            params_dtype=self.model.transformer.params_dtype,
+            fp8_recipe=self.model.transformer.fp8_recipe,
+        )
+
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
         super().validate()
         transformer = getattr(self.model, "transformer", None)
+        if transformer is not None and transformer.gtp_remat_num_sequence_shards > 1:
+            if self.checkpoint.ckpt_format != "torch_dist":
+                raise ValueError("GTP sequence sharding requires torch_dist checkpoints")
+            if self.dist.use_torch_fsdp2 or self.dist.use_megatron_fsdp:
+                raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
+            if self.dist.use_tp_pp_dp_mapping:
+                raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
         cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
         self.rl.validate_run(
             cuda_graph_impl=cuda_graph_impl,
@@ -301,7 +324,7 @@ class InferenceConfigContainer(ConfigContainerBase):
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
 
-    model: HybridModelConfig | GPTModelConfig
+    model: ModelConfig
     """Which model to load for inference."""
 
     checkpoint: CheckpointConfig

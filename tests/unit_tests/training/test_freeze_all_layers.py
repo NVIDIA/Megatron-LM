@@ -10,10 +10,10 @@ motivates the fix: a recv_prev input activation with ``requires_grad=True``.
 """
 
 from contextlib import nullcontext
-from types import SimpleNamespace
 
 import torch
 
+from megatron.training.models.base import ModelConfig
 from megatron.training.training import _forward_backward_grad_context, _freeze_all_model_chunks
 
 
@@ -135,9 +135,9 @@ def _forward_through_frozen_stage(chunk, recv_prev):
 
 def test_frozen_returns_no_grad_and_forward_only():
     """With --freeze-all-layers: no_grad context and forward_only=True."""
-    args = SimpleNamespace(freeze_all_layers=True)
+    config = ModelConfig(freeze_all_layers=True)
 
-    grad_context, forward_only = _forward_backward_grad_context(args)
+    grad_context, forward_only = _forward_backward_grad_context(config)
 
     assert isinstance(grad_context, torch.no_grad)
     assert forward_only is True
@@ -145,17 +145,17 @@ def test_frozen_returns_no_grad_and_forward_only():
 
 def test_unfrozen_returns_nullcontext_and_not_forward_only():
     """Without --freeze-all-layers: no-op context and forward_only=False."""
-    args = SimpleNamespace(freeze_all_layers=False)
+    config = ModelConfig(freeze_all_layers=False)
 
-    grad_context, forward_only = _forward_backward_grad_context(args)
+    grad_context, forward_only = _forward_backward_grad_context(config)
 
     assert isinstance(grad_context, nullcontext)
     assert forward_only is False
 
 
-def test_missing_flag_defaults_to_not_frozen():
-    """A minimal args mock (no freeze_all_layers attr) is treated as unfrozen."""
-    grad_context, forward_only = _forward_backward_grad_context(SimpleNamespace())
+def test_default_config_is_not_frozen():
+    """The default model config keeps normal training gradients enabled."""
+    grad_context, forward_only = _forward_backward_grad_context(ModelConfig())
 
     assert isinstance(grad_context, nullcontext)
     assert forward_only is False
@@ -180,9 +180,9 @@ def test_pp_gt1_frozen_forward_under_context_skips_graph():
     suppresses the autograd graph even though recv_prev requires grad."""
     chunk = _FakeModelChunk()
     _freeze_all_model_chunks([chunk])
-    args = SimpleNamespace(freeze_all_layers=True)
+    config = ModelConfig(freeze_all_layers=True)
 
-    grad_context, _ = _forward_backward_grad_context(args)
+    grad_context, _ = _forward_backward_grad_context(config)
     with grad_context:
         assert not torch.is_grad_enabled()
         out = _forward_through_frozen_stage(chunk, _recv_prev_activation())
@@ -195,9 +195,9 @@ def test_unfrozen_forward_builds_graph_normally():
     """The no-op context leaves normal (trainable) training untouched: a forward
     over a recv_prev input still builds its graph."""
     chunk = _FakeModelChunk()  # params trainable
-    args = SimpleNamespace(freeze_all_layers=False)
+    config = ModelConfig(freeze_all_layers=False)
 
-    grad_context, _ = _forward_backward_grad_context(args)
+    grad_context, _ = _forward_backward_grad_context(config)
     with grad_context:
         assert torch.is_grad_enabled()
         out = _forward_through_frozen_stage(chunk, _recv_prev_activation())

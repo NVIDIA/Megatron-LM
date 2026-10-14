@@ -70,6 +70,9 @@ class HybridModelConfig(ModelConfig):
     vocab_size: int | None = None
     should_pad_vocab: bool = False
 
+    tp_comm_overlap_cfg: str | dict[str, Any] | None = None
+    """Transformer Engine user-buffer overrides, as a YAML path or a dictionary."""
+
     @property
     def mamba_stack_spec(self):
         """Deprecated alias for hybrid_stack_spec."""

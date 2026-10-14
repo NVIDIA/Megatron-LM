@@ -1,48 +1,71 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
-from types import SimpleNamespace
 
+import torch
+
+from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer import TransformerConfig
+from megatron.training.models import GPTModelConfig
 from megatron.training.theoretical_memory_usage import compute_weight_and_optimizer_memory
 
 
-def _make_args(**overrides):
-    args = SimpleNamespace(
+def _memory_inputs(**overrides):
+    values = dict(
         add_bias_linear=False,
         data_parallel_size=16,
         expert_model_parallel_size=2,
         expert_tensor_parallel_size=4,
         ffn_hidden_size=16,
-        group_query_attention=False,
         hidden_size=8,
-        kv_channels=4,
+        kv_channels=2,
         moe_ffn_hidden_size=16,
         moe_latent_size=None,
         moe_layer_freq=[0, 1],
         moe_router_topk=1,
+        moe_router_pre_softmax=True,
         moe_shared_expert_gate=False,
         moe_shared_expert_intermediate_size=8,
         mtp_num_layers=None,
         multi_latent_attention=False,
         normalization="RMSNorm",
-        num_attention_heads=2,
-        num_experts=4,
+        num_attention_heads=4,
+        num_moe_experts=4,
         num_layers=2,
         padded_vocab_size=32,
         pipeline_model_parallel_size=1,
-        swiglu=False,
         tensor_model_parallel_size=2,
         untie_embeddings_and_output_weights=False,
         use_distributed_optimizer=True,
         world_size=32,
     )
-    for name, value in overrides.items():
-        setattr(args, name, value)
-    return args
+    values.update(overrides)
+    data_parallel_size = values.pop("data_parallel_size")
+    world_size = values.pop("world_size")
+    optimizer = OptimizerConfig(use_distributed_optimizer=values.pop("use_distributed_optimizer"))
+    vocab_size = values.pop("padded_vocab_size")
+    share_embeddings = not values.pop("untie_embeddings_and_output_weights")
+    transformer = TransformerConfig(
+        **values,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        sequence_parallel=values["tensor_model_parallel_size"] > 1,
+    )
+    return dict(
+        model_config=GPTModelConfig(
+            transformer=transformer,
+            vocab_size=vocab_size,
+            share_embeddings_and_output_weights=share_embeddings,
+        ),
+        optimizer=optimizer,
+        data_parallel_size=data_parallel_size,
+        world_size=world_size,
+    )
 
 
 def test_weight_and_optimizer_memory_accounts_for_expert_parallelism():
-    args = _make_args(pipeline_model_parallel_size=2, world_size=64)
+    inputs = _memory_inputs(pipeline_model_parallel_size=2, world_size=64)
 
     # Most-loaded stage has 1 / PP of the transformer block plus the embedding table.
     # Regular TP-sharded params: (dense attention/MLP + MoE attention/shared-expert) / PP
@@ -59,13 +82,13 @@ def test_weight_and_optimizer_memory_accounts_for_expert_parallelism():
         6 + 12 / 16
     ) + expert_sharded_params_on_rank * (6 + 12 / 4)
 
-    assert math.isclose(compute_weight_and_optimizer_memory(args), expected_memory)
+    assert math.isclose(compute_weight_and_optimizer_memory(**inputs), expected_memory)
 
 
 def test_weight_and_optimizer_memory_decreases_with_tensor_parallelism():
     memories = [
         compute_weight_and_optimizer_memory(
-            _make_args(
+            **_memory_inputs(
                 data_parallel_size=16,
                 expert_model_parallel_size=1,
                 expert_tensor_parallel_size=1,
@@ -83,7 +106,9 @@ def test_weight_and_optimizer_memory_decreases_with_tensor_parallelism():
 def test_weight_and_optimizer_memory_decreases_with_expert_parallelism():
     memories = [
         compute_weight_and_optimizer_memory(
-            _make_args(expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size)
+            **_memory_inputs(
+                expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size
+            )
         )
         for ep_size, etp_size in ((1, 1), (2, 1), (2, 2), (4, 2))
     ]
@@ -92,7 +117,7 @@ def test_weight_and_optimizer_memory_decreases_with_expert_parallelism():
 
 
 def test_weight_and_optimizer_memory_accounts_for_latent_moe_experts():
-    args = _make_args(moe_latent_size=4)
+    inputs = _memory_inputs(moe_latent_size=4)
 
     # Latent MoE routes experts through moe_latent_size instead of hidden_size.
     # The hidden<->latent projections are duplicated non-expert params.
@@ -106,4 +131,4 @@ def test_weight_and_optimizer_memory_accounts_for_latent_moe_experts():
         6 + 12 / 16
     ) + expert_sharded_params_on_rank * (6 + 12 / 4)
 
-    assert math.isclose(compute_weight_and_optimizer_memory(args), expected_memory)
+    assert math.isclose(compute_weight_and_optimizer_memory(**inputs), expected_memory)

@@ -76,7 +76,8 @@ def test_indexer_logging_counts_only_active_legacy_ratios():
         csa_dense_mode=False,
     )
 
-    assert _get_indexer_logging_layer_counts(args) == (3, 2)
+    model_config = SimpleNamespace(transformer=args, hybrid_layer_pattern=args.hybrid_layer_pattern)
+    assert _get_indexer_logging_layer_counts(model_config) == (3, 2)
 
 
 def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
@@ -90,13 +91,14 @@ def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
         csa_dense_mode=False,
     )
 
-    assert _get_indexer_logging_layer_counts(args) == (5, 5)
+    model_config = SimpleNamespace(transformer=args, hybrid_layer_pattern=args.hybrid_layer_pattern)
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 5)
 
     args.mtp_use_repeated_layer = True
-    assert _get_indexer_logging_layer_counts(args) == (5, 3)
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 3)
 
     args.csa_dense_mode = True
-    assert _get_indexer_logging_layer_counts(args) == (5, 0)
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 0)
 
 
 def test_indexer_logging_uses_normalized_hybrid_layer_positions():
@@ -117,7 +119,8 @@ def test_indexer_logging_uses_normalized_hybrid_layer_positions():
     expected_ratios = [0, 0, 4, 128, 0, 4, 128, 0, 4]
     assert args.csa_compress_ratios == expected_ratios
     assert config_kwargs["csa_compress_ratios"] == expected_ratios
-    assert _get_indexer_logging_layer_counts(args) == (6, 3)
+    model_config = SimpleNamespace(transformer=args, hybrid_layer_pattern=args.hybrid_layer_pattern)
+    assert _get_indexer_logging_layer_counts(model_config) == (6, 3)
 
 
 class TestTraining:

@@ -76,7 +76,14 @@ def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
     if inference:
         cfg = argument_utils.inference_cfg_container_from_args(args, build_model_config=False)
     else:
-        cfg = argument_utils.pretrain_cfg_container_from_args(args)
+        from megatron.core.transformer import TransformerConfig
+        from megatron.training.models import ModelProviderConfig
+
+        model = ModelProviderConfig(
+            transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+            seq_length=16,
+        )
+        cfg = argument_utils.pretrain_cfg_container_from_args(args, model_cfg=model)
     config = cfg.logger
     args.modules_to_filter.append('stale')
     assert config.modules_to_filter == ['module']
@@ -377,8 +384,6 @@ def test_attention_metric_logging_reads_model_config(
     for getter in ('get_wandb_writer', 'get_one_logger', 'get_energy_monitor', 'get_telemetry'):
         monkeypatch.setattr(training, getter, lambda: None)
     model = [SimpleNamespace(config=transformer)] if supplied_model else None
-    if supplied_model:
-        run_config.model = None  # Legacy and MiMo use the built model's transformer config.
     training.training_log({}, {}, 0.01, 1, 1.0, False, 0, None, None, None, 7.0, model=model)
     logged = [
         call for call in writer.add_scalar.call_args_list if call.args[0] == 'max_attention_logit'

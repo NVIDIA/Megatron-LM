@@ -5,32 +5,34 @@ from argparse import Namespace
 import pytest
 import torch
 
+from megatron.core.activations import squared_relu
 from megatron.core.fusions import fused_cross_entropy
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.transformer import TransformerConfig
 from megatron.training import kernel_warmup
 from megatron.training.kernel_warmup import warmup_training_kernels
 from tests.unit_tests.test_utilities import Utils
 
 
 def configuration(tp_group, dtype=torch.float32):
-    return Namespace(
-        seq_length=8,
+    return TransformerConfig(
+        num_layers=2,
+        num_attention_heads=tp_group.size(),
+        tensor_model_parallel_size=tp_group.size(),
         context_parallel_size=1,
-        micro_batch_size=2,
-        padded_vocab_size=128 * tp_group.size(),
-        logit_dtype=dtype,
         params_dtype=dtype,
+        bf16=dtype == torch.bfloat16,
+        fp16=dtype == torch.float16,
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl="native",
-        squared_relu=True,
-        quick_geglu=False,
+        activation_func=squared_relu,
         use_te_activation_func=False,
         use_fused_weighted_squared_relu=True,
         activation_func_tanh_clamp_scale=16.0,
         activation_func_tanh_clamp_scale_linear=None,
-        swiglu=False,
-        bias_swiglu_fusion=True,
-        bias_gelu_fusion=True,
+        gated_linear_unit=False,
+        bias_activation_fusion=False,
         add_bias_linear=False,
         ffn_hidden_size=64 * tp_group.size(),
         moe_shared_expert_intermediate_size=32 * tp_group.size(),
@@ -104,12 +106,16 @@ def test_warmup_preserves_rng_and_live_storage(
 
     monkeypatch.setattr(fused_cross_entropy, "calculate_gradients", observe_gradient)
     monkeypatch.setattr(fused_cross_entropy, "calculate_predicted_logits", observe_labels)
-    args = configuration(tp_group, dtype)
-    args.micro_batch_size = micro_batch_size
-    args.logit_dtype = logit_dtype
-    args.seq_length = 16
-    args.context_parallel_size = 2
-    warmup_training_kernels(args, tp_group)
+    config = configuration(tp_group, dtype)
+    config.context_parallel_size = 2
+    warmup_training_kernels(
+        config,
+        tp_group,
+        sequence_length=16,
+        micro_batch_size=micro_batch_size,
+        vocab_size=128 * tp_group.size(),
+        logit_dtype=logit_dtype,
+    )
     warmup_layouts = layouts.copy()
     layouts.clear()
     warmup_label_layouts = label_layouts.copy()
@@ -156,36 +162,46 @@ def test_warmup_preserves_rng_and_live_storage(
 
 
 def test_warmup_rejects_invalid_shape(tp_group):
-    args = configuration(tp_group)
-    args.seq_length = 0
+    config = configuration(tp_group)
     with pytest.raises(ValueError, match="positive"):
-        warmup_training_kernels(args, tp_group)
+        warmup_training_kernels(
+            config,
+            tp_group,
+            sequence_length=0,
+            micro_batch_size=2,
+            vocab_size=128 * tp_group.size(),
+        )
     if tp_group.size() > 1:
-        args.seq_length = 8
-        args.padded_vocab_size = 129
         with pytest.raises(ValueError, match="divisible"):
-            warmup_training_kernels(args, tp_group)
+            warmup_training_kernels(
+                config, tp_group, sequence_length=8, micro_batch_size=2, vocab_size=129
+            )
 
 
 @pytest.mark.parametrize("activation", ["gelu", "swiglu", "situ_glu"])
 def test_other_configurations_and_later_compilation(tp_group, activation, monkeypatch):
-    args = configuration(tp_group, torch.bfloat16)
-    args.cross_entropy_loss_fusion = False
-    args.squared_relu = False
-    args.activation_func_tanh_clamp_scale = None
-    args.swiglu = activation in {"swiglu", "situ_glu"}
+    config = configuration(tp_group, torch.bfloat16)
+    config.cross_entropy_loss_fusion = False
+    config.activation_func_tanh_clamp_scale = None
+    config.gated_linear_unit = activation in {"swiglu", "situ_glu"}
+    config.activation_func = (
+        torch.nn.functional.silu if config.gated_linear_unit else torch.nn.functional.gelu
+    )
+    config.bias_activation_fusion = True
     if activation == "situ_glu":
-        args.activation_func_tanh_clamp_scale = 16.0
-        args.activation_func_tanh_clamp_scale_linear = 8.0
-    args.add_bias_linear = True
-    args.sequence_parallel = True
-    args.fp32_residual_connection = True
+        config.activation_func_tanh_clamp_scale = 16.0
+        config.activation_func_tanh_clamp_scale_linear = 8.0
+    config.add_bias_linear = True
+    config.sequence_parallel = True
+    config.fp32_residual_connection = True
 
     def unused_ce(*unused):
         pytest.fail("Disabled CE must not be warmed up")
 
     monkeypatch.setattr(kernel_warmup, "_warmup_cross_entropy", unused_ce)
-    warmup_training_kernels(args, tp_group)
+    warmup_training_kernels(
+        config, tp_group, sequence_length=8, micro_batch_size=2, vocab_size=128 * tp_group.size()
+    )
 
     # A new specialization must still compile after startup workers shut down.
     @torch.compile
@@ -198,19 +214,22 @@ def test_other_configurations_and_later_compilation(tp_group, activation, monkey
 
 @pytest.mark.parametrize("activation", ["te", "quick_geglu"])
 def test_does_not_warmup_unused_activation(tp_group, activation, monkeypatch):
-    args = configuration(tp_group)
-    args.cross_entropy_loss_fusion = False
-    args.bias_dropout_fusion = False
-    args.squared_relu = False
-    args.activation_func_tanh_clamp_scale = None
-    args.use_te_activation_func = activation == "te"
-    args.bias_gelu_fusion = activation != "te"
+    config = configuration(tp_group)
+    config.cross_entropy_loss_fusion = False
+    config.bias_dropout_fusion = False
+    config.activation_func = torch.nn.functional.gelu
+    config.activation_func_tanh_clamp_scale = None
+    config.use_te_activation_func = activation == "te"
+    config.bias_activation_fusion = activation != "te"
     if activation == "quick_geglu":
-        args.quick_geglu = True
-        args.add_bias_linear = True
+        config.activation_func = quick_gelu
+        config.gated_linear_unit = True
+        config.add_bias_linear = True
 
     def unused_activation(*unused):
         pytest.fail("Must not warm up a native activation that the model will not use")
 
     monkeypatch.setattr(kernel_warmup, "_warmup_activation", unused_activation)
-    warmup_training_kernels(args, tp_group)
+    warmup_training_kernels(
+        config, tp_group, sequence_length=8, micro_batch_size=2, vocab_size=128 * tp_group.size()
+    )
