@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import inspect
+import logging
 import os
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
@@ -47,18 +48,29 @@ class TestGPTModel:
             use_cpu_initialization=True,
             embedding_init_method_std=1.0,  # Test that we can initialize the embedding weights to something else.
         )
-        self.gpt_model = GPTModel(
-            config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-            vocab_size=100,
-            max_sequence_length=4,
-        )
+        with patch('megatron.core.models.gpt.gpt_model.log_single_rank') as mock_log_single_rank:
+            self.gpt_model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+        self.mock_log_single_rank = mock_log_single_rank
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
     def test_constructor(self):
+        self.mock_log_single_rank.assert_called_once()
+        _, level, message = self.mock_log_single_rank.call_args.args
+        assert level == logging.WARNING
+        assert message == (
+            "GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new "
+            "features. Please reference the migration guide "
+            "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`"
+        )
+
         assert isinstance(self.gpt_model, GPTModel)
 
         assert self.gpt_model.max_sequence_length == 4
@@ -132,6 +144,7 @@ class TestGPTModel:
         ).cuda()
 
         context = {"selected_token_positions": torch.tensor([0, 2], device="cuda")}
+        created = {}
         seen = {}
 
         def output_processor(**kwargs):
@@ -146,7 +159,14 @@ class TestGPTModel:
                 dim=-1, index=kwargs["labels"].unsqueeze(-1)
             )
             token_logprobs = token_logprobs.squeeze(-1)
-            return token_logprobs.index_select(1, kwargs["context"]["selected_token_positions"])
+            result = {
+                "payload": token_logprobs.index_select(
+                    1, kwargs["context"]["selected_token_positions"]
+                ),
+                "tag": "structured",
+            }
+            created["result"] = result
+            return result
 
         with torch.no_grad():
             logits = self.gpt_model.forward(
@@ -164,10 +184,14 @@ class TestGPTModel:
                 output_processor_context=context,
             )
 
-        assert torch.allclose(output, expected)
+        assert output is created["result"]
+        assert isinstance(output, dict)
+        assert torch.allclose(output["payload"], expected)
+        assert output["tag"] == "structured"
         assert seen["context"] is context
         assert seen["output_layer"] is self.gpt_model.output_layer
         assert seen["output_weight"] is None
+        assert seen["output_layer"].weight is not None
         assert seen["labels"] is labels
         assert seen["runtime_gather_output"] is None
         assert seen["config"] is config

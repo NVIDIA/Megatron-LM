@@ -7,9 +7,7 @@
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 -->
 
-# Context Parallel Package
-
-## Context Parallelism Overview
+# Context Parallel Overview
 
 ```{figure} ../../images/context_parallel/CP_overview.png
 :alt: Diagram of a transformer layer with tensor parallelism 2 and context parallelism 2, showing CP and TP communication patterns around attention and other blocks.

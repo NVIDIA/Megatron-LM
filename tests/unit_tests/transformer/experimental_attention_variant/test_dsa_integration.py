@@ -421,6 +421,7 @@ def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group(monkeypatch):
             dynamic_context_parallel=True,
         ),
         recompute_up_proj=False,
+        linear_gate=None,
         linear_proj=linear_proj,
     )
     dummy_attention._checkpointed_attention_forward = lambda *args, **kwargs: (

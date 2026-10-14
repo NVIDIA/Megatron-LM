@@ -346,6 +346,7 @@ class TestExpertLayerReconfiguration:
     def test_sequential_grouped_mlp_extra_state(
         self,
         tmp_path_dist_ckpt,
+        monkeypatch,
         src_tp_pp_exp,
         dest_tp_pp_exp,
         src_module,
@@ -393,6 +394,8 @@ class TestExpertLayerReconfiguration:
                 ckpt_dir_A,
                 load_strategy,
             )
+            # This checkpoint was created by the test and is therefore trusted.
+            monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
             model_A.load_state_dict(
                 {k.removeprefix(layer_prefix): v for k, v in state_dict.items()}
             )
