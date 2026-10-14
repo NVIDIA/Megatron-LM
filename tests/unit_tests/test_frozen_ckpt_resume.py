@@ -9,10 +9,16 @@ of restarting. Its main use today is offline-KD teacher-logit dumps. Pure file I
 (no CUDA, no distributed init), so it runs on CPU.
 """
 
+from argparse import Namespace
+
+import pytest
+
+from megatron.training import checkpointing
 from megatron.training.checkpointing import (
     get_checkpoint_tracker_filename,
     read_frozen_resume_iteration,
 )
+from megatron.training.models import ModelConfig
 
 
 def _write_tracker(dir_path, content):
@@ -54,3 +60,31 @@ def test_advancing_progress_reads_latest(tmp_path):
     assert read_frozen_resume_iteration(str(tmp_path)) == 100
     _write_tracker(tmp_path, "250")
     assert read_frozen_resume_iteration(str(tmp_path)) == 250
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_frozen_resume_policy_uses_model_config(monkeypatch, tmp_path, run_config, frozen):
+    """Frozen-model resume follows the model config even with contradictory legacy args."""
+    _write_tracker(tmp_path, "42")
+    run_config.model = ModelConfig(freeze_all_layers=frozen)
+    args = Namespace(
+        load="teacher",
+        save=str(tmp_path),
+        pretrained_checkpoint=None,
+        freeze_all_layers=not frozen,
+        finetune=False,
+        override_ckpt_iteration=None,
+    )
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+
+    class ReachedModelLoad(Exception):
+        pass
+
+    def stop_at_model_load(model):
+        raise ReachedModelLoad
+
+    monkeypatch.setattr(checkpointing, "unwrap_model", stop_at_model_load)
+    with pytest.raises(ReachedModelLoad):
+        checkpointing.load_checkpoint([], None, None, restore_training_state=True)
+    assert args.finetune is frozen
+    assert args.override_ckpt_iteration == (42 if frozen else None)

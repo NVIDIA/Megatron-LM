@@ -91,10 +91,15 @@ def main() -> None:
     """Build the heterogeneous topology and run stock pretraining."""
     args = _parse_and_validate()
     set_args(args)
-    model_cfg = MimoBuildConfig()
+    from megatron.training.argument_utils import model_provider_config_from_args
+
+    model_cfg = model_provider_config_from_args(args, model_config_cls=MimoBuildConfig)
     cfg = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(cfg)
-    initialize_runtime_services(args, build_tokenizer=False, training=True)
+    _, llm_world_size = validate_hetero_grid_args(args, args.world_size)
+    initialize_runtime_services(
+        args, build_tokenizer=False, training=True, training_world_size=llm_world_size
+    )
     provider = resolve_provider(args)
 
     prefetch_loader = None

@@ -24,7 +24,15 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from examples.mimo.training.args import add_hetero_grid_args
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.enums import AttnBackend
+from megatron.training.argument_utils import (
+    model_provider_config_from_args,
+    resolve_tokenizer_vocab_size,
+)
+from megatron.training.global_vars import get_run_config
+
+pytestmark = pytest.mark.usefixtures("run_config")
 
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
 # 20L and 54L Nemotron presets; every other field is shared. num_layers follows
@@ -137,9 +145,11 @@ def test_build_communicator_wires_bridge_receive_shape(
         mimo_run_input_projections_on_llm_ranks=language_rank_input_projection,
         mimo_encoder_tp=4,
         image_token_id=42,
-        hidden_size=2688,
+        hidden_size=999,
     )
-    language_config = SimpleNamespace(params_dtype=torch.bfloat16, pipeline_dtype=torch.float32)
+    language_config = SimpleNamespace(
+        hidden_size=2688, params_dtype=torch.bfloat16, pipeline_dtype=torch.float32
+    )
 
     monkeypatch.setattr(
         provider,
@@ -308,6 +318,10 @@ def _parse_validate(argv):
     finally:
         sys.argv = saved
     validate_args(args)
+    cfg = get_run_config()
+    cfg.model = model_provider_config_from_args(args)
+    build_tokenizer(args)
+    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
     return args
 
 
@@ -480,7 +494,9 @@ def test_language_model_spec_builds_mamba():
     args = _parse_validate(_build_argv(*_PRESET_20L))
     args.mimo_llm_ep = 2
     args.mimo_llm_expt_tp = 2
-    args.expert_tensor_parallel_num_weight_shards = args.mimo_llm_expt_tp
+    get_run_config().model.transformer.expert_tensor_parallel_num_weight_shards = (
+        args.mimo_llm_expt_tp
+    )
     spec = language_model_spec(args, pg_collection=None, llm_grid=None)
     assert spec.module is MambaModel
     assert spec.params["config"].num_layers == 20
@@ -605,7 +621,7 @@ def test_language_rank_placement_uses_language_parallelism():
 
     assert encoder_spec.submodules["input_projections"] == []
 
-    args.tensor_parallel_num_weight_shards = 4
+    get_run_config().model.transformer.tensor_parallel_num_weight_shards = 4
     language_config = nemotron_language_config(
         args, tp_size=2, pp_size=1, ep_size=1, expt_tp_size=1
     )
@@ -631,6 +647,8 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups):
     from types import SimpleNamespace
 
     from examples.mimo.model_providers import nemotron_moe_vlm as provider
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.models import ModelProviderConfig
 
     # Deliberately disagree with the grid to catch inheritance of stock CP.
     args = SimpleNamespace(
@@ -641,10 +659,17 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups):
         hybrid_layer_pattern="*",
         logit_dtype=None,
     )
-    monkeypatch.setattr(
-        provider,
-        "_base_config",
-        lambda args: SimpleNamespace(context_parallel_size=8, calculate_per_token_loss=True),
+    get_run_config().model = ModelProviderConfig(
+        transformer=TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            context_parallel_size=8,
+            calculate_per_token_loss=True,
+        ),
+        seq_length=32,
+        vocab_size=64,
+        hybrid_layer_pattern="*",
     )
     grid = SimpleNamespace(shape=[1, cp_size, 1], dim_names=["tp", "cp", "pp"])
     groups = None
@@ -666,7 +691,7 @@ def test_encoder_and_projection_do_not_inherit_language_cp():
     from examples.mimo.model_providers.radio_encoder import radio_vision_config
 
     args = _parse_validate(_build_argv(*_PRESET_20L))
-    args.context_parallel_size = 2
+    get_run_config().model.transformer.context_parallel_size = 2
     vision = radio_vision_config(args, tp_size=1, pp_size=1)
     projection = nemotron_projection_config(args, tp_size=1, projection_input_size=5120)
     assert vision.context_parallel_size == 1

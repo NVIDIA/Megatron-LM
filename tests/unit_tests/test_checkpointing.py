@@ -21,6 +21,7 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer import WideResidualConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import (
@@ -39,6 +40,7 @@ from megatron.training.checkpointing import (
 )
 from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
+from megatron.training.models import ModelProviderConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -474,7 +476,7 @@ def test_load_args_restores_wide_residual_config_from_checkpoint():
     assert restored_args.wide_residual_retention_max_forget == 0.2
 
 
-def test_check_checkpoint_args_rejects_wide_residual_mismatch():
+def test_check_checkpoint_args_rejects_wide_residual_mismatch(run_config):
     """Resuming must reject a checkpoint with different wide-residual geometry."""
     current_args = SimpleNamespace(
         num_layers=2,
@@ -493,6 +495,16 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
     )
     checkpoint_args = SimpleNamespace(**vars(current_args))
     checkpoint_args.wide_residual_num_streams = 4
+    run_config.model = ModelProviderConfig(
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            wide_residual=WideResidualConfig(num_streams=3),
+        ),
+        seq_length=16,
+        position_embedding_type='rope',
+    )
 
     with (
         mock.patch('megatron.training.checkpointing.get_args', return_value=current_args),
@@ -500,6 +512,208 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
         pytest.raises(AssertionError, match='wide_residual_num_streams value from checkpoint'),
     ):
         check_checkpoint_args(checkpoint_args)
+
+
+def test_checkpoint_model_checks_use_config_not_stale_args(run_config):
+    run_config.model = ModelProviderConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=64,
+        vocab_size=128,
+        position_embedding_type='rope',
+    )
+    args = SimpleNamespace(vocab_file=None, use_dist_ckpt=True, phase_transition_iterations=None)
+    saved = run_config.to_dict()
+    stale = SimpleNamespace(num_layers=99, hidden_size=99, num_attention_heads=99)
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+    ):
+        check_checkpoint_args(stale, checkpoint_config=saved)
+        saved['model']['transformer']['hidden_size'] = 64
+        with pytest.raises(AssertionError, match='hidden_size value from checkpoint'):
+            check_checkpoint_args(stale, checkpoint_config=saved)
+
+
+@pytest.mark.parametrize("position_type", ["rope", "none"])
+def test_checkpoint_model_restore_preserves_cli_precedence_and_data_length(
+    run_config, position_type
+):
+    run_config.model = ModelProviderConfig(
+        transformer=TransformerConfig(
+            num_layers=2, hidden_size=32, num_attention_heads=4, add_bias_linear=False
+        ),
+        seq_length=512,
+        vocab_size=256,
+        position_embedding_type=position_type,
+        share_embeddings_and_output_weights=False,
+    )
+    args = SimpleNamespace(
+        load='checkpoint',
+        hidden_size=64,
+        num_layers=None,
+        seq_length=None,
+        max_position_embeddings=None,
+        add_bias_linear=True,
+        num_experts=8,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    checkpoint_args = SimpleNamespace(
+        hidden_size=999,
+        num_layers=99,
+        seq_length=128,
+        max_position_embeddings=999,
+        add_bias_linear=True,
+        padded_vocab_size=999,
+    )
+    state = {'args': checkpoint_args, 'iteration': 12}
+    with (
+        mock.patch(
+            'megatron.training.checkpointing._load_base_checkpoint',
+            return_value=(state, 'checkpoint', False, CheckpointType.LEGACY),
+        ),
+        mock.patch(
+            'megatron.training.checkpointing._read_checkpoint_run_config',
+            return_value=run_config.to_dict(),
+        ),
+    ):
+        load_args_from_checkpoint(args)
+    assert args.hidden_size == 64  # Non-None CLI inputs retain precedence.
+    assert args.num_layers == 2
+    assert args.seq_length == 128  # Actual data length is not model position capacity.
+    assert args.max_position_embeddings == 512
+    assert args.padded_vocab_size == 256
+    assert args.add_bias_linear is False  # Concrete-default fields follow the checkpoint.
+    assert args.untie_embeddings_and_output_weights is True
+    assert args.position_embedding_type == position_type
+    assert args.add_position_embedding is True
+    assert args.use_rotary_position_embeddings is False
+    assert args.num_experts is None
+    assert checkpoint_args.hidden_size == 999
+
+
+@pytest.mark.parametrize("spec_name", ["hybrid_stack_spec", "gated_delta_product_stack_spec"])
+@pytest.mark.parametrize("yaml_roundtrip", [False, True])
+@pytest.mark.parametrize("customized", [False, True])
+def test_checkpoint_named_model_spec_restores_without_stale_args(
+    run_config, spec_name, yaml_roundtrip, customized
+):
+    from copy import deepcopy
+
+    import yaml
+
+    from megatron.core.models.hybrid import hybrid_layer_specs
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+    from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.training.checkpointing import _checkpoint_model_spec
+    from megatron.training.config.yaml_utils import safe_yaml_representers
+    from megatron.training.models import HybridModelConfig, ModelConfig
+
+    spec = deepcopy(getattr(hybrid_layer_specs, spec_name))
+    if customized:
+        # Old YAML conversion dropped these fields and could select the default spec.
+        spec.submodules.mlp_layer.submodules.mlp.keywords["submodules"].linear_fc1 = (
+            ColumnParallelLinear
+        )
+    run_config.model = HybridModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        hybrid_stack_spec=spec,
+        hybrid_layer_pattern="MM",
+        seq_length=16,
+        vocab_size=128,
+    )
+    model_dict = run_config.model.as_dict()
+    if yaml_roundtrip:
+        with safe_yaml_representers():
+            model_dict = yaml.safe_load(yaml.safe_dump(model_dict))
+    restored = ModelConfig.from_dict(model_dict)
+    assert isinstance(
+        restored.hybrid_stack_spec.submodules.mtp_block_spec.submodules.layer_specs[0], ModuleSpec
+    )
+    assert (
+        restored.hybrid_stack_spec.submodules.mlp_layer.submodules.mlp.keywords['submodules']
+        == spec.submodules.mlp_layer.submodules.mlp.keywords['submodules']
+    )
+    saved = model_dict['hybrid_stack_spec']
+    legacy_spec = [hybrid_layer_specs.__name__, "hybrid_inference_stack_spec"]
+    if customized:
+        with pytest.raises(ValueError, match="no equivalent CLI import path"):
+            _checkpoint_model_spec(saved, legacy_spec)
+        return
+    # Restore from the authoritative spec even if the old CLI namespace disagrees.
+    assert _checkpoint_model_spec(saved, legacy_spec) == [hybrid_layer_specs.__name__, spec_name]
+
+
+@pytest.mark.parametrize("legacy", ["matching", "missing", "contradictory"])
+def test_checkpoint_old_partial_spec_requires_matching_legacy_evidence(legacy):
+    from megatron.core.models.hybrid import hybrid_layer_specs
+    from megatron.training.checkpointing import _checkpoint_model_spec
+    from megatron.training.models.base import _model_value_to_dict
+
+    saved = _model_value_to_dict(hybrid_layer_specs.hybrid_stack_spec)
+    partial_kwargs = saved['submodules']['mlp_layer']['submodules']['mlp']
+    partial_kwargs['submodules'] = {
+        '_target_': 'megatron.core.transformer.mlp.MLPSubmodules',
+        '_call_': True,
+    }
+    legacy_spec = [hybrid_layer_specs.__name__, 'hybrid_stack_spec']
+    if legacy == "matching":
+        assert _checkpoint_model_spec(saved, legacy_spec) == legacy_spec
+    else:
+        if legacy == "contradictory":
+            saved['submodules']['mlp_layer']['params']['custom_parameter'] = True
+        with pytest.raises(ValueError, match="no equivalent CLI import path"):
+            _checkpoint_model_spec(saved, None if legacy == "missing" else legacy_spec)
+
+
+@pytest.mark.parametrize("activation_name", ["relu", "silu", "squared_relu", "quick_gelu"])
+def test_checkpoint_native_activation_overrides_stale_cli_aliases(run_config, activation_name):
+    from megatron.core.activations import squared_relu
+    from megatron.core.fusions.fused_bias_geglu import quick_gelu
+
+    activation = {
+        "relu": torch.nn.functional.relu,
+        "silu": torch.nn.functional.silu,
+        "squared_relu": squared_relu,
+        "quick_gelu": quick_gelu,
+    }[activation_name]
+    gated = activation_name in ("silu", "quick_gelu")
+    run_config.model = ModelProviderConfig(
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            activation_func=activation,
+            gated_linear_unit=gated,
+        ),
+        seq_length=16,
+        vocab_size=128,
+    )
+    args = SimpleNamespace(
+        load='checkpoint',
+        swiglu=True,
+        squared_relu=True,
+        quick_geglu=True,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state = {'args': SimpleNamespace(swiglu=True), 'iteration': 12}
+    with (
+        mock.patch(
+            'megatron.training.checkpointing._load_base_checkpoint',
+            return_value=(state, 'checkpoint', False, CheckpointType.LEGACY),
+        ),
+        mock.patch(
+            'megatron.training.checkpointing._read_checkpoint_run_config',
+            return_value=run_config.to_dict(),
+        ),
+    ):
+        load_args_from_checkpoint(args)
+    assert args.activation_func is activation
+    assert args.gated_linear_unit is gated
+    assert args.swiglu is (activation_name == "silu")
+    assert args.squared_relu is (activation_name == "squared_relu")
+    assert args.quick_geglu is (activation_name == "quick_gelu")
 
 
 def create_checkpoint(load_path, ckpt_format):
@@ -548,6 +762,11 @@ def create_args(run_config):
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
+    run_config.model = ModelProviderConfig(
+        transformer=TransformerConfig(num_layers=1, hidden_size=2, num_attention_heads=1),
+        seq_length=16,
+        position_embedding_type='rope',
+    )
 
     yield args
 

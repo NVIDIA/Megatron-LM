@@ -18,7 +18,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
-from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
+from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
@@ -177,11 +177,22 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
 
 
 def initialize_runtime_services(
-    args: Namespace, *, build_tokenizer: bool = True, training: bool = False
+    args: Namespace, *, build_tokenizer: bool = True, training: bool = False,
+    training_world_size: int | None = None,
 ) -> None:
-    """Initialize shared services, plus training-only services when requested."""
+    """Initialize shared services, plus training-only services when requested.
+
+    ``training_world_size`` is the language-model world for heterogeneous jobs;
+    ordinary training uses the launch world size.
+    """
+    if training:
+        _set_training_parallel_sizes(args, world_size=training_world_size)
     if build_tokenizer:
         _build_tokenizer(args)
+        if not training:
+            from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
+            resolve_tokenizer_vocab_size(get_run_config(), getattr(args, 'padded_vocab_size', None))
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
@@ -193,6 +204,27 @@ def initialize_runtime_services(
 
     if training:
         initialize_training_runtime_services(args)
+
+
+def _set_training_parallel_sizes(args: Namespace, *, world_size: int | None) -> None:
+    """Resolve runtime batch topology before telemetry and microbatch initialization."""
+    cfg = get_run_config()
+    model_config = cfg.model.transformer
+    sequence_shards = model_config.gtp_remat_num_sequence_shards
+    if model_config.context_parallel_size % sequence_shards:
+        raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+    layout = GTPParallelLayout(
+        world_size=args.world_size if world_size is None else world_size,
+        tp=model_config.tensor_model_parallel_size,
+        pp=model_config.pipeline_model_parallel_size,
+        cp=model_config.context_parallel_size // sequence_shards,
+        weight_size=model_config.gtp_weight_remat_size,
+        num_sequence_shards=sequence_shards,
+    )
+    # These are derived runtime facts, not model configuration. Their consumers
+    # remain on args until runtime-state migration; derive them from the config owner.
+    args.data_parallel_size = layout.dp
+    args.batch_parallel_size = layout.batch_parallel_size
 
 
 def initialize_training_runtime_services(args: Namespace) -> None:
@@ -208,7 +240,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,
         # Independent sequences, including when CP and weight sharding share ranks.
-        data_parallel_size=get_batch_parallel_size(args),
+        data_parallel_size=args.batch_parallel_size,
         decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
         step_batch_size_schedule=args.step_batch_size_schedule,
         seq_length=args.seq_length,
@@ -491,13 +523,8 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     resource_attrs = {}
     fields = [
         ('dl.local_rank', 'local_rank'),
-        ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
-        ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
         ('dl.data_parallel.size', 'data_parallel_size'),
         ('dl.sequence_length', 'seq_length'),
-        ('megatron.num_layers', 'num_layers'),
-        ('megatron.hidden_size', 'hidden_size'),
-        ('megatron.num_attention_heads', 'num_attention_heads'),
         ('megatron.ckpt_format', 'ckpt_format'),
     ]
     if include_training:
@@ -511,10 +538,27 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         if val is not None:
             resource_attrs[attr] = val
 
+    # Preserve inference's CLI boundary; training's existing model tags use its config owner.
+    if include_training:
+        cfg = get_run_config()
+        model_config = cfg.model.transformer
+    else:
+        model_config = args
+    for attr, name in (
+        ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
+        ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
+        ('megatron.num_layers', 'num_layers'),
+        ('megatron.hidden_size', 'hidden_size'),
+        ('megatron.num_attention_heads', 'num_attention_heads'),
+    ):
+        val = getattr(model_config, name, None)
+        if val is not None:
+            resource_attrs[attr] = val
+
     # Derive precision from flags
-    if getattr(args, 'fp16', False):
+    if getattr(model_config, 'fp16', False):
         resource_attrs['megatron.precision'] = 'fp16'
-    elif getattr(args, 'bf16', False):
+    elif getattr(model_config, 'bf16', False):
         resource_attrs['megatron.precision'] = 'bf16'
     else:
         resource_attrs['megatron.precision'] = 'fp32'

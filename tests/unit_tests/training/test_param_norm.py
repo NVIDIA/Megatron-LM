@@ -11,6 +11,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.models import GPTModelConfig
 from megatron.training.utils import common_utils
 from tests.unit_tests.test_utilities import Utils
 
@@ -124,6 +125,7 @@ def test_mimo_param_norm_skips_frozen_pp1_module(monkeypatch):
 )
 def test_moe_param_norm_counts_each_logical_parameter_once(
     monkeypatch,
+    run_config,
     tensor_parallel_size: int,
     expert_parallel_size: int,
     expert_tensor_parallel_size: int,
@@ -145,6 +147,7 @@ def test_moe_param_norm_counts_each_logical_parameter_once(
         reference_model = _build_tiny_moe_gpt(
             tensor_parallel_size=1, expert_parallel_size=1, expert_tensor_parallel_size=1
         )
+        run_config.model = GPTModelConfig(transformer=reference_model.config, vocab_size=16)
         _fill_parameters_with_ones(reference_model)
         expected_numel = sum(param.numel() for param in reference_model.parameters())
         expected_norm = math.sqrt(expected_numel)
@@ -173,7 +176,9 @@ def test_moe_param_norm_counts_each_logical_parameter_once(
 
 
 @pytest.mark.flaky_in_dev
-def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(monkeypatch):
+def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(
+    monkeypatch, run_config
+):
     """Expert parameters must use EGTP even when EP, TP, and ETP alone do not distinguish them."""
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         GTP_CONFIG,
@@ -204,6 +209,7 @@ def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(
         reference_model = _build_tiny_moe_gpt(
             tensor_parallel_size=1, expert_parallel_size=1, expert_tensor_parallel_size=1
         )
+        run_config.model = GPTModelConfig(transformer=reference_model.config, vocab_size=16)
         _fill_parameters_with_ones(reference_model)
         expected_numel = sum(param.numel() for param in reference_model.parameters())
         expected_norm = math.sqrt(expected_numel)

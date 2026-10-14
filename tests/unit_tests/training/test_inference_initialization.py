@@ -10,8 +10,12 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, global_vars, initialize
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.models import ModelProviderConfig
 
 
 @pytest.mark.parametrize("load_checkpoint", [False, True])
@@ -68,7 +72,9 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
 
 
 @pytest.mark.parametrize("restored_samples", [0, 8, 32])
-def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restored_samples):
+def test_resume_updates_microbatches_before_setup_validation(
+    monkeypatch, restored_samples, run_config
+):
     from megatron.training import training
 
     parser = ArgumentParser()
@@ -79,6 +85,11 @@ def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restor
     args.data_parallel_size = 1
     args.micro_batch_size = 1
     args.consumed_train_samples = 0
+    run_config.model = ModelProviderConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=16,
+        vocab_size=128,
+    )
     model = [SimpleNamespace()]
     monkeypatch.setattr(training, "get_args", lambda: args)
     monkeypatch.setattr(training, "get_timers", Mock())
@@ -118,7 +129,7 @@ def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restor
 @pytest.mark.parametrize("enable_runtime_flags", [False, True])
 @pytest.mark.parametrize("training_kwargs", [{}, {"training": False}, {"training": True}])
 def test_runtime_services_initialize_training_only_when_requested(
-    monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs
+    monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs, run_config
 ):
     args = Namespace(
         enable_experimental=enable_runtime_flags, disable_jit_fuser=enable_runtime_flags
@@ -133,6 +144,8 @@ def test_runtime_services_initialize_training_only_when_requested(
         monkeypatch.setattr(global_vars, name, services[name])
     training_services = Mock()
     monkeypatch.setattr(global_vars, "initialize_training_runtime_services", training_services)
+    parallel_sizes = Mock()
+    monkeypatch.setattr(global_vars, "_set_training_parallel_sizes", parallel_sizes)
     for name in (
         "init_num_microbatches_calculator",
         "_set_tensorboard_writer",
@@ -156,8 +169,10 @@ def test_runtime_services_initialize_training_only_when_requested(
     )
     if training_kwargs.get("training", False):
         training_services.assert_called_once_with(args)
+        parallel_sizes.assert_called_once_with(args, world_size=None)
     else:
         training_services.assert_not_called()
+        parallel_sizes.assert_not_called()
     if enable_runtime_flags:
         experimental.assert_called_once_with(True)
         jit.assert_called_once_with()
@@ -194,6 +209,8 @@ def test_inference_distributed_initialization_without_training_fields(
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.rank = 0
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', cfg)
     for name in (
         "micro_batch_size",
         "global_batch_size",
@@ -226,11 +243,14 @@ def test_inference_distributed_initialization_without_training_fields(
 
     distributed.assert_called_once()
     seeds.assert_called_once()
-    assert seeds.call_args.args[0] == run_config.rng.seed
+    assert seeds.call_args.args[0] == cfg.rng.seed
 
 
 def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch, run_config):
-    monkeypatch.setattr(initialize, "get_args", lambda: Namespace(tp_comm_overlap=True))
+    args = Namespace(tp_comm_overlap=True)
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', cfg)
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
     distributed = Mock()
     monkeypatch.setattr(initialize, "_initialize_distributed", distributed)
     with pytest.raises(ValueError, match="fixed training user buffers"):
@@ -246,6 +266,18 @@ def test_distributed_training_services_require_explicit_opt_in(monkeypatch, run_
     args.async_save = True
     args.use_persistent_ckpt_worker = True
     args.tp_comm_overlap = True
+    run_config.model = ModelProviderConfig(
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            tp_comm_overlap=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        ),
+        seq_length=16,
+        vocab_size=128,
+    )
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())

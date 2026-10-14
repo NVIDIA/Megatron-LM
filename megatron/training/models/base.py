@@ -8,10 +8,12 @@ from dataclasses import dataclass, field, is_dataclass
 from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
+import torch
+
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer import MegatronModule
+from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 
 # Hooks and callbacks that each run attaches to the live config. Not to be serialized.
@@ -41,9 +43,9 @@ def _encode_callable(value: Callable) -> dict[str, Any] | None:
         encoded: dict[str, Any] = {
             "_target_": inner["_target_"],
             "_partial_": True,
-            "_args_": list(value.args),
+            "_args_": [_model_value_to_dict(arg) for arg in value.args],
         }
-        encoded.update(value.keywords)
+        encoded.update({key: _model_value_to_dict(arg) for key, arg in value.keywords.items()})
         return encoded
 
     module = inspect.getmodule(value)
@@ -57,6 +59,38 @@ def _encode_callable(value: Callable) -> dict[str, Any] | None:
     if resolved != value:
         return None
     return {"_target_": f"{module.__name__}.{qualname}", "_call_": False}
+
+
+def _model_value_to_dict(value: Any) -> Any:
+    """Preserve nested model-spec inputs, including dataclasses in partial kwargs."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return _model_dataclass_to_dict(value)
+    if callable(value):
+        encoded = _encode_callable(value)
+        return value if encoded is None else encoded
+    if isinstance(value, dict):
+        return {key: _model_value_to_dict(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_model_value_to_dict(item) for item in value]
+    if hasattr(value, "as_dict"):
+        return value.as_dict()
+    return value
+
+
+def _model_dataclass_to_dict(config) -> dict[str, Any]:
+    """Encode model dataclasses consistently for checkpoint export and spec lookup."""
+    result = {"_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}"}
+    for f in dataclass_fields(config):
+        if f.name.startswith("_") or f.name in _RUNTIME_FIELDS:
+            continue
+        value = getattr(config, f.name)
+        if callable(value) and (isinstance(value, type) or not is_dataclass(value)):
+            encoded = _encode_callable(value)
+            if encoded is not None:
+                result[f.name] = encoded
+            continue
+        result[f.name] = _model_value_to_dict(value)
+    return result
 
 
 @runtime_checkable
@@ -79,9 +113,10 @@ class ModelConfig:
 
     Each model type (GPT, T5, Hybrid, etc.) defines a concrete subclass with its
     own model-specific parameters. This class is a pure data container - all model
-    construction logic lives in the corresponding ``ModelBuilder`` subclass.
+    construction logic lives in the corresponding ``ModelBuilder`` subclass or
+    an application-supplied model-provider callback.
 
-    Subclasses must define:
+    Builder-backed subclasses define:
         - ``builder``: a ``ClassVar[str]`` with the full import path to the
           associated ``ModelBuilder`` (e.g.
           ``'megatron.bridge.models.hybrid.HybridModelBuilder'``).
@@ -100,7 +135,7 @@ class ModelConfig:
     """
 
     # === Builder Metadata (Serializable) ===
-    builder: ClassVar[str]
+    builder: ClassVar[str | None] = None
     """Class variable with full path to builder class (e.g.,
     'megatron.bridge.builders.GPTModelBuilder').
     """
@@ -108,6 +143,9 @@ class ModelConfig:
     # === ModelOpt ===
     restore_modelopt_state: bool = False
     """Restore ModelOpt quantization/sparsity state."""
+
+    freeze_all_layers: bool = False
+    """Freeze all model parameters, for example when saving teacher logits."""
 
     extra_checkpoint_metadata: dict[str, Any] | None = None
     """Store for additional model-related metadata to save in the checkpoint. This 
@@ -129,6 +167,8 @@ class ModelConfig:
         """Get the appropriate builder type for this config.
         Dynamically imports the builder from the string path.
         """
+        if self.builder is None:
+            raise ValueError("This model config requires a model-provider callback.")
         module_path, class_name = self.builder.rsplit(".", 1)
         module = importlib.import_module(module_path)
         builder_cls = getattr(module, class_name)
@@ -143,34 +183,9 @@ class ModelConfig:
         - All dataclass fields, including nested dataclasses
         """
 
-        def _as_dict(config):
-            result = {
-                "_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}",
-            }
-            for f in dataclass_fields(config):
-                if f.name.startswith("_") or f.name in _RUNTIME_FIELDS:
-                    continue
-                value = getattr(config, f.name)
-
-                if callable(value) and not is_dataclass(value):
-                    # Encode module-level callables (e.g. activation_func, layer-spec functions)
-                    # so they survive serialization instead of silently reverting to the default.
-                    encoded = _encode_callable(value)
-                    if encoded is not None:
-                        result[f.name] = encoded
-                    continue
-
-                if is_dataclass(value):
-                    result[f.name] = _as_dict(value)  # recurse on nested dataclasses
-                elif hasattr(value, "as_dict"):
-                    result[f.name] = value.as_dict()
-                else:
-                    result[f.name] = value
-
-            return result
-
-        result = _as_dict(self)
-        result["_builder_"] = self.builder  # Serialize the builder path
+        result = _model_dataclass_to_dict(self)
+        if self.builder is not None:
+            result["_builder_"] = self.builder  # Serialize the builder path
         return result
 
     @classmethod
@@ -201,23 +216,71 @@ class ModelConfig:
             valid_fields = {f.name for f in dataclass_fields(config_cls)}
             filtered_data = {k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")}
 
-            # recurse on serialized nested dataclasses; resolve encoded callables
-            subconfigs = {}
-            for k, v in filtered_data.items():
-                if isinstance(v, dict) and "_target_" in v:
-                    if v.get("_call_", True) is False or v.get("_partial_", False):
-                        from megatron.training.config.instantiate_utils import instantiate
-                        subconfigs[k] = instantiate(v)
-                    else:
-                        subconfigs[k] = _from_dict(v)
-            filtered_data.update(subconfigs)
+            return config_cls(**{key: _from_value(value) for key, value in filtered_data.items()})
 
-            return config_cls(**filtered_data)
+        def _from_value(value):
+            if isinstance(value, dict):
+                if "_target_" in value:
+                    if (
+                        value.get("_call_", True) is False
+                        or value.get("_partial_", False)
+                        or "_args_" in value
+                    ):
+                        from megatron.training.config.instantiate_utils import instantiate
+
+                        return instantiate(value)
+                    return _from_dict(value)
+                return {key: _from_value(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return type(value)(_from_value(item) for item in value)
+            return value
 
         result = _from_dict(data)
-        result.builder = data["_builder_"]
+        if "_builder_" in data:
+            result.builder = data["_builder_"]
 
         return result
+
+
+@dataclass(kw_only=True)
+class ModelProviderConfig(ModelConfig):
+    """Model inputs for an application-supplied provider callback.
+
+    The callback remains an explicit runtime argument to ``pretrain``. This config
+    owns the shared model inputs without selecting a GPT or Hybrid builder.
+    ``seq_length`` is position capacity, not the actual data sequence length.
+    """
+
+    transformer: TransformerConfig
+    """Shared transformer architecture, precision, and parallelism settings."""
+    seq_length: int
+    """Maximum position capacity, independent of the actual data sequence length."""
+    vocab_size: int | None = None
+    """Resolved model vocabulary, or None until tokenizer initialization."""
+    should_pad_vocab: bool = False
+    """Whether the provider should pad the supplied raw vocabulary size."""
+    make_vocab_size_divisible_by: int = 128
+    """Vocabulary alignment factor, multiplied by tensor-parallel size."""
+    logit_dtype: torch.dtype | None = None
+    """Optional output-logit dtype override."""
+    fp16_lm_cross_entropy: bool = False
+    """Compute language-model cross entropy in half precision."""
+    share_embeddings_and_output_weights: bool = True
+    """Tie input embedding and output projection weights."""
+    position_embedding_type: str = "learned_absolute"
+    """Position embedding implementation selected by the application."""
+    rotary_percent: float = 1.0
+    """Fraction of the head dimension using rotary embeddings."""
+    rotary_base: int = 10000
+    """Base period for rotary embeddings."""
+    rope_scaling: bool = False
+    """Enable rotary position scaling."""
+    rope_scaling_factor: float = 8.0
+    """Rotary position scaling factor when enabled."""
+    hybrid_layer_pattern: str | None = None
+    """Optional language-model hybrid layer layout."""
+    tp_comm_overlap_cfg: str | dict[str, Any] | None = None
+    """Transformer Engine user-buffer overrides, as a YAML path or a dictionary."""
 
 
 ModelT = TypeVar("ModelT", bound=MegatronModule)

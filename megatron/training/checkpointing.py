@@ -62,6 +62,7 @@ from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_run_config, get_tokenizer, get_train_state
 from megatron.training.utils.checkpoint_utils import get_checkpoint_train_state_filename
+from megatron.training.vocab_utils import calculate_padded_vocab_size, model_vocab_size
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -209,6 +210,187 @@ def get_loaded_iteration():
     return _LOADED_ITERATION
 
 
+_MISSING_CONFIG_VALUE = object()
+
+
+def _checkpoint_model_spec(spec, legacy_spec):
+    """Resolve saved model specs to the existing CLI import-path representation."""
+    if spec is None:
+        return None
+    import yaml
+
+    from megatron.core.transformer.spec_utils import ModuleSpec, import_module
+    from megatron.training.config.yaml_utils import safe_yaml_representers
+    from megatron.training.models.base import _model_value_to_dict
+
+    if isinstance(spec, dict) and spec.get('_call_') is False:
+        return spec['_target_'].rsplit('.', 1)
+
+    def canonical(value):
+        # ModuleSpec may contain partials, whose equality is object identity.
+        # Preserve partial kwargs before YAML normalization: its generic object
+        # fallback used to discard nested dataclass fields in older checkpoints.
+        value = _model_value_to_dict(value)
+        with safe_yaml_representers():
+            return yaml.safe_load(yaml.safe_dump(value))
+
+    saved_spec = canonical(spec)
+
+    def matches_legacy(value, candidate, *, partial_kwarg=False):
+        # Only the old dataclass skeleton inside a partial kwarg is incomplete.
+        # Do not treat arbitrary missing fields as wildcards or guess a named spec.
+        if isinstance(value, dict) and isinstance(candidate, dict):
+            if (
+                partial_kwarg
+                and set(value) == {'_target_', '_call_'}
+                and value['_call_'] is True
+                and candidate.get('_target_') == value['_target_']
+                and '_call_' not in candidate
+            ):
+                return True
+            return value.keys() == candidate.keys() and all(
+                matches_legacy(
+                    item, candidate[key],
+                    partial_kwarg=value.get('_partial_', False) and not key.startswith('_'),
+                )
+                for key, item in value.items()
+            )
+        if isinstance(value, list) and isinstance(candidate, list):
+            return len(value) == len(candidate) and all(
+                matches_legacy(item, other) for item, other in zip(value, candidate)
+            )
+        return value == candidate
+
+    if legacy_spec is not None:
+        try:
+            legacy_value = import_module(legacy_spec)
+        except ImportError:
+            legacy_value = None
+        legacy_value = canonical(legacy_value)
+        if legacy_value == saved_spec:
+            return legacy_spec
+        if matches_legacy(saved_spec, legacy_value):
+            print_rank_0(
+                'WARNING: Restoring nested model-spec fields omitted by old checkpoint '
+                'serialization from the saved legacy args.spec.'
+            )
+            return legacy_spec
+    if isinstance(spec, ModuleSpec) or (
+        isinstance(spec, dict)
+        and spec.get('_target_') == 'megatron.core.transformer.spec_utils.ModuleSpec'
+    ):
+        from megatron.core.models.hybrid import hybrid_layer_specs
+
+        for name, candidate in vars(hybrid_layer_specs).items():
+            if isinstance(candidate, ModuleSpec) and canonical(candidate) == saved_spec:
+                return [hybrid_layer_specs.__name__, name]
+    raise ValueError(
+        'The saved model spec has no equivalent CLI import path. Supply the native '
+        'model config directly instead of reconstructing it with --use-checkpoint-args.'
+    )
+
+
+def _checkpoint_model_arg(model_config, arg_name):
+    """Read model metadata in the legacy CLI vocabulary at the checkpoint boundary.
+
+    This does not construct or synchronize an args snapshot. Missing fields use
+    the legacy checkpoint metadata; present config values, including None, win.
+    Actual data sequence length is deliberately not model position capacity.
+    """
+    if not model_config:
+        return _MISSING_CONFIG_VALUE
+    transformer = model_config.get("transformer", {})
+    if arg_name == "seq_length":
+        return _MISSING_CONFIG_VALUE
+    if arg_name == "spec":
+        return model_config.get(
+            'hybrid_stack_spec', model_config.get('transformer_layer_spec', _MISSING_CONFIG_VALUE)
+        )
+    aliases = {
+        "max_position_embeddings": (model_config, "seq_length"),
+        "num_experts": (transformer, "num_moe_experts"),
+        "apply_layernorm_1p": (transformer, "layernorm_zero_centered_gamma"),
+        "untie_embeddings_and_output_weights": (
+            model_config, "share_embeddings_and_output_weights"
+        ),
+    }
+    if arg_name in aliases:
+        section, name = aliases[arg_name]
+        value = section.get(name, _MISSING_CONFIG_VALUE)
+        if arg_name == "untie_embeddings_and_output_weights" and value is not _MISSING_CONFIG_VALUE:
+            value = not value
+        return value
+    if arg_name.startswith("wide_residual_"):
+        wide_residual = transformer.get("wide_residual", _MISSING_CONFIG_VALUE)
+        if wide_residual is _MISSING_CONFIG_VALUE:
+            return wide_residual
+        if wide_residual is None:
+            return dict(_WIDE_RESIDUAL_ARG_DEFAULTS)[arg_name]
+        return wide_residual.get(arg_name.removeprefix("wide_residual_"), _MISSING_CONFIG_VALUE)
+    if arg_name == "group_query_attention":
+        groups = transformer.get("num_query_groups", _MISSING_CONFIG_VALUE)
+        if groups is _MISSING_CONFIG_VALUE:
+            return groups
+        return groups is not None and groups != transformer.get("num_attention_heads")
+    if arg_name in ("swiglu", "squared_relu", "quick_geglu", "activation_func"):
+        activation = transformer.get("activation_func", {})
+        target = activation.get("_target_") if isinstance(activation, dict) else None
+        if target is None:
+            return _MISSING_CONFIG_VALUE
+        if arg_name == "activation_func":
+            from megatron.training.config.instantiate_utils import instantiate
+
+            return instantiate(activation)
+        if arg_name == "swiglu":
+            return target == "torch.nn.functional.silu" and transformer.get("gated_linear_unit", False)
+        if arg_name == "quick_geglu":
+            return (
+                target == "megatron.core.fusions.fused_bias_geglu.quick_gelu"
+                and transformer.get("gated_linear_unit", False)
+            )
+        return target == "megatron.core.activations.squared_relu"
+    if arg_name in ("add_position_embedding", "use_rotary_position_embeddings"):
+        position_type = model_config.get("position_embedding_type", _MISSING_CONFIG_VALUE)
+        if position_type is _MISSING_CONFIG_VALUE:
+            return position_type
+        # These deprecated flags are normalized into position_embedding_type.
+        return arg_name == "add_position_embedding"
+    if arg_name == "padded_vocab_size":
+        value = model_config.get("vocab_size", _MISSING_CONFIG_VALUE)
+        if value is _MISSING_CONFIG_VALUE or value is None:
+            return value
+        if model_config.get("should_pad_vocab", False):
+            value = calculate_padded_vocab_size(
+                value,
+                model_config["make_vocab_size_divisible_by"],
+                transformer["tensor_model_parallel_size"],
+                logging_enabled=False,
+            )
+        return value
+    if arg_name in model_config:
+        return model_config[arg_name]
+    return transformer.get(arg_name, _MISSING_CONFIG_VALUE)
+
+
+def _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type):
+    """Read the existing config metadata for local, legacy, or distributed checkpoints."""
+    if ckpt_type == CheckpointType.LOCAL:
+        return state_dict.get("run_config")
+    from megatron.training.utils.checkpoint_utils import (
+        get_checkpoint_run_config_filename,
+        read_run_config,
+    )
+
+    checkpoint_dir = (
+        os.path.dirname(os.path.dirname(checkpoint_name))
+        if ckpt_type == CheckpointType.LEGACY else checkpoint_name
+    )
+    config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
+    if maybe_msc.os.path.exists(config_filename):
+        return read_run_config(config_filename)
+    return None
+
+
 def check_checkpoint_args(
     checkpoint_args,
     skip_args: set[str] | None = None,
@@ -222,18 +404,32 @@ def check_checkpoint_args(
     args = get_args()
     skip_args = skip_args or set()
 
-    def _compare(arg_name, old_arg_name=None, default=None):
+    def _compare(
+        arg_name, old_arg_name=None, default=None, *, config_section=None, config_name=None
+    ):
         if arg_name in skip_args:
             return
         if old_arg_name is not None:
             ckpt_arg_name = old_arg_name
         else:
             ckpt_arg_name = arg_name
-        if default is not None:
+        config_name = config_name or arg_name
+        current_config = args
+        saved_config = checkpoint_config or {}
+        if config_section is not None:
+            current_config = cfg
+            for section in config_section.split("."):
+                current_config = getattr(current_config, section)
+                saved_config = (saved_config or {}).get(section, {})
+        else:
+            saved_config = {}
+        if config_name in saved_config:
+            checkpoint_value = saved_config[config_name]
+        elif default is not None:
             checkpoint_value = getattr(checkpoint_args, ckpt_arg_name, default)
         else:
             checkpoint_value = getattr(checkpoint_args, ckpt_arg_name)
-        args_value = getattr(args, arg_name)
+        args_value = getattr(current_config, config_name)
         error_message = (
             '{} value from checkpoint ({}) is not equal to the input argument value ({}).'.format(
                 arg_name, checkpoint_value, args_value
@@ -241,29 +437,47 @@ def check_checkpoint_args(
         )
         assert checkpoint_value == args_value, error_message
 
-    _compare('num_layers')
-    _compare('hidden_size')
-    _compare('num_attention_heads')
-    if hasattr(args, 'gdp_num_householder'):
-        _compare('gdp_num_householder', default=3)
-    _compare('add_position_embedding', default=True)
-    if getattr(args, 'wide_residual_num_streams', None) is not None or hasattr(
+    _compare('num_layers', config_section='model.transformer')
+    _compare('hidden_size', config_section='model.transformer')
+    _compare('num_attention_heads', config_section='model.transformer')
+    _compare('gdp_num_householder', default=3, config_section='model.transformer')
+    legacy_position_type = (
+        'rope' if (
+            getattr(checkpoint_args, 'use_rotary_position_embeddings', False)
+            or not getattr(checkpoint_args, 'add_position_embedding', True)
+        ) else 'learned_absolute'
+    )
+    _compare('position_embedding_type', default=legacy_position_type, config_section='model')
+    if cfg.model.transformer.wide_residual is not None or hasattr(
         checkpoint_args, 'wide_residual_num_streams'
     ):
         for arg_name, default in _WIDE_RESIDUAL_ARG_DEFAULTS:
             if arg_name in skip_args:
                 continue
-            checkpoint_value = getattr(checkpoint_args, arg_name, default)
-            args_value = getattr(args, arg_name, default)
+            checkpoint_value = _checkpoint_model_arg(
+                (checkpoint_config or {}).get('model'), arg_name
+            )
+            if checkpoint_value is _MISSING_CONFIG_VALUE:
+                checkpoint_value = getattr(checkpoint_args, arg_name, default)
+            args_value = getattr(
+                cfg.model.transformer.wide_residual, arg_name.removeprefix('wide_residual_'), default
+            )
             assert checkpoint_value == args_value, (
                 f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
                 f'the input argument value ({args_value}).'
             )
     if args.vocab_file:
-        _compare('max_position_embeddings')
-        _compare('make_vocab_size_divisible_by')
-        if not args.use_dist_ckpt:
-            _compare('padded_vocab_size')
+        _compare('max_position_embeddings', config_section='model', config_name='seq_length')
+        _compare('make_vocab_size_divisible_by', config_section='model')
+        if not args.use_dist_ckpt and 'padded_vocab_size' not in skip_args:
+            saved_vocab_size = _checkpoint_model_arg(
+                (checkpoint_config or {}).get('model'), 'padded_vocab_size'
+            )
+            if saved_vocab_size is _MISSING_CONFIG_VALUE:
+                saved_vocab_size = checkpoint_args.padded_vocab_size
+            assert saved_vocab_size == model_vocab_size(cfg.model), (
+                'padded_vocab_size value from checkpoint does not match cfg.model.'
+            )
         _compare('tokenizer_type')
     if cfg.rng.data_parallel_random_init and 'data_parallel_random_init' not in skip_args:
         saved_rng = checkpoint_config.get('rng', {}) if checkpoint_config is not None else {}
@@ -278,10 +492,10 @@ def check_checkpoint_args(
     if check_training_state and args.phase_transition_iterations:
         _compare('global_batch_size')
     if get_checkpoint_version() < 3.0:
-        _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size')
+        _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size', config_section='model.transformer')
     if get_checkpoint_version() >= 3.0 and not args.use_dist_ckpt:
-        _compare('tensor_model_parallel_size')
-        _compare('pipeline_model_parallel_size')
+        _compare('tensor_model_parallel_size', config_section='model.transformer')
+        _compare('pipeline_model_parallel_size', config_section='model.transformer')
 
 
 def ensure_directory_exists(filename, check_parent=True):
@@ -722,6 +936,7 @@ def save_checkpoint(
     """
     start_ckpt = time()
     args = get_args()
+    cfg = get_run_config()
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0(
@@ -739,7 +954,7 @@ def save_checkpoint(
 
     # --freeze-all-layers: weights are frozen, so skip the weight write and its finalizers; dump
     # progress is recorded separately via the post-logits finalize (see the async block below).
-    skip_weight_ckpt = getattr(args, 'freeze_all_layers', False)
+    skip_weight_ckpt = cfg.model.freeze_all_layers
 
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
@@ -978,7 +1193,7 @@ def save_checkpoint(
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == 'fsdp_dtensor':
-                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                state_dict = preprocess_fsdp_dtensor_state_dict(cfg.model.transformer, state_dict, model[0])
 
             if args.async_save:
                 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
@@ -1906,7 +2121,7 @@ def _localize_redundant_extra_states(state_dict):
     dict_list_map_inplace(_maybe_localize, state_dict)
 
 
-def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
+def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
 
@@ -1919,13 +2134,18 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
         if 'optimizer' in state_dict:
             state_dict['optimizer'] = optimizer_state_dict
 
-    if args.swiglu:
+    if (
+        config.gated_linear_unit
+        and config.activation_func is torch.nn.functional.silu
+    ):
         apply(handle_swiglu_in_state_dict)
     # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
     # layout used on disk. No-op for unfused models.
     apply(handle_mla_down_proj_in_state_dict)
-    if args.num_experts:
-        state_dict['model'] = handle_experts_in_state_dict(state_dict['model'], args.num_experts)
+    if config.num_moe_experts:
+        state_dict['model'] = handle_experts_in_state_dict(
+            state_dict['model'], config.num_moe_experts
+        )
     # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
     # above resolve keys against live module paths, which still use the new name.
     apply(handle_mtp_in_state_dict)
@@ -2339,7 +2559,8 @@ def _load_base_checkpoint(
         )
         raw_model_state_dict = state_dict['model'].copy() if 'model' in state_dict else None
         model = state_dict.pop('_model')
-        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+        cfg = get_run_config()
+        state_dict = preprocess_fsdp_dtensor_state_dict(cfg.model.transformer, state_dict, model[0])
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
         if gpt_compat_layer_maps is not None:
@@ -2429,6 +2650,8 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
         return args
 
     checkpoint_args = state_dict['args']
+    checkpoint_config = _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
+    checkpoint_model = (checkpoint_config or {}).get('model')
     checkpoint_version = state_dict.get('checkpoint_version', 0)
     args.iteration = state_dict['iteration']
 
@@ -2457,12 +2680,16 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
         if not force and getattr(args, arg_name, None) is not None:
             return
 
-        if old_arg_name is not None:
-            checkpoint_value = getattr(checkpoint_args, old_arg_name, None)
-        else:
-            checkpoint_value = getattr(checkpoint_args, arg_name, None)
+        checkpoint_value = _checkpoint_model_arg(checkpoint_model, arg_name)
+        from_model_config = checkpoint_value is not _MISSING_CONFIG_VALUE
+        if checkpoint_value is _MISSING_CONFIG_VALUE:
+            checkpoint_value = getattr(checkpoint_args, old_arg_name or arg_name, None)
+        elif arg_name == 'spec':
+            checkpoint_value = _checkpoint_model_spec(
+                checkpoint_value, getattr(checkpoint_args, 'spec', None)
+            )
 
-        if checkpoint_value is not None:
+        if checkpoint_value is not None or from_model_config:
             print_rank_0(f'Setting {arg_name} to {checkpoint_value} from checkpoint')
             setattr(args, arg_name, checkpoint_value)
         else:
@@ -2488,6 +2715,11 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
+    if 'activation_func' in (checkpoint_model or {}).get('transformer', {}):
+        # Normalize the saved activation, including native choices without a CLI alias.
+        _set_arg('activation_func', force=True)
+        _set_arg('gated_linear_unit', force=True)
+        _set_arg('quick_geglu', force=True)
     _set_arg('activation_func_tanh_clamp_scale', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
@@ -2512,7 +2744,10 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('num_experts', force=True)
     _set_arg('mtp_num_layers', force=True)
     _set_arg('moe_layer_freq', force=True)
-    if getattr(checkpoint_args, 'num_experts', None) is not None:
+    checkpoint_num_experts = _checkpoint_model_arg(checkpoint_model, 'num_experts')
+    if checkpoint_num_experts is _MISSING_CONFIG_VALUE:
+        checkpoint_num_experts = getattr(checkpoint_args, 'num_experts', None)
+    if checkpoint_num_experts is not None:
         _set_arg('moe_ffn_hidden_size', force=True)
     else:
         setattr(args, 'moe_ffn_hidden_size', None)
@@ -2581,7 +2816,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     return args, checkpoint_args
 
 
-def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
+def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model, *, checkpoint_model=None):
     """Detect a GPT (pure transformer) checkpoint being loaded into a HybridModel run.
 
     Returns ``(layer_maps, load_optim)`` where ``layer_maps`` is used to retarget
@@ -2614,13 +2849,15 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
         return False
 
     runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
-    if not vars(ckpt_args):
+    if not vars(ckpt_args) and not checkpoint_model:
         # Checkpoints imported by Megatron Bridge may omit training args entirely.
         # Without explicit source-model metadata, keep the regular loading path.
         return None, False
-    ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
-        ckpt_args, 'hybrid_override_pattern', None
-    )
+    ckpt_pattern = _checkpoint_model_arg(checkpoint_model, 'hybrid_layer_pattern')
+    if ckpt_pattern is _MISSING_CONFIG_VALUE:
+        ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
+            ckpt_args, 'hybrid_override_pattern', None
+        )
     if runtime_is_hybrid == bool(ckpt_pattern):
         return None, False
     if not runtime_is_hybrid:
@@ -2632,21 +2869,24 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
 
     # GPT checkpoint feeding a HybridModel run: translate the sharded state
     # dict at load time instead of converting the checkpoint on disk.
-    if not args.hybrid_layer_pattern:
+    cfg = get_run_config()
+    if not cfg.model.hybrid_layer_pattern:
         raise RuntimeError(
             'Loading a GPT checkpoint into a hybrid model requires '
             '--hybrid-layer-pattern so checkpoint layers can be paired with '
             'hybrid layer positions.'
         )
     try:
-        layer_maps = gpt_compatible_layer_maps(args.hybrid_layer_pattern)
+        layer_maps = gpt_compatible_layer_maps(cfg.model.hybrid_layer_pattern)
     except ValueError as exc:
         raise RuntimeError(f'Cannot load a GPT checkpoint into this hybrid model: {exc}') from exc
 
-    ckpt_num_layers = getattr(ckpt_args, 'num_layers', None)
+    ckpt_num_layers = _checkpoint_model_arg(checkpoint_model, 'num_layers')
+    if ckpt_num_layers is _MISSING_CONFIG_VALUE:
+        ckpt_num_layers = getattr(ckpt_args, 'num_layers', None)
     if ckpt_num_layers is not None and ckpt_num_layers != layer_maps.num_gpt_layers:
         raise RuntimeError(
-            f'Hybrid layer pattern {args.hybrid_layer_pattern!r} pairs with a GPT '
+            f'Hybrid layer pattern {cfg.model.hybrid_layer_pattern!r} pairs with a GPT '
             f'checkpoint of {layer_maps.num_gpt_layers} layers, but the checkpoint '
             f'has num_layers={ckpt_num_layers}.'
         )
@@ -2720,7 +2960,7 @@ def load_checkpoint(
     # progress from --save (this job's output) rather than --load lets --load stay pinned to a
     # fixed checkpoint across resubmits. An explicit --override-ckpt-iteration wins. (The main use
     # today is offline-KD teacher-logit dumps.)
-    if restore_training_state and getattr(args, 'freeze_all_layers', False):
+    if restore_training_state and cfg.model.freeze_all_layers:
         # Weights only: don't adopt the loaded checkpoint's optimizer / LR-scheduler / rng, or run
         # check_checkpoint_args against a checkpoint from a different run (finetune gates all of
         # those; --freeze-all-layers alone would still load the scheduler and assert on arg drift).
@@ -2773,6 +3013,11 @@ def load_checkpoint(
         )
 
     load_kwargs = {}
+    checkpoint_config = (
+        _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
+        if state_dict is not None else None
+    )
+    checkpoint_model = (checkpoint_config or {}).get('model')
     ignore_rng_state = False
     ignore_rerun_state = True
     ckpt_args = types.SimpleNamespace()
@@ -2790,11 +3035,18 @@ def load_checkpoint(
         if any(hasattr(ckpt_args, name) for name in ('fp4', 'fp8', 'fp8_recipe'))
         else None
     )
+    if checkpoint_model and 'transformer' in checkpoint_model:
+        saved_transformer = checkpoint_model['transformer']
+        gtp_pad_for_alignment = resolve_gtp_pad_for_alignment(
+            fp4=saved_transformer.get('fp4') is not None,
+            fp8_recipe=saved_transformer.get('fp8_recipe'),
+            fp8=saved_transformer.get('fp8') is not None,
+        )
 
     # Both model-space torch_dist and fsdp_dtensor checkpoints carry model-keyed
     # optimizer state that can be retargeted from GPTModel to HybridModel.
     gpt_compat_layer_maps, gpt_compat_load_optim = (
-        _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model)
+        _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model, checkpoint_model=checkpoint_model)
         if ckpt_format in ('torch_dist', 'fsdp_dtensor') and state_dict is not None
         else (None, False)
     )
@@ -2806,11 +3058,17 @@ def load_checkpoint(
         if not hasattr(ckpt_args, 'pipeline_model_parallel_size'):
             print_rank_0('WARNING: PP size not found in checkpoint args, using 1 as default.')
 
-        ckpt_tp_pp = (
-            getattr(ckpt_args, 'tensor_model_parallel_size', 1),
-            getattr(ckpt_args, 'pipeline_model_parallel_size', 1),
+        ckpt_tp_pp = []
+        for name in ('tensor_model_parallel_size', 'pipeline_model_parallel_size'):
+            value = _checkpoint_model_arg(checkpoint_model, name)
+            ckpt_tp_pp.append(
+                getattr(ckpt_args, name, 1) if value is _MISSING_CONFIG_VALUE else value
+            )
+        ckpt_tp_pp = tuple(ckpt_tp_pp)
+        run_tp_pp = (
+            cfg.model.transformer.tensor_model_parallel_size,
+            cfg.model.transformer.pipeline_model_parallel_size,
         )
-        run_tp_pp = (args.tensor_model_parallel_size, args.pipeline_model_parallel_size)
 
         ckpt_world_size = getattr(ckpt_args, 'world_size', 0)
         run_world_size = getattr(args, 'world_size', 0)
@@ -3157,22 +3415,8 @@ def load_checkpoint(
         # architecture-preserving load. Keep every other resume-time argument
         # compatibility check.
         skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
-        checkpoint_config = None
-        if ckpt_type == CheckpointType.LOCAL:
-            checkpoint_config = state_dict.get('run_config')
-        else:
-            from megatron.training.utils.checkpoint_utils import (
-                get_checkpoint_run_config_filename,
-                read_run_config,
-            )
-
-            checkpoint_dir = (
-                os.path.dirname(os.path.dirname(checkpoint_name))
-                if ckpt_type == CheckpointType.LEGACY else checkpoint_name
-            )
-            config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
-            if maybe_msc.os.path.exists(config_filename):
-                checkpoint_config = read_run_config(config_filename)
+        if checkpoint_config is None:
+            checkpoint_config = _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
         check_checkpoint_args(
             checkpoint_args,
             skip_args=skip_args,
@@ -3373,13 +3617,13 @@ def load_checkpoint(
             and optimizer is not None
             and not getattr(optimizer, 'is_stub_optimizer', False)
             and (
-                getattr(args, 'fp8_param_gather', False)
-                or getattr(args, 'fp4_param_gather', False)
+                cfg.model.transformer.fp8_param
+                or cfg.model.transformer.fp4_param
             )
         ):
             optimizer.quantize_and_sync_model_params_from_main_params()
     else:
-        if getattr(args, 'fp8_param_gather', False) or getattr(args, 'fp4_param_gather', False):
+        if cfg.model.transformer.fp8_param or cfg.model.transformer.fp4_param:
             print_rank_0(
                 'WARNING: quantized params were loaded without the optimizer main params, so '
                 'they were re-quantized from the dequantized values in the checkpoint rather '
@@ -3387,7 +3631,7 @@ def load_checkpoint(
                 'ones the saving job chose, so the weights are not guaranteed to be bit-wise '
                 'identical to those saved. Load the optimizer state to avoid this.'
             )
-        if (args.fp16 or args.bf16) and optimizer is not None:
+        if (cfg.model.transformer.fp16 or cfg.model.transformer.bf16) and optimizer is not None:
             if args.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)
             else:
