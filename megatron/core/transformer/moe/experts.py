@@ -4,7 +4,6 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-import os
 import weakref
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext

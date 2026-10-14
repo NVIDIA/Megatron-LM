@@ -389,7 +389,8 @@ class _GTPTEWeightBridge:
         # so only verify that GTP handed out the same buffers the push read.
         if self._ptrs(direction, sources) != self._tables[fc_layer][direction].pointers:
             raise RuntimeError(
-                f"FC{fc_layer + 1} {direction}: GTP source storage moved between push and materialization."
+                f"FC{fc_layer + 1} {direction}: "
+                "GTP source storage moved between push and materialization."
             )
         # First consume can replace its forward ticket while discovering the chain. The
         # next push binds the established allocation without constraining GTP's cache setup.
