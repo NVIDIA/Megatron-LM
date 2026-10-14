@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situlu
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.megakernel.mok import weights
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -70,6 +71,7 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
         {"moe_shared_expert_gate": True},
         {"moe_router_dtype": None},
         {"moe_router_dtype": "fp32"},
+        {"moe_shared_expert_gate": True, "activation_func": situlu},
         {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
         {
             "fp8": "hybrid",

@@ -122,9 +122,11 @@ class _MoKAutograd(torch.autograd.Function):
         weight_args = _MoKWeightArguments.from_combined(
             shared_fc1, shared_fc2, fc1_forward, fc2_forward, module.intermediate_size
         )
-        gate_kwargs = {}
+        forward_kwargs = {}
         if shared_output_gate_weight is not None:
-            gate_kwargs["shared_output_gate_weight"] = shared_output_gate_weight
+            forward_kwargs["shared_output_gate_weight"] = shared_output_gate_weight
+        if module.situ_beta is not None:
+            forward_kwargs["situ_beta"] = module.situ_beta
         output, forward_context = functional.forward(
             module.mok_config,
             workspace,
@@ -133,7 +135,7 @@ class _MoKAutograd(torch.autograd.Function):
             router_weights,
             *weight_args,
             swiglu_limit=module.swiglu_limit,
-            **gate_kwargs,
+            **forward_kwargs,
         )
 
         ctx.module = module
