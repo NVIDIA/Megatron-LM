@@ -382,7 +382,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_moe_kernels.py", K + "test_shortcut_inference_kernels.py"),
         kind="te-wrapper",
         notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert; "
-        "the capped Shortcut expert adapter replays real BF16 expert weights and reduction.",
+        "the capped Shortcut expert adapter replays BF16 weights and reduction with changing live tokens.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -623,7 +623,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
         "ordered_reduce_scatter_v (multi-rank) is not replayed here. The Shortcut expert adapter "
-        "covers capped vLLM preparation, GEMMs and reduction with real expert weights.",
+        "covers capped vLLM preparation, GEMMs and reduction in a graph with changing live tokens.",
     ),
     KernelEntry(
         name="batch_invariant_kernels",

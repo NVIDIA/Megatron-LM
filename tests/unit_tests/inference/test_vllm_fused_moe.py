@@ -19,14 +19,6 @@ os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(tempfile.gettempdir(), "t
 import pytest
 import torch
 
-from megatron.core.inference.moe.fused_moe import ActivationType
-from megatron.core.inference.moe.vllm_fused_moe import (
-    compute_vllm_moe,
-    finish_vllm_moe,
-    prepare_vllm_moe,
-    vllm_fused_moe,
-)
-
 
 def _vt(n):
     """Create a valid_tokens scalar int32 CUDA tensor."""
@@ -1378,78 +1370,3 @@ class TestFusedMoeActivationClamp:
             )
             is squared_relu_and_quantize_mxfp8
         )
-
-
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_staged_vllm_moe_grid_limit_covers_all_tiles_in_graph():
-    """Limited grids stride through all tiles as a captured live-token prefix grows."""
-    grid_size_limit = 2
-    max_tokens, hidden_size, ffn_hidden, topk, local_experts = 64, 128, 256, 2, 4
-    hidden, probs, routing_map, fc1_weight, fc2_weight = _make_moe_inputs(
-        max_tokens, hidden_size, ffn_hidden, topk, local_experts, seed=23
-    )
-    # Local experts are [1, 5). Include both non-local IDs and enough local
-    # assignments to require more tiles than either capped launch grid.
-    routing_map.copy_(torch.arange(max_tokens * topk, device="cuda").reshape(max_tokens, topk) % 6)
-    valid_tokens = _vt(max_tokens)
-    output = torch.empty(max_tokens, hidden_size, device="cuda", dtype=torch.float32)
-    reference_output = torch.empty_like(output)
-
-    def prepare(limit):
-        return prepare_vllm_moe(
-            hidden,
-            probs,
-            fc1_weight,
-            fc2_weight,
-            ActivationType.SQUARED_RELU,
-            local_experts,
-            1,
-            valid_tokens,
-            routing_map,
-            num_tokens_hint=4,
-            grid_size_limit=limit,
-        )
-
-    uncapped = prepare(None)
-    disabled = prepare(0)
-    assert disabled.grid_size_fc1 == uncapped.grid_size_fc1 > grid_size_limit
-    assert disabled.grid_size_fc2 == uncapped.grid_size_fc2 > grid_size_limit
-    with pytest.raises(ValueError, match="nonnegative"):
-        prepare(-1)
-
-    def run_stages():
-        prepared = prepare(grid_size_limit)
-        assert prepared.grid_size_fc1 == prepared.grid_size_fc2 == grid_size_limit
-        return finish_vllm_moe(compute_vllm_moe(prepared), out=output)
-
-    warmup_stream = torch.cuda.Stream()
-    warmup_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup_stream):
-        for _ in range(3):
-            run_stages()
-    torch.cuda.current_stream().wait_stream(warmup_stream)
-    # Capture with a small live prefix and then expand it without recapture.
-    valid_tokens.fill_(9)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = run_stages()
-    for count in (9, max_tokens, 0, 33):
-        valid_tokens.fill_(count)
-        output.fill_(float("nan"))
-        graph.replay()
-        expected = vllm_fused_moe(
-            hidden,
-            probs,
-            fc1_weight,
-            fc2_weight,
-            ActivationType.SQUARED_RELU,
-            local_experts,
-            1,
-            valid_tokens,
-            routing_map,
-            out=reference_output,
-            num_tokens_hint=4,
-        )
-        torch.testing.assert_close(captured[:count], expected[:count], atol=0, rtol=0)
-        assert torch.isnan(captured[count:]).all()
