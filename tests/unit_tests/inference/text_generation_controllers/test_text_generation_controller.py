@@ -4024,20 +4024,23 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize(
-        "pp_size, logit_dtype, expected",
+        "tp_size, pp_size, logit_dtype, expected",
         [
-            (1, None, torch.bfloat16),
-            (1, torch.float32, torch.float32),
-            (2, torch.float32, torch.float32),
+            (1, 1, None, torch.bfloat16),
+            (1, 1, torch.float32, torch.float32),
+            (1, 2, torch.float32, torch.float32),
+            (2, 1, None, torch.bfloat16),
         ],
-        ids=["pp1-bf16", "pp1-fp32", "pp2-fp32"],
+        ids=["tp1-pp1-bf16", "tp1-pp1-fp32", "tp1-pp2-fp32", "tp2-pp1-bf16"],
     )
-    def test_logits_keep_the_head_dtype(self, pp_size, logit_dtype, expected):
+    def test_logits_keep_the_head_dtype(self, tp_size, pp_size, logit_dtype, expected):
         """Inference holds logits in the dtype the head emits: the CUDA-graph buffer is
         allocated in it, so an fp32 head (`logit_dtype`) is not narrowed to
         `params_dtype` by the controller copy, and at PP 2 the first stage receives the
-        broadcast in it. Generation with and without the buffer samples the same tokens
-        (both run the same eager kernels here).
+        broadcast in it. With the buffer the model writes each step's logits into it
+        inside the forward and the controller asserts the identity every step; without
+        it there is none. Generation with and without the buffer samples the same
+        tokens (both run the same eager kernels here).
         """
         if logit_dtype is not None and te_general_gemm is None:
             pytest.skip("fp32 logits need Transformer Engine general_gemm")
@@ -4047,7 +4050,7 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 self.teardown_method(None)
             self.setup_model(
                 torch.bfloat16,
-                tensor_model_parallel_size=1,
+                tensor_model_parallel_size=tp_size,
                 pipeline_model_parallel_size=pp_size,
                 static=False,
                 use_training_random_init=True,
@@ -4055,7 +4058,14 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 logit_dtype=logit_dtype,
             )
             controller = self.text_generation_controller
+            context = controller.inference_wrapped_model.inference_context
             assert controller._logits_dtype == expected
+            if cuda_graph_impl == "local":
+                assert context.logits_output_buffer is controller._all_logits_cuda
+                assert controller._all_logits_cuda.shape[-1] == self.vocab_size
+            else:
+                assert context.logits_output_buffer is None
+                assert controller._all_logits_cuda is None
             # The harness wraps bf16 models in Float16Module; the wrapper must not let it
             # upcast the logits to fp32 on the way out.
             assert controller.inference_wrapped_model._model_forward_kwargs == {
