@@ -6,6 +6,8 @@ Unit tests for identity hyper-connections (iHC).
 iHC keeps the mHC H_pre / H_post mappings but fixes the residual mixing matrix
 H_res to the identity: nothing is projected for it and the Sinkhorn-Knopp step
 is skipped, while the downstream H_res / H_post / BDA kernels are unchanged.
+Numerical references use full FP32 matmul precision so identity mixing preserves
+the residual even on devices where TF32 is selected for the native batched matmul.
 """
 
 import pytest
@@ -40,6 +42,22 @@ def _model_parallel():
 @pytest.fixture(autouse=True)
 def _reseed(_model_parallel):
     model_parallel_cuda_manual_seed(123)
+
+
+@pytest.fixture(autouse=True)
+def _full_fp32_matmul():
+    """Match the precision assumed by the strict identity/reference assertions.
+
+    CI containers can enable TF32 by default. On GB200 the native H_res batched
+    matmul then rounds the residual even for an identity matrix, unlike the
+    elementwise reference. Restore the original setting for subsequent tests.
+    """
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
 
 
 @pytest.fixture(autouse=True)
