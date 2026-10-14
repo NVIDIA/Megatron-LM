@@ -138,7 +138,7 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
     block = ShortcutMoEBlock(Compute(config), _FakeMoE(config), overlap_a2a=False).eval().cuda()
     block.moe_layer.mlp.token_dispatcher = Dispatcher()
     side = torch.cuda.Stream()
-    monkeypatch.setattr(block, "_get_a2a_overlap_stream", lambda: side)
+    monkeypatch.setattr(ShortcutMoEBlock, "_parallel_stream", side)
     monkeypatch.setattr(block, "_read_shortcut_hidden", lambda hidden, **kwargs: hidden)
 
     def route(shortcut_hidden, *, padding_mask, **kwargs):
