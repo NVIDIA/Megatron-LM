@@ -68,6 +68,47 @@ def _fill_parameters_with_ones(model: GPTModel) -> None:
             param.fill_(1.0)
 
 
+def _param_with(**attrs) -> torch.Tensor:
+    param = torch.ones(4, dtype=torch.bfloat16)
+    for name, value in attrs.items():
+        setattr(param, name, value)
+    return param
+
+
+def test_get_param_data_uses_precision_aware_shard_when_main_param_is_none():
+    """With the precision-aware optimizer main_param is None because TE owns the masters; the norm
+    must come from the local 16-bit shard instead of dropping the param (norm of 0)."""
+    shard = torch.full((2,), 3.0, dtype=torch.bfloat16)
+    param = _param_with(main_param=None, main_param_sharded=True, main_param_shard_for_norm=shard)
+    data, is_sharded = common_utils._get_param_data(param, False, True)
+    assert is_sharded
+    assert data.dtype == torch.float32
+    assert torch.equal(data, shard.float())
+
+
+def test_get_param_data_skips_param_without_local_shard():
+    """Params owned by other DP ranks (no main_param, no local shard) are still skipped."""
+    param = _param_with(main_param=None, main_param_sharded=True)
+    assert common_utils._get_param_data(param, False, True) == (None, True)
+
+
+def test_get_param_data_prefers_main_param_over_shard():
+    main = torch.full((2,), 2.0)
+    param = _param_with(
+        main_param=main, main_param_sharded=True, main_param_shard_for_norm=torch.zeros(2)
+    )
+    data, is_sharded = common_utils._get_param_data(param, False, True)
+    assert is_sharded and data is main
+
+
+def test_get_param_data_force_fp32_copy_ignores_shard():
+    param = _param_with(
+        main_param=None, main_param_sharded=True, main_param_shard_for_norm=torch.zeros(2)
+    )
+    data, is_sharded = common_utils._get_param_data(param, True, True)
+    assert not is_sharded and data.shape == param.shape
+
+
 def test_mimo_param_norm_skips_frozen_pp1_module(monkeypatch):
     class _ProcessGroup:
         def size(self):

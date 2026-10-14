@@ -69,13 +69,19 @@ def _get_param_data(param, force_create_fp32_copy, bf16):
     """Extract the appropriate data tensor from a param for norm computation.
 
     Returns (data_tensor, is_sharded) where is_sharded indicates the param has
-    a sharded main_param from the distributed optimizer.
+    a sharded main_param (or, with the precision-aware optimizer, a local 16-bit shard) from the
+    distributed optimizer. data_tensor is None if this rank holds no shard of the param.
     """
     if bf16:
         if not force_create_fp32_copy and hasattr(param, 'main_param'):
             if getattr(param, 'main_param_sharded', False):
                 if param.main_param is not None:
                     return param.main_param, True
+                # Precision-aware optimizer: FP32 masters live inside the optimizer, so use the
+                # local 16-bit shard it updates in-kernel.
+                shard = getattr(param, 'main_param_shard_for_norm', None)
+                if shard is not None:
+                    return shard.float(), True
                 return None, True
             return param.main_param, False
         return param.data.float(), False

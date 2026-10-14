@@ -559,6 +559,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # Store handle to main_param.
                     model_param.main_param = shard_main_param
                     model_param.main_param_sharded = True
+                    if (
+                        shard_main_param is None
+                        and shard_model_param is not None
+                        and not cls._is_distopt_quantized_param(model_param)
+                    ):
+                        # The precision-aware optimizer owns the FP32 masters, so there is no
+                        # main_param to take the param norm from. Expose the local 16-bit shard,
+                        # which the optimizer step updates in-kernel (and which, unlike the full
+                        # model param, does not depend on a possibly in-flight param all-gather).
+                        model_param.main_param_shard_for_norm = shard_model_param
 
                     # Add to group.
                     model_float16_params_this_group.append(model_param)
