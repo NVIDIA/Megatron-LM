@@ -8,7 +8,7 @@ on a rank, and ``wrap_model_chunks_with_ddp`` wraps each chunk in its own
 ``fully_shard_context`` around the whole per-chunk loop; each chunk's adapter
 joins it through ``current_fully_shard_context()`` instead of opening a second
 context, and the helper finalizes the shared context exactly once after the
-loop. Tests cover shared context construction and per-root prefetch cursors across
+loop. Tests cover shared context construction and scheduler-managed prefetch cursors across
 grouped microbatches, backward work, and forward-only validation.
 """
 
@@ -27,7 +27,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard i
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.schedule import SchedulePolicy
-from megatron.core.pipeline_parallel.schedules import get_schedule_table
+from megatron.core.pipeline_parallel.schedules import (
+    _reset_mfsdp_prefetch_order,
+    get_schedule_table,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training.training import wrap_model_chunks_with_ddp
@@ -35,13 +38,11 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def test_prefetch_follows_grouped_virtual_pipeline_chunks(monkeypatch):
-    """Grouped VPP forwards/backwards and validation use independent root cursors."""
+    """Scheduler resets support grouped VPP calls, validation, and single-root hooks."""
     monkeypatch.setattr(torch.cuda, 'Stream', lambda *_args: Mock())
     monkeypatch.setattr(torch.cuda.nvtx, 'range_push', Mock())
     monkeypatch.setattr(torch.cuda.nvtx, 'range_pop', Mock())
-    context = FsdpContext(
-        torch.device('cuda'), caller_managed_grad_sync=True, prefetch_per_root=True
-    )
+    context = FsdpContext(torch.device('cuda'), caller_managed_grad_sync=True)
     context.current_stream = Mock()
 
     class HookModule(nn.Module, FsdpModule):
@@ -71,6 +72,13 @@ def test_prefetch_follows_grouped_virtual_pipeline_chunks(monkeypatch):
 
     chunks = [HookModule(HookModule(), HookModule()) for _ in range(2)]
     context.finalize()
+    wrappers = [
+        SimpleNamespace(
+            module=chunk,
+            ddp_config=SimpleNamespace(use_megatron_fsdp=True, megatron_fsdp_version=2),
+        )
+        for chunk in chunks
+    ]
     train_schedule = get_schedule_table(5, 2, 3)
     eval_schedule = get_schedule_table(4, 2, 2)
     assert [chunk_id for _, chunk_id in train_schedule[:6]] == [0, 0, 0, 1, 1, 1]
@@ -79,8 +87,8 @@ def test_prefetch_follows_grouped_virtual_pipeline_chunks(monkeypatch):
         outputs = [[], []]
         for _, chunk_id in schedule:
             chunk = chunks[chunk_id]
+            _reset_mfsdp_prefetch_order(wrappers[chunk_id], forward=True)
             outputs[chunk_id].append(chunk(torch.ones(1, requires_grad=True)))
-            assert list(context.forward_order) == [chunk, *chunk.layers]
             assert context.forward_order.next_item() is None
         return outputs
 
@@ -91,14 +99,26 @@ def test_prefetch_follows_grouped_virtual_pipeline_chunks(monkeypatch):
         for _, forward_chunk_id in train_schedule:
             # The interleaved scheduler reverses chunk IDs for backward.
             chunk_id = len(chunks) - forward_chunk_id - 1
+            _reset_mfsdp_prefetch_order(wrappers[chunk_id], forward=False)
             outputs[chunk_id].pop(0).sum().backward()
-            chunk = chunks[chunk_id]
-            assert list(context.backward_order) == [chunk, *reversed(chunk.layers)]
             assert context.backward_order.next_item() is None
         for chunk in chunks:
             chunk.eval()
         with torch.no_grad():
             forward_pass(eval_schedule)
+
+    # Ordinary single-root hooks reset the full order without scheduler involvement.
+    context = FsdpContext(torch.device('cuda'), caller_managed_grad_sync=True)
+    context.current_stream = Mock()
+    single = HookModule(HookModule(), HookModule())
+    context.finalize()
+    for _ in range(2):
+        context.forward_order.advance(single)
+        output = single(torch.ones(1, requires_grad=True))
+        context.backward_order.advance(single)
+        output.sum().backward()
+        assert context.forward_order.next_item() is None
+        assert context.backward_order.next_item() is None
 
 
 class _VirtualPipelineChunk(nn.Module):
@@ -176,12 +196,8 @@ class TestMfsdpV2PipelineSharedContext:
         # ready to drive forward/backward without an extra finalize.
         first_context.ensure_finalized()
         for wrapped_chunk in wrapped_chunks:
-            first_context.activate_root_prefetch(wrapped_chunk.module)
-            assert list(first_context.forward_order) == [
-                module
-                for module in wrapped_chunk.module.modules()
-                if isinstance(module, FsdpModule)
-            ]
+            _reset_mfsdp_prefetch_order(wrapped_chunk, forward=True)
+            first_context.forward_order.advance(wrapped_chunk.module)
 
         # The helper left no ambient context behind: the chunks joined its scope and
         # that scope, which owned the only finalize call, has since exited.

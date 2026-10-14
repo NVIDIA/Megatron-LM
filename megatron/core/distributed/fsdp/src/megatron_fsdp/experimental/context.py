@@ -63,7 +63,6 @@ class FsdpContext:
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         caller_managed_grad_sync: bool = False,
-        prefetch_per_root: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -84,9 +83,6 @@ class FsdpContext:
                 allowing delayed weight gradients or custom backward schedules. The caller must
                 call ``finish_grad_sync()`` after all backward work and before reading or
                 modifying gradients.
-            prefetch_per_root: Give each root independent forward/backward prefetch orders.
-                Use for VPP chunks whose microbatches execute in scheduler-selected order.
-                Prefetch stays within a root while communication streams remain shared.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -101,10 +97,6 @@ class FsdpContext:
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
-        self._prefetch_per_root = prefetch_per_root
-        self._root_prefetch_orders: WeakKeyDictionary[
-            nn.Module, tuple[ExecutionOrder[nn.Module], ExecutionOrder[nn.Module]]
-        ] = WeakKeyDictionary()
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
@@ -162,18 +154,11 @@ class FsdpContext:
             if root in children:
                 continue
             self._roots.append(root)
-            root_forward_order = ExecutionOrder() if self._prefetch_per_root else None
             for name, module in root.named_modules():
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
                 self.forward_order.append(module)
-                if root_forward_order is not None:
-                    root_forward_order.append(module)
-            if root_forward_order is not None:
-                root_backward_order = ExecutionOrder()
-                _collect_backward_order(root, registered_modules, root_backward_order)
-                self._root_prefetch_orders[root] = (root_forward_order, root_backward_order)
 
         for root in reversed(self._roots):
             _collect_backward_order(root, registered_modules, self.backward_order)
@@ -182,21 +167,9 @@ class FsdpContext:
         self.parameter_to_owner = None
         self._is_finalized = True
 
-    def activate_root_prefetch(self, root: nn.Module, *, backward: bool = False) -> None:
-        """Select a root's cursor when its scheduled forward or backward begins.
-
-        Each cursor cycles after a complete root execution and is preserved when
-        the scheduler switches roots. Forward-only validation leaves backward
-        cursors untouched. Construction order within each root remains strict.
-        """
-        self.ensure_finalized()
-        if not self._prefetch_per_root:
-            return
-        forward_order, backward_order = self._root_prefetch_orders[root]
-        if backward:
-            self.backward_order = backward_order
-        else:
-            self.forward_order = forward_order
+    def has_single_root(self) -> bool:
+        """Return whether ordinary root hooks can reset the complete order."""
+        return sum(1 for _ in self._roots) == 1
 
     def is_root(self, module: nn.Module) -> bool:
         """Return whether ``module`` is an outermost FSDP module in this context."""

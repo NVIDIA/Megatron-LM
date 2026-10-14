@@ -66,6 +66,18 @@ def test_execution_order_validates_calls():
     order.advance(first)
     assert order.next_item() is None
 
+    # Scheduler-selected windows stop at their boundary, including the last window.
+    order.reset(2, end=3)
+    order.advance(first)
+    assert order.next_item() is None
+    with pytest.raises(RuntimeError, match='diverged'):
+        order.advance(first)
+    order.reset()
+    order.advance(first)
+    assert order.next_item() is second
+    with pytest.raises(ValueError, match='reset range'):
+        order.reset(4)
+
 
 def test_membership_reverse_and_weak_references():
     """Traversal preserves repeated occurrences without retaining deleted modules."""

@@ -32,6 +32,7 @@ class ExecutionOrder(Generic[T]):
         """Create an execution sequence, preserving repeated occurrences."""
         self._items: list[ref[T]] = [ref(item) for item in items]
         self._position = 0
+        self._end: int | None = None
 
     def append(self, item: T) -> None:
         """Append one occurrence, including repeated calls to the same module."""
@@ -55,11 +56,22 @@ class ExecutionOrder(Generic[T]):
             if item is not None:
                 yield item
 
+    def reset(self, position: int = 0, *, end: int | None = None) -> None:
+        """Start an execution at ``position``, limiting prefetch to ``end`` if provided."""
+        limit = len(self._items) if end is None else end
+        if not 0 <= position <= limit <= len(self._items):
+            raise ValueError("Invalid execution-order reset range.")
+        self._position = position
+        self._end = end
+
     def advance(self, item: T) -> None:
-        """Consume the next expected call, restarting after the sequence ends."""
-        if not self._items or self._items[self._position]() is not item:
+        """Consume the next expected call; full-order playback cycles automatically."""
+        end = len(self._items) if self._end is None else self._end
+        if self._position >= end or self._items[self._position]() is not item:
             raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-        self._position = (self._position + 1) % len(self._items)
+        self._position += 1
+        if self._end is None:
+            self._position %= len(self._items)
 
     def next_item(self, offset: int = 1) -> T | None:
         """Look ahead from the last consumed occurrence without moving the cursor."""
@@ -67,6 +79,7 @@ class ExecutionOrder(Generic[T]):
             return None
         index = (self._position - 1) % len(self._items)
         next_index = index + offset
-        if next_index >= len(self._items):
+        end = len(self._items) if self._end is None else self._end
+        if next_index >= end:
             return None
         return self._items[next_index]()

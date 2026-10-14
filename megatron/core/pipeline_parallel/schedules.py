@@ -987,6 +987,26 @@ def get_pp_rank_microbatches(
     )
 
 
+def _reset_mfsdp_prefetch_order(model_chunk, *, forward):
+    """Position MFSDP v2's shared cursor at the scheduled chunk's root."""
+    ddp_config = getattr(model_chunk, 'ddp_config', None)
+    if not (
+        getattr(ddp_config, 'use_megatron_fsdp', False)
+        and getattr(ddp_config, 'megatron_fsdp_version', 1) == 2
+    ):
+        return
+    root = model_chunk.module
+    context = root.context
+    order = context.forward_order if forward else context.backward_order
+    modules = list(order)
+    start = modules.index(root)
+    end = next(
+        (index for index in range(start + 1, len(modules)) if context.is_root(modules[index])),
+        len(modules),
+    )
+    order.reset(start, end=end)
+
+
 def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage):
     """Get the schedule table for PP scheduling."""
     schedule_table = []
@@ -1334,6 +1354,7 @@ def forward_backward_pipelining_with_interleaving(
 
     def forward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id, microbatch_id):
         """Preprocess for forward_step_helper"""
+        _reset_mfsdp_prefetch_order(model[model_chunk_id], forward=True)
         # launch param synchronization for next model chunk
         # Note: Asynchronous communication tends to slow down compute.
         # To reduce idling from mismatched microbatch times, we launch
@@ -1419,6 +1440,7 @@ def forward_backward_pipelining_with_interleaving(
 
     def backward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id):
         """Preprocess for backward_step_helper"""
+        _reset_mfsdp_prefetch_order(model[model_chunk_id], forward=False)
         # launch grad synchronization (default)
         if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(
             virtual_microbatch_id

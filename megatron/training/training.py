@@ -2466,18 +2466,12 @@ def wrap_model_chunks_with_ddp(
     # For MFSDP v2 the adapter joins whatever FsdpContext is already active and only opens
     # one when none is (see ``current_fully_shard_context``), so opening one ambient context
     # around the loop below puts every chunk of this call on the same context, sharing
-    # communication streams. VPP uses independent per-root prefetch cursors because
-    # the scheduler can run several microbatches of one chunk before another.
-    # This scope owns the single finalize call.
+    # communication streams and prefetch orders. This scope owns the single finalize call.
     is_mfsdp_v2 = (
         DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
     ) and ddp_config.megatron_fsdp_version == 2
     construction_context = (
-        fully_shard_context(
-            use_symmetric_memory=ddp_config.nccl_ub,
-            caller_managed_grad_sync=True,
-            prefetch_per_root=len(model_chunks) > 1,
-        )
+        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True)
         if is_mfsdp_v2
         else nullcontext()
     )
