@@ -138,6 +138,41 @@ def test_mamba_chunk_scan_combined_varlen_replays():
     )
 
 
+def test_mamba_chunk_scan_combined_train_replays():
+    """The batch-invariant training scan: these kernels forward, mamba_ssm's backward."""
+    pytest.importorskip("mamba_ssm")
+    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_train
+
+    seeded()
+    batch, seqlen, nheads, headdim, ngroups, dstate, chunk = 2, 2048, 32, 64, 1, 128, 256
+    x = torch.randn(batch, seqlen, nheads, headdim, device="cuda", dtype=torch.bfloat16)
+    z = torch.randn_like(x)
+    dt = torch.rand(batch, seqlen, nheads, device="cuda") * 0.1
+    A = -torch.rand(nheads, device="cuda") - 1.0
+    B = torch.randn(batch, seqlen, ngroups, dstate, device="cuda", dtype=torch.bfloat16)
+    C = torch.randn_like(B)
+    D = torch.randn(nheads, device="cuda")
+    dt_bias = torch.rand(nheads, device="cuda")
+    inputs = tuple(t.requires_grad_() for t in (x, z, dt, A, B, C, D, dt_bias))
+
+    def fn(x, z, dt, A, B, C, D, dt_bias):
+        return mamba_chunk_scan_combined_train(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            state_dtype=torch.float32,
+        )
+
+    assert_replays_bit_exact(fn, inputs, replays=4, what="mamba_chunk_scan_combined_train")
+
+
 def test_selective_state_update_replays():
     from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 

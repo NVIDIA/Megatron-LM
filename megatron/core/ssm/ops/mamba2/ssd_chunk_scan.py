@@ -81,6 +81,7 @@ def _chunk_scan_fwd_kernel(
     x_ptr,
     z_ptr,
     out_ptr,
+    out_x_ptr,
     dt_ptr,
     dA_cumsum_ptr,
     seq_idx_ptr,
@@ -134,6 +135,7 @@ def _chunk_scan_fwd_kernel(
     HAS_D: tl.constexpr,
     D_HAS_HDIM: tl.constexpr,
     HAS_Z: tl.constexpr,
+    HAS_OUT_X: tl.constexpr,
     HAS_TARGET_ROWS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -316,6 +318,18 @@ def _chunk_scan_fwd_kernel(
         ).to(tl.float32)
         acc += x_residual * D
 
+    if HAS_OUT_X:
+        # Pre-gate output, which the training backward needs; same layout as out.
+        out_x_ptr += chunk_seqlen_start * stride_out_seqlen + pid_h * stride_out_head
+        out_x_ptrs = out_x_ptr + (
+            stride_out_seqlen * offs_out_m[:, None] + offs_out_n[None, :] * stride_out_hdim
+        )
+        tl.store(
+            out_x_ptrs,
+            acc,
+            mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim),
+        )
+
     if HAS_Z:
         z_ptr += chunk_seqlen_start * stride_z_seqlen + pid_h * stride_z_head
         z_ptrs = z_ptr + (
@@ -365,7 +379,13 @@ def _chunk_scan_fwd(
     initial_states=None,
     target_rows=None,
     chunk_starts=None,
+    out_x=None,
 ):
+    """Chunk scan of the SSD recurrence, written into ``out`` in place.
+
+    ``out_x``, if given, also receives the output before the ``z`` gate (same shape and
+    strides as ``out``); the training backward needs it. It does not change ``out``.
+    """
     assert seq_idx is not None, "this implementation requires seq_idx"
     has_target_rows = target_rows is not None
     assert (
@@ -386,6 +406,9 @@ def _chunk_scan_fwd(
         assert D.shape == (nheads, headdim) or D.shape == (nheads,)
     if z is not None:
         assert z.shape == x.shape
+    if out_x is not None:
+        assert z is not None and not has_target_rows, "out_x is the pre-gate full output"
+        assert out_x.shape == out.shape and out_x.stride() == out.stride()
     assert dt.shape == (nheads, nchunks, chunk_size)
     assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
     assert states.shape == (nchunks, nheads, headdim, dstate)
@@ -414,6 +437,7 @@ def _chunk_scan_fwd(
         x_ptr=x,
         z_ptr=z,
         out_ptr=out,
+        out_x_ptr=out_x,
         dt_ptr=dt,
         dA_cumsum_ptr=dA_cumsum,
         seq_idx_ptr=seq_idx,
@@ -464,6 +488,7 @@ def _chunk_scan_fwd(
         HAS_D=D is not None,
         D_HAS_HDIM=D.dim() == 2 if D is not None else True,
         HAS_Z=z is not None,
+        HAS_OUT_X=out_x is not None,
         HAS_TARGET_ROWS=has_target_rows,
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         IS_TRITON_22=TRITON_22,

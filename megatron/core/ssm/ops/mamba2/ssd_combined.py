@@ -39,6 +39,7 @@ def _mamba_chunk_scan_combined_fwd(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
+    out_x=None,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
@@ -146,6 +147,7 @@ def _mamba_chunk_scan_combined_fwd(
         D=D,
         z=z,
         initial_states=initial_states,
+        out_x=out_x,
     )
 
     final_states = states[last_chunk_indices]
@@ -225,3 +227,132 @@ def mamba_chunk_scan_combined_varlen(
     )
 
     return varlen_states
+
+
+class _MambaChunkScanCombinedTrainFn(torch.autograd.Function):
+    """Differentiable chunk scan whose forward runs the kernels above.
+
+    The forward is the varlen scan dynamic prefill and the batch-invariant decode replay
+    run, so a training forward through it shares their Triton autotuners: with those
+    pinned (batch-invariant mode), it launches their tile configs and reduction order.
+    These kernels have no backward; the backward is mamba_ssm's, which recomputes its own
+    forward intermediates and only needs the pre-gate output saved here.
+    """
+
+    @staticmethod
+    def forward(ctx, x, dt, A, B, C, chunk_size, D, z, dt_bias, dt_softplus, dt_limit, state_dtype):
+        """Varlen scan over the batch rows, each chunked from its own first token."""
+        batch, seqlen = x.shape[:2]
+        device = x.device
+        # Each sequence is chunked from its own first token, as prefill chunks a request.
+        chunks_per_seq = triton.cdiv(seqlen, chunk_size)
+        chunk_starts = torch.arange(0, seqlen, chunk_size, dtype=torch.int32, device=device)
+        seq_starts = torch.arange(0, batch * seqlen, seqlen, dtype=torch.int32, device=device)
+        cu_chunk_seqlens = torch.cat(
+            [
+                (seq_starts[:, None] + chunk_starts[None, :]).flatten(),
+                torch.full((1,), batch * seqlen, dtype=torch.int32, device=device),
+            ]
+        )
+        seq_idx = torch.arange(batch, dtype=torch.int32, device=device).repeat_interleave(
+            chunks_per_seq
+        )
+        last_chunk_indices = (
+            torch.arange(1, batch + 1, dtype=torch.int32, device=device) * chunks_per_seq - 1
+        )
+
+        def flat(t):
+            return None if t is None else t.reshape(batch * seqlen, *t.shape[2:])
+
+        out = torch.empty_like(flat(x))
+        out_x = torch.empty_like(out) if z is not None else None
+        _mamba_chunk_scan_combined_fwd(
+            flat(x),
+            flat(dt),
+            A,
+            flat(B),
+            flat(C),
+            chunk_size,
+            out,
+            D=D,
+            z=flat(z),
+            dt_bias=dt_bias,
+            seq_idx=seq_idx,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            state_dtype=state_dtype,
+            out_x=out_x,
+        )
+        out = out.view_as(x)
+        saved_out = out if z is None else out_x.view_as(x)
+        ctx.save_for_backward(saved_out, x, dt, A, B, C, D, z, dt_bias)
+        ctx.chunk_size = chunk_size
+        ctx.dt_softplus = dt_softplus
+        ctx.dt_limit = dt_limit
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        """mamba_ssm's chunk-scan backward on the saved inputs and pre-gate output."""
+        from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_bwd
+
+        out, x, dt, A, B, C, D, z, dt_bias = ctx.saved_tensors
+        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, _ = _mamba_chunk_scan_combined_bwd(
+            dout,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            out,
+            ctx.chunk_size,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=ctx.dt_softplus,
+            dt_limit=ctx.dt_limit,
+        )
+        return dx, ddt, dA, dB, dC, None, dD, dz, ddt_bias, None, None, None
+
+
+def mamba_chunk_scan_combined_train(
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    D=None,
+    z=None,
+    dt_bias=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    state_dtype=None,
+):
+    """Training chunk scan computed with the generation kernels (differentiable).
+
+    Equal, bitwise, to ``mamba_chunk_scan_combined_varlen`` on each sequence and so to
+    the batch-invariant decode replay whenever they launch the same configs: both sides
+    run the same Triton kernels through the same autotuners, which batch-invariant mode
+    pins (``_pin_mamba_autotuners``). The backward needs ``mamba_ssm``.
+
+    Argument:
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, seqlen, nheads)
+        A: (nheads)
+        B: (batch, seqlen, ngroups, dstate)
+        C: (batch, seqlen, ngroups, dstate)
+        chunk_size: int
+        D: (nheads, headdim) or (nheads,)
+        z: (batch, seqlen, nheads, headdim)
+        dt_bias: (nheads,)
+        dt_softplus: Whether to apply softplus to dt
+        state_dtype: The data type of the chunk-boundary states
+    Return:
+        out: (batch, seqlen, nheads, headdim)
+    """
+    return _MambaChunkScanCombinedTrainFn.apply(
+        x, dt, A, B, C, chunk_size, D, z, dt_bias, dt_softplus, dt_limit, state_dtype
+    )
