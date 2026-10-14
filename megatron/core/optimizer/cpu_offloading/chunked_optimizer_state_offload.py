@@ -12,6 +12,7 @@ therefore only ever observes regular CUDA tensors and does not need an offload-s
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import logging
 import math
@@ -52,6 +53,52 @@ class _StateStagingSlot:
     buffers: Dict[tuple[torch.device, torch.dtype], torch.Tensor] = dataclasses.field(
         default_factory=dict
     )
+
+
+class _StagingSlotPool:
+    """The two staging windows of one manager, or of every manager in an optimizer chain.
+
+    Two windows let H2D(N+1), step(N), and D2H(N-1) overlap without host run-ahead
+    allocating one CUDA tensor set per chunk. A chain shares one pool and holds it while its
+    children step. A child's step then leaves the windows to the next child instead of freeing
+    them: freed storage still marked by ``record_stream()`` for an in-flight D2H is withheld
+    from the allocator, so the next child would allocate a fresh window and every child's
+    window could stay resident until the chain finished. Reuse needs no extra wait, because
+    every H2D already waits for the shared D2H stream. Buffers are keyed by device and dtype,
+    so children whose state dtypes differ hold one window per dtype.
+    """
+
+    def __init__(self) -> None:
+        self.slots = (_StateStagingSlot(), _StateStagingSlot())
+        self.next_slot = 0
+        self._holds = 0
+
+    @property
+    def in_use(self) -> bool:
+        """Return whether any window currently owns CUDA storage."""
+
+        return any(slot.buffers for slot in self.slots)
+
+    @contextlib.contextmanager
+    def hold(self):
+        """Keep the windows across every release requested inside the context."""
+
+        self._holds += 1
+        try:
+            yield
+        finally:
+            self._holds -= 1
+            if self._holds == 0:
+                self.release()
+
+    def release(self) -> None:
+        """Drop CUDA ownership unless a chain is still stepping through the pool."""
+
+        if self._holds:
+            return
+        for slot in self.slots:
+            slot.buffers.clear()
+        self.next_slot = 0
 
 
 class ChunkedOptimizerStateOffloader:
@@ -168,10 +215,7 @@ class ChunkedOptimizerStateOffloader:
         self._h2d_stream = h2d_stream if h2d_stream is not None else torch.cuda.Stream()
         self._master_h2d_event: torch.cuda.Event | None = None
         self._master_weights_resident = True
-        # Two reusable state windows allow H2D(N+1), step(N), and D2H(N-1) to overlap
-        # without letting host run-ahead allocate one CUDA tensor set per chunk.
-        self._state_staging_slots = (_StateStagingSlot(), _StateStagingSlot())
-        self._next_state_staging_slot = 0
+        self._staging_pool = _StagingSlotPool()
         self._first_prefetch: _StatePrefetch | None = None
 
     @staticmethod
@@ -291,6 +335,33 @@ class ChunkedOptimizerStateOffloader:
         """Return the D2H/H2D stream pair used by this manager."""
 
         return self._d2h_stream, self._h2d_stream
+
+    @property
+    def staging_pool(self) -> _StagingSlotPool:
+        """Return the staging windows used by this manager."""
+
+        return self._staging_pool
+
+    def use_staging_pool(self, pool: _StagingSlotPool) -> None:
+        """Adopt staging windows shared by sibling optimizers while none is in use."""
+
+        if pool is self._staging_pool:
+            return
+        if self._staging_pool.in_use or self._first_prefetch is not None:
+            raise RuntimeError("optimizer-state staging windows cannot change while in use")
+        self._staging_pool = pool
+
+    @property
+    def _state_staging_slots(self) -> tuple[_StateStagingSlot, _StateStagingSlot]:
+        return self._staging_pool.slots
+
+    @property
+    def _next_state_staging_slot(self) -> int:
+        return self._staging_pool.next_slot
+
+    @_next_state_staging_slot.setter
+    def _next_state_staging_slot(self, index: int) -> None:
+        self._staging_pool.next_slot = index
 
     def use_transfer_streams(
         self, d2h_stream: torch.cuda.Stream, h2d_stream: torch.cuda.Stream
@@ -756,11 +827,12 @@ class ChunkedOptimizerStateOffloader:
         return views
 
     def _release_state_staging_slots(self) -> None:
-        """Drop GPU pool ownership after all live views have been queued for D2H."""
+        """Drop GPU pool ownership after all live views have been queued for D2H.
 
-        for slot in self._state_staging_slots:
-            slot.buffers.clear()
-        self._next_state_staging_slot = 0
+        Inside a chain's hold the windows pass to the next child instead.
+        """
+
+        self._staging_pool.release()
 
     def _prefetch_state(self, chunk: OptimizerStateChunk) -> _StatePrefetch:
         staging_views = self._state_staging_views(chunk)
