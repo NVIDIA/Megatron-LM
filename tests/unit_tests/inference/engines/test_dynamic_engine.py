@@ -2631,6 +2631,9 @@ def test_engine_skips_prompt_preparation_without_offload_params():
 
 _SCORED = dict(log_probs=[-0.5, -0.25])
 _STAMPED = dict(policy_epoch=[(0, 3), (3, 4)], kv_cache_epoch=[(0, 3), (3, 4)])
+# An epoch change before any token was generated sits on the prompt's last token, the only
+# place a resume without tokens can carry one (the text prompt below has three tokens).
+_STAMPED_EMPTY = dict(policy_epoch=[(0, 3), (2, 4)], kv_cache_epoch=[(0, 3), (2, 4)])
 _FILLED = ResumedGeneration(
     [7, 8, 9, 10, 11, 12],
     6,
@@ -2646,16 +2649,46 @@ _UNREADABLE = ResumedGeneration([7, 8], 6, **_SCORED, **_STAMPED).to_wire()
 del _UNREADABLE["token_ids"]
 
 
+def _engine_for_resumes(max_sequence_length=32):
+    """A mock VLM engine at epoch 9 that admits text and compact multimodal prompts."""
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+    engine.context.max_sequence_length = max_sequence_length
+    engine.context.max_tokens, engine.context.num_speculative_tokens = 32, 0
+    engine.context.kv_block_allocator.pool_size = 8
+    engine._generation_epoch, engine.rank = 9, 1
+    engine.requests, engine.waiting_request_ids, engine.failed_request_ids = {}, deque(), []
+    engine.use_coordinator = engine.enable_chunked_prefill = False
+    engine.materialize_only_last_token_logits = False
+    engine.finished_request_count = 0
+    engine.stop_word_finished_request_ids, engine.stop_word_being_finished_ids = set(), set()
+    engine.controller.terminating_token_ids.return_value = frozenset()
+    engine._loop = asyncio.new_event_loop()
+    return engine
+
+
+def _resume(engine, wire, media):
+    """Admit the three-token prompt with a resume under its reserved key, as every rank does."""
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        return engine.add_request(
+            1,
+            [10, 42, 20],
+            SamplingParams(num_tokens_to_generate=6, termination_id=0, return_log_probs=True),
+            offload_params={"ng_capture": "c", RESUMED_GENERATION_FIELD: wire},
+            **media,
+        )
+
+
 @pytest.mark.parametrize(
     ("multimodal", "resumed", "outcome"),
     [
         (False, ResumedGeneration([7, 8], 6, policy_epoch=[(0, 9)], **_SCORED), None),
         (False, ResumedGeneration([7, 8], 5, **_SCORED, **_STAMPED), None),
-        (True, ResumedGeneration([7, 8], 6, policy_epoch=[(0, 3), (3, 4)], **_SCORED), None),
+        (True, ResumedGeneration([7, 8], 6, policy_epoch=[(0, 3), (5, 4)], **_SCORED), None),
         (True, ResumedGeneration([7, 8], 7, finished=True, **_SCORED, **_STAMPED), None),
         (False, _FILLED, None),
-        (False, ResumedGeneration([], 5, **_STAMPED), "fresh"),
-        (False, ResumedGeneration([], 6, log_probs=[], finished=True, **_STAMPED), None),
+        (False, ResumedGeneration([], 5, **_STAMPED_EMPTY), "fresh"),
+        (False, ResumedGeneration([], 6, log_probs=[], finished=True, **_STAMPED_EMPTY), None),
         (False, _UNREADABLE, "wire is malformed: KeyError: 'token_ids'"),
         (
             False,
@@ -2666,6 +2699,23 @@ del _UNREADABLE["token_ids"]
             False,
             ResumedGeneration([7, 8], 6, **_SCORED),
             "carries no policy epoch for an engine that stamps one",
+        ),
+        (
+            False,
+            ResumedGeneration([7, 8], 6, policy_epoch=[(0, 3), (9, 4)], **_SCORED),
+            "has policy_epoch boundaries outside the sequence it resumes",
+        ),
+        (
+            False,
+            ResumedGeneration([7, 8], 6, policy_epoch=[(0, 3), (1, 4)], **_SCORED),
+            "has policy_epoch boundaries outside the sequence it resumes",
+        ),
+        (
+            False,
+            ResumedGeneration(
+                [7, 8], 6, policy_epoch=[(0, 3)], kv_cache_epoch=[(0, 3), (9, 4)], **_SCORED
+            ),
+            "has kv_cache_epoch boundaries outside the sequence it resumes",
         ),
         (False, ResumedGeneration([7, 8], 6, **_SCORED, **_STAMPED), "overflow"),
     ],
@@ -2680,45 +2730,26 @@ del _UNREADABLE["token_ids"]
         "unreadable-refused",
         "unscored-refused",
         "unstamped-refused",
+        "stamped-past-the-generation-refused",
+        "stamped-inside-the-prompt-refused",
+        "kv-stamped-past-the-generation-refused",
         "overflow-fails-as-admission",
     ],
 )
 def test_admit_resumed_generation(multimodal, resumed, outcome):
     """add_request admits a resume on the request as built, under the banked budget rather than
-    the request's; a multimodal resume's boundaries are measured on the expanded prompt; one with
-    nothing generated yet is admitted fresh, or served empty when the preparer says it ended; a
-    refusal, of a wire that does not read back or of what the payload lacks, names its reason."""
-    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
-    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
-    engine.context.max_sequence_length = 2 if outcome == "overflow" else 32
-    engine.context.max_tokens, engine.context.num_speculative_tokens = 32, 0
-    engine.context.kv_block_allocator.pool_size = 8
-    engine._generation_epoch, engine.rank = 9, 1
-    engine.requests, engine.waiting_request_ids, engine.failed_request_ids = {}, deque(), []
-    engine.use_coordinator = engine.enable_chunked_prefill = False
-    engine.materialize_only_last_token_logits = False
-    engine.finished_request_count = 0
-    engine.stop_word_being_finished_ids = set()
-    engine.controller.terminating_token_ids.return_value = frozenset()
-    engine._loop = asyncio.new_event_loop()
+    the request's; a resume's boundaries are the engine's own, counted on the expanded prompt,
+    and are kept as they are; one with nothing generated yet is admitted fresh, or served empty
+    when the preparer says it ended; a refusal, of a wire that does not read back, of what the
+    payload lacks or of a stamp off the sequence, names its reason and leaves the request as it
+    was; a continued request snapshots whole and resumes again unchanged."""
+    engine = _engine_for_resumes(max_sequence_length=2 if outcome == "overflow" else 32)
     wire = resumed if isinstance(resumed, dict) else resumed.to_wire()
-    offload_params = {"ng_capture": "c", RESUMED_GENERATION_FIELD: wire}
     media = (
         {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])} if multimodal else {}
     )
-    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
-        future = engine.add_request(
-            1,
-            [10, 42, 20],
-            SamplingParams(num_tokens_to_generate=6, termination_id=0, return_log_probs=True),
-            offload_params=offload_params,
-            **media,
-        )
+    future = _resume(engine, wire, media)
     prompt = [10, 99, 99, 20] if multimodal else [10, 42, 20]
-    shift = len(prompt) - 3  # the media expansion moves the resume's boundaries
-
-    def shifted(boundaries):
-        return [(p + shift if p >= 3 else p, epoch) for p, epoch in boundaries]
 
     if outcome == "fresh":
         (admitted,) = engine.requests[1].record.requests
@@ -2739,11 +2770,13 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
         reason = failed.offload_params.pop(dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD, None)
         assert failed.status == Status.FAILED and engine.failed_request_ids == [1]
         assert not engine.waiting_request_ids and failed.offload_params == {"ng_capture": "c"}
-        if outcome == "overflow":
+        if outcome == "overflow":  # a valid resume, admitted and failed as any request is
             assert isinstance(error, MaxSequenceLengthOverflowError) and reason is None
-        else:
+        else:  # refused before the request was touched
             assert isinstance(error, PromptPreparationError) and reason in str(error)
             assert reason == f"resumed generation {outcome}"
+            assert failed.generated_tokens == []
+            assert failed.sampling_params.num_tokens_to_generate == 6
         return
     if resumed.finished:
         completed = future.result()
@@ -2764,8 +2797,8 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
         )
         assert (payload.media_tensors is None) is not multimodal
         assert FinishedRequestRecord.from_request(completed) == FinishedRequestRecord(
-            shifted(resumed.policy_epoch),
-            shifted(resumed.kv_cache_epoch),
+            resumed.policy_epoch,
+            resumed.kv_cache_epoch,
             resumed.num_evictions,
             resumed.num_tokens_to_generate,
         )
@@ -2785,7 +2818,7 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
     assert record[0].sampling_params.num_tokens_to_generate == banked
     assert continuation.sampling_params.num_tokens_to_generate == banked - len(resumed.token_ids)
     assert continuation.offload_params == {"ng_capture": "c"}
-    boundaries = shifted(resumed.policy_epoch)
+    boundaries = resumed.policy_epoch
     restamp = [] if boundaries[-1][1] == 9 else [(len(prompt) + len(resumed.token_ids) - 1, 9)]
     assert (
         continuation.policy_epoch == [*boundaries, *restamp] and continuation.kv_cache_epoch is None
@@ -2794,6 +2827,18 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
         FinishedRequestRecord.from_request(record.merge()).num_evictions
         == resumed.num_evictions + 1
     )
+    # The admitted request snapshots whole and, resumed again on a fresh engine of the same epoch,
+    # keeps its prompt and stamps: the round trip a framework performs at a restart.
+    (snapshot,) = engine._loop.run_until_complete(engine.snapshot_live_requests())
+    assert (snapshot.payload.prompt_token_ids, snapshot.record.policy_epoch) == (
+        prompt,
+        continuation.policy_epoch,
+    )
+    again = _engine_for_resumes()
+    _resume(again, ResumedGeneration.from_snapshot(snapshot).to_wire(), media)
+    resumed_again = again.requests[1].record[-1]
+    assert resumed_again.prompt_tokens.tolist() == continuation.prompt_tokens.tolist()
+    assert resumed_again.policy_epoch == continuation.policy_epoch
 
 
 def test_engine_defers_expanded_multimodal_stitching_past_prompt_preparer():
@@ -8400,9 +8445,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env = self._build_test_env(config)
         prompts = {r.request_id: r.prompt_tokens.tolist() for r in env.requests}
         call_ids = {r.request_id: f"call-{r.request_id}" for r in env.requests}
-        budgets = {
-            call_ids[r.request_id]: r.sampling_params.num_tokens_to_generate for r in env.requests
-        }
 
         def wire_and_submit(engine, epoch, resumes):
             """The wiring a framework performs, with a preparer handing back durable prefixes by
@@ -8452,28 +8494,30 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         # THE KILL. What survives: the stager's finished payloads and the framework's snapshot of
         # the live calls; together they cover every call exactly once.
+        snapshots = snapshot(engine)
         banked = {
             params["call_id"]: (payload, telemetry, True)
             for payload, telemetry, params in engine.payload_stager.by_uid.values()
         }
-        live = {
-            s.offload_params["call_id"]: (s.payload, s.record, s.finished) for s in snapshot(engine)
-        }
+        live = {s.offload_params["call_id"]: (s.payload, s.record, s.finished) for s in snapshots}
         assert set(banked) | set(live) == set(call_ids.values()) and not set(banked) & set(live)
         truth = {**banked, **live}
+        # A live call resumes from its snapshot; a finished one from the payload and record the
+        # stager holds, the engine's stamps copied as they are.
         resumes = {
-            call_id: ResumedGeneration(
+            s.offload_params["call_id"]: ResumedGeneration.from_snapshot(s) for s in snapshots
+        }
+        for call_id, (payload, telemetry, _) in banked.items():
+            resumes[call_id] = ResumedGeneration(
                 payload.generated_token_ids,
-                budgets[call_id],
+                telemetry.num_tokens_to_generate,
                 payload.generated_log_probs,
                 payload.prompt_log_probs,
                 policy_epoch=telemetry.policy_epoch,
                 kv_cache_epoch=telemetry.kv_cache_epoch,
                 num_evictions=telemetry.num_evictions,
-                finished=finished,
+                finished=True,
             )
-            for call_id, (payload, telemetry, finished) in truth.items()
-        }
 
         # RESTART: a fresh engine; the framework's preparer hands back the durable prefixes.
         restarted = self._build_test_env(config)

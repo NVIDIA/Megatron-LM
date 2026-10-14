@@ -6,7 +6,7 @@ import math
 import time
 import uuid
 import warnings
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
@@ -1154,7 +1154,6 @@ class DynamicInferenceRequestRecord:
         first: DynamicInferenceRequest,
         resumed: "ResumedGeneration",
         *,
-        prompt_length: int,
         generation_epoch: Optional[int],
     ) -> "DynamicInferenceRequestRecord":
         """Build the record the engine admits for a request that resumes a generation."""
@@ -1166,16 +1165,32 @@ class DynamicInferenceRequestRecord:
             raise ValueError(
                 "resumed generation carries no policy epoch for an engine that stamps one"
             )
-        resumed = resumed.with_expanded_prompt(prompt_length, len(first.prompt_tokens))
+        prompt_length = len(first.prompt_tokens)  # expanded: the prompt the stamps were made on
         tokens = resumed.token_ids
+        for name, boundaries in (
+            ("policy_epoch", resumed.policy_epoch),
+            ("kv_cache_epoch", resumed.kv_cache_epoch),
+        ):
+            # A stamp sits on an existing token:
+            # at the earliest, the prompt's last, before any generation;
+            # at the latest, the last generated token.
+            if boundaries is not None and any(
+                not prompt_length - 1 <= position <= prompt_length + len(tokens) - 1
+                for position, _ in boundaries[1:]
+            ):
+                raise ValueError(
+                    f"resumed generation has {name} boundaries outside the sequence it resumes"
+                )
         first.sampling_params.num_tokens_to_generate = resumed.num_tokens_to_generate
         first.sampling_params.num_tokens_total = None
         first.generated_tokens = tokens
         first.generated_length = len(tokens)
         first.generated_log_probs = resumed.log_probs
         first.prompt_log_probs = resumed.prompt_log_probs
-        first.policy_epoch = resumed.policy_epoch
-        first.kv_cache_epoch = resumed.kv_cache_epoch
+        first.policy_epoch = None if resumed.policy_epoch is None else list(resumed.policy_epoch)
+        first.kv_cache_epoch = (
+            None if resumed.kv_cache_epoch is None else list(resumed.kv_cache_epoch)
+        )
         for _ in range(resumed.num_evictions):
             first.add_event_evict()
         record = cls.from_request(first)
@@ -1186,8 +1201,7 @@ class DynamicInferenceRequestRecord:
         record.checkpoint()
         continuation = record[-1]
         if generation_epoch is not None and continuation.policy_epoch[-1][1] != generation_epoch:
-            cut = len(first.prompt_tokens) + len(tokens) - 1
-            continuation.policy_epoch.append((cut, generation_epoch))
+            continuation.policy_epoch.append((prompt_length + len(tokens) - 1, generation_epoch))
         return record
 
     def __getitem__(self, idx: int) -> DynamicInferenceRequest:
@@ -1500,7 +1514,7 @@ class RequestPayloadStager(Protocol):
 
 @dataclass(frozen=True)
 class LiveRequestSnapshot:
-    """Snapshot of a live request, allowing its later resumption."""
+    """Snapshot of a live request, allowing for its later resumption."""
 
     uid: str
     request_id: int
@@ -1581,32 +1595,35 @@ class ResumedGeneration:
             ("policy_epoch", self.policy_epoch),
             ("kv_cache_epoch", self.kv_cache_epoch),
         ):
-            if boundaries is not None and not (
+            if boundaries is None:
+                continue
+            if not (
                 boundaries
                 and all(len(b) == 2 and all(type(v) is int for v in b) for b in boundaries)
             ):
                 raise ValueError(f"resumed generation has malformed {name} boundaries")
+            if boundaries[0][0] != 0:
+                raise ValueError(
+                    f"resumed generation has {name} boundaries that do not start at admission"
+                )
+            positions = [position for position, _ in boundaries[1:]]
+            if positions != sorted(positions):
+                raise ValueError(f"resumed generation has {name} boundaries out of order")
 
-    def with_expanded_prompt(
-        self, prompt_length: int, expanded_prompt_length: int
-    ) -> "ResumedGeneration":
-        """Re-base boundary positions after the engine expanded the prompt the preparer had seen:
-        the generated stream is moved by the expansion, the prompt's own positions are not.
-        """
-        shift = expanded_prompt_length - prompt_length
-        if shift == 0:
-            return self
-
-        def rebase(boundaries):
-            if boundaries is None:
-                return None
-            return [
-                (position + shift if position >= prompt_length else position, epoch)
-                for position, epoch in boundaries
-            ]
-
-        return replace(
-            self, policy_epoch=rebase(self.policy_epoch), kv_cache_epoch=rebase(self.kv_cache_epoch)
+    @classmethod
+    def from_snapshot(cls, snapshot: "LiveRequestSnapshot") -> "ResumedGeneration":
+        """The resume of a live request from the engine's snapshot of it."""
+        payload, record = snapshot.payload, snapshot.record
+        log_probs, prompt_log_probs = payload.generated_log_probs, payload.prompt_log_probs
+        return cls(
+            token_ids=[int(t) for t in payload.generated_token_ids],
+            num_tokens_to_generate=record.num_tokens_to_generate,
+            log_probs=None if log_probs is None else list(log_probs),
+            prompt_log_probs=None if prompt_log_probs is None else list(prompt_log_probs),
+            policy_epoch=None if record.policy_epoch is None else list(record.policy_epoch),
+            kv_cache_epoch=None if record.kv_cache_epoch is None else list(record.kv_cache_epoch),
+            num_evictions=record.num_evictions,
+            finished=snapshot.finished,
         )
 
     def to_wire(self) -> Dict[str, Any]:
@@ -1676,7 +1693,8 @@ class RequestPromptPreparer(Protocol):
     multimodal requests. When ``PREFIX_MEDIA_COUNT_FIELD`` is present, they must also
     return the length of that exact prefix as ``PREFIX_EXPANDED_TOKEN_COUNT_FIELD`` so
     the engine expands only the tokens after it. A preparer that resumes a generation
-    puts ``ResumedGeneration.to_wire()`` under ``RESUMED_GENERATION_FIELD``.
+    puts ``ResumedGeneration.to_wire()`` under ``RESUMED_GENERATION_FIELD``; its epoch
+    boundaries are the engine's own, counted on the expanded prompt the engine ran.
     """
 
     def prepare_prompt(

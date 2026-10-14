@@ -968,6 +968,14 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         ({**_WIRE, "policy_epoch": [[0]]}, "has malformed policy_epoch boundaries"),
         ({**_WIRE, "kv_cache_epoch": []}, "has malformed kv_cache_epoch boundaries"),
         (
+            {**_WIRE, "policy_epoch": [[1, 3]]},
+            "has policy_epoch boundaries that do not start at admission",
+        ),
+        (
+            {**_WIRE, "policy_epoch": [[0, 3], [1, 4], [0, 5]]},
+            "has policy_epoch boundaries out of order",
+        ),
+        (
             {k: v for k, v in _WIRE.items() if k != "token_ids"},
             "wire is malformed: KeyError: 'token_ids'",
         ),
@@ -985,6 +993,8 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         "misaligned-log-probs",
         "malformed-policy-epoch",
         "empty-kv-cache-epoch",
+        "policy-epoch-not-at-admission",
+        "policy-epoch-out-of-order",
         "missing-field",
         "not-a-mapping",
         "unlistable-tokens",
@@ -998,35 +1008,12 @@ def test_reject_malformed_resumed_generation(wire, reason):
         ResumedGeneration.from_wire(wire)
 
 
-@pytest.mark.parametrize(
-    ("return_log_probs", "generation_epoch", "reason"),
-    [
-        (True, None, "carries no log probs for a request that returns them"),
-        (False, 9, "carries no policy epoch for an engine that stamps one"),
-    ],
-    ids=["unscored-for-a-scored-request", "unstamped-for-a-stamping-engine"],
-)
-def test_reject_resumed_generation(return_log_probs, generation_epoch, reason):
-    """A consistent resume that lacks what the request or engine needs is refused with its reason,
-    before the request is touched."""
-    request = _make_dynamic_request(
-        sampling_params=SamplingParams(num_tokens_to_generate=2, return_log_probs=return_log_probs)
-    )
-    with pytest.raises(ValueError, match=f"^resumed generation {reason}$"):
-        DynamicInferenceRequestRecord.from_resumed_generation(
-            request,
-            ResumedGeneration.from_wire(_WIRE),
-            prompt_length=len(request.prompt_tokens),
-            generation_epoch=generation_epoch,
-        )
-    assert request.generated_tokens == [] and request.sampling_params.num_tokens_to_generate == 2
-
-
 @pytest.mark.parametrize("new_epoch", [7, 8], ids=["same-epoch", "new-epoch"])
 def test_resumed_record_merge(new_epoch):
     """Run A evicts, maybe under a new epoch, and finishes. Run B is killed at that point and a
-    consumer resumes it from its snapshot of the live request. Both merge to the same payload and
-    telemetry, the kill being the one eviction, and a snapshot of the resumed request reads whole.
+    consumer resumes it from its snapshot of the live request, the engine's stamps carried as they
+    are. Both merge to the same payload and telemetry, the kill being the one eviction, and a
+    snapshot of the resumed request reads whole.
     The engine's bookkeeping is replayed by hand: appends, the restamp at total − 1 on an epoch
     change, the kv stamp at schedule time, and completion."""
     scores, part_one, part_two = (
@@ -1061,9 +1048,10 @@ def test_resumed_record_merge(new_epoch):
             merged
         )
 
-    # Run A, never killed: admitted under epoch 7, evicted after part one, finished under new_epoch.
+    # Run A, never killed: admitted under 6, restamped 7 before any token, evicted after part
+    # one, finished under new_epoch.
     first = admitted()
-    first.policy_epoch, first.kv_cache_epoch = [(0, 7)], [(0, 7)]
+    first.policy_epoch, first.kv_cache_epoch = [(0, 6), (2, 7)], [(0, 6), (2, 7)]
     generate(first, *part_one, scores)
     record = DynamicInferenceRequestRecord.from_request(first)
     snapshot = LiveRequestSnapshot.from_record(record, finished=False)  # Run B's copy, taken here
@@ -1073,17 +1061,10 @@ def test_resumed_record_merge(new_epoch):
     expected_payload, expected_telemetry = finish(record)
 
     # Run B: killed at the snapshot, resumed from it under new_epoch, finished the same way.
-    resumed = ResumedGeneration(
-        snapshot.payload.generated_token_ids,
-        snapshot.record.num_tokens_to_generate,
-        snapshot.payload.generated_log_probs,
-        snapshot.payload.prompt_log_probs,
-        policy_epoch=snapshot.record.policy_epoch,
-        kv_cache_epoch=snapshot.record.kv_cache_epoch,
-        num_evictions=snapshot.record.num_evictions,
-    )
+    resumed = ResumedGeneration.from_snapshot(snapshot)
+    assert (resumed.policy_epoch, resumed.kv_cache_epoch) == ([(0, 6), (2, 7)], [(0, 6), (2, 7)])
     record = DynamicInferenceRequestRecord.from_resumed_generation(
-        admitted(), resumed, prompt_length=3, generation_epoch=new_epoch
+        admitted(), resumed, generation_epoch=new_epoch
     )
     assert len(record.requests) == 2 and record[-1].kv_cache_epoch is None
     generate(schedule(record[-1], new_epoch), *part_two, [-9.0])
@@ -1099,5 +1080,5 @@ def test_resumed_record_merge(new_epoch):
     assert (
         telemetry
         == expected_telemetry
-        == FinishedRequestRecord([(0, 7), *restamp], [(0, new_epoch)], 1, 10)
+        == FinishedRequestRecord([(0, 6), (2, 7), *restamp], [(0, new_epoch)], 1, 10)
     )
