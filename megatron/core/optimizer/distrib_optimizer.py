@@ -7,6 +7,7 @@ import itertools
 import logging
 import re
 from collections import ChainMap, defaultdict
+from copy import deepcopy
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -14,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional
 
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import is_te_min_version, log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -942,6 +943,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         }
         return dtype_map.get(key, torch.float32)
 
+    def _uses_native_te_state_initialization(self) -> bool:
+        """Whether metadata can be restored without TE tensor-state serialization."""
+        # Keep custom subclasses and registered load hooks on their normal
+        # loader path. TE 2.18+ has the public remainder-aware initializer.
+        return (
+            USING_TE_OPTIMIZER
+            and type(self.optimizer) is Adam
+            and is_te_min_version("2.18")
+            and not self.optimizer._optimizer_load_state_dict_pre_hooks
+            and not self.optimizer._optimizer_load_state_dict_post_hooks
+        )
+
     def state_dict(self):
         """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
@@ -950,7 +963,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
         """
-        inner_state_dict = self.optimizer.state_dict()
+        # Only group metadata is retained here. TE's override materializes
+        # unscaled tensor states, which are saved separately by this wrapper.
+        inner_state_dict = (
+            torch.optim.Optimizer.state_dict(self.optimizer)
+            if self._uses_native_te_state_initialization()
+            else self.optimizer.state_dict()
+        )
         state_dict = {}
 
         # Extract 'step', for non-Apex/TE support.
@@ -1048,6 +1067,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
 
+        native_te_state = self._uses_native_te_state_initialization()
+        if native_te_state:
+            # Allocate final state buffers once, without constructing a full
+            # dummy state dict and sending it through TE's copying loader.
+            # Parameter values are restored separately below by load_parameter_state*.
+            for group in self.optimizer.param_groups:
+                for param in group["params"]:
+                    if not self.optimizer.state[param]:
+                        self.optimizer.initialize_state(
+                            param,
+                            self.optimizer.store_param_remainders and param.dtype == torch.bfloat16,
+                        )
+
         # Get the Torch optimizer's state dict.
         # - This 'inner' optimizer at this point is unallocated, and only
         #   contains an integer ordering of parameters within each group, and
@@ -1082,7 +1114,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for param_group in state_dict["optimizer"]["param_groups"]:
             needed_groups = make_needed_groups(param_group)
             param_groups_map[needed_groups] = param_group
-        inner_state_dict = self.optimizer.state_dict()
+        inner_state_dict = (
+            torch.optim.Optimizer.state_dict(self.optimizer)
+            if native_te_state
+            else self.optimizer.state_dict()
+        )
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
@@ -1162,10 +1198,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for v in self.optimizer.state.values():
                     v["step"] = step.detach().clone()
 
-        # Optimizer.
-        self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
-        )
+        # This checkpoint portion contains group metadata, not parameter
+        # state. Preserve TE's existing buffers: loading their state_dict back
+        # into TE casts and reallocates the complete state even when unchanged.
+        if native_te_state:
+            loaded_groups = deepcopy(state_dict_param_groups)
+            for current_group, loaded_group in zip(
+                self.optimizer.param_groups, loaded_groups, strict=True
+            ):
+                loaded_group["params"] = current_group["params"]
+            self.optimizer.param_groups = loaded_groups
+        else:
+            self.optimizer.load_state_dict(
+                {"state": state_dict_state, "param_groups": state_dict_param_groups}
+            )
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
