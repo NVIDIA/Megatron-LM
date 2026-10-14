@@ -57,6 +57,15 @@ def _testmon_dependency_override() -> str:
     return f"testmon_ignore_dependencies={' '.join(ignored_packages)}"
 
 
+def _pytest_args(args: argparse.Namespace) -> list[str]:
+    pytest_args = list(args.pytest_args)
+    if pytest_args[:1] == ["--"]:
+        pytest_args.pop(0)
+    if not pytest_args:
+        raise RuntimeError("pytest arguments are required after --")
+    return pytest_args
+
+
 def _run(args: argparse.Namespace) -> int:
     # Spawned workers reload this script after its directory leaves sys.path.
     from testmon_cache import record_phase, validate_phase
@@ -69,11 +78,7 @@ def _run(args: argparse.Namespace) -> int:
     if rank < 0 or world_size < 1 or rank >= world_size:
         raise RuntimeError("invalid torchrun rank or world size")
 
-    pytest_args = list(args.pytest_args)
-    if pytest_args[:1] == ["--"]:
-        pytest_args.pop(0)
-    if not pytest_args:
-        raise RuntimeError("pytest arguments are required after --")
+    pytest_args = _pytest_args(args)
 
     selection_plugin = None
     if args.mode == "baseline":
@@ -124,17 +129,50 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("baseline", "select"), required=True)
     parser.add_argument("--cache-dir", type=Path, required=True)
-    parser.add_argument("--phase", choices=PHASES, required=True)
+    parser.add_argument("--phase", choices=(*PHASES, "both"), required=True)
+    parser.add_argument("--marker", help="common marker expression for selection of both phases")
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    error_phase = args.phase
     try:
-        return _run(args)
+        if args.phase != "both":
+            return _run(args)
+        if args.mode != "select":
+            raise RuntimeError("--phase both is only supported in select mode")
+        if not args.marker or not args.marker.strip():
+            raise RuntimeError("--marker is required with --phase both")
+
+        from testmon_cache import validate_phase
+
+        common_pytest_args = _pytest_args(args)
+        for phase in PHASES:
+            error_phase = phase
+            validate_phase(args.cache_dir, phase)
+
+        # Both sessions only collect immutable source, so reusing imported modules is safe.
+        # Keep fresh pytest sessions and private databases for the two phase selections.
+        for phase in PHASES:
+            error_phase = phase
+            phase_args = argparse.Namespace(**vars(args))
+            phase_args.phase = phase
+            phase_marker = "not experimental" if phase == "prod" else "experimental"
+            phase_args.pytest_args = [
+                *common_pytest_args,
+                "-m",
+                f"{phase_marker} and {args.marker}",
+            ]
+            if phase == "experimental":
+                phase_args.pytest_args.append("--experimental")
+            result = _run(phase_args)
+            if result != 0:
+                return result
+        return 0
     except (OSError, RuntimeError, ValueError) as error:
-        print(f"Testmon wrapper ({args.mode}/{args.phase}): {error}", file=sys.stderr)
+        print(f"Testmon wrapper ({args.mode}/{error_phase}): {error}", file=sys.stderr)
         return 2
 
 
