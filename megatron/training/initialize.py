@@ -86,6 +86,8 @@ def initialize_megatron(
 
     cfg = get_run_config()
     cfg.validate()
+    # Resolve tracker settings once at startup, before RNG or model initialization.
+    cfg.rng.finalize_model_config(cfg.model)
     if not training and args.tp_comm_overlap:
         raise ValueError(
             "--tp-comm-overlap uses fixed training user buffers and is not supported by "
