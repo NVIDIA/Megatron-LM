@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""DCP save/load roundtrip tests for the experimental Megatron-FSDP path.
+"""DCP save/load roundtrip tests for Megatron-FSDP v2.
 
-Includes expert-parallel save/load coverage by comparing resumed losses with
-uninterrupted training.
+Covers the standalone checkpoint helpers and MCore expert-parallel save/load by
+comparing resumed losses with uninterrupted training.
 """
 
 import math
@@ -19,6 +19,8 @@ from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_op
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
@@ -35,11 +37,15 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.test_utilities import Utils
 
 
 class _TinyModel(nn.Module):
@@ -478,143 +484,171 @@ def test_metadata_attach_issues_no_collectives(
 
 
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
-def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_size):
-    """Checkpointed expert-parallel training reproduces uninterrupted losses.
+@pytest.mark.parametrize("precision_aware", [False, True], ids=["fp32_state", "bf16_state"])
+@pytest.mark.parametrize("drop_empty_shards", [False, True], ids=["all_shards", "nonempty_only"])
+def test_ep_fsdp_checkpoint_roundtrip(
+    tmp_path_dist_ckpt, ep_size, precision_aware, drop_empty_shards
+):
+    """MCore checkpoint save/load reproduces uninterrupted BF16 MoE training.
 
-    EP ranks reuse local expert names (weight0, weight1, ...), but own different
-    global experts. A checkpoint must preserve those distinct values, including
-    when expert-DP has size one. EP=1 is the positive control for the same path.
+    Use MCore's existing global expert names and optimizer checkpoint format.
+    EP=1 is the positive control; EP>1 exercises separate dense and expert-DP meshes.
     """
-    device = distributed_setup.device
-    world_size, rank = distributed_setup.world_size, distributed_setup.rank
+    world_size, rank = Utils.world_size, Utils.rank
     if world_size % ep_size:
         pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
 
-    world_mesh = init_device_mesh(device.type, (world_size,))
-    moe_mesh = init_device_mesh(
-        device.type, (world_size // ep_size, ep_size), mesh_dim_names=("edp", "ep")
-    )
-    one = dist.new_group([rank], use_local_synchronization=True)
-    world = world_mesh.get_group()
-    ep_group = moe_mesh.get_group("ep")
-    groups = ProcessGroupCollection(
-        tp=one,
-        expt_tp=one,
-        cp=one,
-        pp=one,
-        tp_cp=one,
-        tp_dp_cp=world,
-        ep=ep_group,
-        tp_ep=ep_group,
-        expt_dp=moe_mesh.get_group("edp"),
-        dp=world,
-        dp_cp=world,
-        embd=None,
-        pos_embd=None,
-    )
+    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        groups = ProcessGroupCollection.use_mpu_process_groups()
 
-    def build(seed):
-        torch.manual_seed(seed)
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=64,
-            num_attention_heads=4,
-            num_moe_experts=8,
-            expert_model_parallel_size=ep_size,
-            moe_token_dispatcher_type="alltoall",
-            moe_router_topk=2,
-            moe_aux_loss_coeff=0.0,
-            moe_grouped_gemm=True,
-            moe_ffn_hidden_size=128,
-            add_bias_linear=False,
-            gradient_accumulation_fusion=False,
-            use_cpu_initialization=True,
-            params_dtype=torch.float32,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-            # The unfused attention backend supports the FP32 model used here.
-            attention_backend=AttnBackend.unfused,
-        )
-        model = HybridModel(
-            config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=128,
-            max_sequence_length=8,
-            hybrid_layer_pattern="*E",
-            pg_collection=groups,
-        ).cuda()
-        # CPU initialization otherwise gives different EP ranks identical local
-        # experts. Make each global expert distinguishable before checkpointing.
-        fqn_mapping = {}
-        with torch.no_grad():
-            for name, layer in model.named_modules():
-                if isinstance(layer, MoETransformerLayer):
-                    for fc in ("linear_fc1", "linear_fc2"):
-                        linear = getattr(layer.mlp.experts, fc)
-                        for local, global_ in enumerate(layer.mlp.local_expert_indices):
-                            getattr(linear, f"weight{local}").add_(global_ * 0.01)
-                            fqn_mapping[f"{name}.mlp.experts.{fc}.weight{local}"] = (
-                                f"{name}.mlp.experts.{fc}.weight{global_}"
-                            )
-        with fully_shard_context(device=device):
-            for layer in model.decoder.layers:
-                if isinstance(layer, MoETransformerLayer):
-                    fully_shard(
-                        layer.mlp.experts,
-                        mesh=moe_mesh["edp"],
-                        placements=_default_placements(),
-                        grad_divisor=ep_size,
-                    )
-            fully_shard(model, mesh=world_mesh, placements=_default_placements())
-        optimizer = torch.optim.Adam(
-            [
-                {
-                    "params": [
-                        p for name, p in model.named_parameters() if ".experts." not in name
-                    ],
-                    "lr": 0.002,
-                },
-                {
-                    "params": [p for name, p in model.named_parameters() if ".experts." in name],
-                    "lr": 0.003,
-                },
-            ]
-        )
-        fully_shard_optimizer(optimizer)
-        return model, optimizer, fqn_mapping
-
-    source, source_optimizer, fqn_mapping = build(123)
-    torch.manual_seed(4321 + rank)
-    ids = torch.randint(0, 128, (2, 8), device=device)
-    pos = torch.arange(8, device=device).repeat(2, 1)
-    target = torch.randn(2, 8, 128, device=device)
-
-    def train(model, optimizer):
-        losses = []
-        for _ in range(5):
-            optimizer.zero_grad()
-            loss = torch.nn.functional.mse_loss(
-                model(input_ids=ids, position_ids=pos, attention_mask=None), target
+        def build(seed):
+            torch.manual_seed(seed)
+            model_parallel_cuda_manual_seed(seed)
+            config = TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                num_moe_experts=8,
+                expert_model_parallel_size=ep_size,
+                moe_token_dispatcher_type="alltoall",
+                moe_router_topk=2,
+                moe_aux_loss_coeff=0.0,
+                moe_grouped_gemm=True,
+                moe_ffn_hidden_size=128,
+                add_bias_linear=False,
+                gradient_accumulation_fusion=False,
+                use_cpu_initialization=True,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                attention_backend=AttnBackend.unfused,
             )
-            loss.backward()
-            optimizer.step()
-            loss = loss.detach()
-            dist.all_reduce(loss, op=dist.ReduceOp.AVG, group=world)
-            losses.append(loss)
-        return losses
+            model = HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern="*E",
+                pg_collection=groups,
+            ).cuda()
+            # CPU initialization otherwise gives different EP ranks identical local
+            # experts. Make each global expert distinguishable before checkpointing.
+            with torch.no_grad():
+                for layer in model.modules():
+                    if isinstance(layer, MoETransformerLayer):
+                        for fc in ("linear_fc1", "linear_fc2"):
+                            linear = getattr(layer.mlp.experts, fc)
+                            for local, global_ in enumerate(layer.mlp.local_expert_indices):
+                                getattr(linear, f"weight{local}").add_(global_ * 0.01)
+            model = FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    megatron_fsdp_version=2,
+                    use_distributed_optimizer=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    megatron_fsdp_main_params_dtype=torch.float32,
+                    megatron_fsdp_main_grads_dtype=torch.bfloat16,
+                    fsdp_all_gather_in_start_param_sync=False,
+                ),
+                module=model,
+                pg_collection=groups,
+            )
+            optimizer = get_megatron_optimizer(
+                OptimizerConfig(
+                    optimizer="adam",
+                    lr=0.001,
+                    weight_decay=0.1,
+                    bf16=True,
+                    params_dtype=torch.bfloat16,
+                    use_distributed_optimizer=False,
+                    clip_grad=0.0,
+                    use_precision_aware_optimizer=precision_aware,
+                    exp_avg_dtype=torch.bfloat16 if precision_aware else torch.float32,
+                    exp_avg_sq_dtype=torch.bfloat16 if precision_aware else torch.float32,
+                ),
+                [model],
+                use_gloo_process_groups=False,
+            )
+            if drop_empty_shards:
+                # Exercise TE < 2.18 empty-shard filtering on newer TE as well.
+                for group in optimizer.optimizer.param_groups:
+                    group["params"] = [p for p in group["params"] if p.to_local().numel() > 0]
+                optimizer.optimizer.param_groups = [
+                    group for group in optimizer.optimizer.param_groups if group["params"]
+                ]
+            return model, optimizer
 
-    train(source, source_optimizer)
+        source, source_optimizer = build(123)
+        if drop_empty_shards:
+            empty_counts = torch.tensor(
+                [
+                    sum(p.to_local().numel() == 0 for p in source.parameters()),
+                    sum(
+                        p.to_local().numel() == 0
+                        for name, p in source.named_parameters()
+                        if ".experts." in name
+                    ),
+                ],
+                device=device,
+            )
+            dist.all_reduce(empty_counts)
+            if world_size > 1:
+                assert empty_counts[0] > 0, "Empty-shard placeholder coverage is vacuous."
+            if world_size // ep_size > 1:
+                assert empty_counts[1] > 0, "No empty expert shard was exercised."
 
-    with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_fsdp_roundtrip", sync=True) as path:
-        if ep_size > 1:
-            with pytest.raises(ValueError, match="globally unique parameter names"):
-                save_checkpoint(source, source_optimizer, path)
-        save_checkpoint(source, source_optimizer, path, fqn_mapping=fqn_mapping)
-        destination, destination_optimizer, destination_mapping = build(987)
-        load_checkpoint(destination, destination_optimizer, path, fqn_mapping=destination_mapping)
+        torch.manual_seed(4321 + rank)
+        ids = torch.randint(0, 128, (2, 8), device=device)
+        pos = torch.arange(8, device=device).repeat(2, 1)
+        target = torch.randn(2, 8, 128, device=device)
 
-    expected_losses = train(source, source_optimizer)
-    actual_losses = train(destination, destination_optimizer)
-    torch.testing.assert_close(
-        torch.stack(actual_losses), torch.stack(expected_losses), rtol=0, atol=0
-    )
+        def train(model, optimizer):
+            losses = []
+            for _ in range(5):
+                model.zero_grad_buffer()
+                optimizer.zero_grad()
+                if drop_empty_shards:
+                    # Match the older-TE fallback for grads omitted from the optimizer.
+                    model.zero_grad(set_to_none=True)
+                output = model(input_ids=ids, position_ids=pos, attention_mask=None)
+                loss = torch.nn.functional.mse_loss(output.float(), target)
+                loss.backward()
+                model.finish_grad_sync()
+                success, _, _ = optimizer.step()
+                assert success
+                loss = loss.detach()
+                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+                losses.append(loss)
+            return losses
+
+        def checkpoint_state(model, optimizer, *, is_loading=False):
+            state = {
+                "model": handle_experts_in_state_dict(
+                    model.state_dict_for_save_checkpoint(), model.config.num_moe_experts
+                ),
+                "optimizer": optimizer.sharded_state_dict({}, is_loading=is_loading),
+            }
+            preprocess_state_dict_for_uneven_dtensor(state)
+            return state
+
+        train(source, source_optimizer)
+        with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_mcore_roundtrip", sync=True) as path:
+            dcp.save(checkpoint_state(source, source_optimizer), checkpoint_id=path)
+            destination, destination_optimizer = build(987)
+            raw_model_state = destination.state_dict_for_save_checkpoint()
+            state = checkpoint_state(destination, destination_optimizer, is_loading=True)
+            dcp.load(state, checkpoint_id=path)
+            destination.load_state_dict(raw_model_state)
+            destination_optimizer.load_state_dict(state["optimizer"])
+
+        expected_losses = train(source, source_optimizer)
+        actual_losses = train(destination, destination_optimizer)
+        torch.testing.assert_close(
+            torch.stack(actual_losses), torch.stack(expected_losses), rtol=0, atol=0
+        )
+    finally:
+        Utils.destroy_model_parallel()
