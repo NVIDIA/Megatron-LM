@@ -141,7 +141,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         # Here total == prefill_len since we have 1 sequence.
         bufs.seed(
             x[0, :prefill_len],
-            x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
             C[0, :prefill_len],
@@ -302,7 +301,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
                 bufs.seed(
                     x[0, :prefill_len],
-                    x[0, :prefill_len],
                     dt[0, :prefill_len],
                     B[0, :prefill_len],
                     C[0, :prefill_len],
@@ -351,7 +349,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 cu = torch.tensor([0, final_chunk_len], dtype=torch.int32, device=self.device)
                 bufs.seed(
                     x[0, first_chunk_len:prefill_len],
-                    x[0, first_chunk_len:prefill_len],
                     dt[0, first_chunk_len:prefill_len],
                     B[0, first_chunk_len:prefill_len],
                     C[0, first_chunk_len:prefill_len],
@@ -392,7 +389,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         bufs.seed(
             torch.cat([x[0, :prefill_len], nan_x], dim=0),
-            torch.cat([x[0, :prefill_len], nan_x], dim=0),
             torch.cat([dt[0, :prefill_len], nan_dt], dim=0),
             torch.cat([B[0, :prefill_len], nan_B], dim=0),
             torch.cat([C[0, :prefill_len], nan_C], dim=0),
@@ -400,7 +396,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             batch_indices,
         )
         self.assertTrue(torch.isfinite(bufs.x[slot]).all())
-        self.assertTrue(torch.isfinite(bufs.z[slot]).all())
         self.assertTrue(torch.isfinite(bufs.dt[slot]).all())
         self.assertTrue(torch.isfinite(bufs.B[slot]).all())
         self.assertTrue(torch.isfinite(bufs.C[slot]).all())
@@ -556,18 +551,15 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         x, dt, B, C = self._make_seq(prefill_len)
         bufs = self._make_bufs(3)
         bufs.x[1].normal_()
-        bufs.z[1].normal_()
         bufs.dt[1].normal_()
         bufs.B[1].normal_()
         bufs.C[1].normal_()
         bufs.num_buffered[1] = 7
         before = tuple(
-            tensor[1].clone()
-            for tensor in (bufs.x, bufs.z, bufs.dt, bufs.B, bufs.C, bufs.num_buffered)
+            tensor[1].clone() for tensor in (bufs.x, bufs.dt, bufs.B, bufs.C, bufs.num_buffered)
         )
 
         bufs.seed(
-            x[0],
             x[0],
             dt[0],
             B[0],
@@ -576,9 +568,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             torch.tensor([0, -1], dtype=torch.int32, device=self.device),
         )
 
-        for tensor, expected in zip(
-            (bufs.x, bufs.z, bufs.dt, bufs.B, bufs.C, bufs.num_buffered), before
-        ):
+        for tensor, expected in zip((bufs.x, bufs.dt, bufs.B, bufs.C, bufs.num_buffered), before):
             torch.testing.assert_close(tensor[1], expected)
 
     def test_cuda_graph_replay_matches_full_scan(self):
@@ -623,7 +613,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         # Capture executes once, so restore the replay cursor before the first replay.
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         bufs.seed(
-            x[0, :prefill_len],
             x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
@@ -679,7 +668,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         bufs.seed(
             x[0, :prefill_len],
-            x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
             C[0, :prefill_len],
@@ -702,6 +690,80 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 ssm_state,
             )
             self._assert_bitwise(y_batch_invariant[0, 0], y_full[0, pos], f"weak-decay step k={k}")
+
+    def test_independent_gate_across_chunk_boundaries(self):
+        """Decode with a gate z independent of x (the other tests reuse x as z),
+        two slots in one call, prefill tails on both sides of a boundary and
+        decoding across two chunk boundaries: every step must equal the
+        training scan with the same z bitwise. Only the current token's z
+        reaches the scan, so this also checks that no buffered z is needed."""
+        max_requests = 3
+        slots = [2, 0]
+        prefill_lens = [20, self.chunk_size + 9]
+        n_decode = 2 * self.chunk_size + 3
+        seqs, refs, states = [], [], self._make_ssm_state(max_requests)
+        bufs = self._make_bufs(max_requests)
+        for slot, plen in zip(slots, prefill_lens):
+            x, dt, B, C = self._make_seq(plen + n_decode)
+            z = torch.randn_like(x)
+            y_full = mamba_chunk_scan_combined(
+                x,
+                dt,
+                self.A,
+                B,
+                C,
+                self.chunk_size,
+                D=self.D,
+                z=z,
+                dt_bias=self.dt_bias,
+                dt_softplus=True,
+            )
+            seqs.append((x, z, dt, B, C))
+            refs.append(y_full)
+            if plen >= self.chunk_size:
+                aligned = (plen // self.chunk_size) * self.chunk_size
+                _, final = _full_scan(
+                    x[:, :aligned],
+                    dt[:, :aligned],
+                    self.A,
+                    B[:, :aligned],
+                    C[:, :aligned],
+                    self.D,
+                    self.dt_bias,
+                    self.chunk_size,
+                )
+                states[slot] = final[0]
+            bufs.seed(
+                x[0, :plen],
+                dt[0, :plen],
+                B[0, :plen],
+                C[0, :plen],
+                torch.tensor([0, plen], dtype=torch.int32, device=self.device),
+                torch.tensor([slot], dtype=torch.int32, device=self.device),
+            )
+        batch_indices = torch.tensor(slots, dtype=torch.int32, device=self.device)
+        for k in range(n_decode):
+            step = [
+                torch.cat(
+                    [seq[i][:, plen + k : plen + k + 1] for seq, plen in zip(seqs, prefill_lens)]
+                )
+                for i in range(5)
+            ]
+            y = batch_invariant_decode_buffered_scan(
+                bufs, *step, self.A, self.D, self.dt_bias, batch_indices, states
+            )
+            for i, plen in enumerate(prefill_lens):
+                self._assert_bitwise(y[i, 0], refs[i][0, plen + k], f"slot={slots[i]} step k={k}")
+
+    def test_replay_buffers_hold_no_gate(self):
+        """The replay buffers hold x, dt, B, C only; z is not buffered."""
+        max_requests = 4
+        bufs = self._make_bufs(max_requests)
+        self.assertFalse(hasattr(bufs, "z"))
+        elem = torch.empty((), dtype=self.dtype).element_size()
+        replay_bytes = sum(t.numel() * t.element_size() for t in (bufs.x, bufs.dt, bufs.B, bufs.C))
+        per_row = self.nh * self.headdim + self.nh + 2 * self.ngroups * self.dstate
+        self.assertEqual(replay_bytes, max_requests * self.chunk_size * per_row * elem)
 
     def test_deterministic_across_calls(self):
         """Same inputs → bitwise-identical output across repeated invocations."""

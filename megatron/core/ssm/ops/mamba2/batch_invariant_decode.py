@@ -78,7 +78,10 @@ def _mamba_chunk_scan_decode_rows(
     """Run the training scan pipeline over buffered decode chunks.
 
     Each kernel computes only the row or boundary consumed by this decode step,
-    while preserving the training kernel's arithmetic for that result.
+    while preserving the training kernel's arithmetic for that result. ``z`` is
+    the current token's gate per entry (decode_batch_size, nheads, headdim): the
+    gate is row-local and only the target row is computed, so no other row's z
+    is needed.
     """
     dA_cumsum, dt = _chunk_cumsum_fwd(
         dt,
@@ -144,8 +147,9 @@ def _mamba_chunk_scan_decode_rows(
 class BatchInvariantDecodeBuffers:
     """Per-slot persistent state for the buffered decode scan."""
 
+    # No z buffer: the gate z * sigmoid(z) is row-local and decode computes only
+    # the current (target) row, so the current token's z is all the scan reads.
     x: torch.Tensor  # (max_requests, chunk_size, nheads, headdim)
-    z: torch.Tensor  # (max_requests, chunk_size, nheads, headdim)
     dt: torch.Tensor  # (max_requests, chunk_size, nheads)
     B: torch.Tensor  # (max_requests, chunk_size, ngroups, dstate)
     C: torch.Tensor  # (max_requests, chunk_size, ngroups, dstate)
@@ -172,7 +176,6 @@ class BatchInvariantDecodeBuffers:
         """Allocate the per-slot decode buffers."""
         return cls(
             x=torch.zeros(max_requests, chunk_size, nheads, headdim, device=device, dtype=dtype),
-            z=torch.zeros(max_requests, chunk_size, nheads, headdim, device=device, dtype=dtype),
             dt=torch.zeros(max_requests, chunk_size, nheads, device=device, dtype=dtype),
             B=torch.zeros(max_requests, chunk_size, ngroups, dstate, device=device, dtype=dtype),
             C=torch.zeros(max_requests, chunk_size, ngroups, dstate, device=device, dtype=dtype),
@@ -185,7 +188,6 @@ class BatchInvariantDecodeBuffers:
     def seed(
         self,
         x: torch.Tensor,
-        z: torch.Tensor,
         dt: torch.Tensor,
         B: torch.Tensor,
         C: torch.Tensor,
@@ -218,7 +220,6 @@ class BatchInvariantDecodeBuffers:
 
         slots = batch_indices[:num_seqs]
         _masked_update_rows(self.x.flatten(1), slots, x[tail_token_idx].flatten(1))
-        _masked_update_rows(self.z.flatten(1), slots, z[tail_token_idx].flatten(1))
         _masked_update_rows(self.dt.flatten(1), slots, dt[tail_token_idx].flatten(1))
         _masked_update_rows(self.B.flatten(1), slots, B[tail_token_idx].flatten(1))
         _masked_update_rows(self.C.flatten(1), slots, C[tail_token_idx].flatten(1))
@@ -271,7 +272,6 @@ def batch_invariant_decode_buffered_scan(
     buffer_rows = torch.where(active, safe_slots * chunk_size + write_pos, -1).to(torch.int32)
 
     _masked_update_rows(buffers.x.view(-1, nheads * headdim), buffer_rows, x[:, 0].flatten(1))
-    _masked_update_rows(buffers.z.view(-1, nheads * headdim), buffer_rows, z[:, 0].flatten(1))
     _masked_update_rows(buffers.dt.view(-1, nheads), buffer_rows, dt[:, 0])
     _masked_update_rows(
         buffers.B.view(-1, buffers.B.shape[-2] * dstate), buffer_rows, B[:, 0].flatten(1)
@@ -290,7 +290,7 @@ def batch_invariant_decode_buffered_scan(
     # ssm_state, so no scatter is needed afterwards.
     _mamba_chunk_scan_decode_rows(
         buffers.x.view(-1, nheads, headdim),
-        buffers.z.view(-1, nheads, headdim),
+        z[:, 0],
         buffers.dt.view(-1, nheads),
         A,
         buffers.B.view(-1, buffers.B.shape[-2], dstate),
@@ -320,7 +320,7 @@ class MambaBatchInvariantDecode:
 
     def __init__(self, mixer):
         # Training applies z inside the chunk scan before RMSNormGated, so
-        # decode buffers and replays z through that same kernel path.
+        # decode gates the target row through that same kernel path.
         assert mixer.rmsnorm, "batch_invariant_mode requires rmsnorm=True"
         self.mixer = mixer
         self.buffers: BatchInvariantDecodeBuffers | None = None
@@ -341,10 +341,10 @@ class MambaBatchInvariantDecode:
             )
         return self.buffers
 
-    def seed(self, x, z, dt, B, C, cu_seqlens, batch_indices, max_requests) -> None:
+    def seed(self, x, dt, B, C, cu_seqlens, batch_indices, max_requests) -> None:
         """Seed replay buffers from the prefill tail."""
         buffers = self._get_buffers(max_requests, x, B)
-        buffers.seed(x, z, dt, B, C, cu_seqlens, batch_indices)
+        buffers.seed(x, dt, B, C, cu_seqlens, batch_indices)
 
     def step(self, x, z, dt, B, C, batch_indices, ssm_state) -> torch.Tensor:
         """Run one decode step using the mixer's flattened layouts."""
