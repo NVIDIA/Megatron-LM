@@ -663,11 +663,22 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         shapes). ``dispatch_preprocess`` reassigns all of these unconditionally, so
         the backward-time recompute repopulates them before combine runs; clearing
         them after the initial forward only frees the across-gap metadata."""
+        self._release_routing_tensors()
+        self.hidden_shape = None
+        self.hidden_shape_before_permute = None
+
+    def _release_routing_tensors(self) -> None:
+        """Drop the routing tensors cached by ``dispatch_preprocess`` for ``combine_postprocess``.
+
+        ``probs`` carries the router's autograd graph back to the layer input. Kept until the
+        layer's next forward, it holds that graph, and under full recompute the checkpointed
+        layer input with its gradient, across the rest of the step. Shapes are left alone:
+        CUDA graph replay of the preprocess restores only tensor attributes.
+        """
         self.probs = None
         self.routing_map = None
         self.reversed_local_input_permutation_mapping = None
-        self.hidden_shape = None
-        self.hidden_shape_before_permute = None
+        self.batch_invariant_inverse_permutation_mapping = None
 
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
@@ -945,6 +956,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             drop_and_pad=self.drop_and_pad,
             batch_invariant_inverse_map=self.batch_invariant_inverse_permutation_mapping,
         )
+        # The combine was the last reader of this forward's routing tensors.
+        self._release_routing_tensors()
 
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
