@@ -2,9 +2,17 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from megatron.core.inference.utils import Counter, detokenize_tokens, get_language_model
+from megatron.core.inference.utils import (
+    Counter,
+    detokenize_tokens,
+    get_language_model,
+    resolve_logits_dtype,
+)
+from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class _Wrapper(torch.nn.Module):
@@ -62,3 +70,27 @@ class TestInferenceUtils:
     def test_detokenize_without_generation_config_strips_only_eod(self):
         tokenizer = _tokenizer()
         assert detokenize_tokens(tokenizer, [5, 11, 2]) == "5 11"
+
+    @pytest.mark.parametrize("multimodal", [False, True])
+    @pytest.mark.parametrize(
+        "precision, logit_dtype, expected",
+        [
+            (None, None, torch.float64),  # neither: params_dtype
+            ("fp16", None, torch.float16),
+            ("bf16", None, torch.bfloat16),
+            (None, torch.float32, torch.float32),
+            ("bf16", torch.float32, torch.float32),  # logit_dtype wins over the precision
+        ],
+    )
+    def test_resolve_logits_dtype(self, multimodal, precision, logit_dtype, expected):
+        """`logit_dtype` on the language model, else the Float16Module precision, else
+        `params_dtype`, read through multimodal and precision wrappers alike."""
+        language_model = torch.nn.Linear(2, 2)
+        language_model.logit_dtype = logit_dtype
+        model = _Wrapper(language_model) if multimodal else language_model
+        if precision is not None:
+            config = TransformerConfig(
+                num_layers=1, hidden_size=2, num_attention_heads=1, **{precision: True}
+            )
+            model = Float16Module(config, model)
+        assert resolve_logits_dtype(model, torch.float64) is expected
