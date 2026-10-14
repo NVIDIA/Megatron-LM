@@ -20,6 +20,11 @@ skill keyword — infer it from the artifact you read.
 
 ## Contributing
 
+### Git Worktrees
+
+- Create new Git worktrees under the primary checkout's `.worktrees/<name>/`
+  directory, which is already gitignored, unless the user requests another location.
+
 ### Pull Requests
 
 - All PRs must be created as **drafts**. Use `gh pr create --draft` or the GitHub UI draft option.
