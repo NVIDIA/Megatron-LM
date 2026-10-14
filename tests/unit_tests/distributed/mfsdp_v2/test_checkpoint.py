@@ -44,6 +44,9 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
+    run_forward_backward_on_microbatches,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -569,17 +572,17 @@ def test_ep_fsdp_checkpoint_roundtrip(tmp_path_dist_ckpt, ep_size):
         target = torch.randn(2, 8, 128, device=device)
 
         def train(model, optimizer):
+            def forward():
+                output = model(input_ids=ids, position_ids=pos, attention_mask=None)
+                return torch.nn.functional.mse_loss(output.float(), target)
+
             losses = []
             for _ in range(5):
                 model.zero_grad_buffer()
                 optimizer.zero_grad()
-                output = model(input_ids=ids, position_ids=pos, attention_mask=None)
-                loss = torch.nn.functional.mse_loss(output.float(), target)
-                loss.backward()
-                model.finish_grad_sync()
+                (loss,) = run_forward_backward_on_microbatches(model, forward)
                 success, _, _ = optimizer.step()
                 assert success
-                loss = loss.detach()
                 dist.all_reduce(loss, op=dist.ReduceOp.AVG)
                 losses.append(loss)
             return losses
