@@ -429,23 +429,31 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
+    def _use_precision_aware_optimizer_no_fp8_or_ds_fp8(self) -> bool:
+        """Whether the precision-aware optimizer (TE FusedAdam) owns the master weights and
+        consumes decoupled grads.
+
+        This avoids repetition in distrib_optimizer.py, where the handling of parameters differs
+        by training precision. FP8 cases need different handling, with FP8 delayed scaling as an
+        exception because the Adam optimizer in TransformerEngine supports it in the kernel
+        computation. This is also the flag that selects param.grad vs param.decoupled_grad.
+        """
+        return self.use_precision_aware_optimizer and (
+            # Non-FP32 main params are always owned by TE.
+            self.main_params_dtype != torch.float32
+            # Delayed scaling (or no FP8) is handled inside the Adam kernel.
+            or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+            # Params are BF16, so only activations are quantized and TE can own the masters.
+            or not self.fp8_param_gather
+            # Hybrid-device optimizer has its own decoupled-grad support.
+            or self.optimizer_cpu_offload
+        )
+
     def __post_init__(self):
         """Check the validity of the config."""
 
-        # The following condition is used to avoid repetition in distrib_optimizer.py.
-        # This is because in distrib_optimizer.py, the process to handle parameters are
-        # different for different training precision settings. FP8 cases require different
-        # handling while FP8 delayed scaling is an exception because the Adam optimizer in
-        # TransformerEngine supports it in the kernel computation.
-        # This is also the flag to determine the usage of param.grad or param.decoupled_grad
         self.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
-            self.use_precision_aware_optimizer
-            and (
-                self.main_params_dtype != torch.float32
-                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
-                or not self.fp8_param_gather
-                or self.optimizer_cpu_offload
-            )
+            self._use_precision_aware_optimizer_no_fp8_or_ds_fp8()
         )
 
         if self.fp8_recipe == "mxfp8":
