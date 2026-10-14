@@ -103,6 +103,64 @@ def _randint_stub(expected_size, make_result):
     return fake_randint
 
 
+@pytest.mark.parametrize("precision", ["bf16", "fp4"])
+def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypatch):
+    """MTP full recompute must use the layer's TP group, never the global MPU one: a model
+    built from an explicit ProcessGroupCollection may never initialize global MPU."""
+    import megatron.core.transformer.utils as transformer_utils
+
+    def _uninitialized_global_tp_group(*args, **kwargs):
+        raise AssertionError("tensor model parallel group is not initialized")
+
+    monkeypatch.setattr(
+        mtp_module.parallel_state, "get_tensor_model_parallel_group", _uninitialized_global_tp_group
+    )
+    calls = []
+
+    def fake_tensor_parallel_checkpoint(function, distribute_saved_activations, *args):
+        calls.append(("tensor_parallel", None))
+        return function(*args)
+
+    def fake_te_checkpoint(
+        function, distribute_saved_activations, get_rng_tracker, tp_group, *args, **kwargs
+    ):
+        calls.append(("te", tp_group))
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(
+        transformer_utils.tensor_parallel, "checkpoint", fake_tensor_parallel_checkpoint
+    )
+    monkeypatch.setattr(
+        "megatron.core.extensions.transformer_engine.te_checkpoint", fake_te_checkpoint
+    )
+
+    # Bypass __init__ so no process groups are built; set only what the recompute path reads.
+    layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
+    tp_group = object()
+    config = types.SimpleNamespace(
+        fp8=None,
+        fp4="nvfp4" if precision == "fp4" else None,
+        fp8_recipe=None,
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        distribute_saved_activations=False,
+    )
+    object.__setattr__(layer, "config", config)
+    object.__setattr__(layer, "tp_group", tp_group)
+    object.__setattr__(layer, "mtp_layer_pattern", None)
+    object.__setattr__(
+        layer,
+        "_proj_and_transformer_layer",
+        lambda **kwargs: kwargs["hidden_states"] + kwargs["decoder_input"],
+    )
+
+    output = layer._checkpointed_forward(torch.ones(2, 1, 4), torch.full((2, 1, 4), 2.0))
+
+    assert torch.equal(output, torch.full((2, 1, 4), 3.0))
+    expected = ("te", tp_group) if precision == "fp4" else ("tensor_parallel", None)
+    assert calls == [expected]
+
+
 class TestMultiTokenPredictionLayer:
     def setup_method(self, method):
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'

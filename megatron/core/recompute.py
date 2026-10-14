@@ -4,9 +4,7 @@ from typing import List, Optional, Set, Tuple, Union
 
 from torch import Tensor
 
-from megatron.core import tensor_parallel
 from megatron.core.context_parallel import ContextParallelLayoutState
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -14,11 +12,7 @@ from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
-
-if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import te_checkpoint
-else:
-    te_checkpoint = None
+from megatron.core.transformer.utils import precision_aware_checkpoint
 
 
 def checkpointed_forward(
@@ -180,20 +174,13 @@ def checkpointed_forward(
             input_ids,
         )
         if use_checkpoint:
-            # Precision-aware activation checkpoint: TE under FP8/FP4,
-            # tensor_parallel under BF16/FP16/FP32.
-            if self.config.fp8 or self.config.fp4:
-                hidden_states, context = te_checkpoint(
-                    cf,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    *args,
-                )
-            else:
-                hidden_states, context = tensor_parallel.checkpoint(
-                    cf, self.config.distribute_saved_activations, *args
-                )
+            hidden_states, context = precision_aware_checkpoint(
+                cf,
+                self.config,
+                self.pg_collection.tp,
+                *args,
+                distribute_saved_activations=self.config.distribute_saved_activations,
+            )
         else:
             # Note: original block-branch no-checkpoint path omitted padding_mask
             # (relied on its default=None); restored here for consistency.
