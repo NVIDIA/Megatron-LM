@@ -585,6 +585,52 @@ def test_batch_invariant_kernels_replay():
     )
 
 
+def test_mamba_pinning_ignores_import_time_config_lists(monkeypatch):
+    """Batch-invariant pinning gives every process the same Mamba-2 forward configs.
+
+    Deterministic mode can reduce a kernel's candidate list at import, and whether it did
+    depends on when determinism was switched on. Pinning must not inherit that list: a
+    process that reduced it and one that did not have to end up on the same config.
+    """
+    from megatron.core.ssm.ops.common import causal_conv1d_varlen
+    from megatron.core.ssm.ops.mamba2 import (
+        ssd_bmm,
+        ssd_chunk_scan,
+        ssd_chunk_state,
+        ssd_state_passing,
+    )
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+
+    autotuners = (
+        ssd_bmm._bmm_chunk_fwd_kernel,
+        ssd_chunk_scan._chunk_scan_fwd_kernel,
+        ssd_chunk_state._chunk_cumsum_fwd_kernel,
+        ssd_chunk_state._chunk_state_fwd_kernel,
+        ssd_state_passing._state_passing_fwd_kernel,
+        causal_conv1d_varlen._causal_conv1d_varlen_kernel,
+    )
+    monkeypatch.setattr(bik, "_PINNED_AUTOTUNERS", [])
+    for kernel in autotuners:
+        # As if deterministic mode had kept only one, arbitrary, candidate at import.
+        monkeypatch.setattr(kernel, "configs", kernel.configs[-1:])
+    reduced = {kernel: kernel.configs for kernel in autotuners}
+    bik._pin_mamba_autotuners()
+    try:
+        for kernel in autotuners:
+            name = kernel.fn.__name__
+            (config,) = kernel.configs
+            assert config.kwargs == bik._PINNED_MAMBA_CONFIGS[name], name
+            launch = bik._PINNED_MAMBA_LAUNCH_OPTIONS[name]
+            assert (config.num_warps, config.num_stages) == (
+                launch["num_warps"],
+                launch["num_stages"],
+            ), name
+    finally:
+        bik._unpin_mamba_autotuners()
+    for kernel in autotuners:
+        assert kernel.configs is reduced[kernel]
+
+
 def test_mask_routing_padding_replays():
     from megatron.core.transformer.moe.inference_routing_mask_kernel import mask_routing_padding
 

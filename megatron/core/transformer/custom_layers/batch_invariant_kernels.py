@@ -1890,82 +1890,80 @@ def disable_batch_invariant_mode():
 # (autotuner, original configs list) pairs saved by _pin_mamba_autotuners.
 _PINNED_AUTOTUNERS: list = []
 
-# Rollout uses the repo kernels while training uses mamba_ssm. Pin a config
-# present in both copies so autotune timing cannot change the reduction order.
+# Batch-invariant training and generation both run these kernels' forward
+# (MambaMixer._static_prefill trains through mamba_chunk_scan_combined_train), so one
+# launch config per kernel gives both sides one reduction order. The configs are
+# constants: the same for every shape, dtype, GPU, process and Triton cache state,
+# and each was checked to launch and to keep parity at Nano, Super and Ultra-scale
+# per-rank shapes (bf16 and fp32 inputs, d_state up to 256, 64k-token sequences).
+# Tile kwargs per kernel; launch options in _PINNED_MAMBA_LAUNCH_OPTIONS.
 _PINNED_MAMBA_CONFIGS = {
     "_bmm_chunk_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
     "_chunk_scan_fwd_kernel": {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-    "_chunk_state_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
-    "_chunk_cumsum_fwd_kernel": {"BLOCK_SIZE_H": 8},
+    "_chunk_state_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
+    "_chunk_cumsum_fwd_kernel": {"BLOCK_SIZE_H": 16},
     "_state_passing_fwd_kernel": {"BLOCK_SIZE": 1024},
+    "_causal_conv1d_varlen_kernel": {"BLOCK_T": 8, "BLOCK_C": 256},
+}
+_PINNED_MAMBA_LAUNCH_OPTIONS = {
+    "_bmm_chunk_fwd_kernel": {"num_warps": 4, "num_stages": 4},
+    "_chunk_scan_fwd_kernel": {"num_warps": 2, "num_stages": 5},
+    "_chunk_state_fwd_kernel": {"num_warps": 2, "num_stages": 4},
+    "_chunk_cumsum_fwd_kernel": {"num_warps": 4, "num_stages": 3},
+    "_state_passing_fwd_kernel": {"num_warps": 4, "num_stages": 3},
+    "_causal_conv1d_varlen_kernel": {"num_warps": 4, "num_stages": 2},
 }
 
 
 def _pin_mamba_autotuners():
-    """Pin the Mamba chunked-scan forward kernels to fixed tile configs.
+    """Pin the Mamba-2 forward kernels to the constant configs above.
 
-    BLOCK sizes determine the fp32 reduction grouping inside tl.dot loops,
-    so rollout/train parity needs the inference process (repo ssd_* kernels)
-    and the training process (mamba_ssm package kernels) to pick the same
-    config. Triton's autotuner re-benchmarks per process and timing noise
-    can flip the winner; we've seen that break parity in practice. Pinning
-    both sides to the same config removes the benchmark from the loop.
+    BLOCK sizes and warp counts decide how reductions are grouped (the dA cumsum
+    tree, the TF32 tl.dot accumulation), so rollout/train parity needs the
+    rollout and the training process to launch the same config. Triton's
+    autotuner re-benchmarks per process, and import-time deterministic
+    selection depends on when determinism was switched on; either can leave
+    two processes on different configs. The configs are therefore built from
+    the table rather than picked from whatever candidate list the decorator
+    kept, so every process ends up with the same one.
 
-    Only the five forward kernels matter for parity; backward kernels only
-    affect gradients.
+    Only forward kernels matter for parity; backward kernels only affect
+    gradients.
     """
     global _PINNED_AUTOTUNERS
     try:
+        import triton
         from triton.runtime.autotuner import Autotuner
     except ImportError:
         return
 
-    kernels = []
     try:
-        from megatron.core.ssm.ops.mamba2 import ssd_bmm as r_bmm
-        from megatron.core.ssm.ops.mamba2 import ssd_chunk_scan as r_scan
-        from megatron.core.ssm.ops.mamba2 import ssd_chunk_state as r_state
-        from megatron.core.ssm.ops.mamba2 import ssd_state_passing as r_pass
-
-        kernels += [
-            r_bmm._bmm_chunk_fwd_kernel,
-            r_scan._chunk_scan_fwd_kernel,
-            r_state._chunk_cumsum_fwd_kernel,
-            r_state._chunk_state_fwd_kernel,
-            r_pass._state_passing_fwd_kernel,
-        ]
-    except ImportError:
-        pass
-    try:
-        from mamba_ssm.ops.triton import ssd_bmm as p_bmm
-        from mamba_ssm.ops.triton import ssd_chunk_scan as p_scan
-        from mamba_ssm.ops.triton import ssd_chunk_state as p_state
-        from mamba_ssm.ops.triton import ssd_state_passing as p_pass
-
-        kernels += [
-            p_bmm._bmm_chunk_fwd_kernel,
-            p_scan._chunk_scan_fwd_kernel,
-            p_state._chunk_cumsum_fwd_kernel,
-            p_state._chunk_state_fwd_kernel,
-            p_pass._state_passing_fwd_kernel,
-        ]
-    except (ImportError, AttributeError):
-        pass
-
-    for kernel in kernels:
-        if not isinstance(kernel, Autotuner) or len(kernel.configs) <= 1:
-            continue
-        name = getattr(getattr(kernel, "fn", None), "__name__", "")
-        expected = _PINNED_MAMBA_CONFIGS[name]
-        chosen = next(
-            cfg
-            for cfg in kernel.configs
-            if all(cfg.kwargs.get(key) == value for key, value in expected.items())
+        from megatron.core.ssm.ops.common import causal_conv1d_varlen
+        from megatron.core.ssm.ops.mamba2 import (
+            ssd_bmm,
+            ssd_chunk_scan,
+            ssd_chunk_state,
+            ssd_state_passing,
         )
+    except ImportError:
+        return
+
+    for kernel in (
+        ssd_bmm._bmm_chunk_fwd_kernel,
+        ssd_chunk_scan._chunk_scan_fwd_kernel,
+        ssd_chunk_state._chunk_cumsum_fwd_kernel,
+        ssd_chunk_state._chunk_state_fwd_kernel,
+        ssd_state_passing._state_passing_fwd_kernel,
+        causal_conv1d_varlen._causal_conv1d_varlen_kernel,
+    ):
+        if not isinstance(kernel, Autotuner):
+            continue
+        name = kernel.fn.__name__
         _PINNED_AUTOTUNERS.append((kernel, kernel.configs))
-        kernel.configs = [chosen]
-        if hasattr(kernel, "cache"):
-            kernel.cache.clear()
+        kernel.configs = [
+            triton.Config(_PINNED_MAMBA_CONFIGS[name], **_PINNED_MAMBA_LAUNCH_OPTIONS[name])
+        ]
+        kernel.cache.clear()
 
 
 def _unpin_mamba_autotuners():
