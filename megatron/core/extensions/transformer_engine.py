@@ -2977,9 +2977,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 )
 
         def reset_parameters(self, defer_init=False):
-            # TE constructs every GEMM's weight before calling this method. Drop virtual
-            # placeholders before initialization so they neither enter the model tree nor
-            # consume RNG values needed to initialize the next owned expert layer.
+            """Override TE's reset_parameters to remove virtual weights before initialization.
+
+            TE constructs every GEMM's weight before calling this method. Drop virtual
+            placeholders before delegating to TE so they neither enter the model tree nor
+            consume RNG values.
+            """
             for index in range(self.num_gemms - self.num_virtual_experts, self.num_gemms):
                 self.register_parameter(f"weight{index}", None)
                 self.param_init_meta.pop(f"weight{index}", None)

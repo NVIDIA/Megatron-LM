@@ -573,11 +573,13 @@ class _VirtualExpertHook(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, tensor, method, args, *inputs):
+        """Save the callback for backward and return the tensor unchanged."""
         ctx.method, ctx.args = weakref.WeakMethod(method), args
         return tensor
 
     @staticmethod
     def backward(ctx, grad):
+        """Run the callback to obtain input gradients and preserve the tensor gradient."""
         return (grad, None, None, *(ctx.method()(*ctx.args) or ()))
 
 
