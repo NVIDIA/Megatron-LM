@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,7 +14,8 @@ import zmq.asyncio
 
 pytest.importorskip("dynamo")
 
-from dynamo.llm.exceptions import StreamIncomplete
+from dynamo.llm import KvEventPublisher
+from dynamo.llm.exceptions import EngineShutdown, StreamIncomplete
 
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
@@ -24,7 +26,7 @@ from megatron.core.inference.disaggregation.handoff_ownership import (
 )
 from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
-from megatron.core.inference.inference_client import InferenceRequestError
+from megatron.core.inference.inference_client import InferenceRequestAborted, InferenceRequestError
 from megatron.inference.integrations.dynamo.args import Config
 from megatron.inference.integrations.dynamo.llm_engine import (
     MegatronLLMEngine,
@@ -110,6 +112,33 @@ def test_sampling_params_maps_greedy_and_limits():
 
     with pytest.raises(ValueError, match="does not support prompt_logprobs"):
         build_sampling_params({"token_ids": [1], "output_options": {"prompt_logprobs": 0}})
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_sampling_preserves_all_stop_tokens(ignore_eos):
+    params = build_sampling_params(
+        {"stop_conditions": {"stop_token_ids": [3, "2", 3], "ignore_eos": ignore_eos}}
+    )
+    assert params.stop_token_ids == [2, 3]
+    assert params.termination_id == (-1 if ignore_eos else None)
+    assert build_sampling_params({}).stop_token_ids is None
+
+
+@pytest.mark.asyncio
+async def test_forward_logs_drains_long_progress_and_unterminated_output(caplog):
+    engine = MegatronLLMEngine(_config())
+    stream = asyncio.StreamReader()
+    # Both carriage-return progress and a single undelimited line exceed 64 KiB.
+    output = ("progress\r" * 10000 + "x" * 70000 + "done €").encode()
+    stream.feed_data(output[:-1])
+    with caplog.at_level(logging.INFO):
+        task = asyncio.create_task(engine._forward_logs(stream, logging.INFO))
+        await asyncio.sleep(0)
+        stream.feed_data(output[-1:])
+        stream.feed_eof()
+        await task
+    logged = "".join(record.args[0] for record in caplog.records)
+    assert logged == output.decode().replace("\r", "")
 
 
 @pytest.mark.asyncio
@@ -584,7 +613,8 @@ async def test_cancelled_prefill_releases_state_after_final_reply(cancellation):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
-async def test_failed_final_reply_propagates_engine_error(role):
+@pytest.mark.parametrize("event_type", ["ERROR_NONTRANSIENT", "ERROR_TRANSIENT"])
+async def test_failed_final_reply_propagates_engine_error(role, event_type):
     stream = AsyncStream(1, MagicMock())
     stream.put(
         {
@@ -592,7 +622,7 @@ async def test_failed_final_reply_propagates_engine_error(role):
                 "status": "FAILED",
                 "events": [
                     {
-                        "type": "ERROR_NONTRANSIENT",
+                        "type": event_type,
                         "payload": {
                             "type": "TokenOverflowError",
                             "message": "token budget exceeded",
@@ -615,10 +645,53 @@ async def test_failed_final_reply_propagates_engine_error(role):
     with patch(
         "megatron.inference.integrations.dynamo.llm_engine.require_prefill_result", return_value={}
     ):
-        with pytest.raises(InferenceRequestError, match="token budget exceeded"):
+        with pytest.raises(InferenceRequestError, match="token budget exceeded") as error:
             _ = [chunk async for chunk in engine.generate({"token_ids": [1]}, _Context())]
+    assert isinstance(error.value, ValueError) == (event_type == "ERROR_NONTRANSIENT")
+    assert error.value.source_safe
     await asyncio.gather(*engine._cleanup_tasks)
     engine.client.release_handoff.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_rejects_admission_with_retryable_error():
+    engine = MegatronLLMEngine(_config())
+    engine._shutting_down = True
+    with pytest.raises(EngineShutdown):
+        _ = [chunk async for chunk in engine.generate({"token_ids": [1]}, _Context())]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_decode_waits_for_source_safe_ack_before_release():
+    stream = AsyncStream(1, MagicMock())
+    stream.finish(exception=InferenceRequestAborted("cancelled"))
+    engine = MegatronLLMEngine(_config("decode"))
+    engine._claim_remote_handoff = AsyncMock()
+    engine._release_completed_handoff = AsyncMock()
+    ack = asyncio.get_running_loop().create_future()
+    engine.client = SimpleNamespace(
+        add_request_with_kv_handoff_streaming=MagicMock(return_value=stream),
+        abort_request_and_wait=MagicMock(return_value=ack),
+    )
+    with patch(
+        "megatron.inference.integrations.dynamo.llm_engine.require_prefill_result", return_value={}
+    ):
+        chunks = [chunk async for chunk in engine.generate({"token_ids": [1]}, _Context())]
+    assert chunks[-1]["finish_reason"] == "cancelled"
+    await asyncio.sleep(0)
+    engine.client.abort_request_and_wait.assert_called_once_with(1)
+    engine._release_completed_handoff.assert_not_awaited()
+    ack.set_result(True)
+    await asyncio.gather(*engine._cleanup_tasks)
+    engine._release_completed_handoff.assert_awaited_once_with({})
+
+
+@pytest.mark.asyncio
+async def test_unexpected_stream_end_is_not_cancellation():
+    engine = MegatronLLMEngine(_config())
+    engine.client = SimpleNamespace(add_request_streaming=MagicMock(return_value=_stream()))
+    with pytest.raises(RuntimeError, match="without a terminal result"):
+        _ = [chunk async for chunk in engine.generate({"token_ids": [1]}, _Context())]
 
 
 @pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
@@ -630,10 +703,31 @@ def test_kv_startup_buffer_only_keeps_events_for_publishing_roles(role):
     if role == "decode":
         assert engine._kv_queue.empty()
     else:
-        publisher = MagicMock()
+        publisher = MagicMock(spec=KvEventPublisher)
         engine._set_publisher(publisher)
         publisher.publish_removed.assert_called_once_with(block_hashes=[1])
         assert engine._kv_queue.empty()
+
+
+def test_kv_clear_removes_advertised_hashes_and_retains_them_on_failure():
+    engine = MegatronLLMEngine(_config())
+    stored = {"block_hashes": [1, 2], "token_ids": [7, 8], "num_block_tokens": [1, 1]}
+    engine._on_engine_event("stored", stored)
+    engine._on_engine_event("removed", {"block_hashes": [1]})
+    publisher = MagicMock(spec=KvEventPublisher)
+    engine._set_publisher(publisher)
+    publisher.publish_stored.assert_called_once_with(**stored)
+    publisher.publish_removed.assert_called_once_with(block_hashes=[1])
+    publisher.publish_removed.side_effect = RuntimeError("publisher unavailable")
+    engine._on_engine_event("cleared", {})
+    assert engine._published_block_hashes == {2}
+    publisher.publish_removed.side_effect = None
+    engine._on_engine_event("cleared", {})
+    publisher.publish_removed.assert_called_with(block_hashes=[2])
+    assert not engine._published_block_hashes
+    calls = publisher.publish_removed.call_count
+    engine._on_engine_event("cleared", {})
+    assert publisher.publish_removed.call_count == calls
 
 
 @pytest.mark.asyncio

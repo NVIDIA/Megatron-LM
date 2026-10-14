@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -92,7 +93,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=None,
         help="Write this worker's assigned Dynamo identity as JSON after engine readiness.",
     )
-    parser.add_argument("--megatron-root", default="/opt/megatron-lm")
+    parser.add_argument("--megatron-root", default=str(Path(__file__).resolve().parents[4]))
     parser.add_argument("--drain-timeout", type=float, default=30.0)
     parser.add_argument("--engine-start-timeout", type=float, default=1800.0)
     parser.add_argument("--engine-shutdown-timeout", type=float, default=30.0)

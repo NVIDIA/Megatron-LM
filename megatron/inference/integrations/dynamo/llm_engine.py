@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import logging
 import os
@@ -35,12 +36,16 @@ from dynamo.common.backend.worker import WorkerConfig
 from dynamo.common.constants import DisaggregationMode
 from dynamo.common.model_fetch import fetch_model
 from dynamo.llm import KvEventPublisher, ModelInput
-from dynamo.llm.exceptions import StreamIncomplete
+from dynamo.llm.exceptions import EngineShutdown, StreamIncomplete
 
 from megatron.core.inference.disaggregation.handoff_ownership import HandoffClaimStatus
 from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
-from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
+from megatron.core.inference.inference_client import (
+    InferenceClient,
+    InferenceRequestAborted,
+    InferenceRequestError,
+)
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
@@ -50,6 +55,10 @@ from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 logger = logging.getLogger(__name__)
 _HEALTH_CHECK_TIMEOUT = 5.0
 _RELEASE_TIMEOUT = 5.0
+
+
+class InferenceRequestRejected(InferenceRequestError, ValueError):
+    """A non-transient admission error, mapped to HTTP 400 by Dynamo."""
 
 
 def build_sampling_params(request: GenerateRequest) -> SamplingParams:
@@ -77,16 +86,10 @@ def build_sampling_params(request: GenerateRequest) -> SamplingParams:
     params.detokenize_stop_sequence = bool(sampling.get("include_stop_str_in_output", False))
     if stop.get("stop"):
         params.stop_words = list(stop["stop"])
-    stop_token_ids = list(stop.get("stop_token_ids") or [])
+    stop_token_ids = sorted({int(t) for t in (stop.get("stop_token_ids") or [])})
     if stop.get("ignore_eos"):
         params.termination_id = -1
-    elif stop_token_ids:
-        params.termination_id = int(stop_token_ids[0])
-        if len(stop_token_ids) > 1:
-            logger.warning(
-                "Megatron supports one termination token; ignoring %d additional IDs",
-                len(stop_token_ids) - 1,
-            )
+    params.stop_token_ids = stop_token_ids or None
     output = request.get("output_options") or {}
     token_logprobs, prompt_logprobs = parse_logprob_options(output)
     if prompt_logprobs is not None:
@@ -122,6 +125,7 @@ class MegatronLLMEngine(LLMEngine):
         self._kv_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
         self._publisher: Optional[KvEventPublisher] = None
         self._publisher_lock = threading.Lock()
+        self._published_block_hashes: set[int] = set()
         self._event_receiver: Optional[EngineEventReceiver] = None
         self._release_context: zmq.asyncio.Context | None = None
         self._release_sockets: dict[str, zmq.asyncio.Socket] = {}
@@ -294,8 +298,14 @@ class MegatronLLMEngine(LLMEngine):
         return command
 
     async def _forward_logs(self, stream: asyncio.StreamReader, level: int) -> None:
-        while line := await stream.readline():
-            logger.log(level, "[megatron-engine] %s", line.decode(errors="replace").rstrip())
+        # Progress bars use carriage returns, and some logs have no delimiters.
+        # Bounded reads keep draining the pipe without StreamReader's line limit.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        while data := await stream.read(8192):
+            for line in decoder.decode(data).splitlines():
+                logger.log(level, "[megatron-engine] %s", line)
+        if tail := decoder.decode(b"", final=True):
+            logger.log(level, "[megatron-engine] %s", tail)
 
     async def _wait_for_readiness(self) -> dict[str, Any]:
         deadline = asyncio.get_running_loop().time() + self.config.engine_start_timeout
@@ -326,7 +336,9 @@ class MegatronLLMEngine(LLMEngine):
     async def generate(
         self, request: GenerateRequest, context: Context
     ) -> AsyncGenerator[GenerateChunk, None]:
-        if self.client is None or self._shutting_down:
+        if self._shutting_down:
+            raise EngineShutdown("Megatron engine is shutting down")
+        if self.client is None:
             raise RuntimeError("Megatron engine is not initialized")
         token_ids = list(request.get("token_ids") or [])
         if not token_ids:
@@ -438,8 +450,10 @@ class MegatronLLMEngine(LLMEngine):
         source_safe = False
         try:
             async for chunk in self._stream_chunks(stream, token_ids, params):
-                source_safe = True
-                if not released and self.config.role == "decode":
+                # A local cancellation is terminal for the consumer, but is not
+                # proof that remote KV reads have stopped.
+                source_safe = source_safe or chunk.get("finish_reason") != "cancelled"
+                if source_safe and not released and self.config.role == "decode":
                     self._schedule_cleanup(self._release_completed_handoff(release))
                     released = True
                 yield chunk
@@ -510,6 +524,18 @@ class MegatronLLMEngine(LLMEngine):
                 yield chunk
                 return
             raise RuntimeError("Megatron stream ended without a terminal result")
+        except InferenceRequestAborted:
+            completed = True
+            yield {
+                "token_ids": [],
+                "index": 0,
+                "finish_reason": "cancelled",
+                "completion_usage": {
+                    "prompt_tokens": len(prompt_token_ids),
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": len(prompt_token_ids) + completion_tokens,
+                },
+            }
         finally:
             if not completed:
                 await stream.aclose()
@@ -532,12 +558,19 @@ class MegatronLLMEngine(LLMEngine):
         """Reject admission failures delivered through the normal reply channel."""
         if final.get("status") == "FAILED":
             errors = [
-                str(event.get("payload"))
+                event
                 for event in final.get("events", [])
                 if event.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
             ]
-            reason = "; ".join(errors) or "unknown engine error"
-            raise InferenceRequestError(f"Megatron request failed: {reason}", source_safe=True)
+            reason = (
+                "; ".join(str(event.get("payload")) for event in errors) or "unknown engine error"
+            )
+            error_type = (
+                InferenceRequestRejected
+                if any(event["type"] == "ERROR_NONTRANSIENT" for event in errors)
+                else InferenceRequestError
+            )
+            raise error_type(f"Megatron request failed: {reason}", source_safe=True)
 
     @staticmethod
     async def _collect_prefill_result(stream) -> dict[str, Any]:
@@ -835,14 +868,19 @@ class MegatronLLMEngine(LLMEngine):
             except queue.Empty:
                 pass
 
-    @staticmethod
-    def _publish_event(publisher: KvEventPublisher, kind: str, payload: dict) -> None:
+    def _publish_event(self, publisher: KvEventPublisher, kind: str, payload: dict) -> None:
         try:
             if kind == "stored":
                 publisher.publish_stored(**payload)
+                self._published_block_hashes.update(payload["block_hashes"])
             elif kind == "removed":
                 publisher.publish_removed(**payload)
+                self._published_block_hashes.difference_update(payload["block_hashes"])
             else:
-                publisher.publish_all_cleared()
+                # Dynamo's push publisher has no all-cleared API. Remove only
+                # this worker's advertised blocks, including buffered events.
+                if self._published_block_hashes:
+                    publisher.publish_removed(block_hashes=sorted(self._published_block_hashes))
+                    self._published_block_hashes.clear()
         except Exception:
             logger.exception("Failed to publish Megatron KV event %s", kind)

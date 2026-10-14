@@ -8,7 +8,11 @@ import pytest
 import zmq
 
 from megatron.core.inference.headers import Headers
-from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
+from megatron.core.inference.inference_client import (
+    InferenceClient,
+    InferenceRequestAborted,
+    InferenceRequestError,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.asyncio
@@ -246,6 +250,9 @@ async def test_abort_acknowledges_racing_normal_completion(completed_before_abor
         if completed_before_abort:
             socket.send.assert_not_called()
         else:
+            with pytest.raises(InferenceRequestAborted) as error:
+                await anext(stream)
+            assert not error.value.source_safe
             replies.append(reply)
         assert await asyncio.wait_for(ack, timeout=2)
         assert not client._pending_source_requests

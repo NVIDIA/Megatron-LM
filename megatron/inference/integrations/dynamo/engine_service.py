@@ -32,8 +32,6 @@ def _extra_args(parser):
 
 async def _serve() -> None:
     args = get_args()
-    args.return_log_probs = True
-    args.skip_prompt_log_probs = True
     disaggregated = args.role in ("prefill", "decode")
     if disaggregated and args.disagg_kv_transport_backend != "nixl":
         raise ValueError(
@@ -83,6 +81,8 @@ def main() -> None:
     args = parse_and_validate_args(
         extra_args_provider=_extra_args, args_defaults={"no_load_rng": True, "no_load_optim": True}
     )
+    args.return_log_probs = True
+    args.skip_prompt_log_probs = True
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args)
     initialize_megatron()

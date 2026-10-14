@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -57,6 +58,7 @@ def test_parse_args_splits_dynamo_and_megatron_arguments():
     assert config.component == "backend"
     assert config.endpoint_types == "chat,completions"
     assert config.nproc_per_node == 2
+    assert config.megatron_root == str(Path(engine_service.__file__).resolve().parents[4])
     assert config.megatron_argv == [
         "--load",
         "/checkpoints/model",
@@ -119,8 +121,14 @@ def test_owned_engine_command_targets_megatron_only_service():
 
 
 def test_engine_service_initializes_config_before_megatron(monkeypatch):
-    args, config = object(), object()
-    build_config = MagicMock(return_value=config)
+    args, config = SimpleNamespace(return_log_probs=False, skip_prompt_log_probs=False), object()
+
+    def snapshot_config(*args_, **kwargs):
+        assert args.return_log_probs
+        assert args.skip_prompt_log_probs
+        return config
+
+    build_config = MagicMock(side_effect=snapshot_config)
     set_config, runtime_services = MagicMock(), MagicMock()
     monkeypatch.setattr(engine_service, "parse_and_validate_args", lambda **kwargs: args)
     monkeypatch.setattr(engine_service, "inference_cfg_container_from_args", build_config)
@@ -149,20 +157,11 @@ def test_engine_service_initializes_config_before_megatron(monkeypatch):
         ("decode", "nixl"),
     ],
 )
-async def test_engine_service_validates_handoff_and_log_probs_before_construction(
-    monkeypatch, role, backend
-):
-    args = SimpleNamespace(
-        return_log_probs=False,
-        skip_prompt_log_probs=False,
-        role=role,
-        disagg_kv_transport_backend=backend,
-    )
+async def test_engine_service_validates_handoff_before_construction(monkeypatch, role, backend):
+    args = SimpleNamespace(role=role, disagg_kv_transport_backend=backend)
 
     def build_engine(*, engine_class):
         assert engine_class is not None
-        assert args.return_log_probs
-        assert args.skip_prompt_log_probs
         raise RuntimeError("configuration observed")
 
     monkeypatch.setattr(engine_service, "get_args", lambda: args)

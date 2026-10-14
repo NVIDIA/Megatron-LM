@@ -44,6 +44,10 @@ class InferenceRequestError(RuntimeError):
         self.source_safe = source_safe
 
 
+class InferenceRequestAborted(InferenceRequestError):
+    """The local consumer cancelled; remote source-safety still requires an ACK."""
+
+
 class InferenceClient:
     """
     An asynchronous client for communicating with an inference coordinator service.
@@ -418,7 +422,7 @@ class InferenceClient:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def abort_request(self, request_id: int) -> None:
-        """Cancel an in-flight request and close its local response stream."""
+        """Cancel an in-flight request, ending its stream with InferenceRequestAborted."""
 
         self._send_abort(request_id)
 
@@ -460,7 +464,7 @@ class InferenceClient:
             # nothing ever removes and the ABORT_REQUEST send would be wasted.
             return
         if stream is not None:
-            stream.finish()
+            stream.finish(exception=InferenceRequestAborted("Inference request cancelled"))
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)

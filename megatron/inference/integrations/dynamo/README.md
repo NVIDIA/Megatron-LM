@@ -73,6 +73,8 @@ python -m dynamo.frontend \
 
 By default, each backend launches a one-node engine with `torchrun` and binds
 its engine-event socket to a random port on `127.0.0.1`.
+The launch directory defaults to the root containing the imported Megatron
+package; use `--megatron-root` only to override it explicitly.
 
 Deployment systems that own process placement can instead pass
 `--engine-launch-mode external`, `--parent-event-host`, and
@@ -185,10 +187,18 @@ also reclaims state orphaned by frontend failure before delivery to decode.
 Both roles currently require the default `persist` KV-cache management mode.
 `offload` and `recompute` are rejected at transfer setup because suspend/resume
 can invalidate the registered KV/SSM buffers.
+Decode workers also reject `--inference-cuda-graph-all-prefills`: eviction
+recovery must be able to prefill without waiting for a matching CUDA graph.
+Prefill workers may still enable this option.
 
 ## Tests
 
 Adapter tests require an environment containing both Megatron and Dynamo:
+
+Without Dynamo, pytest skips the adapter tests. CI needs a compatible Dynamo
+dependency installed to exercise these tests; a passing inference bucket alone
+does not establish adapter coverage. Track that CI dependency update in
+[#8200](https://github.com/NVIDIA/Megatron-LM/issues/8200).
 
 ```bash
 python -m torch.distributed.run --standalone --nproc-per-node=1 -m pytest -q \
