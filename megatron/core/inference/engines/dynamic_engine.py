@@ -2637,7 +2637,6 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
-        prompt_length = len(tokens)  # as the preparer returned it; a multimodal build may expand it
         if (
             imgs is not None
             or num_tiles is not None
@@ -2674,7 +2673,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # exhaustion, ...), those tensors would linger in the context
             # dicts and leak GPU memory. Clean them up on failure.
             try:
-                return self._admit_request(request, prompt_length)
+                return self._admit_request(request)
             except Exception:
                 self.context.remove_vlm_request_data(request_id)
                 raise
@@ -2695,11 +2694,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 # generation its sender hashed under.
                 block_hash_salt=_weight_scoped_salt(self._weight_epoch, None),
             )
-        return self._admit_request(request, prompt_length)
+        return self._admit_request(request)
 
-    def _admit_request(
-        self, request: DynamicInferenceRequest, prompt_length: int
-    ) -> asyncio.Future:
+    def _admit_request(self, request: DynamicInferenceRequest) -> asyncio.Future:
         """Admit a built request, resuming the generation its preparer handed back, if any."""
         params = request.offload_params if isinstance(request.offload_params, dict) else {}
         wire = params.pop(RESUMED_GENERATION_FIELD, None)
@@ -2712,10 +2709,7 @@ class DynamicInferenceEngine(AbstractEngine):
             resumed = ResumedGeneration.from_wire(wire)
             record = (
                 DynamicInferenceRequestRecord.from_resumed_generation(
-                    request,
-                    resumed,
-                    prompt_length=prompt_length,
-                    generation_epoch=self._generation_epoch,
+                    request, resumed, generation_epoch=self._generation_epoch
                 )
                 if resumed.token_ids or resumed.finished
                 else None  # nothing generated yet
