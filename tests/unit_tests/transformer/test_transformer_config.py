@@ -85,6 +85,21 @@ def test_scheduled_tensor_release_rejects_ncclep_zero_copy():
         _make_scheduled_release_config(moe_ncclep_zero_copy=True)
 
 
+def test_mhc_full_recompute_with_distributed_activations_is_configurable():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_hyper_connections=True,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        distribute_saved_activations=True,
+    )
+    assert config.recompute_granularity == "full"
+    assert config.distribute_saved_activations
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 

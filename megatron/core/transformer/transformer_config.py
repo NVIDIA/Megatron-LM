@@ -1429,6 +1429,16 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    mhc_norm_eps_inside_sqrt: bool = False
+    """Use rsqrt(mean(x**2) + layernorm_epsilon) for the mHC mapping norm."""
+
+    mhc_keep_mappings_in_fp32: bool = False
+    """Keep mHC coefficients and stream mixing in FP32 until the output cast."""
+
+    mhc_learned_output_contract: bool = True
+    """Contract residual streams to the ordinary hidden width using token-dependent gating;
+    otherwise average the streams."""
+
     use_fused_mhc: bool = False
     """Use unified fused kernels for mHC operations.
 

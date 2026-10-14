@@ -678,6 +678,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         def checkpoint_handler(forward_func):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
+            nonlocal hidden_states
+            if self.config.enable_hyper_connections:
+                # mHC expands the block input and its zero-dropout BDA path can return views.
+                # Distributed activation checkpointing replaces the first input's .data, which
+                # requires a viewless tensor at every checkpoint boundary.
+                hidden_states = make_viewless_tensor(
+                    inp=hidden_states, requires_grad=True, keep_graph=True
+                )
             # TODO: check if fp4 is supported in this case
             if self.config.fp8 or self.config.fp4:
                 return te_checkpoint(
