@@ -336,8 +336,12 @@ def test_kda_selective_recompute(recompute_module, two_stage_gates):
         assert (recompute_kda.norm_out_checkpoint is not None) is (
             recompute_module == "gdn_norm_out"
         )
-        torch.testing.assert_close(recompute_output, base_output, atol=0, rtol=0)
-        torch.testing.assert_close(recompute_input_grad, base_input_grad, atol=0, rtol=0)
+        # The checkpointed forward runs the fused BF16 recurrence under no_grad, which can
+        # select a different reduction path from the eager forward.  Keep this to one BF16
+        # ULP while still checking that recomputation preserves the result and input gradient.
+        recompute_tolerance = dict(atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(recompute_output, base_output, **recompute_tolerance)
+        torch.testing.assert_close(recompute_input_grad, base_input_grad, **recompute_tolerance)
         assert recompute_grads.keys() == base_grads.keys()
         for name in base_grads:
             # Recomputed BF16 kernels can choose a different reduction order. Keep output and
