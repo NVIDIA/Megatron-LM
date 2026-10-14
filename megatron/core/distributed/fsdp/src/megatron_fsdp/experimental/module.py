@@ -34,7 +34,12 @@ from .context import FsdpContext
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .parameter_group import (
+    FsdpParameter,
+    FsdpParameterGroup,
+    effective_dtype,
+    get_containing_parameter_group,
+)
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
 
@@ -119,12 +124,11 @@ class FsdpModule:
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
-        num_trainable_parameters = len(
-            {id(parameter) for parameter in owned_parameters.values() if parameter.requires_grad}
+        self._trainable_parameter_countdown = Countdown(
+            grad_accumulation_count
+            if grad_accumulation_count is not None
+            else sum(1 for _ in self._trainable_fsdp_parameters())
         )
-        if grad_accumulation_count is None:
-            grad_accumulation_count = num_trainable_parameters
-        self._trainable_parameter_countdown = Countdown(grad_accumulation_count)
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``register_hooks`` is
         # False (i.e. execution hooks are disabled), so it must not be turned off
@@ -235,6 +239,13 @@ class FsdpModule:
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
                     lambda parameter=parameter: grad_hook(parameter)
                 )
+
+    def _trainable_fsdp_parameters(self) -> Iterator[FsdpParameter]:
+        """Iterate this module's trainable parameters in a stable order."""
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            yield from group.fsdp_parameters
 
     @staticmethod
     def _pre_load_state_dict(
