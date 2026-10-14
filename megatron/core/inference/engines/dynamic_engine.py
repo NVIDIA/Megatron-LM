@@ -3259,16 +3259,17 @@ class DynamicInferenceEngine(AbstractEngine):
         return {"waits": self._prefix_coordination_waits}
 
     def _mamba_batch_invariant_prefill_chunk_length(
-        self, req: DynamicInferenceRequest, capacity: int
+        self, req: DynamicInferenceRequest, capacity: int, prefix_skip_tokens: int = 0
     ) -> int:
         """Raw prefill length that computes an aligned chunk within `capacity`.
 
         Non-final calls must start and end at SSM chunk boundaries. The final
         prompt call may be shorter because it seeds the decode replay tail.
+        A cached prefix contributes to the returned span, not to compute capacity.
         """
-        remaining = len(req.remaining_prompt_tokens)
+        remaining = len(req.remaining_prompt_tokens) - prefix_skip_tokens
         if capacity >= remaining:
-            return remaining
+            return prefix_skip_tokens + remaining
 
         alignment = self.context.ssm_chunk_alignment
         computed_tokens = (capacity // alignment) * alignment
@@ -3276,7 +3277,7 @@ class DynamicInferenceEngine(AbstractEngine):
             computed_tokens -= alignment
         if computed_tokens <= 0:
             return 0
-        return computed_tokens
+        return prefix_skip_tokens + computed_tokens
 
     def schedule_waiting_requests(self) -> None:
         """Try to schedule requests from the waiting pool."""
@@ -3588,7 +3589,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 if batch_invariant_mamba_prefill:
                     prefill_chunk_length = self._mamba_batch_invariant_prefill_chunk_length(
-                        req, computed_chunk
+                        req, computed_chunk, prefix_skip_tokens=prefix_skip
                     )
                     if prefill_chunk_length == 0:
                         can_schedule = False

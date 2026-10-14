@@ -1175,6 +1175,39 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert _m2.effective_prefill_chunk_length == len(p2)
 
     @pytest.mark.internal
+    def test_batch_invariant_mamba_prefix_cache_alignment(self):
+        ctx = self._mctx(batch_invariant_mode=True)
+        assert ctx.enable_prefix_caching
+        assert ctx.mamba_slot_allocator is not None
+        with pytest.raises(AssertionError, match="multiple of ssm_chunk_alignment"):
+            self._mctx(batch_invariant_mode=True, block_size_tokens=32)
+
+    @pytest.mark.internal
+    def test_batch_invariant_mamba_cached_suffix_uses_compute_budget(self):
+        ctx = self._mctx(batch_invariant_mode=True, enable_chunked_prefill=True)
+        engine = _StubEngine(ctx, enable_chunked_prefill=True)
+        req = self._req(ctx, self._prompt(600))
+        # A warm 512-token prefix leaves only 88 tokens. The old scheduler
+        # rounded that suffix down to zero and could never admit the request.
+        assert (
+            engine._mamba_batch_invariant_prefill_chunk_length(req, 88, prefix_skip_tokens=512)
+            == 600
+        )
+        long_req = self._req(ctx, self._prompt(1025), request_id=2)
+        assert (
+            engine._mamba_batch_invariant_prefill_chunk_length(
+                long_req, 512, prefix_skip_tokens=512
+            )
+            == 896
+        )
+        assert (
+            engine._mamba_batch_invariant_prefill_chunk_length(
+                long_req, 100, prefix_skip_tokens=512
+            )
+            == 0
+        )
+
+    @pytest.mark.internal
     def test_batch_invariant_mamba_chunked_prefill_scheduler_alignment(self):
         ctx = self._mctx(
             block_size_tokens=32, batch_invariant_mode=True, enable_prefix_caching=False
@@ -1210,9 +1243,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
                 max_tokens=ctx.mamba_chunk_size,
                 max_requests=64,
             )
-
-        with pytest.raises(AssertionError, match="does not support Mamba prefix caching"):
-            self._mctx(batch_invariant_mode=True)
 
     @pytest.mark.internal
     def test_mamba_intermediate_offsets(self):
