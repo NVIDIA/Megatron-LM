@@ -421,6 +421,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                     imgs_sizes=imgs_sizes,
                     vision_packed_seq_params=vision_packed_seq_params,
                     num_frames=num_frames,
+                    **self._model_forward_kwargs,
                 )
         finally:
             module.add_decoder = old_add_decoder
@@ -571,6 +572,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             inference_context=self.inference_context,
             num_image_tiles=num_image_tiles,
             runtime_gather_output=True,
+            **self._model_forward_kwargs,
         )
         if isinstance(output, tuple):
             logits, _ = output
