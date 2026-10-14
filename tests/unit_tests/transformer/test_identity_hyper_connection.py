@@ -28,9 +28,11 @@ from tests.unit_tests.test_utilities import Utils
 def _model_parallel():
     """Initialize model parallelism once for this module.
 
-    Share TP=1/PP=1 groups because these tests use the same parallel layout and only
-    need a fresh RNG seed per test. Utils.destroy_model_parallel releases the owned
-    process groups and their watchdog threads when this module finishes.
+    Every initialize/destroy cycle leaves its NCCL process groups (and their watchdog
+    threads) behind for the lifetime of the pytest process, and the CI bucket already
+    runs ~1700 tests in one process. Sharing one TP=1/PP=1 initialization across this
+    file keeps its footprint at a single cycle; the tests only need the RNG tracker and
+    a default group.
     """
     Utils.initialize_model_parallel(1, 1)
     yield

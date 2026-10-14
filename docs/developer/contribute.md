@@ -47,21 +47,6 @@ File any bugs you find, keeping the following in mind:
 - Include commented-out code.
 - Attempt large architectural changes without first opening an issue to discuss.
 
-## Distributed Unit-Test Cleanup
-
-Use `tests.unit_tests.test_utilities.Utils` to initialize and destroy model parallelism
-in distributed unit tests. Both explicit teardown and repeated initialization release
-the model-parallel process groups in a consistent order. This prevents NCCL watchdog
-threads from accumulating across tests in the same worker process.
-Teardown also resets Transformer Engine's FP8 global state before releasing its
-cached amax-reduction groups, so subsequent tests cannot reuse stale communicators.
-It also clears DTensor's Python and native sharding caches, whose output specs can
-otherwise reuse an old communicator when a new mesh has the same rank layout.
-
-The helper preserves the default process group and groups created by other callers.
-Tests that create additional groups directly must destroy those groups themselves.
-Release test-owned CUDA graphs before tearing down their communicators.
-
 ## Signing Your Work
 
 - We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.

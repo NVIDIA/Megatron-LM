@@ -7,12 +7,6 @@ from typing import Literal
 import torch
 from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
-from torch.distributed.tensor import DTensor
-
-try:
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
-except ImportError:
-    FP8GlobalStateManager = None
 
 import megatron.core.parallel_state as ps
 from megatron.training.argument_utils import (
@@ -47,14 +41,6 @@ def clear_nvte_env_vars():
 
 
 class Utils:
-    """Distributed test setup with explicit ownership of model-parallel groups.
-
-    Repeated test setup must release NCCL groups, whose watchdog threads otherwise
-    survive MCore's parallel-state reset. WORLD and independently created groups
-    remain available until their owners or the session fixture destroy them.
-    FP8 global state and DTensor sharding caches are reset before their groups
-    are released, so subsequent tests cannot reuse stale communicators.
-    """
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     rank = int(os.environ.get('LOCAL_RANK', '0'))
@@ -113,33 +99,6 @@ class Utils:
             Utils.rank = rank
 
     @staticmethod
-    def _destroy_model_parallel_groups():
-        # MCore records the groups created by its initialization in creation order.
-        # Snapshot them before resetting parallel_state; None denotes WORLD.
-        groups = list(ps._global_process_group_list or [])
-        if groups:
-            torch.cuda.synchronize()
-            # TE retains delayed-scaling amax buffers and their process groups
-            # across autocast contexts. They belong to the model being torn down.
-            if FP8GlobalStateManager is not None:
-                FP8GlobalStateManager.reset()
-            # DTensor caches output specs by mesh layout, which does not include
-            # process-group identity. A new equal-layout mesh must not inherit
-            # an output spec tied to the groups that are about to be destroyed.
-            DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding.cache_clear()
-            # Recent PyTorch versions also cache sharding propagation in C++.
-            clear_native_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
-            if clear_native_cache is not None:
-                clear_native_cache()
-        ps.destroy_model_parallel()
-        # Gloo groups may already have been destroyed by the parallel-state reset.
-        # Release remaining groups in a consistent order without touching groups
-        # created by other test fixtures or destroying the default process group.
-        for group in reversed(groups):
-            if group is not None and group in torch.distributed.distributed_c10d._world.pg_map:
-                torch.distributed.destroy_process_group(group)
-
-    @staticmethod
     def destroy_model_parallel():
         os.environ.pop('NVTE_FLASH_ATTN', None)
         os.environ.pop('NVTE_FUSED_ATTN', None)
@@ -155,7 +114,7 @@ class Utils:
         except Exception:
             Utils.inited = False
             return
-        Utils._destroy_model_parallel_groups()
+        ps.destroy_model_parallel()
         Utils.inited = False
         torch.cuda.memory.empty_cache()
 
@@ -172,7 +131,7 @@ class Utils:
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
-        Utils._destroy_model_parallel_groups()
+        ps.destroy_model_parallel()
         Utils.initialize_distributed()
         ps.initialize_model_parallel(
             tensor_model_parallel_size,
