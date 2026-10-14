@@ -16,6 +16,8 @@ from megatron.core.tensor_parallel.layers import (
     linear_with_grad_accumulation_and_async_allreduce,
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -544,3 +546,72 @@ class TestWgradGemmAccumulate:
         once = out.clone()
         _wgrad_gemm(out, grad_output, total_input)
         torch.testing.assert_close(out, once, rtol=0, atol=0)
+
+
+def _linear(input_data, weight, **kwargs):
+    """The linear forward with fusion, grad all-reduce and sequence parallelism off."""
+    return linear_with_grad_accumulation_and_async_allreduce(
+        input_data, weight, None, False, False, False, tp_group=None, **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    "out_dtype",
+    [
+        torch.bfloat16,
+        pytest.param(
+            torch.float32,
+            marks=pytest.mark.skipif(
+                te_general_gemm is None, reason="fp32 output needs Transformer Engine general_gemm"
+            ),
+        ),
+    ],
+    ids=["bf16", "fp32"],
+)
+def test_linear_out_buffer_writes_gemm_result_in_place(out_dtype):
+    """`out=` makes the GEMM (torch matmul in the input dtype, TE general_gemm for fp32)
+    write the caller's buffer and return it, bitwise what the unbuffered path produces;
+    a conflicting output_dtype, a wrong shape and grad mode are rejected."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        input_data = torch.randn(4, 1, 16, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(32, 16, device="cuda", dtype=torch.bfloat16)
+        out = torch.empty(4, 1, 32, device="cuda", dtype=out_dtype)
+        with torch.inference_mode():
+            output = _linear(input_data, weight, out=out)
+            assert output.data_ptr() == out.data_ptr() and output.dtype == out_dtype
+            assert torch.equal(output, _linear(input_data, weight, output_dtype=out_dtype))
+            with pytest.raises(ValueError, match="output_dtype"):
+                _linear(input_data, weight, output_dtype=torch.float64, out=out)
+            with pytest.raises(ValueError, match="shape"):
+                _linear(input_data, weight, out=out[..., :31])
+        with pytest.raises(RuntimeError, match="grad"):
+            _linear(input_data.requires_grad_(), weight, out=out)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_linear_out_buffer_writes_vocab_parallel_shard():
+    """At TP > 1 without an output gather, `out=` receives this rank's shard, the contract
+    of vocab-parallel consumers; with a gather it is rejected, since the GEMM result is
+    not the layer's output then."""
+    Utils.initialize_model_parallel(8, 1)
+    try:
+        model_parallel_cuda_manual_seed(42)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=16, num_attention_heads=4, params_dtype=torch.bfloat16
+        )
+        layer = ColumnParallelLinear(
+            16, 64, init_method=config.init_method, bias=False, gather_output=False, config=config
+        )
+        with torch.inference_mode():
+            input_data = torch.randn(4, 1, 16, device="cuda", dtype=torch.bfloat16)
+            out = torch.empty(4, 1, layer.weight.shape[0], device="cuda", dtype=torch.bfloat16)
+            output, _ = layer(input_data, out=out)
+            assert output.data_ptr() == out.data_ptr()
+            assert out.shape[-1] * layer.tp_group.size() == 64
+            assert torch.equal(output, layer(input_data)[0])
+            with pytest.raises(ValueError, match="gather"):
+                layer(input_data, runtime_gather_output=True, out=out)
+    finally:
+        Utils.destroy_model_parallel()

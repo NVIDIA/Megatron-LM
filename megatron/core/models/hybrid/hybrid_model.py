@@ -893,6 +893,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 last_dim_width=shard.shape[1],
             )
             logits = buffer_rows.unsqueeze(1)
+        elif logits_buffer is not None and inference_context.logits_output_in_place:
+            # TP 1 with a head that takes a preallocated output and emits fp32: the GEMM writes
+            # directly into the (fp32) buffer.
+            buffer_rows = logits_buffer[0, : hidden_states.shape[0]]
+            logits, _ = self.output_layer(
+                hidden_states,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                output_dtype=output_dtype,
+                out=buffer_rows.unsqueeze(1),
+            )
+            if self.config.use_mup and self.config.mup_output_mult != 1.0:
+                logits.mul_(self.config.mup_output_mult)
         else:
             logits, _ = self.output_layer(
                 hidden_states,

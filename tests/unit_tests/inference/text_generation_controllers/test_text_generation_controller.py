@@ -4300,8 +4300,9 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
         """Inference holds logits in fp32: the CUDA-graph buffer is allocated in it and at PP 2
         the first stage receives the broadcast in it. The bf16 head emits fp32 directly when TE
         general_gemm is available and upcasts otherwise. With the buffer the model writes each
-        step's logits into it inside the forward and the controller asserts the identity every
-        step; without it there is none. Generation with and without the buffer samples the same
+        step's logits into it inside the forward (at TP 1 a head that emits fp32 writes it in
+        place) and the controller asserts the identity every step; without it there is none.
+        Generation with and without the buffer samples the same
         tokens (both run the same eager kernels here).
         """
         generated = {}
@@ -4321,9 +4322,13 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
             if cuda_graph_impl == "local":
                 assert context.logits_output_buffer is controller._all_logits_cuda
                 assert controller._all_logits_cuda.shape[-1] == self.vocab_size
+                assert context.logits_output_in_place == (
+                    tp_size == 1 and controller._language_model.lm_head_can_emit_fp32
+                )
             else:
                 assert context.logits_output_buffer is None
                 assert controller._all_logits_cuda is None
+                assert not context.logits_output_in_place
             generated[cuda_graph_impl] = self._generate_dynamic()
             assert controller._all_logits_cuda.dtype is torch.float32
         assert generated["none"] == generated["local"]
@@ -4411,6 +4416,7 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 )
                 assert not nvls_available, "NVLS is available but no symmetric buffer"
                 pytest.skip("NVLS symmetric memory unavailable on this platform")
+            assert not context.logits_output_in_place
             generated[cuda_graph_impl] = self._generate_dynamic()
         assert generated["none"] == generated["local"]
 
