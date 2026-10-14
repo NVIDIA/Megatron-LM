@@ -21,6 +21,25 @@ def test_layer_sharded_muon_tp_mode_requirements():
         OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'muon_split_qkv': True})
 
 
+def test_optimizer_cuda_graph_disables_store_param_remainders():
+    """TE FusedAdam capturable mode rejects param remainders, so the config must turn them off."""
+    pytest.importorskip("transformer_engine")
+    from megatron.core.utils import is_te_min_version
+
+    if not is_te_min_version("2.1.0"):
+        pytest.skip("store_param_remainders needs TE >= 2.1.0")
+
+    pao = dict(bf16=True, use_precision_aware_optimizer=True)
+    assert OptimizerConfig(**pao).store_param_remainders
+    # Warns, and resolving the config again (which re-runs __post_init__) stays off.
+    with pytest.warns(UserWarning, match="store_param_remainders"):
+        config = OptimizerConfig(optimizer_cuda_graph=True, **pao)
+    assert not config.store_param_remainders
+    assert not config.resolve_fp8_param_gather(False).store_param_remainders
+    # Without the precision-aware optimizer the setting is irrelevant and left alone.
+    assert OptimizerConfig(optimizer_cuda_graph=True).store_param_remainders
+
+
 def test_paramkey_matches():
     len_1_predicate = ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1)
     endswith_bias = ParamKey(name="*.bias")

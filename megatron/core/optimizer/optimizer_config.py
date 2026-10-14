@@ -2,6 +2,7 @@
 
 import fnmatch
 import math
+import warnings
 from dataclasses import dataclass, field, replace
 from typing import Callable, Optional, Tuple, Union
 
@@ -494,8 +495,6 @@ class OptimizerConfig:
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                import warnings
-
                 warnings.warn(
                     "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
                     "will use significant amount additional GPU memory."
@@ -538,6 +537,17 @@ class OptimizerConfig:
                 self.optimizer == 'adam'
             ), '--use-precision-aware-optimizer only supported with adam'
             if not is_te_min_version("2.1.0"):
+                self.store_param_remainders = False
+
+            # TE FusedAdam's capturable (CUDA graph) mode cannot store param remainders, so keep
+            # the full FP32 master weights. This costs 2 extra bytes per (DP-sharded) parameter and
+            # changes the optimizer checkpoint format (FP32 instead of int16 master_param).
+            if self.optimizer_cuda_graph and self.store_param_remainders:
+                warnings.warn(
+                    "--optimizer-cuda-graph is incompatible with store_param_remainders; "
+                    "disabling it. Optimizer checkpoints will not be interchangeable with "
+                    "runs that store param remainders."
+                )
                 self.store_param_remainders = False
 
             # Only the FusedAdam in TE and HybridDeviceOptimizer supports
