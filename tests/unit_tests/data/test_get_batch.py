@@ -903,8 +903,9 @@ def test_get_batch_builds_required_cp_layouts():
         micro_batch_size=1,
         global_batch_size=global_batch_size,
     )
-    args.linear_cp_layout = "contiguous"
-    args.attention_cp_layout = "zigzag"
+    cfg = pretrain_hybrid.get_run_config()
+    cfg.model.transformer.linear_cp_layout = "contiguous"
+    cfg.model.transformer.attention_cp_layout = "zigzag"
 
     tokens = torch.arange(seq_length, dtype=torch.int64).view(1, -1)
     batch = {
@@ -998,6 +999,38 @@ def create_pretrain_data_iterator(
     return iter([batch])
 
 
+def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
+    args = SimpleNamespace(
+        sft=False,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+        linear_cp_layout="zigzag",
+    )
+    config = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        context_parallel_size=2,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        hybrid_context_parallel=False,
+        linear_cp_layout="contiguous",
+    )
+    monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
+    monkeypatch.setattr(
+        pretrain_hybrid,
+        "get_run_config",
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+    )
+    monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(pretrain_hybrid, "is_first_or_last_pipeline_stage", lambda stage: False)
+    monkeypatch.setattr(pretrain_hybrid, "mtp_on_this_rank_func", lambda **kwargs: False)
+
+    batch = get_batch(None)
+
+    assert set(batch.batches_by_layout) == {"contiguous"}
+    assert all(value is None for value in batch.get_batch().values())
+    assert batch.get_packed_seq_params() is None
+
+
 def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     tokens = torch.tensor([[1, 2]])
     labels = torch.tensor([[2, 3]])
@@ -1014,8 +1047,9 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         packed_seq_params,
         padding_mask,
     )
-    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced")
+    args = SimpleNamespace(sequence_packing_scheduler=None)
     config = SimpleNamespace(
+        sequence_packing_scheduler="dp_balanced",
         virtual_pipeline_model_parallel_size=None,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
@@ -1024,7 +1058,11 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
 
     with (
         patch.object(pretrain_hybrid, "get_args", return_value=args),
-        patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
+        patch.object(
+            pretrain_hybrid,
+            "get_run_config",
+            return_value=SimpleNamespace(model=SimpleNamespace(transformer=config)),
+        ),
         patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
         patch.object(
             pretrain_hybrid,

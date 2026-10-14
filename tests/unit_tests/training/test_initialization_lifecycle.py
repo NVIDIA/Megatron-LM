@@ -241,7 +241,14 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
 
         def record(received_args, service=name, **kwargs):
             assert received_args is args
-            assert kwargs == ({"include_training": True} if service == "_set_telemetry" else {})
+            expected = {
+                "_set_telemetry": {"include_training": True},
+                "_build_tokenizer": {
+                    "tensor_model_parallel_size": 1,
+                    "make_vocab_size_divisible_by": 128,
+                },
+            }
+            assert kwargs == expected.get(service, {})
             calls.append(service)
 
         monkeypatch.setattr(global_vars, name, record)
@@ -594,6 +601,131 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
     assert model.as_dict() == legacy_model.as_dict()
     assert cfg.tokenizer.padded_vocab_size == legacy_args.padded_vocab_size
     assert global_vars.get_tokenizer().vocab_size == legacy_tokenizer.vocab_size
+
+
+@pytest.mark.parametrize(
+    "adapter", [gpt_config_from_args, hybrid_config_from_args, ModelProviderConfig]
+)
+@pytest.mark.parametrize("pad_vocab", [False, True])
+@pytest.mark.parametrize("padded_vocab", [None, 768])
+def test_training_tokenizer_padding_uses_model_inputs(
+    monkeypatch, isolated_globals, adapter, pad_vocab, padded_vocab
+):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.rank, args.world_size = 0, 2
+    args.tokenizer_type = "NullTokenizer"
+    args.vocab_size = 129
+    args.pad_vocab_size = pad_vocab
+    args.padded_vocab_size = padded_vocab
+    args.max_position_embeddings = 64
+    args.tensor_model_parallel_size = 1
+    args.make_vocab_size_divisible_by = 128
+    transformer = TransformerConfig(
+        num_layers=2, hidden_size=128, num_attention_heads=4, tensor_model_parallel_size=2
+    )
+    if adapter is ModelProviderConfig:
+        model = ModelProviderConfig(
+            transformer=transformer,
+            seq_length=64,
+            vocab_size=padded_vocab if padded_vocab is not None or pad_vocab else args.vocab_size,
+        )
+    else:
+        model = adapter(args, config=transformer)
+    model.make_vocab_size_divisible_by = 256
+    cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
+    global_vars.set_args(args)
+    global_vars.set_run_config(cfg)
+    for service in ("_set_wandb_writer", "_set_telemetry", "initialize_training_runtime_services"):
+        monkeypatch.setattr(global_vars, service, Mock())
+
+    global_vars.initialize_runtime_services(args, training=True)
+    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
+
+    expected = padded_vocab if padded_vocab is not None else (512 if pad_vocab else None)
+    assert args.padded_vocab_size == cfg.tokenizer.padded_vocab_size == expected
+    assert cfg.model.vocab_size == (129 if expected is None else expected)
+    assert global_vars.get_tokenizer().vocab_size == 129
+    assert args.tensor_model_parallel_size == 1
+    assert args.make_vocab_size_divisible_by == 128
+
+
+@pytest.mark.parametrize("share_embeddings", [False, True])
+def test_gpt_embedding_groups_use_registered_model(monkeypatch, isolated_globals, share_embeddings):
+    import pretrain_gpt
+
+    cfg = SimpleNamespace(
+        model=ModelProviderConfig(
+            transformer=TransformerConfig(
+                num_layers=3,
+                hidden_size=128,
+                num_attention_heads=4,
+                pipeline_model_parallel_size=3,
+                pipeline_model_parallel_layout="Et*3|m|L",
+                mtp_num_layers=1,
+            ),
+            seq_length=64,
+            share_embeddings_and_output_weights=share_embeddings,
+        )
+    )
+    global_vars.set_run_config(cfg)
+    global_vars.set_args(Namespace(untie_embeddings_and_output_weights=share_embeddings))
+
+    assert pretrain_gpt.get_embedding_ranks([0, 2, 4]) == (
+        [0, 2, 4] if share_embeddings else [0, 2]
+    )
+    assert pretrain_gpt.get_embedding_ranks([7]) == [7]
+
+
+@pytest.mark.parametrize("module_name", ["pretrain_gpt", "pretrain_hybrid"])
+def test_dataset_helpers_use_registered_model(monkeypatch, isolated_globals, module_name):
+    import importlib
+
+    entrypoint = importlib.import_module(module_name)
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.seq_length = 32
+    args.data_parallel_size = 2
+    transformer = TransformerConfig(
+        num_layers=3,
+        hidden_size=128,
+        num_attention_heads=4,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+        context_parallel_size=2,
+        hybrid_context_parallel=True,
+        pipeline_model_parallel_size=3,
+        pipeline_model_parallel_layout="Et*3|m|L",
+        mtp_num_layers=1,
+    )
+    cfg = SimpleNamespace(
+        model=ModelProviderConfig(transformer=transformer, seq_length=64),
+        rng=SimpleNamespace(seed=1234),
+    )
+    global_vars.set_args(args)
+    global_vars.set_run_config(cfg)
+    monkeypatch.setattr(entrypoint, "build_tokenizer", Mock())
+    monkeypatch.setattr(entrypoint, "get_blend_and_blend_per_split", lambda args: (None, None))
+    monkeypatch.setattr(entrypoint, "GPTDatasetConfig", SimpleNamespace)
+
+    dataset = entrypoint.core_gpt_dataset_config_from_args(args)
+    assert dataset.context_parallel_size == 2
+    assert dataset.sequence_parallel_size == 2
+    assert dataset.hybrid_context_parallel is True
+    assert dataset.data_parallel_size == 2
+    assert dataset.sequence_length == 32  # Actual data length, not position capacity.
+
+    monkeypatch.setattr(entrypoint.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(entrypoint.mpu, "get_pipeline_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(
+        entrypoint.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None
+    )
+    monkeypatch.setattr(entrypoint, "is_first_or_last_pipeline_stage", lambda stage: False)
+    assert entrypoint.is_dataset_built_on_rank()
+    assert args.context_parallel_size == args.tensor_model_parallel_size == 1
+    assert args.mtp_num_layers is None
 
 
 def test_explicit_model_vocabulary_is_not_overwritten(monkeypatch, isolated_globals):

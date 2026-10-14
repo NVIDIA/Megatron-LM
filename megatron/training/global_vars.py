@@ -188,8 +188,15 @@ def initialize_runtime_services(
     if training:
         _set_training_parallel_sizes(args, world_size=training_world_size)
     if build_tokenizer:
-        _build_tokenizer(args)
-        if not training:
+        if training:
+            cfg = get_run_config()
+            _build_tokenizer(
+                args,
+                tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+                make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+            )
+        else:
+            _build_tokenizer(args)
             from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 
             resolve_tokenizer_vocab_size(get_run_config(), getattr(args, 'padded_vocab_size', None))
@@ -315,11 +322,17 @@ def _set_train_state():
     _GLOBAL_TRAIN_STATE = TrainState()
 
 
-def _build_tokenizer(args):
+def _build_tokenizer(
+    args, *, tensor_model_parallel_size=None, make_vocab_size_divisible_by=None
+):
     """Initialize tokenizer."""
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
-    _GLOBAL_TOKENIZER = build_tokenizer(args)
+    _GLOBAL_TOKENIZER = build_tokenizer(
+        args,
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        make_vocab_size_divisible_by=make_vocab_size_divisible_by,
+    )
     # Resolve the declared model field once, before any args-to-config conversion.
     # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
     if (

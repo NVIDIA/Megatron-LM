@@ -115,7 +115,7 @@ def test_hash_moe_vocab_is_initialized_before_config_conversion(
     args.padded_vocab_size = 100352
     tokenizer = SimpleNamespace(vocab_size=100003)
     monkeypatch.setattr(global_vars, '_GLOBAL_TOKENIZER', None)
-    monkeypatch.setattr(global_vars, 'build_tokenizer', lambda _args: tokenizer)
+    monkeypatch.setattr(global_vars, 'build_tokenizer', lambda _args, **kwargs: tokenizer)
 
     global_vars._build_tokenizer(args)
     config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)

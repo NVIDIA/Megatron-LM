@@ -131,6 +131,10 @@ def test_resume_updates_microbatches_before_setup_validation(
 def test_runtime_services_initialize_training_only_when_requested(
     monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs, run_config
 ):
+    run_config.model = ModelProviderConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=16,
+    )
     args = Namespace(
         enable_experimental=enable_runtime_flags, disable_jit_fuser=enable_runtime_flags
     )
