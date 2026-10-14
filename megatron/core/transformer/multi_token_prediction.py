@@ -16,6 +16,8 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fusions.fused_mtp_prefix import mtp_e2e_prefix_objective
+from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
@@ -26,6 +28,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
+    is_inference_column_parallel_linear,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
@@ -1693,6 +1696,130 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+def _process_mtp_e2e_tv_loss(
+    hidden_states_list: tuple[Tensor, ...],
+    loss_mask: Tensor,
+    output_layer: Callable,
+    output_weight: Tensor,
+    runtime_gather_output: Optional[bool],
+    is_training: bool,
+    config: TransformerConfig,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    dp_cp_group: Optional[torch.distributed.ProcessGroup],
+    packed_seq_params: Optional[PackedSeqParams],
+    scale_logits_fn: Optional[Callable[[Tensor], Tensor]],
+    sequence_roll_context: Optional[MTPSequenceRollContext],
+    derived_labels_from_input_ids: bool,
+    original_num_tokens: Optional[Tensor],
+) -> Tensor:
+    """Apply the end-to-end TV objective to MTP draft hidden states.
+
+    The frozen backbone is projected once. For depth ``i``, its target logits are
+    shifted by ``i + 1`` positions to align with the MTP draft distribution for
+    the same future token. Only start positions with a complete chain across all
+    configured MTP depths contribute to the objective.
+    """
+    hidden_states = hidden_states_list[0]
+    logits_are_vocab_sharded = _mtp_logits_are_vocab_sharded(output_layer, runtime_gather_output)
+
+    # Project the frozen backbone once, then align each target distribution by
+    # rolling logits. Re-projecting one shifted hidden tensor per MTP depth would
+    # add a full vocabulary GEMM for every draft step.
+    with torch.no_grad():
+        target_logits, _ = output_layer(
+            hidden_states.detach(),
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if scale_logits_fn is not None:
+            target_logits = scale_logits_fn(target_logits)
+    # roll_tensor handles packed boundaries and CP communication along its last
+    # dimension. Keep vocabulary before sequence while preparing target alignment.
+    target_logits = target_logits.permute(1, 2, 0)
+    current_loss_mask = loss_mask
+    chain_valid = torch.ones_like(loss_mask, dtype=torch.bool)
+    tv_distances = []
+
+    for mtp_layer_number in range(config.mtp_num_layers):
+        target_logits = roll_tensor(
+            [target_logits],
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            fill_values=[0],
+        )[0]
+        current_loss_mask = roll_tensor(
+            [current_loss_mask],
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            roll_context=sequence_roll_context,
+            sequence_fields=["loss_mask"],
+            roll_depth=mtp_layer_number + int(derived_labels_from_input_ids),
+        )[0]
+        chain_valid &= current_loss_mask.bool()
+
+        draft_logits, _ = output_layer(
+            hidden_states_list[mtp_layer_number + 1],
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if scale_logits_fn is not None:
+            draft_logits = scale_logits_fn(draft_logits)
+        tv_distances.append(
+            vocab_parallel_tv_distance(
+                draft_logits,
+                target_logits.permute(2, 0, 1),
+                tp_group=tp_group,
+                logits_are_vocab_sharded=logits_are_vocab_sharded,
+            )
+        )
+
+    tv_distances_tensor = torch.stack(tv_distances, dim=0)
+    per_step_acceptance = 1.0 - tv_distances_tensor
+    e2e_tv_loss, prefix_losses = mtp_e2e_prefix_objective(per_step_acceptance)
+
+    chain_mask = chain_valid.transpose(0, 1).to(e2e_tv_loss.dtype)
+    num_tokens = chain_mask.sum()
+    masked_e2e_tv_loss = e2e_tv_loss * chain_mask
+
+    if is_training:
+        collect_acceptance = MTPLossLoggingHelper.should_collect_acceptance()
+        for mtp_layer_number in range(config.mtp_num_layers):
+            correct = None
+            total = None
+            if collect_acceptance:
+                correct = torch.sum(per_step_acceptance[mtp_layer_number] * chain_mask)
+                total = num_tokens
+            MTPLossLoggingHelper.save_loss_to_tracker(
+                torch.sum(prefix_losses[mtp_layer_number] * chain_mask),
+                num_tokens,
+                mtp_layer_number,
+                config.mtp_num_layers,
+                correct=correct,
+                total=total,
+                avg_group=dp_cp_group,
+                calculate_per_token_loss=config.calculate_per_token_loss,
+            )
+
+    assert config.mtp_loss_scaling_factor is not None
+    if config.calculate_per_token_loss:
+        assert original_num_tokens is not None
+        normalized_loss = (
+            config.mtp_loss_scaling_factor
+            * masked_e2e_tv_loss
+            * (original_num_tokens / num_tokens.clamp(min=1))
+        )
+    else:
+        normalized_loss = (
+            config.mtp_loss_scaling_factor * masked_e2e_tv_loss / num_tokens.clamp(min=1)
+        )
+    return MTPLossAutoScaler.apply(hidden_states, normalized_loss)
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Optional[Tensor],
@@ -1709,6 +1836,7 @@ def process_mtp_loss(
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
     input_ids: Optional[Tensor] = None,
     sequence_roll_context: Optional[MTPSequenceRollContext] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -1736,6 +1864,8 @@ def process_mtp_loss(
             is provided.
         sequence_roll_context (Optional[MTPSequenceRollContext]): Layout-specific
             metadata shared by MTP rolls in this microbatch.
+        dp_cp_group (Optional[ProcessGroup]): Data and context parallelism process group.
+            Training callers that omit it use the default MPU group for either objective.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -1779,6 +1909,30 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum() if config.calculate_per_token_loss else None
+
+    if is_training and dp_cp_group is None:
+        # Migration fallback for training callers that omit the logging group.
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+    if config.mtp_loss_type == "e2e_tv":
+        assert output_weight is not None
+        return _process_mtp_e2e_tv_loss(
+            hidden_states_list=hidden_states_list,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            is_training=is_training,
+            config=config,
+            cp_group=cp_group,
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_group,
+            packed_seq_params=packed_seq_params,
+            scale_logits_fn=scale_logits_fn,
+            sequence_roll_context=sequence_roll_context,
+            derived_labels_from_input_ids=derived_labels_from_input_ids,
+            original_num_tokens=original_num_tokens,
+        )
 
     fuse_linear_cross_entropy = (
         config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
@@ -1835,7 +1989,7 @@ def process_mtp_loss(
                 config.mtp_num_layers,
                 correct=correct,
                 total=total,
-                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                avg_group=dp_cp_group,
                 calculate_per_token_loss=config.calculate_per_token_loss,
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
@@ -2017,6 +2171,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                 tp_group=pg_collection.tp if pg_collection is not None else None,
                 name=(name + ".eh_proj") if name is not None else None,
             )
+            # eh_proj's input all-gather reuses the shared "tp" symmetric buffer right
+            # after the preceding layer's all-gather (the fused rs-add-norm-ag terminates
+            # with one, as does the previous MTP step's output all-gather), so it must
+            # barrier before overwriting. Only the inference-optimized linear implements
+            # this all-gather; other eh_proj impls have no such buffer to guard.
+            if is_inference_column_parallel_linear(self.eh_proj):
+                self.eh_proj.set_barrier_before_all_gather(True)
             self.e_proj = None
             self.h_proj = None
 
@@ -2055,6 +2216,23 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
+
+        # The MTP inner block's first all-gather reuses the same "tp" symmetric buffer
+        # that _concat_embeddings' output all-gather just wrote, with no reduce-scatter in
+        # between, so it must barrier before overwriting. Later all-gathers in the inner
+        # block are each preceded by a reduce-scatter and need no barrier. modules() yields
+        # in forward order, so the first inference column-parallel linear is that all-gather.
+        if self.mtp_layer_pattern is not None:
+            # Hybrid path: HybridStack of layers.
+            first_inner_layer = self.mtp_model_layer.layers[0]
+        else:
+            # GPT path: single TransformerLayer.
+            first_inner_layer = self.mtp_model_layer
+
+        for module in first_inner_layer.modules():
+            if is_inference_column_parallel_linear(module):
+                module.set_barrier_before_all_gather(True)
+                break
 
         self.final_layernorm = self.submodules.layer_norm(
             config=self.config,
@@ -2137,6 +2315,19 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
+        # Mirror the scatter in the model's own forward (see hybrid_model.py:
+        # "the embedding skips SP scatter for models whose outer wrapper
+        # scatters instead"). Multimodal LMs build LanguageModelEmbedding with
+        # scatter_to_sequence_parallel=False so they can insert media into a
+        # full-length embedding before scattering. The MTP block calls the
+        # embedding directly and so must apply the same scatter, otherwise
+        # decoder_input stays full-length while the backbone hidden_states
+        # arrive sequence-parallel sharded and _concat_embeddings fails.
+        if self.config.sequence_parallel and not getattr(
+            embedding, "scatter_to_sequence_parallel", True
+        ):
+            decoder_input = scatter_to_sequence_parallel_region(decoder_input, group=self.tp_group)
+
         if self.config.mtp_detach_heads:
             decoder_input = decoder_input.detach()
 
@@ -2201,8 +2392,11 @@ class MultiTokenPredictionLayer(MegatronModule):
             # For tensor parallel we need to gather the tensor across the model-parallel
             # ranks after the linear projection.
             if not self.training:
+                # This all-gather immediately follows eh_proj's input all-gather on the
+                # same symmetric buffer (only eh_proj's local matmul runs in between), so
+                # it must barrier before overwriting the buffer's previous contents.
                 hidden_states = inference_all_gather_from_tensor_model_parallel_region(
-                    hidden_states, self.tp_group, self.config
+                    hidden_states, self.tp_group, self.config, barrier_before=True
                 )
             else:
                 hidden_states = gather_from_tensor_model_parallel_region(
