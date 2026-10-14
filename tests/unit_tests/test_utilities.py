@@ -8,6 +8,11 @@ import torch
 from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
 
+try:
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+except ImportError:
+    FP8GlobalStateManager = None
+
 import megatron.core.parallel_state as ps
 from megatron.training.argument_utils import (
     gpt_config_from_args,
@@ -46,6 +51,7 @@ class Utils:
     Repeated test setup must release NCCL groups, whose watchdog threads otherwise
     survive MCore's parallel-state reset. WORLD and independently created groups
     remain available until their owners or the session fixture destroy them.
+    FP8 global state is reset before releasing its cached reduction groups.
     """
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
@@ -111,6 +117,10 @@ class Utils:
         groups = list(ps._global_process_group_list or [])
         if groups:
             torch.cuda.synchronize()
+            # TE retains delayed-scaling amax buffers and their process groups
+            # across autocast contexts. They belong to the model being torn down.
+            if FP8GlobalStateManager is not None:
+                FP8GlobalStateManager.reset()
         ps.destroy_model_parallel()
         # Gloo groups may already have been destroyed by the parallel-state reset.
         # Release remaining groups in a consistent order without touching groups

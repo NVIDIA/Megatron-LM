@@ -53,6 +53,8 @@ Use `tests.unit_tests.test_utilities.Utils` to initialize and destroy model para
 in distributed unit tests. Both explicit teardown and repeated initialization release
 the model-parallel process groups in a consistent order. This prevents NCCL watchdog
 threads from accumulating across tests in the same worker process.
+Teardown also resets Transformer Engine's FP8 global state before releasing its
+cached amax-reduction groups, so subsequent tests cannot reuse stale communicators.
 
 The helper preserves the default process group and groups created by other callers.
 Tests that create additional groups directly must destroy those groups themselves.

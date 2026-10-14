@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core import parallel_state
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -41,3 +42,36 @@ def test_model_parallel_group_cleanup(destroy_between):
         ]
         for group in reversed(owned_groups):
             dist.destroy_process_group(group)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("destroy_between", [True, False], ids=["destroy", "reinitialize"])
+def test_fp8_amax_after_model_parallel_reinitialization(destroy_between):
+    te = pytest.importorskip("transformer_engine.pytorch")
+    from transformer_engine.common.recipe import DelayedScaling
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    available, reason = FP8GlobalStateManager.is_fp8_available()
+    if not available:
+        pytest.skip(reason)
+
+    try:
+        for _ in range(2):
+            Utils.initialize_model_parallel(1, 1)
+            layer = te.Linear(16, 16, params_dtype=torch.bfloat16, device="cuda")
+            inputs = torch.randn(16, 16, dtype=torch.bfloat16, device="cuda")
+            # Delayed scaling retains amax buffers and their reduction group globally.
+            # The second forward must not reduce buffers using the previous group.
+            with te.fp8_autocast(
+                fp8_recipe=DelayedScaling(),
+                fp8_group=parallel_state.get_amax_reduction_group(with_context_parallel=True),
+            ):
+                output = layer(inputs)
+            assert torch.isfinite(output).all()
+            del layer, inputs, output
+            if destroy_between:
+                Utils.destroy_model_parallel()
+    finally:
+        # Keep a failing regression on an old helper from contaminating later tests.
+        FP8GlobalStateManager.reset()
+        Utils.destroy_model_parallel()
