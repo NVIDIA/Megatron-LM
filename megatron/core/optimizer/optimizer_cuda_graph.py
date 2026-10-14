@@ -39,6 +39,9 @@ class OptimizerCudaGraphWrapper:
                 OptimizerCudaGraphWrapper.cuda_graph,
                 stream=capture_stream,
                 pool=get_graph_pool(self.use_single_mempool),
+                # DataLoader threads may allocate pinned host memory for future batches.
+                # Those allocations are independent of this graph; match full-iteration capture.
+                capture_error_mode="thread_local",
             ):
                 OptimizerCudaGraphWrapper.result = self.optimizer_step_func()
             torch.cuda.synchronize()
