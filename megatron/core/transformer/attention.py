@@ -5,7 +5,7 @@ import copy
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol, Tuple, Union
+from typing import Callable, Optional, Protocol, Tuple, Union, cast
 
 import torch
 from torch import Tensor
@@ -1454,22 +1454,47 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
+        use_packed_qkv = (
+            split_qkv
+            and type(self).get_query_key_value_tensors is SelfAttention.get_query_key_value_tensors
+            and getattr(self.core_attention, "supports_packed_qkv", False)
+            and inference_context is None
+            and rotary_pos_emb is None
+            and not self.config.attention_output_gate
+            and not self.checkpoint_core_attention
+            and not self.offload_qkv_linear
+            and not self.offload_core_attention
+            and not self.config.fp8
+            and not self.config.fp4
+        )
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
         with qkv_linear_manager as hidden_states:
-            qkv_output = self.get_query_key_value_tensors(
-                hidden_states,
-                key_value_states,
-                split_qkv=split_qkv,
-                output_gate=self.config.attention_output_gate,
-            )
+            if use_packed_qkv:
+                qkv_output = cast(SelfAttention, self).get_query_key_value_tensors(
+                    hidden_states,
+                    key_value_states,
+                    split_qkv=split_qkv,
+                    output_gate=self.config.attention_output_gate,
+                    return_packed_qkv=True,
+                )
+            else:
+                qkv_output = self.get_query_key_value_tensors(
+                    hidden_states,
+                    key_value_states,
+                    split_qkv=split_qkv,
+                    output_gate=self.config.attention_output_gate,
+                )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
         qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
+        packed_qkv = None
         if split_qkv:
             if self.config.attention_output_gate:
                 query, key, value, gate = qkv_output
+            elif use_packed_qkv:
+                query, key, value, packed_qkv = qkv_output
             else:
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
@@ -1541,6 +1566,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
+            if packed_qkv is not None:
+                packed_qkv = packed_qkv.squeeze(1)
         nvtx_range_pop(suffix="adjust_key_value")
 
         # ================================================
@@ -1637,6 +1664,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
                 with core_attn_manager as query:
+                    packed_qkv_kwargs = (
+                        {"packed_qkv": packed_qkv} if packed_qkv is not None else {}
+                    )
                     core_attn_out = apply_module(self.core_attention)(
                         query,
                         key,
@@ -1645,6 +1675,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
+                        **packed_qkv_kwargs,
                     )
 
             else:
@@ -1906,8 +1937,9 @@ class SelfAttention(Attention):
         key_value_states: Tensor | None = None,
         output_gate: bool = False,
         split_qkv: bool = True,
+        return_packed_qkv: bool = False,
     ) -> (
-        tuple[Tensor, Tensor, Tensor, Tensor]
+        tuple[Tensor, Tensor, Tensor, Tensor | None]
         | tuple[Tensor, Tensor, Tensor]
         | tuple[Tensor, list[int]]
     ):
@@ -1915,7 +1947,11 @@ class SelfAttention(Attention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         If `output_gate` is True, then also derives `gate` tensor.
         If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
+        If `return_packed_qkv` is True, also return a packed view when Q/K/V
+        still directly refer to the projection output.
         """
+        if return_packed_qkv and (not split_qkv or output_gate):
+            raise ValueError("Packed QKV requires split QKV without an output gate")
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
@@ -1988,7 +2024,21 @@ class SelfAttention(Attention):
             if not split_qkv:
                 return mixed_qkv, split_arg_list
 
-            if SplitAlongDim is not None:
+            packed_qkv = None
+            if (
+                return_packed_qkv
+                and num_query_heads_per_group == 1
+                and self.config.num_query_groups >= self.world_size
+                and (self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp))
+                and (self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp))
+                and mixed_qkv.stride(-1) == 1
+            ):
+                # Each group contains exactly one Q, K, and V head in that order.
+                packed_qkv = mixed_qkv.view(
+                    *mixed_qkv.shape[:-1], 3, self.hidden_size_per_attention_head
+                )
+                query, key, value = (packed_qkv.select(-2, i) for i in range(3))
+            elif SplitAlongDim is not None:
                 query, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
                 query, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
@@ -2029,6 +2079,9 @@ class SelfAttention(Attention):
                 )
                 gate = gate[:, :, idx * size : (idx + 1) * size, :]
             return query, key, value, gate
+
+        if return_packed_qkv:
+            return query, key, value, packed_qkv
 
         return query, key, value
 
