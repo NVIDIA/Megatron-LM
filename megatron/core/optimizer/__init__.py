@@ -1078,6 +1078,12 @@ def get_megatron_optimizer(
         ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
         return get_mimo_optimizer(model_chunks[0], config)
 
+    # Whether params are quantized is a property of the DDP config; inherit it into the optimizer
+    # config (on a copy) so callers need not repeat it and derived flags are refreshed.
+    ddp_config = getattr(model_chunks[0], 'ddp_config', None)
+    if ddp_config is not None:
+        config = config.resolve_fp8_param_gather(ddp_config.fp8_param_gather)
+
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.
     if config_overrides is None:

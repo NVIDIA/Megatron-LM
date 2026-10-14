@@ -2,7 +2,7 @@
 
 import fnmatch
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -178,11 +178,13 @@ class OptimizerConfig:
     bf16: bool = False
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
-    fp8_param_gather: bool = False
-    """Whether model parameters are stored (and all-gathered) as FP8 tensors. 
+    fp8_param_gather: Optional[bool] = None
+    """Whether model parameters are stored (and all-gathered) as FP8 tensors.
        With a non-delayed FP8 recipe, only quantized parameters need MCore-managed FP32 main params.
-       When False (e.g. BF16 params) the precision-aware optimizer path is kept if
-       use_precision_aware_optimizer is set.
+       None (default) means "take it from the model's DDP config": get_megatron_optimizer resolves
+       it from ddp_config.fp8_param_gather. Until resolved, None is treated as possibly quantized,
+       i.e. the conservative (pre-existing) behavior. An explicit False that would enable the
+       precision-aware path for params the DDP config says are FP8 raises an error.
     """
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
@@ -444,10 +446,44 @@ class OptimizerConfig:
             # Delayed scaling (or no FP8) is handled inside the Adam kernel.
             or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
             # Params are BF16, so only activations are quantized and TE can own the masters.
-            or not self.fp8_param_gather
+            # None (unresolved) conservatively counts as possibly quantized.
+            or self.fp8_param_gather is False
             # Hybrid-device optimizer has its own decoupled-grad support.
             or self.optimizer_cpu_offload
         )
+
+    def check_fp8_param_gather_consistency(self, ddp_fp8_param_gather: bool) -> None:
+        """Raise if an explicit ``fp8_param_gather`` enables the precision-aware path where the DDP
+        config says it must not be used (FP8 params, which TE cannot update). Unset (None) values
+        never conflict."""
+        if self.fp8_param_gather is None or self.fp8_param_gather == ddp_fp8_param_gather:
+            return
+        # Only the unsafe direction is an error: this value enables the precision-aware path but
+        # the DDP config would not. The reverse just forgoes the memory saving.
+        if (
+            self._use_precision_aware_optimizer_no_fp8_or_ds_fp8()
+            and not replace(
+                self, fp8_param_gather=ddp_fp8_param_gather
+            )._use_precision_aware_optimizer_no_fp8_or_ds_fp8()
+        ):
+            raise ValueError(
+                f"OptimizerConfig.fp8_param_gather={self.fp8_param_gather} conflicts with "
+                f"ddp_config.fp8_param_gather={ddp_fp8_param_gather} for "
+                f"fp8_recipe={self.fp8_recipe!r} with --use-precision-aware-optimizer. "
+                "Quantized params need MCore-managed FP32 main params. Leave "
+                "OptimizerConfig.fp8_param_gather unset to inherit it from the DDP config."
+            )
+
+    def resolve_fp8_param_gather(self, ddp_fp8_param_gather: bool) -> "OptimizerConfig":
+        """Return a config whose ``fp8_param_gather`` is taken from the DDP config.
+
+        Returns a copy (re-running ``__post_init__`` to refresh derived flags) instead of mutating
+        the caller's config. An explicit value that conflicts with DDP raises.
+        """
+        self.check_fp8_param_gather_consistency(ddp_fp8_param_gather)
+        if self.fp8_param_gather is not None:
+            return self
+        return replace(self, fp8_param_gather=ddp_fp8_param_gather)
 
     def __post_init__(self):
         """Check the validity of the config."""
