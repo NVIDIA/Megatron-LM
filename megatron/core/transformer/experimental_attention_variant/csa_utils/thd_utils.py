@@ -295,8 +295,8 @@ def build_csa2_thd_layout(
         raise ValueError("CSA2 THD local_cp_size requires a matching explicit CP group")
     if cp_size < 1 or not 0 <= cp_rank < cp_size:
         raise ValueError("CSA2 THD requires valid CP group membership")
-    if cp_size > 1 and packed_seq_params.cp_partition_mode != "contiguous":
-        raise ValueError("CSA2 THD CP requires a contiguous partition")
+    # Main stores the layout on TransformerConfig, not PackedSeqParams. The
+    # CSA2 config/attention wrapper validates contiguous CP before this helper.
     global_total = total_tokens * cp_size
 
     cu_q = packed_seq_params.cu_seqlens_q

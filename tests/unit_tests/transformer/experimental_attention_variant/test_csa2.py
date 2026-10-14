@@ -306,3 +306,34 @@ def test_candidate_score_and_compaction_gpu_parity_and_replay():
         replays=3,
         what="CSA2 candidate compaction",
     )
+
+
+def test_cp_layout_uses_main_packed_metadata():
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+        build_csa2_thd_layout,
+    )
+
+    class CPGroup:
+        def size(self):
+            return 2
+
+        def rank(self):
+            return 1
+
+    logical = torch.tensor([0, 5, 12], dtype=torch.int32)
+    padded = torch.tensor([0, 8, 16], dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=padded,
+        cu_seqlens_kv_padded=padded,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+    )
+    layout = build_csa2_thd_layout(packed, 8, cp_group=CPGroup())
+    assert layout.global_start == 8
+    assert layout.valid_tokens.tolist() == [True] * 7 + [False]
+    assert layout.position_ids.tolist() == list(range(7)) + [0]
+    assert layout.for_compression(2).valid_groups.sum() == 5
