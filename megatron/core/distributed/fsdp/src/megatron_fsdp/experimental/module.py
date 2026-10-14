@@ -312,12 +312,9 @@ class FsdpModule:
             self._unshard_parameter_groups(phase)
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
-            events = (
-                set(self._unshard_events.values())
-                if phase is None
-                else {self._unshard_events[phase]}
-            )
-            for event in events:
+            phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
+            # Wait in a fixed phase order, skipping an event shared by both phases.
+            for event in dict.fromkeys(self._unshard_events[p] for p in phases):
                 self.context.current_stream().wait_event(event)
 
             if not prefetch:
