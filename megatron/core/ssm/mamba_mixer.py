@@ -82,10 +82,14 @@ except ImportError:
     HAVE_MAMBA_SSM = False
 
 try:
-    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ssm.ops.mamba2.ssd_combined import (
+        mamba_chunk_scan_combined_train,
+        mamba_chunk_scan_combined_varlen,
+    )
 
     HAVE_SSM_OPS_VARLEN = True
 except ImportError:
+    mamba_chunk_scan_combined_train = None
     mamba_chunk_scan_combined_varlen = None
     HAVE_SSM_OPS_VARLEN = False
 
@@ -490,11 +494,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
-        if inference_mode or not self.use_mem_eff_path:
+        # Batch-invariant training must run generation's scan kernels, which only the
+        # non-fused path can; the fused kernel is mamba_ssm's own copy.
+        if inference_mode or not self.use_mem_eff_path or self.config.batch_invariant_mode:
             # TODO(ksanthanam): Consider deprecating this path for training
             assert packed_seq_params is None, (
-                "Training with packed sequences is not supported "
-                "in the non-memory-efficient code path."
+                "Training with packed sequences is not supported in the "
+                "non-memory-efficient code path, which batch_invariant_mode uses."
             )
             y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
@@ -673,32 +679,52 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             self.cp.cp_size == 1 or self.rmsnorm
         ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
 
-        initial_ssm_state = None
-        state_dtype_kwarg = (
-            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
+        D = (
+            rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+            if self.D_has_hdim
+            else self.cp.get_D()
         )
-        y = mamba_chunk_scan_combined(
-            x,
-            dt,
-            A,
-            B,
-            C,
-            self.chunk_size,
-            D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else self.cp.get_D()
-            ),
-            # ssm_prefill, MambaBatchInvariantDecode and the fused path this method
-            # replaces all gate inside the scan; gating in self.norm afterwards is
-            # the same algebra at different precision.
-            z=z if (self.config.batch_invariant_mode or not self.rmsnorm) else None,
-            dt_bias=self.cp.get_dt_bias().float(),
-            dt_softplus=True,
-            return_final_states=ssm_state is not None,
-            initial_states=initial_ssm_state,
-            **state_dtype_kwarg,
-        )
+        if self.config.batch_invariant_mode:
+            # Static-batching inference is rejected in this mode, so this is the training
+            # forward. It runs the scan kernels of ssm_prefill and MambaBatchInvariantDecode
+            # rather than mamba_ssm's copy of them: one set of Triton autotuners, so the
+            # two sides cannot pick different tile configs (reduction orders). FP32 chunk
+            # states, as the dynamic engine keeps in this mode.
+            y = mamba_chunk_scan_combined_train(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                self.chunk_size,
+                D=D,
+                z=z,
+                dt_bias=self.cp.get_dt_bias().float(),
+                dt_softplus=True,
+                state_dtype=torch.float32,
+            )
+        else:
+            initial_ssm_state = None
+            state_dtype_kwarg = (
+                {"state_dtype": self.mamba_training_ssm_states_dtype}
+                if MAMBA_HAS_STATE_DTYPE
+                else {}
+            )
+            y = mamba_chunk_scan_combined(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                self.chunk_size,
+                D=D,
+                z=None if self.rmsnorm else z,
+                dt_bias=self.cp.get_dt_bias().float(),
+                dt_softplus=True,
+                return_final_states=ssm_state is not None,
+                initial_states=initial_ssm_state,
+                **state_dtype_kwarg,
+            )
 
         if ssm_state is not None:
             y, last_state = y
@@ -710,7 +736,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         if self.rmsnorm:
             z = rearrange(z, "b l h p -> l b (h p)").contiguous()
             z = self.cp.post_conv_ssm(z)
-            # Already consumed by the scan above when batch-invariant.
+            # Already consumed by the scan above when batch-invariant: ssm_prefill and
+            # MambaBatchInvariantDecode gate inside the scan, and gating in self.norm
+            # afterwards is the same algebra at different precision.
             y = self.norm(y, None if self.config.batch_invariant_mode else z)
 
         return y

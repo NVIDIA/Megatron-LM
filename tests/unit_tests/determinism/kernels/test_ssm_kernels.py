@@ -662,18 +662,22 @@ def test_unfused_mixer_applies_the_gate_exactly_once(monkeypatch, batch_invarian
         assert mixer.rmsnorm, "the gate placement under test only exists with an RMSNorm"
 
         scan_gates, norm_gates = [], []
-        real_scan = mamba_mixer_module.mamba_chunk_scan_combined
         real_norm_forward = mixer.norm.forward
 
-        def scan(*args, **kwargs):
-            scan_gates.append(kwargs.get("z"))
-            return real_scan(*args, **kwargs)
+        # Batch-invariant mode trains through the generation kernels' scan.
+        for name in ("mamba_chunk_scan_combined", "mamba_chunk_scan_combined_train"):
+            real_scan = getattr(mamba_mixer_module, name)
+
+            def scan(*args, real_scan=real_scan, **kwargs):
+                scan_gates.append(kwargs.get("z"))
+                return real_scan(*args, **kwargs)
+
+            monkeypatch.setattr(mamba_mixer_module, name, scan)
 
         def norm_forward(x, z=None):
             norm_gates.append(z)
             return real_norm_forward(x, z)
 
-        monkeypatch.setattr(mamba_mixer_module, "mamba_chunk_scan_combined", scan)
         monkeypatch.setattr(mixer.norm, "forward", norm_forward)
 
         with torch.no_grad():

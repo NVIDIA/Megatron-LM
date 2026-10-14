@@ -6,22 +6,29 @@ import unittest
 import torch
 
 try:
-    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+    import mamba_ssm  # noqa: F401  (the training scan's backward)
 
     from megatron.core.ssm.ops.mamba2.batch_invariant_decode import (
         BatchInvariantDecodeBuffers,
         batch_invariant_decode_buffered_scan,
     )
-    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ssm.ops.mamba2.ssd_combined import (
+        mamba_chunk_scan_combined_train,
+        mamba_chunk_scan_combined_varlen,
+    )
 
     HAVE_BATCH_INVARIANT_DECODE = True
 except ImportError:
     HAVE_BATCH_INVARIANT_DECODE = False
 
 
-def _full_scan(x, dt, A, B, C, D, dt_bias, chunk_size, initial_states=None):
-    """Reference: a single `mamba_chunk_scan_combined` over the whole sequence."""
-    y, final = mamba_chunk_scan_combined(
+def _full_scan(x, dt, A, B, C, D, dt_bias, chunk_size):
+    """Reference: the batch-invariant training scan over the whole (1, L) sequence.
+
+    Returns its output and the final state a single-request prefill of the sequence
+    caches.
+    """
+    y = mamba_chunk_scan_combined_train(
         x,
         dt,
         A,
@@ -32,8 +39,27 @@ def _full_scan(x, dt, A, B, C, D, dt_bias, chunk_size, initial_states=None):
         z=x,
         dt_bias=dt_bias,
         dt_softplus=True,
-        initial_states=initial_states,
-        return_final_states=True,
+        state_dtype=torch.float32,
+    )
+    seqlen = x.shape[1]
+    num_chunks = (seqlen + chunk_size - 1) // chunk_size
+    bounds = list(range(0, seqlen, chunk_size)) + [seqlen]
+    final = mamba_chunk_scan_combined_varlen(
+        x=x[0],
+        dt=dt[0],
+        A=A,
+        B=B[0],
+        C=C[0],
+        chunk_size=chunk_size,
+        cu_chunk_seqlens=torch.tensor(bounds, dtype=torch.int32, device=x.device),
+        last_chunk_indices=torch.tensor([num_chunks - 1], dtype=torch.int32, device=x.device),
+        seq_idx=torch.zeros(num_chunks, dtype=torch.int32, device=x.device),
+        out=torch.empty_like(x[0]),
+        D=D,
+        z=x[0],
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_dtype=torch.float32,
     )
     return y, final
 
@@ -131,7 +157,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 self.D,
                 self.dt_bias,
                 self.chunk_size,
-                initial_states=None,
             )
             ssm_state[slot] = final[0]
 
@@ -658,20 +683,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         x, dt, B, C = self._make_seq(total)
 
         weak_A = self.A * 0.01
-        y_full, _ = mamba_chunk_scan_combined(
-            x,
-            dt,
-            weak_A,
-            B,
-            C,
-            self.chunk_size,
-            D=self.D,
-            z=x,
-            dt_bias=self.dt_bias,
-            dt_softplus=True,
-            initial_states=None,
-            return_final_states=True,
-        )
+        y_full, _ = _full_scan(x, dt, weak_A, B, C, self.D, self.dt_bias, self.chunk_size)
 
         bufs = self._make_bufs(max_requests)
         ssm_state = self._make_ssm_state(max_requests)
