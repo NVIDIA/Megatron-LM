@@ -781,6 +781,7 @@ class TestGPTModelTEQuantizationConfig:
                 ), f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
                 visited_keys.add(name)
                 assert hasattr(module, "te_quant_params")
+                assert module._pg_collection is model.pg_collection
                 config_expected = expected_match[name][1]
                 if config_expected == "bf16":
                     assert module.te_quant_params.training_recipe.fp8_quantization_recipe is None
