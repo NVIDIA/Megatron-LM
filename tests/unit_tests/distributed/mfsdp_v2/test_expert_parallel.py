@@ -17,6 +17,9 @@ Both models are built from explicit ``ProcessGroupCollection``s (no global
 ``parallel_state`` / ``initialize_model_parallel``): the reference with a size-1 ``ep``
 group (all experts local), the model with the 2-way ``ep`` group. Model shapes and the
 ``(ep, dp)`` split are test-local so different tests can vary them.
+
+Checkpoint coverage additionally verifies exact restoration of distinct global experts
+and their Adam state, followed by comparison with uninterrupted training.
 """
 
 import pytest
@@ -30,6 +33,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
+    load_checkpoint,
+    save_checkpoint,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -37,6 +42,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 
 _NO_SHARD = Placements(
     dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
@@ -260,3 +266,131 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
         torch.stack(reference_losses),
         msg="EP=4 mFSDP model did not reproduce full-batch EP=1 training.",
     )
+
+
+@pytest.mark.parametrize("ep_size", [1, 2, 4])
+def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_size):
+    """Restore every expert and Adam state, then reproduce uninterrupted training.
+
+    EP ranks reuse local expert names (weight0, weight1, ...), but own different
+    global experts. A checkpoint must preserve those distinct values, including
+    when expert-DP has size one. EP=1 is the positive control for the same path.
+    """
+    device = distributed_setup.device
+    world_size, rank = distributed_setup.world_size, distributed_setup.rank
+    if world_size % ep_size:
+        pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
+
+    world_mesh = init_device_mesh(device.type, (world_size,))
+    moe_mesh = init_device_mesh(
+        device.type, (world_size // ep_size, ep_size), mesh_dim_names=("edp", "ep")
+    )
+    one = dist.new_group([rank], use_local_synchronization=True)
+    groups = _build_process_group_collection(
+        one, world_mesh.get_group(), moe_mesh.get_group("ep"), moe_mesh.get_group("edp")
+    )
+
+    def build(seed):
+        torch.manual_seed(seed)
+        model = _build_hybrid_model(
+            _transformer_config(2, 8, ep_size, 64, 128), groups, 128, 8, "*E"
+        )
+        # CPU initialization otherwise gives different EP ranks identical local
+        # experts. Make each global expert distinguishable before checkpointing.
+        fqn_mapping = {}
+        with torch.no_grad():
+            for name, layer in model.named_modules():
+                if isinstance(layer, MoETransformerLayer):
+                    for fc in ("linear_fc1", "linear_fc2"):
+                        linear = getattr(layer.mlp.experts, fc)
+                        for local, global_ in enumerate(layer.mlp.local_expert_indices):
+                            getattr(linear, f"weight{local}").add_(global_ * 0.01)
+                            fqn_mapping[f"{name}.mlp.experts.{fc}.weight{local}"] = (
+                                f"{name}.mlp.experts.{fc}.weight{global_}"
+                            )
+        with fully_shard_context(device=device):
+            for layer in model.decoder.layers:
+                if isinstance(layer, MoETransformerLayer):
+                    fully_shard(
+                        layer.mlp.experts,
+                        mesh=moe_mesh["edp"],
+                        placements=_ZERO3_SHARD,
+                        grad_divisor=ep_size,
+                    )
+            fully_shard(model, mesh=world_mesh, placements=_ZERO3_SHARD)
+        optimizer = torch.optim.Adam(
+            [
+                {
+                    "params": [
+                        p for name, p in model.named_parameters() if ".experts." not in name
+                    ],
+                    "lr": 0.002,
+                },
+                {
+                    "params": [p for name, p in model.named_parameters() if ".experts." in name],
+                    "lr": 0.003,
+                },
+            ]
+        )
+        fully_shard_optimizer(optimizer)
+        return model, optimizer, fqn_mapping
+
+    def snapshot(model, optimizer):
+        values = {}
+        for index, group in enumerate(optimizer.param_groups):
+            for key, value in group.items():
+                if key != "params":
+                    values[f"param_groups.{index}.{key}"] = value
+        for name, parameter in model.named_parameters():
+            values[f"model.{name}"] = parameter.to_local().detach().clone()
+            for key, value in optimizer.state[parameter].items():
+                if hasattr(value, "to_local"):
+                    value = value.to_local()
+                values[f"optimizer.{name}.{key}"] = (
+                    value.detach().clone() if torch.is_tensor(value) else value
+                )
+        return values
+
+    def assert_snapshot(model, optimizer, expected):
+        actual = snapshot(model, optimizer)
+        mismatches = []
+        if actual.keys() != expected.keys():
+            mismatches.append("state keys changed")
+        for key in actual.keys() & expected.keys():
+            try:
+                torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+            except AssertionError:
+                mismatches.append(key)
+        # Fail every rank together, so a good rank cannot enter the next training
+        # collective while a bad rank is already tearing its process groups down.
+        all_mismatches = [None] * world_size
+        dist.all_gather_object(all_mismatches, mismatches)
+        assert not any(all_mismatches), f"Checkpoint mismatches by rank: {all_mismatches}"
+
+    source, source_optimizer, fqn_mapping = build(123)
+    torch.manual_seed(4321 + rank)
+    ids = torch.randint(0, 128, (2, 8), device=device)
+    pos = torch.arange(8, device=device).repeat(2, 1)
+    target = torch.randn(2, 8, 128, device=device)
+    _train(source, source_optimizer, ids, pos, None, target, world_mesh.get_group())
+    saved = snapshot(source, source_optimizer)
+
+    with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_fsdp_roundtrip", sync=True) as path:
+        if ep_size > 1:
+            with pytest.raises(ValueError, match="globally unique parameter names"):
+                save_checkpoint(source, source_optimizer, path)
+        save_checkpoint(source, source_optimizer, path, fqn_mapping=fqn_mapping)
+        destination, destination_optimizer, destination_mapping = build(987)
+        load_checkpoint(destination, destination_optimizer, path, fqn_mapping=destination_mapping)
+        assert_snapshot(destination, destination_optimizer, saved)
+
+    expected_losses = _train(
+        source, source_optimizer, ids, pos, None, target, world_mesh.get_group()
+    )
+    actual_losses = _train(
+        destination, destination_optimizer, ids, pos, None, target, world_mesh.get_group()
+    )
+    torch.testing.assert_close(
+        torch.stack(actual_losses), torch.stack(expected_losses), rtol=0, atol=0
+    )
+    assert_snapshot(destination, destination_optimizer, snapshot(source, source_optimizer))

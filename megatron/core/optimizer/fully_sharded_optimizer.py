@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from typing import Any, Callable, List, Optional, override
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -152,74 +153,50 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 if param.requires_grad:
                     yield param
 
-    def _shard_process_groups(self) -> list[torch.distributed.ProcessGroup]:
-        """Return the process groups across which the parameters are sharded.
-
-        Every sharded dimension of the parameter device mesh contributes one group.
-        Replicated dimensions are skipped: replicas hold identical shards, hence an
-        identical keyspace. These are the groups ``preprocess_state_dict_for_uneven_dtensor``
-        gathers over, so a collective run here reaches the same ranks the save and load
-        collectives do.
-
-        Raises:
-            NotImplementedError: If the parameters do not all share one device mesh, which
-                is what expert parallelism produces. Not yet supported rather than refused
-                on principle; training under expert parallelism is unaffected.
-        """
-        sharded_parameters = [
-            param for param in self._trainable_parameters() if isinstance(param, DTensor)
-        ]
-        if len({param.device_mesh for param in sharded_parameters}) > 1:
-            # MFSDP v2 shards expert parameters over the expert-DP mesh and everything else
-            # over the DP mesh (see FullyShardedDataParallelV2). Expert parallelism also gives
-            # each rank a different set of expert FQNs, so the DTensor keyspace this method
-            # exists to equalize is rank-dependent for a reason no gather can repair.
-            # TODO: not a contract, just unimplemented -- describing an expert-parallel model
-            # needs a keyspace built per mesh instead of one gather over one mesh.
-            raise NotImplementedError(
-                "MFSDP v2 optimizer checkpointing does not support expert parallelism yet: "
-                "its parameters span more than one device mesh."
-            )
-        if not sharded_parameters:
-            return []
-
-        # Union over every parameter rather than reading the first one's layout: a mesh
-        # dimension that one parameter replicates and another sharded still has to be gathered
-        # over, or the rank that solely describes an FQN never reaches the ranks that need it.
-        mesh = sharded_parameters[0].device_mesh
-        sharded_dims = set()
-        for param in sharded_parameters:
-            for mesh_dim, placement in enumerate(param.placements):
-                if isinstance(placement, Shard) and mesh.size(mesh_dim) > 1:
-                    sharded_dims.add(mesh_dim)
-        return [mesh.get_group(mesh_dim) for mesh_dim in sorted(sharded_dims)]
-
     def _gather_state_keys_by_fqn(self) -> dict[str, list[str]]:
-        """Map every parameter's FQN to the keys of its ``DTensor`` optimizer state entries.
+        """Gather optimizer state keys within each parameter's own device mesh.
 
-        The keys are read off live state (``exp_avg``/``exp_avg_sq`` for Adam) rather than
-        hard-coded, so any base optimizer works. They are gathered because a parameter that
-        the TE < 2.18 empty-shard filter dropped from this rank's optimizer is only described
-        by the rank that owns a non-empty shard of it, which is what lets every rank
-        synthesize a placeholder with exactly the owning rank's keys. A parameter that has no
-        state anywhere (nothing has stepped yet) is simply absent.
-
-        Which key set a parameter has is a property of the base optimizer, not of the shard,
-        so ranks that both describe an FQN describe it identically and the merge below can
-        let any of them win. Sorting is what makes that hold as stated rather than by luck:
-        it turns each entry into a canonical list, so two ranks whose state dicts happened to
-        insert the keys in different orders still produce equal values.
+        Older TE versions omit empty local shards from the optimizer. Every rank
+        on a parameter's mesh must still describe the same state tensors for
+        uneven-DTensor preprocessing, so gather the owning ranks' state keys and
+        use them to construct empty placeholders. Expert parameters use expert-DP
+        meshes and globally unique expert names; dense parameters use the DP mesh.
+        Ranks outside an expert's mesh do not need entries for that expert.
         """
-        state_keys_by_fqn = {
+        local_keys = {
             self._param_to_fqn[param]: sorted(
                 key for key, value in state.items() if isinstance(value, DTensor)
             )
             for param, state in self.optimizer.state.items()
         }
-        for group in self._shard_process_groups():
-            gathered = [None] * torch.distributed.get_world_size(group)
-            torch.distributed.all_gather_object(gathered, state_keys_by_fqn, group=group)
-            state_keys_by_fqn = {fqn: keys for rank in gathered for fqn, keys in rank.items()}
+        parameters_by_mesh: dict[DeviceMesh, list[DTensor]] = {}
+        for param in self._trainable_parameters():
+            if isinstance(param, DTensor):
+                parameters_by_mesh.setdefault(param.device_mesh, []).append(param)
+
+        state_keys_by_fqn = dict(local_keys)
+        # A common total order keeps collectives on overlapping meshes ordered
+        # consistently even when ranks participate in different expert-DP meshes.
+        for mesh in sorted(
+            parameters_by_mesh, key=lambda mesh: (tuple(mesh.mesh.flatten().tolist()), mesh.shape)
+        ):
+            parameters = parameters_by_mesh[mesh]
+            fqns = {self._param_to_fqn[param] for param in parameters}
+            mesh_keys = {fqn: local_keys[fqn] for fqn in fqns if fqn in local_keys}
+            sharded_dims = sorted(
+                {
+                    axis
+                    for param in parameters
+                    for axis, placement in enumerate(param.placements)
+                    if isinstance(placement, Shard) and mesh.size(axis) > 1
+                }
+            )
+            for axis in sharded_dims:
+                group = mesh.get_group(axis)
+                gathered: list[Any] = [None] * torch.distributed.get_world_size(group)
+                torch.distributed.all_gather_object(gathered, mesh_keys, group=group)
+                mesh_keys = {fqn: keys for rank in gathered for fqn, keys in rank.items()}
+            state_keys_by_fqn.update(mesh_keys)
         return state_keys_by_fqn
 
     def _param_to_group_meta(self) -> dict[str, Any]:
@@ -323,13 +300,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         whose names are the plain ``named_parameters`` ones rather than MCore's PP/EP-unique
         checkpoint names.
 
-        Rank consistency is the load-bearing invariant here. Under TE < 2.18 the empty-shard
-        filter (see :meth:`_trainable_parameters`) leaves each rank with a different set of
-        parameters, while ``preprocess_state_dict_for_uneven_dtensor`` runs one
-        ``all_gather_object`` *per DTensor* in sorted key order, so a rank-dependent DTensor
-        keyspace deadlocks. Every trainable parameter is therefore emitted: the parameters
-        this rank's optimizer holds contribute their real state, and the rest contribute
-        empty-local placeholders. On a newer TE no parameter is ever missing, so the loop
+        Consistency within each parameter mesh is the load-bearing invariant here.
+        Under TE < 2.18 the empty-shard filter (see :meth:`_trainable_parameters`) leaves
+        each rank with a different set of parameters, while
+        ``preprocess_state_dict_for_uneven_dtensor`` runs one
+        ``all_gather_object`` *per DTensor* in sorted key order, so differing DTensor
+        keys within one mesh would deadlock. Every trainable parameter is therefore
+        emitted: this rank's optimizer parameters contribute their real state, and the rest
+        contribute empty-local placeholders. On a newer TE no parameter is ever missing, so the loop
         below takes the real-state branch throughout and the result is the same.
 
         Args:

@@ -24,7 +24,10 @@ from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimize
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
+from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+    get_global_unique_param_name,
+    handle_experts_in_state_dict,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -450,7 +453,7 @@ class TestOptimizerCheckpoint:
 
 
 class TestOptimizerCheckpointExpertParallel:
-    """Expert parallelism is refused, until implemented, rather than mis-checkpointed."""
+    """Round-trip distinct experts and Adam state across dense and expert-DP meshes."""
 
     def setup_method(self):
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -463,15 +466,7 @@ class TestOptimizerCheckpointExpertParallel:
     def teardown_method(self):
         Utils.destroy_model_parallel()
 
-    def test_sharded_state_dict_rejects_expert_parallelism(self) -> None:
-        """Building the state dict raises instead of writing a rank-inconsistent checkpoint.
-
-        MFSDP v2 shards expert parameters over the expert-DP mesh and everything else over the
-        DP mesh, and expert parallelism gives each rank a different set of expert FQNs, so the
-        rank-identical DTensor keyspace this format needs cannot be assembled by gathering over
-        one mesh. Until that is implemented, a save has to fail loudly: the alternative is a
-        rank-dependent keyspace, which deadlocks the uneven-DTensor preprocessing.
-        """
+    def _build_model_and_optimizer(self, *, zero_init, precision_aware, drop_empty_shards):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=64,
@@ -485,7 +480,8 @@ class TestOptimizerCheckpointExpertParallel:
             moe_ffn_hidden_size=128,
             add_bias_linear=False,
             use_cpu_initialization=True,
-            params_dtype=torch.float32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
             attention_dropout=0.0,
             hidden_dropout=0.0,
             gradient_accumulation_fusion=False,
@@ -499,26 +495,114 @@ class TestOptimizerCheckpointExpertParallel:
             hybrid_layer_pattern="*E",
             pg_collection=self.pg_collection,
         ).cuda()
-        model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-                fsdp_all_gather_in_start_param_sync=False,
-            ),
-            module=model,
-            pg_collection=self.pg_collection,
+        if zero_init:
+            _zero_parameters(model)
+        model, optimizer = _shard_and_build_optimizer(
+            config, self.pg_collection, model, precision_aware=precision_aware
         )
-        optimizer = get_megatron_optimizer(
-            OptimizerConfig(
-                lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=0.0
-            ),
-            [model],
-            use_gloo_process_groups=False,
-        )
-        assert isinstance(optimizer, FullyShardedOptimizer)
+        if drop_empty_shards:
+            # Exercise the TE < 2.18 path even when running with a newer TE.
+            for group in optimizer.optimizer.param_groups:
+                group["params"] = [p for p in group["params"] if p.to_local().numel() > 0]
+            optimizer.optimizer.param_groups = [
+                group for group in optimizer.optimizer.param_groups if group["params"]
+            ]
+        return model, optimizer
 
-        with pytest.raises(NotImplementedError, match="expert parallelism"):
-            optimizer.sharded_state_dict({})
+    @pytest.mark.parametrize(
+        "drop_empty_shards", [False, True], ids=["all_shards", "nonempty_only"]
+    )
+    @pytest.mark.parametrize("precision_aware", [False, True], ids=["fp32_state", "bf16_state"])
+    def test_checkpoint_roundtrip(self, tmp_path_dist_ckpt, precision_aware, drop_empty_shards):
+        """Restore trained expert weights, moments and step counts, then continue identically."""
+        source, source_optimizer = self._build_model_and_optimizer(
+            zero_init=False, precision_aware=precision_aware, drop_empty_shards=drop_empty_shards
+        )
+        if drop_empty_shards:
+            empty_counts = torch.tensor(
+                [
+                    sum(p.to_local().numel() == 0 for p in source.parameters()),
+                    sum(
+                        p.to_local().numel() == 0
+                        for name, p in source.named_parameters()
+                        if ".experts." in name
+                    ),
+                ],
+                device="cuda",
+            )
+            torch.distributed.all_reduce(empty_counts)
+            assert empty_counts[0] > 0, "Empty-shard placeholder coverage is vacuous."
+            if torch.distributed.get_world_size() > 2:
+                assert empty_counts[1] > 0, "No empty expert shard was exercised."
+        torch.manual_seed(4321 + torch.distributed.get_rank())
+        ids = torch.randint(0, 128, (2, 8), device="cuda")
+        pos = torch.arange(8, device="cuda").repeat(2, 1)
+        target = torch.randn(2, 8, 128, device="cuda")
+
+        def train_step(model, optimizer):
+            model.zero_grad_buffer()
+            optimizer.zero_grad()
+            if drop_empty_shards:
+                # Match FullyShardedOptimizer.zero_grad's older-TE fallback:
+                # parameters omitted from the base optimizer still own empty grads.
+                model.zero_grad(set_to_none=True)
+            output = model(input_ids=ids, position_ids=pos, attention_mask=None)
+            loss = torch.nn.functional.mse_loss(output.float(), target)
+            loss.backward()
+            model.finish_grad_sync()
+            success, _, _ = optimizer.step()
+            assert success
+            return loss.detach()
+
+        def checkpoint_state(model, optimizer, *, is_loading=False):
+            state = {
+                "model": handle_experts_in_state_dict(
+                    model.state_dict_for_save_checkpoint(), model.config.num_moe_experts
+                ),
+                "optimizer": optimizer.sharded_state_dict({}, is_loading=is_loading),
+            }
+            preprocess_state_dict_for_uneven_dtensor(state)
+            return state
+
+        for _ in range(3):
+            train_step(source, source_optimizer)
+        model_snapshot = _snapshot_model_state(source)
+        optimizer_snapshot = _snapshot_optimizer_state(source_optimizer)
+        group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
+        assert {group["step"] for group in group_snapshot} == {3}
+        assert any(".experts." in name for name in optimizer_snapshot)
+
+        with TempNamedDir(tmp_path_dist_ckpt / "ep_optimizer_roundtrip", sync=True) as path:
+            dcp.save(checkpoint_state(source, source_optimizer), checkpoint_id=path)
+            metadata = dcp.FileSystemReader(path).read_metadata().state_dict_metadata
+            expert_weights = [
+                key
+                for key in metadata
+                if key.startswith("model.") and ".experts." in key and ".weight" in key
+            ]
+            assert len(expert_weights) == 2 * source.config.num_moe_experts
+            destination, destination_optimizer = self._build_model_and_optimizer(
+                zero_init=True, precision_aware=precision_aware, drop_empty_shards=drop_empty_shards
+            )
+            # Fresh optimizer state must be materialized by the load path.
+            assert not destination_optimizer.optimizer.state
+            raw_model_state = destination.state_dict_for_save_checkpoint()
+            state = checkpoint_state(destination, destination_optimizer, is_loading=True)
+            dcp.load(state, checkpoint_id=path)
+            destination.load_state_dict(raw_model_state)
+            destination_optimizer.load_state_dict(state["optimizer"])
+
+        _assert_model_matches_snapshot(destination, model_snapshot)
+        _assert_optimizer_matches_snapshot(
+            destination_optimizer, optimizer_snapshot, group_snapshot
+        )
+        for _ in range(2):
+            expected_loss = train_step(source, source_optimizer)
+            actual_loss = train_step(destination, destination_optimizer)
+            torch.testing.assert_close(actual_loss, expected_loss, rtol=0, atol=0)
+        _assert_model_matches_snapshot(destination, _snapshot_model_state(source))
+        _assert_optimizer_matches_snapshot(
+            destination_optimizer,
+            _snapshot_optimizer_state(source_optimizer),
+            _snapshot_param_group_hyperparameters(source_optimizer),
+        )
