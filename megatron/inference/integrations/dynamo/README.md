@@ -114,7 +114,20 @@ of its GPU allocations; no database or persistent volume is required.
 Successful imports and storage-safe aborts release normally, with failed
 releases retried while the adapter is alive.
 Unclaimed offers expire after five minutes; late claims are rejected before
-any remote read is submitted. Claimed transfers do not expire: a cancellation
+any remote read is submitted. Claim acknowledgements distinguish `accepted`,
+`expired`, and `rejected`. An expired claim raises Dynamo's `StreamIncomplete`
+so a compatible frontend can rerun prefill and obtain a new offer. Enable
+`--migration-limit 1` (or a larger retry budget) on the frontend. This requires
+a Dynamo router that treats `backend.stream_incomplete` as migratable, such as
+[revision bd634e83](https://github.com/ai-dynamo/dynamo/blob/bd634e832d614be82f3ef5b669e268dad2c6be1b/lib/llm/src/migration.rs#L91);
+the v1.3.0/v1.3.1 routers do not, even though their Python packages export the
+exception. Without compatible migration support, expiry remains a request error.
+Source coordinators remember the most recent 4096 expired offers after releasing
+their storage; older unknown IDs are conservatively rejected. Duplicate claims,
+terminated owners, and replaced-source incarnations are not retried. Upgrade
+source and decode adapters together for the enum acknowledgement protocol.
+
+Claimed transfers do not expire: a cancellation
 response deadline does not cancel background cleanup waiting for a storage-safe
 acknowledgement.
 The Dynamo engine service opts into this with

@@ -13,10 +13,15 @@ import zmq.asyncio
 
 pytest.importorskip("dynamo")
 
+from dynamo.llm.exceptions import StreamIncomplete
+
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator.handlers import HANDLERS
-from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
+from megatron.core.inference.disaggregation.handoff_ownership import (
+    HandoffClaimStatus,
+    HandoffOwnership,
+)
 from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceRequestError
@@ -196,7 +201,8 @@ async def test_external_start_waits_without_launching_subprocess(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_start_cleans_up_after_readiness_failure(tmp_path):
+@pytest.mark.parametrize("failure", ["readiness", "launch_cancelled"])
+async def test_start_cleans_up_after_failure(tmp_path, failure):
     config = _config()
     config.megatron_root = str(tmp_path)
     engine = MegatronLLMEngine(config)
@@ -208,40 +214,24 @@ async def test_start_cleans_up_after_readiness_failure(tmp_path):
     event_receiver = SimpleNamespace(start=MagicMock(return_value="tcp://127.0.0.1:5556"))
     engine._wait_for_readiness = AsyncMock(side_effect=TimeoutError("not ready"))
     engine.cleanup = AsyncMock()
+    launch = AsyncMock(
+        return_value=process,
+        side_effect=asyncio.CancelledError if failure == "launch_cancelled" else None,
+    )
+    expected_error = asyncio.CancelledError if failure == "launch_cancelled" else TimeoutError
 
     with (
-        patch("asyncio.create_subprocess_exec", AsyncMock(return_value=process)),
+        patch("asyncio.create_subprocess_exec", launch),
         patch(
             "megatron.inference.integrations.dynamo.llm_engine.EngineEventReceiver",
             return_value=event_receiver,
         ),
-        pytest.raises(TimeoutError, match="not ready"),
+        pytest.raises(expected_error),
     ):
         await engine.start(worker_id=0)
 
     engine.cleanup.assert_awaited_once_with()
     await asyncio.gather(*engine._log_tasks)
-
-
-@pytest.mark.asyncio
-async def test_start_cleans_up_when_process_launch_is_cancelled(tmp_path):
-    config = _config()
-    config.megatron_root = str(tmp_path)
-    engine = MegatronLLMEngine(config)
-    event_receiver = SimpleNamespace(start=MagicMock(return_value="tcp://127.0.0.1:5556"))
-    engine.cleanup = AsyncMock()
-
-    with (
-        patch("asyncio.create_subprocess_exec", AsyncMock(side_effect=asyncio.CancelledError)),
-        patch(
-            "megatron.inference.integrations.dynamo.llm_engine.EngineEventReceiver",
-            return_value=event_receiver,
-        ),
-        pytest.raises(asyncio.CancelledError),
-    ):
-        await engine.start(worker_id=0)
-
-    engine.cleanup.assert_awaited_once_with()
 
 
 class _Context:
@@ -335,6 +325,64 @@ async def test_decode_uses_streaming_kv_handoff():
     assert chunks[-1]["token_ids"] == [9]
     assert chunks[-1]["finish_reason"] == "length"
     assert handoff.call_args.args[2:] == ({"peer": "prefill"}, [4, 5])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["expired", "swept", "claimed"])
+async def test_decode_claim_expiry_is_retryable_without_read_or_release(monkeypatch, state):
+    ownership = HandoffOwnership(offer_timeout=1)
+    ownership.offer(7, b"prefill", require_claim=True)
+    if state == "claimed":
+        assert ownership.claim(7, "other") is HandoffClaimStatus.ACCEPTED
+    ownership._handoffs[7].expires_at = 0.0
+    if state == "swept":
+        ownership.release(7)
+    context = zmq.asyncio.Context()
+    router = context.socket(zmq.ROUTER)
+    port = router.bind_to_random_port("tcp://127.0.0.1")
+    coord = SimpleNamespace(
+        instance_id="source",
+        known_clients=set(),
+        router_socket=router,
+        _send_to_client=router.send_multipart,
+        handoff_ownership=ownership,
+    )
+
+    async def serve():
+        while True:
+            identity, payload = await router.recv_multipart()
+            metadata = msgpack.unpackb(payload, raw=False)
+            HANDLERS[Headers(metadata[0])](coord, identity, metadata, [])
+
+    server = asyncio.create_task(serve())
+    engine = MegatronLLMEngine(_config("decode"))
+    engine.client = MagicMock()
+    engine._release_completed_handoff = AsyncMock()
+    prefill = {
+        "disaggregated_params": {
+            "release": {
+                "coordinator_addr": f"tcp://127.0.0.1:{port}",
+                "coordinator_instance_id": "source",
+                "request_id": 7,
+            }
+        }
+    }
+    monkeypatch.setattr(
+        "megatron.inference.integrations.dynamo.llm_engine.require_prefill_result",
+        lambda *_: prefill,
+    )
+    try:
+        with pytest.raises(RuntimeError if state == "claimed" else StreamIncomplete):
+            _ = [chunk async for chunk in engine.generate({"token_ids": [1]}, _Context())]
+        engine.client.add_request_with_kv_handoff_streaming.assert_not_called()
+        await engine.drain()
+        engine._release_completed_handoff.assert_not_awaited()
+    finally:
+        await engine.cleanup()
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+        router.close(linger=0)
+        context.term()
 
 
 @pytest.mark.asyncio

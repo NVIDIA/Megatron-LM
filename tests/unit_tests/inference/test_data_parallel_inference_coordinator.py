@@ -23,7 +23,10 @@ from megatron.core.inference.data_parallel_inference_coordinator.handlers import
     HANDLERS,
     handle_engine_reply,
 )
-from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
+from megatron.core.inference.disaggregation.handoff_ownership import (
+    HandoffClaimStatus,
+    HandoffOwnership,
+)
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
@@ -65,15 +68,28 @@ def test_unclaimed_offer_expiry_fences_claims_but_not_live_readers(monkeypatch):
     ownership.offer(1, b"prefill", require_claim=True)
     ownership.offer(2, b"prefill", require_claim=True)
     ownership.offer(3, b"unfenced-source")
-    assert ownership.claim(2, "decode")
+    assert ownership.claim(2, "decode") is HandoffClaimStatus.ACCEPTED
     clock.return_value = 15.0
-    assert not ownership.claim(1, "late")
+    assert ownership.claim(1, "late") is HandoffClaimStatus.EXPIRED
     assert ownership.expired_unclaimed() == [(1, b"prefill")]
     assert ownership.expired_unclaimed() == [(1, b"prefill")]  # failed send must retry
     ownership.release(1)
+    assert ownership.claim(1, "late") is HandoffClaimStatus.EXPIRED
+    assert ownership.claim(2, "other") is HandoffClaimStatus.REJECTED
+    assert ownership.claim(99, "unknown") is HandoffClaimStatus.REJECTED
     assert not ownership.expired_unclaimed()
     assert ownership.confirm_terminated("decode") == [(2, b"prefill")]
     assert ownership.source_engine(3) == b"unfenced-source"
+    ownership.confirm_terminated("late")
+    assert ownership.claim(1, "late") is HandoffClaimStatus.REJECTED
+    ownership.offer(1, b"prefill", require_claim=True)
+    assert ownership.source_engine(1) is None
+    ownership._max_expired_offers = 1
+    ownership.offer(4, b"prefill", require_claim=True)
+    clock.return_value = 20.0
+    ownership.release(4)
+    assert ownership.claim(4, "new") is HandoffClaimStatus.EXPIRED
+    assert ownership.claim(1, "new") is HandoffClaimStatus.REJECTED
 
 
 def test_disconnected_client_does_not_interrupt_reply_bookkeeping():
@@ -1084,7 +1100,7 @@ class TestRoutingPolicies:
         coord.known_clients = {b"client"}
         for request_id, owner in ((7, "old"), (8, "replacement")):
             coord.handoff_ownership.offer(request_id, b"rank-0")
-            assert coord.handoff_ownership.claim(request_id, owner)
+            assert coord.handoff_ownership.claim(request_id, owner) is HandoffClaimStatus.ACCEPTED
         # Routing eviction is not evidence that the source freed its allocations.
         coord._remove_engine(b"rank-0")
         metadata = (
@@ -1100,7 +1116,7 @@ class TestRoutingPolicies:
         assert coord.router_socket.send_multipart.call_count == 1
         assert coord.router_socket.send_multipart.call_args.args[0][0] == b"rank-0"
         assert coord.handoff_ownership.source_engine(7) == b"rank-0"
-        assert not coord.handoff_ownership.claim(7, "other")
+        assert coord.handoff_ownership.claim(7, "other") is HandoffClaimStatus.REJECTED
 
         coord._handle_rank_registration(b"rank-0")
         coord.router_socket.send_multipart.reset_mock(side_effect=True)

@@ -101,6 +101,15 @@ def _submit(runtime, request_id, prompt, params):
     )
 
 
+def test_native_disagg_rejects_external_handoff_registration():
+    runtime, _ = _runtime()
+    with pytest.raises(AssertionError, match="REGISTER_KV"):
+        HANDLERS[Headers.REGISTER_KV](
+            runtime.coordinator, b"prefill", [Headers.REGISTER_KV.value, 5, True], []
+        )
+    assert runtime.coordinator.handoff_ownership.source_engine(5) is None
+
+
 def test_request_routes_prefill_then_decode():
     runtime, sent = _runtime()
     sampling_params = {"temperature": 0.0, "return_log_probs": True, "skip_prompt_log_probs": True}
@@ -347,13 +356,18 @@ def test_active_decode_cancellation_waits_for_engine_safety():
     assert 5 not in runtime.terminating_request_ids
 
 
-def test_unsafe_cancellation_keeps_prefill_capacity_until_read_completes():
+@pytest.mark.parametrize("termination", ["abort", "failure"])
+def test_unsafe_termination_keeps_prefill_capacity_until_read_completes(termination):
     runtime, sent = _runtime(ssm_capacity=1)
     _submit(runtime, 5, [1], {})
     _prefill_done(runtime, hybrid=True)
 
-    runtime.abort_request(5)
-    runtime.handle_engine_aborted(5, source_safe=False)
+    sent.clear()
+    if termination == "abort":
+        runtime.abort_request(5)
+        runtime.handle_engine_aborted(5, source_safe=False)
+    else:
+        runtime.handle_engine_failure(5, "transfer failed", source_safe=False)
 
     assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
     assert runtime.scheduler.prefill_load(b"prefill") == (0, 1, 1)
@@ -366,6 +380,16 @@ def test_unsafe_cancellation_keeps_prefill_capacity_until_read_completes():
     runtime.handle_engine_aborted(5, source_safe=True)
     assert runtime.scheduler.assigned_engine("decode", 5) is None
     assert 5 not in runtime.terminating_request_ids
+    assert 5 not in runtime.coordinator.request_id_to_client_id
+    assert any(
+        identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV
+        for identity, message in sent
+    )
+    assert any(
+        identity == b"client"
+        and Headers(msgpack.unpackb(message[1], raw=False)[0]) == Headers.REQUEST_ABORTED
+        for identity, message in sent
+    )
 
 
 def test_decode_removal_does_not_release_inflight_source():
@@ -440,36 +464,6 @@ def test_engine_removal_after_kv_read_preserves_source_safety():
     response = msgpack.unpackb(sent[-1][1][1], raw=False)
     assert Headers(response[0]) == Headers.REQUEST_ERROR
     assert response[3] is True
-
-
-def test_late_source_safety_releases_prefill_after_request_failure():
-    runtime, sent = _runtime(ssm_capacity=1)
-    _submit(runtime, 5, [1], {})
-    _prefill_done(runtime, hybrid=True)
-    sent.clear()
-
-    runtime.handle_engine_failure(5, "transfer failed", source_safe=False)
-
-    assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
-    assert runtime.scheduler.prefill_load(b"prefill") == (0, 1, 1)
-
-    runtime.handle_kv_read_done(b"decode", 5)
-
-    assert runtime.scheduler.reserved_engine("prefill", 5) is None
-    assert runtime.scheduler.prefill_load(b"prefill") == (0, 0, 0)
-
-    runtime.handle_engine_aborted(5, source_safe=True)
-
-    assert 5 not in runtime.coordinator.request_id_to_client_id
-    assert any(
-        identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV
-        for identity, message in sent
-    )
-    assert any(
-        identity == b"client"
-        and Headers(msgpack.unpackb(message[1], raw=False)[0]) == Headers.REQUEST_ABORTED
-        for identity, message in sent
-    )
 
 
 @pytest.mark.parametrize("policy", list(PrefixCachingCoordinatorPolicy))

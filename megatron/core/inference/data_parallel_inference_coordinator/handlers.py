@@ -30,6 +30,7 @@ from megatron.core.inference.config import (
     PrefixCachingCoordinatorPolicy,
     routes_on_prefix,
 )
+from megatron.core.inference.disaggregation.handoff_ownership import HandoffClaimStatus
 from megatron.core.inference.headers import Headers
 
 from .state import CONTROL_TRANSITIONS, CoordinatorState
@@ -427,6 +428,10 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
 @message_handler(Headers.REGISTER_KV)
 def handle_register_kv(coordinator, sender_identity, metadata, bodies):
     """Register source state before its engine publishes handoff metadata."""
+    assert not coordinator.is_disaggregated_inference(), (
+        "REGISTER_KV is only valid for externally routed handoffs; "
+        "native disaggregation owns its prefill reservations"
+    )
     if sender_identity in coordinator.identities_of_data_parallel_ranks and len(metadata) in (2, 3):
         # Two-field registrations predate the claim protocol. Do not expire a
         # source whose consumers can submit reads without claiming first.
@@ -456,8 +461,12 @@ def handle_handoff_owner(coordinator, sender_identity, metadata, bodies):
             and isinstance(request_id, int)
             and not isinstance(request_id, bool)
         )
-        accepted = accepted and coordinator.handoff_ownership.claim(request_id, owner)
-        reply = [Headers.CLAIM_KV_ACK.value, request_id, instance_id, bool(accepted)]
+        status = (
+            coordinator.handoff_ownership.claim(request_id, owner)
+            if accepted
+            else HandoffClaimStatus.REJECTED
+        )
+        reply = [Headers.CLAIM_KV_ACK.value, request_id, instance_id, status.value]
     else:
         if len(metadata) != 3:
             return

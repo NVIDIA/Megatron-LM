@@ -18,7 +18,10 @@ pytest.importorskip("dynamo")
 
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.data_parallel_inference_coordinator.handlers import HANDLERS
-from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
+from megatron.core.inference.disaggregation.handoff_ownership import (
+    HandoffClaimStatus,
+    HandoffOwnership,
+)
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceRequestError
 from megatron.inference.integrations.dynamo.handoff_recovery import (
@@ -59,6 +62,7 @@ async def test_killed_owner_recovery_restores_prefill_capacity_and_fences_replac
         _send_to_client=router.send_multipart,
         identities_of_data_parallel_ranks={b"prefill-engine"},
         handoff_ownership=ownership,
+        is_disaggregated_inference=lambda: False,
         _send_to_engine=send,
     )
     for request_id in (7, 8, 9):
@@ -87,7 +91,7 @@ socket.connect(sys.argv[1])
 socket.send(msgpack.packb([int(sys.argv[2])]))
 instance = msgpack.unpackb(socket.recv())[1]
 socket.send(msgpack.packb([int(sys.argv[3]), 7, instance, "old"]))
-assert msgpack.unpackb(socket.recv())[-1] is True
+assert msgpack.unpackb(socket.recv())[-1] == "accepted"
 print("claimed", flush=True)
 signal.pause()
 """,
@@ -111,9 +115,9 @@ signal.pause()
             await replacement._claim_remote_handoff(asdict(HandoffRelease(address, "prefill", 7)))
         await confirm_terminated(address, "old")
         await confirm_terminated(address, "old")
-        assert not ownership.claim(9, "old")
-        assert not ownership.claim(7, "replacement")
-        assert not ownership.claim(8, "other")
+        assert ownership.claim(9, "old") is HandoffClaimStatus.REJECTED
+        assert ownership.claim(7, "replacement") is HandoffClaimStatus.REJECTED
+        assert ownership.claim(8, "other") is HandoffClaimStatus.REJECTED
         assert ownership.confirm_terminated(replacement._handoff_owner) == [(8, b"prefill-engine")]
         for source in sources:
             assert source.pinned_handoff_block_count == 0
@@ -181,26 +185,6 @@ async def test_decode_claims_before_submission_and_retries_only_safe_releases(so
         await engine._replay_handoffs()
         assert engine._release_remote_handoff.await_count == int(source_safe)
         assert not engine._pending_releases
-    finally:
-        await engine.cleanup()
-
-
-@pytest.mark.asyncio
-async def test_rejected_claim_neither_submits_nor_releases_another_owners_handoff():
-    engine = MegatronLLMEngine(_config("decode"))
-    engine.client = MagicMock()
-    engine._claim_remote_handoff = AsyncMock(side_effect=RuntimeError("claim rejected"))
-    engine._release_remote_handoff = AsyncMock()
-    try:
-        with patch(
-            "megatron.inference.integrations.dynamo.llm_engine.require_prefill_result",
-            return_value={},
-        ):
-            with pytest.raises(RuntimeError, match="claim rejected"):
-                await anext(engine.generate({"token_ids": [1]}, _Context()))
-        await asyncio.gather(*engine._cleanup_tasks)
-        engine.client.add_request_with_kv_handoff_streaming.assert_not_called()
-        engine._release_remote_handoff.assert_not_awaited()
     finally:
         await engine.cleanup()
 

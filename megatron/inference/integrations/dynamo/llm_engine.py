@@ -35,7 +35,9 @@ from dynamo.common.backend.worker import WorkerConfig
 from dynamo.common.constants import DisaggregationMode
 from dynamo.common.model_fetch import fetch_model
 from dynamo.llm import KvEventPublisher, ModelInput
+from dynamo.llm.exceptions import StreamIncomplete
 
+from megatron.core.inference.disaggregation.handoff_ownership import HandoffClaimStatus
 from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
@@ -615,10 +617,16 @@ class MegatronLLMEngine(LLMEngine):
                 await socket.send(msgpack.packb(command, use_bin_type=True))
                 reply = msgpack.unpackb(await socket.recv(), raw=False)
                 expected = (
-                    [Headers.CLAIM_KV_ACK.value, int(request_id), instance_id, True]
+                    [Headers.CLAIM_KV_ACK.value, int(request_id), instance_id]
                     if owner is not None
                     else [Headers.RELEASE_KV_ACK.value, int(request_id), instance_id]
                 )
+                if owner is not None and reply == [*expected, HandoffClaimStatus.EXPIRED.value]:
+                    # No remote read was submitted. Let Dynamo's migration layer
+                    # replay the request through prefill to obtain a fresh offer.
+                    raise StreamIncomplete("Unclaimed Megatron prefill handoff expired")
+                if owner is not None:
+                    expected.append(HandoffClaimStatus.ACCEPTED.value)
                 if reply != expected:
                     raise RuntimeError("Unexpected or rejected handoff acknowledgement")
             except BaseException:
