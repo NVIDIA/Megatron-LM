@@ -1398,7 +1398,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         max_seqlen,
         position_ids,
         tokens,
-    ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
+    ) = [batch.get(key) for key in pretrain_hybrid.BATCH_KEYS]
 
     # Presence checks
     assert tokens is not None
