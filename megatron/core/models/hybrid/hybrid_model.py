@@ -23,6 +23,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
 from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
@@ -549,6 +550,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
         cp_batch: ContextParallelBatch | None = None,
+        shared_prefix_layout: Optional[SharedPrefixLayout | SharedPrefixForestLayout] = None,
+        shared_prefix_exclude_sequence_padding_from_expert_bias: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -563,9 +566,107 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 ``labels`` still determine whether the model returns loss or logits.
                 Defaults to True.
             cp_batch: Input tensors and packed metadata keyed by CP layout.
+            shared_prefix_layout (SharedPrefixLayout | SharedPrefixForestLayout, optional):
+                Explicitly selects the star path. The global packed input is
+                ``[prefix, completion_1, ..., completion_G, optional_topology_padding]`` with
+                batch size one; CP1 receives it whole, while CP>1 receives standard two-chunk
+                zigzag sequence shards. With TP>1, input IDs remain CP-local and replicated
+                over TP; sequence parallelism starts at the embedding output. The layout owns
+                the exact tree mask and prefix-continued RoPE positions. With
+                ``labels=None`` and parallel output, logits remain
+                ``[1, physical_len/CP, padded_vocab/TP]`` in the input shard's zigzag token
+                order; this model gathers neither sequence across CP nor vocabulary across TP.
+                Training-mode MTP is not supported yet. The normal decoder path is unchanged
+                when the argument is ``None``. Defaults to None.
+            shared_prefix_exclude_sequence_padding_from_expert_bias (bool, optional): The
+                caller's dense expert-bias convention for per-branch padding rows of a
+                ``shared_prefix_layout``. ``True`` excludes them, as a dense forward with the
+                packed-sequence padding mask does; ``False`` counts them, as a dense forward with
+                ``padding_mask=None`` does. ``None`` excludes them when
+                ``moe_token_dispatcher_type`` is ``"flex"`` and ``moe_flex_dispatcher_backend``
+                is ``"hybridep"``, and counts them otherwise. Trailing topology padding is never
+                counted. A value other than ``None`` requires ``shared_prefix_layout``.
+                Defaults to None.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
+
+        # Validate a shared-prefix request before any preprocessing or partial forward runs.
+        shared_prefix_physical_len = None
+        if shared_prefix_layout is not None:
+            # Imported here: the adapter loads the Mamba modules and requires einops, which
+            # models that never pass a layout must not need.
+            from megatron.core.models.hybrid.shared_prefix import _validate_hybrid_stack
+
+            if cp_batch is not None:
+                raise ValueError("Shared prefix owns CP token layout; cp_batch must be None")
+            if (
+                InferenceMode.is_active()
+                or inference_context is not None
+                or inference_params is not None
+            ):
+                raise NotImplementedError("shared-prefix Hybrid forward is training-only")
+            if attention_mask is not None:
+                raise ValueError(
+                    'shared-prefix Hybrid forward owns its tree mask and requires '
+                    'attention_mask=None'
+                )
+            if labels is not None:
+                raise NotImplementedError(
+                    "shared-prefix Hybrid forward requires external next-token loss computation"
+                )
+            if packed_seq_params is not None:
+                raise ValueError(
+                    "shared_prefix_layout and packed_seq_params are mutually exclusive"
+                )
+            if padding_mask is not None:
+                raise ValueError("shared-prefix Hybrid forward does not accept padding_mask")
+            if not self.pre_process or not self.post_process or self.vp_stage is not None:
+                raise NotImplementedError(
+                    "shared-prefix HybridModel forward currently requires a complete PP1 model"
+                )
+            if self.mtp_process and self.training and compute_mtp_loss:
+                raise NotImplementedError(
+                    "shared-prefix Hybrid forward does not support MTP yet; pass "
+                    "compute_mtp_loss=False to skip MTP"
+                )
+            if self.position_embedding_type not in ('rope', 'none'):
+                raise NotImplementedError(
+                    "shared-prefix Hybrid forward supports only RoPE or positionless attention"
+                )
+            if self.config.multi_latent_attention:
+                raise NotImplementedError(
+                    "shared-prefix Hybrid forward does not support multi-latent attention"
+                )
+            tp_size = self.pg_collection.tp.size()
+            cp_size = self.pg_collection.cp.size()
+            if decoder_input is None:
+                if input_ids is None or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+                    raise ValueError(
+                        "shared-prefix Hybrid input_ids must have shape [1, physical_len/CP]"
+                    )
+                shared_prefix_physical_len = input_ids.shape[1] * cp_size
+            else:
+                if decoder_input.ndim != 3 or decoder_input.shape[1] != 1:
+                    raise ValueError(
+                        "shared-prefix Hybrid decoder input must have shape "
+                        "[physical_len/(TP*CP), 1, hidden] when sequence parallelism is enabled"
+                    )
+                sequence_shards = tp_size if self.config.sequence_parallel else 1
+                shared_prefix_physical_len = decoder_input.shape[0] * cp_size * sequence_shards
+            # Topology (TP/SP/CP/PP), layer types, MoE features and the physical length.
+            _validate_hybrid_stack(
+                self.decoder, shared_prefix_layout, physical_len=shared_prefix_physical_len
+            )
+            if tp_size > 1 and (not self.parallel_output or runtime_gather_output):
+                raise NotImplementedError(
+                    "shared-prefix HybridModel TP/SP requires TP-sharded parallel output logits"
+                )
+        elif shared_prefix_exclude_sequence_padding_from_expert_bias is not None:
+            raise ValueError(
+                "shared_prefix_exclude_sequence_padding_from_expert_bias requires "
+                "shared_prefix_layout"
+            )
 
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
@@ -648,7 +749,24 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        if shared_prefix_layout is not None and self.position_embedding_type == 'rope':
+            if decoder_input is None:
+                raise RuntimeError("shared-prefix Hybrid embedding did not produce decoder input")
+            cp_group = self.pg_collection.cp
+            cp_size = cp_group.size()
+            rotary_table = self.rotary_pos_emb.get_emb(
+                max(shared_prefix_layout.dense_branch_lengths)
+            )
+            global_position_ids = shared_prefix_layout.padded_position_ids(
+                shared_prefix_physical_len, rotary_table.device
+            )
+            if cp_size > 1:
+                local_indices = shared_prefix_layout.cp_local_indices(
+                    shared_prefix_physical_len, cp_size, cp_group.rank(), rotary_table.device
+                )
+                global_position_ids = global_position_ids.index_select(0, local_indices)
+            rotary_pos_emb = rotary_table.index_select(0, global_position_ids)
+        elif self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
@@ -694,22 +812,40 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             else nullcontext()
         )
         with backbone_context:
-            decoder_output = self.decoder(
-                hidden_states=decoder_input,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-                input_ids=hash_input_ids,
-            )
-        if isinstance(decoder_output, tuple):
-            hidden_states, mhc_multistream = decoder_output
-        else:
-            hidden_states = decoder_output
-            mhc_multistream = None
+            if shared_prefix_layout is not None:
+                from megatron.core.models.hybrid.shared_prefix import (
+                    forward_hybrid_stack_shared_prefix,
+                )
+
+                hidden_states = forward_hybrid_stack_shared_prefix(
+                    self.decoder,
+                    decoder_input,
+                    shared_prefix_layout,
+                    rotary_pos_emb=rotary_pos_emb,
+                    position_embedding_type=self.position_embedding_type,
+                    exclude_sequence_padding_from_expert_bias=(
+                        shared_prefix_exclude_sequence_padding_from_expert_bias
+                    ),
+                    validated_physical_len=shared_prefix_physical_len,
+                )
+                mhc_multistream = None
+            else:
+                decoder_output = self.decoder(
+                    hidden_states=decoder_input,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                    packed_seq_params_by_layout=packed_seq_params_by_layout,
+                    cp_layout_plan=cp_layout_plan,
+                    input_ids=hash_input_ids,
+                )
+                if isinstance(decoder_output, tuple):
+                    hidden_states, mhc_multistream = decoder_output
+                else:
+                    hidden_states = decoder_output
+                    mhc_multistream = None
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -725,8 +861,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.num_speculative_tokens > 0
         )
 
+        # A shared-prefix forward never runs MTP: training-mode requests are rejected above.
         mtp_forward_ran = (
-            self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
+            self.mtp_process
+            and not (in_inference_mode or is_spec_decode)
+            and compute_mtp_loss
+            and shared_prefix_layout is None
         )
         mtp_hidden_states = hidden_states
         mtp_inputs = None
