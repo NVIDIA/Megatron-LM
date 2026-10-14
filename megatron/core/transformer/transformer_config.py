@@ -3975,15 +3975,21 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 if any(
                     scope in self.cuda_graph_modules
-                    for scope in (
-                        CudaGraphModule.moe,
-                        CudaGraphModule.moe_router,
-                        CudaGraphModule.moe_preprocess,
-                    )
+                    for scope in (CudaGraphModule.moe, CudaGraphModule.moe_preprocess)
                 ):
                     raise ValueError(
                         "MOK does not support per-layer CUDA Graph scopes containing "
-                        "moe/moe_router/moe_preprocess"
+                        "moe/moe_preprocess"
+                    )
+                # The router can run in the layer's graph: the graph returns its outputs and the
+                # megakernel runs eagerly after it, as the native dispatcher does.
+                if (
+                    CudaGraphModule.moe_router in self.cuda_graph_modules
+                    and self.cuda_graph_impl != "transformer_engine"
+                ):
+                    raise ValueError(
+                        "MOK supports the moe_router CUDA Graph scope only with "
+                        "cuda_graph_impl='transformer_engine'"
                     )
             elif self.cuda_graph_impl not in ("none", "full_iteration"):
                 raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")

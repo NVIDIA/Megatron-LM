@@ -150,15 +150,30 @@ def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
     "cuda_graph_modules",
     [
         [CudaGraphModule.moe],
-        [CudaGraphModule.moe_router],
         [CudaGraphModule.moe_preprocess],
         [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
     ],
 )
 def test_mok_rejects_per_layer_cuda_graph_covering_moe(cuda_graph_impl, cuda_graph_modules):
-    with pytest.raises(ValueError, match="moe/moe_router/moe_preprocess"):
+    with pytest.raises(ValueError, match="moe/moe_preprocess"):
         _mok_transformer_config(
             cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules
+        )
+
+
+def test_mok_accepts_transformer_engine_moe_router_cuda_graph():
+    cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.moe_router]
+    config = _mok_transformer_config(
+        cuda_graph_impl="transformer_engine", cuda_graph_modules=cuda_graph_modules
+    )
+
+    assert config.cuda_graph_modules == cuda_graph_modules
+
+
+def test_mok_rejects_local_moe_router_cuda_graph():
+    with pytest.raises(ValueError, match="only with cuda_graph_impl='transformer_engine'"):
+        _mok_transformer_config(
+            cuda_graph_impl="local", cuda_graph_modules=[CudaGraphModule.moe_router]
         )
 
 

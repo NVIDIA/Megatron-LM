@@ -1828,9 +1828,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             submodules += [self.pre_mlp_layernorm, self.mlp]
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
+            # A megakernel backend computes the shared expert itself, outside the graph.
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
+                and self.config.moe_megakernel_backend is None
             ):
                 submodules += [self.mlp.shared_experts]
         return submodules
@@ -1977,8 +1979,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
+                and self.config.moe_megakernel_backend is None
             ):
                 # The shared expert output is the last second element in the CUDA graph output.
+                # A megakernel backend computes the shared expert itself, so its graph has none.
                 shared_expert_output = cuda_graph_output.pop()
 
             if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:

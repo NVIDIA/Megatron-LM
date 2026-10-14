@@ -782,7 +782,13 @@ class MoELayer(BaseMoELayer):
                     megakernel_forward, self.config, self.tp_group, hidden_states, padding_mask
                 )
             else:
-                output = megakernel_forward(hidden_states, padding_mask)
+                try:
+                    output = megakernel_forward(hidden_states, padding_mask)
+                except MoECudaGraphPartialCaptureSignal as e:
+                    # Capturing cuda_graph_modules=[..., "moe_router"]: the layer's CUDA graph
+                    # ends after the router and returns its outputs. The shared expert runs inside
+                    # the megakernel, so it adds no graph output.
+                    return e.get_early_return_outputs(hidden_states, None)
             return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine
