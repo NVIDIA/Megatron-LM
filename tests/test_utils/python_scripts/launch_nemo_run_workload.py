@@ -11,7 +11,7 @@ from typing import Optional
 import click
 import nemo_run as run
 
-from tests.test_utils.python_scripts import recipe_parser
+from tests.test_utils.python_scripts import recipe_parser, unit_compiler_cache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -242,6 +242,8 @@ def main(
             "NCCL_DEBUG_FILE": "/opt/megatron-lm/assets_dir/logs/nccl_debug.log",
             "HF_HOME": "/mnt/hf_home",
             "TRANSFORMERS_OFFLINE": "1",
+            # The repository volume also persists these caches outside the container.
+            **unit_compiler_cache.compiler_cache_env(scope, test_case, environment, tag),
         },
         packager=run.Packager(),
         volumes=artifacts,

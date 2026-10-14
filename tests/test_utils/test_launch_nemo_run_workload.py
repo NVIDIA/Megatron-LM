@@ -1,9 +1,66 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import threading
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock
+
+import pytest
+from click.testing import CliRunner
 
 from tests.test_utils.python_scripts import launch_nemo_run_workload
+from tests.test_utils.python_scripts.unit_compiler_cache import CACHE_DIR, GDN_BUCKET
+
+
+@pytest.mark.parametrize("testmon_mode", ["full", "enforce", "baseline"])
+@pytest.mark.parametrize("warm", [False, True])
+def test_gdn_compiler_cache_is_mounted_without_changing_selection(
+    monkeypatch, tmp_path, testmon_mode, warm
+):
+    monkeypatch.chdir(tmp_path)
+    if warm:
+        (tmp_path / "assets_dir/compiler-cache/gdn/triton").mkdir(parents=True)
+    workload = SimpleNamespace(
+        type="basic", spec={"name": "gdn", "test_case": GDN_BUCKET, "script": "run selected tests"}
+    )
+    monkeypatch.setattr(
+        launch_nemo_run_workload.recipe_parser, "load_workloads", Mock(return_value=[workload])
+    )
+    executor = Mock()
+    monkeypatch.setattr(launch_nemo_run_workload.run, "DockerExecutor", executor)
+    experiment = MagicMock()
+    experiment.__enter__.return_value.status.return_value = {"task-1": {"status": "SUCCEEDED"}}
+    monkeypatch.setattr(launch_nemo_run_workload.run, "Experiment", Mock(return_value=experiment))
+
+    result = CliRunner().invoke(
+        launch_nemo_run_workload.main,
+        [
+            "--scope",
+            "unit-tests",
+            "--model",
+            "unit-tests",
+            "--test-case",
+            GDN_BUCKET,
+            "--environment",
+            "dev",
+            "--platform",
+            "dgx_h100",
+            "--tag",
+            "latest",
+            "--container-image",
+            "test-image",
+            "--unit-testmon-mode",
+            testmon_mode,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = executor.call_args.kwargs
+    assert f"{tmp_path}:/opt/megatron-lm" in kwargs["volumes"]
+    assert kwargs["env_vars"]["UNIT_TESTMON_MODE"] == testmon_mode
+    assert kwargs["env_vars"]["TRITON_CACHE_DIR"] == f"{CACHE_DIR}/triton"
+    assert kwargs["env_vars"]["TORCHINDUCTOR_CACHE_DIR"] == f"{CACHE_DIR}/inductor"
+    assert kwargs["env_vars"]["TILELANG_CACHE_DIR"] == f"{CACHE_DIR}/tilelang"
+    assert workload.spec["script"] == "run selected tests"
 
 
 def test_nccl_watchdog_timeout_is_flaky():
