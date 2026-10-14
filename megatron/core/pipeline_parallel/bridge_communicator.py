@@ -112,6 +112,9 @@ class BridgeCommunicator:
             raise TypeError("requires_backward must be a bool")
         self.requires_backward = requires_backward
         self._sent_forward_shapes: Deque[List[Tuple[int, ...]]] = deque()
+        # Backward follows forward microbatch order; preserve each source's
+        # contribution length instead of evenly splitting the concatenated gradient.
+        self._forward_fanin_split_sizes: Deque[List[int]] = deque()
 
         assert tensor_ndim in (2, 3), f"tensor_ndim must be 2 or 3, got {tensor_ndim}"
         self.tensor_ndim = tensor_ndim
@@ -211,6 +214,15 @@ class BridgeCommunicator:
 
         self.build_comm_map(self.src_tp_leaders, self.dest_tp_leaders)
         dist.barrier()
+
+    def reset_forward_fanin_state(self) -> None:
+        """Discard split metadata left by a previous schedule invocation.
+
+        Forward-only schedules receive activations without sending gradients, so
+        their source-length metadata cannot be consumed by the backward path.
+        The multi-module communicator resets this state before each schedule.
+        """
+        self._forward_fanin_split_sizes.clear()
 
     def _validate_send_dtype(self, tensor: torch.Tensor, operation: str) -> None:
         """Fail before entering NCCL when a sender disagrees with the receive dtype."""
@@ -517,6 +529,10 @@ class BridgeCommunicator:
                 recv_forward_shapes = [self._validate_receiver_provided_shape(recv_shape)]
             else:
                 recv_forward_shapes, _ = self._communicate_shapes(recv_prev=True)
+            if self.requires_backward:
+                self._forward_fanin_split_sizes.append(
+                    [int(shape[self._batch_dim]) for shape in recv_forward_shapes]
+                )
             logger.debug(
                 "[Bridge Communicator] [receive_forward] Rank %s received forward shapes %s",
                 self.current_rank,
@@ -617,7 +633,12 @@ class BridgeCommunicator:
             self._validate_send_dtype(grad_tensor, "send_backward")
             # Send gradients back to source ranks
             num_receives = len(rank_info.recv_from_ranks)
-            tensor_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
+            forward_split_sizes = None
+            if self._forward_fanin_split_sizes:
+                forward_split_sizes = self._forward_fanin_split_sizes.popleft()
+            tensor_splits = self._split_tensor_at_batch_dim(
+                grad_tensor, num_receives, split_sizes=forward_split_sizes
+            )
             if not self.skip_shape_exchange:
                 self._communicate_shapes(tensor_to_send_prev=tensor_splits)
             if num_receives > 0:
@@ -926,13 +947,22 @@ class BridgeCommunicator:
             self._validate_send_dtype(grad_tensor, "send_backward_recv_forward")
 
             num_receives = len(rank_info.recv_from_ranks)
-            gradient_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
+            forward_split_sizes = None
+            if self._forward_fanin_split_sizes:
+                forward_split_sizes = self._forward_fanin_split_sizes.popleft()
+            gradient_splits = self._split_tensor_at_batch_dim(
+                grad_tensor, num_receives, split_sizes=forward_split_sizes
+            )
             if self.skip_shape_exchange:
                 recv_forward_shapes = [self._validate_receiver_provided_shape(forward_shape)]
             else:
                 # Communicate shapes for both directions (send backward, receive forward)
                 recv_forward_shapes, _ = self._communicate_shapes(
                     tensor_to_send_prev=gradient_splits, recv_prev=True
+                )
+            if self.requires_backward:
+                self._forward_fanin_split_sizes.append(
+                    [int(shape[self._batch_dim]) for shape in recv_forward_shapes]
                 )
             logger.debug(
                 "[Bridge Communicator] [send_backward_recv_backward] Rank %s "
@@ -1168,13 +1198,17 @@ class BridgeCommunicator:
         return list(tensors)
 
     def _split_tensor_at_batch_dim(
-        self, aggregated_tensor: torch.Tensor, num_splits: int
+        self,
+        aggregated_tensor: torch.Tensor,
+        num_splits: int,
+        split_sizes: Optional[List[int]] = None,
     ) -> List[torch.Tensor]:
         """Split an aggregated tensor into multiple tensors at the batch dimension.
 
         Args:
             aggregated_tensor: The tensor to split
             num_splits: The number of splits to create
+            split_sizes: Explicit per-source lengths from the corresponding forward receive.
 
         Returns:
             List of tensors split at the batch dimension
@@ -1182,7 +1216,8 @@ class BridgeCommunicator:
         if num_splits <= 0:
             raise ValueError(f"num_splits must be positive, got {num_splits}")
 
-        split_sizes = getattr(aggregated_tensor, "_mimo_bridge_split_sizes", None)
+        if split_sizes is None:
+            split_sizes = getattr(aggregated_tensor, "_mimo_bridge_split_sizes", None)
         if split_sizes is not None:
             if num_splits == 1:
                 return [aggregated_tensor.contiguous()]
