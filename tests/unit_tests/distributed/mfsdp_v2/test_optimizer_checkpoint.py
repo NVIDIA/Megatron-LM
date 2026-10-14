@@ -154,6 +154,7 @@ def _train_step(
     optimizer.zero_grad(set_to_none=True)
     batch = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
     model(hidden_states=batch, attention_mask=None).square().mean().backward()
+    model.finish_grad_sync()
     success, _, _ = optimizer.step()
     assert success
 
