@@ -335,8 +335,9 @@ class DSAIndexerLossLoggingHelper:
         tracker["values"][layer_number - 1] += loss.detach()
         if raw_loss is not None:
             if "raw_values" not in tracker or tracker["raw_values"].shape[0] < needed:
-                grown = torch.zeros(needed, device=tracker["values"].device,
-                                    dtype=tracker["values"].dtype)
+                grown = torch.zeros(
+                    needed, device=tracker["values"].device, dtype=tracker["values"].dtype
+                )
                 if "raw_values" in tracker:
                     grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
                 tracker["raw_values"] = grown
@@ -397,8 +398,9 @@ class DSAIndexerLossLoggingHelper:
         # raw_values must exist on every pipeline rank before the collectives below,
         # since ranks that own no indexer still have to contribute zeros.
         if "raw_values" not in tracker or tracker["raw_values"].shape[0] < size:
-            grown = torch.zeros(size, device=tracker["values"].device,
-                                dtype=tracker["values"].dtype)
+            grown = torch.zeros(
+                size, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
             if "raw_values" in tracker:
                 grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
             tracker["raw_values"] = grown

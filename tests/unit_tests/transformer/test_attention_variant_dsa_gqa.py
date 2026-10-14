@@ -18,10 +18,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGroupedSelfAttention,
     SimplifiedDSGQAIndexer,
     SimplifiedDSGQAIndexerSubmodules,
-    _DSAZeroParamDependency,
     _dsa_caches_indexer_k,
     _dsa_caches_routing,
     _dsa_caches_selected_scores,
+    _DSAZeroParamDependency,
     _simplified_index_scores,
     _simplified_indexer_input,
     _simplified_indexer_norm_spec,
@@ -179,10 +179,7 @@ def test_gdp_dsa_stack_spec_does_not_mutate_upstream_gdp_spec():
 
 def test_the_two_dsa_stacks_keep_their_own_mamba_mixers():
     """Only the attention layer is DSA's to change; the mixers are what distinguish the stacks."""
-    assert (
-        gdp_dsa_stack_spec.submodules.mamba_layer
-        != dsa_stack_spec.submodules.mamba_layer
-    )
+    assert gdp_dsa_stack_spec.submodules.mamba_layer != dsa_stack_spec.submodules.mamba_layer
 
 
 def _causal_mask(seqlen: int, device: torch.device):

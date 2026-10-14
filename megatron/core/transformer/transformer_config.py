@@ -375,9 +375,7 @@ class TransformerConfig(ModelParallelConfig):
     top-k indices."""
 
     dsa_kernel_backend: (
-        Literal[
-            "none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"
-        ]
+        Literal["none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"]
         | None
     ) = None
     """Which DSA implementation to run. This is the only backend selector.
