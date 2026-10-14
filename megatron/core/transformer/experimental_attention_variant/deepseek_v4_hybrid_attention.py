@@ -449,7 +449,12 @@ class DSv4HybridAttention(Attention):
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
         )
-        wo_a_weight = self.linear_o_group_proj.view(
+        linear_o_group_proj = self.linear_o_group_proj
+        if isinstance(linear_o_group_proj, torch.nn.Module):
+            # LoRA promotes this replicated parameter to a wrapped linear
+            # module. Keep the bare-parameter path unchanged for base models.
+            linear_o_group_proj = linear_o_group_proj.weight
+        wo_a_weight = linear_o_group_proj.view(
             self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
         )
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
