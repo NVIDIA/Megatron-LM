@@ -586,6 +586,61 @@ FP8 training provides benefits across all three performance walls:
 
 > **Note**: For blockwise and MXFP8 recipes with current scaling, training loss curves show negligible difference compared to BF16 baselines.
 
+### MoE Megakernel Backends
+
+#### MOK
+
+A megakernel backend replaces the native post-router dispatch, expert-compute, and combine path.
+Select MOK for a SwiGLU model with the following YAML configuration:
+
+```yaml
+bf16: true
+add_bias_linear: false
+moe_grouped_gemm: true
+moe_ffn_hidden_size: 3072
+gradient_accumulation_fusion: true
+moe_shared_expert_intermediate_size: 3072
+moe_megakernel_backend: mok
+moe_megakernel_backend_config:
+  fwd_num_comm_sms: 40
+  bwd_num_comm_sms: 28
+```
+
+The equivalent backend-specific CLI value is a JSON object:
+
+```bash
+--moe-megakernel-backend mok --moe-megakernel-backend-config '{"fwd_num_comm_sms": 40, "bwd_num_comm_sms": 28}'
+```
+
+MOK is an optional dependency, imported only when the backend is selected. The ARM64 development
+image already installs the supported
+[MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/a2ad2d0ce2366c1817d15498cdbaf8ead5966117)
+through `docker/common/install_mok.sh`, including the compatibility patch in
+`docker/patches/mok.patch`. Use that image or its installation helper rather than an unpatched
+source installation. The AMD64 image skips MOK because its H100 target is unsupported.
+The pinned API does not provide the optional shared-expert output gate used by newer MOK versions.
+
+| Area | Current MOK support |
+|------|---------------------|
+| GPU architecture | NVIDIA Blackwell SM100/SM103; upstream integration validated on GB300 |
+| Routed precision | BF16, or MXFP8 with FP8 parameter gather (Transformer Engine 2.10 or later) |
+| Shared experts | Required; BF16; same intermediate size as routed experts |
+| Activation | SwiGLU, without a linear offset or tanh clamp |
+| Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
+| Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
+| Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
+| Recomputation | Whole-MoE activation recompute |
+| CUDA Graph | Full-iteration capture |
+| Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
+
+The current backend requires grouped experts and fused gradient accumulation. It does not support
+linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
+wgrad, native shared-expert overlap/gating, shared-expert-only
+recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
+partial MoE CUDA Graph replay, MCore expert-input
+capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
+layouts.
+
 
 ### GLU Checkpoint Layout
 
