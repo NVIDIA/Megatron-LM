@@ -1,5 +1,13 @@
 # Megatron Lite
 
+> [!IMPORTANT]
+> **Rename and upstreaming notice:** Megatron Lite (`mlite`) is the prototype
+> name used while this project is under active development. Its official name is
+> **Agent Compose (`agent_compose`)**. Validated features will be merged into the
+> `main` branch incrementally, one feature at a time. Once feature parity is
+> reached, the project will fully adopt the `agent_compose` name. We currently
+> expect this transition to take approximately three months.
+
 Megatron Lite is an experimental, agentic-native training runtime and native
 model implementation layer for Megatron. It is designed for work that needs to
 move quickly without giving up Megatron-Core performance: small composable
