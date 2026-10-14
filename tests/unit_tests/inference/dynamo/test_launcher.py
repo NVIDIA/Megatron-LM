@@ -65,15 +65,13 @@ def test_parse_args_splits_dynamo_and_megatron_arguments():
     ]
 
 
-def test_local_launch_requires_process_count():
-    with pytest.raises(SystemExit):
-        parse_args(["--model", "model-meta", "--", "--load", "/checkpoint"])
-
-
-def test_external_launch_requires_fixed_parent_event_port():
-    argv = _external_argv()
-    del argv[argv.index("--parent-event-port") : argv.index("--parent-event-port") + 2]
-
+@pytest.mark.parametrize(
+    "external,missing", [(False, "--nproc-per-node"), (True, "--parent-event-port")]
+)
+def test_launch_requires_process_count_or_fixed_event_port(external, missing):
+    argv = _external_argv() if external else _argv()
+    index = argv.index(missing)
+    del argv[index : index + 2]
     with pytest.raises(SystemExit):
         parse_args(argv)
 

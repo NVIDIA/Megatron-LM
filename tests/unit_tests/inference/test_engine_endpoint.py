@@ -48,30 +48,21 @@ def test_endpoint_round_trip_describes_running_engine():
     )
 
 
-def test_capabilities_validate_registration_limits():
-    values = InferenceEngineCapabilities.from_engine(
-        _engine(SimpleNamespace(bos_token_id=1))
-    ).to_dict()
-    values["max_num_seqs"] = 0
-
-    with pytest.raises(ValueError, match="max_num_seqs must be positive"):
-        InferenceEngineCapabilities.from_dict(values)
-
-
 @pytest.mark.parametrize(
-    ("field_name", "invalid_value", "message"),
+    ("field_name", "invalid_value", "error", "message"),
     [
-        ("context_length", "8192", "context_length must be an integer"),
-        ("enable_prefix_caching", 1, "enable_prefix_caching must be a boolean"),
+        ("max_num_seqs", 0, ValueError, "max_num_seqs must be positive"),
+        ("context_length", "8192", TypeError, "context_length must be an integer"),
+        ("enable_prefix_caching", 1, TypeError, "enable_prefix_caching must be a boolean"),
     ],
 )
-def test_capabilities_reject_coerced_wire_types(field_name, invalid_value, message):
+def test_capabilities_reject_invalid_wire_values(field_name, invalid_value, error, message):
     values = InferenceEngineCapabilities.from_engine(
         _engine(SimpleNamespace(bos_token_id=1))
     ).to_dict()
     values[field_name] = invalid_value
 
-    with pytest.raises(TypeError, match=message):
+    with pytest.raises(error, match=message):
         InferenceEngineCapabilities.from_dict(values)
 
 

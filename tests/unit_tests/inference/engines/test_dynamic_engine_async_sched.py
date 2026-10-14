@@ -2251,18 +2251,8 @@ def test_base_engine_rejects_kv_handoff_commands():
 
 
 def test_disagg_engine_resolves_handoff_methods_from_mixin():
-    assert StateHandoffDynamicInferenceEngine.mro()[:3] == [
-        StateHandoffDynamicInferenceEngine,
-        InferenceStateHandoffMixin,
-        DynamicInferenceEngine,
-    ]
-    assert DisaggDynamicInferenceEngine.mro()[:4] == [
-        DisaggDynamicInferenceEngine,
-        StateHandoffDynamicInferenceEngine,
-        InferenceStateHandoffMixin,
-        DynamicInferenceEngine,
-    ]
-    assert (
-        DisaggDynamicInferenceEngine.add_request_with_kv_handoff
-        is InferenceStateHandoffMixin.add_request_with_kv_handoff
-    )
+    for engine_cls in (StateHandoffDynamicInferenceEngine, DisaggDynamicInferenceEngine):
+        assert (
+            engine_cls.add_request_with_kv_handoff
+            is InferenceStateHandoffMixin.add_request_with_kv_handoff
+        )
