@@ -293,11 +293,12 @@ class InferenceConfigContainer(ConfigContainerBase):
 
     This is the inference counterpart to :class:`PretrainConfigContainer`. It holds only the
     configs that inference actually needs and is intentionally shaped differently from the
-    training container: there is no optimizer, LR schedule, train/validation loop, DDP, rerun
-    state machine, or straggler detection.
+    training container: there is no LR schedule, train/validation loop, DDP, rerun state
+    machine, or straggler detection. ``OptimizerConfig`` is included only as a settings
+    section; no optimizer is constructed for inference.
 
     Explicitly NOT included (relative to ``PretrainConfigContainer``): ``TrainingConfig``,
-    ``OptimizerConfig``, ``SchedulerConfig``, ``ValidationConfig``,
+    ``SchedulerConfig``, ``ValidationConfig``,
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
 
@@ -311,6 +312,10 @@ class InferenceConfigContainer(ConfigContainerBase):
     """Declarative inference settings (the serializable, args-shaped layer). Use
     ``InferenceSetupConfig.to_inference_config(model, ...)`` to build the runtime
     ``megatron.core.inference.config.InferenceConfig`` consumed by the engine."""
+
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    """Optimizer settings. Inference never builds an optimizer; this section carries the
+    optimizer-owned values (e.g. precision flags) that shared code reads from the run config."""
 
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)

@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
@@ -833,8 +834,8 @@ def inference_cfg_container_from_args(
     """Build an InferenceConfigContainer from the argparse arguments.
 
     This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that
-    inference needs (no optimizer, scheduler, training, validation, DDP, rerun, or straggler
-    configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
+    inference needs (an optimizer settings section, but no scheduler, training, validation, DDP,
+    rerun, or straggler configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
 
     Args:
         args: Parsed and validated argparse namespace (e.g. from ``parse_and_validate_args``).
@@ -864,6 +865,7 @@ def inference_cfg_container_from_args(
         model=model_cfg,
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         inference=inference_cfg_from_args(args),
+        optimizer=_default_config_from_args(OptimizerConfig, args),
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
