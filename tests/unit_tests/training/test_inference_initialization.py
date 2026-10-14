@@ -236,14 +236,37 @@ def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch
     distributed.assert_not_called()
 
 
-def test_distributed_training_services_require_explicit_opt_in(monkeypatch, run_config):
+@pytest.mark.parametrize("native_model", [False, True])
+@pytest.mark.parametrize("decoder_overlap", [False, True])
+def test_distributed_training_services_require_explicit_opt_in(
+    monkeypatch, run_config, native_model, decoder_overlap
+):
+    import torch
+
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.models import GPTModelConfig
+
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.rank = 0
     args.async_save = True
     args.use_persistent_ckpt_worker = True
-    args.tp_comm_overlap = True
+    args.tp_comm_overlap = not native_model
+    args.num_layers, args.hidden_size, args.num_attention_heads = 4, 128, 8
+    args.params_dtype = torch.float32
+    args.seq_length, args.decoder_seq_length = 64, 96
+    args.decoder_tp_comm_overlap = decoder_overlap
+    args.micro_batch_size = 7  # Deliberately stale; cfg.train owns the input.
+    run_config.train.micro_batch_size = 3
+    if native_model:
+        run_config.model = GPTModelConfig(
+            transformer=TransformerConfig(
+                num_layers=4, hidden_size=128, num_attention_heads=8, tp_comm_overlap=True
+            ),
+            seq_length=1024,  # Position capacity must not be used for buffer sizing.
+            tp_comm_overlap_cfg={"qkv_fprop": {"method": "ring_exchange"}},
+        )
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
@@ -275,6 +298,15 @@ def test_distributed_training_services_require_explicit_opt_in(monkeypatch, run_
         "_compile_dependencies",
         "_initialize_tp_communicators",
     ]
+    tp_call = initialize._initialize_tp_communicators.call_args
+    assert isinstance(tp_call.args[0], TransformerConfig)
+    assert tp_call.kwargs["sequence_length"] == (96 if decoder_overlap else 64)
+    assert tp_call.kwargs["micro_batch_size"] == 3
+    if native_model:
+        assert tp_call.args[0] is run_config.model.transformer
+        assert tp_call.kwargs["tp_comm_overlap_cfg"] == run_config.model.tp_comm_overlap_cfg
+    else:
+        assert tp_call.kwargs["tp_comm_overlap_cfg"] == args.tp_comm_overlap_cfg
 
 
 @pytest.mark.parametrize("is_vlm,is_mimo", [(False, False), (True, False), (True, True)])

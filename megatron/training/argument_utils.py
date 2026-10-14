@@ -617,6 +617,7 @@ def gpt_config_from_args(
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
 
+    kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = import_module(args.spec)
 
@@ -705,6 +706,7 @@ def hybrid_config_from_args(
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
 
+    kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if transformer_cfg.transformer_impl == "inference_optimized":
         assert (
             not transformer_cfg.inference_fuse_tp_communication

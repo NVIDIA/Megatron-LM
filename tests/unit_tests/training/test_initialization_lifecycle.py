@@ -3,6 +3,7 @@
 """Tests for config construction before training runtime initialization."""
 
 from argparse import ArgumentParser, Namespace
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import timedelta
 from types import SimpleNamespace
@@ -46,6 +47,86 @@ def _runtime_args():
         exit_signal_handler_for_training=False,
         disable_jit_fuser=False,
     )
+
+
+@pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
+@pytest.mark.parametrize(
+    "overrides", [None, "overlap.yaml", {"qkv_fprop": {"method": "ring_exchange"}}]
+)
+def test_tp_user_buffer_overrides_reach_model_config(adapter, overrides):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.tp_comm_overlap_cfg = overrides
+    config = adapter(
+        args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
+    )
+    assert config.tp_comm_overlap_cfg == overrides
+
+
+@pytest.mark.parametrize("te_version", ["1.8.0", "1.9.0", "2.7.0"])
+@pytest.mark.parametrize("fp8,bf16_layers", [(None, 0), ("hybrid", 0), ("hybrid", 1)])
+@pytest.mark.parametrize("override_source", ["none", "dict", "file"])
+def test_tp_user_buffers_use_config_and_explicit_batch_shape(
+    monkeypatch, tmp_path, te_version, fp8, bf16_layers, override_source
+):
+    from transformer_engine.pytorch import module as te_module
+
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=128,
+        num_attention_heads=8,
+        tensor_model_parallel_size=2,
+        context_parallel_size=2,
+        fp8=fp8,
+        fp8_recipe="tensorwise",
+        first_last_layers_bf16=bool(bf16_layers),
+        num_layers_at_start_in_bf16=bf16_layers,
+        tp_comm_bootstrap_backend="gloo",
+    )
+    overrides = {"qkv_fprop": {"method": "ring_exchange"}}
+    source = overrides if override_source == "dict" else None
+    if override_source == "file":
+        path = tmp_path / "overlap.yaml"
+        path.write_text("qkv_fprop:\n  method: ring_exchange\n")
+        source = str(path)
+    initialize_ub, create_group = Mock(), Mock()
+    modes = SimpleNamespace(NONE="none", FP8="fp8")
+    monkeypatch.setattr(te_module.base, "initialize_ub", initialize_ub)
+    monkeypatch.setattr(te_module.base, "UserBufferQuantizationMode", modes, raising=False)
+    monkeypatch.setattr(initialize, "create_group", create_group)
+    monkeypatch.setattr(
+        initialize, "get_args", Mock(side_effect=AssertionError("global args read"))
+    )
+    monkeypatch.setattr(initialize, "get_te_version", lambda: te_version)
+    monkeypatch.setattr(
+        initialize,
+        "is_te_min_version",
+        lambda minimum: tuple(map(int, te_version.split(".")))
+        >= tuple(map(int, minimum.split("."))),
+    )
+    warning = (
+        pytest.warns(UserWarning, match="supports only MPI")
+        if te_version == "1.8.0"
+        else nullcontext()
+    )
+    with warning:
+        initialize._initialize_tp_communicators(
+            config, sequence_length=96, micro_batch_size=3, tp_comm_overlap_cfg=source
+        )
+    expected = dict(shape=[144, 128], tp_size=2, ub_cfgs={} if source is None else overrides)
+    if te_version == "2.7.0":
+        expected["quantization_modes"] = [modes.FP8 if fp8 else modes.NONE]
+        if bf16_layers:
+            expected["quantization_modes"].append(modes.NONE)
+    else:
+        expected["use_fp8"] = fp8 is not None
+    if te_version == "1.8.0":
+        create_group.assert_called_once_with(backend="mpi", group_desc="TP_BOOTSTRAP_GROUP_MPI")
+    else:
+        expected["bootstrap_backend"] = "gloo"
+        create_group.assert_not_called()
+    initialize_ub.assert_called_once_with(**expected)
 
 
 def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_config):
