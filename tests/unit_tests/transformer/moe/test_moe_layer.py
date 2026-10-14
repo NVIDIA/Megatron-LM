@@ -12,6 +12,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import _set_capture_end, _set_capture_start
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -19,6 +21,46 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+
+
+class _RecordingMegakernel(torch.nn.Module):
+    """Megakernel backend stand-in that records the routes it receives."""
+
+    def __init__(self):
+        super().__init__()
+        self.routes = []
+
+    def forward(self, hidden_states, probs, routing_map):
+        self.routes.append((probs.detach().clone(), routing_map.clone()))
+        return hidden_states * 2
+
+
+def _megakernel_moe_layer(monkeypatch, backend, **config_overrides):
+    """Build a two-expert MoE layer that runs ``backend`` as its megakernel."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=128,
+        moe_shared_expert_intermediate_size=128,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_grouped_gemm=True,
+        gated_linear_unit=True,
+        activation_func=torch.nn.functional.silu,
+        gradient_accumulation_fusion=True,
+        moe_megakernel_backend="mok",
+        add_bias_linear=False,
+        bf16=True,
+        use_cpu_initialization=True,
+        **config_overrides,
+    )
+    submodules = get_submodules(
+        get_gpt_layer_with_transformer_engine_submodules(num_experts=2, moe_grouped_gemm=True).mlp
+    )
+    monkeypatch.setattr(moe_layer_module, "build_megakernel_backend", lambda **kwargs: backend)
+    return MoELayer(config, submodules)
 
 
 class TestMoELayerInit:
@@ -88,7 +130,99 @@ class TestMoELayerInit:
             assert router_forward.call_args.args[0] is hidden
             torch.testing.assert_close(router_forward.call_args.args[1], padding_mask.T.bool())
             assert router_forward.call_args.kwargs["input_ids"] is input_ids
-            backend_forward.assert_called_once_with(hidden, probs, routing_map)
+            backend_forward.assert_called_once()
+            backend_hidden, backend_probs, backend_routing_map = backend_forward.call_args.args
+            assert backend_hidden is hidden
+            # Tokens flatten sequence-first, so the padded tokens are rows 3, 4 and 5.
+            valid = torch.tensor([[True], [True], [True], [False], [False], [False]])
+            torch.testing.assert_close(backend_probs, probs * valid)
+            torch.testing.assert_close(backend_routing_map, routing_map & valid)
+        finally:
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0.dev0"),
+        reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
+    )
+    @pytest.mark.parametrize("path", ["eager", "recompute", "moe_router_graph_replay"])
+    def test_megakernel_receives_no_padding_routes(self, monkeypatch, path):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        try:
+            config_overrides = {
+                "eager": {},
+                "recompute": {"recompute_granularity": "selective", "recompute_modules": ["moe"]},
+                "moe_router_graph_replay": {
+                    "cuda_graph_impl": "transformer_engine",
+                    "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.moe_router],
+                },
+            }[path]
+            backend = _RecordingMegakernel()
+            layer = _megakernel_moe_layer(monkeypatch, backend, **config_overrides)
+
+            hidden = torch.randn((3, 2, 128), dtype=torch.bfloat16, requires_grad=True)
+            padding_mask = torch.tensor([[False, False, True], [False, True, True]])
+            probs = torch.rand((6, 2))
+            routing_map = torch.tensor([[True, False], [False, True]] * 3)
+            router_forward = Mock(return_value=(probs, routing_map))
+            monkeypatch.setattr(layer.router, "forward", router_forward)
+            if path == "moe_router_graph_replay":
+                # Replay hands the layer the router outputs captured in its graph, unmasked.
+                layer.cudagraph_tensor_store.set(
+                    hidden_states=hidden, probs=probs, routing_map=routing_map
+                )
+
+            output, bias = layer(hidden, padding_mask=padding_mask)
+            output.sum().backward()
+            layer.cudagraph_tensor_store.clear()
+
+            assert bias is None
+            # Recompute reruns the router and the megakernel in backward; replay skips the router.
+            router_calls, backend_calls = {
+                "eager": (1, 1),
+                "recompute": (2, 2),
+                "moe_router_graph_replay": (0, 1),
+            }[path]
+            assert router_forward.call_count == router_calls
+            assert len(backend.routes) == backend_calls
+            # Tokens flatten sequence-first, so the padded tokens are rows 3, 4 and 5.
+            valid = torch.tensor([[True], [True], [True], [False], [False], [False]])
+            for backend_probs, backend_routing_map in backend.routes:
+                torch.testing.assert_close(backend_probs, probs * valid)
+                torch.testing.assert_close(backend_routing_map, routing_map & valid)
+        finally:
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0.dev0"),
+        reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
+    )
+    def test_megakernel_moe_router_graph_capture_outputs_unmasked_routes(self, monkeypatch):
+        Utils.initialize_model_parallel(1, 1)
+        try:
+            backend = _RecordingMegakernel()
+            layer = _megakernel_moe_layer(
+                monkeypatch,
+                backend,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
+            )
+            hidden = torch.zeros((3, 2, 128), dtype=torch.bfloat16)
+            padding_mask = torch.tensor([[False, False, True], [False, True, True]])
+            probs = torch.rand((6, 2))
+            routing_map = torch.tensor([[True, False], [False, True]] * 3)
+            monkeypatch.setattr(layer.router, "forward", Mock(return_value=(probs, routing_map)))
+
+            _set_capture_start()
+            try:
+                graph_outputs = layer(hidden, padding_mask=padding_mask)
+            finally:
+                _set_capture_end()
+
+            # The graph ends after the router, so the mask is applied at replay, not captured.
+            assert graph_outputs[0] is hidden
+            assert graph_outputs[1] is probs and graph_outputs[2] is routing_map
+            assert backend.routes == []
         finally:
             Utils.destroy_model_parallel()
 
