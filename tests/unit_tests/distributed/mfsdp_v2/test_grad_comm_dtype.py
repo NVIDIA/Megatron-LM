@@ -209,20 +209,26 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
     x = torch.randn(3, 8, device=device, dtype=torch.bfloat16)
     target = torch.randn(3, 4, device=device, dtype=torch.bfloat16)
 
-    for _ in range(3):
-        baseline_optimizer.zero_grad()
-        optimizer.zero_grad()
+    def train(module, module_optimizer, *, reduce_grads: bool) -> list[torch.Tensor]:
+        losses = []
+        for _ in range(3):
+            module_optimizer.zero_grad()
+            # The fp32 baseline computes in bf16 like the FSDP model's bf16 compute weights.
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=reduce_grads):
+                output = module(x)
+            loss = torch.nn.functional.mse_loss(output.float(), target.float())
+            losses.append(loss.detach())
+            loss.backward()
+            if reduce_grads:
+                # The unsharded baseline needs the same DP average as FSDP.
+                for parameter in module.parameters():
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+            module_optimizer.step()
+        return losses
 
-        with torch.autocast(device.type, dtype=torch.bfloat16):
-            baseline_out = baseline(x)
-        baseline_loss = torch.nn.functional.mse_loss(baseline_out.float(), target.float())
-        loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
-        torch.testing.assert_close(loss, baseline_loss, rtol=0, atol=atol)
+    baseline_losses = train(baseline, baseline_optimizer, reduce_grads=True)
+    sharded_losses = train(model, optimizer, reduce_grads=False)
 
-        baseline_loss.backward()
-        loss.backward()
-        # The unsharded baseline needs the same DP average as FSDP.
-        for parameter in baseline.parameters():
-            dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
-        baseline_optimizer.step()
-        optimizer.step()
+    torch.testing.assert_close(
+        torch.stack(sharded_losses), torch.stack(baseline_losses), rtol=0, atol=atol
+    )
