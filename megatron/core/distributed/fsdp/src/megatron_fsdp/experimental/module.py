@@ -94,12 +94,6 @@ class FsdpModule:
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
-        num_trainable_parameters = len(
-            {id(parameter) for parameter in owned_parameters.values() if parameter.requires_grad}
-        )
-        if grad_accumulation_count is None:
-            grad_accumulation_count = num_trainable_parameters
-        self._trainable_parameter_countdown = Countdown(grad_accumulation_count)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
         parameter_groups = []
@@ -125,6 +119,12 @@ class FsdpModule:
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
+        num_trainable_parameters = len(
+            {id(parameter) for parameter in owned_parameters.values() if parameter.requires_grad}
+        )
+        if grad_accumulation_count is None:
+            grad_accumulation_count = num_trainable_parameters
+        self._trainable_parameter_countdown = Countdown(grad_accumulation_count)
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``register_hooks`` is
         # False (i.e. execution hooks are disabled), so it must not be turned off
