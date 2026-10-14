@@ -102,8 +102,7 @@ def fully_shard(
             is registered independently.
         grad_accumulation_count: Total parameter-gradient callbacks per reduction
             window, including contributions from separate GraphTasks and delayed
-            weight gradients. Defaults to one per owned trainable parameter. Must
-            be zero exactly when no trainable parameters are owned by this unit.
+            weight gradients. Defaults to one per owned trainable parameter.
             The scheduler must declare the complete count before sharding the unit.
     """
     if isinstance(module, FsdpModule):

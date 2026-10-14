@@ -87,8 +87,7 @@ class FsdpModule:
 
         Args:
             grad_accumulation_count: Total parameter-gradient callbacks per reduction
-                window. Defaults to one per owned trainable parameter. Must be zero
-                exactly when the unit owns no trainable parameters.
+                window. Defaults to one per owned trainable parameter.
         """
         self._context = context
         self._unshard_event = None
@@ -100,11 +99,6 @@ class FsdpModule:
         )
         if grad_accumulation_count is None:
             grad_accumulation_count = num_trainable_parameters
-        elif (grad_accumulation_count > 0) != bool(num_trainable_parameters):
-            raise ValueError(
-                "grad_accumulation_count must be zero exactly when the module "
-                "owns no trainable parameters."
-            )
         self._trainable_parameter_countdown = Countdown(grad_accumulation_count)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
