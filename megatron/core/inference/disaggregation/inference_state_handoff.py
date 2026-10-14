@@ -291,6 +291,11 @@ class InferenceStateHandoffMixin:
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
+        if role == "decode" and self.context.config.cuda_graph_all_prefills:
+            raise ValueError(
+                "Disaggregated decode does not support cuda_graph_all_prefills; "
+                "eviction recovery must be able to prefill without a matching CUDA graph"
+            )
         if self.context.is_hybrid_model:
             if role == "decode" and self.context.mamba_slot_allocator is not None:
                 raise RuntimeError(

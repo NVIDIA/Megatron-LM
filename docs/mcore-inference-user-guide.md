@@ -856,6 +856,9 @@ currently reject `offload` and `recompute` because suspend/resume can invalidate
 the registered KV/SSM buffers. Under memory pressure, evicted decode requests
 recover through the engine's local recomputation path; new requests still
 route to prefill.
+Decode workers reject `--inference-cuda-graph-all-prefills`, since recovery
+must be able to prefill without a matching CUDA graph. Prefill workers may
+still use it.
 
 For RL, only the final decode completion writes to the request metadata ledger
 or payload stager. Handoffs preserve the request UID, policy/KV epoch history,

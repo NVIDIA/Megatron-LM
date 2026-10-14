@@ -89,7 +89,7 @@ class InferenceEngineCapabilities:
         return cls(
             context_length=int(engine.context.max_sequence_length),
             kv_cache_block_size=int(engine.context.block_size_tokens),
-            # Block zero is the allocator's root and cannot hold request KV.
+            # The last block is the allocator's dummy block, not request KV storage.
             total_kv_blocks=max(0, int(allocator.pool_size) - 1),
             max_num_seqs=int(engine.context.max_requests),
             max_num_batched_tokens=int(engine.context.max_tokens),

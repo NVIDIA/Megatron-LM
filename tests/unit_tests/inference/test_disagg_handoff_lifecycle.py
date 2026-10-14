@@ -399,7 +399,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
     )
     engine.context = SimpleNamespace(
-        config=SimpleNamespace(kv_transport_backend="nccl"),
+        config=SimpleNamespace(kv_transport_backend="nccl", cuda_graph_all_prefills=False),
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
         moe_enable_routing_replay=False,
         kv_block_allocator=allocator,
@@ -430,6 +430,9 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
     ):
         engine.setup_kv_transfer("decode")
         assert not allocator.enable_handoff_pinning
+        engine.context.config.cuda_graph_all_prefills = True
+        with pytest.raises(ValueError, match="does not support cuda_graph_all_prefills"):
+            engine.setup_kv_transfer("decode")
         engine.setup_kv_transfer("prefill")
         assert allocator.enable_handoff_pinning
         engine.setup_kv_transfer("prefill")
@@ -455,7 +458,7 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     engine.context = SimpleNamespace(
-        config=SimpleNamespace(kv_transport_backend="nixl"),
+        config=SimpleNamespace(kv_transport_backend="nixl", cuda_graph_all_prefills=False),
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
         moe_enable_routing_replay=False,
         kv_block_allocator=SimpleNamespace(
@@ -1760,6 +1763,7 @@ def test_transfer_rejects_unsupported_cache_state(mode, routing_replay, error, r
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     engine.context = SimpleNamespace(
+        config=SimpleNamespace(cuda_graph_all_prefills=False),
         is_hybrid_model=False,
         kv_cache_management_mode=mode,
         moe_enable_routing_replay=routing_replay,
