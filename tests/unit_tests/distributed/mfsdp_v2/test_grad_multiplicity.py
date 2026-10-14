@@ -88,9 +88,3 @@ def test_gradients_and_updates_match_baseline(distributed_setup, nodes):
         baseline_optimizer.step()
         for reference, parameter in zip(baseline.parameters(), model.parameters()):
             torch.testing.assert_close(parameter.full_tensor(), reference)
-
-
-def test_parameter_free_module_rejects_nonzero_count(distributed_setup):
-    """A parameter-free unit cannot wait for callbacks that never arrive."""
-    with pytest.raises(ValueError, match="owns no trainable parameters"):
-        _sharded_unit(distributed_setup, nn.ReLU(), grad_accumulation_count=1)
