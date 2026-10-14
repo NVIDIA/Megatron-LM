@@ -1657,7 +1657,8 @@ class TestGTPCaptureParamReadiness:
 
         dense = Param(GTPChain.GRAPHED.value)
         expert = Param(GTPChain.GRAPHED.value, allreduce=False)
-        runner = type("Runner", (), {"gtp_remat": True})()
+        # The graphed module stores no collection, so the plan uses the global GTP groups.
+        runner = type("Runner", (), {"gtp_remat": True, "base_module": object()})()
 
         cuda_graphs_module._CudaGraphRunner._set_gtp_finalize_hook_plan(
             runner, [dense, expert, dense]

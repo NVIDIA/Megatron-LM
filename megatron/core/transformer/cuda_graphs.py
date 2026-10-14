@@ -21,7 +21,7 @@ import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     cudagraph_needs_generator_registration,
@@ -1092,17 +1092,23 @@ class _CudaGraphRunner(torch.nn.Module):
             torch.cuda.current_stream().wait_stream(s)
 
     def _set_gtp_finalize_hook_plan(self, finalized_params):
-        """Build the replay hook plan from captured GRAPHED finalization occurrences."""
+        """Build the replay hook plan from captured GRAPHED finalization occurrences.
+
+        Each parameter's hook runs on the reduce-scatter stream of its GTP group: `gtp_remat`
+        for dense parameters and `expt_gtp_remat` for expert parameters. The groups come from
+        the graphed module's `pg_collection`, the collection its GTP layers took their groups
+        from. A field set to None there means that axis is off. `resolve_gtp_remat_group` uses
+        the global groups when the module has no collection or the collection lacks the field.
+        """
         self.finalized_during_bwd_capture = list(finalized_params) if self.gtp_remat else []
         self._gtp_finalize_hook_plan = []
         if not self.finalized_during_bwd_capture:
             return
 
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        dense_group = pg_collection.gtp_remat
-        expert_group = pg_collection.expt_gtp_remat
+        # Not every graphed module stores a collection.
+        pg_collection = getattr(self.base_module, "pg_collection", None)
+        dense_group = resolve_gtp_remat_group(pg_collection, is_expert=False)
+        expert_group = resolve_gtp_remat_group(pg_collection, is_expert=True)
         params_by_group = defaultdict(list)
         for param in self.finalized_during_bwd_capture:
             is_expert = not getattr(param, 'allreduce', True)
