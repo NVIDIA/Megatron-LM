@@ -1871,10 +1871,6 @@ def validate_args(args, defaults={}):
         exit_interval=args.exit_interval,
     )
 
-    rl_cfg.resolve_grad_buffer_offload(
-        reuse_grad_buf_for_mxfp8_param_ag=args.reuse_grad_buf_for_mxfp8_param_ag
-    )
-
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (

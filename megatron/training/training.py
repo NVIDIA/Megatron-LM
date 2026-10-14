@@ -2564,8 +2564,8 @@ def _forward_backward_grad_context(args):
     return grad_context, forward_only
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
-    """Build the model."""
+def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
+    """Build the model using a finalized DDP config, or legacy args if omitted."""
     cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
@@ -2703,11 +2703,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         config = get_model_config(model[0])
 
-        ddp_config = get_megatron_ddp_config(args)
-        from megatron.training.argument_utils import _default_config_from_args
-        from megatron.training.config.rl_config import RLConfig
-
-        ddp_config = _default_config_from_args(RLConfig, args).resolve_ddp_config(ddp_config)
+        if ddp_config is None:
+            ddp_config = get_megatron_ddp_config(args)
         if not getattr(args, "use_torch_fsdp2", False):
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(
@@ -2947,7 +2944,7 @@ def setup_model_and_optimizer(
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
-                ddp_config=cfg.rl.resolve_ddp_config(cfg.ddp),
+                ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
                 use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
@@ -2958,7 +2955,13 @@ def setup_model_and_optimizer(
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
-            return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
+            return get_model(
+                model_provider_func,
+                model_type,
+                wrap_with_ddp=wrap_with_ddp,
+                pg_collection=pg_collection,
+                ddp_config=cfg_container.ddp if cfg_container is not None else None,
+            )
 
     # Configure GTP weight-remat padding/loss reduction before model construction (pad
     # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it

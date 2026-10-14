@@ -1,8 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import argparse
-from dataclasses import dataclass, field, replace
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from megatron.core.distributed import DistributedDataParallelConfig
 
 SubmissionGranularity = Literal["R", "G", "B"]
 ConsumptionGranularity = Literal["G", "B"]
@@ -247,30 +250,36 @@ class RLConfig:
                     "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                 )
 
-    def resolve_grad_buffer_offload(self, *, reuse_grad_buf_for_mxfp8_param_ag: bool) -> bool:
-        """Return the DDP gradient-buffer layout required by RL optimizer offload."""
-        grad_buffer_offload = bool(
+    @property
+    def requires_grad_buffer_offload(self) -> bool:
+        """Whether RL releases gradient storage between training and inference."""
+        return (
             self.perform_rl_step
             and self.rl_offload_optimizer_during_inference
             and not self.rl_training_cuda_graphs
         )
-        if grad_buffer_offload and reuse_grad_buf_for_mxfp8_param_ag:
+
+    def validate_ddp_config(self, ddp_config: "DistributedDataParallelConfig") -> None:
+        """Check the requested and RL-required layouts without changing either config."""
+        if (
+            ddp_config.grad_buffer_offload or self.requires_grad_buffer_offload
+        ) and ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             raise ValueError(
-                "--rl-offload-optimizer-during-inference is incompatible with "
-                "--reuse-grad-buf-for-mxfp8-param-ag when RL training CUDA graphs are disabled: "
+                "Gradient-buffer offload is incompatible with "
+                "--reuse-grad-buf-for-mxfp8-param-ag: "
                 "parameters share the gradient-buffer storage that offload releases."
             )
-        return grad_buffer_offload
 
-    def resolve_ddp_config(self, ddp_config):
-        """Build a validated DDP config without modifying the user's explicit settings."""
-        if not hasattr(ddp_config, "grad_buffer_offload"):
-            # Torch FSDP uses a different configuration without classic-DDP buffer layouts.
-            return replace(ddp_config)
-        required = self.resolve_grad_buffer_offload(
-            reuse_grad_buf_for_mxfp8_param_ag=ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-        )
-        return replace(ddp_config, grad_buffer_offload=ddp_config.grad_buffer_offload or required)
+    def finalize_ddp_config(self, ddp_config: "DistributedDataParallelConfig") -> None:
+        """Apply the RL layout during container finalization, before DDP allocates buffers.
+
+        Unlike validation, this updates the run's owned config so checkpoint metadata
+        and model construction see the same effective layout. Do not change the RL
+        offload policy after model setup; the buffer layout is fixed at construction.
+        """
+        self.validate_ddp_config(ddp_config)
+        if self.requires_grad_buffer_offload:
+            ddp_config.grad_buffer_offload = True
 
     def validate_run(
         self,
