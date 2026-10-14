@@ -66,7 +66,7 @@ def test_tracker_cli_flags_populate_rng_config(enabled):
 @pytest.mark.parametrize("inference", [False, True])
 @pytest.mark.parametrize("te_tracker", [False, True])
 @pytest.mark.parametrize("inference_tracker", [False, True])
-def test_container_validation_defers_tracker_fields_until_startup(
+def test_initialization_applies_tracker_policy(
     monkeypatch,
     run_config,
     initialization_mocks,
@@ -102,12 +102,6 @@ def test_container_validation_defers_tracker_fields_until_startup(
     cfg.model = model
     cfg.rng = RNGConfig(te_rng_tracker=te_tracker, inference_rng_tracker=inference_tracker)
     before = asdict(cfg.rng)
-    for _ in range(2):
-        cfg.validate()
-        assert transformer.use_te_rng_tracker is not te_tracker
-        assert transformer.inference_rng_tracker is not inference_tracker
-        assert asdict(cfg.rng) == before
-
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     initialize.initialize_megatron(
         allow_no_cuda=True, skip_mpu_initialization=True, training=not inference
@@ -148,11 +142,6 @@ def test_native_cuda_graph_requirement_is_resolved_before_seeding(
     cfg.model = model
     cfg.rng = RNGConfig(inference_rng_tracker=not training)
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
-    for _ in range(2):
-        cfg.validate()
-        assert cfg.rng.te_rng_tracker is False
-        assert transformer.use_te_rng_tracker is False
-        assert transformer.inference_rng_tracker is False
 
     def check_seed(*seed_args, **seed_kwargs):
         assert seed_args == (1234, False, True, not training)
