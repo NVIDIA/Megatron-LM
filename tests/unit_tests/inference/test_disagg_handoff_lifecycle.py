@@ -1096,6 +1096,7 @@ def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
     block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
     pending = _pending_import(engine, 4, block_id, 104)
     pending.handle = _PendingHandle()
+    assert engine._reserve_handoff_hashes(4, [104])
     engine._pending_kv_imports.append(pending)
     engine._record_handoff_completion_notification(4, failed=True, source_safe=False)
 
@@ -1114,6 +1115,8 @@ def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
     assert engine.context.kv_block_allocator.releases == []
     assert not engine._pending_kv_imports
     assert engine._quarantined_kv_imports == [pending]
+    assert 104 not in engine._pending_prefill_block_hashes()
+    assert engine._reserve_handoff_hashes(5, [104])
     log_error.assert_called_once_with(
         "Quarantining request %d cache storage after an incomplete handoff", 4
     )
@@ -1124,6 +1127,7 @@ def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
 
     assert engine.context.kv_block_allocator.releases
     assert not engine._quarantined_kv_imports
+    assert engine._pending_handoff_hash_owners[104] == 5
     engine._notify_kv_read_done.assert_called_once_with(4)
     engine._notify_request_aborted.assert_called_once_with(4, source_safe=True)
 
@@ -1686,28 +1690,42 @@ def test_nccl_handoff_reuses_decode_cached_prefix(handoff_loop):
 
 
 @pytest.mark.parametrize("is_push", [False, True], ids=["pull", "push"])
-def test_fully_cached_transformer_handoff_skips_transfer(handoff_loop, is_push):
-    engine = _HandoffHarness(handoff_loop)
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_fully_cached_handoff_skips_kv_but_imports_ssm(handoff_loop, is_push, hybrid):
+    engine = _HandoffHarness(handoff_loop, hybrid=hybrid, available=1)
     engine._kv_transfer_agent.is_push = is_push
     engine._notify_kv_transfer_ready = mock.Mock()
     prompt = [4] * 8
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     engine.context.kv_block_allocator.kv_hash_to_block_id.update(zip(hashes, [4, 5]))
 
+    meta = {
+        "request_id": 10,
+        "resume_tokens": [99],
+        "pp_metas": [
+            {"tp_metas": {"rank": 0}, "block_ids": [100, 101]},
+            {"tp_metas": {"rank": 1}, "block_ids": [200, 201]},
+        ],
+    }
+    if hybrid:
+        meta["ssm"] = {"conv": {"request_id": 10}, "recurrent": {"request_id": 10}}
     engine.add_request_with_kv_handoff(
-        10,
-        prompt,
-        SamplingParams(num_tokens_to_generate=2),
-        {"request_id": 10, "resume_tokens": [99]},
-        [100, 101],
+        10, prompt, SamplingParams(num_tokens_to_generate=2), meta, [100, 101]
     )
     _drain_loop(handoff_loop)
 
     pending = engine._pending_kv_imports[0]
     assert pending.local_blocks == [4, 5]
-    assert pending.handle is None
+    assert (pending.handle is not None) == (hybrid and is_push)
     assert not engine._kv_transfer_agent.calls
-    engine._notify_kv_transfer_ready.assert_not_called()
+    if hybrid:
+        assert pending.ssm.live_slot == 20
+        for kind, agent in engine._ssm_transfer_agents.items():
+            assert agent.calls == [(meta["ssm"][kind], [], [20])]
+    if hybrid and is_push:
+        engine._notify_kv_transfer_ready.assert_called_once_with(10, 2)
+    else:
+        engine._notify_kv_transfer_ready.assert_not_called()
 
 
 def test_decode_role_rejects_prompt_scheduling(handoff_loop):

@@ -1001,11 +1001,13 @@ class InferenceStateHandoffMixin:
                     handoff.kv_meta, handoff.src_block_ids, len(cached_blocks)
                 )
                 if self._kv_transfer_agent.is_push:
-                    plans = [
-                        self._kv_transfer_agent.prepare_pull_blocks(
-                            transfer_meta, transfer_src_blocks, imported_blocks
+                    plans = []
+                    if imported_blocks:
+                        plans.append(
+                            self._kv_transfer_agent.prepare_pull_blocks(
+                                transfer_meta, transfer_src_blocks, imported_blocks
+                            )
                         )
-                    ]
                     if ssm_import is not None:
                         for state_kind in _SSM_STATE_KINDS:
                             plans.append(
@@ -1019,9 +1021,10 @@ class InferenceStateHandoffMixin:
                     self._notify_kv_transfer_ready(handoff.request_id, len(cached_blocks))
                     handle = self._kv_transfer_agent.start_prepared(plans)
                 else:
-                    handle = self._kv_transfer_agent.begin_pull_blocks(
-                        transfer_meta, transfer_src_blocks, imported_blocks
-                    )
+                    if imported_blocks:
+                        handle = self._kv_transfer_agent.begin_pull_blocks(
+                            transfer_meta, transfer_src_blocks, imported_blocks
+                        )
                     if ssm_import is not None:
                         self._start_ssm_handoff_import(handoff.request_id, ssm_meta, ssm_import)
             except Exception as exc:
@@ -1444,6 +1447,11 @@ class InferenceStateHandoffMixin:
         self._report_completed_kv_imports()
         return int(self.has_admittable_kv_import)
 
+    def _quarantine_kv_import(self, pending: PendingKvImport) -> None:
+        """Retain unsafe storage, but stop reserving hashes this import cannot publish."""
+        self._release_handoff_hash_reservations(pending.request_id, pending.hashes)
+        self._quarantined_kv_imports.append(pending)
+
     def _poll_quarantined_kv_imports(self) -> None:
         """Reclaim failed imports once their transfer handles become terminal."""
 
@@ -1509,7 +1517,7 @@ class InferenceStateHandoffMixin:
                     if safe_to_release:
                         self._release_pending_kv_import(pending)
                     else:
-                        self._quarantined_kv_imports.append(pending)
+                        self._quarantine_kv_import(pending)
                     if not pending.future.done():
                         pending.future.cancel()
                     self._notify_request_aborted(pending.request_id, source_safe=safe_to_release)
@@ -1536,7 +1544,7 @@ class InferenceStateHandoffMixin:
                 if safe_to_release:
                     self._release_pending_kv_import(pending)
                 else:
-                    self._quarantined_kv_imports.append(pending)
+                    self._quarantine_kv_import(pending)
                     logging.error(
                         "Quarantining request %d cache storage after an incomplete handoff",
                         pending.request_id,
