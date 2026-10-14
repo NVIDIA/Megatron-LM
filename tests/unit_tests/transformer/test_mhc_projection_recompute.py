@@ -1,9 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
+
 import pytest
 import torch
 
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import HyperConnectionModule, _proj_rms_impl
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -86,3 +88,28 @@ def test_mhc_projection_recompute_preserves_math_and_saves_activation_dtype(
     bf16_input = (torch.bfloat16, (8, 32))
     assert fp32_input not in saved
     assert bf16_input in saved
+
+
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_mhc_projection_stays_fp32_under_autocast(eps_inside_sqrt):
+    """The FP32 projection/RMS recipe must not be downcast by an outer autocast scope."""
+    torch.manual_seed(456)
+    x = torch.randn(8, 32)
+    weight = torch.randn(24, 32)
+    eps = 1e-6
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        actual_proj, actual_norm = _proj_rms_impl(x, weight, eps, eps_inside_sqrt)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        with torch.autocast(device_type="cpu", enabled=False):
+            expected_proj = torch.matmul(x.float(), weight.float().t())
+            if eps_inside_sqrt:
+                expected_norm = torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
+            else:
+                expected_norm = 1.0 / (x.float().norm(dim=-1, keepdim=True) / math.sqrt(32) + eps)
+
+    assert actual_proj.dtype == torch.float32
+    assert actual_norm.dtype == torch.float32
+    torch.testing.assert_close(actual_proj, expected_proj)
+    torch.testing.assert_close(actual_norm, expected_norm)
