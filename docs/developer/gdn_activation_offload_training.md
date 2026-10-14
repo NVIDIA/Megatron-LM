@@ -26,8 +26,25 @@ disabled and fraction-1 processes: four two-rank runs, eight rank files and
 24 exact complete rank-step states. Each comparison includes one warmup and two
 steady optimizer steps, with all pre-reset pool counts zero and positive transfer
 bytes in enabled arms. These runs use sequence 128 and the 1024-element threshold;
-they produce no timed samples. The local publication evidence is indexed by
-`publication-20261011/publication-checks.json`.
+they produce no timed samples. The committed functional source snapshot is
+`82ac2c88f7ba2f3b9aae3ad779d8575596ec2fec`; some jobs started with the backend fix
+as working-tree edits before that commit. The subsequent submission commit
+`8e8c43c84a4901b8a0d1d68409e6d81e3d33c5ff` changes documentation and kernel-registry
+notes. It does not change training execution.
+
+[Public post-rebase evidence](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/gdn-offload-post-rebase-20261014)
+includes original rank stdout/stderr, Qwen rank JSON results and combined run logs,
+test commands, source-file hashes, validation output and a CPU-only verification
+script. The bundle records the exact clean checkout used for the latest-source
+two-rank GPU rerun, separately from the earlier working-tree runs. Its dated tag
+is retained unchanged; the PR also links the bundle by its full commit SHA.
+Qwen training states contain losses and full gradient, updated-weight and Adam
+fingerprints; model weights and private training text are not included. Qwen's
+earlier runs recorded combined logs rather than separate rank stdout/stderr.
+Downloading and comparing these results requires neither GPUs nor local artifact
+paths. Rerunning pretrained training requires the original weights and dataset.
+Historical four-rank and memory/runtime results below retain their original
+source commits and are not described as measurements on the rebased submission.
 
 The 2026-10-06/07/08/10/11 runs use RTX A6000 GPUs, PyTorch 2.11.0+cu130, Transformer
 Engine 2.20.2, FLA 0.5.1 and cuDNN 9.19.0. These public-package container runs
