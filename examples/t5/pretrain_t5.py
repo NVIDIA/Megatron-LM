@@ -129,7 +129,7 @@ def model_provider(
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        fp16_lm_cross_entropy=cfg.optimizer.fp16_lm_cross_entropy,
         parallel_output=True,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,

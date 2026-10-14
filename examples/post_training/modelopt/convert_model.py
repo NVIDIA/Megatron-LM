@@ -149,7 +149,7 @@ if __name__ == "__main__":
             FutureWarning,
             stacklevel=2,
         )
-        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
+        import_dtype = torch.float16 if cfg.optimizer.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
         print_rank_0(

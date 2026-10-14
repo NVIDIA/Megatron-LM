@@ -185,7 +185,7 @@ def calc_params_l2_norm(
             if is_expert:
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
-                data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                data, is_sharded = _get_param_data(param, force_create_fp32_copy, cfg.optimizer.bf16)
                 if data is None:
                     continue
                 if is_gtp:
@@ -195,7 +195,7 @@ def calc_params_l2_norm(
             else:
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
-                    data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                    data, is_sharded = _get_param_data(param, force_create_fp32_copy, cfg.optimizer.bf16)
                     if data is None:
                         continue
                     if is_gtp:

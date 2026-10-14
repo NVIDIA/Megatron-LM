@@ -38,7 +38,7 @@ def load_args_from_checkpoint(args):
     args.add_position_embedding = False
     args.use_rotary_position_embeddings = True
     args.swiglu = True
-    args.bf16 = True
+    cfg.optimizer.bf16 = True
     args.add_bias_linear = False
     args.normalization = "RMSNorm"
     args.tokenizer_type = "Llama2Tokenizer"
@@ -139,7 +139,7 @@ def load_checkpoint_to_model(args):
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
+    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(cfg.optimizer.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)
@@ -259,7 +259,7 @@ def _load_checkpoint(queue, args):
     md.max_position_embeddings = margs.max_position_embeddings
     md.tokenizer_type = margs.tokenizer_type
     md.iteration = margs.iteration
-    md.params_dtype = margs.params_dtype
+    md.params_dtype = mcfg.optimizer.params_dtype
     md.bert_binary_head = margs.bert_binary_head
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embedding_type = margs.position_embedding_type

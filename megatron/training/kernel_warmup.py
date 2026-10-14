@@ -25,7 +25,7 @@ def _warmup_cross_entropy(args: Namespace, tp_group: torch.distributed.ProcessGr
         logits = torch.zeros(
             (sequence, args.micro_batch_size, vocab // tp_group.size()),
             device="cuda",
-            dtype=args.logit_dtype or args.params_dtype,
+            dtype=args.logit_dtype or cfg.optimizer.params_dtype,
             requires_grad=True,
         )
         # Match the model's batch-major labels, including singleton-dimension
@@ -56,7 +56,7 @@ def _warmup_activation(args: Namespace, tp_size: int, width: int, *, flatten: bo
         x = torch.zeros(
             (*leading_shape, width // tp_size * (2 if args.swiglu else 1)),
             device="cuda",
-            dtype=args.params_dtype,
+            dtype=cfg.optimizer.params_dtype,
             requires_grad=True,
         )
         bias = (
@@ -94,7 +94,7 @@ def _warmup_residual(args: Namespace, tp_size: int) -> None:
                 x = torch.zeros(
                     (sequence, args.micro_batch_size, args.hidden_size),
                     device="cuda",
-                    dtype=args.params_dtype,
+                    dtype=cfg.optimizer.params_dtype,
                     requires_grad=True,
                 )
                 residual = torch.zeros_like(

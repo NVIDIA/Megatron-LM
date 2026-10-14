@@ -290,7 +290,7 @@ def model_provider(
         language_rope_scaling=args.use_rope_scaling,
         language_rope_scaling_factor=args.rope_scaling_factor,
         hybrid_layer_pattern=args.hybrid_layer_pattern,
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        fp16_lm_cross_entropy=cfg.optimizer.fp16_lm_cross_entropy,
         image_token_index=image_token_index,
         pixel_shuffle=args.pixel_shuffle,
         conv_merging=getattr(args, "conv_merging", False),

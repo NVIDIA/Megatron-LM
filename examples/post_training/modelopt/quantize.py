@@ -516,7 +516,7 @@ if __name__ == "__main__":
     if args.pretrained_model_path is not None:
         from modelopt.torch.export import import_mcore_gpt_from_hf
 
-        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
+        import_dtype = torch.float16 if cfg.optimizer.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
 

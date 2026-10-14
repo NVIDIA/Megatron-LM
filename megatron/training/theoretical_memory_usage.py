@@ -293,7 +293,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     def num_bytes_per_parameter(data_parallel_size):
         # This estimator assumes bf16 training: bf16 model params, fp32 main gradients,
         # fp32 main params, and fp32 Adam states. See docs/user-guide/features/dist_optimizer.md.
-        return 18 if not args.use_distributed_optimizer else 6 + (12 / data_parallel_size)
+        return 18 if not cfg.optimizer.use_distributed_optimizer else 6 + (12 / data_parallel_size)
 
     weight_and_optimizer_memory = (
         (tp_sharded_params_on_most_loaded_shard + replicated_params_on_most_loaded_shard)

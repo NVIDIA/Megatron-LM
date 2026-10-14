@@ -19,7 +19,7 @@ def get_lsq_config_overrides(args) -> Dict[ParamKey, ParamGroupOverride]:
     and the two would collide on resume.
     """
     lsq_scale_lr = getattr(args, "lsq_scale_lr", None)
-    if lsq_scale_lr is None or lsq_scale_lr == args.lr:
+    if lsq_scale_lr is None or lsq_scale_lr == cfg.optimizer.lr:
         return {}
     return {ParamKey(name=LSQ_SCALE_PARAM_NAMES): ParamGroupOverride(max_lr=lsq_scale_lr)}
 

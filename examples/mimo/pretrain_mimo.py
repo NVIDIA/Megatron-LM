@@ -71,7 +71,7 @@ def _parse_and_validate() -> argparse.Namespace:
     finally:
         args.world_size = physical_world_size
     if not (
-        args.use_distributed_optimizer
+        cfg.optimizer.use_distributed_optimizer
         or getattr(args, "use_layer_wise_distributed_optimizer", False)
     ):
         raise ValueError("Other optimizer paths have not been tested with heterogeneous MIMO")

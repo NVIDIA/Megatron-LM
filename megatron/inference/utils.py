@@ -181,7 +181,7 @@ def get_model_for_inference() -> MegatronModule:
     # Eval mode.
     model.eval()
 
-    if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
+    if args.transformer_impl == "inference_optimized" and cfg.optimizer.fp16 == "mxfp8":
         quant_backend = resolve_mxfp8_backend(args.inference_grouped_gemm_backend)
         quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
     return model

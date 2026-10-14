@@ -86,7 +86,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         hidden_size=args.hidden_size,
         inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
         fp32_residual_connection=args.fp32_residual_connection,
-        params_dtype=args.params_dtype,
+        params_dtype=cfg.optimizer.params_dtype,
         padded_vocab_size=args.padded_vocab_size,
     )
 
