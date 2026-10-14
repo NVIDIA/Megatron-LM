@@ -1205,23 +1205,6 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
-    # Streaming dequantize is unsafe with tensorwise (current) FP8 scaling.
-    # The streaming planner does a BF16->FP8 ``copy_`` per slice; tensorwise
-    # recomputes the per-tensor scale from each slice's amax, so multi-shard
-    # destinations (e.g. resharded loads) end up with inconsistent scales
-    # across slices and the loaded weights are corrupted. Block-scaled
-    # recipes (mxfp8, blockwise, nvfp4) carry per-block scales and are
-    # unaffected. Force the upfront ``force_all_tensors_to_non_fp8`` path
-    # for tensorwise.
-    if args.fp8 and args.fp8_recipe == "tensorwise" and args.stream_ckpt_dequant:
-        warn_rank_0(
-            "--fp8-recipe=tensorwise is incompatible with the streaming "
-            "checkpoint dequantize path; falling back to the upfront "
-            "dequantize pass. Pass --no-stream-ckpt-dequant to silence "
-            "this warning."
-        )
-        args.stream_ckpt_dequant = False
-
     if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
@@ -1231,13 +1214,18 @@ def validate_args(args, defaults={}):
         #       Future updates will drop support for `use_custom_fsdp` to avoid confusion.
         args.use_custom_fsdp = True
 
-        # Megatron-FSDP requires the DistributedOptimizer.
-        if not args.use_distributed_optimizer:
-            warn_rank_0(
-                'Megatron-FSDP is only compatible with --use-distributed-optimizer. Using DistributedOptimizer...',
-                args.rank,
-            )
-        args.use_distributed_optimizer = True
+        if args.megatron_fsdp_version == 2:
+            assert not args.use_distributed_optimizer, \
+                '--megatron-fsdp-version 2 is not compatible with --use-distributed-optimizer'
+        else:
+            # Megatron-FSDP v1 requires the DistributedOptimizer.
+            if not args.use_distributed_optimizer:
+                warn_rank_0(
+                    'Megatron-FSDP v1 is only compatible with --use-distributed-optimizer. '
+                    'Using DistributedOptimizer...',
+                    args.rank,
+                )
+            args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
         if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
@@ -2623,7 +2611,7 @@ def _add_inference_args(parser):
         '--inference-dynamic-batching-buffer-size-gb',
         type=float,
         default=40.0,
-        help='Amount of on-GPU memory allocated for the KV cache. '
+        help='On-GPU portion of the shared KV cache block pool. '
         'The total amount of memory allocated for the KV cache '
         '(CPU + GPU memory) depends on the value set for the '
         'unified virtual memory (UVM) level (via '
@@ -2638,10 +2626,12 @@ def _add_inference_args(parser):
         '--inference-dynamic-batching-paused-buffer-size-gb',
         type=float,
         default=None,
-        help='Amount of memory reserved for paused requests in '
-        'the dynamic inference context. Active requests are '
-        'paused when there are not enough active blocks available '
-        'to continue generating a request.',
+        help='Memory used to derive the paused-request block retention '
+        'budget. This does not reserve blocks from active requests: '
+        'active requests may use the entire shared pool of usable KV '
+        'cache blocks. Under allocation pressure, paused requests '
+        'retain blocks only within this budget and excess paused '
+        'requests may be evicted.',
     )
     group.add_argument(
         '--inference-dynamic-batching-mamba-memory-ratio',
@@ -3565,6 +3555,12 @@ def _add_regularization_args(parser):
         'complete local query groups; other layouts fall back to non-TP NS',
     )
     group.add_argument(
+        '--muon-use-syrk',
+        action='store_true',
+        help='Use the Triton SYRK kernel for the Gram matrix '
+        'in Newton-Schulz iteration.',
+    )
+    group.add_argument(
         '--muon-extra-scale-factor',
         type=float,
         default=1.0,
@@ -4236,6 +4232,20 @@ def _add_checkpointing_args(parser):
         dest='ckpt_fully_parallel_save_deprecated',
         help='Deprecated: see --no-ckpt-fully-parallel-save.',
     )
+    group.add_argument(
+        '--ckpt-drop-redundant-extra-state',
+        action='store_true',
+        default=False,
+        help='Drop TE `_extra_state` artifacts that carry no '
+        'irreplaceable state (no FP8, or block/current FP8 '
+        'scaling) from the distributed checkpoint, keeping them '
+        'local instead of writing them. Only delayed-scaling '
+        '`_extra_state` (amax history + scale) is ever needed and '
+        'it is always persisted regardless of this flag. By '
+        'default (flag off) all `_extra_state` are persisted, '
+        'preserving the previous behavior. Older checkpoints load '
+        'unchanged either way.',
+    )
     return parser
 
 
@@ -4403,6 +4413,16 @@ def _add_distributed_args(parser):
         'with the standard ring implementation) but performs accumulation locally in FP32.',
     )
     group.add_argument(
+        '--gtp-remat-reduce-scatter-with-fp32-accumulation',
+        action='store_true',
+        default=False,
+        help='Same trade as --ddp-reduce-scatter-with-fp32-accumulation, but for '
+        'the wgrad reduce-scatter GTP weight-remat performs over the gtp_remat axis: send '
+        'low-precision values over the wire via an all-to-all and accumulate locally in FP32. '
+        'Independent of the DDP flag (different collective, different process group). Costs one '
+        'extra unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.',
+    )
+    group.add_argument(
         '--ddp-param-name-patterns-for-fp32-local-accumulation',
         nargs='+',
         default=[],
@@ -4451,6 +4471,13 @@ def _add_distributed_args(parser):
     )
     group.add_argument(
         '--use-distributed-optimizer', action='store_true', help='Use distributed optimizer.'
+    )
+    group.add_argument(
+        '--megatron-fsdp-version',
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help='Megatron-FSDP implementation version. Defaults to 1.',
     )
     group.add_argument(
         '--use-nccl-ub',

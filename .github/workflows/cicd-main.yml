@@ -414,6 +414,9 @@ jobs:
         run: |
           uv sync --locked --only-group linting
 
+      - name: Test CI cache keys
+        run: .github/scripts/test_cache_keys.sh
+
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'

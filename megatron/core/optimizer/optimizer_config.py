@@ -297,6 +297,9 @@ class OptimizerConfig:
     ``distributed`` applies only to projection splits with complete local query groups; other
     QKV layouts fall back to non-TP NS with a warning. Defaults to "blockwise"."""
 
+    muon_use_syrk: bool = False
+    """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
+
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
