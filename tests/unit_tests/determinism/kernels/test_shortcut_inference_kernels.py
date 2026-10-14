@@ -145,10 +145,10 @@ def wide_inference_layers():
         )
         submodules = wide_residual_gated_delta_product_inference_stack_spec.submodules
 
-        def layer(spec, number):
+        def layer(name, number):
             return (
                 build_module(
-                    spec,
+                    getattr(submodules, name),
                     config=config,
                     layer_number=number,
                     add_layer_offset=False,
@@ -158,14 +158,15 @@ def wide_inference_layers():
                 .eval()
             )
 
-        yield config, layer(submodules.attention_layer, 1), layer(submodules.moe_layer, 2)
+        yield config, layer
     finally:
         Utils.destroy_model_parallel()
 
 
 def test_staged_attention_output_and_kv_cache_replay(wide_inference_layers):
     """Preserve RoPE, KV writes and wide residuals in prefill and padded decode replay."""
-    config, layer, _ = wide_inference_layers
+    config, build_layer = wide_inference_layers
+    layer = build_layer("attention_layer", 1)
     real_requests = 3
     rope = RotaryEmbedding(
         kv_channels=config.kv_channels, rotary_percent=1.0, use_cpu_initialization=True
@@ -264,32 +265,46 @@ def test_staged_attention_output_and_kv_cache_replay(wide_inference_layers):
                 torch.testing.assert_close(captured_cache, expected_cache, atol=0, rtol=0)
 
 
-def test_staged_expert_adapter_replay(wide_inference_layers, monkeypatch):
-    """The owning expert module replays its capped BF16 GEMMs and top-k sum bit-exactly."""
-    config, _, layer = wide_inference_layers
-    experts = layer.mlp.experts
-    tokens = 32
+def test_capped_expert_adapter_graph_covers_live_tiles(wide_inference_layers, monkeypatch):
+    """Capped expert stages match serial as a graph's live-token prefix changes."""
+    config, build_layer = wide_inference_layers
+    experts = build_layer("moe_layer", 2).mlp.experts
+    tokens = 64
     hidden = torch.randn(tokens, config.hidden_size, device="cuda", dtype=torch.bfloat16)
     probs = torch.rand(tokens, 2, device="cuda")
-    routes = torch.randint(0, 4, (tokens, 2), device="cuda")
+    # Include non-local experts and more tiles than the two-CTA launch cap.
+    routes = torch.arange(tokens * 2, device="cuda").reshape(tokens, 2) % 6
     valid = torch.tensor(tokens, device="cuda", dtype=torch.int32)
     output = torch.empty(tokens, config.hidden_size, device="cuda", dtype=torch.float32)
-    # Isolate the expert adapter from multi-rank communication. All compute
-    # kernels and real expert weights run; the supplied buffers are the same
-    # graph-safe dispatcher contract exercised by the end-to-end EP4 checks.
     monkeypatch.setattr(InferenceAllGatherDispatcherBase, "_valid_tokens", lambda: valid)
     monkeypatch.setattr(
-        InferenceAllGatherDispatcherBase, "_get_host_valid_tokens_estimate", lambda: tokens
+        InferenceAllGatherDispatcherBase, "_get_host_valid_tokens_estimate", lambda: 4
     )
     monkeypatch.setattr(NVLSAllGatherVDispatcher, "_get_rsv_tensor", lambda: output)
 
     def run(hidden, probs):
         prepared = experts.prepare_shortcut_overlap(hidden, probs, routes, max_blocks=2)
+        assert prepared.grid_size_fc1 == prepared.grid_size_fc2 == 2
         result, bias = experts.finish_shortcut_overlap(experts.compute_shortcut_overlap(prepared))
         assert bias is None
         return result
 
     with torch.inference_mode(), InferenceMode.active():
+        uncapped = experts.prepare_shortcut_overlap(hidden, probs, routes, max_blocks=0)
+        assert uncapped.grid_size_fc1 > 2 and uncapped.grid_size_fc2 > 2
         assert_replays_bit_exact(
-            run, (hidden, probs), backward=False, contention=True, what="Shortcut expert adapter"
+            run, (hidden, probs), backward=False, contention=True, what="Shortcut capped experts"
         )
+        valid.fill_(9)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run(hidden, probs)
+        for count in (9, tokens, 0, 33):
+            valid.fill_(count)
+            output.fill_(float("nan"))
+            graph.replay()
+            actual = captured.clone()
+            expected, bias = experts(hidden, None, probs, routing_map=routes)
+            assert bias is None
+            torch.testing.assert_close(actual[:count], expected[:count], atol=0, rtol=0)
+            assert torch.isnan(actual[count:]).all()
