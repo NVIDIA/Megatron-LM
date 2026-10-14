@@ -91,6 +91,37 @@ def test_dense_route_indices_dtype(
     assert TopKRouter._dense_route_indices_dtype(router) == expected_dtype
 
 
+@pytest.mark.parametrize(
+    "backend,routing_map_mode,compact_dtype",
+    [
+        ("deepep", "bool", torch.int64),
+        ("ncclep", "bool", torch.int64),
+        ("hybridep", "indices", torch.int16),
+    ],
+)
+def test_dense_route_indices_dtype_keeps_dense_routes_for_megakernel(
+    monkeypatch, backend, routing_map_mode, compact_dtype
+):
+    monkeypatch.setattr(router_module, "fused_topk_with_score_function_supports_topk_indices", True)
+    monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    config = SimpleNamespace(
+        moe_megakernel_backend=None,
+        moe_router_fusion=True,
+        moe_token_dispatcher_type="flex",
+        moe_expert_capacity_factor=None,
+        moe_flex_dispatcher_backend=backend,
+        moe_hybridep_routing_map_mode=routing_map_mode,
+        num_moe_experts=8,
+    )
+    router = SimpleNamespace(config=config, expt_tp_group=SimpleNamespace(size=lambda: 1))
+    assert TopKRouter._dense_route_indices_dtype(router) == compact_dtype
+
+    # A megakernel backend builds no token dispatcher and consumes the dense
+    # [tokens, experts] probs/routing_map pair, so the router must not compact the routes.
+    config.moe_megakernel_backend = "mok"
+    assert TopKRouter._dense_route_indices_dtype(router) is None
+
+
 @pytest.mark.parametrize("supports_topk_indices", [False, True])
 def test_fused_router_only_forwards_supported_topk_indices(monkeypatch, supports_topk_indices):
     received_kwargs = {}
