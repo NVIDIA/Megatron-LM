@@ -142,6 +142,9 @@ class ShortcutMoEBlock(MegatronModule):
             cls._parallel_stream = torch.cuda.Stream(priority=-1)
         return cls._parallel_stream
 
+    # Inference uses all-gather/reduce-scatter on the same MoE stream.
+    _get_moe_overlap_stream = _get_a2a_overlap_stream
+
     def __init__(
         self,
         compute_layer,
@@ -481,7 +484,7 @@ class ShortcutMoEBlock(MegatronModule):
 
         decode_only = inference_context.is_decode_only()
         main_stream = torch.cuda.current_stream()
-        shortcut_stream = self._get_a2a_overlap_stream()
+        shortcut_stream = self._get_moe_overlap_stream()
         # Fork before the shortcut read/router. Protect the original pair input
         # and padding mask until side-stream routing has consumed them.
         self.route_ready_event.record(main_stream)
