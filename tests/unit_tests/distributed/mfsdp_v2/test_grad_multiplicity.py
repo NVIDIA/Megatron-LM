@@ -25,12 +25,16 @@ def _sharded_unit(setup, model, grad_accumulation_count):
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     placements = Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
     with fully_shard_context(device=setup.device, caller_managed_grad_sync=True):
-        fully_shard(model, mesh=mesh, placements=placements, register_hooks=False)
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=placements,
+            register_hooks=False,
+            grad_accumulation_count=grad_accumulation_count,
+        )
     # The test drives materialization around each GraphTask; the completion hook
     # only reduces gradients once all declared contributions have accumulated.
-    model.register_post_backward_hook(
-        FsdpModule._reduce_gradient_groups, grad_accumulation_count=grad_accumulation_count
-    )
+    model.register_post_backward_hook(FsdpModule._reduce_gradient_groups)
     return model
 
 

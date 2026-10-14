@@ -2,7 +2,12 @@
 
 from collections import Counter
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from torch import nn
+
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+    FsdpModule,
+    _collect_owned_parameters,
+)
 from megatron.core.utils import get_attr_wrapped_model
 
 
@@ -49,7 +54,7 @@ def reshard_fsdp_module(module: FsdpModule) -> None:
 
 
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
-    """Install sub-module hooks and gradient callback counts for combined 1F1B."""
+    """Install execution hooks for units whose callback counts are set at construction."""
 
     # Nearest owning FSDP unit per module (first parent wins), recorded by the walk
     # below: unshard/reshard act on an FSDP *unit*, so a module that consumes another
@@ -76,14 +81,10 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     register_hooks(module, module)
     _register_borrowed_weight_unshard_hooks(model, owners)
 
-    extras = _window_extras(model)
     for submodule in module.modules():
         if not isinstance(submodule, FsdpModule):
             continue
-        submodule.register_post_backward_hook(
-            _module_post_backward_hook,
-            grad_accumulation_count=_unit_grad_accumulation_count(submodule, extras),
-        )
+        submodule.register_post_backward_hook(_module_post_backward_hook)
 
 
 def _register_borrowed_weight_unshard_hooks(model, owners) -> None:
@@ -198,20 +199,28 @@ def _mtp_layer_weights(model):
     )
 
 
-def _unit_grad_accumulation_count(unit: FsdpModule, extras: Counter[int]) -> int:
-    """Total parameter-gradient callbacks per combined 1F1B reduction window.
+def get_combined_1f1b_grad_accumulation_count(unit: nn.Module, model: nn.Module) -> int:
+    """Declare the unit's callback total after materialization and before sharding.
 
-    ``1`` per parameter plus every extra contribution of the weights it is
-    (``_window_extras``). Contributions add rather than being alternatives, so a weight
-    that is both the embedding and the projection's target picks up both. The extras
-    cannot be derived from the FSDP unit alone -- they depend on this chunk's stage
-    flags and the pipeline size -- which is why the caller passes them in.
+    Read the model's current parameter identities each time: meta initialization
+    and earlier child-unit sharding may have replaced Parameters since construction
+    began. Counts depend on this model chunk's stage flags and pipeline size.
     """
+    return _unit_grad_accumulation_count(unit, _window_extras(model))
+
+
+def _unit_grad_accumulation_count(unit: nn.Module, extras: Counter[int]) -> int:
+    """Count unique, trainable parameters owned by the next FSDP unit.
+
+    Already-sharded child units own their own parameters and are excluded, using
+    the same ownership traversal as fully_shard(). Aliases within this unit count
+    once, with additive contributions from every consumer of that weight.
+    """
+    parameters = {
+        id(parameter): parameter for parameter in _collect_owned_parameters(unit).values()
+    }
     return sum(
-        1
-        + sum(
-            extras.get(identity, 0)
-            for identity in {id(fsdp_parameter.unsharded), id(fsdp_parameter.sharded)}
-        )
-        for fsdp_parameter in unit._trainable_fsdp_parameters()
+        1 + extras.get(identity, 0)
+        for identity, parameter in parameters.items()
+        if parameter.requires_grad
     )
