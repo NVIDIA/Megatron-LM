@@ -74,6 +74,47 @@ def test_repository_config_is_valid():
                 assert (ROOT / base).exists(), pattern
 
 
+@pytest.mark.parametrize(
+    "source,required",
+    [
+        (
+            "megatron/core/fusions/fused_gated_norm.py",
+            "tests/unit_tests/ssm/test_gdn_gated_output_norm_fusion.py",
+        ),
+        (
+            "megatron/core/transformer/experimental_attention_variant/cp_balanced_indexer.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention_cp_cuda_graph.py",
+        ),
+        (
+            "megatron/core/optimizer/emerging_optimizers.py",
+            "tests/unit_tests/optimizer/test_muon_sync_qkv_cpu.py",
+        ),
+        (
+            "megatron/core/fusions/fused_mrope.py",
+            "examples/multimodal_dev/tests/test_vision_rope_fusion.py",
+        ),
+    ],
+)
+def test_dev_integration_mappings_are_targeted(source, required):
+    mappings = mandatory.load_mappings(CONFIG_PATH)
+    _, patterns = mandatory.triggered_patterns(mappings, [source], "dgx_h100")
+    assert required in patterns
+    assert "tests/unit_tests/**/*.py" not in patterns
+    assert mandatory.triggered_patterns(mappings, ["docs/unrelated.md"], "dgx_h100") == ([], [])
+
+
+def test_mrope_mapping_does_not_cross_bucket_boundaries(monkeypatch):
+    monkeypatch.chdir(ROOT)
+    _, patterns = mandatory.triggered_patterns(
+        mandatory.load_mappings(CONFIG_PATH), ["megatron/core/fusions/fused_mrope.py"], "dgx_h100"
+    )
+    files = mandatory.mandatory_files(patterns, "examples/multimodal_dev/tests/**/*.py", set())
+    assert files == [
+        "examples/multimodal_dev/tests/test_mrope_parity.py",
+        "examples/multimodal_dev/tests/test_vision_rope_fusion.py",
+    ]
+
+
 def test_repository_gb200_mapping_respects_recipe_and_marker_filtering(monkeypatch, capsys):
     monkeypatch.chdir(ROOT)
     recipe = yaml.safe_load((ROOT / "tests/test_utils/recipes/gb200/unit-tests.yaml").read_text())

@@ -6,20 +6,29 @@ import torch.nn.functional as F
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-from megatron.core.ssm.gated_delta_net import HAVE_FLA_GDN2
+from megatron.core.ssm.gated_delta_net import HAVE_FLA, HAVE_FLA_GDN2
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.ssm.gated_delta_net_test_cases import GatedDeltaNetModuleTestCases
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 
 
+@pytest.mark.parametrize("use_gdn2", [True], ids=["gdn2"])
+@pytest.mark.parametrize(
+    ("tp_size", "sp", "cp_size"),
+    [(1, False, 1), (2, False, 1), (2, True, 1), (1, False, 2), (2, False, 2), (2, True, 2)],
+)
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+class TestGatedDeltaNet(GatedDeltaNetModuleTestCases):
+    """GDN2 assertions isolated from the GDN compilation and kernel caches."""
+
+
+# One canonical copy of the parallel test previously collected in two files.
+# Keep all layouts from test_gated_delta_net.py, not #8148's new quarantine.
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
-    [
-        # TP w/ SP: intermittent compilation/teardown hangs (#7742).
-        pytest.param(4, True, 1, marks=pytest.mark.flaky_in_dev),
-        (1, False, 2),  # CP
-        (2, True, 2),  # TP w/ SP + CP
-    ],
+    [(4, True, 1), (1, False, 2), (2, True, 2)],  # TP w/ SP  # CP  # TP w/ SP + CP
 )
 @pytest.mark.skipif(not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed.")
 def test_parallel_gated_delta_net2_correctness(
@@ -40,6 +49,7 @@ def test_parallel_gated_delta_net2_correctness(
         activation_func=F.silu,
         bf16=True,
         experimental_attention_variant="gdn2",
+        gdn_kernel_backend="fla",
         linear_attention_freq=[1],
         transformer_impl="transformer_engine",
     )

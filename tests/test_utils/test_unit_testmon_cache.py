@@ -71,6 +71,37 @@ def test_source_edits_preserve_identity(source_tree):
     assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == before
 
 
+def test_multimodal_unit_bucket_tracks_its_own_conftest(source_tree):
+    unit = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+    conftest = source_tree / "examples/multimodal_dev/tests/conftest.py"
+    conftest.parent.mkdir(parents=True)
+    conftest.write_text("original example fixtures")
+    bucket = "examples/multimodal_dev/tests/**/*.py"
+    example = cache.cache_identity(source_tree, bucket, "dgx_h100", IMAGE_ID)
+    assert str(conftest.relative_to(source_tree)) in example["compatibility"]["inputs"]
+    assert example["cache_prefix"] != unit["cache_prefix"]
+    conftest.write_text("changed example fixtures")
+    changed = cache.cache_identity(source_tree, bucket, "dgx_h100", IMAGE_ID)
+    assert changed["cache_prefix"] == example["cache_prefix"]
+    assert changed["compatibility"] != example["compatibility"]
+    assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == unit
+
+
+@pytest.mark.parametrize(
+    "bucket",
+    [
+        "examples/other/tests/**/*.py",
+        "examples/multimodal_dev/tests/../../outside.py",
+        "tests/unit_tests/../outside.py",
+        "tests/unit_tests/test_file.py\n",
+        "tests/unit_tests/test_file.py\r",
+    ],
+)
+def test_bucket_identity_rejects_unsupported_or_escaping_paths(source_tree, bucket):
+    with pytest.raises(ValueError, match="invalid unit-test bucket"):
+        cache.cache_identity(source_tree, bucket, "dgx_h100", IMAGE_ID)
+
+
 @pytest.mark.parametrize(
     "changed", ["tests/test_utils/python_scripts/download_unit_tests_dataset.py"]
 )

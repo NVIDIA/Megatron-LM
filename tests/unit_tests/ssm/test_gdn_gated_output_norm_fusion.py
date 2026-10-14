@@ -17,6 +17,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.ssm.gdn_test_matrix import POST_FUSION_DISTRIBUTED_CASES
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -241,13 +242,10 @@ def test_pre_fusion_rejects_deterministic_mode(model_parallel):
         _model(True, deterministic_mode=True, gdn_kernel_backend='torch')
 
 
-@pytest.mark.parametrize("value_heads", [16, 64])
 @pytest.mark.parametrize(
-    "tp,cp,sequence_parallel", [(1, 2, False), (1, 4, False), (2, 2, True), (4, 1, True)]
+    "tp,cp,sequence_parallel,batch,packed,pre_fusion,recompute,value_heads",
+    POST_FUSION_DISTRIBUTED_CASES,
 )
-@pytest.mark.parametrize("batch,packed", [(1, False), (2, False), (1, True)])
-@pytest.mark.parametrize("pre_fusion", [False, True])
-@pytest.mark.parametrize("recompute", [False, True])
 def test_post_fusion_distributed_layout(
     tp, cp, sequence_parallel, batch, packed, pre_fusion, recompute, value_heads
 ):

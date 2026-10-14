@@ -19,6 +19,7 @@ from pathlib import Path
 SCHEMA = 1
 TESTMON_VERSION = "2.2.0"
 PHASES = ("prod", "experimental")
+UNIT_TEST_ROOTS = ("tests/unit_tests", "examples/multimodal_dev/tests")
 PLATFORMS = {
     "dgx_h100": {"cloud": "aws-h100", "recipe": "tests/test_utils/recipes/h100/unit-tests.yaml"},
     "dgx_gb200": {"cloud": "gb-gpu", "recipe": "tests/test_utils/recipes/gb200/unit-tests.yaml"},
@@ -104,7 +105,8 @@ def _bucket_conftests(root: Path, bucket: str) -> set[Path]:
 
     return {
         path
-        for path in (root / "tests/unit_tests").rglob("conftest.py")
+        for test_root in UNIT_TEST_ROOTS
+        for path in (root / test_root).rglob("conftest.py")
         if path.is_file()
         and (
             directory.is_relative_to(path.parent) or (recursive and path.is_relative_to(directory))
@@ -118,7 +120,11 @@ def cache_identity(
     """Separate cache lookup from compatibility checks and diagnostic image identity."""
     if recipe_platform not in PLATFORMS:
         raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
-    if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
+    if (
+        not any(bucket.startswith(test_root + "/") for test_root in UNIT_TEST_ROOTS)
+        or ".." in Path(bucket).parts
+        or any(character in bucket for character in "\n\r")
+    ):
         raise ValueError("invalid unit-test bucket")
     paths = {root / path for path in COMPATIBILITY_FILES}
     paths.update(
