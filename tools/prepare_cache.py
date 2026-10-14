@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.utils import compile_helpers
+from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_train_valid_test_num_samples
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
@@ -172,7 +173,7 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
 
     try:
         cfg = pretrain_cfg_container_from_args(args)
-        cfg.finalize_batch_sizes(args.data_parallel_size, args.gtp_weight_remat_size)
+        cfg.finalize_batch_sizes(get_batch_parallel_size(args))
         set_run_config(cfg)
         # Derive train_iters from --train-samples when needed (pretrain() does the same).
         update_train_iters()

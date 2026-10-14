@@ -3191,7 +3191,6 @@ def load_checkpoint(
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The
     # GBS-match check applies only when adopting this checkpoint's own args (not a finetune load).
     if restore_training_state and getattr(args, 'override_ckpt_iteration', None) is not None:
-        cfg = get_run_config()
         if 'args' in state_dict and not args.finetune:
             saved_train = checkpoint_config.get('train', {}) if checkpoint_config is not None else {}
             ckpt_global_batch_size = saved_train.get(

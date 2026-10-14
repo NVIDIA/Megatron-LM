@@ -28,9 +28,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
 from megatron.post_training.optimizer import install_lsq_optimizer_overrides
-from megatron.training import get_args, get_run_config, print_rank_0
+from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.config import PretrainConfigContainer
+from megatron.training.global_vars import get_run_config
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
