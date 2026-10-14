@@ -601,6 +601,12 @@ GLU interleaving is unsupported with FP32 model parameters and is rejected durin
 configuration validation. BF16 and FP16 model parameters remain supported,
 including when the optimizer uses FP32 master weights.
 
+GLU interleaving also requires GTP weight sharding to be disabled for the affected
+FC1: routed experts require `expert_gtp_weight_remat_size=1`, and grouped shared
+experts require `gtp_weight_remat_size=1`. Configuration validation rejects these
+combinations even when optimizer state is not loaded. GTP on other modules and
+ordinary TP/ETP remain allowed.
+
 For `torch` and `torch_dist` checkpoints, model weights are saved in contiguous
 `[all gate | all up]` layout. Optimizer master weights and moments retain their
 runtime layout, described by the existing saved configuration. GLU conversion

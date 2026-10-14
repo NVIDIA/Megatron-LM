@@ -3105,6 +3105,20 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "GLU interleave is not supported with FP32 model parameters. Use BF16 or FP16."
             )
+        if self.gated_linear_unit and self.moe_mlp_glu_interleave_size is not None:
+            assert self.expert_gtp_weight_remat_size == 1, (
+                "Routed expert GLU interleave is not supported with GTP weight sharding. "
+                "Disable routed expert GLU interleave or expert GTP weight sharding."
+            )
+        if (
+            self.gated_linear_unit
+            and self.use_grouped_gemm_for_shared_expert
+            and self.moe_shared_expert_glu_interleave_size is not None
+        ):
+            assert self.gtp_weight_remat_size == 1, (
+                "Shared expert GLU interleave is not supported with GTP weight sharding. "
+                "Disable shared expert GLU interleave or GTP weight sharding."
+            )
 
         if self.bias_activation_fusion:
             if self.activation_func not in [F.gelu, F.silu, quick_gelu]:
