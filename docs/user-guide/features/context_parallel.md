@@ -54,6 +54,11 @@ GDN-family `linear_cp_mode`, and the incompatibility between chunkwise CP and
 be a string or a list with one entry per transformer layer. Non-DSA configurations
 retain their existing behavior when `cp_comm_type=None`.
 
+GDN2 (`experimental_attention_variant="gdn2"`) implements only headwise CP: its layers
+split heads across CP ranks whatever `linear_cp_mode` says. With CP, validation requires
+its linear key and value head counts to be multiples of TP × CP, and rejects
+`cp_partition_mode="contiguous"` and Dynamic CP. GDN and KDA layers keep both modes.
+
 These are capability checks, not a prediction of each microbatch's group size.
 Numeric constraints such as head divisibility and hierarchical CP group sizes
 continue to use the configured parallel sizes. Ordinary static CP with
