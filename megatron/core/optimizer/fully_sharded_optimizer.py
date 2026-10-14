@@ -5,7 +5,8 @@
 from typing import Any, Callable, List, Optional, override
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -15,6 +16,7 @@ from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
 )
 from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 from ..transformer.module import MegatronModule
+from ..utils import is_te_min_version
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
@@ -90,9 +92,17 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         # is the direction the checkpoint path resolves, and because the optimizer names each
         # parameter once: a tied parameter is one ``nn.Parameter`` with one state entry, and
         # its several FQNs are the model state dict's business, not this map's.
+        parameters = self.get_parameters()
+        if not is_te_min_version("2.18.0"):
+            # Include the empty local shards filtered out of older TE optimizers.
+            parameters = [
+                param
+                for model_chunk in self.model_chunks
+                for param in model_chunk.parameters()
+                if param.requires_grad
+            ]
         self._param_to_fqn: dict[torch.nn.Parameter, str] = {
-            param: get_global_unique_param_name(self.model_chunks, param)
-            for param in self.get_parameters()
+            param: get_global_unique_param_name(self.model_chunks, param) for param in parameters
         }
 
     @staticmethod
@@ -152,6 +162,46 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             for param in group["params"]
         }
 
+    def _add_empty_shard_state(self, state_by_fqn: dict[str, Any]) -> None:
+        """Add checkpoint placeholders for empty shards omitted by TE < 2.18.
+
+        Uneven-DTensor preprocessing needs matching state keys on every rank of
+        a parameter's mesh. Gather the keys within each dense or expert-DP mesh.
+        """
+        local_keys = {
+            fqn: sorted(key for key, value in state.items() if isinstance(value, DTensor))
+            for fqn, state in state_by_fqn.items()
+        }
+        parameters_by_mesh: dict[DeviceMesh, list[DTensor]] = {}
+        for param in self._param_to_fqn:
+            if isinstance(param, DTensor):
+                parameters_by_mesh.setdefault(param.device_mesh, []).append(param)
+
+        # Keep collectives on overlapping dense and expert-DP meshes in a common order.
+        for mesh in sorted(
+            parameters_by_mesh, key=lambda mesh: (tuple(mesh.mesh.flatten().tolist()), mesh.shape)
+        ):
+            parameters = parameters_by_mesh[mesh]
+            fqns = {self._param_to_fqn[param] for param in parameters}
+            mesh_keys = {fqn: local_keys[fqn] for fqn in fqns if fqn in local_keys}
+            sharded_dims = sorted(
+                {
+                    axis
+                    for param in parameters
+                    for axis, placement in enumerate(param.placements)
+                    if isinstance(placement, Shard) and mesh.size(axis) > 1
+                }
+            )
+            for axis in sharded_dims:
+                group = mesh.get_group(axis)
+                gathered: list[Any] = [None] * torch.distributed.get_world_size(group)
+                torch.distributed.all_gather_object(gathered, mesh_keys, group=group)
+                mesh_keys = {fqn: keys for rank in gathered for fqn, keys in rank.items()}
+            for param in parameters:
+                fqn = self._param_to_fqn[param]
+                if fqn not in state_by_fqn and fqn in mesh_keys:
+                    state_by_fqn[fqn] = {key: torch.zeros_like(param) for key in mesh_keys[fqn]}
+
     def _param_groups_from_group_meta(
         self, param_to_group_meta: dict[str, Any]
     ) -> list[dict[str, Any]]:
@@ -201,7 +251,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         :meth:`DistributedOptimizer.load_state_dict`.
         """
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
-        self.optimizer.load_state_dict({"state": state_dict["state"], "param_groups": param_groups})
+        state = state_dict["state"]
+        if not is_te_min_version("2.18.0"):
+            # Empty-shard placeholders are not owned by the older TE optimizer.
+            owned_fqns = {fqn for group in param_groups for fqn in group["params"]}
+            state = {fqn: param_state for fqn, param_state in state.items() if fqn in owned_fqns}
+        self.optimizer.load_state_dict({"state": state, "param_groups": param_groups})
 
     @override
     def sharded_state_dict(
@@ -237,13 +292,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         if is_loading:
             init_optimizer_state(self.optimizer)
 
-        return {
-            "state": {
-                self._param_to_fqn[param]: param_state
-                for param, param_state in self.optimizer.state.items()
-            },
-            "param_to_group_meta": self._param_to_group_meta(),
+        state_by_fqn = {
+            self._param_to_fqn[param]: param_state
+            for param, param_state in self.optimizer.state.items()
         }
+        if not is_te_min_version("2.18.0"):
+            self._add_empty_shard_state(state_by_fqn)
+        return {"state": state_by_fqn, "param_to_group_meta": self._param_to_group_meta()}
 
     @override
     def get_grad_norm(self):
@@ -332,6 +387,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
         if not self.is_stub_optimizer:
             self.optimizer.zero_grad(set_to_none=set_to_none)
+
+        if not is_te_min_version("2.18.0"):
+            # Older TE omits empty local shards, so clear their gradients through the model.
+            for model_chunk in self.model_chunks:
+                model_chunk.zero_grad(set_to_none=set_to_none)
 
     def _copy_model_grads_to_main_grads(self) -> None:
         """Install optimizer-compatible gradients for non-precision-aware optimizers."""
