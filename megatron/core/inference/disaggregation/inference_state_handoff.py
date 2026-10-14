@@ -291,11 +291,6 @@ class InferenceStateHandoffMixin:
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
-        if role == "decode" and self.context.config.cuda_graph_all_prefills:
-            raise ValueError(
-                "Disaggregated decode does not support cuda_graph_all_prefills; "
-                "eviction recovery must be able to prefill without a matching CUDA graph"
-            )
         if self.context.is_hybrid_model:
             if role == "decode" and self.context.mamba_slot_allocator is not None:
                 raise RuntimeError(
@@ -312,6 +307,11 @@ class InferenceStateHandoffMixin:
                 "Disaggregated KV transfer does not support MoE routing replay; "
                 "handoffs do not transfer the prompt's routing-replay buffers"
             )
+        if role == "decode":
+            # Shared launch flags still apply to prefill workers. Disable only
+            # this engine's admission gate so eviction recovery cannot wait for
+            # a missing graph; existing captured graphs remain usable.
+            self.cuda_graph_all_prefills = False
         self._kv_transfer_role = role
         self._require_handoff_claim = require_handoff_claim
         backend_cls = construct_kv_transfer_backend_class(self.context.config.kv_transport_backend)

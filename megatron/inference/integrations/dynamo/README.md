@@ -187,9 +187,10 @@ also reclaims state orphaned by frontend failure before delivery to decode.
 Both roles currently require the default `persist` KV-cache management mode.
 `offload` and `recompute` are rejected at transfer setup because suspend/resume
 can invalidate the registered KV/SSM buffers.
-Decode workers also reject `--inference-cuda-graph-all-prefills`: eviction
-recovery must be able to prefill without waiting for a matching CUDA graph.
-Prefill workers may still enable this option.
+`--inference-cuda-graph-all-prefills` remains effective on prefill workers for
+both full and chunked prefill admissions. Decode workers automatically disable
+this admission gate so eviction recovery need not wait for a matching graph;
+their captured CUDA graphs remain usable.
 
 ## Tests
 

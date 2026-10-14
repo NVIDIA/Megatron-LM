@@ -856,9 +856,11 @@ currently reject `offload` and `recompute` because suspend/resume can invalidate
 the registered KV/SSM buffers. Under memory pressure, evicted decode requests
 recover through the engine's local recomputation path; new requests still
 route to prefill.
-Decode workers reject `--inference-cuda-graph-all-prefills`, since recovery
-must be able to prefill without a matching CUDA graph. Prefill workers may
-still use it.
+Keep `--inference-cuda-graph-all-prefills` enabled for prefill workers when desired;
+it gates both full and chunked prefill admissions on compatible captured graphs.
+Shared launches can pass this flag unchanged: decode workers automatically disable
+the admission gate so eviction recovery can prefill without a matching graph.
+This does not disable CUDA-graph replay on decode workers.
 
 For RL, only the final decode completion writes to the request metadata ledger
 or payload stager. Handoffs preserve the request UID, policy/KV epoch history,

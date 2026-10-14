@@ -383,7 +383,11 @@ def test_completed_exact_ssm_handoff_enters_decode_without_waiting_queue(handoff
     assert pending.ssm is None
 
 
-def test_setup_pins_handoff_outputs_only_on_prefill():
+@pytest.mark.parametrize(
+    "engine_cls", [DisaggDynamicInferenceEngine, StateHandoffDynamicInferenceEngine]
+)
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_setup_applies_role_specific_pinning_and_graph_gating(engine_cls, role):
     class _Backend:
         names = []
 
@@ -393,13 +397,16 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         def export_meta(self):
             return {"transport": "test"}
 
-    engine = object.__new__(InferenceStateHandoffMixin)
+    engine = object.__new__(engine_cls)
     engine._initialize_disaggregation_state()
+    engine.cuda_graph_all_prefills = True
     allocator = SimpleNamespace(
         enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
     )
     engine.context = SimpleNamespace(
-        config=SimpleNamespace(kv_transport_backend="nccl", cuda_graph_all_prefills=False),
+        config=SimpleNamespace(kv_transport_backend="nccl", cuda_graph_all_prefills=True),
+        use_cuda_graphs_for_non_decode_steps=True,
+        cuda_graph_batch_dimensions_list=[object()],
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
         moe_enable_routing_replay=False,
         kv_block_allocator=allocator,
@@ -428,14 +435,14 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         mock.patch(pg_size, return_value=1),
         mock.patch(pg_rank, return_value=0),
     ):
-        engine.setup_kv_transfer("decode")
-        assert not allocator.enable_handoff_pinning
-        engine.context.config.cuda_graph_all_prefills = True
-        with pytest.raises(ValueError, match="does not support cuda_graph_all_prefills"):
-            engine.setup_kv_transfer("decode")
-        engine.setup_kv_transfer("prefill")
-        assert allocator.enable_handoff_pinning
-        engine.setup_kv_transfer("prefill")
+        engine.setup_kv_transfer(role)
+        assert allocator.enable_handoff_pinning == (role == "prefill")
+        assert engine.cuda_graph_all_prefills == (role == "prefill")
+        assert engine._cg_admission_gating_active() == (role == "prefill")
+        assert engine.context.config.cuda_graph_all_prefills
+        assert engine.context.use_cuda_graphs_for_non_decode_steps
+        assert len(engine.context.cuda_graph_batch_dimensions_list) == 1
+        engine.setup_kv_transfer(role)
 
     backend_factory_mock.assert_called_with("nccl")
     assert _Backend.names[-2] != _Backend.names[-1]
