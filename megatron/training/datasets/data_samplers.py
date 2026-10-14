@@ -401,7 +401,9 @@ class MegatronPretrainingRandomSampler:
             g = torch.Generator()
             g.manual_seed(self.epoch)
             idx_range_total = torch.randperm(full_bucket_size, generator=g).tolist()
-            idx_range_active = idx_range_total[full_bucket_offset:]
+            # Drop the incomplete global batch before slicing by rank. Dropping only
+            # each rank's partial microbatch can leave some ranks with an extra batch.
+            idx_range_active = idx_range_total[full_bucket_offset:active_total_samples]
             idx_range = idx_range_active[self.data_parallel_rank :: self.data_parallel_size]
 
         batch = []
