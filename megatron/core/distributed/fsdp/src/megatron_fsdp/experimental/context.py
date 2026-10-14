@@ -167,10 +167,6 @@ class FsdpContext:
         self.parameter_to_owner = None
         self._is_finalized = True
 
-    def has_single_root(self) -> bool:
-        """Return whether ordinary root hooks can reset the complete order."""
-        return sum(1 for _ in self._roots) == 1
-
     def is_root(self, module: nn.Module) -> bool:
         """Return whether ``module`` is an outermost FSDP module in this context."""
         self.ensure_finalized()

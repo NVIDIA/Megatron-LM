@@ -44,39 +44,37 @@ def test_prefetch_replays_occurrences(budget, expected):
             assert order.next_item() is successor
 
 
-def test_execution_order_validates_calls():
-    """Empty or mismatched calls raise without consuming the expected occurrence."""
-    first, second = nn.Module(), nn.Module()
+def test_unique_calls_resynchronize_and_repeated_calls_validate():
+    """Unique VPP chunk calls select their position; ambiguous repeats stay strict."""
+    chunk0, layer0, chunk1, layer1 = (nn.Module() for _ in range(4))
+    order = ExecutionOrder([chunk0, layer0, chunk1, layer1])
+    # Grouped VPP repeats chunk 0 before switching to chunk 1, in one shared order.
+    for chunk in (chunk0, chunk0, chunk0, chunk1, chunk1, chunk0):
+        layer = layer0 if chunk is chunk0 else layer1
+        order.advance(chunk)
+        assert order.next_item() is layer
+        order.advance(layer)
+        assert order.next_item() is (chunk1 if chunk is chunk0 else None)
+
+    order = ExecutionOrder([chunk0, layer0, chunk0])
+    order.advance(chunk0)
+    assert order.next_item() is layer0
+    with pytest.raises(RuntimeError, match='diverged'):
+        order.advance(chunk0)
+    # A rejected repeated call must not consume the expected occurrence.
+    order.advance(layer0)
+    assert order.next_item() is chunk0
+    order.advance(chunk0)
+    assert order.next_item() is None
+    # Unique calls remain valid anchors even when the sequence also has repeats.
+    order.advance(layer0)
+    order.advance(chunk0)
+    assert order.next_item() is None
+
     empty = ExecutionOrder()
     assert empty.next_item() is None
     with pytest.raises(RuntimeError, match='diverged'):
-        empty.advance(first)
-
-    order = ExecutionOrder([first, second, first])
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(second)
-    order.advance(first)
-    assert order.next_item() is second
-    assert order.next_item(2) is first
-    assert order.next_item(3) is None
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(first)
-    order.advance(second)
-    assert order.next_item() is first
-    order.advance(first)
-    assert order.next_item() is None
-
-    # Scheduler-selected windows stop at their boundary, including the last window.
-    order.reset(2, end=3)
-    order.advance(first)
-    assert order.next_item() is None
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(first)
-    order.reset()
-    order.advance(first)
-    assert order.next_item() is second
-    with pytest.raises(ValueError, match='reset range'):
-        order.reset(4)
+        empty.advance(chunk0)
 
 
 def test_membership_reverse_and_weak_references():
