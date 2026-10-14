@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Compact CSA2 candidate blocks for unpacked sequences."""
+"""Compact CSA2 candidate blocks for packed and unpacked sequences."""
 
 from dataclasses import dataclass
 
@@ -28,6 +28,26 @@ class CSA2CandidateBlocks:
         # Invalid slots write to a discarded column instead of overwriting block zero.
         flags.scatter_(-1, self.indices.masked_fill(self.indices < 0, num_blocks).long(), True)
         return flags[..., :num_blocks].repeat_interleave(self.block_size, -1)[..., :num_keys]
+
+    def to_mask_thd(
+        self, query_sequence_ids: Tensor, key_sequence_ids: Tensor, key_local_positions: Tensor
+    ) -> Tensor:
+        """Expand sequence-local block IDs at physical packed key addresses."""
+        num_keys = key_local_positions.numel()
+        if num_keys == 0 or self.indices.shape[-1] == 0:
+            return torch.zeros(
+                (*self.indices.shape[:-1], num_keys), dtype=torch.bool, device=self.indices.device
+            )
+        num_blocks = (num_keys + self.block_size - 1) // self.block_size
+        flags = torch.zeros(
+            (*self.indices.shape[:-1], num_blocks + 1), dtype=torch.bool, device=self.indices.device
+        )
+        # Avoid a [query, candidate, key] broadcast for long packed sequences.
+        invalid = (self.indices < 0) | (self.indices >= num_blocks)
+        flags.scatter_(-1, self.indices.masked_fill(invalid, num_blocks).long(), True)
+        key_blocks = key_local_positions.div(self.block_size, rounding_mode="floor").long()
+        selected = flags.gather(-1, key_blocks.expand(*self.indices.shape[:-1], num_keys))
+        return selected & (query_sequence_ids[None, :, None] == key_sequence_ids[None, None, :])
 
 
 @torch.no_grad()

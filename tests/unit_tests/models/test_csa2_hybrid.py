@@ -71,6 +71,75 @@ def test_csa2_with_dense_layers_and_two_pending_microbatches(groups, single_pass
         assert parameter.grad.isfinite().all() and parameter.grad.abs().sum() > 0
 
 
+@pytest.mark.parametrize("single_trainable_weight", [False, True])
+def test_csa2_full_recompute_matches_eager_with_pending_microbatches(
+    groups, single_trainable_weight
+):
+    """Layer replay must use the original shared KV, indices, and mHC mix."""
+    common = dict(
+        num_layers=6,
+        csa_compress_ratios=[2, 0, 2, 0, 2, 0],
+        csa2_kv_source_layers=[0],
+        csa2_index_source_layers=[0, 4],
+        csa2_candidate_source_layer=0,
+        csa2_candidate_topk_blocks=2,
+        csa2_candidate_block_size=2,
+        dsa_indexer_loss_coeff=0,
+        enable_mhc_connections=True,
+        mhc_single_pass=True,
+        num_moe_experts=None,
+        moe_ffn_hidden_size=None,
+        activation_func_clamp_value=None,
+        moe_shared_expert_intermediate_size=None,
+        moe_router_enable_expert_bias=False,
+        ffn_hidden_size=64,
+    )
+    configs = [
+        _make_config(**common),
+        _make_config(
+            **common,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        ),
+    ]
+    models = [
+        HybridModel(
+            config,
+            hybrid_csa2_stack_spec,
+            vocab_size=128,
+            max_sequence_length=64,
+            hybrid_layer_pattern="V-V-V-",
+            position_embedding_type="none",
+            pg_collection=groups,
+        ).cuda()
+        for config in configs
+    ]
+    models[1].load_state_dict(models[0].state_dict())
+    if single_trainable_weight:
+        for model in models:
+            for parameter in model.parameters():
+                parameter.requires_grad_(False)
+            owner = model.decoder.layers[0].inner_layer.self_attention.core_attention
+            owner.compressor.linear_wkv.weight.requires_grad_(True)
+    ids = torch.randint(0, 128, (2, 17), device="cuda")
+    positions = torch.arange(17, device="cuda").expand_as(ids)
+    losses = [
+        [model(tokens, positions, None, labels=ids).mean() for tokens in (ids, ids.roll(1, 1))]
+        for model in models
+    ]
+    for actual, expected in zip(losses[1], losses[0]):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    for model_losses in losses:
+        sum(model_losses).backward()
+    for (name, expected), (_, actual) in zip(
+        models[0].named_parameters(), models[1].named_parameters()
+    ):
+        assert (actual.grad is None) == (expected.grad is None), name
+        if expected.grad is not None:
+            torch.testing.assert_close(actual.grad, expected.grad, atol=2e-4, rtol=2e-2, msg=name)
+
+
 @pytest.mark.parametrize("fused", [False, True])
 def test_single_pass_mhc_on_standard_dense_hybrid(groups, fused):
     """A standard attention/MLP model can opt in without any CSA2 or DeepSeek configuration."""

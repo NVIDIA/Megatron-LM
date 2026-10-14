@@ -224,12 +224,13 @@ class TestFusedCrossEntropy:
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
-@pytest.mark.parametrize("layout", ["contiguous", "transposed"])
+@pytest.mark.parametrize("layout", ["contiguous", "transposed", "token_major"])
 def test_dsv4_q_rms_norm_replays(dtype, layout):
-    """``_q_rms_norm`` (weightless RMS norm, ``torch.compile``) on a [s, b, heads, dim] query.
+    """``_q_rms_norm`` (weightless RMS norm, ``torch.compile``) on production query layouts.
 
     Inductor reduces ``q.square().mean(-1)`` per row; the transposed layout exercises the
-    strided-input specialisation the compiler guards on separately.
+    strided-input specialisation the compiler guards on separately, while ``token_major``
+    matches the packed THD query shape used by DSv4's up-projection path.
     """
     try:
         from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
@@ -242,8 +243,10 @@ def test_dsv4_q_rms_norm_replays(dtype, layout):
     seq, batch, heads, dim = 1024, 4, 32, 128
     if layout == "contiguous":
         q = _act((seq, batch, heads, dim), dtype=dtype)
-    else:
+    elif layout == "transposed":
         q = _act((batch, seq, heads, dim), dtype=dtype).transpose(0, 1)
+    else:
+        q = _act((seq * batch, heads, dim), dtype=dtype)
     assert_replays_bit_exact(
         lambda q: _q_rms_norm(q, 1e-6), (q,), replays=3, contention=True, what="_q_rms_norm"
     )

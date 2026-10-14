@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant import (
     deepseek_v4_hybrid_attention as dsv4_attention,
 )
@@ -11,6 +12,7 @@ from megatron.core.transformer.experimental_attention_variant.csa2_module_spec i
     csa2_attention_spec,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
+    CSA2CandidateBlocks,
     candidate_blocks_from_scores,
 )
 from megatron.core.transformer.hyper_connection import HyperConnectionModule, SinglePassMHCState
@@ -128,6 +130,28 @@ def test_csa2_candidate_replay(groups):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
+def test_csa2_thd_candidate_mask_replay():
+    """Packed candidate expansion is bit-exact for sequence-local key addresses."""
+    blocks = CSA2CandidateBlocks(
+        torch.tensor([[[0, 1, -1], [0, -1, -1], [1, 9, -1], [1, -1, -1]]], device="cuda"),
+        block_size=2,
+    )
+    query_sequences = torch.tensor([0, 1, 1, 0], device="cuda")
+    key_sequences = torch.tensor([0, 0, 0, 1, 1, 1, 1], device="cuda")
+    key_positions = torch.tensor([0, 1, 2, 0, 1, 2, 3], device="cuda")
+
+    def expand(query_ids, key_ids, positions):
+        return blocks.to_mask_thd(query_ids, key_ids, positions)
+
+    with deterministic_algorithms(True):
+        assert_replays_bit_exact(
+            expand,
+            (query_sequences, key_sequences, key_positions),
+            backward=False,
+            what="CSA2 THD candidate mask",
+        )
+
+
 def test_csa2_module_replay(groups, monkeypatch):
     """Replay the shared DSv4 projection path with V4.1's weightless query norm disabled."""
 
@@ -153,6 +177,47 @@ def test_csa2_module_replay(groups, monkeypatch):
         assert_module_replays_bit_exact(
             layer, (torch.randn(9, 2, 32, device="cuda", requires_grad=True), None)
         )
+
+
+def test_csa2_thd_module_replay(groups):
+    """Replay the packed THD path that maps physical rows to sequence-local positions."""
+    seeded()
+    config = tiny_config(
+        num_layers=1,
+        csa_compress_ratios=[2],
+        csa2_kv_source_layers=[0],
+        csa2_index_source_layers=[0],
+        csa2_candidate_source_layer=None,
+        csa2_candidate_topk_blocks=0,
+        csa2_candidate_block_size=0,
+        dsa_indexer_loss_coeff=0,
+    )
+    layer = build_module(
+        csa2_attention_spec, config=config, layer_number=1, pg_collection=groups
+    ).cuda()
+    logical = torch.tensor([0, 3, 7], device="cuda", dtype=torch.int32)
+    physical = torch.tensor([0, 5, 12], device="cuda", dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=7,
+        max_seqlen_kv=7,
+    )
+    hidden = torch.randn(12, 1, 32, device="cuda", requires_grad=True)
+
+    class PackedCSA2(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = layer
+
+        def forward(self, x):
+            return self.layer(x, None, packed_seq_params=packed)
+
+    with deterministic_algorithms(True):
+        assert_module_replays_bit_exact(PackedCSA2(), (hidden,))
 
 
 def test_engram_duplicate_rows_replay(groups):
