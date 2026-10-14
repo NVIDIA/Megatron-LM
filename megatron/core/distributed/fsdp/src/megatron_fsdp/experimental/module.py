@@ -272,6 +272,8 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
 
         if self.is_root():
+            if not is_recomputing:
+                context.activate_root_prefetch(cast(nn.Module, self))
             context.allgather_stream.wait_stream(context.current_stream())
 
         self.unshard(prefetch="forward" if not is_recomputing else "none")
@@ -383,6 +385,7 @@ class FsdpModule:
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
+            context.activate_root_prefetch(cast(nn.Module, self), backward=True)
             context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
