@@ -383,6 +383,12 @@ class TEGroupedMLP(MegatronModule):
             and has_gtp_sharded_weights
             and (blocked_by_te or blocked_by_fp8_gather)
         ):
+            if self.config.moe_paged_stash:
+                raise RuntimeError(
+                    "moe_paged_stash requires GroupedTensor execution, but these GTP-sharded "
+                    "expert weights require the split-quantize fallback. Disable "
+                    "moe_paged_stash for this configuration."
+                )
             # Fall back to the split-quantize path, which handles sharded weights.
             # Both sides of the boundary have to agree, so flip both.
             # mcore: selects the tokens_per_expert form below (CUDA tensor vs host list).

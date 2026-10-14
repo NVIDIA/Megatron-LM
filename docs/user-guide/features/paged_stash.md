@@ -42,7 +42,7 @@ HybridEP and TE grouped experts are required whenever `moe_expert_rank_capacity_
 # B. Device-initiated GroupedLinear, without the operation fuser
 --moe-grouped-gemm
 --moe-use-grouped-tensor
-# Keep the default fused SwiGLU activation; do not pass --no-bias-swiglu-fusion.
+--swiglu  # Keep fusion enabled; do not pass --no-bias-swiglu-fusion.
 ```
 
 Path B removes host-device synchronization from grouped GEMM split metadata, but FC1, activation,

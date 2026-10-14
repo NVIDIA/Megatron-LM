@@ -96,6 +96,118 @@ def test_paged_stash_allows_non_fused_grouped_tensor_hybridep():
     assert config.use_transformer_engine_op_fuser is False
 
 
+def _construct_grouped_mlp_with_gtp_weights(
+    monkeypatch, *, moe_paged_stash, te_supports_sharded_weights, native_fp8_gather
+):
+    from megatron.core.tensor_parallel import gtp_api
+
+    modules = []
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight0 = SimpleNamespace(_gtp_native_fp8=native_fp8_gather)
+            self.use_grouped_tensor = True
+
+    def build_grouped_linear(*args, **kwargs):
+        module = FakeGroupedLinear()
+        modules.append(module)
+        return module
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=256,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_expert_rank_capacity_factor=1.5,
+        moe_paged_stash=moe_paged_stash,
+        use_transformer_engine_op_fuser=False,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        bias_activation_fusion=True,
+        bias_dropout_fusion=False,
+    )
+    monkeypatch.setattr(gtp_api, "HAVE_GTP", True)
+    monkeypatch.setattr(gtp_api, "is_gtp_param", lambda weight: True)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(
+        experts_module,
+        "Fp8Padding",
+        lambda num_experts, align_size: SimpleNamespace(
+            num_experts=num_experts, align_size=align_size
+        ),
+    )
+    monkeypatch.setattr(
+        experts_module,
+        "Fp8Unpadding",
+        lambda num_experts, align_size: SimpleNamespace(
+            num_experts=num_experts, align_size=align_size
+        ),
+    )
+    monkeypatch.setattr(
+        experts_module,
+        "_te_grouped_tensor_supports_sharded_weights",
+        lambda: te_supports_sharded_weights,
+    )
+
+    submodules = SimpleNamespace(
+        linear_fc1=build_grouped_linear, linear_fc2=build_grouped_linear, activation_func=None
+    )
+    pg_collection = SimpleNamespace(ep=None, expt_tp=None)
+    module = TEGroupedMLP(
+        num_local_experts=2, config=config, submodules=submodules, pg_collection=pg_collection
+    )
+    return module, modules
+
+
+@pytest.mark.parametrize(
+    "te_supports_sharded_weights,native_fp8_gather",
+    [pytest.param(False, False, id="te-unsupported"), pytest.param(True, True, id="native-fp8")],
+)
+def test_paged_stash_rejects_gtp_split_quantize_fallback(
+    monkeypatch, te_supports_sharded_weights, native_fp8_gather
+):
+    with pytest.raises(RuntimeError, match="requires GroupedTensor execution"):
+        _construct_grouped_mlp_with_gtp_weights(
+            monkeypatch,
+            moe_paged_stash=True,
+            te_supports_sharded_weights=te_supports_sharded_weights,
+            native_fp8_gather=native_fp8_gather,
+        )
+
+
+@pytest.mark.parametrize(
+    "te_supports_sharded_weights,native_fp8_gather",
+    [pytest.param(False, False, id="te-unsupported"), pytest.param(True, True, id="native-fp8")],
+)
+def test_gtp_split_quantize_fallback_remains_available_without_paged_stash(
+    monkeypatch, te_supports_sharded_weights, native_fp8_gather
+):
+    module, grouped_linears = _construct_grouped_mlp_with_gtp_weights(
+        monkeypatch,
+        moe_paged_stash=False,
+        te_supports_sharded_weights=te_supports_sharded_weights,
+        native_fp8_gather=native_fp8_gather,
+    )
+
+    assert module._use_grouped_tensor is False
+    assert all(linear.use_grouped_tensor is False for linear in grouped_linears)
+
+
+def test_paged_stash_keeps_supported_gtp_grouped_tensor(monkeypatch):
+    module, grouped_linears = _construct_grouped_mlp_with_gtp_weights(
+        monkeypatch, moe_paged_stash=True, te_supports_sharded_weights=True, native_fp8_gather=False
+    )
+
+    assert module._use_grouped_tensor is True
+    assert all(linear.use_grouped_tensor is True for linear in grouped_linears)
+
+
 @pytest.mark.parametrize(
     "invalid_fused_activation_config",
     [
