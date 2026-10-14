@@ -614,7 +614,12 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
         def __iter__(self):
             return iterator
 
-    return torch.utils.data.DataLoader(Dataset(), batch_size=None, pin_memory=True, num_workers=0)
+    # Iterator creation must not consume the default CPU RNG restored from a checkpoint.
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(torch.initial_seed())
+    return torch.utils.data.DataLoader(
+        Dataset(), batch_size=None, pin_memory=True, num_workers=0, generator=loader_generator
+    )
 
 
 def validation_only_config(config: Any, sample_counts: list) -> list:

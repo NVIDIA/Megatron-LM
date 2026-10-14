@@ -138,8 +138,6 @@ def commit_logits_attempt() -> None:
         saver.commit_attempt()
 
 
-_MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
-
 class LogitsSaverHooks:
     """
     Hook-based utility to save top-K log-probabilities during training with minimal overhead.
@@ -212,6 +210,8 @@ class LogitsSaverHooks:
         save_dtype: String name of the dtype for top-K log-probabilities on
             disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
     """
+
+    _max_vocab_size = 2 ** 17  # V1/V2 use 17-bit vocabulary indices.
 
     _DTYPE_MAP = {
         'fp16': torch.float16,
@@ -536,7 +536,7 @@ class LogitsSaverHooks:
         local_vocab_size = logits.shape[-1]
         global_vocab_size = local_vocab_size * self.tp_size
 
-        max_vocab_size = getattr(self, "_max_vocab_size", _MAX_VOCAB_SIZE)
+        max_vocab_size = self._max_vocab_size
         assert global_vocab_size <= max_vocab_size, (
             f"Global vocab size {global_vocab_size} exceeds maximum supported {max_vocab_size}"
         )

@@ -1786,10 +1786,15 @@ def legacy_saver_methods():
     cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef))
     names = {"_process_single_microbatch", "_compute_global_topk", "_apply_topp_truncation"}
     nodes = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    nodes += [
+        n
+        for n in cls.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "_max_vocab_size" for t in n.targets)
+    ]
     namespace = {
         "torch": torch,
         "dist": torch.distributed,
-        "_MAX_VOCAB_SIZE": 1 << 17,
         "CACHED_LOGITS_INDEX_SENTINEL": -1,
         "CACHED_LOGITS_LOGPROB_SENTINEL": -1e3,
     }
@@ -1800,8 +1805,15 @@ def legacy_saver_methods():
 
 def test_only_v3_extracts_vocabularies_above_17_bits(runtime_environment):
     module = importlib.import_module(f"{_namespace}.v3_saver")
-    method = legacy_saver_methods()["_process_single_microbatch"]
-    saver = types.SimpleNamespace(tp_size=1, k=2, p=None, _save_dtype=torch.float32)
+    helpers = legacy_saver_methods()
+    method = helpers["_process_single_microbatch"]
+    saver = types.SimpleNamespace(
+        tp_size=1,
+        k=2,
+        p=None,
+        _save_dtype=torch.float32,
+        _max_vocab_size=helpers["_max_vocab_size"],
+    )
     logits = torch.arange((1 << 17) + 1, dtype=torch.float32).reshape(1, 1, -1)
     with pytest.raises(AssertionError, match="maximum supported"):
         method(saver, logits)
@@ -1872,6 +1884,7 @@ def test_inherited_tp_top_p_survives_v3_codec(dtype, monkeypatch):
         tp_rank=0,
         tp_group=object(),
         _tp_dst_rank_global=7,
+        _max_vocab_size=helpers["_max_vocab_size"],
         k=4,
         p=0.7,
         min_k=2,
