@@ -96,6 +96,8 @@ products:
             set -euo pipefail
             cd /opt/megatron-lm
             export PYTHONPATH="$(pwd):${{PYTHONPATH:-}}"
+            # Nested launchers must retain the native packages already built in CI.
+            export UV_NO_SYNC=1
 
             uv run --no-sync pytest -s \
               tests/functional_tests/test_cases/mimo/{test_case}/test_checkpoint_round_trip.py

@@ -180,6 +180,26 @@ def test_batch_invariant_swiglu_matches_training():
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("clamp_scale", [None, 8.0], ids=["unclamped", "clamped"])
+def test_batch_invariant_squared_relu_matches_training(clamp_scale):
+    """Exercise the FP32 intermediates the training squared-ReLU fusion rounds only once."""
+    from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
+    from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
+
+    seeded()
+    rows, ffn = 512, 768
+    # Centred on zero so both sides of the ReLU are exercised.
+    x = torch.randn(rows, ffn, device="cuda", dtype=torch.bfloat16)
+    # FP32 probabilities, as moe_router_dtype=fp32 delivers them.
+    probs = torch.rand(rows, device="cuda")
+    perm = torch.arange(rows, device="cuda", dtype=torch.int32)
+    used = _dev_scalar(rows)
+
+    expected = weighted_squared_relu_impl(x.clone(), probs[:, None], clamp_scale)
+    actual = squared_relu_with_probs(x.clone(), perm, used, probs, clamp_scale)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_batch_invariant_inference_activations_replay():
     from megatron.core.inference.moe import batch_invariant
 
@@ -213,6 +233,14 @@ def test_batch_invariant_inference_activations_replay():
         (x2,),
         backward=False,
         what="weighted_silu_mul_bounded",
+    )
+    assert_replays_bit_exact(
+        lambda x: batch_invariant.weighted_silu_mul_bounded(x, probs, bound_elems, xblock=2048)[
+            :n_used
+        ],
+        (x2,),
+        backward=False,
+        what="weighted_silu_mul_bounded (larger block)",
     )
 
 
@@ -497,6 +525,33 @@ def test_vllm_fused_moe_and_moe_sum_replay():
         return out[: max_tokens - 100]
 
     assert_replays_bit_exact(moe_sum, (inp, probs), replays=4, backward=False, what="_moe_sum")
+
+
+def test_vllm_moe_align_block_size_replays():
+    """The counters are zeroed inside the init kernel, so a fresh ``torch.empty`` buffer that
+    reuses the previous replay's memory must still count from zero on every replay."""
+    from megatron.core.inference.moe.vllm_fused_moe import _moe_align_block_size_cuda_graphable
+
+    seeded()
+    max_tokens, topk, experts, num_local, local_start = 4096, 8, 64, 16, 16
+    routing_map = torch.randint(0, experts, (max_tokens, topk), device="cuda")
+    valid = _dev_scalar(max_tokens - 100)
+
+    def fn(routing_map):
+        sorted_token_ids, expert_ids, num_tokens_post_padded = _moe_align_block_size_cuda_graphable(
+            routing_map, 64, num_local, local_start, valid
+        )
+        # Atomic slot order within an expert may differ between replays; the multiset may not.
+        return torch.sort(sorted_token_ids).values, expert_ids, num_tokens_post_padded
+
+    assert_replays_bit_exact(
+        fn,
+        (routing_map,),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="_moe_align_block_size_cuda_graphable",
+    )
 
 
 # --- batch-invariant kernels -----------------------------------------------------------------

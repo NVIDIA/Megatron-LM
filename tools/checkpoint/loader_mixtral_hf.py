@@ -163,9 +163,9 @@ def _load_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables, set_run_config
         from megatron.training.argument_utils import inference_cfg_container_from_args
+        from megatron.training.arguments import parse_args, validate_args
+        from megatron.training.global_vars import set_args, set_global_variables
         from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -235,10 +235,8 @@ def _load_checkpoint(queue, args):
     # Suppress warning about torch.distributed not being initialized.
     LanguageModule.embedding_warning_printed = True 
 
-    # Temporary args/config duplication during the training-loop refactor:
-    # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(margs, build_model_config=False))
-    set_global_variables(margs, build_tokenizer=False)
+    cfg = inference_cfg_container_from_args(margs, build_model_config=False)
+    set_global_variables(margs, cfg, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)

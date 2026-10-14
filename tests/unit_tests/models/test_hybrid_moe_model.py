@@ -17,6 +17,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -104,10 +105,12 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_rope_interleaved": False,
     "dsa_indexer_rotate_activation": True,
     "dsa_indexer_scoring_relu": True,
+    "dsa_indexer_weights_proj_output_dtype": "bf16",
     "dsa_indexer_skip_topk_offset": 0,
     "dsa_indexer_topk": None,
     "dsa_indexer_topk_freq": 1,
     "dsa_indexer_use_sparse_loss": False,
+    "dsa_indexer_weights_proj_use_quantization": True,
     "dsa_kernel_backend": "none",
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
@@ -149,6 +152,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fused_residual_rmsnorm": False,
     "fused_single_qkv_rope": False,
     "gated_linear_unit": False,
+    "gdn_kernel_backend": "fla",
     "gdp_cutedsl_kernel": False,
     "gdp_num_chunk_states_to_recompute": 2,
     "gdp_num_householder": 3,
@@ -325,6 +329,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "symmetric_ar_type": None,
     "tensor_model_parallel_size": 2,
     "tensor_parallel_num_weight_shards": 2,
+    "tensor_parallel_num_sequence_shards": 2,
     "test_mode": False,
     "timers": None,
     "tp_comm_atomic_ag": False,
@@ -352,7 +357,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_mup": False,
     "use_ring_exchange_p2p": False,
     "use_te_activation_func": False,
-    "use_te_rng_tracker": False,
+    # RNGConfig now propagates the fixture's te_rng_tracker=True; the old
+    # args adapter missed this differently named field and left it False.
+    "use_te_rng_tracker": True,
     "variable_seq_lengths": False,
     "virtual_pipeline_model_parallel_size": None,
     "wgrad_deferral_limit": 0,
@@ -579,7 +586,7 @@ class TestHybridMoEModel:
         args.vocab_size = 131072
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     def setup_method(self, method):
