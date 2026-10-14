@@ -687,6 +687,55 @@ class TestHybridModel:
             assert torch.isfinite(layer.inner_layer.proj.weight.grad).all()
             assert torch.isfinite(layer.hyper_connection.mapping_proj.weight.grad).all()
 
+    def test_hybrid_model_output_processor(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=2,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=3,
+        )
+        model = (
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=_get_dummy_hybrid_stack_spec(),
+                vocab_size=64,
+                max_sequence_length=8,
+                hybrid_layer_pattern="M*-",
+                parallel_output=False,
+            )
+            .cuda()
+            .eval()
+        )
+        input_ids = torch.arange(8, dtype=torch.int64, device="cuda").repeat((2, 1))
+        position_ids = torch.arange(8, dtype=torch.int64, device="cuda").repeat((2, 1))
+        context = {"name": "hybrid"}
+        seen = {}
+
+        def output_processor(**kwargs):
+            seen.update(kwargs)
+            return kwargs["hidden_states"], kwargs["context"]
+
+        with torch.no_grad():
+            output = model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                output_processor=output_processor,
+                output_processor_context=context,
+            )
+
+        hidden_states, returned_context = output
+        assert hidden_states.shape == (8, 2, config.hidden_size)
+        assert returned_context is context
+        assert seen["output_layer"] is model.output_layer
+        assert seen["output_weight"] is None
+        assert seen["context"] is context
+        assert seen["config"] is config
+
     def test_set_input_tensor(self):
         config: TransformerConfig = self.model.config
         sequence_length = self.model.max_sequence_length

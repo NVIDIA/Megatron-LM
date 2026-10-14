@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import copy
 import os
 from dataclasses import replace
 
@@ -9,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import get_fp8_context, is_float8tensor
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -37,8 +37,10 @@ def _make_config(
     sequence_parallel: bool = False,
     params_dtype: torch.dtype = torch.bfloat16,
     linear_cp_mode: str = "headwise",
+    two_stage_gates: bool = False,
+    **overrides,
 ) -> TransformerConfig:
-    return TransformerConfig(
+    settings = dict(
         hidden_size=128,
         num_layers=1,
         num_attention_heads=4,
@@ -49,6 +51,7 @@ def _make_config(
         linear_value_head_dim=32,
         linear_num_key_heads=4,
         linear_num_value_heads=4,
+        kda_two_stage_gates=two_stage_gates,
         kda_safe_gate=True,
         kda_lower_bound=-5.0,
         normalization="RMSNorm",
@@ -65,6 +68,8 @@ def _make_config(
         is_hybrid_model=True,
         transformer_impl="transformer_engine",
     )
+    settings.update(overrides)
+    return TransformerConfig(**settings)
 
 
 def test_kda_norm_out_recompute_config_accepts_hybrid_model():
@@ -113,7 +118,7 @@ def test_kda_config_rejects_unsupported_head_layouts():
     with pytest.raises(ValueError, match="must be either 'headwise' or 'chunkwise'"):
         _make_config(linear_cp_mode="tokenwise")
 
-    with pytest.raises(AssertionError, match="linear_head_parallel_size"):
+    with pytest.raises(ValueError, match=r"divisible by TP\*CP"):
         _make_config(cp_size=3, linear_cp_mode="headwise")
 
     chunkwise_config = _make_config(cp_size=3, linear_cp_mode="chunkwise")
@@ -152,18 +157,50 @@ def test_kda_rejects_invalid_packed_boundaries():
         KimiDeltaAttention._validate_packed_cu_seqlens(empty, empty.clone())
 
 
+@pytest.mark.parametrize("field", ["linear_key_head_dim", "linear_value_head_dim"])
+def test_kda_config_rejects_missing_dimensions(field):
+    with pytest.raises(ValueError, match=f"{field} must be positive"):
+        _make_config(**{field: None})
+
+
+def test_kda_config_rejects_headwise_cp_misalignment():
+    with pytest.raises(ValueError, match=r"divisible by TP\*CP"):
+        _make_config(cp_size=2, linear_num_key_heads=3, linear_num_value_heads=3)
+
+
+def test_kda_config_rejects_deterministic_chunkwise_cp():
+    with pytest.raises(ValueError, match="incompatible with deterministic_mode"):
+        _make_config(cp_size=2, linear_cp_mode="chunkwise", deterministic_mode=True)
+
+
+@pytest.mark.parametrize("alignment", [0, -4])
+def test_kda_config_rejects_nonpositive_conv_padding_alignment(alignment):
+    with pytest.raises(ValueError, match="gdn_conv_pad_alignment must be positive"):
+        _make_config(gdn_conv_pad_alignment=alignment)
+
+
+@pytest.mark.parametrize("lower_bound", [None, 0.0, -6.0])
+def test_kda_config_rejects_invalid_safe_gate_lower_bound(lower_bound):
+    with pytest.raises(ValueError, match="kda_lower_bound"):
+        _make_config(kda_safe_gate=True, kda_lower_bound=lower_bound)
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_kda_forward_backward():
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_forward_backward(two_stage_gates):
     Utils.initialize_distributed()
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
     )
     try:
         model_parallel_cuda_manual_seed(123)
-        config = _make_config()
+        config = _make_config(two_stage_gates=two_stage_gates)
         kda = _build_kda(config)
-        assert kda.in_proj_split_names == ["query", "key", "value", "g", "gate"]
+        expected_splits = ["query", "key", "value"]
+        if not two_stage_gates:
+            expected_splits += ["g", "gate"]
+        assert kda.in_proj_split_names == expected_splits
         assert kda.A_log.dtype == torch.float32
         assert kda.dt_bias.dtype == torch.float32
         assert getattr(kda.A_log, "keep_in_fp32", False)
@@ -183,8 +220,8 @@ def test_kda_forward_backward():
         assert hidden_states.grad is not None
         assert torch.isfinite(hidden_states.grad).all()
         for name, parameter in kda.named_parameters():
-            if parameter.grad is not None:
-                assert torch.isfinite(parameter.grad).all(), f"non-finite gradient in {name}"
+            assert parameter.grad is not None, f"missing gradient in {name}"
+            assert torch.isfinite(parameter.grad).all(), f"non-finite gradient in {name}"
     finally:
         Utils.destroy_model_parallel()
 
@@ -209,11 +246,12 @@ def test_kda_gate_parameters_remain_fp32_after_model_cast():
 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_kda_packed_matches_unpacked_cp1():
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_packed_matches_unpacked_cp1(two_stage_gates):
     Utils.initialize_model_parallel(1, 1)
     try:
         model_parallel_cuda_manual_seed(321)
-        kda = _build_kda(_make_config())
+        kda = _build_kda(_make_config(two_stage_gates=two_stage_gates))
         unpacked = torch.randn(
             (16, 2, kda.config.hidden_size),
             device=torch.cuda.current_device(),
@@ -236,8 +274,72 @@ def test_kda_packed_matches_unpacked_cp1():
 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("deterministic_mode", [False, True])
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_rejects_packed_convolution_fallback(monkeypatch, deterministic_mode, two_stage_gates):
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(321)
+        kda = _build_kda(
+            _make_config(deterministic_mode=deterministic_mode, two_stage_gates=two_stage_gates)
+        )
+        if not deterministic_mode:
+            monkeypatch.setattr("megatron.core.ssm.gated_delta_net.kda.causal_conv1d", None)
+        hidden_states = torch.randn(
+            (32, 1, kda.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=[0, 16, 32])
+        with pytest.raises(ValueError, match="deterministic_mode=False"):
+            kda(hidden_states, None, packed_seq_params=packed_seq_params)
+        output, _ = kda(hidden_states, None)
+        assert torch.isfinite(output).all()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+@pytest.mark.parametrize("disable_fp8", [False, True])
+def test_kda_fp8_parameter_initialization(two_stage_gates, disable_fp8):
+    """KDA exclusions must preserve BF16 weights inside an enclosing FP8 init context."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = _make_config(
+            two_stage_gates=two_stage_gates,
+            linear_num_key_heads=16,
+            linear_num_value_heads=16,
+            fp8="hybrid",
+            fp8_param=True,
+            kda_disable_fp8=disable_fp8,
+            use_cpu_initialization=False,
+        )
+        model_parallel_cuda_manual_seed(321)
+        reference = _build_kda(config)
+        model_parallel_cuda_manual_seed(321)
+        with get_fp8_context(config, is_init=True):
+            layer = _build_kda(config)
+
+        projections = ["in_proj", "out_proj", "beta_proj"]
+        if two_stage_gates:
+            projections += ["f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj"]
+        for name in projections:
+            weight = getattr(layer, name).weight
+            assert is_float8tensor(weight) is (not disable_fp8), name
+            if disable_fp8:
+                assert weight.dtype == torch.bfloat16
+                torch.testing.assert_close(weight, getattr(reference, name).weight, atol=0, rtol=0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
 @pytest.mark.parametrize("recompute_module", ["gdn_norm_out", "gdn"])
-def test_kda_selective_recompute(recompute_module):
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_selective_recompute(recompute_module, two_stage_gates):
     Utils.initialize_model_parallel(1, 1)
     try:
 
@@ -251,10 +353,12 @@ def test_kda_selective_recompute(recompute_module):
             }
             return output.detach(), hidden_states.grad.detach().clone(), grads
 
-        base_config = _make_config()
-        recompute_config = copy.deepcopy(base_config)
-        recompute_config.recompute_granularity = "selective"
-        recompute_config.recompute_modules = [recompute_module]
+        base_config = _make_config(two_stage_gates=two_stage_gates)
+        recompute_config = _make_config(
+            two_stage_gates=two_stage_gates,
+            recompute_granularity="selective",
+            recompute_modules=[recompute_module],
+        )
 
         model_parallel_cuda_manual_seed(42)
         base_kda = _build_kda(base_config)
@@ -284,8 +388,12 @@ def test_kda_selective_recompute(recompute_module):
         assert (recompute_kda.norm_out_checkpoint is not None) is (
             recompute_module == "gdn_norm_out"
         )
-        torch.testing.assert_close(recompute_output, base_output, atol=0, rtol=0)
-        torch.testing.assert_close(recompute_input_grad, base_input_grad, atol=0, rtol=0)
+        # The checkpointed forward runs the fused BF16 recurrence under no_grad, which can
+        # select a different reduction path from the eager forward.  Keep this to one BF16
+        # ULP while still checking that recomputation preserves the result and input gradient.
+        recompute_tolerance = dict(atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(recompute_output, base_output, **recompute_tolerance)
+        torch.testing.assert_close(recompute_input_grad, base_input_grad, **recompute_tolerance)
         assert recompute_grads.keys() == base_grads.keys()
         for name in base_grads:
             # Recomputed BF16 kernels can choose a different reduction order. Keep output and
@@ -304,7 +412,9 @@ def test_kda_selective_recompute(recompute_module):
 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_kda_cp2_packed_with_physical_padding_matches_cp1():
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+@pytest.mark.skipif(Utils.world_size < 2, reason="Requires two GPUs.")
+def test_kda_cp2_packed_with_physical_padding_matches_cp1(two_stage_gates):
     """Match CP2 packed KDA against CP1 when physical and actual boundaries differ."""
 
     sequence_length = 32
@@ -323,7 +433,7 @@ def test_kda_cp2_packed_with_physical_padding_matches_cp1():
             dtype=torch.bfloat16,
         )
         model_parallel_cuda_manual_seed(2026)
-        reference_kda = _build_kda(_make_config(cp_size=1))
+        reference_kda = _build_kda(_make_config(cp_size=1, two_stage_gates=two_stage_gates))
         reference_state = {
             name: tensor.detach().clone() for name, tensor in reference_kda.state_dict().items()
         }
@@ -358,7 +468,7 @@ def test_kda_cp2_packed_with_physical_padding_matches_cp1():
     )
     try:
         model_parallel_cuda_manual_seed(2026)
-        parallel_kda = _build_kda(_make_config(cp_size=2))
+        parallel_kda = _build_kda(_make_config(cp_size=2, two_stage_gates=two_stage_gates))
         parallel_kda.load_state_dict(reference_state)
         cp_group = parallel_state.get_context_parallel_group()
 
@@ -444,3 +554,48 @@ def test_kda_packed_cu_seqlens_validation_skips_device_sync_during_capture():
         KimiDeltaAttention._validate_packed_cu_seqlens(cu_seqlens, mismatched)
     with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
         KimiDeltaAttention._validate_packed_cu_seqlens(cu_seqlens, mismatched)  # no sync, no raise
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"linear_num_value_heads": 8}, "head counts"),
+        ({"linear_value_head_dim": 64}, "head dimensions"),
+    ],
+)
+def test_kda_layer_config_rejects_unequal_heads(overrides, message):
+    with pytest.raises(ValueError, match=f"equal key and value {message}"):
+        _make_config(**overrides)
+
+    # from_config preserves stack values without running __post_init__. They must
+    # still be checked before any layer parameters or process groups are built.
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+    )
+    for name, value in overrides.items():
+        setattr(config, name, value)
+    with pytest.raises(ValueError, match=f"equal key and value {message}"):
+        KimiDeltaAttention(config, submodules=None)
+
+
+def test_kda_recompute_modules_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="cannot be used together"):
+        _make_config(recompute_granularity="selective", recompute_modules=["gdn", "gdn_norm_out"])
+
+
+@pytest.mark.parametrize("recompute_module", ["gdn_norm_out", "gdn"])
+def test_gdn_recompute_rejects_non_gdn_models(recompute_module):
+    with pytest.raises(ValueError, match="only supported with GDN-family layers"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            recompute_granularity="selective",
+            recompute_modules=[recompute_module],
+        )

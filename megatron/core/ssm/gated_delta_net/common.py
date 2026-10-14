@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Protocol, Union
@@ -12,7 +13,7 @@ from typing import Optional, Protocol, Union
 import torch
 import torch.nn as nn
 
-from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -74,6 +75,17 @@ __all__ = [
     "tensor_a2a_cp2hp",
     "tensor_a2a_hp2cp",
 ]
+
+
+def _build_with_kda_fp8_disabled(fp8_config, module_spec, *args, **kwargs):
+    """Build a KDA projection without quantized parameter initialization when requested."""
+    init_context = (
+        get_fp8_disabled_context(fp8_config, is_init=True)
+        if getattr(fp8_config, "kda_disable_fp8", False)
+        else nullcontext()
+    )
+    with init_context:
+        return build_module(module_spec, *args, **kwargs)
 
 
 @dataclass
@@ -245,16 +257,21 @@ class _GDNBase(MegatronModule):
             assert (
                 getattr(self, attr) is not None
             ), f"Attribute {attr} for the GDN-family variant is not set"
-        # Full input projection width: q, k, v, output gate, and variant-specific gate features.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
+        # Two-stage gates use separate projections; in_proj emits QKV only.
+        if getattr(self, "two_stage_gates", False):
+            self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim
+        else:
+            self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
+        self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
-        if self.config.fp8:
+        if self.config.fp8 and not getattr(self.config, "kda_disable_fp8", False):
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
                 "For FP8, the innermost dimension of the GDN-family layer "
                 "input projection output tensor must be a multiple of 16."
             )
-        self.in_proj = build_module(
+        self.in_proj = _build_with_kda_fp8_disabled(
+            self.config,
             submodules.in_proj,
             self.hidden_size,
             self.in_proj_dim,
@@ -323,7 +340,8 @@ class _GDNBase(MegatronModule):
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
             self.recompute_gdn = "gdn" in self.config.recompute_modules
 
-        self.out_proj = build_module(
+        self.out_proj = _build_with_kda_fp8_disabled(
+            self.config,
             submodules.out_proj,
             self.v_dim,
             self.hidden_size,

@@ -152,6 +152,14 @@ hybrid_stack_spec = ModuleSpec(
                     submodules=KimiDeltaAttentionSubmodules(
                         in_proj=TEColumnParallelLinear,
                         beta_proj=TEColumnParallelLinear,
+                        # Two-stage low-rank gates (GLM-5.3-Flash); only used when
+                        # config.kda_two_stage_gates=True, else IdentityOp.
+                        # f_a/g_a are replicated (TELinear parallel_mode="duplicated");
+                        # f_b/g_b are TP-sharded column-parallel.
+                        f_a_proj=TELinear,
+                        f_b_proj=TEColumnParallelLinear,
+                        g_a_proj=TELinear,
+                        g_b_proj=TEColumnParallelLinear,
                         out_norm=TENorm,
                         out_proj=TERowParallelLinear,
                     ),
@@ -269,6 +277,7 @@ gated_delta_product_stack_spec = ModuleSpec(
             TELayerNormColumnParallelLinear, TERowParallelLinear
         ),
         gdn_layer=hybrid_stack_spec.submodules.gdn_layer,
+        kda_layer=hybrid_stack_spec.submodules.kda_layer,
         attention_layer=hybrid_stack_spec.submodules.attention_layer,
         dsa_layer=hybrid_stack_spec.submodules.dsa_layer,
         mlp_layer=hybrid_stack_spec.submodules.mlp_layer,
@@ -292,6 +301,30 @@ hybrid_inference_stack_spec = ModuleSpec(
                     ),
                 ),
                 mamba_bda=get_bias_dropout_add,
+            ),
+        ),
+        kda_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=KimiDeltaAttention,
+                    submodules=KimiDeltaAttentionSubmodules(
+                        in_proj=InferenceColumnParallelLinear,
+                        beta_proj=InferenceColumnParallelLinear,
+                        # Two-stage low-rank gates (GLM-5.3-Flash); only used when
+                        # config.kda_two_stage_gates=True, else IdentityOp.
+                        # f_a/g_a replicated (TELinear parallel_mode="duplicated");
+                        # f_b/g_b TP-sharded inference column-parallel.
+                        f_a_proj=TELinear,
+                        f_b_proj=InferenceColumnParallelLinear,
+                        g_a_proj=TELinear,
+                        g_b_proj=InferenceColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
             ),
         ),
         # Started with spec from gpt_layer_specs.py (with MLP removed)
@@ -425,6 +458,7 @@ gated_delta_product_inference_stack_spec = ModuleSpec(
             InferenceLayerNormColumnParallelLinear, InferenceRowParallelLinear
         ),
         gdn_layer=hybrid_inference_stack_spec.submodules.gdn_layer,
+        kda_layer=hybrid_inference_stack_spec.submodules.kda_layer,
         attention_layer=hybrid_inference_stack_spec.submodules.attention_layer,
         dsa_layer=hybrid_inference_stack_spec.submodules.dsa_layer,
         mlp_layer=hybrid_inference_stack_spec.submodules.mlp_layer,
