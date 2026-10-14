@@ -633,7 +633,7 @@ target is unsupported.
 | Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
 | Recomputation | Whole-MoE activation recompute |
-| CUDA Graph | Full-iteration capture |
+| CUDA Graph | Full-iteration capture; per-layer Transformer Engine capture with the `moe_router` scope |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
 Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the reduction-store
@@ -658,7 +658,7 @@ The current backend requires grouped experts and fused gradient accumulation. It
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
 wgrad, native shared-expert overlap, shared-expert-only
 recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
-partial MoE CUDA Graph replay, MCore expert-input
+the `moe_preprocess` CUDA Graph scope, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
 layouts.
 
