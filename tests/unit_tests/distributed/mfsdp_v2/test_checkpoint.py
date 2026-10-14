@@ -562,7 +562,7 @@ def test_ep_fsdp_checkpoint_roundtrip(tmp_path_dist_ckpt, ep_size):
             )
             return model, optimizer
 
-        source, source_optimizer = build(123)
+        source, source_optimizer = build(seed=123)
         torch.manual_seed(4321 + rank)
         ids = torch.randint(0, 128, (2, 8), device=device)
         pos = torch.arange(8, device=device).repeat(2, 1)
@@ -597,7 +597,7 @@ def test_ep_fsdp_checkpoint_roundtrip(tmp_path_dist_ckpt, ep_size):
         train(source, source_optimizer)
         with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_mcore_roundtrip", sync=True) as path:
             dcp.save(checkpoint_state(source, source_optimizer), checkpoint_id=path)
-            destination, destination_optimizer = build(987)
+            destination, destination_optimizer = build(seed=987)
             raw_model_state = destination.state_dict_for_save_checkpoint()
             state = checkpoint_state(destination, destination_optimizer, is_loading=True)
             dcp.load(state, checkpoint_id=path)
