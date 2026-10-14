@@ -50,6 +50,7 @@ class StaticInferenceEngineTestHarness:
         self.vocab_size = vocab_size
         self.sequence_length = 64
         transformer_config = TransformerConfig(
+            flash_attention_version=2,
             num_layers=4,
             hidden_size=self.hidden_size,
             num_attention_heads=4,
