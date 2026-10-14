@@ -110,6 +110,12 @@ class LanguageModule(MegatronModule):
 
         Transformer engine works based on optout. By default all three attention backend flags are set to 1. So if the user choses a particular attention backend we set the other two to 0. If the user choses local, we set all 3 TE env variables to 0.
         """
+        if self.config.batch_invariant_mode:
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                assert_te_supports_batch_invariant_attention,
+            )
+
+            assert_te_supports_batch_invariant_attention()
 
         def check_and_set_env_variable(
             env_variable_name: str, expected_value: int, attn_type: AttnBackend

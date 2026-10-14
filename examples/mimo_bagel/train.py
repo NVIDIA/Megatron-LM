@@ -850,13 +850,15 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
     import megatron
     from examples.mimo_bagel.vision.hf_bagel_vision_encoder import HFBagelVisionEncoderWrapper
-    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
     from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     # from megatron.core.models.vision.multimodal_projector import MultimodalProjector
     # Subclass so we can set default fsdp_unit_modules without using partial().
-    # training.py uses isinstance(module, megatron_FSDP), so megatron_FSDP must be a class.
+    # training.py builds Megatron-FSDP through the FullyShardedDataParallel factory and
+    # type-checks with isinstance(module, (FullyShardedDataParallelV1, ...V2)), so subclass
+    # the V1 implementation class and patch the factory name used by get_model().
     #
     # HFBagelVisionEncoderWrapper and MultimodalProjector are added as fsdp_unit_modules to
     # prevent FSDP bucket misalignment.  When LLM hidden_size > ViT hidden_size (e.g.
@@ -866,7 +868,7 @@ if __name__ == "__main__":
     # make_fsdp_dtensor's local_tensor.view((-1, 1152)) to fail.  Isolating the ViT encoder
     # and the vision projector into their own FSDP units keeps their [N, 1152] params out of
     # any bucket that also contains [M, 2048] diffusion/LLM non-layer params.
-    class BagelFullyShardedDataParallel(FullyShardedDataParallel):
+    class BagelFullyShardedDataParallel(FullyShardedDataParallelV1):
         def __init__(self, config, ddp_config, module, fsdp_unit_modules=None, **kwargs):
             if fsdp_unit_modules is None:
                 fsdp_unit_modules = [
@@ -883,7 +885,7 @@ if __name__ == "__main__":
                 **kwargs,
     )
 
-    megatron.training.training.megatron_FSDP = BagelFullyShardedDataParallel
+    megatron.training.training.FullyShardedDataParallel = BagelFullyShardedDataParallel
     args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
     validate_reference_training_args(args)
     full_config = pretrain_cfg_container_from_args(args)
