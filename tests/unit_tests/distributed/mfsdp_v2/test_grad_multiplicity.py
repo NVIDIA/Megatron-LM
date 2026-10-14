@@ -49,6 +49,15 @@ def _graph_task(model, inputs, node):
     return loss.detach()
 
 
+def _gather_parameter_shards(tensor):
+    """Reconstruct a parameter whose rows are distributed by the packed layout."""
+    # Packed FSDP shards can own unequal row counts, including empty shards.
+    # DTensor.full_tensor() assumes ordinary per-parameter Shard(0) partitions.
+    shards = [None] * dist.get_world_size()
+    dist.all_gather_object(shards, tensor.to_local().detach().cpu())
+    return torch.cat(shards, dim=0).to(tensor.device)
+
+
 @pytest.mark.parametrize(
     "nodes",
     [(None,), (None, None), (None, None, None), (0, 1, 0)],
@@ -83,8 +92,8 @@ def test_gradients_and_updates_match_baseline(distributed_setup, nodes):
         model.context.finish_grad_sync()
         for reference, parameter in zip(baseline.parameters(), model.parameters()):
             dist.all_reduce(reference.grad, op=dist.ReduceOp.AVG)
-            torch.testing.assert_close(parameter.grad.full_tensor(), reference.grad)
+            torch.testing.assert_close(_gather_parameter_shards(parameter.grad), reference.grad)
         optimizer.step()
         baseline_optimizer.step()
         for reference, parameter in zip(baseline.parameters(), model.parameters()):
-            torch.testing.assert_close(parameter.full_tensor(), reference)
+            torch.testing.assert_close(_gather_parameter_shards(parameter), reference)
