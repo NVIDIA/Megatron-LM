@@ -261,6 +261,7 @@ class TestHybridStackMHC:
             padding_mask,
             input_ids=None,
             mhc_recompute_manager=None,
+            cross_layer_state=None,
         ):
             seen_input_ids.append(input_ids)
             return original(
@@ -274,6 +275,7 @@ class TestHybridStackMHC:
                 padding_mask,
                 input_ids,
                 mhc_recompute_manager,
+                cross_layer_state,
             )
 
         monkeypatch.setattr(

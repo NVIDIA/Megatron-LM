@@ -431,7 +431,14 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
         for layer, values in zip(layers, inputs):
             q, kv, x, qr = [v.detach().clone().requires_grad_() for v in values]
             leaves.extend((q, kv, x, qr))
-            outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state))
+            try:
+                outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state))
+            except RuntimeError as error:
+                # The standard CI image deliberately builds FlashMLA without SM90.
+                # Keep parity active on images/devices that have the compiled kernel.
+                if layers is fused and "no kernel image is available" in str(error):
+                    pytest.skip("FlashMLA was built without kernels for this GPU")
+                raise
         sum(y.float().square().mean() for y in outputs).backward()
         grads = [p.grad for p in layers.parameters()] + [x.grad for x in leaves]
         results.append((outputs, grads))
