@@ -270,20 +270,24 @@ class DisaggCoordinatorRuntime:
             assert state.prompt_frame is not None, "completed request remained in the prefill queue"
             self._submit_prefill(prefill_id, request.request_id)
 
-    def handle_prefill_done(self, request_id: int, finished_request: dict) -> None:
-        """Route a completed prefill handoff to a decode instance."""
+    def handle_prefill_done(self, request_id: int, finished_request: dict) -> bool:
+        """Consume a prefill reply, or return False to forward an ordinary failed result."""
 
         self.hop1_request_ids.discard(request_id)
         if request_id in self.terminating_request_ids:
             self._finish_abort(request_id)
-            return
+            return True
+        if finished_request.get("status") == "FAILED":
+            # Preserve the engine's error events and the frontend's 400/500 mapping.
+            # The ordinary reply path releases reservations and client bookkeeping.
+            return False
         request_state = self.requests.get(request_id)
         handoff = finished_request.get("disaggregated_params")
         if request_state is None or not isinstance(handoff, dict):
             self.drop_request(
                 request_id, "prefill reply carried no handoff metadata", source_safe=True
             )
-            return
+            return True
         kv_meta = handoff.get("kv_meta")
         block_ids = handoff.get("block_ids")
         prompt_frame = finished_request.get("prompt_frame")
@@ -298,12 +302,12 @@ class DisaggCoordinatorRuntime:
             self.drop_request(
                 request_id, "prefill reply carried invalid handoff metadata", source_safe=True
             )
-            return
+            return True
         try:
             decode_id = self._select_engine(DECODE, request_id, request_state.block_hashes)
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to decode: {error}", source_safe=True)
-            return
+            return True
 
         prefill_id = self.scheduler.reserved_engine(PREFILL, request_id)
         if prefill_id is not None and self.engine_transport.get(prefill_id) == "nixl":
@@ -315,7 +319,7 @@ class DisaggCoordinatorRuntime:
                 self.drop_request(
                     request_id, f"invalid NIXL handoff metadata: {error}", source_safe=True
                 )
-                return
+                return True
 
         payload = [
             msgpack.packb(
@@ -344,13 +348,14 @@ class DisaggCoordinatorRuntime:
                 f"engine {decode_id!r} advertises only {capacity}",
                 source_safe=True,
             )
-            return
+            return True
         if self.scheduler.has_queued(decode_id) or not self.scheduler.try_reserve(
             decode_id, request_id, slot_cost
         ):
             self.scheduler.enqueue(decode_id, request_id, payload, slot_cost)
-            return
+            return True
         self._send_decode_handoff(decode_id, request_id, payload)
+        return True
 
     def _send_decode_handoff(self, decode_id, request_id: int, payload: list[bytes]) -> bool:
         """Send a handoff; an unreachable engine is removed with its assigned work."""

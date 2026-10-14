@@ -564,8 +564,8 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             and fid in coordinator.disaggregated_runtime.hop1_request_ids
         ):
             finished_request = msgpack.unpackb(body, raw=False)
-            coordinator.disaggregated_runtime.handle_prefill_done(fid, finished_request)
-            continue
+            if coordinator.disaggregated_runtime.handle_prefill_done(fid, finished_request):
+                continue
 
         if fid not in coordinator.request_id_to_client_id:
             logging.warning(

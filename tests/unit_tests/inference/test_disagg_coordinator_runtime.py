@@ -185,6 +185,45 @@ def test_malformed_prefill_handoff_fails_the_request(handoff, prompt_frame):
     assert 5 not in runtime.requests
 
 
+@pytest.mark.parametrize("error_type", ["ERROR_NONTRANSIENT", "ERROR_TRANSIENT"])
+@pytest.mark.parametrize("aborted", [False, True])
+def test_failed_prefill_preserves_engine_error_and_releases_capacity(error_type, aborted):
+    runtime, sent = _runtime(request_capacity=1)
+    coordinator = runtime.coordinator
+    coordinator.request_id_to_rank = {}
+    _submit(runtime, 5, [1], {})
+    _submit(runtime, 6, [2], {})
+    if aborted:
+        runtime.abort_request(5)
+    sent.clear()
+    body = msgpack.packb(
+        {"status": "FAILED", "events": [{"type": error_type, "payload": "original error"}]},
+        use_bin_type=True,
+    )
+
+    HANDLERS[Headers.ENGINE_REPLY](
+        coordinator, b"prefill", [Headers.ENGINE_REPLY.value, [[5, False]]], [body]
+    )
+
+    client_frames = [message for identity, message in sent if identity == b"client"]
+    assert len(client_frames) == 1
+    response = client_frames[0]
+    if aborted:
+        assert msgpack.unpackb(response[1]) == [Headers.REQUEST_ABORTED.value, 50, True]
+    else:
+        assert msgpack.unpackb(response[1]) == [Headers.ENGINE_REPLY.value, 50]
+        assert response[2] == body
+    assert 5 not in runtime.requests
+    assert 5 not in runtime.hop1_request_ids
+    assert 5 not in runtime.terminating_request_ids
+    assert 5 not in coordinator.request_id_to_client_id
+    assert runtime.scheduler.reserved_engine("prefill", 5) is None
+    assert runtime.scheduler.reserved_engine("prefill", 6) == b"prefill"
+    assert [
+        (identity, Headers(message[0])) for identity, message in sent if identity != b"client"
+    ] == [(b"prefill", Headers.RELEASE_KV), (b"prefill", Headers.SUBMIT_REQUEST)]
+
+
 def test_nccl_send_waits_for_decode_destinations():
     runtime, sent = _runtime(backend="nccl")
     _submit(runtime, 5, [1], {})
