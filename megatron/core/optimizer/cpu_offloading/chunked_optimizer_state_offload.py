@@ -4,9 +4,10 @@
 
 The wrapped optimizer continues to own its normal param_groups and state mappings.
 Parameters selected for offload keep their master weights and tensor states in pinned CPU
-memory between updates. Immediately before an update, master weights are restored as one
-window and optimizer tensor states are restored one chunk at a time. The external optimizer
-therefore only ever observes regular CUDA tensors and does not need an offload-specific API.
+memory between updates. During an update, optimizer tensor states are restored one chunk at a
+time; a master the optimizer owns (``state['master_param']``) is one of them. MCore-owned
+masters are restored as one window before the first chunk. The external optimizer therefore
+only ever observes regular CUDA tensors and does not need an offload-specific API.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import torch
 from megatron.core.utils import log_single_rank
 
 _MASTER_PARAM_KEY = "master_param"
-_NON_OFFLOADABLE_STATE_KEYS = frozenset({_MASTER_PARAM_KEY, "step", "found_inf"})
+_NON_OFFLOADABLE_STATE_KEYS = frozenset({"step", "found_inf"})
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +63,13 @@ class ChunkedOptimizerStateOffloader:
     matrix optimizers such as Muon and also avoids fabricating optimizer parameters for slices
     of a DistributedOptimizer shard.
 
-    Master weights are always offloaded for selected mixed-precision parameters. They use a
-    full-window fallback: all selected masters are restored before the first state chunk and
-    copied back after the optimizer/model-parameter staging phase. This keeps the external
-    optimizer and FP8 parameter-gather paths unchanged while still removing masters from the
+    Master weights are always offloaded for selected mixed-precision parameters. A master the
+    optimizer owns (precision-aware FusedAdam's ``state['master_param']``) is read only by the
+    optimizer's own update, so it is ordinary chunk state: staged, updated and copied back with
+    its chunk's moments. MCore-owned masters use a full-window fallback: all selected masters
+    are restored before the first state chunk and copied back after the optimizer/model-parameter
+    staging phase, because MCore's main-to-model copies read them after the update. This keeps
+    the FP8 parameter-gather paths unchanged while still removing masters from the
     forward/backward residency set.
 
     Args:
@@ -81,7 +85,7 @@ class ChunkedOptimizerStateOffloader:
             authority for the actual state schema.
         optimizer_owned_master_dtypes: Dtype of each optimizer-owned ``master_param`` entry.
             Passing the exact parameters that materialize this entry avoids guessing and
-            accounts for compact int16 parameter remainders.
+            accounts for compact int16 parameter remainders in the chunk plan.
         d2h_stream: Optional transfer stream shared by related optimizer wrappers.
         h2d_stream: Optional transfer stream shared by related optimizer wrappers.
     """
@@ -158,10 +162,11 @@ class ChunkedOptimizerStateOffloader:
         )
         self._chunks = self._build_chunks(self._selected_params)
 
+        # CPU canonical tensor state, an optimizer-owned ``state['master_param']`` included.
         self._cpu_state: Dict[torch.Tensor, Dict[str, torch.Tensor]] = collections.defaultdict(dict)
-        # This map can be keyed by parameter alone because the constructor rejects combining
-        # MCore-owned ``param.data`` masters with optimizer-owned ``state['master_param']`` in
-        # one manager, and ``_validate_master_storage`` rechecks that invariant after lazy init.
+        # CPU canonical MCore-owned ``param.data`` masters. The constructor rejects combining them
+        # with optimizer-owned masters in one manager, and ``_validate_master_storage`` rechecks
+        # that invariant after lazy init.
         self._cpu_master: Dict[torch.Tensor, torch.Tensor] = {}
 
         self._d2h_stream = d2h_stream if d2h_stream is not None else torch.cuda.Stream()
@@ -187,14 +192,12 @@ class ChunkedOptimizerStateOffloader:
         return tuple(params)
 
     def _estimated_bundle_bytes(self, param: torch.Tensor) -> int:
-        state_bytes = self._estimated_state_bytes(param)
-        if id(param) in self._explicit_master_param_ids:
-            master_bytes = param.numel() * param.element_size()
-        elif id(param) in self._optimizer_owned_master_dtypes:
-            master_bytes = param.numel() * self._optimizer_owned_master_dtypes[id(param)].itemsize
-        else:
-            master_bytes = 0
-        return state_bytes + master_bytes
+        mcore_master_bytes = (
+            param.numel() * param.element_size()
+            if id(param) in self._explicit_master_param_ids
+            else 0
+        )
+        return self._estimated_state_bytes(param) + mcore_master_bytes
 
     def _param_has_master(self, param: torch.Tensor) -> bool:
         return (
@@ -226,7 +229,11 @@ class ChunkedOptimizerStateOffloader:
         return tuple(selected)
 
     def _estimated_state_bytes(self, param: torch.Tensor) -> int:
-        return param.numel() * self._state_bytes_per_param
+        """Bytes one state chunk stages for ``param``, an optimizer-owned master included."""
+
+        master_dtype = self._optimizer_owned_master_dtypes.get(id(param))
+        master_bytes = 0 if master_dtype is None else param.numel() * master_dtype.itemsize
+        return param.numel() * self._state_bytes_per_param + master_bytes
 
     def _build_chunks(self, params: Sequence[torch.Tensor]) -> tuple[OptimizerStateChunk, ...]:
         if not params:
@@ -335,9 +342,10 @@ class ChunkedOptimizerStateOffloader:
     def _is_offloadable_state(param: torch.Tensor, key: str, value: object) -> bool:
         """Return whether a tensor belongs to the supported chunked state schema."""
 
-        # Shape is sufficient only for the currently admitted fp32/bf16 Adam moments and the
-        # exact Muon momentum schema. FP8 moments carry one-element scale metadata that can match
-        # a one-element DistOpt shard; supporting them requires explicit state-key classification.
+        # Shape is sufficient only for the currently admitted fp32/bf16 Adam moments, the
+        # optimizer-owned fp32 master or its int16 remainder, and the exact Muon momentum schema.
+        # FP8 moments carry one-element scale metadata that can match a one-element DistOpt
+        # shard; supporting them requires explicit state-key classification.
         return (
             key not in _NON_OFFLOADABLE_STATE_KEYS
             and isinstance(value, torch.Tensor)
@@ -379,10 +387,10 @@ class ChunkedOptimizerStateOffloader:
         """Register CPU tensor states created or loaded outside the manager.
 
         Naturally CPU scalar state is left resident. Tensor state matching an optimizer
-        parameter shape is treated as offloaded state; this covers Adam moments and Muon
-        momentum while avoiding ordinary CPU step counters. Tracked buffers that are no longer
-        part of the optimizer's canonical state are released so checkpoint schema changes do
-        not retain stale pinned host memory.
+        parameter shape is treated as offloaded state; this covers Adam moments, an
+        optimizer-owned master and Muon momentum while avoiding ordinary CPU step counters.
+        Tracked buffers that are no longer part of the optimizer's canonical state are released
+        so checkpoint schema changes do not retain stale pinned host memory.
         """
 
         params = self._selected_params if params is None else params
@@ -455,8 +463,8 @@ class ChunkedOptimizerStateOffloader:
                 self._d2h_stream.synchronize()
                 self.adopt_cpu_optimizer_state(chunk.params)
 
-            # Precision-aware FusedAdam creates masters in optimizer.state during init.
-            # Scan and offload the full master window once, after all chunks exist.
+            # Precision-aware FusedAdam's masters went back with their chunks; this moves
+            # the MCore-owned master window.
             self._schedule_master_d2h()
             self._d2h_stream.synchronize()
             self.adopt_cpu_optimizer_state()
@@ -593,15 +601,16 @@ class ChunkedOptimizerStateOffloader:
                 )
 
     def _master_bindings_are_cuda(self) -> bool:
-        """Return whether every materialized selected master is CUDA-bound."""
+        """Return whether every selected MCore-owned master is CUDA-bound.
 
-        for param in self._selected_params:
-            if id(param) in self._explicit_master_param_ids and not param.data.is_cuda:
-                return False
-            state_master = self.optimizer.state.get(param, {}).get(_MASTER_PARAM_KEY)
-            if isinstance(state_master, torch.Tensor) and not state_master.is_cuda:
-                return False
-        return True
+        An optimizer-owned master is chunk state that only the optimizer's update reads.
+        """
+
+        return all(
+            param.data.is_cuda
+            for param in self._selected_params
+            if id(param) in self._explicit_master_param_ids
+        )
 
     def assert_master_weights_resident(self, operation: str) -> None:
         """Reject an external master reader while D2H/H2D changes its canonical binding."""
@@ -622,67 +631,53 @@ class ChunkedOptimizerStateOffloader:
         # Make the current stream depend on the H2D copy before the D2H stream follows it.
         self._wait_master_h2d()
 
-        transfers = []
-        for param in self._selected_params:
-            if id(param) in self._explicit_master_param_ids and param.data.is_cuda:
-                transfers.append((param, None, param.data))
-            state_master = self.optimizer.state.get(param, {}).get(_MASTER_PARAM_KEY)
-            if isinstance(state_master, torch.Tensor) and state_master.is_cuda:
-                transfers.append((param, _MASTER_PARAM_KEY, state_master))
+        transfers = [
+            param
+            for param in self._selected_params
+            if id(param) in self._explicit_master_param_ids and param.data.is_cuda
+        ]
         if not transfers:
             return
 
         self._master_weights_resident = False
         self._d2h_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._d2h_stream):
-            for param, state_key, gpu_tensor in transfers:
+            for param in transfers:
+                gpu_tensor = param.data
                 cpu_tensor = self._cpu_buffer_for_master(param, gpu_tensor)
                 cpu_tensor.copy_(gpu_tensor, non_blocking=True)
                 gpu_tensor.record_stream(self._d2h_stream)
                 # CPU is the canonical binding as soon as the copy is enqueued. CUDA's
                 # allocator keeps the source alive through record_stream(), and any H2D
                 # consumer waits on the D2H stream before reading this buffer.
-                if state_key is None:
-                    param.data = cpu_tensor
-                else:
-                    self.optimizer.state[param][state_key] = cpu_tensor
+                param.data = cpu_tensor
 
     def _schedule_master_h2d(self) -> None:
         if not self._selected_params or self._master_h2d_event is not None:
             return
         self._validate_master_storage()
 
-        transfers = []
-        for param in self._selected_params:
-            if id(param) in self._explicit_master_param_ids and not param.data.is_cuda:
-                transfers.append((param, None, param.data))
-            state_master = self.optimizer.state.get(param, {}).get(_MASTER_PARAM_KEY)
-            if isinstance(state_master, torch.Tensor) and not state_master.is_cuda:
-                transfers.append((param, _MASTER_PARAM_KEY, state_master))
+        transfers = [
+            param
+            for param in self._selected_params
+            if id(param) in self._explicit_master_param_ids and not param.data.is_cuda
+        ]
         if not transfers:
             self._master_weights_resident = self._master_bindings_are_cuda()
             return
 
         self._master_weights_resident = False
         gpu_transfers = [
-            (
-                param,
-                state_key,
-                cpu_tensor,
-                torch.empty_like(cpu_tensor, device=self._param_devices[param]),
-            )
-            for param, state_key, cpu_tensor in transfers
+            (param, param.data, torch.empty_like(param.data, device=self._param_devices[param]))
+            for param in transfers
         ]
 
         self._order_h2d_after_source_streams()
         with torch.cuda.stream(self._h2d_stream):
-            for param, state_key, cpu_tensor, gpu_tensor in gpu_transfers:
+            for param, cpu_tensor, gpu_tensor in gpu_transfers:
                 gpu_tensor.copy_(cpu_tensor, non_blocking=cpu_tensor.is_pinned())
                 gpu_tensor.record_stream(self._h2d_stream)
-                if state_key is None:
-                    param.data = gpu_tensor
-                else:
-                    self.optimizer.state[param][state_key] = gpu_tensor
+                param.data = gpu_tensor
                 self._cpu_master[param] = cpu_tensor
 
             event = torch.cuda.Event()
@@ -783,7 +778,8 @@ class ChunkedOptimizerStateOffloader:
             torch.cuda.current_stream().wait_event(prefetch.event)
 
     def prefetch_for_step(self) -> None:
-        """Asynchronously restore masters and the first state chunk for the next update."""
+        """Asynchronously restore MCore-owned masters and the first state chunk for the next
+        update."""
 
         if not self._selected_params:
             return
@@ -792,13 +788,13 @@ class ChunkedOptimizerStateOffloader:
             self._first_prefetch = self._prefetch_state(self._chunks[0])
 
     def prefetch_master_for_step(self) -> None:
-        """Asynchronously restore only masters, leaving tensor state CPU-resident."""
+        """Asynchronously restore only MCore-owned masters, leaving tensor state CPU-resident."""
 
         if self._selected_params:
             self._schedule_master_h2d()
 
     def ensure_master_for_param_sync(self) -> None:
-        """Ensure selected master weights are available for pre-forward FP8 staging."""
+        """Ensure selected MCore-owned masters are available for pre-forward FP8 staging."""
 
         if self._master_weights_resident and self._master_h2d_event is None:
             return
@@ -808,14 +804,16 @@ class ChunkedOptimizerStateOffloader:
     def offload_for_forward(self, offload_master: bool = True) -> None:
         """Start D2H for tensors still resident after an update or load.
 
-        Selected master bindings become CPU tensors as soon as their asynchronous D2H copy is
-        enqueued. CUDA consumers must restore them through this manager, and host consumers must
-        first call :meth:`synchronize_for_checkpoint`. The training loop deliberately calls this
-        only at the optimizer-to-forward lifecycle boundary, where no other master reader runs.
+        Selected MCore-owned master bindings become CPU tensors as soon as their asynchronous
+        D2H copy is enqueued. CUDA consumers must restore them through this manager, and host
+        consumers must first call :meth:`synchronize_for_checkpoint`. The training loop
+        deliberately calls this only at the optimizer-to-forward lifecycle boundary, where no
+        other master reader runs.
 
         Args:
-            offload_master: If false, stage only optimizer state. The training loop uses this
-                while an MXFP8 parameter buffer still needs to read updated masters.
+            offload_master: If false, stage only optimizer state, an optimizer-owned master
+                included. The training loop uses this while an MXFP8 parameter buffer still
+                needs to read updated MCore-owned masters.
         """
 
         if not self._selected_params:
