@@ -916,11 +916,11 @@ def finish_embedding_wgrad_compute(config, embedding_module, is_last_stage, tp_g
     if is_last_stage and config.defer_embedding_wgrad_compute:
         embedding_activation_buffer = embedding_module.embedding_activation_buffer
         grad_output_buffer = embedding_module.grad_output_buffer
-        weight = (
-            embedding_module.output_layer.weight
-            if embedding_module.share_embeddings_and_output_weights
-            else embedding_module.shared_embedding_or_output_weight()
-        )
+        # Use the weight the output projection actually ran with. When the output
+        # weight is borrowed (tied embeddings / MTP stage),
+        # `shared_embedding_or_output_weight()` names it and `output_layer.weight`
+        # is not allocated.
+        weight = embedding_module.shared_embedding_or_output_weight()
 
         drain_embedding_wgrad_compute(
             config, embedding_activation_buffer, grad_output_buffer, weight, tp_group
