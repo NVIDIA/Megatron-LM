@@ -10,10 +10,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.megakernel import parameter_bridge
+from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.mok import backend as mok_backend
 from megatron.core.transformer.moe.megakernel.mok import runtime as mok_runtime
 from megatron.core.transformer.moe.megakernel.mok import weights as mok_weights
+from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 @pytest.mark.parametrize("recompute", [False, True])
@@ -387,6 +391,184 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
 
     assert third is not first
     assert view_calls == [None, None, first[0], first[1]]
+
+
+def test_mxfp8_weight_views_refresh_outside_moe_cuda_graph(monkeypatch):
+    """With the moe TE CUDA graph scope a capture records no scale refresh and keeps the flag;
+    the eager refresh_weight_views() before replay refreshes once per optimizer iteration."""
+    module = mok_backend.MoKMegakernel.__new__(mok_backend.MoKMegakernel)
+    torch.nn.Module.__init__(module)
+    module.native_single_grouped_weights = True
+    module.use_mxfp8_weights = True
+    module._reset_derived_state()
+    module._weight_views_refreshed_outside_graph = True
+    module._weight_views_captured = False
+    module.routed_fc1_weight = object()
+    module.routed_fc2_weight = object()
+    module.num_local_experts = 2
+    module.intermediate_size = 128
+    module.hidden_size = 256
+
+    view_calls = []
+
+    def fake_view(*args, cached_view=None, **kwargs):
+        del args, kwargs
+        view_calls.append(cached_view)
+        return object()
+
+    capturing = [True]
+    monkeypatch.setattr(mok_backend, "_native_single_grouped_weight_view", fake_view)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+
+    with pytest.raises(RuntimeError, match="built before CUDA graph capture"):
+        module.quantized_routed_weights()
+    capturing[0] = False
+    first = module.quantized_routed_weights()  # eager warm-up builds the views
+    assert view_calls == [None, None]
+
+    module.is_first_microbatch = True  # set_is_first_microbatch, then the capture
+    capturing[0] = True
+    assert module.quantized_routed_weights() is first
+    assert module.is_first_microbatch and view_calls == [None, None]
+
+    capturing[0] = False
+    module.refresh_weight_views()  # before the microbatch-0 replay
+    assert view_calls == [None, None, first[0], first[1]]
+    assert not module.is_first_microbatch
+    module.refresh_weight_views()  # later microbatches
+    assert len(view_calls) == 4
+
+    with pytest.raises(RuntimeError, match="captured CUDA graphs"):
+        module._reset_derived_state()
+    # A checkpoint reload would also drop the captured views.
+    with pytest.raises(RuntimeError, match="captured CUDA graphs"):
+        module.load_state_dict({}, strict=False)
+
+
+def test_bf16_weight_views_are_built_once_outside_moe_cuda_graph(monkeypatch):
+    """BF16 views alias the weights, so the pre-replay refresh only builds them once."""
+    module = _split_module(use_mxfp8_weights=False)
+    module._weight_views_refreshed_outside_graph = True
+    module._weight_views_captured = False
+    view_calls = []
+
+    def fake_split(params, *, rows, columns, use_mxfp8, cached_view=None):
+        del params, rows, columns, use_mxfp8
+        view_calls.append(cached_view)
+        return object()
+
+    capturing = [False]
+    monkeypatch.setattr(mok_backend, "_native_split_weight_view", fake_split)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+
+    module.refresh_weight_views()
+    first = module._routed_weight_view_cache
+    assert view_calls == [None, None] and not module.is_first_microbatch
+
+    module.is_first_microbatch = True
+    module.refresh_weight_views()
+    capturing[0] = True
+    assert module.quantized_routed_weights() is first
+    assert view_calls == [None, None] and module._weight_views_captured
+
+
+def test_megakernel_backend_refresh_weight_views_defaults_to_noop():
+    class _Backend(MegakernelBackend):
+        def forward(self, hidden_states, probs, routing_map, padding_mask=None):
+            return hidden_states
+
+    assert _Backend().refresh_weight_views() is None
+
+
+def test_te_cuda_graph_replay_refreshes_after_manual_hooks_and_before_the_graph():
+    """The pre-replay refresh must see the parameter all-gather the manual hooks waited for."""
+    calls = []
+    graph_output = object()
+
+    def graph(*args, **kwargs):
+        calls.append(("replay", args, kwargs))
+        return graph_output
+
+    hidden = torch.zeros(2)
+    module = SimpleNamespace(
+        current_microbatch=1,
+        cuda_graphs=[None, graph],
+        cuda_graph_manual_hooks=[(lambda param_module: calls.append(("hook", param_module)), (7,))],
+        _get_te_cuda_graph_replay_args=lambda *args, **kwargs: (args, kwargs),
+        _before_te_cuda_graph_replay=lambda: calls.append(("refresh",)),
+    )
+
+    assert GraphableMegatronModule._te_cuda_graph_replay(module, hidden) is graph_output
+    assert calls == [("hook", 7), ("refresh",), ("replay", (hidden,), {})]
+    assert GraphableMegatronModule._before_te_cuda_graph_replay(module) is None
+
+
+def _graph_layer(is_moe_layer, megakernel, cuda_graph_modules, **attributes):
+    """A TransformerLayer stand-in exposing the attributes its CUDA-graph megakernel hooks read."""
+    layer = SimpleNamespace(
+        is_moe_layer=is_moe_layer,
+        mlp=(
+            SimpleNamespace(megakernel_experts=megakernel)
+            if megakernel is not None
+            else SimpleNamespace()
+        ),
+        config=SimpleNamespace(cuda_graph_modules=cuda_graph_modules),
+        **attributes,
+    )
+    for name in ("_cuda_graph_megakernel", "_after_te_cuda_graphs_deleted"):
+        setattr(layer, name, MethodType(getattr(TransformerLayer, name), layer))
+    return layer
+
+
+_MEGAKERNEL_GRAPH_SCOPES = pytest.mark.parametrize(
+    "is_moe_layer, has_megakernel, cuda_graph_modules, in_graph",
+    [
+        (True, True, [CudaGraphModule.attn, CudaGraphModule.moe], True),
+        (True, True, [CudaGraphModule.moe], True),
+        # An empty scope graphs the whole layer.
+        (True, True, [], True),
+        # The megakernel runs eagerly after a router-only graph and refreshes itself.
+        (True, True, [CudaGraphModule.attn, CudaGraphModule.moe_router], False),
+        (True, False, [CudaGraphModule.attn, CudaGraphModule.moe], False),
+        (False, False, [CudaGraphModule.attn, CudaGraphModule.mlp], False),
+    ],
+)
+
+
+@_MEGAKERNEL_GRAPH_SCOPES
+def test_layer_refreshes_megakernel_weight_views_only_before_moe_graph_replay(
+    is_moe_layer, has_megakernel, cuda_graph_modules, in_graph
+):
+    calls = []
+    megakernel = SimpleNamespace(refresh_weight_views=lambda: calls.append("refresh"))
+    layer = _graph_layer(is_moe_layer, megakernel if has_megakernel else None, cuda_graph_modules)
+
+    assert layer._cuda_graph_megakernel() is (megakernel if in_graph else None)
+    TransformerLayer._before_te_cuda_graph_replay(layer)
+
+    assert calls == (["refresh"] if in_graph else [])
+
+
+@_MEGAKERNEL_GRAPH_SCOPES
+def test_layer_releases_megakernel_only_from_its_deleted_moe_graphs(
+    is_moe_layer, has_megakernel, cuda_graph_modules, in_graph
+):
+    calls = []
+    megakernel = SimpleNamespace(cuda_graphs_deleted=lambda: calls.append("deleted"))
+    layer = _graph_layer(is_moe_layer, megakernel if has_megakernel else None, cuda_graph_modules)
+
+    TransformerLayer._after_te_cuda_graphs_deleted(layer)
+
+    assert calls == (["deleted"] if in_graph else [])
+
+
+def test_cuda_graphs_deleted_hooks_default_to_noop():
+    class _Backend(MegakernelBackend):
+        def forward(self, hidden_states, probs, routing_map, padding_mask=None):
+            return hidden_states
+
+    assert _Backend().cuda_graphs_deleted() is None
+    assert GraphableMegatronModule._after_te_cuda_graphs_deleted(SimpleNamespace()) is None
 
 
 def _split_module(*, use_mxfp8_weights):
@@ -865,7 +1047,7 @@ def test_mok_autograd_saves_only_backward_inputs_and_grads_every_routed_paramete
         assert param.grad is not None and param.grad.data_ptr() == buffer.data_ptr()
 
 
-def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False):
+def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False, **config_extra):
     """Build the actual adapter while keeping these contract tests independent of MOK."""
     if mxfp8:
         from megatron.core import fp8_utils
@@ -914,9 +1096,90 @@ def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False)
         fp8_param=mxfp8,
         moe_single_grouped_weight=single_grouped,
         moe_megakernel_backend_config=None,
+        **config_extra,
     )
     module = mok_backend.MoKMegakernel(config, object(), experts, shared, 2)
     return module, shared, functional
+
+
+@pytest.mark.parametrize(
+    "config_extra, refreshed_outside_graph",
+    [
+        ({}, False),
+        ({"cuda_graph_impl": "none", "cuda_graph_modules": []}, False),
+        ({"cuda_graph_impl": "full_iteration", "cuda_graph_modules": []}, False),
+        (
+            {
+                "cuda_graph_impl": "transformer_engine",
+                "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.moe_router],
+            },
+            False,
+        ),
+        (
+            {
+                "cuda_graph_impl": "transformer_engine",
+                "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.moe],
+            },
+            True,
+        ),
+    ],
+)
+def test_weight_view_refresh_leaves_the_graph_only_for_the_te_moe_scope(
+    monkeypatch, config_extra, refreshed_outside_graph
+):
+    module, _, _ = _mock_backend(monkeypatch, mxfp8=True, **config_extra)
+
+    assert module._weight_views_refreshed_outside_graph is refreshed_outside_graph
+    assert not module._weight_views_captured
+
+
+def test_deleting_te_cuda_graphs_releases_the_captured_mok_weight_views(monkeypatch):
+    """Captured weight views block parameter reloads and moves only while a graph references them:
+    TECudaGraphHelper.delete_cuda_graphs releases them through the layer."""
+    from megatron.core.transformer import cuda_graphs
+
+    moe_scope = [CudaGraphModule.attn, CudaGraphModule.moe]
+    module, _, _ = _mock_backend(
+        monkeypatch, mxfp8=True, cuda_graph_impl="transformer_engine", cuda_graph_modules=moe_scope
+    )
+    capturing = [False]
+    monkeypatch.setattr(
+        mok_backend, "_native_split_weight_view", lambda *args, cached_view=None, **kwargs: object()
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    module.refresh_weight_views()  # eager warm-up builds the views
+    capturing[0] = True
+    module.quantized_routed_weights()  # the capture records them
+    capturing[0] = False
+    assert module._weight_views_captured
+    with pytest.raises(RuntimeError, match="captured CUDA graphs"):
+        module.load_state_dict({}, strict=False)
+    with pytest.raises(RuntimeError, match="captured CUDA graphs"):
+        module._apply(lambda tensor: tensor)
+
+    graph = SimpleNamespace(reset=lambda: None)
+    layer = _graph_layer(
+        True, module, moe_scope, cuda_graphs=[graph], cuda_graph_manual_hooks=[object()]
+    )
+    helper = cuda_graphs.TECudaGraphHelper.__new__(cuda_graphs.TECudaGraphHelper)
+    helper.callables_per_chunk = [[layer]]
+    helper.tp_group = helper.dp_cp_group = None
+    helper._graphs_created = True
+    # Only the deletion log needs a process group.
+    monkeypatch.setattr(cuda_graphs, "log_on_each_pipeline_stage", lambda **kwargs: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+
+    helper.delete_cuda_graphs()
+
+    assert not helper.graphs_created()
+    assert layer.cuda_graphs == [] and layer.cuda_graph_manual_hooks == []
+    assert not module._weight_views_captured
+    # A checkpoint reload and a dtype move work again, and drop the views they invalidate.
+    module.load_state_dict({}, strict=False)
+    assert module._routed_weight_view_cache is None and module.is_first_microbatch
+    module.refresh_weight_views()
+    module.float()
+    assert module._routed_weight_view_cache is None
 
 
 def test_register_shared_output_gate_rejects_non_bf16_parameter(monkeypatch):

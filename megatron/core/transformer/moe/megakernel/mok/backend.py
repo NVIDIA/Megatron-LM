@@ -17,6 +17,7 @@ import torch
 from torch import nn
 from torch.distributed import ProcessGroup
 
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import (
@@ -178,6 +179,16 @@ class MoKMegakernel(MegakernelBackend):
         self._routed_dummy_gradient_buffers = None
         self._main_grad_arguments_cache = None
         self._shared_fc1_gate_up_cache = None
+        # Per-layer TE CUDA graphs with the moe scope replay MOK without Python. The layer then
+        # refreshes the cached weight views eagerly before each replay (refresh_weight_views, after
+        # the parameter all-gather hooks), so a capture must neither record nor consume the refresh.
+        cuda_graph_modules = getattr(config, "cuda_graph_modules", None) or []
+        self._weight_views_refreshed_outside_graph = (
+            getattr(config, "cuda_graph_impl", "none") == "transformer_engine"
+            and CudaGraphModule.moe in cuda_graph_modules
+        )
+        # Set once a CUDA graph captured the cached views: their addresses must stay valid.
+        self._weight_views_captured = False
 
     def _routed_parameter_groups(self) -> tuple[tuple[nn.Parameter, ...], ...]:
         """Return the (FC1, FC2, FC1 + FC2) routed parameter aliases, resolved once."""
@@ -287,6 +298,12 @@ class MoKMegakernel(MegakernelBackend):
 
     def _reset_derived_state(self) -> None:
         """Drop all state derived from the aliased parameters and their main grads."""
+        if getattr(self, "_weight_views_captured", False):
+            raise RuntimeError(
+                "MOK weight views are referenced by captured CUDA graphs; delete the graphs "
+                "(TECudaGraphHelper.delete_cuda_graphs) before reloading or moving the MOK "
+                "parameters"
+            )
         self._routed_weight_view_cache = None
         self._routed_parameter_cache = None
         self._routed_dummy_gradient_buffers = None
@@ -342,6 +359,21 @@ class MoKMegakernel(MegakernelBackend):
         # second optimizer parameter or checkpoint entry.
         self.register_parameter("shared_output_gate_weight", output_gate)
 
+    def refresh_weight_views(self) -> None:
+        """Eagerly build or refresh the cached routed-weight views outside a CUDA graph.
+
+        Called before every replay of a graph that contains this megakernel; it refreshes only
+        when ``quantized_routed_weights`` would (first call after ``set_is_first_microbatch``).
+        """
+        if self._routed_weight_view_cache is None or (
+            self.use_mxfp8_weights and self.is_first_microbatch
+        ):
+            self.quantized_routed_weights()
+
+    def cuda_graphs_deleted(self) -> None:
+        """No CUDA graph references the cached weight views anymore: allow resets again."""
+        self._weight_views_captured = False
+
     @torch.no_grad()
     def quantized_routed_weights(self):
         """Alias native payloads and refresh the converted scales after parameter sync.
@@ -353,6 +385,16 @@ class MoKMegakernel(MegakernelBackend):
         Scale conversion still needs to run after each optimizer update, in place
         so descriptors keep their addresses. It does not requantize the weights.
         """
+        if (
+            getattr(self, "_weight_views_refreshed_outside_graph", False)
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # The graph reads the cached, address-stable views; refresh_weight_views updates them
+            # before every replay. Leave is_first_microbatch for that eager refresh.
+            if self._routed_weight_view_cache is None:
+                raise RuntimeError("MOK weight views must be built before CUDA graph capture")
+            self._weight_views_captured = True
+            return self._routed_weight_view_cache
         needs_weight_view_update = self._routed_weight_view_cache is None or (
             self.use_mxfp8_weights and self.is_first_microbatch
         )
