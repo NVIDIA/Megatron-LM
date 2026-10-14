@@ -494,13 +494,13 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
     @staticmethod
     @custom_fwd
-    def forward(ctx, input, weight, bias, allreduce_dgrad, tp_group, output_dtype):
+    def forward(ctx, input, weight, bias, allreduce_dgrad, tp_group, output_dtype, out):
         """Forward with frozen weight."""
         ctx.save_for_backward(weight)
         ctx.allreduce_dgrad = allreduce_dgrad
         ctx.tp_group = tp_group
         ctx.input_dtype = input.dtype
-        return _linear_forward(input, weight, bias, output_dtype)
+        return _linear_forward(input, weight, bias, output_dtype, out)
 
     @staticmethod
     @custom_bwd
@@ -521,7 +521,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
             # All-reduce. Note: here async and sync are effectively the same.
             torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
 
-        return grad_input, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None
 
 
 def _linear_forward(
@@ -529,12 +529,28 @@ def _linear_forward(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     output_dtype: Optional[torch.dtype],
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Run a linear GEMM with an optional output dtype distinct from its input dtype."""
+    """Run a linear GEMM with an optional output dtype and/or preallocated output buffer.
+
+    When `out` is provided, the GEMM writes its result directly into it and returns it,
+    allowing for CUDA graphs to replay the operation without any additional memory allocation.
+    The write bypasses autograd, so `out` requires grad to be disabled.
+    """
+    if out is not None:
+        expected_shape = (*input.shape[:-1], weight.shape[0])
+        if out.shape != torch.Size(expected_shape):
+            raise ValueError(f"`out` has shape {tuple(out.shape)}, expected {expected_shape}.")
+        if output_dtype is not None and output_dtype != out.dtype:
+            raise ValueError(
+                f"`out` dtype {out.dtype} conflicts with requested output_dtype {output_dtype}."
+            )
+        output_dtype = out.dtype
+
     if output_dtype is None or output_dtype == input.dtype:
-        output = torch.matmul(input, weight.t())
+        output = torch.matmul(input, weight.t(), out=out)
         if bias is not None:
-            output = output + bias
+            output += bias
         return output
 
     # Deferred to avoid a circular import: transformer_engine imports tensor-parallel layers.
@@ -547,9 +563,10 @@ def _linear_forward(
 
     input_shape = input.shape
     input_2d = input.reshape(-1, input_shape[-1])
-    output = torch.empty(
-        (*input_shape[:-1], weight.size(0)), dtype=output_dtype, device=input.device
-    )
+    if out is None:
+        out = torch.empty(
+            (*input_shape[:-1], weight.size(0)), dtype=output_dtype, device=input.device
+        )
     # Cross entropy transforms FP32 logits in place. Have TE write through a 2-D view of
     # the final-shaped allocation, then return the owning tensor rather than that view.
     te_general_gemm(
@@ -557,10 +574,10 @@ def _linear_forward(
         input_2d,
         out_dtype=output_dtype,
         layout="TN",
-        out=output.view(-1, weight.size(0)),
+        out=out.view(-1, weight.size(0)),
         bias=bias,
     )
-    return output
+    return out
 
 
 def linear_with_frozen_weight(
@@ -575,6 +592,7 @@ def linear_with_frozen_weight(
     wgrad_deferral_limit: None = None,
     gtp_remat_size: int = 1,
     output_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Linear layer execution with weight.requires_grad == False.
 
@@ -618,6 +636,9 @@ def linear_with_frozen_weight(
 
     output_dtype (torch.dtype optional): Optional GEMM output dtype. A dtype different from
         the input dtype requires Transformer Engine ``general_gemm``.
+
+    out (torch.Tensor optional): Optional preallocated buffer the GEMM result is written
+        into (and returned). Requires grad to be disabled.
     """
 
     assert grad_output_buffer is None, (
@@ -641,7 +662,14 @@ def linear_with_frozen_weight(
     if gtp_remat_size > 1:
         weight = weight.all_gather_and_prefetch(fwd=True)
 
-    args = [input, weight, bias, allreduce_dgrad, tp_group, output_dtype]
+    if (
+        out is not None
+        and torch.is_grad_enabled()
+        and (input.requires_grad or weight.requires_grad)
+    ):
+        # The write into `out` bypasses autograd.
+        raise RuntimeError("Using a preallocated `out` buffer is not supported with grad enabled.")
+    args = [input, weight, bias, allreduce_dgrad, tp_group, output_dtype, out]
 
     return LinearWithFrozenWeight.apply(*args)
 
@@ -696,6 +724,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         tp_group,
         gtp_remat_size,
         output_dtype,
+        out,
     ):
         """Forward."""
         if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
@@ -731,7 +760,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             total_input = input
 
-        return _linear_forward(total_input, weight, bias, output_dtype)
+        return _linear_forward(total_input, weight, bias, output_dtype, out)
 
     @staticmethod
     @custom_bwd
@@ -914,12 +943,26 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
 
         if ctx.allreduce_dgrad:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, None
+        return (
+            grad_input,
+            grad_weight,
+            grad_bias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def linear_with_grad_accumulation_and_async_allreduce(
@@ -934,6 +977,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     gtp_remat_size: int = 1,
     output_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -999,10 +1043,20 @@ def linear_with_grad_accumulation_and_async_allreduce(
 
         output_dtype (torch.dtype optional): Optional GEMM output dtype. A dtype different from
             the input dtype requires Transformer Engine ``general_gemm``.
+
+        out (torch.Tensor optional): Optional preallocated buffer the GEMM result is
+            written into (and returned). Requires grad to be disabled.
     """
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
 
+    if (
+        out is not None
+        and torch.is_grad_enabled()
+        and (input.requires_grad or weight.requires_grad)
+    ):
+        # The write into `out` bypasses autograd.
+        raise RuntimeError("Using a preallocated `out` buffer is not supported with grad enabled.")
     args = [
         input,
         weight,
@@ -1015,6 +1069,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
         tp_group,
         gtp_remat_size,
         output_dtype,
+        out,
     ]
 
     if not linear_with_grad_accumulation_and_async_allreduce.warned:
@@ -1293,6 +1348,7 @@ class ColumnParallelLinear(torch.nn.Module):
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
         inference_tp_ag_barrier: bool = False,
+        out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
@@ -1309,12 +1365,34 @@ class ColumnParallelLinear(torch.nn.Module):
                 can copy-out the previous AG output. For more information, refer to
                 ``barrier_before`` in ``multimem_all_gather``
                 (``megatron.core.inference.communication.torch_symm_triton.collectives``).
+            out (optional):
+                Preallocated buffer the GEMM result is written into (and returned).
+                Only valid when the GEMM result is the layer's final output:
+                no tensor-parallel output gather and no sequence-parallel input gather
+                and requires grad to be disabled.
 
         Returns:
             - output
             - bias
 
         """
+        gather_output = self.gather_output
+        # Use the runtime gather output if it's set explicitly.
+        if runtime_gather_output is not None:
+            gather_output = runtime_gather_output
+
+        if out is not None:
+            if gather_output and self.tp_group.size() > 1:
+                raise ValueError(
+                    "`out` writes the GEMM result directly and cannot be combined with a "
+                    "tensor-parallel output gather."
+                )
+            if self.sequence_parallel:
+                raise ValueError(
+                    "`out` is sized for the caller-visible input and cannot be combined with a "
+                    "sequence-parallel input gather."
+                )
+
         if weight is None:
             if self.weight is None:
                 raise RuntimeError(
@@ -1384,12 +1462,8 @@ class ColumnParallelLinear(torch.nn.Module):
             tp_group=self.tp_group,
             gtp_remat_size=self.gtp_remat_size,
             output_dtype=self.output_dtype,
+            out=out,
         )
-
-        gather_output = self.gather_output
-        # Use the runtime gather output if it's set explicitly.
-        if runtime_gather_output is not None:
-            gather_output = runtime_gather_output
 
         if gather_output:
             output = self.gather_tensor_parallel_output(

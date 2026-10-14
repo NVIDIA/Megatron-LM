@@ -16,6 +16,7 @@ from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -373,8 +374,9 @@ class TextGenerationController(MTPControllerMixin):
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
+            tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
             symmetric = None
-            if get_pg_size(self.inference_wrapped_model.tp_group) > 1:
+            if tp_size > 1:
                 # Under TP, prefer a symmetric-memory buffer: each rank then multicast-stores
                 # its logits shard straight into its column block, gather and transpose fused,
                 # no copy. Otherwise a plain buffer and the in-forward copy.
@@ -388,6 +390,12 @@ class TextGenerationController(MTPControllerMixin):
                     (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
                 )
             context.logits_output_buffer = self._all_logits_cuda
+            # At TP 1, the LM head is instructed to write the GEMM result in-place into the buffer,
+            # unless the head cannot - currently the case for TE MXFP8.
+            # In such cases, we fall back to a copy; but we must instruct the LM head.
+            context.logits_output_in_place = tp_size == 1 and not is_mxfp8_output_proj_active(
+                self.model_config
+            )
         else:
             self._all_logits_cuda = None
         self._async_sched_logits = AsyncScheduleLogitsState()

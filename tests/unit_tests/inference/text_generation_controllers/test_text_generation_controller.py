@@ -4039,8 +4039,9 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
         allocated in it, so an fp32 head (`logit_dtype`) is not narrowed to
         `params_dtype` by the controller copy, and at PP 2 the first stage receives the
         broadcast in it. With the buffer the model writes each step's logits into it
-        inside the forward and the controller asserts the identity every step; without
-        it there is none. Generation with and without the buffer samples the same
+        inside the forward (at TP 1 the LM-head GEMM writes it in place) and the
+        controller asserts the identity every step; without it there is none.
+        Generation with and without the buffer samples the same
         tokens (both run the same eager kernels here).
         """
         if logit_dtype is not None and te_general_gemm is None:
@@ -4064,9 +4065,11 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
             if cuda_graph_impl == "local":
                 assert context.logits_output_buffer is controller._all_logits_cuda
                 assert controller._all_logits_cuda.shape[-1] == self.vocab_size
+                assert context.logits_output_in_place == (tp_size == 1)
             else:
                 assert context.logits_output_buffer is None
                 assert controller._all_logits_cuda is None
+                assert not context.logits_output_in_place
             # The harness wraps bf16 models in Float16Module; the wrapper must not let it
             # upcast the logits to fp32 on the way out.
             assert controller.inference_wrapped_model._model_forward_kwargs == {
@@ -4159,6 +4162,7 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 )
                 assert not nvls_available, "NVLS is available but no symmetric buffer"
                 pytest.skip("NVLS symmetric memory unavailable on this platform")
+            assert not context.logits_output_in_place
             generated[cuda_graph_impl] = self._generate_dynamic()
         assert generated["none"] == generated["local"]
 
