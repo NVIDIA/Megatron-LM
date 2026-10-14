@@ -1673,14 +1673,28 @@ class ChainedOptimizer(MegatronOptimizer):
             if any(self._iter_optimizer_state_offloaders(child))
         ]
         for child in offloading_children[1:]:
-            if getattr(child, '_optimizer_state_offloader', None) is None:
-                # A nested chain cannot be deferred from here. The factory always places
-                # LayerWise first, so only DistributedOptimizer siblings reach this loop.
-                continue
-            child.set_optimizer_state_offload_deferred_lifecycle(
+            self._defer_state_prefetch_to_step(child)
+
+    @classmethod
+    def _defer_state_prefetch_to_step(cls, optimizer: MegatronOptimizer) -> None:
+        """Move ``optimizer``'s first state-chunk restore from gradient finalization to its step.
+
+        A nested chain is marked too, because LayerWise prefetches its managed child through
+        its own gradient-finalization policy rather than the child's.
+        """
+
+        if getattr(optimizer, '_optimizer_state_offloader', None) is not None:
+            optimizer.set_optimizer_state_offload_deferred_lifecycle(
                 state_prefetch_to_step=True,
-                master_offload_for_param_sync=child._defer_optimizer_master_offload_for_param_sync,
+                master_offload_for_param_sync=(
+                    optimizer._defer_optimizer_master_offload_for_param_sync
+                ),
             )
+            return
+        optimizer._defer_optimizer_state_prefetch_to_step = True
+        for child in getattr(optimizer, 'chained_optimizers', ()):
+            if any(cls._iter_optimizer_state_offloaders(child)):
+                cls._defer_state_prefetch_to_step(child)
 
     @staticmethod
     def _iter_optimizer_state_offloaders(optimizer: MegatronOptimizer):
@@ -1709,7 +1723,8 @@ class ChainedOptimizer(MegatronOptimizer):
         """Keep the shared staging windows alive while the children step one after another.
 
         Each child then hands its windows to the next instead of freeing them while its last
-        D2H copies are still in flight; see ``_StagingSlotPool``.
+        D2H copies are still in flight; see ``_StagingSlotPool``. Only the children loop holds
+        them, so post-step parameter staging does not run beside two idle windows.
         """
 
         manager = next(self._iter_optimizer_state_offloaders(self), None)
@@ -1980,13 +1995,14 @@ class ChainedOptimizer(MegatronOptimizer):
     def _step(self) -> bool:
         """Step all optimizers in this chain."""
         success = True
-        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
-            self._before_child_step(optimizer_idx)
-            success &= optimizer.step_with_ready_grads()
-            if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
-                assert success
-                assert len(optimizer.model_chunks) == 1
-                optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+        with self._hold_optimizer_state_staging():
+            for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+                self._before_child_step(optimizer_idx)
+                success &= optimizer.step_with_ready_grads()
+                if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
+                    assert success
+                    assert len(optimizer.model_chunks) == 1
+                    optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
         return success
 
     def _should_defer_mxfp8_param_sync(self) -> bool:
@@ -2083,10 +2099,9 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
-        with self._hold_optimizer_state_staging():
-            if self._should_defer_mxfp8_param_sync():
-                return self._step_with_deferred_mxfp8_param_sync()
-            return self._step()
+        if self._should_defer_mxfp8_param_sync():
+            return self._step_with_deferred_mxfp8_param_sync()
+        return self._step()
 
     def grads_states_parallel_group_is_shared(self):
         """Check if all optimizers share the same gradient statistics parallel group."""

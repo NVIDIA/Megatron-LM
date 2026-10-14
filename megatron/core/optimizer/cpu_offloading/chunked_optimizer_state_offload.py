@@ -91,6 +91,18 @@ class _StagingSlotPool:
             if self._holds == 0:
                 self.release()
 
+    def retain_only(self, keys: set[tuple[torch.device, torch.dtype]]) -> None:
+        """Free the windows of every other (device, dtype), even while held.
+
+        A chain child whose state dtypes differ from its predecessor's would otherwise keep
+        the predecessor's windows through its whole step. Their views were marked with
+        ``record_stream()``, so the allocator reuses the storage only after its copies finish.
+        """
+
+        for slot in self.slots:
+            for key in [key for key in slot.buffers if key not in keys]:
+                del slot.buffers[key]
+
     def release(self) -> None:
         """Drop CUDA ownership unless a chain is still stepping through the pool."""
 
@@ -350,18 +362,6 @@ class ChunkedOptimizerStateOffloader:
         if self._staging_pool.in_use or self._first_prefetch is not None:
             raise RuntimeError("optimizer-state staging windows cannot change while in use")
         self._staging_pool = pool
-
-    @property
-    def _state_staging_slots(self) -> tuple[_StateStagingSlot, _StateStagingSlot]:
-        return self._staging_pool.slots
-
-    @property
-    def _next_state_staging_slot(self) -> int:
-        return self._staging_pool.next_slot
-
-    @_next_state_staging_slot.setter
-    def _next_state_staging_slot(self, index: int) -> None:
-        self._staging_pool.next_slot = index
 
     def use_transfer_streams(
         self, d2h_stream: torch.cuda.Stream, h2d_stream: torch.cuda.Stream
@@ -804,10 +804,9 @@ class ChunkedOptimizerStateOffloader:
         if not entries:
             return []
 
-        slot = self._state_staging_slots[self._next_state_staging_slot]
-        self._next_state_staging_slot = (self._next_state_staging_slot + 1) % len(
-            self._state_staging_slots
-        )
+        pool = self._staging_pool
+        slot = pool.slots[pool.next_slot]
+        pool.next_slot = (pool.next_slot + 1) % len(pool.slots)
         for (device, dtype), numel in required_numel.items():
             buffer = slot.buffers.get((device, dtype))
             if buffer is None or buffer.numel() < numel:
@@ -1033,6 +1032,13 @@ class ChunkedOptimizerStateOffloader:
             self.optimizer.step()
             return
 
+        self._staging_pool.retain_only(
+            {
+                (self._param_devices[param], tensor.dtype)
+                for param, states in self._cpu_state.items()
+                for tensor in states.values()
+            }
+        )
         self.prefetch_for_step()
         self._wait_master_h2d()
 

@@ -439,6 +439,66 @@ def test_chained_optimizer_counts_nested_layerwise_manager_when_deferring():
     assert expert.deferred == dict(state_prefetch_to_step=True, master_offload_for_param_sync=False)
 
 
+def test_chained_optimizer_defers_a_nested_chain_after_the_first_child():
+    """A nested chain placed after the first offloading child must defer too, down to the
+    child that owns its manager; skipping it would let LayerWise prefetch a chunk eagerly."""
+
+    class FakeManager:
+        transfer_streams = (None, None)
+        staging_pool = None
+
+        def use_transfer_streams(self, d2h_stream, h2d_stream):
+            pass
+
+        def use_staging_pool(self, pool):
+            pass
+
+    class FakeOptimizer:
+        def __init__(self, manager=None, chained_optimizers=None):
+            self.config = None
+            if manager is not None:
+                self._optimizer_state_offloader = manager
+            if chained_optimizers is not None:
+                self.chained_optimizers = chained_optimizers
+            self._defer_optimizer_master_offload_for_param_sync = False
+            self.deferred = None
+
+        def set_optimizer_state_offload_deferred_lifecycle(self, **lifecycle):
+            self.deferred = lifecycle
+
+    dense = FakeOptimizer(manager=FakeManager())
+    muon = FakeOptimizer(manager=FakeManager())
+    layer_wise = FakeOptimizer(chained_optimizers=[FakeOptimizer(), muon])
+    ChainedOptimizer([dense, layer_wise])
+
+    assert dense.deferred is None
+    assert layer_wise._defer_optimizer_state_prefetch_to_step
+    assert muon.deferred == dict(state_prefetch_to_step=True, master_offload_for_param_sync=False)
+
+
+def test_deferred_layerwise_prefetches_only_masters_at_gradient_finalization():
+    """A LayerWise chain deferred by an outer chain leaves its managed chunk to its step."""
+
+    from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+    events = []
+    managed = SimpleNamespace(
+        prefetch_optimizer_master_weights_for_step=lambda: events.append("master"),
+        prefetch_optimizer_state_for_step=lambda: events.append("state"),
+    )
+    optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.chained_optimizers = [managed]
+    optimizer.config = SimpleNamespace(
+        chunked_optimizer_state_offload=True, optimizer_state_offload_fraction=1.0
+    )
+    optimizer._managed_optimizer_state_offload_indices = (0,)
+    optimizer._defer_optimizer_state_prefetch_to_step = True
+
+    optimizer.prefetch_optimizer_state_for_gradient_finalization()
+
+    assert events == ["master"]
+
+
 def test_chained_step_prefetch_follows_each_child_deferral_policy():
     """The chain-level step prefetch must not stage a chunk for children deferred to step."""
 
@@ -730,7 +790,7 @@ def test_chunked_step_releases_staging_slots_when_optimizer_raises():
     with pytest.raises(RuntimeError, match="optimizer failure"):
         manager.step()
 
-    assert all(not slot.buffers for slot in manager._state_staging_slots)
+    assert all(not slot.buffers for slot in manager.staging_pool.slots)
     manager.synchronize_for_checkpoint()
 
 
@@ -834,7 +894,7 @@ def test_state_h2d_waits_for_compute_stream_before_reusing_staging_buffer():
         # Allocate the reusable slot on the compute stream, then make its last compute use
         # finish well after the tiny CPU-to-GPU copy would finish without stream ordering.
         staging_views = manager._state_staging_views(manager.chunks[0])
-        manager._next_state_staging_slot = 0
+        manager.staging_pool.next_slot = 0
         torch.cuda._sleep(50_000_000)
         staging_views[0][3].fill_(7)
         prefetch = manager._prefetch_state(manager.chunks[0])
@@ -902,7 +962,7 @@ def test_chained_managers_hand_staging_windows_over_while_d2h_drains():
 
     def delayed_d2h(params):
         with torch.cuda.stream(first[2]._d2h_stream):
-            torch.cuda._sleep(20_000_000)
+            torch.cuda._sleep(100_000_000)
         schedule_d2h(params)
 
     first[2]._schedule_state_d2h = delayed_d2h
@@ -929,6 +989,49 @@ def test_chained_managers_hand_staging_windows_over_while_d2h_drains():
                     msg=key,
                 )
             torch.testing.assert_close(param, reference_param)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_chained_manager_with_other_state_dtype_frees_predecessor_windows():
+    """A chain child whose state dtype differs must not keep its predecessor's windows alive
+    through its whole step just because the chain holds the shared pool."""
+
+    def make_manager(dtype, streams=()):
+        params = [nn.Parameter(torch.randn(256 * 1024, device="cuda", dtype=dtype))]
+        optimizer = torch.optim.Adam(params, lr=0.1)
+        manager = ChunkedOptimizerStateOffloader(
+            optimizer=optimizer,
+            master_params=[],
+            chunk_size_bytes=2 * 1024**2,
+            offload_fraction=1.0,
+            state_dtypes=(dtype, dtype),
+            **dict(zip(("d2h_stream", "h2d_stream"), streams)),
+        )
+        return params, manager
+
+    fp32_params, fp32_manager = make_manager(torch.float32)
+    bf16_params, bf16_manager = make_manager(torch.bfloat16, fp32_manager.transfer_streams)
+    bf16_manager.use_staging_pool(fp32_manager.staging_pool)
+    pool = fp32_manager.staging_pool
+
+    def held_dtypes():
+        return {dtype for slot in pool.slots for _, dtype in slot.buffers}
+
+    def step_chain():
+        for params in (fp32_params, bf16_params):
+            for param in params:
+                param.grad = torch.ones_like(param)
+        with pool.hold():
+            fp32_manager.step()
+            after_first = held_dtypes()
+            bf16_manager.step()
+            return after_first, held_dtypes()
+
+    step_chain()  # The first update creates Adam state lazily, outside the staging windows.
+    assert step_chain() == ({torch.float32}, {torch.bfloat16})
+    assert not pool.in_use
+    for manager in (fp32_manager, bf16_manager):
+        manager.synchronize_for_checkpoint()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
