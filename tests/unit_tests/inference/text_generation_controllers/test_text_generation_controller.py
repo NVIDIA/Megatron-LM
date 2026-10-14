@@ -123,6 +123,7 @@ class TextGenerationControllerTestBase:
             num_attention_heads=4,
             use_cpu_initialization=True,
             attention_backend=AttnBackend.auto if inference_optimized else AttnBackend.local,
+            flash_attention_version=2,
             params_dtype=dtype,
             symmetric_ar_type=symmetric_ar_type,
             fp8="hybrid" if fp8 else None,
@@ -221,13 +222,22 @@ class TextGenerationControllerTestBase:
                 ),
             )
 
+        if not static:
+            # Direct controller tests bypass request admission, which normally writes
+            # the unseeded sentinel into these otherwise uninitialized buffers.
+            inference_context.request_metadata["seed"].fill_(-1)
+            inference_context.active_request_metadata["seed"].fill_(-1)
+
         inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
 
         inference_wrapped_model.model_is_pipeline_parallel = not (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
 
+        # Set before construction: __init__ reads `tokenizer.eod`, an int per the
+        # tokenizer interface, and a bare Mock yields a Mock.
         self.mock_tokenizer = mock.Mock()
+        self.mock_tokenizer.eod = self.vocab_size - 1
 
         self.text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
@@ -835,7 +845,14 @@ def test_run_async_sched_sample_reuses_gpu_buffer(logits_dtype):
     assert n == 3
     assert called_context is context
     sample_kwargs = controller._sampling.sample_kernel.call_args.kwargs
-    assert set(sample_kwargs) == {"gather_indices", "no_top_k", "no_top_p", "output"}
+    assert set(sample_kwargs) == {
+        "gather_indices",
+        "no_top_k",
+        "no_top_p",
+        "output",
+        "sequence_lengths",
+    }
+    assert sample_kwargs["sequence_lengths"] is None
     assert sample_kwargs["gather_indices"] is None
     assert not sample_kwargs["no_top_k"]
     assert sample_kwargs["no_top_p"]
@@ -1239,7 +1256,7 @@ def test_async_sched_step_overlap_order():
         side_effect=lambda: call_order.append("prepare") or (input_ids, position_ids)
     )
     controller._run_async_sched_sample = mock.Mock(
-        side_effect=lambda: call_order.append("sample")
+        side_effect=lambda **_kwargs: call_order.append("sample")
         or SimpleNamespace(
             sampled_tokens_gpu=sample_tokens,
             sampled_tokens_cpu_view=sampled_tokens_cpu,
@@ -1381,6 +1398,54 @@ def test_async_sched_step_wires_sampling_through_resolution(
     assert context.resolve_requests.call_args.args[0].tolist() == expected_mask
     assert context.async_sched_step_count == 1
     assert context.async_sched_compaction_step_count == expected_compaction_count
+
+
+@pytest.mark.internal
+def test_async_overlap_seed_uses_pending_logits_positions():
+    """Preparing the next forward must not change the pending token's RNG draw."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.config.num_speculative_tokens = 0
+    context.active_request_metadata["seed"] = torch.tensor([91, 92, 93])
+    context.active_request_metadata["top_k"].zero_()
+    context.get_active_sequence_lengths = lambda: (
+        context.request_kv_length_offsets + context.request_query_lengths
+    )
+    pending_positions = context.get_active_sequence_lengths().clone()
+    controller = _make_async_sched_controller(context)
+    controller._all_logits_cuda = torch.randn(
+        1, 3, 97, device="cuda", generator=torch.Generator(device="cuda").manual_seed(17)
+    )
+    controller._sampled_tokens_cuda = torch.empty(3, dtype=torch.int64, device="cuda")
+    controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
+        3, dtype=torch.int64, pin_memory=True
+    )
+    controller._async_sched_sample_gpu_ready_event = torch.cuda.Event()
+    controller._async_sched_sample_cpu_ready_event = torch.cuda.Event()
+    controller._async_sched_copy_stream = torch.cuda.Stream()
+    sampler = TorchSampling.__new__(TorchSampling)
+    sampler._rng = torch.Generator(device="cuda").manual_seed(18)
+    sampler._vocab_size = 97
+    controller._sampling = sampler
+    expected = sampler.sample_kernel(
+        controller._all_logits_cuda[0], 3, context, no_top_k=True, no_top_p=True
+    )
+    sampler.sample_kernel = mock.Mock(wraps=sampler.sample_kernel)
+
+    def prepare_successor():
+        context.request_kv_length_offsets.add_(context.request_query_lengths)
+        return torch.empty(3, dtype=torch.int64), torch.empty(3, dtype=torch.int64)
+
+    controller._run_async_sched_prepare = mock.Mock(side_effect=prepare_successor)
+    controller._run_async_sched_publish_bookkeeping = mock.Mock(return_value=None)
+    controller._run_async_sched_forward = mock.Mock()
+
+    result = asyncio.run(controller._run_async_sched_step_overlap())
+
+    assert torch.equal(context.get_active_sequence_lengths(), pending_positions + 1)
+    assert torch.equal(
+        sampler.sample_kernel.call_args.kwargs["sequence_lengths"], pending_positions
+    )
+    assert torch.equal(result.output["sample"], expected.cpu())
 
 
 def test_async_sched_step_yields_after_resolution_outside_inference_mode():
@@ -1872,6 +1937,82 @@ def test_async_generate_output_tokens_dynamic_batch_assertions(mode, expected_me
 
     with pytest.raises(AssertionError, match=expected_message):
         asyncio.run(controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True))
+
+
+class _EosStubTokenizer:
+    """Minimal stand-in exposing only what `_build_extra_eos_token_id_set` reads."""
+
+    def __init__(self, eod=None, generation_config=None):
+        if eod is not None:
+            self.eod = eod
+        if generation_config is not None:
+            self.generation_config = generation_config
+
+
+def _make_eos_controller(eod=None, generation_config=None):
+    """A controller with only its EOS state built (no model, no GPU)."""
+    controller = TextGenerationController.__new__(TextGenerationController)
+    controller.extra_eos_token_id_set = controller._build_extra_eos_token_id_set(
+        _EosStubTokenizer(eod=eod, generation_config=generation_config)
+    )
+    return controller
+
+
+def test_terminating_token_ids_honors_multi_eos_generation_config():
+    # nanov3p5 declares [2, 11] = [</s>, <|im_end|>]; NeMo-RL sets termination_id to
+    # tokenizer.eod (2). vLLM stops on either, so all declared ids must terminate.
+    controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": [2, 11]})
+    assert controller.extra_eos_token_id_set == frozenset({2, 11})
+    assert controller.terminating_token_ids(2) == frozenset({2, 11})
+    assert torch.equal(
+        controller.extra_eos_token_id_tensor, torch.tensor([2, 11], dtype=torch.long)
+    )
+
+
+def test_terminating_token_ids_leaves_single_eos_termination_id_sole_authority():
+    # One declared id means the model file adds nothing, so a client that deliberately
+    # narrowed termination_id is not silently widened back to tokenizer.eod.
+    controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": 2})
+    assert controller.extra_eos_token_id_set == frozenset()
+    assert controller.extra_eos_token_id_tensor is None
+    assert controller.terminating_token_ids(99) == frozenset({99})
+
+
+def test_terminating_token_ids_without_generation_config_is_unchanged_behavior():
+    controller = _make_eos_controller(eod=2)
+    assert controller.extra_eos_token_id_tensor is None
+    assert controller.terminating_token_ids(2) == frozenset({2})
+
+
+@pytest.mark.parametrize("termination_id", [-1, None])
+def test_terminating_token_ids_empty_when_ignore_eos(termination_id):
+    # termination_id of -1 is how `ignore_eos` is expressed. Multi-EOS must not
+    # resurrect termination for those requests.
+    controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": [2, 11]})
+    assert controller.terminating_token_ids(termination_id) == frozenset()
+
+
+@pytest.mark.parametrize("termination_id", [2, -1, None])
+@pytest.mark.parametrize("stop_token_ids", [None, [], [7, 11, 7]])
+def test_terminating_token_ids_combines_request_stops(termination_id, stop_token_ids):
+    controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": [2, 11]})
+    original_stops = None if stop_token_ids is None else list(stop_token_ids)
+    expected = set(stop_token_ids or ())
+    if termination_id == 2:
+        expected.update([2, 11])
+
+    result = controller.terminating_token_ids(termination_id, stop_token_ids=stop_token_ids)
+
+    assert isinstance(result, frozenset)
+    assert result == expected
+    assert stop_token_ids == original_stops
+    assert controller.extra_eos_token_id_set == frozenset({2, 11})
+
+
+def test_build_extra_eos_token_id_set_rejects_booleans():
+    # bool is an int subclass, so {"eos_token_id": true} must not become id 1.
+    controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": [2, True]})
+    assert controller.extra_eos_token_id_set == frozenset()
 
 
 class TestTextGenerationController(TextGenerationControllerTestBase):

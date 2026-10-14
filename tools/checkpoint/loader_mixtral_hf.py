@@ -8,7 +8,7 @@ import transformers
 from tqdm import tqdm
 import types
 
-from tools.checkpoint.utils import _ConverterFakeProcessGroup
+from tools.checkpoint.utils import initialize_checkpoint_converter_fake_process_groups
 
 
 def add_arguments(parser):
@@ -163,6 +163,7 @@ def _load_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
+        from megatron.training.argument_utils import inference_cfg_container_from_args
         from megatron.training.arguments import parse_args, validate_args
         from megatron.training.global_vars import set_args, set_global_variables
         from megatron.core import mpu
@@ -234,17 +235,19 @@ def _load_checkpoint(queue, args):
     # Suppress warning about torch.distributed not being initialized.
     LanguageModule.embedding_warning_printed = True 
 
-    set_global_variables(margs, build_tokenizer=False)
+    cfg = inference_cfg_container_from_args(margs, build_model_config=False)
+    set_global_variables(margs, cfg, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
     
-    # For backward compatibility during local parallel states refactoring
-    fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
-    fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
-    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-    mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
+    initialize_checkpoint_converter_fake_process_groups(
+        mpu,
+        margs.tensor_model_parallel_size,
+        margs.pipeline_model_parallel_size,
+        margs.expert_model_parallel_size,
+    )
 
     # Metadata.
     md = types.SimpleNamespace()

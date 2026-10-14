@@ -1,4 +1,4 @@
-# Megatron Core Inference User Guide
+# Inference User Guide
 
 A practical guide to running inference with Megatron Core (MCore) using the
 dynamic inference path. This is the recommended and actively developed
@@ -145,13 +145,25 @@ workload rather than generalizing from any single comparison.
 > selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
 > default, or `multimem`) selects the cross-rank expert-combine reduction.
 >
-> Both dense and MoE models are supported. Batch-invariant MoE is bf16-only,
-> requires the unfused permute/unpermute path, and under
+> Both dense and MoE models are supported. Batch-invariant MoE supports BF16 and
+> MXFP8 squared-ReLU/SwiGLU experts, requires unfused permute/unpermute, and under
 > `--transformer-impl inference_optimized` requires
-> `inference_grouped_gemm_backend` of `vllm` or `torch` (plus the `nvls` token
-> dispatcher when `EP > 1`). Some backend combinations additionally need DeepGEMM
+> `inference_grouped_gemm_backend` of `vllm`, `torch`, or `flashinfer` (plus the
+> `nvls` token dispatcher when `EP > 1`). FlashInfer supports MXFP8 non-gated
+> squared-ReLU experts, including selective BF16 layers, but its batch invariance
+> does not imply bitwise parity with TE training. Use Torch/vLLM for exact
+> training-policy comparisons. Some backend combinations additionally need DeepGEMM
 > bf16 bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
-> attention dropout are not supported in either case.
+> attention dropout are not supported in either case. MXFP8 training uses
+> `batch_invariant_backend="te_native"`. Legacy TE GroupedLinear remains the
+> default. On SM100 with cuBLASLt 13.5.1, `moe_use_grouped_tensor=True` opts into
+> TE device-metadata grouped GEMM and its required 256-row expert padding.
+> This requires a TE build exposing `GroupedLinear(use_grouped_tensor=...)`;
+> the old environment switch alone is not sufficient. Other GPU/library pairs
+> are rejected: this path requires a full workspace, so its forward invariance
+> must be validated numerically rather than inferred from alignment.
+> Keep `use_transformer_engine_op_fuser=False`. Forward batch invariance does
+> not promise bitwise-identical gradients across different minibatches.
 
 > **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
 > precision recipe for training and inference through `TransformerConfig.quant_recipe`
@@ -376,6 +388,7 @@ asyncio.run(main())
 | `num_tokens_to_generate` | Max new tokens to generate |
 | `num_tokens_total` | Cap on prompt + generated length. Mutually exclusive with `num_tokens_to_generate` |
 | `temperature` | Softmax temperature (`1.0` = unmodified) |
+| `seed` | Optional nonnegative int64 request seed; dynamic Torch sampling only |
 | `top_k` | Keep top-k logits (`0` = disabled) |
 | `top_p` | Nucleus sampling threshold (`0.0` = disabled) |
 | `termination_id` | Token id that stops generation (commonly the EOD token) |
@@ -389,6 +402,27 @@ asyncio.run(main())
 | `add_BOS` | Prepend BOS when tokenizing |
 | `streaming`, `streaming_interval` | Emit incremental partial replies. Refer to [Streaming](#streaming) |
 | `do_kv_handoff` | Pin KV blocks and publish handoff metadata for a peer decode engine. Refer to [Disaggregated Prefill and Decode](#disaggregated-prefill-and-decode) |
+
+An explicit `seed` assigns random draws by request seed and absolute token
+position, so moving a request between dynamic batch slots does not reassign its
+random stream. `/v1/chat/completions` and `/v1/completions` accept the same field;
+chat choice `i` or completion prompt `i` uses `(seed + i) % 2**63`. Use a different
+seed for each independently sampled rollout and reuse it when retrying that
+logical request. Omitting `seed` retains the shared-generator sampling path.
+
+This requires dynamic inference with `sampling_backend="torch"` and no
+speculative decoding. Unsupported modes reject seeded requests. CUDA seeded
+draws require Triton and use one batched noise-generation launch per sampling
+bucket, keyed by request seed, absolute position, and vocabulary index. Explicit
+request seeds require CUDA logits; CPU seeded sampling is not supported.
+Unseeded rows retain the shared-generator path and seeded rows do not consume
+its random draws. Exact
+seeded CUDA token sequences can differ from the earlier per-row Torch implementation:
+the same seed identifies a different random stream, not a loss of repeatability.
+Replay requires the same implementation and runtime, not different RNG algorithms
+or CPU/CUDA backends. This feature does not make model logits
+batch invariant, freeze policy weights, or snapshot external tool execution.
+Identical generated tokens still require identical logits and sampling settings.
 
 ```python
 sp = SamplingParams(
@@ -988,9 +1022,14 @@ is the opposite of the `MegatronLLM` constructor default.
   warning if FlashInfer is not installed.
 - **Async scheduling excludes MoE router replay** and does not support paused
   requests. Refer to [Async Scheduling](#async-scheduling).
-- **Batch-invariant MoE is bf16-only** and requires the unfused
-  permute/unpermute path; batch-invariant mode in general excludes context
-  parallelism and attention dropout.
+- **Batch-invariant MoE supports BF16 and MXFP8 squared-ReLU/SwiGLU experts.**
+  MXFP8 uses TE `te_native` for training and Torch/vLLM for inference. FlashInfer
+  additionally supports batch-invariant MXFP8 squared-ReLU inference, without
+  bitwise TE training-policy parity.
+  It requires unfused permute/unpermute and excludes context parallelism and
+  attention dropout. Device-metadata training GEMM is opt-in via
+  `moe_use_grouped_tensor=True`, restricted to SM100 with cuBLASLt 13.5.1
+  and a TE build exposing that constructor argument.
 - **MXFP8 fused quantization supports squared-ReLU only.** SwiGLU uses separate
   BF16 activation and MXFP8 quantization kernels; it does not fall back to BF16 GEMM.
 - **Disaggregated handoff does not support log-probs** (`return_log_probs` or

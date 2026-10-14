@@ -104,9 +104,12 @@ class EmergingOptimizerEntry:
     """Everything needed to create and configure an emerging optimizer.
 
     Attributes:
-        optimizer_cls: The torch optimizer class.
+        optimizer_cls: The torch optimizer class (default when config_to_cls is None).
         init_state_fn: Lazily initialises optimizer state (needed for checkpoint formats).
         config_to_kwargs: ``(config, model_chunks, pg_collection) -> dict`` of constructor kwargs.
+        config_to_cls: Optional ``(config) -> type`` callable. When provided, overrides
+            ``optimizer_cls`` so the instantiated class can vary based on config (e.g.
+            selecting ``LayerShardedMuon`` when ``muon_tp_mode == 'layer_sharded'``).
         default_param_overrides: Per-parameter config overrides applied automatically
             (e.g. route non-linear params to Adam).
     """
@@ -114,6 +117,7 @@ class EmergingOptimizerEntry:
     optimizer_cls: type
     init_state_fn: Callable = _eopt_init_state_fn
     config_to_kwargs: Callable | None = None
+    config_to_cls: Callable | None = None
     default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(
         default_factory=_default_param_overrides_factory
     )
@@ -128,7 +132,10 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
         eopt_kwargs = _default_adam_based_eopt_config_to_kwargs(
             eopt_name, config, model_chunks, pg_collection
         )
-    optimizer = entry.optimizer_cls(param_groups, **eopt_kwargs)
+    optimizer_cls = (
+        entry.config_to_cls(config) if entry.config_to_cls is not None else entry.optimizer_cls
+    )
+    optimizer = optimizer_cls(param_groups, **eopt_kwargs)
     return optimizer, entry.init_state_fn
 
 
@@ -746,12 +753,52 @@ def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, A
     return kwargs
 
 
+def _muon_config_to_cls(config) -> type:
+    """The ``muon`` registry entry's class.
+
+    ``LayerShardedMuon`` when ``muon_tp_mode == 'layer_sharded'`` (a registry-level class
+    selector, not a TensorParallelMuon runtime mode), ``TensorParallelMuon`` otherwise.
+    """
+    if getattr(config, 'muon_tp_mode', 'duplicated') == 'layer_sharded':
+        from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+
+        return LayerShardedMuon
+    return TensorParallelMuon
+
+
 def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
-    """Convert OptimizerConfig to TensorParallelMuon constructor kwargs."""
+    """Convert OptimizerConfig to TensorParallelMuon constructor kwargs.
+
+    Shared by ``adaptive_muon`` (which layers its own kwargs on top), so it never
+    dispatches on ``muon_tp_mode='layer_sharded'``; that lives in
+    :func:`_muon_registry_config_to_kwargs`.
+    """
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
     kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
     kwargs["pg_collection"] = pg_collection
+    return kwargs
+
+
+def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """``config_to_kwargs`` for the ``muon`` registry entry.
+
+    TensorParallelMuon kwargs, plus LayerShardedMuon's own when
+    :func:`_muon_config_to_cls` selects it (the same helper the entry's
+    ``config_to_cls`` uses, so class and kwargs cannot disagree).
+    """
+    kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+    cls = _muon_config_to_cls(config)
+    if cls is TensorParallelMuon:
+        return kwargs
+    # LayerShardedMuon: its own muon-prefixed kwargs (ns_batch_size, concurrent_groups, ...).
+    kwargs.update(_kwargs_from_config(cls, "muon", config))
+    # 'layer_sharded' selected the class; it is not a TensorParallelMuon mode, so the
+    # delegated (empty-homes fallback) path runs the bitwise reference mode instead.
+    kwargs["tp_mode"] = "duplicated"
+    # No config attr for these: the (gtp_remat, tp) axes come from the collection.
+    kwargs["gtp_remat_group"] = getattr(pg_collection, "gtp_remat", None)
+    kwargs["tp_group"] = getattr(pg_collection, "tp", None)
     return kwargs
 
 
@@ -779,7 +826,8 @@ _EMERGING_OPTIMIZERS.update(
         'muon': EmergingOptimizerEntry(
             optimizer_cls=TensorParallelMuon,
             init_state_fn=_eopt_init_state_fn,
-            config_to_kwargs=_muon_config_to_kwargs,
+            config_to_kwargs=_muon_registry_config_to_kwargs,
+            config_to_cls=_muon_config_to_cls,
             default_param_overrides={
                 ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
                     'optimizer': 'adam'

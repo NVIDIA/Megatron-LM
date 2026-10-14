@@ -135,7 +135,11 @@ class DummyEngine(DynamicInferenceEngine):
         self.rank = torch.distributed.get_rank()
 
     def add_request(
-        self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
+        self,
+        request_id: int,
+        prompt: str,
+        sampling_params: Optional[SamplingParams] = None,
+        offload_params=None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         self.requests[request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(
@@ -305,6 +309,7 @@ class TestSubmitDoesNotDecodePrompt:
 
     UNDECODABLE_PROMPT = b"\xc1not-valid-msgpack"
     UNDECODABLE_MEDIA = b"\xc1not-valid-msgpack-either"
+    UNDECODABLE_OFFLOAD = b"\xc1not-valid-msgpack-at-all"
 
     def _submit(self, coordinator, block_hashes=None, media_meta=None):
         """Drive handle_submit_request once and return the frames sent onward."""
@@ -322,6 +327,7 @@ class TestSubmitDoesNotDecodePrompt:
             self.UNDECODABLE_PROMPT,
             msgpack.packb(block_hashes, use_bin_type=True),
             self.UNDECODABLE_MEDIA,
+            self.UNDECODABLE_OFFLOAD,
         ]
         handle_submit_request(coordinator, b"client-A", metadata, bodies)
         return coordinator.router_socket.send_multipart.call_args.args[0]
@@ -330,13 +336,17 @@ class TestSubmitDoesNotDecodePrompt:
         """LOAD_BALANCED ignores hashes, so the prompt is never decoded."""
         coordinator = make_coordinator_direct(data_parallel_size=2)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-        _identity, _metadata, prompt_frame, _media = self._submit(coordinator, block_hashes=[])
+        _identity, _metadata, prompt_frame, _media, _offload = self._submit(
+            coordinator, block_hashes=[]
+        )
         assert prompt_frame is self.UNDECODABLE_PROMPT
 
     def test_disabled_prefix_caching_forwards_prompt_verbatim(self):
         """With prefix caching off there are no hashes to compute either."""
         coordinator = make_coordinator_direct(data_parallel_size=2, enable_prefix_caching=False)
-        _identity, _metadata, prompt_frame, _media = self._submit(coordinator, block_hashes=[])
+        _identity, _metadata, prompt_frame, _media, _offload = self._submit(
+            coordinator, block_hashes=[]
+        )
         assert prompt_frame is self.UNDECODABLE_PROMPT
 
     def test_prefix_routing_uses_frontend_hashes_without_decoding_prompt(self):
@@ -350,7 +360,7 @@ class TestSubmitDoesNotDecodePrompt:
         coordinator.prefix_caching_coordinator_policy = (
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         )
-        _identity, _metadata, prompt_frame, _media = self._submit(
+        _identity, _metadata, prompt_frame, _media, _offload = self._submit(
             coordinator, block_hashes=[11, 22]
         )
         assert prompt_frame is self.UNDECODABLE_PROMPT
@@ -361,9 +371,11 @@ class TestSubmitDoesNotDecodePrompt:
         coordinator.prefix_caching_coordinator_policy = (
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         )
-        identity, _metadata, _prompt, _media = self._submit(coordinator, block_hashes=[11, 22])
+        identity, _metadata, _prompt, _media, _offload = self._submit(
+            coordinator, block_hashes=[11, 22]
+        )
         # A second request with the same prefix must now land on the same rank.
-        again, _m, _p, _md = self._submit(coordinator, block_hashes=[11, 22])
+        again, _m, _p, _md, _o = self._submit(coordinator, block_hashes=[11, 22])
         assert again == identity
 
     def test_unhashed_prompt_falls_back_to_the_coordinator(self):
@@ -399,7 +411,12 @@ class TestSubmitDoesNotDecodePrompt:
             coordinator,
             b"client-A",
             metadata,
-            [prompt, msgpack.packb(None, use_bin_type=True), self.UNDECODABLE_MEDIA],
+            [
+                prompt,
+                msgpack.packb(None, use_bin_type=True),
+                self.UNDECODABLE_MEDIA,
+                self.UNDECODABLE_OFFLOAD,
+            ],
         )
 
         # Decoded here, and salted with whatever media key the metadata carried.
@@ -416,7 +433,9 @@ class TestSubmitDoesNotDecodePrompt:
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         )
         coordinator.compute_request_hashes = MagicMock(return_value=[5])
-        _identity, _metadata, prompt_frame, _media = self._submit(coordinator, block_hashes=[])
+        _identity, _metadata, prompt_frame, _media, _offload = self._submit(
+            coordinator, block_hashes=[]
+        )
         assert prompt_frame is self.UNDECODABLE_PROMPT
         coordinator.compute_request_hashes.assert_not_called()
 
@@ -432,16 +451,30 @@ class TestSubmitDoesNotDecodePrompt:
         coordinator.prefix_caching_coordinator_policy = (
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         )
-        _identity, _metadata, _prompt, media_frame = self._submit(
+        _identity, _metadata, _prompt, media_frame, _offload = self._submit(
             coordinator, block_hashes=[11, 22], media_meta={"media_cache_key": "img-1"}
         )
         assert media_frame is self.UNDECODABLE_MEDIA
+
+    def test_offload_frame_is_forwarded_without_being_decoded(self):
+        """Offload params reach the engine untouched.
+
+        They are unbounded client metadata for the engine's prompt preparer and
+        payload stager, which is why they ride in their own frame rather than
+        in the metadata frame this loop unpacks and repacks per request.
+        """
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        _identity, _metadata, _prompt, _media, offload_frame = self._submit(
+            coordinator, block_hashes=[]
+        )
+        assert offload_frame is self.UNDECODABLE_OFFLOAD
 
     def test_media_identity_routes_without_the_media_payload(self):
         """Affinity keys on the descriptor in metadata, never on the bytes."""
         coordinator = make_coordinator_direct(data_parallel_size=2)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-        identity, _m, _p, _md = self._submit(
+        identity, _m, _p, _md, _o = self._submit(
             coordinator, block_hashes=[], media_meta={"media_cache_key": "img-1"}
         )
         assert coordinator._media_cache_affinity["img-1"] == identity
@@ -450,12 +483,16 @@ class TestSubmitDoesNotDecodePrompt:
         """The client's request id is swapped for the coordinator's own."""
         coordinator = make_coordinator_direct(data_parallel_size=2)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-        _identity, metadata_frame, _prompt, _media = self._submit(coordinator, block_hashes=[])
+        _identity, metadata_frame, _prompt, _media, offload_frame = self._submit(
+            coordinator, block_hashes=[]
+        )
         header, request_id, sampling_params, media_meta = msgpack.unpackb(metadata_frame, raw=False)
         assert header == Headers.SUBMIT_REQUEST.value
         assert request_id == 0  # server-side id, not the client's 7
         assert sampling_params == {"temperature": 1.0}
         assert media_meta is None
+        # Offload params stay out of the rewritten metadata frame.
+        assert offload_frame is self.UNDECODABLE_OFFLOAD
         assert coordinator.request_id_to_client_request_id[0] == 7
 
 
@@ -1223,11 +1260,27 @@ class TestMalformedSubmissionsAreDropped:
         coordinator.router_socket.send_multipart.assert_not_called()
         assert coordinator.next_request_id == 0
 
+    def test_submission_missing_the_offload_frame_is_dropped(self):
+        """Three bodies was the previous wire format; offload params now ride in a fourth."""
+        coordinator = self._coordinator()
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}, None]
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0", b"\xc0", b"\xc0"])
+        coordinator.router_socket.send_multipart.assert_not_called()
+        assert coordinator.next_request_id == 0
+
     def test_submission_with_short_metadata_is_dropped(self):
         """Too few metadata fields must not raise a ValueError on unpack."""
         coordinator = self._coordinator()
         metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}]
-        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0", b"\xc0", b"\xc0"])
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0"] * 4)
+        coordinator.router_socket.send_multipart.assert_not_called()
+        assert coordinator.next_request_id == 0
+
+    def test_submission_with_offload_params_in_metadata_is_dropped(self):
+        """Offload params in the metadata frame was the previous layout; it must be rejected."""
+        coordinator = self._coordinator()
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}, None, {"k": "v"}]
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0"] * 4)
         coordinator.router_socket.send_multipart.assert_not_called()
         assert coordinator.next_request_id == 0
 

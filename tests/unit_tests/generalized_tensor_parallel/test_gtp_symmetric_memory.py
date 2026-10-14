@@ -208,6 +208,39 @@ class TestSymmPoolBackend:
             gtp_symm._pools.pop("fallback_group", None)
 
 
+@pytest.mark.parametrize("symmetric", [False, True], ids=["plain", "symmetric"])
+def test_wgrad_pool_fences_cross_stream_reuse(monkeypatch, symmetric):
+    """Recycling scratch must not let the next writer clobber an outstanding reader."""
+    monkeypatch.setattr(gtp_module, "_wgrad_buf_pool", {})
+    pool, group = RegisteredLIFOPool(), _StubGroup()
+
+    def alloc():
+        if symmetric:
+            return pool.alloc((1024,), torch.bfloat16, "cuda", group)
+        return gtp_module._wgrad_pool_get((1024,), torch.bfloat16, "cuda")
+
+    buf = alloc()
+    buf.fill_(1)
+    observed = torch.empty_like(buf)
+    reader = torch.cuda.Stream()
+    reader.wait_stream(torch.cuda.current_stream())
+    ready = torch.cuda.Event()
+    with torch.cuda.stream(reader):
+        torch.cuda._sleep(50_000_000)
+        observed.copy_(buf)
+        ready.record()
+    if symmetric:
+        pool.free(buf, ready_event=ready)
+    else:
+        gtp_module._wgrad_pool_put(buf, ready_event=ready)
+    reused = alloc()
+    assert reused.data_ptr() == buf.data_ptr()
+    reused.fill_(17)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(observed, torch.ones_like(observed))
+    torch.testing.assert_close(reused, torch.full_like(reused, 17))
+
+
 class TestRegisteredLIFOPool:
     def test_alloc_returns_tagged_view(self):
         pool = RegisteredLIFOPool()
@@ -248,6 +281,29 @@ class TestRegisteredLIFOPool:
         pool = RegisteredLIFOPool()
         pool.free(torch.empty(8, device="cuda"))
         assert not pool._free  # nothing entered the free lists
+
+    def test_has_free_reports_whether_alloc_would_grow_the_pool(self):
+        # has_free is what lets a caller tell "recycling a buffer" from "raising the
+        # high-water mark", so it must answer per bucket, not per pool.
+        pool = RegisteredLIFOPool()
+        group = _StubGroup()
+        assert not pool.has_free((8, 4), torch.bfloat16, group)  # empty bucket
+        buf = pool.alloc((8, 4), torch.bfloat16, "cuda", group)
+        assert not pool.has_free((8, 4), torch.bfloat16, group)  # checked out, not free
+        pool.free(buf)
+        assert pool.has_free((8, 4), torch.bfloat16, group)  # back on the free list
+
+    def test_has_free_keys_on_numel_dtype_and_group(self):
+        # Same keying as alloc: a free buffer must not be claimed to serve a different
+        # bucket, or the caller would skip the wait and then allocate anyway.
+        pool = RegisteredLIFOPool()
+        g1, g2 = _StubGroup("g1"), _StubGroup("g2")
+        pool.free(pool.alloc((8,), torch.bfloat16, "cuda", g1))
+        assert pool.has_free((8,), torch.bfloat16, g1)
+        assert pool.has_free((4, 2), torch.bfloat16, g1)  # 1-D key: same numel
+        assert not pool.has_free((8,), torch.float32, g1)  # different dtype
+        assert not pool.has_free((16,), torch.bfloat16, g1)  # different numel
+        assert not pool.has_free((8,), torch.bfloat16, g2)  # different group
 
     def test_capture_guard_raises_on_empty_bucket(self, monkeypatch):
         pool = RegisteredLIFOPool()

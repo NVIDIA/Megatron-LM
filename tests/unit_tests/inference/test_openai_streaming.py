@@ -257,7 +257,7 @@ async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
         }
     )
     stream.finish()
-    parser = StreamingChatParser(lambda text: (text, {}))
+    parser = StreamingChatParser(lambda text, finished=False: (text, {}))
 
     records = [
         record
@@ -293,8 +293,8 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
         }
     ]
 
-    def parse(text):
-        return Qwen3CoderToolParser.parse(text, tools=tools)
+    def parse(text, finished=False):
+        return Qwen3CoderToolParser.parse(text, tools=tools, finished=finished)
 
     parser = StreamingChatParser(parse, marker_prefixes=Qwen3CoderToolParser.streaming_markers)
     model_output = (
@@ -377,7 +377,9 @@ def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
     )
 
     parser = StreamingChatParser(
-        lambda text: Qwen3CoderToolParser.parse(text, tools=tools),
+        lambda text, finished=False: Qwen3CoderToolParser.parse(
+            text, tools=tools, finished=finished
+        ),
         marker_prefixes=Qwen3CoderToolParser.streaming_markers,
     )
     model_output = (
@@ -525,3 +527,29 @@ def test_json_safe_helpers_clamp_only_non_finite():
     orjson = pytest.importorskip("orjson")
     assert orjson.dumps(NEG_INF) == b"null"
     assert orjson.loads(orjson.dumps(json_safe_logprob(NEG_INF))) == floor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["stop", "length"])
+async def test_stream_preserves_engine_finish_reason_at_budget(reason):
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.put(
+        {
+            "final": {
+                "prompt_tokens": [9],
+                "generated_tokens": [1, 2],
+                "generated_log_probs": [-0.1, -0.2],
+                "finish_reason": reason,
+                "sampling_params": {"num_tokens_to_generate": 2},
+            }
+        }
+    )
+    stream.finish()
+    records = [
+        record
+        async for record in openai_stream(
+            [stream], _Tokenizer(), [_IncrementalDetokenizer()], chat=False, return_log_probs=False
+        )
+    ]
+    payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
+    assert payloads[-1]["choices"][0]["finish_reason"] == reason

@@ -11,6 +11,7 @@ import torch
 
 from megatron.core.optimizer import Adam
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
@@ -74,8 +75,34 @@ class TestGradNormAndClip:
                 assert bytes_equal(a, b), f"clipped grad {j} differs on replay {i}"
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_tensor_metric_l2_replays(monkeypatch, dtype):
+    """Replay TE's per-tensor norm outputs through the actual batched metric path."""
+    if _fused_l2_norm_impl() is None:
+        pytest.skip("TransformerEngine multi-tensor L2 kernel is unavailable")
+    seeded()
+    # Span many reduction CTAs and include uneven chunk boundaries and small tensors.
+    tensors = tuple(
+        torch.randn(n, device="cuda", dtype=dtype) for n in (4_194_321, 131_071, 4097, 1)
+    )
+    metric = L2NormMetric()
+
+    def unexpected_fallback(tensor):
+        pytest.fail("Expected the fused multi-tensor L2 path, not the per-tensor fallback")
+
+    monkeypatch.setattr(metric, "contribution", unexpected_fallback)
+    assert_replays_bit_exact(
+        lambda *values: metric.contribution_batch(values),
+        tensors,
+        replays=8,
+        backward=False,
+        contention=True,
+        what=f"L2NormMetric.contribution_batch ({dtype})",
+    )
+
+
 def test_fused_adam_step_replays():
-    """Same params, grads and optimizer state -> identical updated params and moments."""
+    """Mixed weight-decay groups produce identical updated params and moments on replay."""
     seeded()
     shapes = [(4096, 4096), (16384, 2048), (2048,), (65536,)]
     params0 = [torch.randn(*s, device="cuda", dtype=torch.float32) for s in shapes]
@@ -85,7 +112,17 @@ def test_fused_adam_step_replays():
         params = [torch.nn.Parameter(p.clone()) for p in params0]
         for p, g in zip(params, grads):
             p.grad = g.clone()
-        opt = Adam(params, lr=1e-3, betas=(0.9, 0.95), weight_decay=0.1, eps=1e-8)
+        # Retention routing places a 1-D controller in a decayed group while ordinary
+        # vector parameters remain in a zero-WD group. Exercise both kernel paths together.
+        opt = Adam(
+            [
+                {"params": params[:3], "weight_decay": 0.1},
+                {"params": params[3:], "weight_decay": 0.0},
+            ],
+            lr=1e-3,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
         with RacingStreams():
             opt.step()
             opt.step()

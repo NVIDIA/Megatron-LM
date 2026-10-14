@@ -20,13 +20,14 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.utils import configure_nvtx_profiling
-from megatron.inference.utils import (
-    add_inference_args,
-    get_dynamic_inference_engine,
-    get_model_for_inference,
+from megatron.training import get_args, get_tokenizer
+
+from tools.run_dynamic_text_generation_server import (
+    _build_engine_for_vlm_or_gpt,
+    add_text_generation_server_args,
+    parse_args_and_detect_vlm,
 )
-from megatron.training import get_args, get_tokenizer, initialize_megatron
-from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import get_run_config
 
 # pylint: disable=line-too-long
 
@@ -215,11 +216,10 @@ if __name__ == "__main__":
     # enable inference mode in the very beginning as some fp8 optimizations
     # check for it.
     with torch.inference_mode():
-        args = parse_and_validate_args(
-            extra_args_provider=add_inference_args,
+        args, is_vlm = parse_args_and_detect_vlm(
+            extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
-        initialize_megatron()
         configure_nvtx_profiling(True)
 
         tokenizer = get_tokenizer()
@@ -236,21 +236,21 @@ if __name__ == "__main__":
             ),
         )
 
-        if getattr(args, 'moe_routing_trace_path', None):
+        cfg = get_run_config()
+        if cfg.logger.moe_routing_trace_path:
             rank = dist.get_rank()
             max_steps = getattr(args, 'moe_routing_trace_max_inference_steps', None) or 10**9
             init_moe_router_tracer(
-                output_dir=args.moe_routing_trace_path,
+                output_dir=cfg.logger.moe_routing_trace_path,
                 max_steps=max_steps,
                 rank=rank,
-                capture_hidden_states=getattr(
-                    args, 'moe_routing_trace_capture_hidden_states', False
-                ),
-                capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
-                dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
+                capture_hidden_states=cfg.logger.moe_routing_trace_capture_hidden_states,
+                capture_logits=cfg.logger.moe_routing_trace_capture_logits,
+                dump_router_weights=cfg.logger.moe_routing_trace_dump_weights,
             )
 
-        model = get_model_for_inference()
+        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
+        model = engine.controller.inference_wrapped_model.model
 
         tracer = get_moe_router_tracer()
         if tracer is not None:
@@ -264,8 +264,6 @@ if __name__ == "__main__":
                 tracer.register_hooks(model)
 
         requests = build_requests(args, tokenizer, sampling_params)
-
-        engine = get_dynamic_inference_engine(model=model)
 
         if dist.get_rank() == 0:
             setup_prefix = build_dynamic_engine_setup_prefix(args, model, engine.context, requests)
