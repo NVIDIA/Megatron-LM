@@ -257,6 +257,41 @@ def _freeze_base_for_mtp(model):
     _freeze_for_qad(model, "mtp")
 
 
+def _gpt_oss_enabled(args) -> bool:
+    """Return whether ``--enable-gpt-oss`` selected the GPT-OSS recipe."""
+    return bool(getattr(args, "enable_gpt_oss", False))
+
+
+def _apply_gpt_oss_yarn(config) -> str:
+    """Set YaRN and the published GPT-OSS factors on ``config``.
+
+    The GPT-OSS recipe leaves ``--position-embedding-type`` at
+    ``learned_absolute``. ``GPTModel`` uses the config attribute for
+    ``YarnRotaryEmbedding`` and the constructor argument for the embedding
+    table. ``HybridModel`` uses only the constructor argument. The rotary
+    module reads ``yarn_*`` with no default.
+
+    A distillation teacher is rebuilt from checkpoint args that still say
+    ``learned_absolute``, then constructed with the student's ``model_kwargs``.
+    Those kwargs already request YaRN, so the teacher config needs the same
+    position type and factors or ``YarnRotaryEmbedding`` raises on
+    ``yarn_rotary_scaling_factor``.
+
+    Returns:
+        The position type to pass into the model constructor.
+    """
+    config.position_embedding_type = "yarn"
+    # Hugging Face GPT-OSS YaRN configuration.
+    config.yarn_rotary_scaling_factor = 32.0
+    config.yarn_original_max_position_embeddings = 131072
+    config.yarn_beta_fast = 32.0
+    config.yarn_beta_slow = 1.0
+    config.yarn_mscale = 1.0
+    config.yarn_mscale_all_dim = 0.0
+    config.yarn_correction_range_round_to_int = False
+    return "yarn"
+
+
 def modelopt_gpt_hybrid_builder(
     args,
     pre_process,
@@ -297,27 +332,9 @@ def modelopt_gpt_hybrid_builder(
     # Passed to LanguageModelEmbedding and HybridModel. GPTModel uses this argument
     # for the embedding table and config.position_embedding_type for YaRN.
     position_embedding_type = args.position_embedding_type
-
-    # Handle GPT-OSS mode with YaRN RoPE configuration
-    if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:
+    if _gpt_oss_enabled(args):
         print_rank_0("GPT-OSS mode enabled: Configuring YaRN RoPE parameters")
-
-        # The GPT-OSS recipe leaves --position-embedding-type at its default,
-        # learned_absolute. Setting only the config attribute enables YaRN in
-        # GPTModel while LanguageModelEmbedding still allocates a position table
-        # and adds it to every token. HybridModel reads the constructor argument
-        # and would not enable YaRN at all. Use YaRN for both.
-        config.position_embedding_type = "yarn"
-        position_embedding_type = "yarn"
-        # Set GPT-OSS YaRN values directly on the config
-        # These defaults are based on Huggingface GPT-OSS configurations
-        config.yarn_rotary_scaling_factor = 32.0
-        config.yarn_original_max_position_embeddings = 131072
-        config.yarn_beta_fast = 32.0
-        config.yarn_beta_slow = 1.0
-        config.yarn_mscale = 1.0
-        config.yarn_mscale_all_dim = 0.0
-        config.yarn_correction_range_round_to_int = False
+        position_embedding_type = _apply_gpt_oss_yarn(config)
 
     if vp_stage is not None:
         raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
@@ -506,13 +523,23 @@ def modelopt_gpt_hybrid_builder(
             ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
         teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
-        teacher_config = core_transformer_config_from_args(teacher_config_raw)  # convert to TransformerConfig
+        teacher_config = core_transformer_config_from_args(teacher_config_raw)
+        teacher_model_kwargs = model_kwargs
+        # model_kwargs already carries yarn when the student is GPT-OSS, but
+        # teacher_config was just built from args that still say learned_absolute.
+        if _gpt_oss_enabled(args) or _gpt_oss_enabled(teacher_config_raw):
+            _apply_gpt_oss_yarn(teacher_config)
+            if teacher_model_kwargs.get("position_embedding_type") != "yarn":
+                teacher_model_kwargs = dict(model_kwargs)
+                teacher_model_kwargs["position_embedding_type"] = "yarn"
 
         distill_cfg = mtd_mcore.setup_distillation_config(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config
         )
         kd_config = {
-            "teacher_model": _build_teacher_model(teacher_config, teacher_config_raw, model_kwargs),
+            "teacher_model": _build_teacher_model(
+                teacher_config, teacher_config_raw, teacher_model_kwargs
+            ),
             "criterion": distill_cfg.criterion,
             "loss_balancer": distill_cfg.loss_balancer,
         }
