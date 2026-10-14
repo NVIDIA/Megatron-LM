@@ -108,7 +108,7 @@ def create_args():
     args.auto_detect_ckpt_format = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
-    cfg.scheduler.override_opt_param_scheduler = False
+    args.override_opt_param_scheduler = False
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False

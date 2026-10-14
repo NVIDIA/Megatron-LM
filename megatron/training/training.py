@@ -2773,6 +2773,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
     args = get_args()
+    cfg = get_run_config()
 
     # Iteration-based training.
     if args.train_iters:

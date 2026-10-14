@@ -544,7 +544,7 @@ def create_args(run_config):
     args.auto_detect_ckpt_format = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
-    cfg.scheduler.override_opt_param_scheduler = False
+    args.override_opt_param_scheduler = False
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
@@ -829,7 +829,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = False
     args.use_dist_ckpt = ckpt_format != "torch"
-    cfg.scheduler.override_opt_param_scheduler = True
+    args.override_opt_param_scheduler = True
     args.lr = 1.0
     args.min_lr = 0.1
     args.decoupled_lr = 0.5
