@@ -33,14 +33,13 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtenso
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
 )
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.distributed.mfsdp_v2.expert_parallel_utils import (
-    build_hybrid_model,
-    build_process_group_collection,
-    train_hybrid_model,
-    transformer_config,
-)
 
 
 class _TinyModel(nn.Module):
@@ -496,13 +495,54 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
         device.type, (world_size // ep_size, ep_size), mesh_dim_names=("edp", "ep")
     )
     one = dist.new_group([rank], use_local_synchronization=True)
-    groups = build_process_group_collection(
-        one, world_mesh.get_group(), moe_mesh.get_group("ep"), moe_mesh.get_group("edp")
+    world = world_mesh.get_group()
+    ep_group = moe_mesh.get_group("ep")
+    groups = ProcessGroupCollection(
+        tp=one,
+        expt_tp=one,
+        cp=one,
+        pp=one,
+        tp_cp=one,
+        tp_dp_cp=world,
+        ep=ep_group,
+        tp_ep=ep_group,
+        expt_dp=moe_mesh.get_group("edp"),
+        dp=world,
+        dp_cp=world,
+        embd=None,
+        pos_embd=None,
     )
 
     def build(seed):
         torch.manual_seed(seed)
-        model = build_hybrid_model(transformer_config(2, 8, ep_size, 64, 128), groups, 128, 8, "*E")
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_moe_experts=8,
+            expert_model_parallel_size=ep_size,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0.0,
+            moe_grouped_gemm=True,
+            moe_ffn_hidden_size=128,
+            add_bias_linear=False,
+            gradient_accumulation_fusion=False,
+            use_cpu_initialization=True,
+            params_dtype=torch.float32,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            # The unfused attention backend supports the FP32 model used here.
+            attention_backend=AttnBackend.unfused,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            hybrid_layer_pattern="*E",
+            pg_collection=groups,
+        ).cuda()
         # CPU initialization otherwise gives different EP ranks identical local
         # experts. Make each global expert distinguishable before checkpointing.
         fqn_mapping = {}
@@ -580,7 +620,22 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
     ids = torch.randint(0, 128, (2, 8), device=device)
     pos = torch.arange(8, device=device).repeat(2, 1)
     target = torch.randn(2, 8, 128, device=device)
-    train_hybrid_model(source, source_optimizer, ids, pos, None, target, world_mesh.get_group())
+
+    def train(model, optimizer):
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad()
+            loss = torch.nn.functional.mse_loss(
+                model(input_ids=ids, position_ids=pos, attention_mask=None), target
+            )
+            loss.backward()
+            optimizer.step()
+            loss = loss.detach()
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG, group=world)
+            losses.append(loss)
+        return losses
+
+    train(source, source_optimizer)
     saved = snapshot(source, source_optimizer)
 
     with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_fsdp_roundtrip", sync=True) as path:
@@ -592,12 +647,8 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
         load_checkpoint(destination, destination_optimizer, path, fqn_mapping=destination_mapping)
         assert_snapshot(destination, destination_optimizer, saved)
 
-    expected_losses = train_hybrid_model(
-        source, source_optimizer, ids, pos, None, target, world_mesh.get_group()
-    )
-    actual_losses = train_hybrid_model(
-        destination, destination_optimizer, ids, pos, None, target, world_mesh.get_group()
-    )
+    expected_losses = train(source, source_optimizer)
+    actual_losses = train(destination, destination_optimizer)
     torch.testing.assert_close(
         torch.stack(actual_losses), torch.stack(expected_losses), rtol=0, atol=0
     )
