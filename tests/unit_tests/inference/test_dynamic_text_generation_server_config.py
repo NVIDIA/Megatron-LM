@@ -2,6 +2,8 @@
 
 """Tests for configurable defaults on the dynamic text generation server."""
 
+import asyncio
+
 import pytest
 
 quart = pytest.importorskip("quart")
@@ -130,8 +132,12 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
 
     captured = {}
 
+    class PinnedLoop(asyncio.SelectorEventLoop):
+        """Distinguishable from whatever the process policy would build."""
+
     async def fake_run_text_gen_server(*args):
         captured["run_args"] = args
+        captured["loop"] = asyncio.get_running_loop()
 
     class FakeProcess:
         pid = 123
@@ -179,7 +185,11 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         default_top_p=0.8,
         default_top_k=5,
         eval_mode=True,
+        loop_factory=PinnedLoop,
     )
+
+    # The replica builds its loop with the caller's factory, not the process policy's default.
+    assert isinstance(captured["loop"], PinnedLoop)
 
     # The port is taken from the socket; no fd is handed to the replica, which
     # binds its own listener on that port.
