@@ -2339,6 +2339,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
+        # The combine was the last reader of this forward's routing metadata; token_probs
+        # carries the router's autograd graph back to the layer input.
+        self._comm_manager.reset_transient_forward_state()
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(hidden_states)
             self.shared_experts.post_forward_comm()
