@@ -27,6 +27,9 @@ from .endpoints.common import apply_optional_sampling_default
 
 logger = logging.getLogger(__name__)
 
+# Per-request payload limit, enforced by Quart.
+_MAX_REQUEST_CONTENT_SIZE = 2**30
+
 # Global reference to manage the background server processes
 _SERVER_PROCESSES: List[mp.Process] = []
 # The policy worker is a live Ray/CUDA process with background threads by the
@@ -48,6 +51,101 @@ def temp_log_level(level, logger=None):
         logger.setLevel(old_level)
 
 
+class _InflightHTTPLimit:
+    """ASGI middleware that caps how much request state one server replica can hold.
+
+    It limits two totals across all of the replica's in-flight HTTP requests:
+
+    - ``max_inflight_requests``: the number of requests being handled at once.
+    - ``max_inflight_bytes``: the payload bytes (prompt JSON, base64 media) those
+      requests have received so far, counted as they arrive.
+
+    A request arriving while either total is at its limit gets 503. A request is
+    aborted mid-upload with 413 once its individual payload exceeds
+    ``max_request_content_size``, or with 503 once it pushes the byte total over
+    its limit.
+    """
+
+    def __init__(
+        self,
+        app,
+        max_inflight_requests: int,
+        max_inflight_bytes: int,
+        max_request_content_size: int,
+    ):
+        self.app = app
+        self.max_request_content_size = max_request_content_size
+        self.max_inflight_requests = max_inflight_requests
+        self.max_inflight_bytes = max_inflight_bytes
+        self.inflight = 0
+        self.inflight_bytes = 0
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            # Limiter is only supported for HTTP.
+            return await self.app(scope, receive, send)
+
+        if (
+            self.inflight >= self.max_inflight_requests
+            or self.inflight_bytes >= self.max_inflight_bytes
+        ):
+            # Server is already saturated with requests. Reject.
+            return await self._reject(send, 503)
+
+        # Request-level parameters for limiting.
+        received = 0
+        reject_status = None
+        response_started = False
+
+        async def limited_receive():
+            nonlocal received, reject_status
+            if reject_status is not None:
+                # Already rejected.
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if message["type"] == "http.request":
+                # Measure the message size for server limits.
+                size = len(message.get("body", b""))
+                received += size
+                self.inflight_bytes += size
+                if received > self.max_request_content_size:
+                    # Request messages have exceeded max request size.
+                    reject_status = 413
+                elif self.inflight_bytes > self.max_inflight_bytes:
+                    # Server is saturated.
+                    reject_status = 503
+                if reject_status is not None:
+                    # Quart ASGI disconnect message.
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def tracked_send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        # Execute the server application.
+        self.inflight += 1
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        finally:
+            # Once the request is done, restore the quota.
+            self.inflight -= 1
+            self.inflight_bytes -= received
+        if reject_status is not None and not response_started:
+            # Reject with the rejection status and an empty body.
+            await self._reject(send, reject_status)
+
+    @staticmethod
+    async def _reject(send, status: int):
+        headers = [(b"content-length", b"0")]
+        if status == 503:
+            headers.append((b"retry-after", b"1"))
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": b""})
+
+
 @trace_async_exceptions
 async def _run_text_gen_server(
     coordinator_addr: str,
@@ -65,6 +163,8 @@ async def _run_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    max_inflight_requests: int = 16384,
+    max_inflight_bytes: int = 2**34,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -101,7 +201,7 @@ async def _run_text_gen_server(
         app = Quart(__name__)
 
         # Quart native way to handle max body size (1 GB; needed for large prompts)
-        app.config['MAX_CONTENT_LENGTH'] = 2**30
+        app.config['MAX_CONTENT_LENGTH'] = _MAX_REQUEST_CONTENT_SIZE
 
         # Store client and tokenizer in app config for Blueprints to use
         app.config['client'] = inference_client
@@ -133,12 +233,15 @@ async def _run_text_gen_server(
         for endpoint in endpoints.__all__:
             app.register_blueprint(endpoint)
 
+        app.asgi_app = _InflightHTTPLimit(
+            app.asgi_app, max_inflight_requests, max_inflight_bytes, _MAX_REQUEST_CONTENT_SIZE
+        )
+
         config = Config()
         config.keep_alive_timeout = 30.0  # Keep connection alive between long-running requests.
         config.backlog = 2**14  # Expect high load; ensure we do not drop connections.
-        config.h2_max_concurrent_streams = (
-            2**14
-        )  # Allow many concurrent streams for HTTP/2 clients.
+        # One HTTP/2 connection can open as many streams as the replica will handle.
+        config.h2_max_concurrent_streams = max_inflight_requests
 
         # Held for this worker's lifetime; closing it would drop the listener.
         own_socket = _bind_reuseport_socket(server_port, bind_host)
@@ -182,6 +285,8 @@ def _server_process_worker(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    max_inflight_requests: int = 16384,
+    max_inflight_bytes: int = 2**34,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -204,6 +309,8 @@ def _server_process_worker(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                max_inflight_requests,
+                max_inflight_bytes,
             )
         )
     except KeyboardInterrupt:
@@ -267,6 +374,8 @@ def start_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    max_inflight_requests: int = 16384,
+    max_inflight_bytes: int = 2**34,
 ) -> Optional[str]:
     """Start the text generation server.
 
@@ -290,6 +399,11 @@ def start_text_gen_server(
             shared with them.
         chat_template: Chat template to apply, as a file path or an inline
             template string. None falls back to the tokenizer's own template.
+        max_inflight_requests: Per replica, the most HTTP requests handled at
+            once. Requests beyond it get 503.
+        max_inflight_bytes: Per replica, the most request payload bytes held at
+            once. The 16 GiB default is sized for DGX hosts; lower it on hosts
+            with less memory.
 
     Returns:
         The base URL this rank serves on, or None if the server was already
@@ -300,6 +414,14 @@ def start_text_gen_server(
     if _SERVER_PROCESSES:
         logger.warning("Text gen server processes are already running.")
         return None
+
+    if max_inflight_requests < 1:
+        raise ValueError(f"max_inflight_requests must be >= 1, got {max_inflight_requests}")
+    if max_inflight_bytes < _MAX_REQUEST_CONTENT_SIZE:
+        raise ValueError(
+            f"max_inflight_bytes must be >= {_MAX_REQUEST_CONTENT_SIZE} (the per-request limit), "
+            f"got {max_inflight_bytes}"
+        )
 
     if sock is not None:
         # Take the port and release the socket: replicas each bind their own with
@@ -332,6 +454,8 @@ def start_text_gen_server(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                max_inflight_requests,
+                max_inflight_bytes,
             ),
             daemon=True,
         )
