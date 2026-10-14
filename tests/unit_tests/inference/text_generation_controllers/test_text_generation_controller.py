@@ -4292,12 +4292,16 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("pp_size", [1, 2], ids=["pp1", "pp2"])
-    def test_logits_are_fp32(self, pp_size):
+    @pytest.mark.parametrize(
+        "tp_size, pp_size", [(1, 1), (1, 2), (2, 1)], ids=["tp1-pp1", "tp1-pp2", "tp2-pp1"]
+    )
+    def test_logits_are_fp32(self, tp_size, pp_size):
         """Inference holds logits in fp32: the CUDA-graph buffer is allocated in it and at PP 2
         the first stage receives the broadcast in it. The bf16 head emits fp32 directly when TE
-        general_gemm is available and upcasts otherwise. Generation with and without the buffer
-        samples the same tokens (both run the same eager kernels here).
+        general_gemm is available and upcasts otherwise. With the buffer the model writes each
+        step's logits into it inside the forward and the controller asserts the identity every
+        step; without it there is none. Generation with and without the buffer samples the same
+        tokens (both run the same eager kernels here).
         """
         generated = {}
         for cuda_graph_impl in ("none", "local"):
@@ -4305,13 +4309,20 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 self.teardown_method(None)
             self.setup_model(
                 torch.bfloat16,
-                tensor_model_parallel_size=1,
+                tensor_model_parallel_size=tp_size,
                 pipeline_model_parallel_size=pp_size,
                 static=False,
                 use_training_random_init=True,
                 cuda_graph_impl=cuda_graph_impl,
             )
             controller = self.text_generation_controller
+            context = controller.inference_wrapped_model.inference_context
+            if cuda_graph_impl == "local":
+                assert context.logits_output_buffer is controller._all_logits_cuda
+                assert controller._all_logits_cuda.shape[-1] == self.vocab_size
+            else:
+                assert context.logits_output_buffer is None
+                assert controller._all_logits_cuda is None
             generated[cuda_graph_impl] = self._generate_dynamic()
             assert controller._all_logits_cuda.dtype is torch.float32
         assert generated["none"] == generated["local"]
