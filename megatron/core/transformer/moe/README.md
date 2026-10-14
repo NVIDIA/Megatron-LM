@@ -530,7 +530,9 @@ image already installs the supported
 through `docker/common/install_mok.sh`, including the compatibility patch in
 `docker/patches/mok.patch`. Use that image or its installation helper rather than an unpatched
 source installation. The AMD64 image skips MOK because its H100 target is unsupported.
-The pinned API does not provide the optional shared-expert output gate used by newer MOK versions.
+The optional shared-expert output gate (`moe_shared_expert_gate`) runs inside MOK and requires
+[MOK 7a8cfb7](https://github.com/QiZhangNV/mixture-of-kittens/tree/7a8cfb7fdd96a1cfba506caf4756c6c86073399a)
+or later, which is newer than the pinned snapshot.
 
 | Area | Current MOK support |
 |------|---------------------|
@@ -562,7 +564,7 @@ static input token counts alone do not establish that lifecycle.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
-wgrad, native shared-expert overlap/gating, shared-expert-only
+wgrad, native shared-expert overlap, shared-expert-only
 recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
 the `moe_preprocess` CUDA Graph scope, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
