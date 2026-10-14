@@ -1376,7 +1376,8 @@ class TransformerConfig(ModelParallelConfig):
     """Keep mHC coefficients and stream mixing in FP32 until the output cast."""
 
     mhc_learned_output_contract: bool = True
-    """Use learned hc_head_* weights to contract residual streams; otherwise take their mean."""
+    """Contract residual streams to the ordinary hidden width using token-dependent gating;
+    otherwise average the streams."""
 
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
