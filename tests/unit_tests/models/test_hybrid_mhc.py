@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -355,10 +357,18 @@ class TestHybridStackMHC:
         assert all(captured is None for captured in seen_input_ids)
 
     @pytest.mark.parametrize("recompute_method", ["uniform", "block"])
-    @pytest.mark.parametrize("precision", ["fp32", "bf16_fp32_mixing", "bf16_fused"])
+    @pytest.mark.parametrize(
+        "precision, autocast_forward",
+        [
+            ("fp32", False),
+            ("bf16_fp32_mixing", False),
+            ("bf16_fused", False),
+            ("bf16_fp32_mixing", True),
+        ],
+    )
     @pytest.mark.parametrize("learned_output_contract", [False, True])
     def test_full_recompute_matches_forward_backward(
-        self, recompute_method, precision, learned_output_contract
+        self, recompute_method, precision, learned_output_contract, autocast_forward
     ):
         dtype = torch.float32 if precision == "fp32" else torch.bfloat16
         config_kwargs = dict(
@@ -385,14 +395,27 @@ class TestHybridStackMHC:
         reference_input = hidden.clone().requires_grad_()
         checkpointed_input = hidden.clone().requires_grad_()
 
-        expected = reference(reference_input, attention_mask=None)
-        actual = checkpointed(checkpointed_input, attention_mask=None)
+        forward_context = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if autocast_forward
+            else nullcontext()
+        )
+        with forward_context:
+            expected = reference(reference_input, attention_mask=None)
+            actual = checkpointed(checkpointed_input, attention_mask=None)
         torch.testing.assert_close(actual, expected)
+        # Backward runs after the forward autocast scope has ended; checkpoint replay must
+        # restore the forward autocast state internally.
         expected.float().square().mean().backward()
         actual.float().square().mean().backward()
-        torch.testing.assert_close(checkpointed_input.grad, reference_input.grad)
+        grad_close_kwargs = {"rtol": 1e-2, "atol": 1e-3} if autocast_forward else {}
+        torch.testing.assert_close(
+            checkpointed_input.grad, reference_input.grad, **grad_close_kwargs
+        )
         for name, param in checkpointed.named_parameters():
-            torch.testing.assert_close(param.grad, reference.get_parameter(name).grad, msg=name)
+            torch.testing.assert_close(
+                param.grad, reference.get_parameter(name).grad, msg=name, **grad_close_kwargs
+            )
 
     def test_fused_bf16_forward_backward(self):
         config = _get_config(
