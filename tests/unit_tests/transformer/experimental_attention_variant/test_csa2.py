@@ -437,6 +437,15 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
                 # The standard CI image deliberately builds FlashMLA without SM90.
                 # Keep parity active on images/devices that have the compiled kernel.
                 if layers is fused and "no kernel image is available" in str(error):
+                    from cuda.bindings import runtime
+
+                    # FlashMLA's cudaFuncSetAttribute failure leaves a CUDA last-error
+                    # behind. Clear it before skipping so the next test can launch kernels.
+                    (status,) = runtime.cudaGetLastError()
+                    assert status in (
+                        runtime.cudaError_t.cudaSuccess,
+                        runtime.cudaError_t.cudaErrorNoKernelImageForDevice,
+                    ), status
                     pytest.skip("FlashMLA was built without kernels for this GPU")
                 raise
         sum(y.float().square().mean() for y in outputs).backward()
