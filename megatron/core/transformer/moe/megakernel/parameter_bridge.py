@@ -6,17 +6,40 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+# Uninitialized gradient-sentinel storage, one buffer per (shape, dtype, device).
+_DUMMY_WEIGHT_GRADIENT_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+
+def dummy_weight_gradient_buffer(param: nn.Parameter) -> torch.Tensor:
+    """Return the shared buffer that backs ``param``'s gradient sentinels.
+
+    Every parameter with the same shape, dtype and device shares one buffer, as in Transformer
+    Engine's ``get_dummy_wgrad``. Return ``buffer.detach()`` as the gradient, never the buffer
+    itself: AccumulateGrad steals only a gradient that nothing else references.
+    """
+    key = (param.shape, param.dtype, param.device)
+    buffer = _DUMMY_WEIGHT_GRADIENT_BUFFERS.get(key)
+    if buffer is None:
+        buffer = torch.empty(param.shape, dtype=param.dtype, device=param.device)
+        _DUMMY_WEIGHT_GRADIENT_BUFFERS[key] = buffer
+    return buffer
+
 
 def dummy_weight_gradient(param: nn.Parameter) -> torch.Tensor:
-    """Return a zero-allocation gradient sentinel that triggers MCore DDP hooks.
+    """Return a gradient sentinel that triggers MCore DDP hooks without a per-call allocation.
 
-    The detached tensor intentionally aliases the parameter storage; callers must
-    never read or mutate its values. This is safe only after the megakernel writes
-    the numerical gradient to ``main_grad`` and sets
-    ``grad_added_to_main_grad=True``. MCore's DDP hook then clears ``.grad``
-    without reading or accumulating this sentinel.
+    The sentinel is a fresh alias of :func:`dummy_weight_gradient_buffer`. It matches the
+    parameter's shape, nominal dtype and contiguous layout, so autograd neither casts nor copies
+    it, and AccumulateGrad steals it into ``.grad``. This also holds for Transformer Engine
+    quantized parameters, which TE's own fused-wgrad modules rely on. ``param.detach()`` would
+    allocate nothing either, but on a quantized parameter it builds a tensor subclass in Python,
+    and AccumulateGrad's steal builds a second one.
+
+    Callers must never read or mutate the values. This is safe only after the megakernel writes
+    the numerical gradient to ``main_grad`` and sets ``grad_added_to_main_grad=True``. MCore's DDP
+    hook then clears ``.grad`` without reading or accumulating this sentinel.
     """
-    return param.detach()
+    return dummy_weight_gradient_buffer(param).detach()
 
 
 def main_grad_buffer(param: nn.Parameter) -> torch.Tensor:
