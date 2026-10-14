@@ -791,8 +791,10 @@ class TopKRouter(Router):
                         device=activation.device
                     )
                 else:
-                    aux_loss_scale_num_tokens = torch.tensor(
-                        num_local_tokens, device=activation.device
+                    # Filled on device: torch.tensor would copy the count from host memory,
+                    # which a CUDA graph capturing the router cannot record.
+                    aux_loss_scale_num_tokens = torch.full(
+                        (), num_local_tokens, device=activation.device
                     )
                 if aux_loss_scale_reduce_groups is None:
                     assert reduce_group is not None, "reduce_group is required for aux-loss scaling"
