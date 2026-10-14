@@ -13,11 +13,13 @@ import pretrain_hybrid
 from megatron.core import mpu
 from megatron.core.context_parallel import get_batches_on_this_cp_rank
 from megatron.core.context_parallel.utils import (
+    ContextParallelBatch,
     _build_packed_seq_params,
     _get_batch_on_this_cp_rank_contiguous,
 )
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
     flatten_batch_for_packed_sequences,
@@ -59,7 +61,7 @@ def initialize_test_environment(
     args.pipeline_model_parallel_size = pp_size
     args.context_parallel_size = cp_size
     args.hybrid_context_parallel = hybrid_context_parallel
-    args.max_seqlen_per_cp_rank = max_seqlen_per_cp_rank
+    args.max_seqlen_per_dp_cp_rank = max_seqlen_per_cp_rank
     args.sft = sft
     args.micro_batch_size = micro_batch_size
     args.create_attention_mask_in_dataloader = create_attention_mask
@@ -1069,16 +1071,20 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     position_ids = torch.tensor([[0, 1]])
     padding_mask = torch.zeros(1, 2, dtype=torch.bool)
     packed_seq_params = PackedSeqParams(qkv_format="thd")
-    scheduler_batch = (
-        tokens,
-        labels,
-        loss_mask,
-        None,
-        position_ids,
-        packed_seq_params,
-        padding_mask,
+    scheduler_batch = ContextParallelBatch(
+        boundary_layout="zigzag",
+        batches_by_layout={
+            "zigzag": {
+                "tokens": tokens,
+                "labels": labels,
+                "loss_mask": loss_mask,
+                "position_ids": position_ids,
+                "padding_mask": padding_mask,
+            }
+        },
+        packed_seq_params_by_layout={"zigzag": packed_seq_params},
     )
-    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced")
+    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced", dynamic_context_parallel=False)
     config = SimpleNamespace(
         virtual_pipeline_model_parallel_size=None,
         pipeline_model_parallel_layout=None,
@@ -1094,10 +1100,14 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
             pretrain_hybrid,
             "get_batch_on_this_rank_for_sequence_packing",
             return_value=scheduler_batch,
-        ),
+        ) as fetch_batch,
     ):
-        cp_batch = get_batch(None)
+        pg_collection = ProcessGroupCollection(pp=object())
+        cp_batch = get_batch(None, pg_collection=pg_collection)
 
+    assert cp_batch is scheduler_batch
+    assert fetch_batch.call_args.kwargs["return_context_parallel_batch"]
+    assert fetch_batch.call_args.kwargs["pg_collection"] is pg_collection
     assert set(cp_batch.batches_by_layout) == {"zigzag"}
     assert cp_batch.get_packed_seq_params() is packed_seq_params
     batch = cp_batch.get_batch()
@@ -1300,6 +1310,7 @@ def test_pretrain_batch(
 
 
 def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
+    """Create a scheduled packed batch for the standard dynamic-CP fetch path."""
     # Pack n_seqs equal-length sequences; total length must be divisible by 2 * cp_size for CP splitting
     n_seqs = max(2, 2 * cp_size)
     align = max(1, 2 * cp_size)
@@ -1344,7 +1355,8 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
     if cp_size > 1:
         batch["cu_seqlens_padded"] = cu_seqlens.clone()
 
-    return iter([batch])
+    # The standard scheduler emits flat CUDA tensors before TP broadcast and CP slicing.
+    return iter([{key: value.reshape(-1).cuda() for key, value in batch.items()}])
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
