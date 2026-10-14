@@ -54,6 +54,309 @@ HAVE_GDP_DEPS = all(
 )
 
 
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize(
+    "precision,use_op_fuser",
+    [("bf16", False), ("bf16", True), ("mxfp8", False), ("mxfp8", True)],
+    ids=["bf16-module", "bf16-op-fuser", "mxfp8-module", "mxfp8-op-fuser"],
+)
+def test_glu_checkpoint_mxfp8_gtp_param_gather_resume(
+    tmp_path_dist_ckpt, monkeypatch, precision, use_op_fuser
+):
+    """EGTP2 x DP2, native MXFP8, real grad-buffer reuse and Adam checkpoint resume."""
+    import sys
+
+    from megatron.core import dist_checkpointing
+    from megatron.core.enums import ModelType
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+    from megatron.training import checkpointing
+    from megatron.training.global_vars import set_args
+    from megatron.training.training import force_param_sync, setup_model_and_optimizer
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    if Utils.world_size != 4 or get_device_arch_version() < 10:
+        pytest.skip("Requires four Blackwell torchrun ranks")
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    harness = _FP8ParamHarness()
+    harness.setup_method(None)
+    harness.seq_length, harness.micro_batch_size = 128, 1
+    Utils.initialize_distributed()
+    native_fp8 = precision == "mxfp8"
+
+    def setup(directory, load, *, canonical_reference=False):
+        fuser = use_op_fuser and not canonical_reference
+        args = harness.create_test_args(
+            1,
+            "mxfp8" if native_fp8 else "delayed",
+            128,
+            1,
+            False,
+            native_fp8,
+            False,
+            fp8="e4m3" if native_fp8 else None,
+            use_distributed_optimizer=native_fp8,
+            num_layers=1,
+            padded_vocab_size=512,
+            hidden_size=128,
+            num_attention_heads=4,
+            ffn_hidden_size=256,
+            num_experts=2,
+            moe_grouped_gemm=True,
+            moe_single_grouped_weight=False,
+            moe_ffn_hidden_size=256,
+            moe_mlp_glu_interleave_size=None if canonical_reference else 32,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            tensor_parallel_num_weight_shards=1,
+            expert_tensor_parallel_num_weight_shards=2,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0.0,
+            use_transformer_engine_op_fuser=fuser,
+            overlap_param_gather=native_fp8,
+            overlap_grad_reduce=True,
+            global_batch_size=4,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            untie_embeddings_and_output_weights=True,
+            save=str(directory),
+            load=str(directory) if load else None,
+            ckpt_format="torch_dist",
+            async_save=False,
+            save_interval=1,
+            dist_ckpt_optim_fully_reshardable=True,
+            no_save_rng=True,
+            no_load_rng=True,
+            save_tokenizer_assets=False,
+        )
+        set_args(args)
+        torch.manual_seed(1234)
+        Utils.initialize_model_parallel(expert_gtp_remat_size=2)
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1" if fuser else "0")
+        model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        cfg = Utils.pretrain_config_from_global_args(args, "gpt")
+        model, optimizer, scheduler = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder,
+            harness.model_provider,
+            cfg_container=cfg,
+            pg_collection=pg,
+        )
+        experts = [m for m in model[0].modules() if isinstance(m, TEGroupedMLP)]
+        assert len(experts) == 1
+        assert experts[0]._with_fused_impl == fuser
+        assert pg.expt_gtp_remat.size() == 2 and pg.expt_dp.size() == 2
+        assert args.fp8_param_gather == native_fp8
+        assert args.reuse_grad_buf_for_mxfp8_param_ag == native_fp8
+        for linear in (experts[0].linear_fc1, experts[0].linear_fc2):
+            for i in range(2):
+                param = getattr(linear, f"weight{i}")
+                assert is_gtp_param(param)
+                assert is_mxfp8tensor(param) == native_fp8
+        # Reuse is an actual storage alias, not just an argument value.
+        buffers = model[0].buffers + model[0].expert_parallel_buffers
+        relevant = [b for b in buffers if any(is_gtp_param(p) for p in b.params)]
+        assert relevant
+        if native_fp8:
+            for buffer in relevant:
+                assert buffer.param_data is not None
+                assert (
+                    buffer.param_data.untyped_storage().data_ptr()
+                    == buffer.grad_data.untyped_storage().data_ptr()
+                )
+        if load:
+            assert args.iteration == 1
+        return args, model, optimizer, scheduler, experts[0]
+
+    def sync_parameters(model, optimizer):
+        if native_fp8:
+            force_param_sync(model, optimizer=optimizer)
+
+    def snapshot(model, optimizer):
+        result = {}
+        for name, param in model[0].named_parameters():
+            value = (
+                dequantize_gtp_native_fp8(param)
+                if is_gtp_param(param) and is_mxfp8tensor(param)
+                else dequantize_fp8_tensor(param) if is_mxfp8tensor(param) else param
+            )
+            result["model." + name] = value.detach().float().cpu().clone()
+            for attr in ("_rowwise_data", "_columnwise_data"):
+                data = getattr(param, attr, None)
+                if isinstance(data, torch.Tensor):
+                    result["codes." + name + attr] = data.detach().cpu().clone()
+        for child_id, child in enumerate(getattr(optimizer, "chained_optimizers", [optimizer])):
+            for group_id, group in enumerate(child.optimizer.param_groups):
+                for index, param in enumerate(group["params"]):
+                    prefix = f"optimizer.{child_id}.{group_id}.{index}."
+                    result[prefix + "master"] = param.detach().cpu().clone()
+                    for name, value in child.optimizer.state.get(param, {}).items():
+                        if isinstance(value, torch.Tensor):
+                            result[prefix + name] = value.detach().cpu().clone()
+        return result
+
+    def assert_equal(actual, expected):
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            torch.testing.assert_close(
+                actual[key], expected[key], rtol=0, atol=0, msg=lambda message: f"{key}: {message}"
+            )
+
+    def semantic_weights(experts):
+        values = []
+        for layer in ("linear_fc1", "linear_fc2"):
+            for i in range(2):
+                param = getattr(getattr(experts, layer), f"weight{i}")
+                local = dequantize_gtp_native_fp8(param) if native_fp8 else param.detach()
+                shards = [torch.empty_like(local) for _ in range(param.group.size())]
+                torch.distributed.all_gather(shards, local, group=param.group)
+                full = torch.cat(shards)
+                block = experts.config.moe_mlp_glu_interleave_size
+                if layer == "linear_fc1" and block is not None:
+                    gate = [
+                        r
+                        for start in range(0, full.shape[0], 2 * block)
+                        for r in range(start, start + block)
+                    ]
+                    full = full[gate + [r + block for r in gate]]
+                values.append(full.cpu())
+        return values
+
+    def train_trace(args, model, optimizer, experts):
+        """Compare execution in semantic channel order, independently of checkpoint mapping."""
+        trace = {"output": [], "input_grad": [], "parameter_grad": []}
+
+        def before_forward(module, inputs):
+            inputs[0].register_hook(
+                lambda grad: trace["input_grad"].append(grad.detach().float().cpu())
+            )
+
+        def after_forward(module, inputs, output):
+            trace["output"].append(output[0].detach().float().cpu())
+
+        before = experts.register_forward_pre_hook(before_forward)
+        after = experts.register_forward_hook(after_forward)
+        original_step = optimizer.step
+
+        def checked_step(*a, **kw):
+            # This is test-only gathering of gradients, after GTP/DP reduction.
+            # Production serialization itself performs no layout all-gather.
+            grads = []
+            for layer in ("linear_fc1", "linear_fc2"):
+                for i in range(2):
+                    param = getattr(getattr(experts, layer), f"weight{i}")
+                    local = param.main_grad.detach().contiguous()
+                    if native_fp8:
+                        # DistOpt reduce-scatter leaves only the DP-owned interval
+                        # valid. Reconstruct that interval before comparing gradients;
+                        # other main_grad bytes are not a full reduced parameter.
+                        reduced = torch.zeros_like(local)
+                        for child in optimizer.chained_optimizers:
+                            if param in child.model_param_gbuf_map:
+                                owned = child._get_model_param_range_map(param)["param"]
+                                reduced.view(-1)[owned.start : owned.end].copy_(
+                                    local.view(-1)[owned.start : owned.end]
+                                )
+                        torch.distributed.all_reduce(reduced, group=model[0].expt_dp_group)
+                        local = reduced
+                    shards = [torch.empty_like(local) for _ in range(param.group.size())]
+                    torch.distributed.all_gather(shards, local, group=param.group)
+                    full = torch.cat(shards)
+                    block = experts.config.moe_mlp_glu_interleave_size
+                    if layer == "linear_fc1" and block is not None:
+                        gate = [
+                            r
+                            for start in range(0, full.shape[0], 2 * block)
+                            for r in range(start, start + block)
+                        ]
+                        up = [r + block for r in gate]
+                        full = full[gate + up]
+                    grads.append(full.float().cpu().flatten())
+            trace["parameter_grad"].append(torch.cat(grads))
+            return original_step(*a, **kw)
+
+        optimizer.step = checked_step
+        try:
+            harness.run_train_steps(args, model, optimizer, 2)
+        finally:
+            optimizer.step = original_step
+            before.remove()
+            after.remove()
+        assert all(len(values) == 2 for values in trace.values())
+        return trace
+
+    try:
+        with TempNamedDir(tmp_path_dist_ckpt / "mxfp8_glu_resume", sync=True) as directory:
+            args, model, optimizer, scheduler, experts = setup(directory, False)
+            harness.run_train_steps(args, model, optimizer, 1)
+            sync_parameters(model, optimizer)
+            if use_op_fuser:
+                assert experts._fused_ops is not None
+            before_save = snapshot(model, optimizer)
+            canonical_saved_weights = semantic_weights(experts)
+            checkpointing.save_checkpoint(1, model, optimizer, scheduler, 0)
+            assert_equal(snapshot(model, optimizer), before_save)
+            checkpoint_dir = checkpointing.get_checkpoint_name(directory, 1, return_base_dir=True)
+            disk = dist_checkpointing.load_plain_tensors(checkpoint_dir)
+            fc1 = [k for k in disk if k.endswith("experts.linear_fc1.weight")]
+            assert len(fc1) >= 4  # model, master, and both Adam moments
+            assert any("exp_avg_sq" in k for k in fc1)
+            uninterrupted_trace = train_trace(args, model, optimizer, experts)
+            sync_parameters(model, optimizer)
+            uninterrupted = snapshot(model, optimizer)
+            del model, optimizer, scheduler, experts, disk
+            harness.cleanup_between_runs()
+            args, model, optimizer, scheduler, experts = setup(directory, True)
+            sync_parameters(model, optimizer)
+            assert_equal(snapshot(model, optimizer), before_save)
+            resumed_trace = train_trace(args, model, optimizer, experts)
+            sync_parameters(model, optimizer)
+            assert_equal(snapshot(model, optimizer), uninterrupted)
+            for key in uninterrupted_trace:
+                for expected, actual in zip(uninterrupted_trace[key], resumed_trace[key]):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            del model, optimizer, scheduler, experts
+            harness.cleanup_between_runs()
+            args, model, optimizer, scheduler, experts = setup(
+                directory, True, canonical_reference=True
+            )
+            sync_parameters(model, optimizer)
+            for actual, expected in zip(semantic_weights(experts), canonical_saved_weights):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            reference_trace = train_trace(args, model, optimizer, experts)
+            comparisons = []
+            gradient_sizes = [value.numel() for value in canonical_saved_weights]
+            for key in uninterrupted_trace:
+                for step, (expected, actual) in enumerate(
+                    zip(reference_trace[key], uninterrupted_trace[key])
+                ):
+                    error = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
+                    comparisons.append(
+                        (key, step, error.item(), actual.norm().item(), expected.norm().item())
+                    )
+                    if key == "parameter_grad":
+                        for i, (a, e) in enumerate(
+                            zip(actual.split(gradient_sizes), expected.split(gradient_sizes))
+                        ):
+                            comparisons.append(
+                                (
+                                    f"weight{i}",
+                                    step,
+                                    ((a - e).norm() / e.norm()).item(),
+                                    a.norm().item(),
+                                    e.norm().item(),
+                                )
+                            )
+            assert all(c[2] < (0.06 if native_fp8 else 0.015) for c in comparisons), str(
+                comparisons
+            )
+    finally:
+        harness.teardown_method(None)
+
+
 def _gdp_moe_test_args(overlap, *, num_weight_shards):
     """Return the shared real-GDP + grouped-MoE training configuration."""
 

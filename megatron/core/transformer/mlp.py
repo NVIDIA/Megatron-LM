@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
     ReplicaId,
     ShardedStateDict,
     ShardedTensorFactory,
@@ -457,16 +458,147 @@ class MLP(MegatronModule):
 
 
 # pylint: disable=missing-function-docstring
+def _swiglu_shard_row_ranges(start, end, num_rows, interleave_size):
+    """Map a runtime row interval to its two contiguous canonical channel intervals."""
+    assert num_rows % 2 == 0
+    half = num_rows // 2
+    if interleave_size is not None:
+        assert interleave_size > 0 and half % interleave_size == 0
+
+    def counts(x):
+        x = min(x, num_rows)
+        gate = (
+            min(x, half)
+            if interleave_size is None
+            else x // (2 * interleave_size) * interleave_size
+            + min(x % (2 * interleave_size), interleave_size)
+        )
+        return gate, x - gate
+
+    assert 0 <= start <= end
+    gate_start, up_start = counts(start)
+    gate_end, up_end = counts(end)
+    return (gate_start, gate_end), (up_start, up_end)
+
+
 def apply_swiglu_sharded_factory(
     original_sh_ten,
     sharded_offsets,
     singleton_local_shards: bool = False,
     tp_group: torch.distributed.ProcessGroup | None = None,
     dp_group: torch.distributed.ProcessGroup | None = None,
+    *,
+    glu_interleave_size: Optional[int] = None,
+    tp_local_rows: Optional[int] = None,
+    local_row_offset: int = 0,
 ):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
     # and `cat`s during loading
+
+    if tp_local_rows is not None:
+        # Routed experts supply the logical TP-local size before GTP padding. Their
+        # GTP shard can cut a GLU block, or contain only one semantic half/padding.
+        assert not getattr(original_sh_ten, "is_torch_fsdp2_param", False)
+        assert tp_group is not None
+        shape = original_sh_ten.local_shape
+        axis = len(sharded_offsets)
+        half = tp_local_rows // 2
+        tp_rank, tp_size = get_pg_rank(tp_group), get_pg_size(tp_group)
+        ranges = _swiglu_shard_row_ranges(
+            local_row_offset, local_row_offset + shape[0], tp_local_rows, glu_interleave_size
+        )
+        valid_rows = max(0, min(shape[0], tp_local_rows - local_row_offset))
+
+        def gate_mask(device):
+            rows = torch.arange(valid_rows, device=device) + local_row_offset
+            return (
+                rows < half
+                if glu_interleave_size is None
+                else rows.remainder(2 * glu_interleave_size) < glu_interleave_size
+            )
+
+        @torch.no_grad()
+        def build(key, tensor, replica_id, flattened_range):
+            if flattened_range is not None:
+                raise NotImplementedError(
+                    "GLU checkpointing requires complete per-parameter optimizer tensors"
+                )
+            # Factory data keeps the live Parameter identity for optimizer matching.
+            # Only the serialization payload is dequantized, never the live storage.
+            from megatron.core.fp8_utils import dequantize_fp8_tensor, is_float8tensor
+
+            if is_float8tensor(tensor):
+                from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+                if HAVE_GTP:
+                    from megatron.core.tensor_parallel.gtp_api import (
+                        dequantize_gtp_native_fp8,
+                        is_gtp_param,
+                    )
+
+                tensor = (
+                    dequantize_gtp_native_fp8(tensor)
+                    if HAVE_GTP and is_gtp_param(tensor)
+                    else dequantize_fp8_tensor(tensor)
+                )
+            assert tuple(tensor.shape) == shape
+            if not valid_rows:
+                # Carry only the dtype/device locally; no zero-length disk chunk or
+                # persistent padding. This also works for FP32 optimizer factories.
+                return {"empty": LocalNonpersistentObject(tensor.new_empty(0))}
+            mask = gate_mask(tensor.device)
+            parts = {}
+            for index, (name, (start, end)) in enumerate(zip(("gate", "up"), ranges)):
+                if start == end:
+                    continue
+                data = tensor[:valid_rows][mask if index == 0 else ~mask].contiguous()
+                global_shape = [1] * axis + list(shape)
+                global_offset = [0] * len(global_shape)
+                for dim, rank_offset, fragmentation in sharded_offsets:
+                    global_shape[dim] = fragmentation
+                    global_offset[dim] = rank_offset
+                global_shape[axis] = half * tp_size * (1 if singleton_local_shards else 2)
+                global_offset[axis] = tp_rank * half + start
+                if not singleton_local_shards:
+                    global_offset[axis] += index * half * tp_size
+                # The irregular DCP adapter expects data with the same rank as
+                # its global coordinates. Singleton views preserve the existing
+                # layer/expert dimensions and disk keys without changing storage.
+                data = data.reshape((1,) * axis + tuple(data.shape))
+                parts[name] = ShardedTensor(
+                    key=(key + ("_w" if index == 0 else "_v")) if singleton_local_shards else key,
+                    data=data,
+                    dtype=data.dtype,
+                    local_shape=tuple(data.shape),
+                    global_shape=tuple(global_shape),
+                    global_offset=tuple(global_offset),
+                    axis_fragmentations=None,
+                    replica_id=replica_id,
+                    prepend_axis_num=0,
+                )
+            return parts
+
+        @torch.no_grad()
+        def merge(parts):
+            prototype = next(iter(parts.values()))
+            result = prototype.new_zeros(shape)
+            mask = gate_mask(result.device)
+            for index, name in enumerate(("gate", "up")):
+                if name in parts:
+                    result[:valid_rows][mask if index == 0 else ~mask] = parts[name].reshape(
+                        -1, *shape[1:]
+                    )
+            return result
+
+        return ShardedTensorFactory(
+            original_sh_ten.key,
+            getattr(original_sh_ten.data, "_gtp_dequant_src", original_sh_ten.data),
+            build,
+            merge,
+            original_sh_ten.replica_id,
+            flattened_range=original_sh_ten.flattened_range,
+        )
 
     swiglu_shard_axis = 0
     prepend_axis_num = len(sharded_offsets)
