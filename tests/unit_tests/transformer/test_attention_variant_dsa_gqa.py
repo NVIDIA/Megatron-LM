@@ -12,10 +12,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec,
 )
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.dsa import (
-    fused_qk_topk_chunked,
-    fused_qk_topk_naive,
-)
+from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGQACoreAttention,
     DSGroupedSelfAttention,
@@ -557,7 +554,6 @@ def test_simplified_learned_k_dense_loss_matches_reference_and_is_detached():
         attention_scale,
         loss_coeff,
         False,
-        query_chunk_size=3,
         key_chunk_size=4,
         use_triton=False,
     )
@@ -591,9 +587,7 @@ def test_simplified_learned_k_sparse_min_memory_matches_reference():
     index_scores = _simplified_index_scores(q_index, k_index, indexer.softmax_scale)
     index_scores = index_scores + _causal_mask(seqlen, query.device)
     topk_indices = index_scores.topk(topk, dim=-1).indices.sort(dim=-1).values
-    reference_output = unfused_grouped_dsa_fn(
-        query, key, value, topk_indices, attention_scale, use_gather=True
-    )
+    reference_output = unfused_grouped_dsa_fn(query, key, value, topk_indices, attention_scale)
     reference_loss = compute_gqa_dsa_indexer_loss(
         index_scores,
         topk_indices,
@@ -621,7 +615,6 @@ def test_simplified_learned_k_sparse_min_memory_matches_reference():
         attention_scale,
         loss_coeff,
         False,
-        query_chunk_size=seqlen,
         key_chunk_size=seqlen,
         use_triton=False,
     )
@@ -656,7 +649,6 @@ def test_simplified_learned_k_sparse_min_memory_matches_reference():
         attention_scale,
         loss_coeff,
         False,
-        query_chunk_size=seqlen,
         key_chunk_size=seqlen,
         cache_routing=True,
         cache_indexer_k=True,
@@ -1033,176 +1025,6 @@ def test_unfused_grouped_dsa_fn_output_shape():
     assert output.dtype == query.dtype
 
 
-def test_unfused_grouped_dsa_fn_matches_dense_reference():
-    torch.manual_seed(123)
-
-    seqlen = 6
-    batch_size = 2
-    num_heads = 8
-    num_query_groups = 2
-    head_dim = 16
-    topk = 3
-
-    query = torch.randn(
-        seqlen, batch_size, num_heads, head_dim, dtype=torch.float32, requires_grad=True
-    )
-    key = torch.randn(
-        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
-    )
-    value = torch.randn(
-        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
-    )
-    topk_indices = _random_topk_indices(batch_size, seqlen, topk)
-    mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32)
-    mask[:, :, -1] = float("-inf")
-
-    sparse_output = unfused_grouped_dsa_fn(
-        query=query,
-        key=key,
-        value=value,
-        topk_indices=topk_indices,
-        softmax_scale=head_dim**-0.5,
-        mask=mask,
-        use_gather=True,
-    )
-    sparse_output.sum().backward()
-    sparse_grads = (query.grad.clone(), key.grad.clone(), value.grad.clone())
-
-    query.grad = None
-    key.grad = None
-    value.grad = None
-
-    dense_output = unfused_grouped_dsa_fn(
-        query=query,
-        key=key,
-        value=value,
-        topk_indices=topk_indices,
-        softmax_scale=head_dim**-0.5,
-        mask=mask,
-    )
-    dense_output.sum().backward()
-
-    torch.testing.assert_close(sparse_output, dense_output)
-    torch.testing.assert_close(query.grad, sparse_grads[0])
-    torch.testing.assert_close(key.grad, sparse_grads[1])
-    torch.testing.assert_close(value.grad, sparse_grads[2])
-
-
-def test_unfused_grouped_dsa_fn_gather_bool_mask_matches_dense_float_mask():
-    torch.manual_seed(123)
-
-    seqlen = 6
-    batch_size = 2
-    num_heads = 8
-    num_query_groups = 2
-    head_dim = 16
-    topk = 3
-
-    query = torch.randn(
-        seqlen, batch_size, num_heads, head_dim, dtype=torch.float32, requires_grad=True
-    )
-    key = torch.randn(
-        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
-    )
-    value = torch.randn(
-        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
-    )
-    topk_indices = _random_topk_indices(batch_size, seqlen, topk)
-    bool_mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.bool)
-    bool_mask[:, :, -1] = True
-    float_mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32).masked_fill(
-        bool_mask, float("-inf")
-    )
-
-    gather_output = unfused_grouped_dsa_fn(
-        query=query,
-        key=key,
-        value=value,
-        topk_indices=topk_indices,
-        softmax_scale=head_dim**-0.5,
-        mask=bool_mask,
-        use_gather=True,
-    )
-    gather_output.sum().backward()
-    gather_grads = (query.grad.clone(), key.grad.clone(), value.grad.clone())
-
-    query.grad = None
-    key.grad = None
-    value.grad = None
-
-    dense_output = unfused_grouped_dsa_fn(
-        query=query,
-        key=key,
-        value=value,
-        topk_indices=topk_indices,
-        softmax_scale=head_dim**-0.5,
-        mask=float_mask,
-    )
-    dense_output.sum().backward()
-
-    torch.testing.assert_close(gather_output, dense_output)
-    torch.testing.assert_close(query.grad, gather_grads[0])
-    torch.testing.assert_close(key.grad, gather_grads[1])
-    torch.testing.assert_close(value.grad, gather_grads[2])
-
-
-def test_unfused_grouped_dsa_fn_chunked_matches_unchunked():
-    torch.manual_seed(123)
-
-    seqlen = 6
-    batch_size = 2
-    num_heads = 8
-    num_query_groups = 2
-    head_dim = 16
-    topk = 3
-
-    query = torch.randn(
-        seqlen, batch_size, num_heads, head_dim, dtype=torch.float32, requires_grad=True
-    )
-    key = torch.randn(
-        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
-    )
-    value = torch.randn(
-        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
-    )
-    topk_indices = _random_topk_indices(batch_size, seqlen, topk)
-    mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32)
-    mask[:, :, -1] = float("-inf")
-
-    unchunked_output = unfused_grouped_dsa_fn(
-        query=query,
-        key=key,
-        value=value,
-        topk_indices=topk_indices,
-        softmax_scale=head_dim**-0.5,
-        mask=mask,
-        use_gather=True,
-    )
-    unchunked_output.sum().backward()
-    unchunked_grads = (query.grad.clone(), key.grad.clone(), value.grad.clone())
-
-    query.grad = None
-    key.grad = None
-    value.grad = None
-
-    chunked_output = unfused_grouped_dsa_fn(
-        query=query,
-        key=key,
-        value=value,
-        topk_indices=topk_indices,
-        softmax_scale=head_dim**-0.5,
-        mask=mask,
-        query_chunk_size=2,
-        use_gather=True,
-    )
-    chunked_output.sum().backward()
-
-    torch.testing.assert_close(chunked_output, unchunked_output)
-    torch.testing.assert_close(query.grad, unchunked_grads[0])
-    torch.testing.assert_close(key.grad, unchunked_grads[1])
-    torch.testing.assert_close(value.grad, unchunked_grads[2])
-
-
 def test_fused_qk_topk_naive_caps_topk_by_key_length():
     torch.manual_seed(123)
 
@@ -1214,37 +1036,6 @@ def test_fused_qk_topk_naive_caps_topk_by_key_length():
 
     assert topk_indices.shape == (1, 2, 4)
     assert torch.all((topk_indices >= 0) & (topk_indices < 5))
-
-
-def test_fused_qk_topk_chunked_matches_dense_reference():
-    torch.manual_seed(123)
-
-    seqlen_q = 7
-    seqlen_k = 9
-    batch_size = 2
-    num_index_heads = 4
-    head_dim = 8
-    topk = 3
-
-    q = torch.randn(seqlen_q, batch_size, num_index_heads, head_dim, dtype=torch.float32)
-    k = torch.randn(seqlen_k, batch_size, head_dim, dtype=torch.float32)
-    weights = torch.randn(seqlen_q, batch_size, num_index_heads, dtype=torch.float32)
-    mask = torch.zeros(batch_size, seqlen_q, seqlen_k, dtype=torch.float32)
-    mask[:, :, -1] = float("-inf")
-
-    dense_scores, dense_indices = fused_qk_topk_naive(
-        q=q, k=k, weights=weights, index_topk=topk, mask=mask
-    )
-    chunked_scores, chunked_indices = fused_qk_topk_chunked(
-        q=q, k=k, weights=weights, index_topk=topk, mask=mask, key_chunk_size=4
-    )
-
-    expected_chunked_scores = dense_scores.gather(-1, chunked_indices)
-    torch.testing.assert_close(chunked_scores, expected_chunked_scores)
-    torch.testing.assert_close(
-        torch.sort(chunked_scores, dim=-1).values,
-        torch.sort(dense_scores.gather(-1, dense_indices), dim=-1).values,
-    )
 
 
 def test_transformer_config_accepts_min_memory_sparse_forward_dense_loss():
