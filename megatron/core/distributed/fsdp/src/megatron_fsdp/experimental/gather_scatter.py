@@ -66,21 +66,17 @@ def gather(
     layout = source.layout
     rank_ranges = _get_sorted_rank_ranges(source)
     group = mesh.get_group()
-    owned_tensor_indices = [i for i, owner in tensor_to_owner.items() if owner == this_rank]
 
     # Build the P2P ops: send non-owned chunks to their owners, receive owned ones.
     ops: list[dist.P2POp] = []
     for i, owner_rank in tensor_to_owner.items():
-        # Don't send already local or empty chunks.
-        if (
-            owner_rank == this_rank
-            or intersect_ranges(layout.get_tensor_range(i), rank_ranges[this_rank]).numel == 0
-        ):
-            continue
-        chunk = source.get_tensor_view(i).flatten()
-        ops.append(dist.P2POp(dist.isend, chunk, peer=owner_rank, group=group))
-    for i in owned_tensor_indices:
         tensor_range = layout.get_tensor_range(i)
+        if owner_rank != this_rank:
+            if intersect_ranges(tensor_range, rank_ranges[this_rank]).numel > 0:
+                chunk = source.get_tensor_view(i).flatten()
+                ops.append(dist.P2POp(dist.isend, chunk, peer=owner_rank, group=group))
+            continue
+
         target = destination[i]
         if (
             not target.is_contiguous()
@@ -137,19 +133,17 @@ def scatter(
     layout = destination.layout
     rank_ranges = _get_sorted_rank_ranges(destination)
     group = mesh.get_group()
-    held_tensor_indices = [
-        i
-        for i, owner in tensor_to_owner.items()
-        if owner != this_rank
-        and intersect_ranges(layout.get_tensor_range(i), rank_ranges[this_rank]).numel > 0
-    ]
 
     # Build the P2P ops: send owned result chunks, receive the ones held here.
     ops: list[dist.P2POp] = []
     for i, owner in tensor_to_owner.items():
-        # Don't send local chunks.
+        tensor_range = layout.get_tensor_range(i)
         if owner != this_rank:
+            if intersect_ranges(tensor_range, rank_ranges[this_rank]).numel > 0:
+                chunk = destination.get_tensor_view(i).flatten()
+                ops.append(dist.P2POp(dist.irecv, chunk, peer=owner, group=group))
             continue
+
         tensor = source[i]
         if (
             not tensor.is_contiguous()
@@ -159,21 +153,18 @@ def scatter(
             raise ValueError(
                 f"source[{i}] must be contiguous and match the destination's dtype and device."
             )
-        flat = tensor.view(layout.get_tensor_range(i).numel)
+        flat = tensor.view(tensor_range.numel)
         for dest in rank_ranges:
             if dest == this_rank:
                 continue
-            shard_range = intersect_ranges(layout.get_tensor_range(i), rank_ranges[dest])
+            shard_range = intersect_ranges(tensor_range, rank_ranges[dest])
             numel = shard_range.numel
-            offset = shard_range.start - layout.tensor_to_offset[i]
+            offset = shard_range.start - tensor_range.start
             if numel == 0:
                 continue
             ops.append(
                 dist.P2POp(dist.isend, flat[offset : offset + numel], peer=dest, group=group)
             )
-    for i in held_tensor_indices:
-        chunk = destination.get_tensor_view(i).flatten()
-        ops.append(dist.P2POp(dist.irecv, chunk, peer=tensor_to_owner[i], group=group))
 
     works = dist.batch_isend_irecv(ops) if ops else []
     for work in works:
