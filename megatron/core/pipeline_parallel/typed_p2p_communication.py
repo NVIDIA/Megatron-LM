@@ -406,8 +406,14 @@ class TypedP2PCommunicator(P2PCommunicator):
             # before releasing its buffers. Prepared plans post all receives,
             # so waiting the complete batch cannot block header discovery.
             requests = dist.batch_isend_irecv(ops)
-            for handle in dict.fromkeys(owners):
-                handle._requests.extend(requests)
+            if len(requests) == len(owners):
+                # Gloo returns one Work per operation. Its P2P completion is
+                # consumed by wait(), so do not wait it again from another direction.
+                for request, handle in zip(requests, owners):
+                    handle._requests.append(request)
+            else:
+                for handle in dict.fromkeys(owners):
+                    handle._requests.extend(requests)
         if overlap:
             return handles
         for handle in handles.values():
