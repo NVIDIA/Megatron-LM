@@ -502,6 +502,63 @@ class TestDynamicCPRouterDistributed:
         torch.testing.assert_close(aux_source.grad, expected_grad)
 
 
+class TestPerTokenAuxLossCudaGraph:
+    """Per-token aux-loss scaling must stay capturable: per-layer CUDA graphs capture the router."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+    def teardown_method(self, method):
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    # aux_loss passes its already-reduced token count; these two build the count from the local
+    # token dimension.
+    @pytest.mark.parametrize("load_balancing_type", ["seq_aux_loss", "global_aux_loss"])
+    def test_router_forward_is_capturable(self, load_balancing_type):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type=load_balancing_type,
+            moe_router_topk=2,
+            moe_aux_loss_coeff=1.0,
+            calculate_per_token_loss=True,
+            add_bias_linear=False,
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+        router = cast(TopKRouter, MoELayer(config, submodules).router).cuda().train()
+        hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda")
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(2):
+                router(hidden_states)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
+
+        # Without padding the aux-loss token count is a Python int from the static token
+        # dimension. Building it with a host-to-device copy fails during capture.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            probs, routing_map = router(hidden_states)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        num_tokens = hidden_states.shape[0] * hidden_states.shape[1]
+        assert torch.isfinite(probs).all()
+        assert routing_map.sum().item() == num_tokens * config.moe_router_topk
+
+
 class TestTop2Router:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
