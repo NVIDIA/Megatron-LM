@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from typing import Dict, List, Tuple
 
 from ..logger import PELogger
@@ -79,8 +80,8 @@ class CommunicationScheduler:
             for i, _ in enumerate(groups):
                 local_batches.append((my_pe, dest_pe, i))  # (src, dest, batch_idx)
 
-        PELogger.debug(f"  Local batch count: {len(local_batches)}")
-        PELogger.debug(f"  Local batches: {local_batches}")
+        PELogger.debug("  Local batch count: %s", len(local_batches))
+        PELogger.debug("  Local batches: %s", local_batches)
 
         # Gather all batches from all PEs using torch.distributed
         all_batches_list: List[List[Tuple[int, int, int]] | None] = [None] * n_pes
@@ -96,14 +97,17 @@ class CommunicationScheduler:
                     ScheduledBatch(src_pe=src, dest_pe=dest, batch_index=idx, iteration=-1)
                 )
 
-        PELogger.debug(f"  Global batches collected: {len(global_batches)} total")
+        PELogger.debug("  Global batches collected: %s total", len(global_batches))
 
         # Group by source for readability
-        batches_by_src: Dict[int, List[Tuple[int, int]]] = {}
-        for b in global_batches:
-            batches_by_src.setdefault(b.src_pe, []).append((b.dest_pe, b.batch_index))
-        for src_pe in sorted(batches_by_src.keys()):
-            PELogger.debug(f"    PE {src_pe} sends to: {batches_by_src[src_pe]}")
+        if PELogger.is_enabled_for(logging.DEBUG):
+            batches_by_src: Dict[int, List[Tuple[int, int]]] = {}
+            for batch in global_batches:
+                batches_by_src.setdefault(batch.src_pe, []).append(
+                    (batch.dest_pe, batch.batch_index)
+                )
+            for src_pe in sorted(batches_by_src):
+                PELogger.debug("    PE %s sends to: %s", src_pe, batches_by_src[src_pe])
 
         return global_batches
 
