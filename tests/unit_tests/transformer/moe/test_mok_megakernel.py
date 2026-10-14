@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import operator
 import sys
 import types
 from contextlib import contextmanager, nullcontext
@@ -44,11 +45,8 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
 
     assert output is hidden and bias is None
     layer.route.assert_called_once_with(hidden, padding_mask, input_ids, packed_seq_params=packed)
-    layer.megakernel_experts.forward.assert_called_once()
-    backend_hidden, backend_probs, backend_routes = layer.megakernel_experts.forward.call_args.args
-    assert backend_hidden is hidden
-    # The backend receives copies with the padding routes dropped; no token here is padding.
-    assert torch.equal(backend_probs, probs) and torch.equal(backend_routes, routes)
+    # The backend drops the padding routes itself, from the batch-first mask.
+    layer.megakernel_experts.forward.assert_called_once_with(hidden, probs, routes, padding_mask)
     assert checkpoint.call_count == int(recompute)
 
 
@@ -210,6 +208,7 @@ def test_aliased_parameter_metadata_survives_dtype_conversion():
         "_routed_parameter_cache",
         "_routed_dummy_gradient_buffers",
         "_main_grad_arguments_cache",
+        "_shared_fc1_gate_up_cache",
     )
     for name in derived_state:
         setattr(backend, name, object())
@@ -528,6 +527,7 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped, gated):
         "_routed_parameter_cache",
         "_routed_dummy_gradient_buffers",
         "_main_grad_arguments_cache",
+        "_shared_fc1_gate_up_cache",
     )
     for name in derived_state:
         setattr(mok, name, object())
@@ -757,6 +757,67 @@ def test_main_grad_arguments_are_reused_until_a_main_grad_changes(monkeypatch):
         module.main_grad_arguments()
 
 
+def test_mok_main_grad_arguments_are_cached_in_mok_gate_up_order(monkeypatch):
+    module, _, tables = _split_module_with_main_grads(monkeypatch)
+
+    first = module.mok_main_grad_arguments()
+    # MOK validates its main grads once per tensor object, so repeated calls reuse every view.
+    assert module.mok_main_grad_arguments() is first
+    main_grads, storage_tables = first
+    expected, expected_tables = mok_runtime._gate_up_main_grad_arguments(
+        *module.main_grad_arguments(), module.intermediate_size
+    )
+    for actual, reference in zip(main_grads, expected, strict=True):
+        assert actual.data_ptr() == reference.data_ptr() and actual.shape == reference.shape
+    assert storage_tables == expected_tables and len(tables) == 2
+
+    # A replaced main_grad rebuilds the MOK-order arguments together with the logical ones.
+    module.shared_fc1_weight.main_grad = torch.zeros_like(module.shared_fc1_weight.main_grad)
+    second = module.mok_main_grad_arguments()
+    assert second is not first
+    assert second[0][0].data_ptr() == module.shared_fc1_weight.main_grad.data_ptr()
+    assert module.mok_main_grad_arguments() is second
+
+
+def test_shared_fc1_gate_up_views_are_reused_until_the_weight_storage_changes(monkeypatch):
+    module, _, _ = _split_module_with_main_grads(monkeypatch)
+    shared_fc1 = module.shared_fc1_weight
+
+    first = module.shared_fc1_gate_up()
+    assert module.shared_fc1_gate_up() is first
+    shared_gate, shared_up = first
+    torch.testing.assert_close(shared_gate, shared_fc1[:4], rtol=0, atol=0)
+    torch.testing.assert_close(shared_up, shared_fc1[4:], rtol=0, atol=0)
+    assert shared_gate.data_ptr() == shared_fc1.data_ptr()
+    assert shared_gate.grad_fn is None and not shared_gate.requires_grad
+
+    # In-place updates (the optimizer step) keep the views; new storage (DDP's buffer
+    # re-pointing) and derived-state resets rebuild them.
+    with torch.no_grad():
+        shared_fc1.add_(1.0)
+    assert module.shared_fc1_gate_up() is first
+    torch.testing.assert_close(first[1], shared_fc1[4:], rtol=0, atol=0)
+    shared_fc1.data = torch.randn_like(shared_fc1)
+    second = module.shared_fc1_gate_up()
+    assert second is not first and second[0].data_ptr() == shared_fc1.data_ptr()
+    module._reset_derived_state()
+    assert module.shared_fc1_gate_up() is not second
+
+
+def test_backward_options_follow_the_installed_mok_signature():
+    def legacy_backward(*args, shared_output_gate_weight=None, **kwargs):
+        del args, shared_output_gate_weight, kwargs
+
+    def backward(*args, zero_unrouted_router_grads=True, **kwargs):
+        del args, zero_unrouted_router_grads, kwargs
+
+    assert mok_runtime._backward_options(legacy_backward) == {}
+    options = mok_runtime._backward_options(backward)
+    # The route adapter reads router-weight gradients only at routed slots.
+    assert options == {"zero_unrouted_router_grads": False}
+    assert mok_runtime._backward_options(backward) is options
+
+
 def test_mok_autograd_saves_only_backward_inputs_and_grads_every_routed_parameter(monkeypatch):
     module, fake_mok, _ = _split_module_with_main_grads(monkeypatch)
     module.mok_config = object()
@@ -975,6 +1036,39 @@ def test_gate_autograd_accumulation_and_ddp_hooks(
             handle.remove()
     assert waited == ([bucket] * 3 if gated else [])
     assert ready == ([(gate, False)] * 3 if gated else [])
+
+
+def test_runtime_passes_supported_backward_options(monkeypatch):
+    module, _, functional = _mock_backend(monkeypatch, gated=False)
+    for parameter in module.parameters():
+        parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
+    view = object()
+    monkeypatch.setattr(module, "quantized_routed_weights", lambda: (view, view))
+    functional.get_workspace = functional.build_schedule = lambda *args, **kwargs: object()
+    seen = []
+
+    def forward(config, workspace, schedule, x, router_weights, *weights, swiglu_limit):
+        # Cached shared views and the same combined routed FC1 payload for gate and up.
+        assert all(map(operator.is_, weights[:2], module.shared_fc1_gate_up()))
+        assert weights[3] is weights[4] is view
+        return x.clone(), object()
+
+    def backward(*args, zero_unrouted_router_grads=True, **kwargs):
+        seen.append(zero_unrouted_router_grads)
+        assert kwargs["main_grads"] is module.mok_main_grad_arguments()[0]
+        return (torch.ones_like(args[5]), torch.ones_like(args[6])) + (None,) * 7
+
+    functional.forward = forward
+    functional.backward = backward
+    x = torch.zeros((4, 8), dtype=torch.bfloat16, requires_grad=True)
+    probs = torch.zeros((4, 2), dtype=torch.float32, requires_grad=True)
+    experts = torch.zeros((4, 2), dtype=torch.int32)
+    monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
+
+    module(x, probs, experts).sum().backward()
+
+    assert seen == [False]
+    torch.testing.assert_close(probs.grad, torch.ones_like(probs))
 
 
 def test_runtime_requires_output_gate_main_grad(monkeypatch):

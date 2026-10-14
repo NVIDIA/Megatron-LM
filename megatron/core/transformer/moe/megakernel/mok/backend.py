@@ -11,7 +11,7 @@ from __future__ import annotations
 import operator
 from dataclasses import dataclass
 from types import MethodType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import nn
@@ -19,7 +19,11 @@ from torch.distributed import ProcessGroup
 
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
-from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
+from megatron.core.transformer.moe.megakernel.mok.runtime import (
+    _gate_up_main_grad_arguments,
+    _gate_up_weight_arguments,
+    _MoKAutograd,
+)
 from megatron.core.transformer.moe.megakernel.mok.weights import (
     _native_single_grouped_weight_view,
     _native_split_weight_view,
@@ -46,6 +50,8 @@ class _MainGradArguments:
     main_grads: tuple[torch.Tensor, ...]
     data_ptrs: tuple[int, ...]
     arguments: tuple
+    # ``arguments`` in MOK's six-buffer gate/up order (see _gate_up_main_grad_arguments).
+    mok_arguments: tuple
 
     def is_current(self) -> bool:
         """Return whether every parameter still owns the same ``main_grad`` at the same address."""
@@ -171,6 +177,7 @@ class MoKMegakernel(MegakernelBackend):
         self._routed_parameter_cache = None
         self._routed_dummy_gradient_buffers = None
         self._main_grad_arguments_cache = None
+        self._shared_fc1_gate_up_cache = None
 
     def _routed_parameter_groups(self) -> tuple[tuple[nn.Parameter, ...], ...]:
         """Return the (FC1, FC2, FC1 + FC2) routed parameter aliases, resolved once."""
@@ -208,9 +215,20 @@ class MoKMegakernel(MegakernelBackend):
         until a parameter's ``main_grad`` is replaced or its storage moves (for example, a
         grad-buffer offload and reload).
         """
+        return self._current_main_grad_arguments().arguments
+
+    def mok_main_grad_arguments(self):
+        """Return ``main_grad_arguments()`` in MOK's six-buffer gate/up order.
+
+        The shared FC1 gate/up views are cached with the arguments, so MOK receives the same
+        tensor objects on every call and validates them only once.
+        """
+        return self._current_main_grad_arguments().mok_arguments
+
+    def _current_main_grad_arguments(self) -> _MainGradArguments:
         cached = self._main_grad_arguments_cache
         if cached is not None and cached.is_current():
-            return cached.arguments
+            return cached
 
         routed = self.autograd_routed_parameters
         parameters = (self.shared_fc1_weight, self.shared_fc2_weight, *routed)
@@ -227,13 +245,30 @@ class MoKMegakernel(MegakernelBackend):
             fc1_table = ops.make_routed_d_weight_storage_table(list(fc1_main_grads))
             fc2_table = ops.make_routed_d_weight_storage_table(list(fc2_main_grads))
             arguments = (logical_main_grads, (fc1_table, fc2_table))
-        self._main_grad_arguments_cache = _MainGradArguments(
+        cached = _MainGradArguments(
             parameters=parameters,
             main_grads=main_grads,
             data_ptrs=tuple(grad.data_ptr() for grad in main_grads),
             arguments=arguments,
+            mok_arguments=_gate_up_main_grad_arguments(*arguments, self.intermediate_size),
         )
-        return arguments
+        self._main_grad_arguments_cache = cached
+        return cached
+
+    def shared_fc1_gate_up(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the gate and up row views of the shared FC1 weight.
+
+        The views are reused until the parameter or its storage changes, so MOK receives the same
+        tensor objects on every call and validates them only once.
+        """
+        shared_fc1 = self.shared_fc1_weight
+        cached = self._shared_fc1_gate_up_cache
+        if cached is not None and cached[0] is shared_fc1 and cached[1] == shared_fc1.data_ptr():
+            return cached[2]
+        # Views of a detached alias: kernel arguments only, outside any autograd graph.
+        views = _gate_up_weight_arguments(shared_fc1.detach(), None, self.intermediate_size)[:2]
+        self._shared_fc1_gate_up_cache = (shared_fc1, shared_fc1.data_ptr(), views)
+        return views
 
     def finish_routed_weight_gradients(self) -> tuple[torch.Tensor, ...]:
         """Finalize and return routed weight gradients.
@@ -256,6 +291,7 @@ class MoKMegakernel(MegakernelBackend):
         self._routed_parameter_cache = None
         self._routed_dummy_gradient_buffers = None
         self._main_grad_arguments_cache = None
+        self._shared_fc1_gate_up_cache = None
         self.is_first_microbatch = True
 
     @torch.no_grad()
@@ -422,7 +458,11 @@ class MoKMegakernel(MegakernelBackend):
         return out
 
     def forward(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the fused MoE megakernel (dispatch, routed/shared experts, combine).
 
@@ -430,6 +470,9 @@ class MoKMegakernel(MegakernelBackend):
             hidden_states: Input activations of shape ``[..., hidden_size]``.
             probs: Router probabilities, flattened to ``[num_tokens, num_experts]``.
             routing_map: Token-to-expert routing map matching ``probs``.
+            padding_mask: Optional batch-first ``[bsz, seq_length]`` mask of the sequence-first
+                tokens, True for padding. Padding tokens get no routes, like dropless HybridEP:
+                MOK skips them and their routed output is zero.
 
         Returns:
             MoE output with the same shape as ``hidden_states``.
@@ -440,8 +483,11 @@ class MoKMegakernel(MegakernelBackend):
         routing_map = routing_map.reshape(x.shape[0], -1)
 
         # Compact the authoritative route set directly into MOK's fixed [tokens, K]
-        # representation. Missing routes are encoded as expert -1 with zero weight.
-        router_weights, top_experts = routing_map_to_mok_inputs(probs, routing_map, self.topk)
+        # representation. Missing routes, including all routes of padding tokens, are
+        # encoded as expert -1 with zero weight.
+        router_weights, top_experts = routing_map_to_mok_inputs(
+            probs, routing_map, self.topk, padding_mask
+        )
 
         output = _MoKAutograd.apply(
             self,

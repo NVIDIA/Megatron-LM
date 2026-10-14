@@ -9,6 +9,7 @@ import torch
 from megatron.core import config
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
+from megatron.core.transformer.moe.moe_utils import drop_padding_routes
 
 
 class PytorchIndicesToMultihot:
@@ -125,3 +126,76 @@ class TestRoutingMapToIndices:
         (weights * grad).sum().backward()
         (expected_weights * grad).sum().backward()
         torch.testing.assert_close(probs.grad, probs_reference.grad, rtol=0, atol=0)
+
+    @pytest.mark.experimental
+    @pytest.mark.parametrize(
+        ("seq_length", "batch_size", "num_experts", "topk", "mask_layout"),
+        [
+            (4096, 1, 64, 10, "bool"),
+            (512, 4, 256, 8, "bool"),
+            (37, 3, 31, 6, "int"),
+            (64, 2, 8, 2, "strided"),
+        ],
+    )
+    def test_padding_mask_matches_drop_padding_routes(
+        self, seq_length, batch_size, num_experts, topk, mask_layout
+    ):
+        generator = torch.Generator(device="cuda").manual_seed(1234)
+        num_tokens = seq_length * batch_size
+        scores = torch.rand((num_tokens, num_experts), device="cuda", generator=generator)
+        routing_map = torch.zeros_like(scores, dtype=torch.bool)
+        routing_map.scatter_(1, scores.topk(topk, dim=1).indices, True)
+        routing_map[::3] &= scores[::3] > 0.5  # Some tokens keep fewer than topk routes.
+        probs = torch.rand(
+            (num_tokens, num_experts), device="cuda", generator=generator, requires_grad=True
+        )
+        probs_reference = probs.detach().clone().requires_grad_(True)
+        padding_mask = (
+            torch.rand((batch_size, seq_length), device="cuda", generator=generator) < 0.6
+        )
+        mask_argument = {
+            "bool": padding_mask,
+            "int": padding_mask.int(),
+            "strided": padding_mask.t().contiguous().t(),
+        }[mask_layout]
+
+        weights, indices = routing_map_to_mok_inputs(probs, routing_map, topk, mask_argument)
+        expected_weights, expected_indices = routing_map_to_mok_inputs(
+            *drop_padding_routes(probs_reference, routing_map, padding_mask), topk
+        )
+
+        torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
+        torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+        # Tokens flatten sequence-first: token s * batch_size + b is padding[b, s].
+        padding_rows = padding_mask.t().reshape(-1)
+        assert padding_rows.any() and (~padding_rows).any()
+        assert (indices[padding_rows] == -1).all() and (weights[padding_rows] == 0).all()
+        grad = torch.randn_like(weights)
+        torch.autograd.backward(weights, grad)
+        torch.autograd.backward(expected_weights, grad)
+        torch.testing.assert_close(probs.grad, probs_reference.grad, rtol=0, atol=0)
+
+    @pytest.mark.experimental
+    def test_padding_mask_must_cover_every_token(self):
+        probs = torch.rand((12, 8), device="cuda")
+        routing_map = probs > 0.5
+        with pytest.raises(ValueError, match="one entry per token"):
+            routing_map_to_mok_inputs(probs, routing_map, 2, torch.zeros((2, 5), dtype=torch.bool))
+
+    @pytest.mark.experimental
+    def test_backward_does_not_materialize_the_indices_gradient(self):
+        num_tokens, num_experts, topk = 256, 16, 4
+        probs = torch.rand((num_tokens, num_experts), device="cuda", requires_grad=True)
+        routing_map = torch.zeros((num_tokens, num_experts), dtype=torch.bool, device="cuda")
+        routing_map[:, :topk] = True
+        weights, _ = routing_map_to_mok_inputs(probs, routing_map, topk)
+        grad = torch.randn_like(weights)
+
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
+            torch.autograd.backward(weights, grad)
+
+        # The integer indices output has no gradient, so autograd creates no zeros for it.
+        names = {event.name for event in profiler.events()}
+        assert not names & {"aten::zeros", "aten::zeros_like"}, sorted(names)
+        torch.testing.assert_close(probs.grad[:, :topk], grad, rtol=0, atol=0)
+        assert not probs.grad[:, topk:].any()

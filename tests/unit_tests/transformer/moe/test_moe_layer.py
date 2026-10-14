@@ -15,6 +15,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import _set_capture_end, _set_capture_start
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.moe_utils import drop_padding_routes
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -24,13 +25,15 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class _RecordingMegakernel(torch.nn.Module):
-    """Megakernel backend stand-in that records the routes it receives."""
+    """Megakernel backend stand-in that records the routes it computes: padding tokens dropped."""
 
     def __init__(self):
         super().__init__()
         self.routes = []
 
-    def forward(self, hidden_states, probs, routing_map):
+    def forward(self, hidden_states, probs, routing_map, padding_mask=None):
+        if padding_mask is not None:
+            probs, routing_map = drop_padding_routes(probs, routing_map, padding_mask)
         self.routes.append((probs.detach().clone(), routing_map.clone()))
         return hidden_states * 2
 
@@ -130,13 +133,8 @@ class TestMoELayerInit:
             assert router_forward.call_args.args[0] is hidden
             torch.testing.assert_close(router_forward.call_args.args[1], padding_mask.T.bool())
             assert router_forward.call_args.kwargs["input_ids"] is input_ids
-            backend_forward.assert_called_once()
-            backend_hidden, backend_probs, backend_routing_map = backend_forward.call_args.args
-            assert backend_hidden is hidden
-            # Tokens flatten sequence-first, so the padded tokens are rows 3, 4 and 5.
-            valid = torch.tensor([[True], [True], [True], [False], [False], [False]])
-            torch.testing.assert_close(backend_probs, probs * valid)
-            torch.testing.assert_close(backend_routing_map, routing_map & valid)
+            # The backend drops the padding routes itself, from the batch-first mask.
+            backend_forward.assert_called_once_with(hidden, probs, routing_map, padding_mask)
         finally:
             Utils.destroy_model_parallel()
 
