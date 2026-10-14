@@ -233,6 +233,12 @@ class FileSystemWriterAsync(FileSystemWriter):
                 save in a checkpoint.
             non_blocking (bool, optional): knob to enable pinned D2H memcpy. Default is True.
         """
+        if non_blocking and getattr(torch.version, "hip", None):
+            # On ROCm, staging through pinned host memory (non_blocking=True) and then
+            # forking the async checkpoint writer process triggers a segmentation fault,
+            # so stage through pageable memory instead.
+            logger.debug("ROCm detected: forcing blocking D2H staging in preload_tensors")
+            non_blocking = False
         result = []
 
         for bucket in write_buckets:
