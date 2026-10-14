@@ -16,9 +16,12 @@ Gradient copy from GPU to CPU, CPU optimizer step, and subsequent parameter copy
 
 `--chunked-optimizer-state-offload` keeps a configurable fraction of optimizer tensor state and
 master weights in pinned CPU memory between updates, while the optimizer update itself still runs
-on GPU. Tensor state is restored and updated in bounded parameter chunks. All selected master
-weights use one full restore window and remain on CUDA across every state chunk during an update or
-distributed-checkpoint state initialization.
+on GPU. Tensor state is restored and updated in bounded parameter chunks. A master the optimizer
+owns, precision-aware FusedAdam's `state['master_param']` (an fp32 copy or the int16 remainder of a
+BF16 parameter), is part of that tensor state: only the optimizer's own update reads it, so it is
+staged, updated and copied back with its chunk. MCore-owned master weights, which MCore's
+main-to-model copies read after the update, use one full restore window and remain on CUDA across
+every state chunk during an update or distributed-checkpoint state initialization.
 
 ```bash
 --chunked-optimizer-state-offload
@@ -29,11 +32,12 @@ distributed-checkpoint state initialization.
 
 A chunk size of `0` restores all selected tensor state for one update and therefore does not bound
 the temporary tensor-state peak; argument validation emits a warning for this setting. A positive
-size bounds that tensor-state window, but never the full selected master-weight window described
-above. The fraction is an approximate byte fraction because a parameter and all of its optimizer
-state are an atomic bundle. Partial selection prioritizes bundles that actually include a separate
-master before state-only bundles; precision-aware FusedAdam can own a separate master for native
-FP32 DistributedOptimizer shards too.
+size bounds that tensor-state window, optimizer-owned masters included, but never the full
+MCore-owned master-weight window described above. The fraction is an approximate byte fraction
+because a parameter and all of its optimizer state are an atomic bundle. Partial selection
+prioritizes bundles that actually include a separate master before state-only bundles;
+precision-aware FusedAdam can own a separate master for native FP32 DistributedOptimizer shards
+too.
 Supported paths are Adam with `DistributedOptimizer`, and BF16 Muon with compact-layout
 `LayerWiseDistributedOptimizer`; BF16 and FP8 parameter gather are supported. Full-iteration and
 optimizer CUDA graphs are not supported while the fraction is nonzero. When optimizer state is
