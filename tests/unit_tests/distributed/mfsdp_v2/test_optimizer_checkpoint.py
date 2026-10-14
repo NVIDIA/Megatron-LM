@@ -281,9 +281,7 @@ class TestOptimizerCheckpoint:
         a dropped or mis-serialized ``step`` (and the stale momentum that comes with it)
         fails the comparison instead of matching by construction.
 
-        With >=2 ranks this also covers the empty-local placeholder path: under TE < 2.18
-        MFSDP v2 filters empty-local shards out of the base optimizer per rank, so the
-        placeholders are what keep the DTensor keyspace identical across ranks.
+        With >=2 ranks this also covers checkpointing zero-sized local shards.
 
         ``precision_aware`` keeps the optimizer state in bf16 rather than fp32, which is how
         ``test_mcore_adapter.py`` trains MFSDP v2. It changes the state tensors' dtype but not
@@ -305,10 +303,7 @@ class TestOptimizerCheckpoint:
         assert {group["step"] for group in param_group_snapshot} == {source_steps}
 
         if world_size > 1:
-            # Confirm the placeholder path is not vacuous: at least one rank must own an
-            # empty local shard, which is what the TE < 2.18 filter drops from its optimizer.
-            # Count empty local shards directly, which is that exact condition, over the
-            # trainable parameters, which are the only ones the optimizer is ever given.
+            # Ensure the round trip exercises zero-sized local shards.
             empty_local = sum(
                 1
                 for param in source_model.parameters()
@@ -319,7 +314,7 @@ class TestOptimizerCheckpoint:
             empty_local_counts = [None] * world_size
             torch.distributed.all_gather_object(empty_local_counts, empty_local)
             assert any(empty_local_counts), (
-                "No rank had an empty local shard, so the placeholder path is untested for "
+                "No rank had an empty local shard, so empty-shard checkpointing is untested for "
                 f"this config. empty_local_counts={empty_local_counts}"
             )
 

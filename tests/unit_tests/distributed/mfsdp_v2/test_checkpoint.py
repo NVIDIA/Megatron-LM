@@ -484,11 +484,7 @@ def test_metadata_attach_issues_no_collectives(
 
 
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
-@pytest.mark.parametrize("precision_aware", [False, True], ids=["fp32_state", "bf16_state"])
-@pytest.mark.parametrize("drop_empty_shards", [False, True], ids=["all_shards", "nonempty_only"])
-def test_ep_fsdp_checkpoint_roundtrip(
-    tmp_path_dist_ckpt, ep_size, precision_aware, drop_empty_shards
-):
+def test_ep_fsdp_checkpoint_roundtrip(tmp_path_dist_ckpt, ep_size):
     """MCore checkpoint save/load reproduces uninterrupted BF16 MoE training.
 
     Use MCore's existing global expert names and optimizer checkpoint format.
@@ -566,41 +562,16 @@ def test_ep_fsdp_checkpoint_roundtrip(
                     params_dtype=torch.bfloat16,
                     use_distributed_optimizer=False,
                     clip_grad=0.0,
-                    use_precision_aware_optimizer=precision_aware,
-                    exp_avg_dtype=torch.bfloat16 if precision_aware else torch.float32,
-                    exp_avg_sq_dtype=torch.bfloat16 if precision_aware else torch.float32,
+                    use_precision_aware_optimizer=True,
+                    exp_avg_dtype=torch.bfloat16,
+                    exp_avg_sq_dtype=torch.bfloat16,
                 ),
                 [model],
                 use_gloo_process_groups=False,
             )
-            if drop_empty_shards:
-                # Exercise TE < 2.18 empty-shard filtering on newer TE as well.
-                for group in optimizer.optimizer.param_groups:
-                    group["params"] = [p for p in group["params"] if p.to_local().numel() > 0]
-                optimizer.optimizer.param_groups = [
-                    group for group in optimizer.optimizer.param_groups if group["params"]
-                ]
             return model, optimizer
 
         source, source_optimizer = build(123)
-        if drop_empty_shards:
-            empty_counts = torch.tensor(
-                [
-                    sum(p.to_local().numel() == 0 for p in source.parameters()),
-                    sum(
-                        p.to_local().numel() == 0
-                        for name, p in source.named_parameters()
-                        if ".experts." in name
-                    ),
-                ],
-                device=device,
-            )
-            dist.all_reduce(empty_counts)
-            if world_size > 1:
-                assert empty_counts[0] > 0, "Empty-shard placeholder coverage is vacuous."
-            if world_size // ep_size > 1:
-                assert empty_counts[1] > 0, "No empty expert shard was exercised."
-
         torch.manual_seed(4321 + rank)
         ids = torch.randint(0, 128, (2, 8), device=device)
         pos = torch.arange(8, device=device).repeat(2, 1)
@@ -611,9 +582,6 @@ def test_ep_fsdp_checkpoint_roundtrip(
             for _ in range(5):
                 model.zero_grad_buffer()
                 optimizer.zero_grad()
-                if drop_empty_shards:
-                    # Match the older-TE fallback for grads omitted from the optimizer.
-                    model.zero_grad(set_to_none=True)
                 output = model(input_ids=ids, position_ids=pos, attention_mask=None)
                 loss = torch.nn.functional.mse_loss(output.float(), target)
                 loss.backward()
