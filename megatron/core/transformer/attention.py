@@ -757,7 +757,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         """
 
     def get_softmax_scale(
-        self, query_tensor: torch.Tensor | None, head_dim_index: int = -1
+        self, query_tensor: torch.Tensor, head_dim_index: int = -1
     ) -> float | None:
         """Return the softmax scaling value to use.
 
