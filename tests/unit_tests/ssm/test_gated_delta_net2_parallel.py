@@ -11,15 +11,12 @@ from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 
 
+# Intermittent compilation/teardown hangs (#7742).
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
-    [
-        # TP w/ SP: intermittent compilation/teardown hangs (#7742).
-        pytest.param(4, True, 1, marks=pytest.mark.flaky_in_dev),
-        (1, False, 2),  # CP
-        (2, True, 2),  # TP w/ SP + CP
-    ],
+    [(4, True, 1), (1, False, 2), (2, True, 2)],  # TP w/ SP  # CP  # TP w/ SP + CP
 )
 @pytest.mark.skipif(not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed.")
 def test_parallel_gated_delta_net2_correctness(

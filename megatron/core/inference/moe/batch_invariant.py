@@ -7,6 +7,9 @@ from unittest.mock import MagicMock
 import torch
 
 from megatron.core.inference.communication.torch_symm_triton.barrier import symm_mem_sync
+from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+    SYMM_MEM_KERNEL_CONFIG,
+)
 from megatron.core.inference.communication.torch_symm_triton.utils import (
     is_device_nvls_capable,
     sync_threads,
@@ -386,10 +389,14 @@ def ordered_reduce_scatter_v(
         input_tensor.shape[1] == hidden_size
     ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
 
-    max_num_blocks = kwargs.get("max_num_blocks", 128)
-    block_size = min(triton.next_power_of_2(hidden_size), 1024)
-    num_warps = max(1, block_size // 32)
+    # Do not autotune the number of blocks with Triton: every rank must launch the same grid
+    # of at most max_num_blocks blocks, or the barrier overflows the signal pad or hangs.
+    # See torch_symm_triton/kernel_config.py.
+    max_num_blocks = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    block_size = min(triton.next_power_of_2(hidden_size), SYMM_MEM_KERNEL_CONFIG.max_block_size)
+    num_warps = max(1, block_size // SYMM_MEM_KERNEL_CONFIG.warp_size)
     num_blocks = min(per_rank_max_tokens, max_num_blocks)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _ordered_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
         output_tensor,
