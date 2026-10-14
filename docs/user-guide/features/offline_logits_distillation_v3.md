@@ -169,9 +169,12 @@ only need inputs (the first pipeline stage, and middle stages for packed data) n
 download targets.
 
 Each tar begins with `_meta.json`, followed by one member per teacher iteration
-(`START-END.inputs.pt.zst` or `START-END.targets.pt.zst`, with a matching `record_id`).
-Each data member is one zstd frame whose built-in content checksum is verified on read,
-holding a `torch.save` dictionary of CPU tensors.
+(`START-END.inputs.safetensors.zst` or `START-END.targets.safetensors.zst`). Each data
+member is one zstd frame, with its built-in content checksum verified on read, holding a
+[safetensors](https://github.com/huggingface/safetensors) file: a flat map of named
+tensors and nothing else (no pickle). Any safetensors reader can load a decompressed
+member. Members carry no metadata of their own: the tar's `_meta.json` and the member
+name identify the record, and an inputs tar and its targets tar must share `generation`.
 
 The rest of this section is the producer-neutral specification. Megatron is one producer;
 other producers (for example a vLLM-based dumper) and consumers (for example a Hugging
@@ -219,7 +222,6 @@ Targets drop the same rows. Consequently every stored segment ends on a scored p
 
 | Inputs field | Required | Encoding / default |
 | --- | --- | --- |
-| `record_id` | yes | `generation:dpR:START-END`, also in the targets member |
 | `sample_offsets` | yes | int64 `[samples + 1]` offsets into the flat token tensors (empty samples allowed) |
 | `tokens` | yes | int32 flat token IDs |
 | `segment_lengths`, `segment_counts` | for `isolated_segments` | int32 positive lengths of each sample's segments, and segments per sample; otherwise each non-empty sample is one segment |
@@ -253,8 +255,10 @@ Student-inserted padding has zero loss weight for both losses.
 | --- | --- |
 | `values` | `[tokens, K]`, `save_dtype` |
 | `indices_low` | `[tokens, K]`, uint16 lower 16 bits |
-| `indices_high` | `[tokens, K]`, uint8 bits 16–23; present only for `index_encoding: "u16+u8"` |
-| `index_encoding` | `"u16"` when `logprob_vocab_size <= 65536`, else `"u16+u8"` (up to `2**24`) |
+| `indices_high` | `[tokens, K]`, uint8 bits 16–23; present exactly when `contract.targets.index_encoding` is `"u16+u8"` |
+
+`index_encoding` is `"u16"` when `logprob_vocab_size <= 65536`, else `"u16+u8"` (up to
+`2**24`).
 
 The `-1` selection sentinel encodes as all ones. Readers validate dtypes, shapes, the
 encoding against `logprob_vocab_size`, and that valid entries index below it. TP gathering
@@ -386,7 +390,7 @@ replay frontier, chunked remote reads, frozen-teacher range resume and cleanup,
 mismatched-settings detection, and differentiable sparse KL:
 
 ```sh
-uv run --no-project --with torch --with numpy --with zstandard --with pytest \
+uv run --no-project --with torch --with numpy --with zstandard --with safetensors --with pytest \
   python -m pytest -q -o addopts='' tests/offline_kd_cpu
 ```
 

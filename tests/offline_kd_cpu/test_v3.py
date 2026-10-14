@@ -19,7 +19,9 @@ import typing
 from pathlib import Path
 
 import pytest
+import safetensors.torch
 import torch
+import zstandard
 
 _namespace = "offline_kd_cpu"
 _package = types.ModuleType(_namespace)
@@ -109,7 +111,6 @@ def write_flush(
         ]
         batch = (source or inputs)(ids, packed=packed)
         record, targets = make_record(codec.capture_batch(batch), contract)
-        record["record_id"] = targets["record_id"] = f"{generation}:dp{rank}:{start}-{end}"
         for kind, payload in (("inputs", record), ("targets", targets)):
             members[kind].append(
                 (storage_module.member_name(start, end, kind), codec.encode(payload))
@@ -209,6 +210,22 @@ def test_zstd_checksum_detects_corruption():
         codec.decode(raw[:-1] + bytes([raw[-1] ^ 1]))
 
 
+def test_members_are_plain_safetensors_inside_zstd():
+    payload = {
+        "values": torch.tensor([[-0.5, -1000.0]], dtype=torch.bfloat16),
+        "indices_low": torch.tensor([[7, 0xFFFF]], dtype=torch.uint16),
+        "loss_mask": torch.tensor([True, False]),
+        "empty": torch.zeros(0, dtype=torch.int32),
+    }
+    raw = zstandard.ZstdDecompressor().decompress(codec.encode(payload))
+    restored = safetensors.torch.load(raw)
+    assert restored.keys() == payload.keys()
+    assert all(torch.equal(restored[key], payload[key]) for key in payload)
+    assert all(restored[key].dtype == payload[key].dtype for key in payload)
+    with pytest.raises(ValueError, match="safetensors"):
+        codec.decode(zstandard.ZstdCompressor().compress(b"not safetensors"))
+
+
 @pytest.mark.parametrize(
     "vocab_size,encoding",
     [(1, "u16"), (65536, "u16"), (65537, "u16+u8"), (1 << 17, "u16+u8"), (1 << 24, "u16+u8")],
@@ -217,7 +234,6 @@ def test_index_encoding_roundtrip(vocab_size, encoding):
     indices = torch.tensor([[0, vocab_size - 1, -1, 0, vocab_size - 1]])
     values = torch.tensor([[-1.0, -2.0, -1000.0, -3.0, -4.0]])
     payload = codec.pack_targets(values, indices, vocab_size=vocab_size)
-    assert payload["index_encoding"] == encoding
     assert payload["indices_low"].dtype == torch.uint16
     assert ("indices_high" in payload) == (encoding == "u16+u8")
     if "indices_high" in payload:
@@ -238,20 +254,22 @@ def test_index_encoding_rejects_invalid_vocab_size(vocab_size):
 
 
 @pytest.mark.parametrize(
-    "case", ["encoding", "mismatch", "missing_high", "extra_high", "dtype", "bounds"]
+    "case", ["missing_low", "mismatch", "missing_high", "extra_high", "dtype", "bounds"]
 )
 def test_malformed_target_encoding_rejected(case):
     payload = codec.pack_targets(torch.zeros(1, 2), torch.tensor([[0, 1]]), vocab_size=65537)
     kwargs = {}
-    if case == "encoding":
-        payload["index_encoding"] = "u24"
+    if case == "missing_low":
+        del payload["indices_low"]
     elif case == "mismatch":
         kwargs["vocab_size"] = 65536
     elif case == "missing_high":
         del payload["indices_high"]
+        kwargs["vocab_size"] = 65537
     elif case == "extra_high":
         payload = codec.pack_targets(torch.zeros(1, 2), torch.tensor([[0, 1]]), vocab_size=3)
         payload["indices_high"] = torch.zeros(1, 2, dtype=torch.uint8)
+        kwargs["vocab_size"] = 3
     elif case == "dtype":
         payload["indices_low"] = payload["indices_low"].long()
     else:
@@ -416,7 +434,6 @@ def test_input_defaults_are_per_segment():
     assert defaults["labels"].tolist() == [6, 7, 10, 9, 11]
     assert defaults["loss_mask"].all()
     minimal = {
-        "format_version": 3,
         "sample_offsets": torch.tensor([0, 5]),
         "tokens": tokens,
         "segment_lengths": torch.tensor([3, 2], dtype=torch.int32),
@@ -433,7 +450,6 @@ def test_input_defaults_are_per_segment():
 @pytest.mark.parametrize("case", ["counts", "length", "zero", "sum"])
 def test_malformed_segments_rejected(case):
     record = {
-        "format_version": 3,
         "sample_offsets": torch.tensor([0, 5]),
         "tokens": torch.zeros(5, dtype=torch.int32),
         "labels": torch.zeros(5, dtype=torch.int32),
@@ -1358,15 +1374,13 @@ def test_isolated_records_require_segments(tmp_path):
     metadata = settings(contract={"attention_mode": "isolated_segments"})
     live = replay.ReplayReader(Storage(str(tmp_path)), metadata, [])
     record = {
-        "format_version": 3,
-        "record_id": "gen:dp0:0-8",
         "sample_offsets": torch.tensor([0, 2, 4, 6, 8]),
         "tokens": torch.zeros(8, dtype=torch.int32),
         "labels": torch.zeros(8, dtype=torch.int32),
     }
     try:
         with pytest.raises(ValueError, match="requires saved segments"):
-            live.decode_record(0, 0, 8, "gen", codec.encode(record))
+            live.decode_record(0, 0, 8, codec.encode(record))
     finally:
         live.close()
 
@@ -1374,13 +1388,11 @@ def test_isolated_records_require_segments(tmp_path):
 def test_unsegmented_causal_records_use_defaults(tmp_path):
     live = replay.ReplayReader(Storage(str(tmp_path)), settings(), [])
     record = {
-        "format_version": 3,
-        "record_id": "gen:dp0:0-8",
         "sample_offsets": torch.tensor([0, 2, 4, 6, 8]),
         "tokens": torch.arange(8, dtype=torch.int32),
         "segment_final_labels": torch.tensor([2, 4, 6, 8], dtype=torch.int32),
     }
-    inputs_, _ = live.decode_record(0, 0, 8, "gen", codec.encode(record))
+    inputs_, _ = live.decode_record(0, 0, 8, codec.encode(record))
     live.close()
     assert inputs_["segment_lengths"].tolist() == [2, 2, 2, 2]
     assert inputs_["labels"].tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
@@ -1402,9 +1414,9 @@ def test_reader_checks_target_width_against_tar_metadata(tmp_path):
         next(target_stream)
         raw_inputs = next(input_stream)[1]
         payload = codec.decode(next(target_stream)[1])
-        payload["index_encoding"] = "u16"
+        del payload["indices_high"]  # u16 encoding, but the cache vocabulary needs u16+u8.
         with pytest.raises(ValueError, match="index_encoding"):
-            live.decode_record(0, 0, 8, "gen", raw_inputs, codec.encode(payload))
+            live.decode_record(0, 0, 8, raw_inputs, codec.encode(payload))
     finally:
         input_stream.close()
         target_stream.close()
@@ -1611,7 +1623,7 @@ def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeyp
     restored = codec.decode(record["inputs"])
     values, indices = codec.unpack_targets(codec.decode(record["targets"]))
     assert "sample_ids" not in record and "sample_ids" not in restored
-    assert restored["record_id"] == "gen:dp0:0-4"
+    assert all(isinstance(value, torch.Tensor) for value in restored.values())
     assert restored["tokens"][0] == 400
     assert torch.equal(restored["tokens"].long(), indices.squeeze(-1))
     assert torch.equal(values.long(), indices)
@@ -1627,11 +1639,9 @@ def test_saver_writes_paired_tars_readable_by_replay(tmp_path, runtime_environme
         for rank in (0, 1):
             ids = [start + (mb * 2 + rank) * 2 + j for mb in range(2) for j in range(2)]
             captured, targets = make_record(codec.capture_batch(inputs(ids)), metadata["contract"])
-            captured["record_id"] = targets["record_id"] = f"gen:dp{rank}:{start}-{end}"
             writes.setdefault(rank, {})[(start, end)] = {
                 "start": start,
                 "end": end,
-                "record_id": captured["record_id"],
                 "inputs": codec.encode(captured),
                 "targets": codec.encode(targets),
             }
@@ -1801,7 +1811,7 @@ def test_only_v3_extracts_vocabularies_above_17_bits(runtime_environment):
     payload = codec.pack_targets(
         values.reshape(1, 2), indices.reshape(1, 2), vocab_size=logits.shape[-1]
     )
-    assert payload["index_encoding"] == "u16+u8"
+    assert payload["indices_high"].dtype == torch.uint8
     restored, ids = codec.unpack_targets(payload, vocab_size=logits.shape[-1])
     assert torch.equal(ids, indices.reshape(1, 2))
     assert torch.equal(restored, values.reshape(1, 2))
@@ -2274,5 +2284,5 @@ def test_golden_fixtures_decode(tmp_path, name):
             assert torch.equal(a[key], b[key]), (name, key)
     if name == "u16_minimal_fields":
         members = dict(storage_module.iter_tar(storage, "dp0__0-16.inputs.tar"))
-        record = codec.decode(members["0-8.inputs.pt.zst"])
+        record = codec.decode(members["0-8.inputs.safetensors.zst"])
         assert not set(codec.OPTIONAL_TOKEN_FIELDS) & set(record)  # All defaults: omitted.

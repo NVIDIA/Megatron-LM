@@ -150,12 +150,9 @@ class PairedLogitsSaver(LogitsSaverHooks):
             targets = pack_targets(values, indices, vocab_size=contract["logprob_vocab_size"])
             start = args.consumed_train_samples
             end = start + get_num_microbatches() * self.dp_size * args.micro_batch_size
-            record_id = f'{self.metadata_dict["generation"]}:dp{self.dp_rank}:{start}-{end}'
-            inputs["record_id"] = targets["record_id"] = record_id
             self._iteration_records = {
                 "start": start,
                 "end": end,
-                "record_id": record_id,
                 "inputs": encode(inputs),
                 "targets": encode(targets),
             }

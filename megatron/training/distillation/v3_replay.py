@@ -257,7 +257,6 @@ class _Lane:
                     f"Offline KD v3 inputs and targets for dp{self.dp_rank} {span} "
                     "were written by different dump jobs"
                 )
-            generation = generations.pop()
             for record, record_start in enumerate(range(start, end, reader.gbs)):
                 record_end = record_start + reader.gbs
                 payloads = []
@@ -272,12 +271,7 @@ class _Lane:
                 if record < first:
                     continue
                 yield record, reader.pool.submit(
-                    reader.decode_record,
-                    self.dp_rank,
-                    record_start,
-                    record_end,
-                    generation,
-                    *payloads,
+                    reader.decode_record, self.dp_rank, record_start, record_end, *payloads
                 )
             for stream in streams:
                 if next(stream, None) is not None:
@@ -418,25 +412,21 @@ class ReplayReader:
         dp_rank: int,
         start: int,
         end: int,
-        generation: str,
         raw_inputs: bytes,
         raw_targets: bytes | None = None,
     ) -> tuple[dict, tuple | None]:
         """Decode and validate one teacher iteration's paired members."""
-        record_id = f"{generation}:dp{dp_rank}:{start}-{end}"
         inputs = decode(raw_inputs)
         validate_inputs(inputs)
         if self.isolated and inputs.get("segment_lengths") is None:
             raise ValueError("Offline KD isolated_segments requires saved segments")
-        if inputs.get("record_id") != record_id:
-            raise ValueError(f"Offline KD input record {inputs.get('record_id')} != {record_id}")
         if inputs["sample_offsets"].numel() - 1 != (end - start) // self.dp:
-            raise ValueError(f"Offline KD record {record_id} has the wrong sample count")
+            raise ValueError(
+                f"Offline KD record dp{dp_rank} {start}-{end} has the wrong sample count"
+            )
         targets = None
         if raw_targets is not None:
             payload = decode(raw_targets)
-            if payload.get("record_id") != record_id:
-                raise ValueError("Offline KD inputs and targets belong to different records")
             targets = unpack_targets(payload, vocab_size=self.contract["logprob_vocab_size"])
             if targets[0].shape[0] != inputs["tokens"].numel():
                 raise ValueError("Offline KD input/target token counts disagree")

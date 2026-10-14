@@ -8,13 +8,14 @@ reused by non-Megatron producers and consumers.
 """
 
 import hashlib
-import io
 import itertools
 import json
 from typing import Any
 
 import torch
 import zstandard
+from safetensors.torch import load as load_tensors
+from safetensors.torch import save as save_tensors
 
 FORMAT_VERSION = 3
 MAX_VOCAB_SIZE = 1 << 24
@@ -151,23 +152,22 @@ def hf_tokenizer_identity(tokenizer: Any, *, eod_id: int | None = None) -> dict[
     }
 
 
-def encode(payload: dict[str, Any]) -> bytes:
-    """Serialize tensors into one zstd frame carrying its own content checksum."""
-    stream = io.BytesIO()
-    torch.save(payload, stream)
-    return zstandard.ZstdCompressor(level=3, write_checksum=True).compress(stream.getvalue())
+def encode(payload: dict[str, torch.Tensor]) -> bytes:
+    """Serialize a flat dict of tensors as safetensors inside one checksummed zstd frame."""
+    tensors = {key: value.detach().cpu().contiguous() for key, value in payload.items()}
+    return zstandard.ZstdCompressor(level=3, write_checksum=True).compress(save_tensors(tensors))
 
 
-def decode(data: bytes) -> dict[str, Any]:
-    """Verify the frame checksum while decompressing, then load the tensor-only payload."""
+def decode(data: bytes) -> dict[str, torch.Tensor]:
+    """Verify the frame checksum while decompressing, then load the safetensors payload."""
     try:
         raw = zstandard.ZstdDecompressor().decompress(data)
     except zstandard.ZstdError as error:
         raise ValueError(f"Offline KD v3 member checksum or framing error: {error}") from None
-    result = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
-    if result.get("format_version") != FORMAT_VERSION:
-        raise ValueError("Expected an offline KD v3 payload")
-    return result
+    try:
+        return load_tensors(raw)
+    except Exception as error:
+        raise ValueError(f"Offline KD v3 member is not a safetensors payload: {error}") from None
 
 
 def int32(tensor: torch.Tensor) -> torch.Tensor:
@@ -188,7 +188,7 @@ def capture_batch(batch: dict[str, Any]) -> dict[str, Any]:
     if len(shape) != 2:
         raise ValueError("Offline KD v3 initially requires fixed-length [batch, sequence] inputs")
     rows, length = shape
-    payload = {"format_version": FORMAT_VERSION, "sample_offsets": torch.arange(rows + 1) * length}
+    payload = {"sample_offsets": torch.arange(rows + 1) * length}
     for key in TOKEN_FIELDS:
         tensor = batch[key]
         if tuple(tensor.shape) != tuple(shape):
@@ -223,7 +223,7 @@ def join_inputs(batches: list[dict[str, Any]]) -> dict[str, Any]:
     """Concatenate captured samples without imposing teacher microbatch shapes."""
     if not batches:
         raise ValueError("Cannot serialize an empty offline KD iteration")
-    result = {"format_version": FORMAT_VERSION}
+    result = {}
     offsets = [0]
     for batch in batches:
         offsets.extend((batch["sample_offsets"][1:] + offsets[-1]).tolist())
@@ -302,7 +302,6 @@ def finalize_record(
     segment_ends = list(itertools.accumulate(segment_lengths))
     sample_ends = [segment_ends[c - 1] if c else 0 for c in itertools.accumulate(segment_counts)]
     record = {
-        "format_version": FORMAT_VERSION,
         "sample_offsets": torch.tensor([0, *sample_ends], dtype=torch.int64),
         "tokens": inputs["tokens"][keep],
         "segment_lengths": lengths.to(torch.int32),
@@ -325,7 +324,9 @@ def finalize_record(
     return record, values[keep], indices[keep]
 
 
-def pack_targets(values: torch.Tensor, indices: torch.Tensor, *, vocab_size: int) -> dict[str, Any]:
+def pack_targets(
+    values: torch.Tensor, indices: torch.Tensor, *, vocab_size: int
+) -> dict[str, torch.Tensor]:
     """Encode [tokens, K] indices as uint16 low words plus, above 2**16, a uint8 high byte."""
     encoding = index_encoding_for_vocab(vocab_size)
     if values.shape != indices.shape or values.ndim != 2:
@@ -340,34 +341,32 @@ def pack_targets(values: torch.Tensor, indices: torch.Tensor, *, vocab_size: int
         or ((indices == -1) & (values != LOGPROB_SENTINEL)).any()
     ):
         raise ValueError("Offline KD vocabulary index is out of range or has an unmasked sentinel")
-    payload = {
-        "format_version": FORMAT_VERSION,
-        "index_encoding": encoding,
-        "values": values,
-        "indices_low": (indices & 0xFFFF).to(torch.uint16),
-    }
+    payload = {"values": values, "indices_low": (indices & 0xFFFF).to(torch.uint16)}
     if encoding == "u16+u8":
         payload["indices_high"] = ((indices >> 16) & 0xFF).to(torch.uint8)
     return payload
 
 
 def unpack_targets(
-    payload: dict[str, Any], *, vocab_size: int | None = None
+    payload: dict[str, torch.Tensor], *, vocab_size: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reconstruct vocabulary indices in canonical token order."""
-    encoding = payload.get("index_encoding")
-    if encoding not in ("u16", "u16+u8"):
-        raise ValueError("Malformed offline KD target index_encoding")
+    """Reconstruct vocabulary indices in canonical token order.
+
+    The encoding is implied by ``indices_high``'s presence; with ``vocab_size`` it must
+    also be the one :func:`index_encoding_for_vocab` prescribes.
+    """
+    values, low = payload.get("values"), payload.get("indices_low")
+    high = payload.get("indices_high")
+    if values is None or low is None:
+        raise ValueError("Malformed offline KD target tensors")
+    encoding = "u16" if high is None else "u16+u8"
     if vocab_size is not None and encoding != index_encoding_for_vocab(vocab_size):
         raise ValueError("Offline KD target index_encoding disagrees with logprob_vocab_size")
-    values, low = payload["values"], payload["indices_low"]
-    high = payload.get("indices_high")
     if (
         values.shape != low.shape
         or values.ndim != 2
         or not values.is_floating_point()
         or low.dtype != torch.uint16
-        or (encoding == "u16") != (high is None)
         or (high is not None and (high.dtype != torch.uint8 or high.shape != low.shape))
     ):
         raise ValueError("Malformed offline KD target tensors")

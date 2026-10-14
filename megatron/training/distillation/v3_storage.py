@@ -52,7 +52,7 @@ def tar_name(dp_rank: int, start: int, end: int, kind: str) -> str:
 
 def member_name(start: int, end: int, kind: str) -> str:
     """Name the member holding one teacher iteration."""
-    return f"{start}-{end}.{kind}.pt.zst"
+    return f"{start}-{end}.{kind}.safetensors.zst"
 
 
 def parse_tar_name(name: str) -> TarName | None:
