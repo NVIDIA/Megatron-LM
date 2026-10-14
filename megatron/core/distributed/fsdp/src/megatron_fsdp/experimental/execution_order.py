@@ -16,7 +16,7 @@
 
 from collections.abc import Iterable, Iterator
 from typing import Generic, TypeVar
-from weakref import WeakKeyDictionary, ref
+from weakref import ref
 
 T = TypeVar("T")
 
@@ -36,28 +36,23 @@ class ExecutionOrder(Generic[T]):
         Args:
             items: Initial module sequence.
             recorded: Preserve repeated occurrences and validate demand-call order.
-                Otherwise, index unique modules for construction-order lookahead.
+                Otherwise, resynchronize the cursor when construction order differs
+                from actual execution.
         """
         self._items: list[ref[T]] = []
-        self._index_by_item: WeakKeyDictionary[T, int] | None = (
-            None if recorded else WeakKeyDictionary()
-        )
+        self._recorded = recorded
         self._position = 0
         for item in items:
             self.append(item)
 
     def append(self, item: T) -> None:
         """Append a module; repeated occurrences are allowed only in recorded order."""
-        if self._index_by_item is not None:
-            if item in self._index_by_item:
-                raise ValueError("Construction execution order does not support duplicate items.")
-            self._index_by_item[item] = len(self._items)
+        if not self._recorded and item in self:
+            raise ValueError("Construction execution order does not support duplicate items.")
         self._items.append(ref(item))
 
     def __contains__(self, item: object) -> bool:
         """Return whether the sequence contains a live item."""
-        if self._index_by_item is not None:
-            return item in self._index_by_item
         return any(candidate is item for candidate in self)
 
     def __iter__(self) -> Iterator[T]:
@@ -74,21 +69,38 @@ class ExecutionOrder(Generic[T]):
             if item is not None:
                 yield item
 
+    def _find_index(self, item: T) -> int:
+        """Find a construction-order module by identity when the cursor differs."""
+        for index, item_ref in enumerate(self._items):
+            if item_ref() is item:
+                return index
+        raise KeyError(item)
+
     def advance(self, item: T) -> None:
-        """Consume a recorded demand call; construction orders need no cursor."""
-        if self._index_by_item is not None:
-            return
-        if not self._items or self._items[self._position]() is not item:
+        """Consume a demand call, resynchronizing only construction-order mismatches.
+
+        Calls following the sequence advance in constant time. Construction-order
+        mismatches search the sequence; recorded-order mismatches raise instead.
+        """
+        if self._items and self._items[self._position]() is item:
+            index = self._position
+        elif self._recorded:
             raise RuntimeError("FSDP module calls diverged from the recorded prefetch order.")
-        self._position = (self._position + 1) % len(self._items)
+        else:
+            index = self._find_index(item)
+        self._position = (index + 1) % len(self._items)
 
     def next_item(self, item: T, offset: int = 1) -> T | None:
-        """Look ahead from a module or its last consumed recorded occurrence."""
-        index = (
-            self._index_by_item[item]
-            if self._index_by_item is not None
-            else (self._position - 1) % len(self._items)
-        )
+        """Look ahead without advancing the demand-call cursor.
+
+        Recorded orders use the last consumed occurrence. Construction orders
+        also support lookup from a different module without moving the cursor.
+        """
+        if not self._items:
+            raise KeyError(item)
+        index = (self._position - 1) % len(self._items)
+        if not self._recorded and self._items[index]() is not item:
+            index = self._find_index(item)
         next_index = index + offset
         if next_index >= len(self._items):
             return None

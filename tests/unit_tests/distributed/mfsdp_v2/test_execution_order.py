@@ -89,6 +89,34 @@ def test_construction_prefetch_tolerates_reordered_calls(budget):
         assert prefetched == expected
 
 
+def test_construction_cursor_restarts_without_search(monkeypatch):
+    """Expected calls and prefetch lookahead use the cursor across iterations."""
+    first, second, third = (nn.Module() for _ in range(3))
+    order = ExecutionOrder([first, second, third])
+    search = Mock(side_effect=AssertionError('Unexpected construction-order search'))
+    monkeypatch.setattr(order, '_find_index', search)
+    for _ in range(2):
+        for module, successor in ((first, second), (second, third), (third, None)):
+            order.advance(module)
+            assert order.next_item(module) is successor
+            # Looking ahead twice must not consume the next demand call.
+            assert order.next_item(module) is successor
+    search.assert_not_called()
+
+
+def test_construction_lookup_preserves_demand_cursor(monkeypatch):
+    """An unrelated successor lookup cannot change the next expected demand call."""
+    first, second, third = (nn.Module() for _ in range(3))
+    order = ExecutionOrder([first, second, third])
+    order.advance(first)
+    assert order.next_item(third) is None
+    search = Mock(side_effect=AssertionError('Lookup moved the demand cursor'))
+    monkeypatch.setattr(order, '_find_index', search)
+    order.advance(second)
+    assert order.next_item(second) is third
+    search.assert_not_called()
+
+
 @pytest.mark.parametrize('recorded', [False, True])
 def test_membership_reverse_and_weak_references(recorded):
     """Topology lookups and traversal preserve weak ownership in both modes."""
