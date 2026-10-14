@@ -131,11 +131,12 @@ class ReplayedRouting:
             router.router_replay = replay
             self.replays.append(replay)
 
-    def set(self, keys: Tensor) -> None:
-        """Replay the experts of ``keys`` next."""
+    def set(self, decoder_keys: Tensor, mtp_keys: Tensor | None = None) -> None:
+        """Replay the experts of ``decoder_keys`` (and ``mtp_keys`` in MTP routers) next."""
         from megatron.core.transformer.moe.router_replay import RouterReplayAction
 
-        for _, replay in zip(self.routers, self.replays):
+        for (name, _), replay in zip(self.routers, self.replays):
+            keys = mtp_keys if mtp_keys is not None and name.startswith("mtp.") else decoder_keys
             replay.clear_indices()
             replay.set_target_indices(self.table.index_select(0, keys.cpu()).cuda())
             replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
@@ -356,14 +357,23 @@ def run_shared(
     """
     _start_run(model)
     problem = tokens.problem
+    with_mtp = bool(getattr(model, "mtp_process", False))
     local = _cp_local(problem.physical_len)
     if routing is not None:
-        routing.set(_sequence_shard(tokens.star_keys.index_select(0, local)))
+        # The MTP heads run on the dense branches, packed branch-major in CP-local order.
+        mtp_keys = torch.cat(
+            [keys.index_select(0, _cp_local(keys.numel())) for keys in tokens.row_keys]
+        )
+        routing.set(
+            _sequence_shard(tokens.star_keys.index_select(0, local)), _sequence_shard(mtp_keys)
+        )
+    extra = {"loss_mask": tokens.star_loss_mask[local][None].cuda()} if with_mtp else {}
     output = model(
         input_ids=tokens.star_ids[local][None].cuda(),
         position_ids=None,
         attention_mask=None,
         shared_prefix_layout=layout,
+        **extra,
         **forward_kwargs,
     )
     loss = (output.float() * _vocab_shard(tokens.star_cotangent[local])[None].cuda()).sum()
@@ -395,8 +405,16 @@ def model_grads_rel_l2(
 
 
 def compare_model_runs(candidate: ModelRun, reference: ModelRun, model) -> dict[str, float]:
-    """Completion-logit and whole-gradient relative errors of two model runs."""
-    return {
+    """Completion-logit and whole-gradient relative errors of two model runs.
+
+    Models with MTP heads also report the MTP-head gradients alone (``mtp_grads``).
+    """
+    errors = {
         "logits": rel_l2(torch.cat(candidate.logits), torch.cat(reference.logits)),
         "grads": model_grads_rel_l2(candidate.grads, reference.grads, model),
     }
+    if getattr(model, "mtp_process", False):
+        errors["mtp_grads"] = model_grads_rel_l2(
+            candidate.grads, reference.grads, model, prefix="mtp."
+        )
+    return errors

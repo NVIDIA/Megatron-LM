@@ -84,7 +84,7 @@ ordered reductions with `MAMBA_DETERMINISTIC=1` and `CAUSAL_CONV1D_DETERMINISTIC
 which that test sets; `--deterministic-mode` rejects explicit non-deterministic
 values of either.
 
-## MoE and recomputation
+## MoE, recomputation, and MTP
 
 Shared prompt rows carry their logical multiplicity for expert-bias statistics.
 Both boolean routing maps and upstream dense top-k expert-index maps are supported;
@@ -100,7 +100,9 @@ The caller states whether per-branch padding rows count toward expert bias with
 `False` counts them, as a dense forward with `padding_mask=None` does. When the
 argument is unset, padding rows are excluded if `moe_token_dispatcher_type` is
 `flex` and `moe_flex_dispatcher_backend` is `hybridep`, and counted otherwise.
-Passing the argument without `shared_prefix_layout` raises `ValueError`. Trailing topology
+The MTP routers follow the same convention: when padding is excluded, the dense
+MTP branches receive their per-sequence padding as `padding_mask`. Passing the
+argument without `shared_prefix_layout` raises `ValueError`. Trailing topology
 padding never counts.
 
 The router runs fixed row blocks inside a scoped shared forward, so its GEMM does
@@ -109,9 +111,24 @@ while suppressing tensor-observation callbacks inside the restored context, so a
 logical forward is observed only once. Frozen router parameters skip unused
 parameter gradients while preserving gradients into hidden states.
 
-Shared-prefix MTP is not supported yet. A training forward with MTP heads and
-`compute_mtp_loss=True` raises `NotImplementedError`; an evaluation-mode shared
-forward skips MTP.
+MTP uses dense branch inputs and its existing heads. It does not share the MTP
+prefix. Shared-prefix MTP runs only in training; an evaluation-mode shared forward
+skips it, as `compute_mtp_loss=False` does. A training forward rebuilds the dense
+branches from `input_ids`, requires `loss_mask`, and rejects `decoder_input` and
+`mtp_input_mask`. A forest, with or without explicit `mtp_loss_group_root_counts`,
+also requires `calculate_per_token_loss=True`. With `compute_mtp_loss=False`,
+these MTP-only checks are skipped. Each rank sums its prompt copies' gradients in
+a fixed FP32 order over the prompt rows only; at CP>1 the per-rank partials are
+combined by the CP reduce-scatter. A shared rerun is therefore as reproducible as a
+dense one. The backward peak memory of this gather exceeds that of a plain
+`index_select` only by an FP32 and a BF16 copy of the prompt rows. MTP MoE layers
+run under the same fixed router row-block scope as the backbone.
+
+When several independently normalized groups share one forward, `process_mtp_loss`
+takes their CP-local `loss_group_lengths` and normalizes each group as a packed
+dense forward of that group alone would. A forest keeps one group per root unless
+`mtp_loss_group_root_counts` merges consecutive roots. Ordinary MTP still accepts
+precomputed decoder embeddings and upstream CP layout preparation.
 
 ## Supported scope and explicit guards
 
@@ -151,9 +168,10 @@ replaces:
   logits, parameter gradients and expert-bias counts for stars and forests at
   TP1/CP1, TP2/SP/CP2 and TP1/CP4; full recomputation against the plain shared
   forward; and the default path with an explicit `None` layout, bit for bit.
-- `tests/unit_tests/models/hybrid/test_shared_prefix_moe_mtp.py`: expert-bias
-  counts through a real router. `test_shared_prefix_mtp_guard.py`: training-mode
-  MTP is rejected before the backbone runs and skipped otherwise.
+- `tests/unit_tests/models/hybrid/test_shared_prefix_moe_mtp.py` and
+  `test_shared_prefix_mtp_branches.py`: expert-bias counts through a real router,
+  MTP parity and grouped normalization at TP1/CP1 and TP2/SP/CP2, the fixed-order
+  prompt-row gather, and the MTP input guards.
 - `tests/unit_tests/transformer/test_multi_token_prediction_loss_groups.py`: one
   grouped `process_mtp_loss` call against one call per loss group, on CPU.
 - `tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py` and
@@ -207,5 +225,5 @@ at CP1/2/4, and drive the shared-prefix branch of `SelfAttention.forward`.
 
 These tests qualify layer- and model-level numerics and determinism on small
 models. They include no whole-model gradient comparison at a large training
-topology, such as TP2/CP4 with sequence parallelism. They do not qualify
+topology, such as TP2/CP4 with sequence parallelism and MTP. They do not qualify
 RL training quality, which the integrating framework must establish.

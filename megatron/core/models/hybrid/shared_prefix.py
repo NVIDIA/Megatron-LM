@@ -150,7 +150,7 @@ def resolve_exclude_sequence_padding_from_expert_bias(config, requested: bool | 
 
     ``requested`` is the caller's dense convention. ``None`` excludes padding with the flex
     dispatcher's HybridEP backend, which masks per-sequence padding in a dense packed forward,
-    and counts it otherwise. The backbone routers follow this rule.
+    and counts it otherwise. The backbone routers and the MTP routers both follow this rule.
     """
     if requested is not None:
         return requested
@@ -509,6 +509,9 @@ SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp_tp_sp_v1"
 # Target-model feature: Nemotron-H attention is positionless while Mamba remains
 # state-positioned by sequence order.
 SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY = "hybrid_star_positionless_attention_v1"
+# MTP predictor feature: reconstruct dense attention/MLP or attention/MoE heads from
+# the shared-prefix physical layout on the implemented TP/CP topologies.
+SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY = "hybrid_star_mtp_dense_heads_v1"
 SHARED_PREFIX_GROUP_EXECUTION_CAPABILITY = "hybrid_forest_stable_router_v1"
 # Topology and feature capabilities are independent so integrations can negotiate their exact
 # conjunction without inferring support from a broader aggregate token.
@@ -522,6 +525,7 @@ SHARED_PREFIX_TRAINING_CAPABILITIES = frozenset(
         SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY,
         SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY,
         SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+        SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
         SHARED_PREFIX_GROUP_EXECUTION_CAPABILITY,
     }
 )
