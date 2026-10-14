@@ -186,6 +186,14 @@ def exchange_cp_boundary_hidden(
     return boundary_hidden.reshape((d_window,) + tuple(hidden_states.shape[1:]))
 
 
+def get_cp_compressor_capacity(local_rows: int, ratio: int) -> int:
+    """Return the aligned per-rank capacity without reading device prefix contents."""
+    halo = 8 if ratio == 4 else ratio
+    alignment = 32 // math.gcd(32, ratio)
+    capacity = max(1, (local_rows + halo) // ratio)
+    return (capacity + alignment - 1) // alignment * alignment
+
+
 def prepare_cp_compressor_input(
     hidden_local: torch.Tensor,
     boundary_hidden: torch.Tensor,
@@ -216,9 +224,7 @@ def prepare_cp_compressor_input(
     d_comp = 8 if ratio == 4 else ratio
     global_start = int(global_start)
     l_local = hidden_local.shape[0]
-    group_alignment = 32 // math.gcd(32, ratio)
-    c_cap = max(1, (l_local + d_comp) // ratio)
-    c_cap = ((c_cap + group_alignment - 1) // group_alignment) * group_alignment
+    c_cap = get_cp_compressor_capacity(l_local, ratio)
     return packed_layout.compact_compressor_input(
         hidden_local, boundary_hidden, cu_seqlens, global_start, ratio, d_comp, c_cap, cp_size
     )

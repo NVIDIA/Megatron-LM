@@ -1,0 +1,308 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""CSA2 ownership, loss-gradient and packed-layout contracts on small reference inputs."""
+
+from functools import partial
+
+import pytest
+import torch
+from torch import nn
+
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttentionSubmodules,
+    CompressorSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.csa2 import (
+    CompressedSparseAttention2,
+    CSA2Compressor,
+    CSA2Indexer,
+    CSA2IndexerSubmodules,
+    CSA2State,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossAutoScaler,
+    DSAIndexerLossLoggingHelper,
+)
+from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+
+@pytest.fixture(autouse=True)
+def loss_scale(monkeypatch):
+    """Keep the auxiliary-loss scale local to each reference test."""
+    monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+
+
+class Group:
+    def size(self):
+        return 1
+
+    def rank(self):
+        return 0
+
+
+class Linear(nn.Module):
+    def __init__(self, input_size, output_size, *, config, init_method, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(output_size, input_size, dtype=config.params_dtype))
+        init_method(self.weight)
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight), None
+
+    def backward_dw(self):
+        pass
+
+
+class Norm(nn.Module):
+    def __init__(self, *, config, hidden_size, eps, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps) * self.weight
+
+
+class CpuRoPE(nn.Module):
+    def forward(self, n, packed_seq=False):
+        frequencies = torch.outer(
+            torch.arange(n).float(), 1 / (10000 ** (torch.arange(0, 4, 2).float() / 4))
+        )
+        return torch.cat((frequencies, frequencies), -1)[:, None, None, :]
+
+
+def _setup():
+    cfg = MLATransformerConfig(
+        num_layers=3,
+        hidden_size=16,
+        num_attention_heads=2,
+        params_dtype=torch.float32,
+        use_cpu_initialization=True,
+        multi_latent_attention=True,
+        experimental_attention_variant='dsv4_hybrid',
+        dsv4_version='v4.1',
+        qk_layernorm=True,
+        normalization='RMSNorm',
+        q_lora_rank=8,
+        v_head_dim=8,
+        qk_head_dim=4,
+        qk_pos_emb_head_dim=4,
+        kv_lora_rank=4,
+        csa_compress_ratios=[2, 2, 2],
+        csa2_kv_source_layers=[0],
+        csa2_index_source_layers=[0, 1],
+        csa_window_size=4,
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=8,
+        dsa_indexer_topk=2,
+        dsa_indexer_rotate_activation=False,
+        dsa_kernel_backend='none',
+        add_bias_linear=False,
+        attention_dropout=0,
+        hidden_dropout=0,
+        dsa_indexer_loss_coeff=0.01,
+    )
+    g = Group()
+    groups = ProcessGroupCollection(tp=g, cp=g, pp=g, dp=g, dp_cp=g, ep=g, expt_dp=g)
+    rope = CpuRoPE()
+    mods = CompressedSparseAttentionSubmodules(
+        compressor=partial(
+            CSA2Compressor,
+            submodules=CompressorSubmodules(linear_wkv=Linear, linear_wgate=Linear, norm=Norm),
+        ),
+        indexer=partial(
+            CSA2Indexer,
+            submodules=CSA2IndexerSubmodules(
+                linear_wq_b=Linear, linear_wk=Linear, k_norm=Norm, linear_weights_proj=Linear
+            ),
+        ),
+    )
+    layers = [
+        CompressedSparseAttention2(
+            cfg, mods, i + 1, AttnMaskType.causal, 'self', groups, rotary_pos_emb=rope
+        )
+        for i in range(3)
+    ]
+    return cfg, layers
+
+
+def _forward(layers, state):
+    outputs, inputs = [], []
+    for layer in layers:
+        x = torch.randn(8, 2, 16, requires_grad=True)
+        qr = torch.randn(8, 2, 8, requires_grad=True)
+        q = torch.randn(8, 2, 2, 8, requires_grad=True)
+        kv = torch.randn(8, 2, 1, 8, requires_grad=True)
+        inputs.append((x, qr, q, kv))
+        outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state))
+    return outputs, inputs
+
+
+def test_shared_owners_receive_main_and_auxiliary_gradients(monkeypatch):
+    monkeypatch.setattr(DSAIndexerLossLoggingHelper, "save_loss_to_tracker", lambda **kwargs: None)
+    DSAIndexerLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+    _, layers = _setup()
+    first, first_inputs = _forward(layers, CSA2State())
+    second, _ = _forward(layers, CSA2State())
+    assert layers[2].indexer is None and layers[1].compressor is None
+    sum(output.square().mean() for output in first + second).backward()
+    assert layers[0].compressor.linear_wkv.weight.grad.abs().sum() > 0
+    assert layers[0].indexer.linear_wk.weight.grad.abs().sum() > 0
+    assert layers[1].indexer.linear_wq_b.weight.grad.abs().sum() > 0
+    assert torch.isfinite(first_inputs[0][0].grad).all()
+
+
+def test_auxiliary_objective_does_not_train_main_compressor(monkeypatch):
+    monkeypatch.setattr(DSAIndexerLossLoggingHelper, "save_loss_to_tracker", lambda **kwargs: None)
+    _, layers = _setup()
+    state = CSA2State(defer_indexer_loss=True)
+    _forward(layers[:1], state)
+    state.indexer_loss.backward()
+    assert layers[0].compressor.linear_wkv.weight.grad is None
+    assert layers[0].indexer.linear_wk.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("ratio", [1, 2, 4, 128])
+def test_compression_capacity_preserves_main_alignment(ratio):
+    import math
+
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
+        get_cp_compressor_capacity,
+    )
+
+    for rows in (1, 7, 128, 257):
+        halo = 8 if ratio == 4 else ratio
+        alignment = 32 // math.gcd(32, ratio)
+        expected = max(1, (rows + halo) // ratio)
+        expected = (expected + alignment - 1) // alignment * alignment
+        assert get_cp_compressor_capacity(rows, ratio) == expected
+
+
+def test_candidate_mask_does_not_change_tied_causal_prefix():
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
+        candidate_blocks_from_scores,
+    )
+
+    short = torch.zeros(1, 3, 6)
+    visible = torch.tensor([[1, 3, 6]])
+    short.masked_fill_(torch.arange(6)[None, None, :] >= visible[..., None], -torch.inf)
+    long = torch.nn.functional.pad(short, (0, 5), value=-torch.inf)
+    a = candidate_blocks_from_scores(short, visible, 2, 2)
+    b = candidate_blocks_from_scores(long, visible, 2, 2)
+    assert torch.equal(a.indices, b.indices)
+    assert torch.equal(a.lengths, b.lengths)
+
+
+def test_window_teacher_includes_sink_and_ignores_invalid_keys():
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_teacher_lse import (
+        fused_csa_window_lse,
+    )
+
+    query = torch.ones(3, 2, 4)
+    keys = torch.ones(3, 4)
+    sink = torch.tensor([0.0, 32.0])
+    indices = torch.tensor([[0, -1], [0, 1], [-1, -1]], dtype=torch.int32)
+    result = fused_csa_window_lse(query, keys, sink, indices, 0.5)
+    expected = torch.stack(
+        (
+            torch.logaddexp(sink, torch.full_like(sink, 2.0)),
+            torch.logaddexp(sink, torch.full_like(sink, 2.0 + torch.log(torch.tensor(2.0)).item())),
+            sink,
+        )
+    )
+    torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_window_teacher_gpu_parity_and_bit_exact_replay():
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_teacher_lse import (
+        fused_csa_window_lse,
+    )
+    from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
+
+    query = torch.randn(32, 64, 512, device="cuda", dtype=torch.bfloat16)
+    keys = torch.randn(32, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.linspace(0, 32, 64, device="cuda")
+    rows = torch.arange(32, device="cuda")[:, None]
+    ids = rows - torch.arange(8, device="cuda")[None, :]
+    ids = ids.clamp_min(-1).int()
+    scale = 512**-0.5
+    expected = fused_csa_window_lse(query.cpu(), keys.cpu(), sink.cpu(), ids.cpu(), scale)
+    actual = fused_csa_window_lse(query, keys, sink, ids, scale)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=1e-5)
+    assert_replays_bit_exact(
+        lambda q, k, s, indices: fused_csa_window_lse(q, k, s, indices, scale),
+        (query, keys, sink, ids),
+        backward=False,
+        replays=3,
+        contention=True,
+        what="CSA2 window/sink teacher",
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_candidate_score_and_compaction_gpu_parity_and_replay():
+    pytest.importorskip("cudnn")
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
+        _select_blocks,
+        candidate_blocks_from_scores,
+    )
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_indexer import (
+        _score_chunk,
+    )
+    from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
+
+    q = torch.randn(16, 32, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(32, 128, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(16, 32, device="cuda", dtype=torch.bfloat16)
+    ids = torch.zeros(16, 1, device="cuda", dtype=torch.int32)
+    starts = torch.zeros(16, device="cuda", dtype=torch.int32)
+    visible = torch.arange(16, device="cuda", dtype=torch.int32) * 2
+
+    def score(query, keys, w):
+        return _score_chunk(
+            query,
+            keys,
+            w,
+            ids,
+            starts,
+            starts,
+            visible,
+            width=32,
+            stride=32,
+            mode=0,
+            block_size=1,
+            selection=True,
+        )
+
+    scores = score(q, k, weights)
+    scaled_weights = (weights.float() / 64).bfloat16().float()
+    expected = (
+        torch.einsum("qhd,kd->qhk", q.float(), k.float()).relu() * scaled_weights[..., None]
+    ).sum(1)
+    expected.masked_fill_(torch.arange(32, device="cuda")[None, :] >= visible[:, None], -torch.inf)
+    torch.testing.assert_close(scores, expected, rtol=2e-4, atol=2e-4)
+    blocks = _select_blocks(scores, visible, 2, 8)
+    reference = candidate_blocks_from_scores(expected, visible, 2, 8)
+    assert torch.equal(blocks.indices, reference.indices)
+    assert torch.equal(blocks.lengths, reference.lengths)
+    assert_replays_bit_exact(
+        score,
+        (q, k, weights),
+        backward=False,
+        replays=3,
+        contention=True,
+        what="CSA2 BF16 candidate scoring",
+    )
+    assert_replays_bit_exact(
+        lambda s: (
+            _select_blocks(s, visible, 2, 8).indices,
+            _select_blocks(s, visible, 2, 8).lengths,
+        ),
+        (scores,),
+        backward=False,
+        replays=3,
+        what="CSA2 candidate compaction",
+    )

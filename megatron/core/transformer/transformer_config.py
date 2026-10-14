@@ -400,6 +400,24 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # Compressed sparse attention
     ####################
+    dsv4_version: Literal["v4", "v4.1"] = "v4"
+    """Attention architecture. V4.1 uses CSA2 with explicit cross-layer sharing."""
+
+    csa2_kv_source_layers: list[int] | None = None
+    """Zero-based stack layer indices producing global KV and indexer K."""
+
+    csa2_index_source_layers: list[int] | None = None
+    """Zero-based stack layer indices computing new sparse indices."""
+
+    csa2_candidate_source_layer: int | None = None
+    """Full layer producing the hierarchical candidate pool; None disables it."""
+
+    csa2_candidate_topk_blocks: int = 0
+    """Maximum candidate blocks selected by the first decoder indexer."""
+
+    csa2_candidate_block_size: int = 0
+    """Number of global positions in a candidate block."""
+
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
 
@@ -1643,6 +1661,10 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.dsv4_version not in ("v4", "v4.1"):
+            raise ValueError(f"Unsupported dsv4_version: {self.dsv4_version}")
+        if self.dsv4_version == "v4.1" and self.experimental_attention_variant != "dsv4_hybrid":
+            raise ValueError("V4.1 requires experimental_attention_variant='dsv4_hybrid'")
         self._validate_cp_layouts()
 
         if self.attn_logit_softcapping is not None and not (
@@ -1865,6 +1887,13 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+        elif self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1":
+            from megatron.core.transformer.experimental_attention_variant.csa2_config import (
+                validate_csa2_config,
+            )
+
+            validate_csa2_config(self)
+            self.hetereogenous_dist_checkpoint = True
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
