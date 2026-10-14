@@ -339,18 +339,32 @@ def test_cp_layout_uses_main_packed_metadata():
     assert layout.for_compression(2).valid_groups.sum() == 5
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, ratio):
     """Exercise real Full/Reindex/Reuse kernels with shared producer gradients."""
     import os
+    import shutil
+    import subprocess
     from dataclasses import replace
 
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
     pytest.importorskip("cudnn")
-    pytest.importorskip("flash_mla")
+    flash_mla_cuda = pytest.importorskip("flash_mla.cuda")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    if torch.cuda.get_device_capability()[0] == 9:
+        # CI omits SM90 kernels. Check the binary before launching: a failed
+        # FlashMLA call can leave CUDA errors behind even after pytest.skip.
+        cuobjdump = shutil.which("cuobjdump")
+        if cuobjdump is None:
+            pytest.skip("cuobjdump is required to check FlashMLA's SM90 kernel availability")
+        kernels = subprocess.check_output(
+            [cuobjdump, "--list-elf", flash_mla_cuda.__file__], text=True, timeout=30
+        )
+        if ".sm_90" not in kernels:
+            pytest.skip("FlashMLA was built without SM90 kernels")
     monkeypatch.setattr(DSAIndexerLossLoggingHelper, "save_loss_to_tracker", lambda **kwargs: None)
     cfg, _ = _setup()
     cfg = replace(
@@ -431,23 +445,7 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
         for layer, values in zip(layers, inputs):
             q, kv, x, qr = [v.detach().clone().requires_grad_() for v in values]
             leaves.extend((q, kv, x, qr))
-            try:
-                outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state))
-            except RuntimeError as error:
-                # The standard CI image deliberately builds FlashMLA without SM90.
-                # Keep parity active on images/devices that have the compiled kernel.
-                if layers is fused and "no kernel image is available" in str(error):
-                    from cuda.bindings import runtime
-
-                    # FlashMLA's cudaFuncSetAttribute failure leaves a CUDA last-error
-                    # behind. Clear it before skipping so the next test can launch kernels.
-                    (status,) = runtime.cudaGetLastError()
-                    assert status in (
-                        runtime.cudaError_t.cudaSuccess,
-                        runtime.cudaError_t.cudaErrorNoKernelImageForDevice,
-                    ), status
-                    pytest.skip("FlashMLA was built without kernels for this GPU")
-                raise
+            outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state))
         sum(y.float().square().mean() for y in outputs).backward()
         grads = [p.grad for p in layers.parameters()] + [x.grad for x in leaves]
         results.append((outputs, grads))
