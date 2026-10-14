@@ -438,21 +438,27 @@ def apply_rotary_pos_emb_with_cos_sin(
     sin = sin.to(t.dtype)
 
     if apply_rotary_emb_flash is None:
-        # Combine cos and sin into freqs
-        freqs = torch.stack([cos, sin], dim=-1).flatten(start_dim=-2)
+        # cos and sin already hold the cosine and sine of the rotation angles, one value per
+        # rotated pair. Lay them out over the full rotary width in the order that
+        # flash_attn.layers.rotary.apply_rotary_emb uses, then rotate the first d_rot channels
+        # of t directly. Feeding them through _apply_rotary_pos_emb_bshd would take cos and sin
+        # of them a second time.
+        if rotary_interleaved:
+            cos = cos.repeat_interleave(2, dim=-1)
+            sin = sin.repeat_interleave(2, dim=-1)
+        else:
+            cos = torch.cat((cos, cos), dim=-1)
+            sin = torch.cat((sin, sin), dim=-1)
 
-        # Expand freqs to match t's shape
-        while freqs.dim() < t.dim():
-            freqs = freqs.unsqueeze(1)
-        freqs = freqs.expand(t.shape[:-1] + (-1,))
+        # Broadcast [seq_len, d_rot] over the batch and head dimensions of t.
+        while cos.dim() < t.dim():
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
 
-        y = _apply_rotary_pos_emb_bshd(
-            t,
-            freqs,
-            rotary_interleaved=rotary_interleaved,
-            mla_rotary_interleaved=False,
-            mscale=1.0,
-        )
+        rot_dim = cos.shape[-1]
+        t_rot, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+        t_rot = (t_rot * cos) + (_rotate_half(t_rot, rotary_interleaved) * sin)
+        y = torch.cat((t_rot, t_pass), dim=-1)
     else:
         # Use Flash Attention's optimized kernel for rotary embedding
         t = t.permute(1, 0, 2, 3)
