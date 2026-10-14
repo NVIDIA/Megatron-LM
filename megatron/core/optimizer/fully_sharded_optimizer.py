@@ -95,12 +95,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         parameters = self.get_parameters()
         if not is_te_min_version("2.18.0"):
             # Include the empty local shards filtered out of older TE optimizers.
-            parameters = [
-                param
-                for model_chunk in self.model_chunks
-                for param in model_chunk.parameters()
-                if param.requires_grad
-            ]
+            parameters = []
+            for model_chunk in self.model_chunks:
+                for param in model_chunk.parameters():
+                    if param.requires_grad:
+                        parameters.append(param)
         self._param_to_fqn: dict[torch.nn.Parameter, str] = {
             param: get_global_unique_param_name(self.model_chunks, param) for param in parameters
         }
