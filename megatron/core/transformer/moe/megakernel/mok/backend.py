@@ -15,6 +15,7 @@ import torch
 from torch import nn
 from torch.distributed import ProcessGroup
 
+from megatron.core.activations import situlu
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
@@ -81,6 +82,11 @@ class MoKMegakernel(MegakernelBackend):
             )
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
+        self.situ_beta = (
+            (config.situ_glu_beta1, config.situ_glu_beta2)
+            if config.activation_func == situlu
+            else None
+        )
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )

@@ -6,6 +6,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.activations import situlu
 from megatron.core.transformer.moe.megakernel import parameter_bridge
 from megatron.core.transformer.moe.megakernel.mok import backend as mok_backend
 from megatron.core.transformer.moe.megakernel.mok import runtime as mok_runtime
@@ -401,7 +402,7 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped, gated):
     assert mok.is_first_microbatch
 
 
-def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False):
+def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False, situ=False):
     """Build the actual adapter while keeping these contract tests independent of MOK."""
     if mxfp8:
         from megatron.core import fp8_utils
@@ -445,6 +446,9 @@ def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False)
         moe_shared_expert_intermediate_size=4,
         moe_router_topk=2,
         activation_func_clamp_value=None,
+        activation_func=situlu if situ else torch.nn.functional.silu,
+        situ_glu_beta1=2.0,
+        situ_glu_beta2=8.0,
         fp8="hybrid" if mxfp8 else None,
         fp8_recipe="mxfp8",
         fp8_param=mxfp8,
@@ -463,21 +467,21 @@ def test_register_shared_output_gate_rejects_non_bf16_parameter(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mxfp8, single_grouped, gated, main_grad_dtype",
+    "mxfp8, single_grouped, gated, main_grad_dtype, situ",
     [
-        pytest.param(False, False, True, torch.float32, id="bf16-split-g-fp32"),
-        pytest.param(True, False, True, torch.bfloat16, id="mxfp8-split-g-bf16"),
-        pytest.param(True, True, True, torch.float32, id="mxfp8-single-g-fp32"),
-        pytest.param(False, True, False, torch.bfloat16, id="bf16-single-u-bf16"),
+        pytest.param(False, False, True, torch.float32, True, id="bf16-split-g-fp32"),
+        pytest.param(True, False, True, torch.bfloat16, False, id="mxfp8-split-g-bf16"),
+        pytest.param(True, True, True, torch.float32, True, id="mxfp8-single-g-fp32"),
+        pytest.param(False, True, False, torch.bfloat16, False, id="bf16-single-u-bf16"),
     ],
 )
 def test_gate_autograd_accumulation_and_ddp_hooks(
-    monkeypatch, single_grouped, gated, mxfp8, main_grad_dtype
+    monkeypatch, single_grouped, gated, mxfp8, main_grad_dtype, situ
 ):
     from megatron.core.distributed import distributed_data_parallel as ddp_module
 
     module, shared, functional = _mock_backend(
-        monkeypatch, single_grouped=single_grouped, gated=gated, mxfp8=mxfp8
+        monkeypatch, single_grouped=single_grouped, gated=gated, mxfp8=mxfp8, situ=situ
     )
     gate = shared.gate_weight
     assert module.shared_output_gate_weight is gate
@@ -499,7 +503,8 @@ def test_gate_autograd_accumulation_and_ddp_hooks(
     gate_keys = {"shared_output_gate_weight"} if gated else set()
 
     def forward(*args, **kwargs):
-        assert set(kwargs) == {"swiglu_limit"} | gate_keys
+        assert set(kwargs) == {"swiglu_limit"} | gate_keys | ({"situ_beta"} if situ else set())
+        assert kwargs.get("situ_beta") == ((2.0, 8.0) if situ else None)
         assert kwargs.get("shared_output_gate_weight") is gate
         return args[3].clone(), object()
 
