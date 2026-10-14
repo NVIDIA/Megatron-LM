@@ -29,6 +29,26 @@ def build_disagg_inference_model(
     args, model_type, transformer_config, *, cfg_container, model_alloc_ctx
 ):
     """Build this rank's disaggregated RL inference shard."""
+    for field in (
+        "rl_inference_tensor_model_parallel_size",
+        "rl_inference_pipeline_model_parallel_size",
+        "rl_inference_expert_model_parallel_size",
+        "rl_inference_expert_tensor_model_parallel_size",
+    ):
+        if getattr(cfg_container.rl, field) is not None:
+            raise ValueError(
+                f"--{field.replace('_', '-')} cannot be combined with disaggregated "
+                "--inference-shards; configure parallelism in each shard specification"
+            )
+    if cfg_container.rl.rl_verify_model_weights_swap:
+        raise ValueError(
+            "--rl-verify-model-weights-swap does not support disaggregated inference shards"
+        )
+    if cfg_container.rl.refit_method == "nixl":
+        raise ValueError(
+            "--refit-method=nixl does not support multiple disaggregated destination pools; "
+            "use a supported refit backend such as nccl"
+        )
     if not args.inference_dynamic_batching_enable_prefix_caching:
         raise ValueError("disaggregated RL rollouts require prefix caching")
     shards = build_inference_pg_collections_for_shards(

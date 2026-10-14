@@ -14,7 +14,7 @@ from megatron.core.inference.shards_spec import (
     normalize_shard_specs,
     resolve_inference_shard,
 )
-from megatron.core.utils import get_pg_rank
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 PREFILL = "prefill"
 DECODE = "decode"
@@ -71,6 +71,27 @@ def configure_prebuilt_disagg_engine(engine: Any) -> None:
         raise ValueError("disaggregation requires prefix caching")
     rank = dist.get_rank()
     assignment = resolve_inference_shard(specs, dist.get_world_size(), rank)
+    spec = assignment.spec
+    pgc = engine.pg_collection
+    model_config = engine.controller.inference_wrapped_model.model.config
+    built = tuple(
+        get_pg_size(group) for group in (pgc.tp, pgc.pp, pgc.dp, pgc.ep, pgc.cp, pgc.expt_tp)
+    )
+    configured = (
+        model_config.tensor_model_parallel_size,
+        model_config.pipeline_model_parallel_size,
+        model_config.context_parallel_size,
+        model_config.expert_model_parallel_size,
+        model_config.expert_tensor_parallel_size,
+    )
+    expected_built = (spec.tp, spec.pp, spec.dp, spec.ep, spec.cp, spec.expt_tp)
+    expected_configured = (spec.tp, spec.pp, spec.cp, spec.ep, spec.expt_tp)
+    if built != expected_built or configured != expected_configured:
+        raise ValueError(
+            f"inference shard {assignment.index} parallelism mismatch: "
+            f"process groups {built}, expected {expected_built}; "
+            f"model config {configured}, expected {expected_configured}"
+        )
 
     # Each shard replica needs a distinct coordinator identity.
     dp_rank = get_pg_rank(engine.pg_collection.dp)

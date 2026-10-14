@@ -480,6 +480,11 @@ def swap_model_weights(
     else:
         raise TypeError("refit_method must be a str backend name or a CopyService instance")
 
+    if num_dst_pools > 1 and not service.supports_multiple_destination_pools:
+        raise ValueError(
+            f"{type(service).__name__} does not support num_dst_pools > 1; "
+            "use a refit backend with per-pool receiver support, such as nccl"
+        )
     if num_dst_pools > 1 and not service.supports_idle_ranks:
         raise ValueError(
             f"{type(service).__name__} does not support num_dst_pools > 1 because each pool "

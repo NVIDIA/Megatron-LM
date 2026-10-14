@@ -862,6 +862,20 @@ or payload stager. Handoffs preserve the request UID, policy/KV epoch history,
 and prefill eviction history. MoE routing replay is not supported: transfer
 setup rejects it because handoffs do not transfer the prompt's routing buffers.
 
+Shard models require a distributed checkpoint format such as `torch_dist`; legacy `torch`
+checkpoints are rejected. For native RL, configure parallelism in
+`--inference-shards`, not the global `--rl-inference-*-model-parallel-size`
+overrides. Disaggregated RL currently rejects `--rl-verify-model-weights-swap`;
+the existing verifier does not support the different shard layouts. NIXL weight
+refit also rejects multiple destination pools because it binds a single receiver
+map; use a supported refit backend such as NCCL. This is separate from NIXL
+KV/SSM handoff, which remains supported.
+
+RL generation-lag autotuning and HTTP concurrency limits still use local shard
+capacity rather than aggregate decode capacity. Set `--rl-generation-lag`
+explicitly for partial rollouts; capacity aggregation and the remaining
+limitations are tracked in [#8200](https://github.com/NVIDIA/Megatron-LM/issues/8200).
+
 ---
 
 ## Customizing the Pipeline

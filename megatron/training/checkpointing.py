@@ -2602,10 +2602,6 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     from megatron.core.models.hybrid.hybrid_model import HybridModel
     from megatron.core.models.mimo.model.base import MimoModel
 
-    # Model-only inference checkpoints may omit the saved argument namespace.
-    if ckpt_args is None:
-        return None, False
-
     def _contains_hybrid_model(module):
         # Megatron-FSDP and Float16Module both retain the wrapped module under
         # ``module`` but are intentionally not handled by the regular
@@ -2781,6 +2777,12 @@ def load_checkpoint(
         else:
             raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
 
+    if ckpt_format == 'torch' and getattr(args, 'inference_shards', None):
+        raise ValueError(
+            '--inference-shards is incompatible with legacy torch checkpoints; '
+            'convert the checkpoint to torch_dist first'
+        )
+
     if model_sharded_state_dict_modifier is not None and ckpt_format != 'torch_dist':
         raise NotImplementedError(
             f'model_sharded_state_dict_modifier requires a torch_dist checkpoint, got {ckpt_format}'
@@ -2789,13 +2791,13 @@ def load_checkpoint(
     load_kwargs = {}
     ignore_rng_state = False
     ignore_rerun_state = True
-    ckpt_args = None
+    ckpt_args = types.SimpleNamespace()
     if (
         ckpt_format in ('torch_dist', 'fsdp_dtensor')
         and state_dict is not None
         and 'args' in state_dict
     ):
-        ckpt_args = state_dict.get('args')
+        ckpt_args = state_dict.get('args') or types.SimpleNamespace()
 
     # GTP padding was sized by the precision recipe of the run that saved the checkpoint, which
     # can differ from this run's (e.g. an MXFP8-trained checkpoint loaded for BF16 inference).
@@ -2813,7 +2815,6 @@ def load_checkpoint(
         else (None, False)
     )
     gpt_compat_load_optim = gpt_compat_load_optim and not release and restore_training_state
-    ckpt_args = ckpt_args or types.SimpleNamespace()
 
     if ckpt_format == 'torch_dist':
         if not hasattr(ckpt_args, 'tensor_model_parallel_size'):

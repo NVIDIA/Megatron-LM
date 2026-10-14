@@ -1289,6 +1289,10 @@ class DynamicInferenceEngine(AbstractEngine):
             "pip install msgpack"
         )
 
+        disagg_config = self._get_disaggregation_config()
+        if disagg_config is not None and not launch_inference_coordinator:
+            raise ValueError("native disaggregation requires launch_inference_coordinator=True")
+
         self.zmq_context = zmq.Context.instance()
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
@@ -1312,7 +1316,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
         local_ip = hostname or socket.gethostname()
-        disagg_config = self._get_disaggregation_config()
 
         # Spawn a DP coordinator process and get the connection info.
         if disagg_config is not None:

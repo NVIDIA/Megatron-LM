@@ -320,6 +320,15 @@ def test_swap_threads_execution_limit_to_named_service(monkeypatch):
     assert forwarded == {"backend": "nccl_m2n", "group": group, "execution_batch_bytes": 123}
 
 
+def test_swap_rejects_multiple_pools_for_nixl_before_planning(monkeypatch):
+    service = object.__new__(refit.NixlCopyService)
+    build = MagicMock(side_effect=AssertionError("must reject before planning"))
+    monkeypatch.setattr(refit, "_build_or_get_plan", build)
+    with pytest.raises(ValueError, match="per-pool receiver support"):
+        refit.swap_model_weights(None, None, refit_method=service, num_dst_pools=2)
+    build.assert_not_called()
+
+
 def test_swap_rejects_multiple_pools_for_service_without_idle_ranks():
     class NoIdleRanksService(CopyService):
         supports_idle_ranks = False

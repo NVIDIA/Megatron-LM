@@ -22,6 +22,7 @@ from megatron.core.inference.shards_spec import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import unwrap_model
+from megatron.training.config import RLConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -66,7 +67,7 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
             args,
             ModelType.encoder_or_decoder,
             training_config.transformer,
-            cfg_container=SimpleNamespace(model=training_config),
+            cfg_container=SimpleNamespace(model=training_config, rl=RLConfig()),
             model_alloc_ctx=nullcontext(),
         )[0]
         for model in (serving, rl):
@@ -85,6 +86,72 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
         assert load.call_args.kwargs["tp_group"] is pg.tp
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "rl_inference_tensor_model_parallel_size",
+        "rl_inference_pipeline_model_parallel_size",
+        "rl_inference_expert_model_parallel_size",
+        "rl_inference_expert_tensor_model_parallel_size",
+        "rl_verify_model_weights_swap",
+        "refit_method",
+    ],
+)
+def test_disagg_rl_rejects_ignored_overrides(field):
+    from megatron.rl.inference.disagg import build_disagg_inference_model
+
+    config = RLConfig()
+    value = (
+        "nixl"
+        if field == "refit_method"
+        else True if field == "rl_verify_model_weights_swap" else 1
+    )
+    setattr(config, field, value)
+    with pytest.raises(ValueError, match=field.replace("_", "-")):
+        build_disagg_inference_model(
+            None, None, None, cfg_container=SimpleNamespace(rl=config), model_alloc_ctx=None
+        )
+
+
+@pytest.mark.parametrize("mismatch", [None, "groups", "model"])
+def test_prebuilt_disagg_checks_groups_and_model_config(monkeypatch, mismatch):
+    from megatron.core.inference.disaggregation import coordinator_setup as setup
+
+    monkeypatch.setattr(setup.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(setup.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(setup, "get_pg_size", lambda group: group)
+    monkeypatch.setattr(setup, "get_pg_rank", lambda group: 0)
+    config = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
+    )
+    engine = SimpleNamespace(
+        context=SimpleNamespace(
+            enable_prefix_caching=True,
+            config=SimpleNamespace(disaggregation_shards="tp=1,role=prefill+tp=1,role=decode"),
+        ),
+        pg_collection=SimpleNamespace(
+            tp=2 if mismatch == "groups" else 1, pp=1, dp=1, ep=1, cp=1, expt_tp=1
+        ),
+        controller=SimpleNamespace(
+            inference_wrapped_model=SimpleNamespace(model=SimpleNamespace(config=config))
+        ),
+        set_disaggregation_config=Mock(),
+    )
+    if mismatch == "model":
+        config.pipeline_model_parallel_size = 2
+    if mismatch:
+        with pytest.raises(ValueError, match="parallelism mismatch"):
+            setup.configure_prebuilt_disagg_engine(engine)
+        engine.set_disaggregation_config.assert_not_called()
+    else:
+        setup.configure_prebuilt_disagg_engine(engine)
+        engine.set_disaggregation_config.assert_called_once()
 
 
 def test_shard_builder_keeps_replica_process_group(monkeypatch):
