@@ -123,8 +123,8 @@ class FsdpParameterGroup:
     # storage is stale and must be cleared before the next accumulation begins.
     _main_grad_is_stale: bool
     # dtype of the reduce-scatter input (partial_grad): MixedPrecisionPolicy.grad_comm_dtype,
-    # or main_grad's dtype when unset. None when the group has no gradients.
-    grad_comm_dtype: torch.dtype | None
+    # or main_grad's dtype when unset.
+    grad_comm_dtype: torch.dtype
     _unsharded_model_weight: "DBuffer | QuantizedDBuffer"
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
@@ -353,12 +353,11 @@ class FsdpParameterGroup:
         self.main_grad = None
         self.pre_optimizer_main_grad = None
         self._main_grad_is_stale = False
-        self.grad_comm_dtype = None
+        grad_dtype = mixed_precision_policy.main_grads_dtype or parameters[0].dtype
+        self.grad_comm_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
         if not self.requires_grad:
             return
 
-        grad_dtype = mixed_precision_policy.main_grads_dtype or parameters[0].dtype
-        self.grad_comm_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
         # Keep main_grad persistent for the initial implementation. For micro-batch
         # size 1, this allocation could be delayed until post_backward and then
         # eagerly deallocated right after optimizer.step(), avoiding main_grad
@@ -507,7 +506,6 @@ class FsdpParameterGroup:
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
-        assert self.grad_comm_dtype is not None
 
         grads: list[torch.Tensor] = []
         for fsdp_parameter in self.fsdp_parameters:
