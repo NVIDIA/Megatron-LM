@@ -662,6 +662,7 @@ def test_gpt_embedding_groups_use_registered_model(monkeypatch, isolated_globals
                 hidden_size=128,
                 num_attention_heads=4,
                 pipeline_model_parallel_size=3,
+                pipeline_dtype=torch.float32,
                 pipeline_model_parallel_layout="Et*3|m|L",
                 mtp_num_layers=1,
             ),
@@ -697,6 +698,7 @@ def test_dataset_helpers_use_registered_model(monkeypatch, isolated_globals, mod
         context_parallel_size=2,
         hybrid_context_parallel=True,
         pipeline_model_parallel_size=3,
+        pipeline_dtype=torch.float32,
         pipeline_model_parallel_layout="Et*3|m|L",
         mtp_num_layers=1,
     )
