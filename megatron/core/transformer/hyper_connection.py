@@ -116,12 +116,16 @@ def _proj_rms_impl(
     """FP32 projection + RMS normalization from an activation-dtype input."""
     x = x.to(torch.float32)
     weight = weight.to(torch.float32)
-    proj = torch.matmul(x, weight.t())
-    if eps_inside_sqrt:
-        return proj, torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
-    norm = x.norm(dim=-1, keepdim=True)
-    K = x.shape[-1]
-    return proj, 1.0 / (norm / math.sqrt(K) + eps)
+    # Casting the operands is not sufficient under CUDA/CPU autocast: matmul and
+    # reductions are still eligible to downcast float32 inputs.  Keep the whole
+    # projection/RMS recipe in FP32; the caller controls the output cast.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        proj = torch.matmul(x, weight.t())
+        if eps_inside_sqrt:
+            norm = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+        else:
+            norm = 1.0 / (x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1]) + eps)
+    return proj, norm
 
 
 @torch.compile
