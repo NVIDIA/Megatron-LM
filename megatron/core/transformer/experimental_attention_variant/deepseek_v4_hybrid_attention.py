@@ -23,7 +23,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module, get_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
@@ -152,7 +152,7 @@ class DSv4HybridAttention(Attention):
                     f"{ratio_idx + 1} entries, got {len(self.config.csa_compress_ratios)}."
                 )
             compress_ratio = self.config.csa_compress_ratios[ratio_idx]
-        use_compressed_yarn = compress_ratio > 1
+        use_compressed_yarn = compress_ratio > (0 if config.dsv4_version == "v4.1" else 1)
         rope_base = (
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
         )
@@ -271,6 +271,7 @@ class DSv4HybridAttention(Attention):
         sequence_len_offset=None,
         *,
         inference_params=None,
+        csa2_state=None,
     ):
         """Forward pass for DeepSeek-v4 Hybrid Attention"""
         assert (
@@ -351,6 +352,7 @@ class DSv4HybridAttention(Attention):
                 qr=q_compressed,
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
+                **({"csa2_state": csa2_state} if self.config.dsv4_version == "v4.1" else {}),
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
@@ -543,10 +545,15 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         )
 
         q_down_proj_kwargs = {}
-        if submodules.linear_q_down_proj in [TELinear]:
+        # The backend supplies a duplicated linear projection. Only TE requires
+        # an explicit parallel-mode selector; other builders own that contract.
+        q_down_proj_module = get_module(submodules.linear_q_down_proj)
+        if (
+            TELinear is not None
+            and isinstance(q_down_proj_module, type)
+            and issubclass(q_down_proj_module, TELinear)
+        ):
             q_down_proj_kwargs['parallel_mode'] = 'duplicated'
-        else:
-            raise ValueError(f"Unsupported linear_q_down_proj: {submodules.linear_q_down_proj}")
 
         self.linear_q_down_proj = build_module(
             submodules.linear_q_down_proj,
@@ -734,7 +741,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            if self.config.dsv4_version != "v4.1":
+                q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             boundary_rows = 0
             if boundary_kv_compressed is not None:

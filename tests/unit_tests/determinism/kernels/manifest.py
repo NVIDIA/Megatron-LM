@@ -103,6 +103,17 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="cross_layer_tensor_state",
+        sources=(
+            "megatron/core/transformer/state_boundary.py",
+            "megatron/core/transformer/stateful_module.py",
+            "megatron/core/context_parallel/shared_state.py",
+        ),
+        tests=(K + "test_shared_tensor_state.py",),
+        kind="dispatch",
+        notes="Eager/checkpoint/Torch and TE graph state replay, plus explicit CP layout/gather gradients.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
@@ -184,6 +195,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
         ),
         tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
             K + "test_fused_activations.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
         ),
@@ -232,7 +244,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fusions/fused_mhc_kernels.py",
             "megatron/core/transformer/hyper_connection.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py",),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            "tests/unit_tests/transformer/test_single_pass_mhc.py",
+        ),
         kind="triton",
         notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",
     ),
@@ -801,6 +816,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
+        name="csa2_shared_attention",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa2.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_candidates.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_indexer.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_teacher_lse.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_context_parallel.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/thd_utils.py",
+        ),
+        tests=("tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",),
+        kind="triton",
+        notes="CPU owner-gradient and packed-capacity contracts, plus window/sink teacher GPU parity "
+        "and bit-exact replay. Full FlashMLA attention and shared-K atomic gradients remain "
+        "unqualified for deterministic mode; this draft rejects that mode.",
+    ),
+    KernelEntry(
         name="csa_teacher_lse",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
@@ -818,6 +849,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_layout.py",
         ),
         tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
             K + "test_csa_packed_kernels.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
         ),
@@ -825,6 +857,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Tensor-based packed layout, index sanitation and compiled KL. "
         "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
         "numerical CP parity is covered by test_dsv4_packed_cp.py.",
+    ),
+    KernelEntry(
+        name="v41_engram_embedding",
+        sources=("megatron/core/models/engram/distributed_embedding.py",),
+        tests=("tests/unit_tests/models/test_v41_engram.py",),
+        kind="torch-op",
+        notes="Sorted repeated-row accumulation in deterministic mode; real Gloo EP lookup "
+        "and gradient parity, including uneven shards. NCCL GPU replay remains to be qualified.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
