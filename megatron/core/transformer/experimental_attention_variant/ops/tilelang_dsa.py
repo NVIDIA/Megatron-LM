@@ -413,6 +413,7 @@ def _can_use_fused_sparse_indexer_target(
         and query.size(-1) % 16 == 0
         and topk_indices.ndim == 2
         and topk_indices.size(-1) % 64 == 0
+        and (topk_indices.size(-1) <= 256 or topk_indices.size(-1) % 256 == 0)
     )
 
 
