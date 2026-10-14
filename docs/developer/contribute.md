@@ -55,6 +55,8 @@ the model-parallel process groups in a consistent order. This prevents NCCL watc
 threads from accumulating across tests in the same worker process.
 Teardown also resets Transformer Engine's FP8 global state before releasing its
 cached amax-reduction groups, so subsequent tests cannot reuse stale communicators.
+It also clears DTensor's Python and native sharding caches, whose output specs can
+otherwise reuse an old communicator when a new mesh has the same rank layout.
 
 The helper preserves the default process group and groups created by other callers.
 Tests that create additional groups directly must destroy those groups themselves.

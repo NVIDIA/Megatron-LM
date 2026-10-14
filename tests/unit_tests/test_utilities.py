@@ -7,6 +7,7 @@ from typing import Literal
 import torch
 from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
+from torch.distributed.tensor import DTensor
 
 try:
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
@@ -51,7 +52,8 @@ class Utils:
     Repeated test setup must release NCCL groups, whose watchdog threads otherwise
     survive MCore's parallel-state reset. WORLD and independently created groups
     remain available until their owners or the session fixture destroy them.
-    FP8 global state is reset before releasing its cached reduction groups.
+    FP8 global state and DTensor sharding caches are reset before their groups
+    are released, so subsequent tests cannot reuse stale communicators.
     """
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
@@ -121,6 +123,14 @@ class Utils:
             # across autocast contexts. They belong to the model being torn down.
             if FP8GlobalStateManager is not None:
                 FP8GlobalStateManager.reset()
+            # DTensor caches output specs by mesh layout, which does not include
+            # process-group identity. A new equal-layout mesh must not inherit
+            # an output spec tied to the groups that are about to be destroyed.
+            DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding.cache_clear()
+            # Recent PyTorch versions also cache sharding propagation in C++.
+            clear_native_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
+            if clear_native_cache is not None:
+                clear_native_cache()
         ps.destroy_model_parallel()
         # Gloo groups may already have been destroyed by the parallel-state reset.
         # Release remaining groups in a consistent order without touching groups

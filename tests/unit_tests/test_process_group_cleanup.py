@@ -5,6 +5,9 @@
 import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor._op_schema import OpSchema
 
 from megatron.core import parallel_state
 from tests.unit_tests.test_utilities import Utils
@@ -74,4 +77,32 @@ def test_fp8_amax_after_model_parallel_reinitialization(destroy_between):
     finally:
         # Keep a failing regression on an old helper from contaminating later tests.
         FP8GlobalStateManager.reset()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("destroy_between", [True, False], ids=["destroy", "reinitialize"])
+def test_dtensor_after_model_parallel_reinitialization(destroy_between):
+    try:
+        for _ in range(2):
+            Utils.initialize_model_parallel(1, 1)
+            group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+            mesh = DeviceMesh.from_group(group, "cuda", mesh_dim_names=("dp",))
+            value = DTensor.from_local(torch.ones(2, device="cuda"), mesh, [Shard(0)])
+
+            # Equal mesh layouts must not reuse output specs tied to old groups.
+            # Exercise ordinary dispatch (C++ on newer PyTorch) and the Python
+            # propagation path used when native dispatch cannot cache an op.
+            result = value + value
+            assert result.device_mesh.get_group() is group
+            torch.testing.assert_close(
+                result.full_tensor(), torch.full((2 * group.size(),), 2.0, device="cuda")
+            )
+            schema = OpSchema(torch.ops.aten.add.Tensor, (value._spec, value._spec), {})
+            output = DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding(schema)
+            assert output.output_spec.mesh.get_group() is group
+            del mesh, value, result, schema, output
+            if destroy_between:
+                Utils.destroy_model_parallel()
+    finally:
         Utils.destroy_model_parallel()
