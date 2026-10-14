@@ -292,7 +292,7 @@ attribute with the following groups:
 | Field | Required | Purpose |
 |-------|----------|---------|
 | `tp` | Yes | Tensor parallelism sharding |
-| `dp` | Yes (auto-filled on source from `parallel_state` if missing) | Data parallelism routing |
+| `dp` | Yes | Data parallelism routing |
 | `pp` | If PP > 1 | Pipeline stage / layer index remapping |
 | `ep` | If MoE | Expert parallelism routing |
 | `expt_tp` | If expert TP | Expert-specific tensor parallelism |
