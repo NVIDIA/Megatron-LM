@@ -29,7 +29,6 @@ from megatron.core.transformer.moe.megakernel import (
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
-    drop_padding_routes,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
 )
@@ -809,12 +808,12 @@ class MoELayer(BaseMoELayer):
                     packed_seq_params=packed_seq_params,
                     replay_topk_idx=replay_topk_idx,
                 )
-                if padding_mask is not None:
-                    # Like dropless HybridEP, give padding tokens no routes so the megakernel
-                    # skips them. Applied after route(), so it also covers the unmasked router
-                    # outputs that a moe_router CUDA graph replay returns.
-                    probs, routing_map = drop_padding_routes(probs, routing_map, padding_mask)
-                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                # Like dropless HybridEP, the megakernel gives padding tokens no routes and skips
+                # them. It masks after route(), so this also covers the unmasked router outputs
+                # that a moe_router CUDA graph replay returns.
+                return apply_module(self.megakernel_experts)(
+                    hidden_states, probs, routing_map, padding_mask
+                )
 
             if self.moe_layer_recompute and self.training:
                 output = precision_aware_checkpoint(
