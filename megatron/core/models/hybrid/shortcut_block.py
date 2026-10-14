@@ -29,6 +29,7 @@ from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -152,6 +153,7 @@ class ShortcutMoEBlock(MegatronModule):
         super().__init__(compute_layer.config)
 
         self.overlap_mode = overlap_a2a
+        self.inference_overlap = self.config.inference_shortcut_moe_overlap
         self.layer_number = compute_layer.layer_number
         self.attn_layer_idx = compute_layer.layer_number - 1
         self.attn_local_idx = attn_local_idx
@@ -232,7 +234,9 @@ class ShortcutMoEBlock(MegatronModule):
             if self.config.moe_shortcut_post_norm
             else IdentityOp()
         )
-        self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
+        self.route_ready_event = (
+            torch.cuda.Event() if self.overlap_mode or self.inference_overlap else None
+        )
 
     def _read_shortcut_hidden(
         self,
@@ -430,6 +434,149 @@ class ShortcutMoEBlock(MegatronModule):
         )
         return hidden_states
 
+    def _forward_inference_overlap(
+        self,
+        hidden_states,
+        *,
+        attention_mask,
+        inference_context,
+        rotary_pos_emb,
+        sequence_len_offset,
+        packed_seq_params,
+        padding_mask,
+        quant_context_factory,
+        attn_recompute_context,
+        moe_recompute_context,
+    ):
+        """Run independent mixer and routed-expert branches until their outputs join.
+
+        Prefill and mixed use the predecessor's atomic cache-aware forward.
+        Decode exposes its projection, unsplit core and output phases only to
+        order their launches around expert preparation and compute. The routed
+        branch runs entirely on the side stream in every phase. CUDA graphs
+        capture the input-ready fork and the join before the residual write.
+        """
+        if attn_recompute_context is not None or moe_recompute_context is not None:
+            raise RuntimeError("Shortcut MoE inference cannot use residual-stream recomputation")
+        if inference_context is None or not inference_context.is_dynamic_batching():
+            raise RuntimeError("Shortcut MoE inference overlap requires dynamic batching")
+        if inference_context.num_speculative_tokens:
+            raise RuntimeError("Shortcut MoE inference overlap does not support speculative decode")
+        if self.config.mlp_chunks_for_prefill > 1 and not inference_context.is_decode_only():
+            raise RuntimeError("Shortcut MoE inference overlap requires mlp_chunks_for_prefill=1")
+        shortcut_hidden = hidden_states
+        staged_gdp = isinstance(
+            self.compute_layer, MambaLayer
+        ) and self.compute_layer.supports_staged_inference(inference_context)
+        supports_attention = getattr(self.compute_layer, "supports_staged_dynamic_inference", None)
+        staged_attention = callable(supports_attention) and supports_attention(inference_context)
+        if not (staged_gdp or staged_attention):
+            raise RuntimeError(
+                "Shortcut MoE inference overlap requires a staged GDP or dynamic "
+                "FlashAttention predecessor; "
+                f"got {type(self.compute_layer).__name__}"
+            )
+        if not isinstance(self.moe_layer.mlp.token_dispatcher, NVLSAllGatherVDispatcher):
+            raise RuntimeError("Shortcut MoE inference overlap requires the active NVLS dispatcher")
+
+        decode_only = inference_context.is_decode_only()
+        main_stream = torch.cuda.current_stream()
+        shortcut_stream = self._get_a2a_overlap_stream()
+        # Fork before the shortcut read/router. Protect the original pair input
+        # and padding mask until side-stream routing has consumed them.
+        self.route_ready_event.record(main_stream)
+        shortcut_stream.wait_event(self.route_ready_event)
+        shortcut_hidden.record_stream(shortcut_stream)
+        if isinstance(padding_mask, torch.Tensor) and padding_mask.is_cuda:
+            padding_mask.record_stream(shortcut_stream)
+        with torch.cuda.stream(shortcut_stream):
+            with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
+                shortcut_hidden = self._read_shortcut_hidden(
+                    shortcut_hidden, recompute_context=None
+                )
+                route_input, route_probs = self._moe_router_preprocess(
+                    shortcut_hidden=shortcut_hidden,
+                    padding_mask=padding_mask,
+                    packed_seq_params=packed_seq_params,
+                    recompute_context=None,
+                )
+                dispatched_input, dispatched_probs = self._launch_dispatch(
+                    route_input, route_probs, async_op=False
+                )
+
+        if decode_only:
+            with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
+                if staged_gdp:
+                    projection = self.compute_layer.inference_project(
+                        hidden_states, inference_context
+                    )
+                else:
+                    projection = self.compute_layer.forward_inference_project(
+                        hidden_states,
+                        attention_mask,
+                        inference_context=inference_context,
+                        rotary_pos_emb=rotary_pos_emb,
+                        sequence_len_offset=sequence_len_offset,
+                        packed_seq_params=packed_seq_params,
+                        padding_mask=padding_mask,
+                    )
+
+        with torch.cuda.stream(shortcut_stream):
+            with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
+                prepared = self.moe_layer.mlp.experts.prepare_shortcut_overlap(
+                    dispatched_input,
+                    dispatched_probs,
+                    self.moe_layer.mlp.token_dispatcher.routing_map,
+                    max_blocks=self.config.inference_shortcut_moe_expert_max_blocks,
+                )
+
+        if decode_only:
+            with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
+                core_output = (
+                    self.compute_layer.inference_core(projection, inference_context)
+                    if staged_gdp
+                    else self.compute_layer.forward_inference_core(projection)
+                )
+        with torch.cuda.stream(shortcut_stream):
+            with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
+                computed = self.moe_layer.mlp.experts.compute_shortcut_overlap(prepared)
+                routed_output, _ = self.moe_layer.mlp.experts.finish_shortcut_overlap(computed)
+                combined_output = self._launch_combine(routed_output, async_op=False)
+
+        with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
+            if not decode_only:
+                compute_output = self._forward_compute_atomic(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    sequence_len_offset=sequence_len_offset,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                )
+            elif staged_gdp:
+                compute_output = self.compute_layer.inference_post(projection, core_output)
+            else:
+                compute_output, _ = self.compute_layer.forward_inference_post_core(core_output)
+
+        with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
+            shared_expert_output, moe_unflatten_mbs, residual, mlp_state = self._moe_shared_experts(
+                hidden_states=compute_output,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
+                recompute_context=None,
+            )
+            combined_output = self._wait_combine(combined_output)
+            return self._postprocess(
+                residual=residual,
+                combined_output=combined_output,
+                shared_expert_output=shared_expert_output,
+                mlp_state=mlp_state,
+                packed_seq_params=packed_seq_params,
+                moe_unflatten_mbs=moe_unflatten_mbs,
+                recompute_context=None,
+            )
+
     def forward(
         self,
         hidden_states,
@@ -463,6 +610,19 @@ class ShortcutMoEBlock(MegatronModule):
             assert inference_context is None, (
                 "Shortcut-MoE received an inference context outside inference mode; the two-stage "
                 "schedule does not update KV-cache or recurrent inference state."
+            )
+        if inference and self.inference_overlap:
+            return self._forward_inference_overlap(
+                hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                quant_context_factory=quant_context_factory,
+                attn_recompute_context=attn_recompute_context,
+                moe_recompute_context=moe_recompute_context,
             )
         overlap = self.overlap_mode and not inference
 

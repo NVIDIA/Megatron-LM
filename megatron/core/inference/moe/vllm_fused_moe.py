@@ -9,6 +9,7 @@ CUDA-graph compatible: all indirection table construction happens on-device
 via Triton kernels with fixed-size buffers and valid_tokens gating.
 """
 
+from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -703,7 +704,47 @@ def _moe_sum(
 # ---------------------------------------------------------------------------
 
 
-def vllm_fused_moe(
+@dataclass(frozen=True)
+class PreparedVllmMoE:
+    """Device-side expert table and fixed launch configuration.
+
+    Keep this state alive until reduction completes on the consuming stream.
+    Streams and their dependencies belong to the caller. Intermediate buffers
+    reuse the existing process-wide MoE workspace, so separate staged calls
+    must not overwrite a workspace still in use.
+    """
+
+    hidden_states: torch.Tensor
+    probs: torch.Tensor
+    fc1_weight: torch.Tensor
+    fc2_weight: torch.Tensor
+    activation_type: ActivationType
+    activation_clamp_scale: float | None
+    routing_map: torch.Tensor
+    valid_tokens: torch.Tensor
+    num_local_experts: int
+    local_expert_start: int
+    max_tokens: int
+    topk: int
+    config: dict[str, int]
+    sorted_token_ids: torch.Tensor
+    expert_ids: torch.Tensor
+    num_post_padded: torch.Tensor
+    grid_size_fc1: int
+    grid_size_fc2: int
+    topk_weights_flat: torch.Tensor
+    batch_invariant_mode: bool
+
+
+@dataclass(frozen=True)
+class ComputedVllmMoE:
+    """Expert outputs retained with their routing metadata until reduction completes."""
+
+    prepared: PreparedVllmMoE
+    intermediate3: torch.Tensor
+
+
+def prepare_vllm_moe(
     hidden_states: torch.Tensor,
     probs: torch.Tensor,
     fc1_weight: torch.Tensor,
@@ -713,87 +754,125 @@ def vllm_fused_moe(
     local_expert_start: int,
     valid_tokens: torch.Tensor,
     routing_map: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-    num_tokens_hint: Optional[int] = None,
-    activation_clamp_scale: Optional[float] = None,
-) -> torch.Tensor:
-    """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
+    num_tokens_hint: int | None = None,
+    activation_clamp_scale: float | None = None,
+    grid_size_limit: int | None = None,
+) -> PreparedVllmMoE:
+    """Build graph-safe expert tables on the caller's stream before expert GEMMs.
 
-    CUDA-graph compatible: indirection tables are built entirely on-device
-    using fixed-size buffers gated by valid_tokens.
+    ``grid_size_limit`` bounds the launched CTAs for each GEMM; zero or None
+    preserves the ordinary launch grids. This is not an SM allocation limit.
+    The kernel's tile-striding loop still processes every valid expert tile.
+    The limit is a host-side capture setting, fixed across graph replays.
+    All token counts and expert offsets remain on the device.
 
     Args:
-        hidden_states: [max_tokens, hidden_size] BF16 input. Only the first
-            valid_tokens rows are valid; the rest are ignored.
-        probs: [max_tokens, topk] fp32 routing probabilities.
-        fc1_weight: [num_local_experts, fc1_out, hidden_size] BF16.
-        fc2_weight: [num_local_experts, hidden_size, fc1_out] BF16.
-        activation_type: ActivationType enum.
-        num_local_experts: experts on this rank.
-        local_expert_start: first global expert index on this rank.
-        valid_tokens: scalar int32 CUDA tensor with number of valid tokens.
-        routing_map: [max_tokens, topk] int expert assignments.
-        out: optional [max_tokens, hidden_size] output buffer (e.g. the RSV
-            symmetric memory tensor). If None, an fp32 buffer is allocated.
-            When provided, tl.store casts to the buffer's dtype automatically.
-        num_tokens_hint: optional host-side int with the expected number of
-            valid tokens (e.g. batch_size * ep_size). Used to select a better
-            BLOCK_SIZE_M instead of using the worst-case buffer size.
-        activation_clamp_scale: config.activation_func_tanh_clamp_scale. When set, the
-            squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before
-            the square, bounding the activation output by ``s ** 2``. Only supported for
-            SQUARED_RELU; the gated SiTU-GLU form of the clamp is not implemented here.
+        hidden_states: Fixed-capacity BF16 input buffer.
+        probs: Routing probabilities for each input and top-k slot.
+        fc1_weight: Local expert input projection weights.
+        fc2_weight: Local expert output projection weights.
+        activation_type: Activation fused into or following the first GEMM.
+        num_local_experts: Number of experts owned by this rank.
+        local_expert_start: First global expert index owned by this rank.
+        valid_tokens: Device-resident scalar delimiting the live input prefix.
+        routing_map: Global expert assignments for every input and top-k slot.
+        num_tokens_hint: Static token estimate selecting the GEMM configuration.
+        activation_clamp_scale: Optional squared-ReLU pre-activation clamp.
+        grid_size_limit: Maximum launched CTAs per expert GEMM; zero or None
+            leaves the existing grid unchanged.
 
     Returns:
-        [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
-        tl.store handles the implicit cast when out is a different dtype.
+        GPU routing buffers and the static launch configuration.
     """
+    if grid_size_limit is not None and grid_size_limit < 0:
+        raise ValueError("grid_size_limit must be nonnegative or None")
     assert (
         hidden_states.dtype == torch.bfloat16
     ), f"vllm_fused_moe requires bf16 input, got {hidden_states.dtype}"
+    assert activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
+    assert not (activation_type == ActivationType.SWIGLU and activation_clamp_scale is not None), (
+        "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; the "
+        "gated form (SiTU-GLU) has no inference kernel yet."
+    )
 
     max_tokens = hidden_states.size(0)
     topk = routing_map.shape[1]
     effective_tokens = num_tokens_hint if num_tokens_hint is not None else max_tokens
-
-    # Mirror upstream vLLM: pick the full launch config (tile sizes, warps,
-    # stages) host-side from the token-count hint, not from the worst-case
-    # buffer size. Same config is used for both FC1 and FC2 (matches vLLM).
+    # Select the complete launch recipe from the typical token count rather
+    # than the worst-case capacity. Both expert GEMMs use the same tile sizes.
     batch_invariant_mode = batch_invariant.enabled()
     config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
     if batch_invariant_mode:
-        # Batch-invariant mode: pin only the K-reduction recipe. The kernel
-        # accumulates in fp32 with no split-K, so bits depend solely on the
-        # K-loop grouping (BLOCK_SIZE_K); M/N tile shapes, tile grouping and
-        # pipeline depth reorder nothing in the accumulation (bf16 products
-        # are exact in fp32 — only the addition order matters). Keeping the
-        # M/N tiling adaptive preserves the decode-tuned configs; pinning
-        # BLOCK_SIZE_K removes the one field _get_default_config varies that
-        # could change the summation order across co-batch sizes.
+        # Keep the accumulation order independent of the host-side token hint.
         config['BLOCK_SIZE_K'] = 64
 
     sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
         routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
     )
-    num_valid = max_tokens * topk
-
-    N = fc1_weight.size(1)
-    K = fc1_weight.size(2)
-
-    # Grid sized for the typical-case token count (num_tokens_hint).  When the
-    # actual num_tokens_post_padded exceeds this, the kernel's outer tl.range
-    # makes each CTA stride over additional tiles — correct but with reduced
-    # parallelism on rare prefill spikes.  EM hint = effective_tokens*topk +
-    # BLOCK_SIZE_M*num_local_experts upper-bounds the per-expert padding.
+    # Per-expert padding bounds the hinted M-grid. The persistent kernel's
+    # tile-striding loop handles live counts larger than this hint or cap.
     block_m = config['BLOCK_SIZE_M']
     em_hint = effective_tokens * topk + block_m * num_local_experts
     num_pid_m_hint = _ceil_div(em_hint, block_m)
-    num_pid_n_fc1 = _ceil_div(N, config['BLOCK_SIZE_N'])
-    num_pid_n_fc2 = _ceil_div(K, config['BLOCK_SIZE_N'])
-    grid_size_fc1 = num_pid_m_hint * num_pid_n_fc1
-    grid_size_fc2 = num_pid_m_hint * num_pid_n_fc2
+    grid_size_fc1 = num_pid_m_hint * _ceil_div(fc1_weight.size(1), config['BLOCK_SIZE_N'])
+    grid_size_fc2 = num_pid_m_hint * _ceil_div(fc1_weight.size(2), config['BLOCK_SIZE_N'])
+    if grid_size_limit:
+        grid_size_fc1 = min(grid_size_fc1, grid_size_limit)
+        grid_size_fc2 = min(grid_size_fc2, grid_size_limit)
 
-    topk_weights_flat = probs.reshape(-1).contiguous()
+    return PreparedVllmMoE(
+        hidden_states=hidden_states,
+        probs=probs,
+        fc1_weight=fc1_weight,
+        fc2_weight=fc2_weight,
+        activation_type=activation_type,
+        activation_clamp_scale=activation_clamp_scale,
+        routing_map=routing_map,
+        valid_tokens=valid_tokens,
+        num_local_experts=num_local_experts,
+        local_expert_start=local_expert_start,
+        max_tokens=max_tokens,
+        topk=topk,
+        config=config,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_post_padded=num_post_padded,
+        grid_size_fc1=grid_size_fc1,
+        grid_size_fc2=grid_size_fc2,
+        topk_weights_flat=probs.reshape(-1).contiguous(),
+        batch_invariant_mode=batch_invariant_mode,
+    )
+
+
+def compute_vllm_moe(prepared: PreparedVllmMoE) -> ComputedVllmMoE:
+    """Run both expert GEMMs and activation on the caller's current stream.
+
+    Args:
+        prepared: Routing metadata produced by ``prepare_vllm_moe``.
+
+    Returns:
+        Expert outputs and metadata required for the top-k reduction.
+    """
+    hidden_states = prepared.hidden_states
+    fc1_weight = prepared.fc1_weight
+    fc2_weight = prepared.fc2_weight
+    activation_type = prepared.activation_type
+    activation_clamp_scale = prepared.activation_clamp_scale
+    valid_tokens = prepared.valid_tokens
+    max_tokens = prepared.max_tokens
+    topk = prepared.topk
+    config = prepared.config
+    sorted_token_ids = prepared.sorted_token_ids
+    expert_ids = prepared.expert_ids
+    num_post_padded = prepared.num_post_padded
+    grid_size_fc1 = prepared.grid_size_fc1
+    grid_size_fc2 = prepared.grid_size_fc2
+    topk_weights_flat = prepared.topk_weights_flat
+    routing_map = prepared.routing_map
+    batch_invariant_mode = prepared.batch_invariant_mode
+    num_valid = max_tokens * topk
+    N = fc1_weight.size(1)
+    K = fc1_weight.size(2)
 
     # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]. Outside
     # batch-invariant mode, SQUARED_RELU fuses into the GEMM epilogue while
@@ -858,9 +937,9 @@ def vllm_fused_moe(
         # SiLU(gate) * up over the valid_tokens*topk live rows only.
         intermediate1 = bounded_silu_mul(intermediate1, (valid_tokens * topk).to(torch.int32))
 
-    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Batch-invariant mode
-    # already applied routing weights at the activation to match training;
-    # ordinary inference applies them in the reduction kernel.
+    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], without routing weights.
+    # Routing weights are applied in the reduction kernel to avoid an extra
+    # bf16 truncation of prob-scaled values before the topk summation.
     # Only local-expert blocks are processed; non-local positions are left
     # undefined and skipped by _moe_sum (which checks the routing map).
     intermediate3 = VllmFusedMoeBuffers.get(
@@ -880,29 +959,92 @@ def vllm_fused_moe(
         grid_size=grid_size_fc2,
     )
 
-    # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
-    # Applies routing weights and accumulates in fp32, writes directly to
-    # out (if provided), zeros rows beyond valid_tokens, and skips non-local
-    # expert slots.
-    apply_routing_weights = True
-    accumulate_in_fp64 = False
-    if batch_invariant_mode:
-        # Probabilities were applied at the activation to mirror training. Use
-        # training's invariant within-rank accumulation for the unweighted sum.
-        apply_routing_weights = False
-        accumulate_in_fp64 = True
+    return ComputedVllmMoE(prepared=prepared, intermediate3=intermediate3)
 
+
+def finish_vllm_moe(computed: ComputedVllmMoE, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Reduce local top-k expert outputs on the caller's current stream.
+
+    Args:
+        computed: Expert outputs produced by ``compute_vllm_moe``.
+        out: Optional output buffer, including an NVLS reduce-scatter buffer.
+
+    Returns:
+        The supplied output buffer, or an allocated FP32 output buffer.
+    """
+    prepared = computed.prepared
     return _moe_sum(
-        intermediate3,
+        computed.intermediate3,
+        prepared.probs,
+        prepared.max_tokens,
+        prepared.topk,
+        prepared.fc1_weight.size(2),
+        prepared.valid_tokens,
+        prepared.routing_map,
+        prepared.local_expert_start,
+        prepared.num_local_experts,
+        out=out,
+        apply_weights=not prepared.batch_invariant_mode,
+        acc_fp64=prepared.batch_invariant_mode,
+    )
+
+
+def vllm_fused_moe(
+    hidden_states: torch.Tensor,
+    probs: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    activation_type: ActivationType,
+    num_local_experts: int,
+    local_expert_start: int,
+    valid_tokens: torch.Tensor,
+    routing_map: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    num_tokens_hint: Optional[int] = None,
+    activation_clamp_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
+
+    CUDA-graph compatible: indirection tables are built entirely on-device
+    using fixed-size buffers gated by valid_tokens.
+
+    Args:
+        hidden_states: [max_tokens, hidden_size] BF16 input. Only the first
+            valid_tokens rows are valid; the rest are ignored.
+        probs: [max_tokens, topk] fp32 routing probabilities.
+        fc1_weight: [num_local_experts, fc1_out, hidden_size] BF16.
+        fc2_weight: [num_local_experts, hidden_size, fc1_out] BF16.
+        activation_type: ActivationType enum.
+        num_local_experts: experts on this rank.
+        local_expert_start: first global expert index on this rank.
+        valid_tokens: scalar int32 CUDA tensor with number of valid tokens.
+        routing_map: [max_tokens, topk] int expert assignments.
+        out: optional [max_tokens, hidden_size] output buffer (e.g. the RSV
+            symmetric memory tensor). If None, an fp32 buffer is allocated.
+            When provided, tl.store casts to the buffer's dtype automatically.
+        num_tokens_hint: optional host-side int with the expected number of
+            valid tokens (e.g. batch_size * ep_size). Used to select a better
+            BLOCK_SIZE_M instead of using the worst-case buffer size.
+        activation_clamp_scale: config.activation_func_tanh_clamp_scale. When set, the
+            squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before
+            the square, bounding the activation output by ``s ** 2``. Only supported for
+            SQUARED_RELU; the gated SiTU-GLU form of the clamp is not implemented here.
+
+    Returns:
+        [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
+        tl.store handles the implicit cast when out is a different dtype.
+    """
+    prepared = prepare_vllm_moe(
+        hidden_states,
         probs,
-        max_tokens,
-        topk,
-        K,
+        fc1_weight,
+        fc2_weight,
+        activation_type,
+        num_local_experts,
+        local_expert_start,
         valid_tokens,
         routing_map,
-        local_expert_start,
-        num_local_experts,
-        out=out,
-        apply_weights=apply_routing_weights,
-        acc_fp64=accumulate_in_fp64,
+        num_tokens_hint=num_tokens_hint,
+        activation_clamp_scale=activation_clamp_scale,
     )
+    return finish_vllm_moe(compute_vllm_moe(prepared), out=out)
