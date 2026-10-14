@@ -768,7 +768,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         """
         if getattr(self, "softmax_scale", None) is not None:
             softmax_scale = self.softmax_scale
-        elif self.config.softmax_scale is not None:
+        elif getattr(self.config, "softmax_scale", None) is not None:
             softmax_scale = self.config.softmax_scale
         else:
             softmax_scale = query_tensor.size(head_dim_index) ** -0.5
