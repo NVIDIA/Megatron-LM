@@ -322,18 +322,18 @@ selected experts to other EP ranks. The planner uses the algorithm from
 Triton kernels, a virtual-expert dispatcher, and Transformer Engine's grouped expert computation.
 
 - **Dispatcher:** Flex selects `_VirtualExpertHybridEPManager` in
-  [token_dispatcher.py](token_dispatcher.py), which extends the existing HybridEP manager with
+  [token_dispatcher.py](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py), which extends the existing HybridEP manager with
   `VirtualExpertLoadBalancer`. It accepts the router's `[tokens, topk]` expert IDs and
   probabilities, starts planning and weight prefetch, then supplies remapped runtime expert
   IDs to HybridEP. HybridEP handles token dispatch and combine using a fixed receive capacity
   calculated to cover the balanced workload and padding.
-- **Triton kernels:** [virtual_expert_triton.py](ops/virtual_expert_triton.py) implements planning,
+- **Triton kernels:** [virtual_expert_triton.py](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/ops/virtual_expert_triton.py) implements planning,
   selected-weight prefetch, and replica-gradient reduction. The planner combines histogram
   construction, cross-rank histogram exchange, placement, and route remapping in one cooperative
   kernel launch. Separate transport kernels push selected weights into peer virtual slots and
   read replica gradients back into their owners' native gradients through NCCL symmetric memory.
   These kernels move expert weights and gradients; token movement remains with HybridEP.
-- **Expert buffers:** [virtual_expert_load_balancer.py](virtual_expert_load_balancer.py) binds
+- **Expert buffers:** [virtual_expert_load_balancer.py](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/virtual_expert_load_balancer.py) binds
   native weights and temporary virtual slots into the FC1/FC2 runtime weight lists consumed by
   TE's grouped GEMMs. Compatible layers share persistent weight and gradient arenas, reusing
   replica storage across layers. Non-GTP native gradients accumulate directly into DDP buffers;
