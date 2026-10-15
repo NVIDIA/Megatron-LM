@@ -923,17 +923,27 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             if non_compressed_lse is not None
             else q.new_empty(0, dtype=torch.float32)
         )
-        ctx.save_for_backward(q, weights, k, query, key, topk_indices, saved_non_compressed_lse)
+        # The optional mask and layout tensors are built during forward and may live in a CUDA
+        # graph pool that another replay reuses before this backward, so they are saved too.
+        ctx.save_for_backward(
+            q,
+            weights,
+            k,
+            query,
+            key,
+            topk_indices,
+            saved_non_compressed_lse,
+            mask,
+            varlen_starts,
+            varlen_ends,
+            key_positions,
+            query_valid_rows,
+        )
         ctx.has_non_compressed_lse = non_compressed_lse is not None
         ctx.softmax_scale = softmax_scale
         ctx.loss_coeff = loss_coeff
         ctx.sparse_loss = sparse_loss
-        ctx.mask = mask
         ctx.pg_collection = pg_collection
-        ctx.varlen_starts = varlen_starts
-        ctx.varlen_ends = varlen_ends
-        ctx.key_positions = key_positions
-        ctx.query_valid_rows = query_valid_rows
         ctx.calculate_per_token_loss = calculate_per_token_loss
         ctx.use_relu = use_relu
         ctx.num_inputs = len(ctx.needs_input_grad)
@@ -945,7 +955,20 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         """
         Backward: Recompute what we need.
         """
-        q, weights, k, query, key, topk_indices, saved_non_compressed_lse = ctx.saved_tensors
+        (
+            q,
+            weights,
+            k,
+            query,
+            key,
+            topk_indices,
+            saved_non_compressed_lse,
+            mask,
+            varlen_starts,
+            varlen_ends,
+            key_positions,
+            query_valid_rows,
+        ) = ctx.saved_tensors
         non_compressed_lse = saved_non_compressed_lse if ctx.has_non_compressed_lse else None
 
         grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
@@ -958,13 +981,13 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             ctx.softmax_scale,
             ctx.loss_coeff,
             ctx.sparse_loss,
-            ctx.mask,
+            mask,
             grad_loss,
             ctx.pg_collection,
-            varlen_starts=ctx.varlen_starts,
-            varlen_ends=ctx.varlen_ends,
-            key_positions=ctx.key_positions,
-            query_valid_rows=ctx.query_valid_rows,
+            varlen_starts=varlen_starts,
+            varlen_ends=varlen_ends,
+            key_positions=key_positions,
+            query_valid_rows=query_valid_rows,
             calculate_per_token_loss=ctx.calculate_per_token_loss,
             use_relu=ctx.use_relu,
             non_compressed_lse=non_compressed_lse,
