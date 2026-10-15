@@ -30,27 +30,42 @@ if not HAVE_TRITON:
 @triton.jit
 def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
     # Cast ``pid_m`` and ``cu_seqlens`` loads to a single shared dtype so
-    # the loop-body reassignments don't surface as
+    # the reassignments below don't surface as
     # "initial value is int32 but redefined as int64" in newer Triton
     # versions (which promote ``// Python_int`` to int64).
     pid_m = pid_m.to(tl.int64)
-    token_idx = tl.full((), -1, dtype=tl.int64)
-    this_seq_len = tl.full((), 0, dtype=tl.int64)
-    seq_idx = 0
-    last_cum_seqlen = tl.load(cu_seqlens).to(tl.int64) // cp_size
-    while seq_idx < seq_num:
-        cur_cum_seqlen = tl.load(cu_seqlens + seq_idx + 1).to(tl.int64) // cp_size
-        if token_idx == -1 and cur_cum_seqlen > pid_m:
-            token_idx = pid_m - last_cum_seqlen
-            this_seq_len = cur_cum_seqlen - last_cum_seqlen
-        last_cum_seqlen = cur_cum_seqlen
-        seq_idx += 1
+    seq_count = tl.full((), seq_num, dtype=tl.int32)
+
+    # Binary search for the first sequence whose CP-local end offset
+    # cu_seqlens[i + 1] // cp_size is greater than pid_m, as in
+    # _get_contiguous_thd_token_idx: log2(seq_num) steps per row instead of a walk
+    # over every packed sequence, and zero-length sequences (duplicate offsets) are
+    # skipped. The test is written as cu_seqlens[i + 1] >= (pid_m + 1) * cp_size to
+    # keep the division out of the loop, and start_offset / end_offset carry
+    # cu_seqlens[low] / cu_seqlens[high + 1], so the sequence found needs no reload.
+    row_end = (pid_m + 1) * cp_size
+    start_offset = tl.load(cu_seqlens)
+    end_offset = start_offset
+    low = tl.full((), 0, dtype=tl.int32)
+    high = seq_count
+    while low < high:
+        mid = (low + high) >> 1
+        offset = tl.load(cu_seqlens + mid + 1)
+        go_left = row_end <= offset
+        low = tl.where(go_left, low, mid + 1)
+        high = tl.where(go_left, mid, high)
+        start_offset = tl.where(go_left, start_offset, offset)
+        end_offset = tl.where(go_left, offset, end_offset)
+
     # Padding tokens beyond cu_seqlens[-1] (from THD CUDA-graph padding)
-    # never match any sequence, leaving token_idx == -1.  Clamp to 0 so
-    # the cos/sin table loads stay in-bounds; the wrong RoPE result is
-    # harmless because padding positions are excluded by loss_mask.
-    if token_idx == -1:
-        token_idx = tl.full((), 0, dtype=tl.int64)
+    # never match any sequence.  Give them position 0 and length 0 so the
+    # cos/sin table loads stay in-bounds; the wrong RoPE result is harmless
+    # because padding positions are excluded by loss_mask.
+    in_sequence = low < seq_count
+    seq_start = start_offset.to(tl.int64) // cp_size
+    seq_end = end_offset.to(tl.int64) // cp_size
+    token_idx = tl.where(in_sequence, pid_m - seq_start, 0)
+    this_seq_len = tl.where(in_sequence, seq_end - seq_start, 0)
     if cp_size > 1:
         first_cp_seg = (this_seq_len + 1) // 2
         second_cp_seg = this_seq_len // 2
