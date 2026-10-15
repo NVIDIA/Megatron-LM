@@ -1560,6 +1560,21 @@ class ChainedOptimizer(MegatronOptimizer):
             params.extend(optimizer.get_parameters())
         return params
 
+    def get_main_param_shard(self, model_param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+        """Return the FP32 main param shard held by this rank for model_param, or None.
+
+        Delegates to the chained optimizers that track main params (the distributed optimizer).
+        None means no chained optimizer holds a shard of model_param on this rank.
+        """
+        for optimizer in self.chained_optimizers:
+            get_main_param_shard = getattr(optimizer, 'get_main_param_shard', None)
+            if get_main_param_shard is None:
+                continue
+            shard = get_main_param_shard(model_param)
+            if shard is not None:
+                return shard
+        return None
+
     @property
     def state(self) -> ProxyDict:
         """
