@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional
 
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import is_te_min_version, log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -1036,6 +1036,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.load_state_dict(state_dict)
             return
 
+        if 'param_state' in state_dict:
+            self._check_loaded_param_remainders(state_dict)
+
         if len(self.optimizer.state) == 0:
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
@@ -1117,7 +1120,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 for key in self.optimizer_state_keys
                             }
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                                if self.config.resolved_store_param_remainders and self.config.bf16:
+                                if self._stores_param_remainders():
                                     tensors["master_param"] = init_shard(torch.int16)
                                 else:
                                     tensors["master_param"] = init_shard(
@@ -1748,7 +1751,52 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         state_dict['param_state'] = param_state
         state_dict['param_state_sharding_type'] = sharding_type
+        state_dict['param_state_param_remainders'] = self._stores_param_remainders()
         return state_dict
+
+    def _stores_param_remainders(self) -> bool:
+        """Whether the "param" entries of the parameter state are the int16 remainders of the FP32
+        master weights (see OptimizerConfig.store_param_remainders) rather than main params."""
+        return bool(
+            self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and self.config.resolved_store_param_remainders
+            and self.config.bf16
+        )
+
+    def _check_loaded_param_remainders(self, state_dict: dict) -> None:
+        """Raise if the checkpoint's "param" entries are in a different format than this run's.
+
+        Loading int16 param remainders as main params, or the reverse, is a silent value cast
+        that corrupts the master weights, so it must fail instead.
+        """
+        stored = state_dict.get('param_state_param_remainders')
+        if stored is None:
+            # Written before the format was recorded. Infer it as it was resolved then: the
+            # precision-aware optimizer did not own the masters of BF16 params with FP32 main
+            # params and a non-delayed FP8 recipe, and param remainders were stored unless
+            # disabled (they were incompatible with --optimizer-cuda-graph, so it was not used).
+            stored = bool(
+                self.config._use_precision_aware_optimizer_regardless_of_param_dtype()
+                and self.config.bf16
+                and self.config.store_param_remainders is not False
+                and is_te_min_version("2.1.0")
+            )
+        current = self._stores_param_remainders()
+        if stored == current:
+            return
+
+        def describe(remainders):
+            if remainders:
+                return "int16 param remainders of the FP32 master weights"
+            return "full main params"
+
+        raise RuntimeError(
+            f"The distributed optimizer checkpoint stores {describe(stored)}, but this run uses "
+            f"{describe(current)}. Loading it would silently corrupt the master weights. "
+            f"{'Set --store-param-remainders' if stored else 'Set --no-store-param-remainders'} "
+            "to match the checkpoint (param remainders are not supported with "
+            "--optimizer-cuda-graph), or skip loading the optimizer state with --no-load-optim."
+        )
 
     def _param_groups_to_param2group_meta(
         self, param_groups: list[dict[str, Any]]

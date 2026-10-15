@@ -6,10 +6,12 @@ import torch
 
 pytest.importorskip("transformer_engine")
 
+from megatron.core.dist_checkpointing import load, save
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -231,3 +233,55 @@ def test_precision_aware_optimizer_requires_distributed_optimizer(model_parallel
     model = _ddp_model(use_distributed_optimizer=False)
     with pytest.raises(ValueError, match="only supported with distributed optimizer"):
         _get_optimizer(model, use_distributed_optimizer=False)
+
+
+# (format saved with, format loaded with, whether the checkpoint records its format). The
+# checkpoints without a record stand for the ones written before the BF16-params path existed,
+# which held MCore-managed FP32 main params for this configuration.
+_CHECKPOINT_COMPATIBILITY_CASES = [
+    (None, None, True),
+    (True, True, True),
+    (None, True, True),
+    (True, None, True),
+    (None, None, False),
+    (None, True, False),
+]
+
+
+@pytest.mark.parametrize(
+    ("save_remainders", "load_remainders", "record_format"), _CHECKPOINT_COMPATIBILITY_CASES
+)
+def test_param_remainders_checkpoint_compatibility(
+    model_parallel, tmp_path_dist_ckpt, save_remainders, load_remainders, record_format
+):
+    """Loading int16 param remainders as FP32 master params, or the reverse, used to be a silent
+    value cast in dist-checkpointing that corrupted the master weights. It must raise instead,
+    and matching formats must load the exact master weights."""
+    metadata = {"distrib_optim_sharding_type": "dp_reshardable", "checkpoint_version": 3.1}
+    name = f"remainders_{save_remainders}_{load_remainders}_{record_format}"
+    with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:
+        model = _ddp_model()
+        _, optimizer = _get_optimizer(model, store_param_remainders=save_remainders)
+        _train_step(model, optimizer)
+        (saving,) = optimizer.chained_optimizers
+        sharded_state_dict = saving.sharded_state_dict({}, metadata=metadata)
+        assert sharded_state_dict["param_state_param_remainders"] == bool(save_remainders)
+        if not record_format:
+            del sharded_state_dict["param_state_param_remainders"]
+        save({"optimizer": sharded_state_dict}, ckpt_dir)
+        saved_shard = saving.get_main_param_shard(model.module.weight)
+
+        _, optimizer = _get_optimizer(model, store_param_remainders=load_remainders)
+        (loading,) = optimizer.chained_optimizers
+        loaded = load(
+            {"optimizer": loading.sharded_state_dict({}, metadata=metadata, is_loading=True)},
+            ckpt_dir,
+        )
+        if bool(save_remainders) != bool(load_remainders):
+            with pytest.raises(RuntimeError, match="silently corrupt"):
+                loading.load_state_dict(loaded["optimizer"])
+            return
+        loading.load_state_dict(loaded["optimizer"])
+        loaded_shard = loading.get_main_param_shard(model.module.weight)
+        if saved_shard is not None:
+            assert torch.equal(loaded_shard, saved_shard)
