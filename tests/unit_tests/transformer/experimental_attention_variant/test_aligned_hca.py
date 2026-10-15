@@ -99,13 +99,14 @@ def test_backward_dispatch_and_strides(cp_rank, cp_size, deterministic, reconstr
             hca_cp_size=cp_size,
         )
         torch.testing.assert_close(result, out.reshape(3, -1))
-        context = result.grad_fn.next_functions[0][0]
+        # Saved layout ends with (topk_idxs, out, lse, topk_length, *out_rope tensors).
+        saved = result.grad_fn.next_functions[0][0].saved_tensors
         if cp_rank is None:
-            assert context.saved_tensors[-3] is forward.call_args.args[2]
-            assert context.topk_length is lengths
+            assert saved[-6] is forward.call_args.args[2]
+            assert saved[-3] is lengths
         else:
-            assert context.saved_tensors[-3] is None
-            assert context.topk_length is None
+            assert saved[-6] is None
+            assert saved[-3] is None
         result.backward(dout.reshape_as(result))
     for actual, expected in zip((q.grad, kv.grad, sink.grad), grads.values()):
         torch.testing.assert_close(actual, expected)
