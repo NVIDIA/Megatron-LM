@@ -286,13 +286,15 @@ class TestTop2Router:
         not torch.cuda.is_available() or not HAVE_DENSE_ROUTER_FUSION,
         reason="TE dense fused router output is not available",
     )
-    def test_hybridep_dense_routing_masks_padding(self, monkeypatch):
+    @pytest.mark.parametrize("rank_capacity_factor", [None, 1.5])
+    def test_hybridep_dense_routing_masks_padding(self, monkeypatch, rank_capacity_factor):
         monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
         self.router = self.router.cuda()
         self.router.config.moe_router_fusion = True
         self.router.config.moe_token_dispatcher_type = "flex"
         self.router.config.moe_flex_dispatcher_backend = "hybridep"
         self.router.config.moe_hybridep_routing_map_mode = "indices"
+        self.router.config.moe_expert_rank_capacity_factor = rank_capacity_factor
         hidden_states = torch.randn(
             (8, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
         )
@@ -318,13 +320,12 @@ class TestTop2Router:
             ("flex", "deepep", None, None),
             ("flex", "deepepv2", None, None),
             ("flex", "hybridep", 1.0, None),
-            ("flex", "hybridep", None, 1.0),
         ],
     )
     def test_padding_mask_preserves_routes_outside_dropless_hybridep(
         self, dispatcher, backend, capacity_factor, rank_capacity_factor
     ):
-        """Only dropless HybridEP may consume a sparse route map."""
+        """Other backends and per-expert padding retain their fixed-route contract."""
         self.router = self.router.cuda()
         self.router.config.moe_token_dispatcher_type = dispatcher
         self.router.config.moe_flex_dispatcher_backend = backend
@@ -567,6 +568,79 @@ class TestGroupLimitedRouter:
             torch.testing.assert_close(scores_ref, scores_fused)
             # restore the config
             self.router.config.moe_router_fusion = False
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("hash_routing", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_hybridep_rank_capacity_masks_padding(hash_routing, capture):
+    """A static rank budget must not count padded tokens as routed work."""
+    Utils.initialize_model_parallel(1, 1)
+    graph = None
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_score_function="sqrtsoftplus",
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_grouped_gemm=True,
+            moe_use_grouped_tensor=True,
+            moe_expert_rank_capacity_factor=1.5,
+            moe_n_hash_layers=int(hash_routing),
+            actual_vocab_size=16,
+            use_cpu_initialization=True,
+            add_bias_linear=False,
+        )
+        router = TopKRouter(
+            config, pg_collection=get_default_pg_collection(), layer_number=1
+        ).cuda()
+        logits = torch.arange(64, dtype=torch.float32, device="cuda").reshape(8, 1, 8) / 64
+        input_ids = torch.arange(8, device="cuda").reshape(1, 8)
+        padding_mask = torch.zeros(8, 1, device="cuda", dtype=torch.bool)
+        if capture:
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(3):
+                    router.routing(logits, padding_mask=padding_mask, input_ids=input_ids)
+            torch.cuda.current_stream().wait_stream(warmup_stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual_probs, actual_map = router.routing(
+                    logits, padding_mask=padding_mask, input_ids=input_ids
+                )
+
+        # Replay with different padding amounts, including all padding. Repeated
+        # zero IDs would otherwise concentrate hash routes on the first experts.
+        for valid_tokens in (2, 5, 0, 2):
+            padding_mask.copy_((torch.arange(8, device="cuda") >= valid_tokens).unsqueeze(1))
+            input_ids.copy_(torch.arange(8, device="cuda").reshape(1, 8))
+            input_ids[:, valid_tokens:] = 0
+            config.moe_expert_rank_capacity_factor = None
+            expected_probs, expected_map = router.routing(
+                logits, padding_mask=padding_mask, input_ids=input_ids
+            )
+            config.moe_expert_rank_capacity_factor = 1.5
+            if graph is None:
+                actual_probs, actual_map = router.routing(
+                    logits, padding_mask=padding_mask, input_ids=input_ids
+                )
+            else:
+                graph.replay()
+            assert not actual_map[valid_tokens:].any(), "Padding consumed the expert-rank budget"
+            assert actual_map.sum().item() == valid_tokens * config.moe_router_topk
+            torch.testing.assert_close(actual_probs, expected_probs, rtol=0, atol=0)
+            assert torch.equal(actual_map, expected_map)
+    finally:
+        if graph is not None:
+            graph.reset()
+        Utils.destroy_model_parallel()
 
 
 class TestAuxLossFreeTop2Router:
