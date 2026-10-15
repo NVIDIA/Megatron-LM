@@ -3154,6 +3154,135 @@ class TestMultiTokenPrediction:
         for sharded, gathered in zip(results[False], results[True]):
             torch.testing.assert_close(gathered, sharded)
 
+    def test_process_mtp_loss_counts_with_argmax_from_loss(self, monkeypatch):
+        """When the loss returns the argmax of the logits, the acceptance counts use it."""
+        captured = {}
+        calls = []
+
+        def capture_metrics(loss, correct, total, *args, **kwargs):
+            captured["correct"], captured["total"] = correct, total
+
+        monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", capture_metrics)
+        monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=3,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        # The MTP logits are all zero, so their own argmax would be token 0 everywhere.
+        hidden_states = torch.zeros(2 * seq_len, 1, 3)
+        labels = torch.tensor([[0, 1, 2, 0]])
+        # Labels after the MTP roll are [1, 2, 0, 0], the last one masked.
+        preds_from_loss = torch.tensor([[1], [2], [0], [1]])
+
+        def compute_language_model_loss(labels, logits, return_argmax=False):
+            calls.append(return_argmax)
+            loss = torch.ones_like(labels, dtype=logits.dtype)
+            return (loss, preds_from_loss) if return_argmax else loss
+
+        for is_training in (True, False):
+            process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=torch.ones(1, seq_len),
+                output_layer=lambda hidden, **kwargs: (hidden, None),
+                output_weight=None,
+                is_training=is_training,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+                metric_avg_group=object(),
+            )
+
+        assert calls == [True, False]
+        assert captured["correct"].item() == 3
+        assert captured["total"].item() == 3
+
+    @pytest.mark.skipif(not HAVE_TE, reason="needs Transformer Engine")
+    @pytest.mark.parametrize("tp", [1, 2])
+    def test_process_mtp_loss_te_argmax_matches_acceptance_argmax(self, tp, monkeypatch):
+        """Acceptance counts from the argmax of TE's cross entropy equal those from the logits,
+        and the loss and gradients do not change."""
+        from megatron.core.extensions import transformer_engine as te_extensions
+
+        if not getattr(te_extensions, "_TE_FUSED_PARALLEL_CE_RETURN_ARGMAX", False):
+            pytest.skip("TE's parallel_cross_entropy cannot return the argmax")
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp:
+            pytest.skip(f"TP={tp} requires at least {tp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+        tp_group = get_tensor_model_parallel_group()
+        config = TransformerConfig(
+            hidden_size=64,
+            num_layers=2,
+            num_attention_heads=4,
+            mtp_num_layers=2,
+            use_cpu_initialization=True,
+        )
+        # A small vocabulary, so that some predictions are right.
+        seq_len, vocab_size = 64, 16
+        hidden_states = torch.randn(
+            (1 + config.mtp_num_layers) * seq_len, self.micro_batch_size, config.hidden_size
+        ).cuda()
+        labels = torch.randint(0, vocab_size, (self.micro_batch_size, seq_len)).cuda()
+        argmax_requests = []
+
+        def loss_with_argmax(labels, logits, return_argmax=False):
+            out = te_extensions.te_cross_entropy(
+                logits, labels.transpose(0, 1).contiguous(), tp_group, return_argmax=return_argmax
+            )
+            loss, argmax = out if return_argmax else (out, None)
+            loss = loss.transpose(0, 1).contiguous()
+            if not return_argmax:
+                return loss
+            argmax_requests.append(argmax is not None)
+            return loss, argmax
+
+        def loss_without_argmax(labels, logits):
+            return loss_with_argmax(labels, logits)
+
+        monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+        results = []
+        for compute_language_model_loss in (loss_without_argmax, loss_with_argmax):
+            torch.manual_seed(_SEED)  # Same weights for both runs.
+            output_layer = ColumnParallelLinear(
+                config.hidden_size,
+                vocab_size,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                gather_output=False,
+                tp_group=tp_group,
+            ).cuda()
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            hidden = hidden_states.clone().requires_grad_(True)
+            process_mtp_loss(
+                hidden_states=hidden,
+                labels=labels,
+                loss_mask=None,
+                output_layer=output_layer,
+                output_weight=None,
+                is_training=True,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+                tp_group=tp_group,
+            ).sum().backward()
+            tracker = MTPLossLoggingHelper.tracker
+            metrics = torch.cat(
+                [tracker[key] for key in ("loss_values", "correct_values", "total_values")]
+            )
+            results.append((metrics, output_layer.weight.grad, hidden.grad))
+
+        assert argmax_requests == [True] * config.mtp_num_layers
+        correct_values = results[0][0][config.mtp_num_layers : 2 * config.mtp_num_layers]
+        assert correct_values.sum() > 0
+        for without_argmax, with_argmax in zip(*results):
+            torch.testing.assert_close(with_argmax, without_argmax, rtol=0, atol=0)
+
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences(self, cp):
         """Test roll_tensor function with packed sequences, with and without CP.
