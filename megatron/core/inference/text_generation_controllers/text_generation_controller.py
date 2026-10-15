@@ -38,6 +38,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer
@@ -979,6 +980,17 @@ class TextGenerationController:
         if has_mtp:
             # Get decoder hidden states at last accepted positions.
             hidden_states = unwrapped_model._decoder_hidden_states_cache
+
+            # Block-scope CUDA graphs write into a persistent max_tokens-sized
+            # buffer. Only the prefix for this step is valid. Slice each rank's
+            # local SP shard before gathering; gathering the oversized buffer
+            # would place rank 0's stale tail between the valid rank shards.
+            if context.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                local_token_count = context.padded_active_token_count
+                if self._sp_enabled:
+                    assert local_token_count % self._tp_size == 0
+                    local_token_count //= self._tp_size
+                hidden_states = hidden_states[:local_token_count]
 
             # When SP is active the decoder output is in scattered format
             # [S/TP, B, H], but _last_accepted_seq_indices are indices into

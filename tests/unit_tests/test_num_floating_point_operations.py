@@ -74,6 +74,7 @@ def _make_gpt_args(
     args.moe_shared_expert_intermediate_size = None
     args.mtp_num_layers = None
     args.mtp_use_repeated_layer = False
+    args.mtp_detach_heads = False
     # Linear attention disabled.
     args.experimental_attention_variant = None
     args.linear_attention_freq = None
@@ -107,6 +108,7 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     args.mamba_head_dim = 64
     args.mamba_num_groups = 8
     args.mamba_num_heads = 128
+    args.gdp_num_householder = 3
     return args
 
 
@@ -539,6 +541,7 @@ class TestHybridMatchesStandard:
         hybrid.mamba_head_dim = 64
         hybrid.mamba_num_groups = 8
         hybrid.mamba_num_heads = 128
+        hybrid.gdp_num_householder = 3
         # Match the standard model's attention implementation explicitly:
         # '*' is regular attention and '+' is dense MLA in the hybrid grammar.
         attention_symbol = "+" if hybrid.multi_latent_attention else "*"
@@ -618,6 +621,84 @@ class TestHybridMatchesStandard:
             args.gated_attention_proj_granularity = gate_granularity
 
         self._assert_match(configure)
+
+
+class TestMTPLogitFlops:
+    """MTP head detachment removes draft wgrad without changing the final LM head."""
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    @pytest.mark.parametrize("mtp_loss_type", ("cross_entropy", "e2e_tv"))
+    def test_detached_draft_heads_omit_only_weight_gradient(self, make_args, mtp_loss_type):
+        args = make_args()
+        args.mtp_num_layers = 3
+        args.mtp_loss_type = mtp_loss_type
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        args.mtp_detach_heads = False
+        attached_flops = num_floating_point_operations(args, batch_size)
+        args.mtp_detach_heads = True
+        detached_flops = num_floating_point_operations(args, batch_size)
+
+        # One FMA-counted output-projection pass (wgrad) disappears per draft
+        # head. Forward and hidden-state dgrad remain.
+        expected_removed_wgrad = (
+            2 * total_tokens * args.hidden_size * args.padded_vocab_size * args.mtp_num_layers
+        )
+        assert attached_flops - detached_flops == expected_removed_wgrad
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    def test_detached_heads_preserve_e2e_tv_target_projection(self, make_args):
+        args = make_args()
+        args.mtp_num_layers = 3
+        args.mtp_detach_heads = True
+        batch_size = 2
+
+        args.mtp_loss_type = "cross_entropy"
+        cross_entropy_flops = num_floating_point_operations(args, batch_size)
+        args.mtp_loss_type = "e2e_tv"
+        e2e_tv_flops = num_floating_point_operations(args, batch_size)
+
+        # The frozen target projection adds one forward pass, independent of
+        # the number of draft heads and their omitted weight gradients.
+        expected_target_projection = (
+            2 * batch_size * args.seq_length * args.hidden_size * args.padded_vocab_size
+        )
+        assert e2e_tv_flops - cross_entropy_flops == expected_target_projection
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    def test_detach_flag_does_not_change_final_lm_head(self, make_args):
+        args = make_args()
+        args.mtp_num_layers = None
+        batch_size = 2
+
+        args.mtp_detach_heads = False
+        attached_flops = num_floating_point_operations(args, batch_size)
+        args.mtp_detach_heads = True
+        detached_flops = num_floating_point_operations(args, batch_size)
+
+        assert attached_flops == detached_flops
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    def test_missing_detach_flag_keeps_legacy_three_pass_count(self, make_args):
+        args = make_args()
+        args.mtp_num_layers = 3
+        batch_size = 2
+
+        del args.mtp_detach_heads
+        legacy_flops = num_floating_point_operations(args, batch_size)
+        args.mtp_detach_heads = False
+        explicit_attached_flops = num_floating_point_operations(args, batch_size)
+
+        assert legacy_flops == explicit_attached_flops
 
 
 class TestKimiDeltaAttentionFlops:
@@ -710,6 +791,36 @@ class TestHybridAttentionOutputGateFlops:
 
         expected_delta = 3 * 2 * total_tokens * args.hidden_size * gate_projection_size
         assert gated_flops - ungated_flops == expected_delta
+
+
+class TestGatedDeltaProductFlops:
+    """GDP FLOPs must use the Householder count from the model configuration."""
+
+    def test_householder_count_changes_flops(self):
+        args = _make_hybrid_args()
+        args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "gdp_stack_spec"]
+        batch_size = 4
+
+        flops_m3 = num_floating_point_operations(args, batch_size)
+        args.gdp_num_householder = 4
+        flops_m4 = num_floating_point_operations(args, batch_size)
+
+        total_tokens = batch_size * args.seq_length
+        d_inner = args.mamba_num_heads * args.mamba_head_dim
+        group_state_dim = args.mamba_num_groups * args.mamba_state_dim
+        forward_delta_per_layer = (
+            2
+            * total_tokens
+            * (
+                args.hidden_size * (d_inner + group_state_dim + args.mamba_num_heads)
+                + 4 * (d_inner + group_state_dim)
+            )
+            + 4 * total_tokens * d_inner * args.mamba_state_dim
+        )
+        num_gdp_layers = 2
+        expected_delta = 3 * num_gdp_layers * forward_delta_per_layer
+
+        assert flops_m4 - flops_m3 == expected_delta
 
 
 class TestPaddingRemoval:
@@ -1604,6 +1715,7 @@ def _make_dsv4_pair(*, ratios, mtp, moe):
     hybrid.mamba_head_dim = 64
     hybrid.mamba_num_groups = 8
     hybrid.mamba_num_heads = 128
+    hybrid.gdp_num_householder = 3
     main_pattern = "".join(_RATIO_TO_SYMBOL[r] + ffn_symbol for r in ratios)
     mtp_pattern = ("/" + "W" + ffn_symbol) * mtp  # MTP layer = Window attention
     hybrid.hybrid_layer_pattern = main_pattern + mtp_pattern

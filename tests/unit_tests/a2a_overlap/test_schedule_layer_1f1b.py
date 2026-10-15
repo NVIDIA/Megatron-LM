@@ -489,7 +489,9 @@ class TestA2AOverlap:
         apply_flex_backend_kwargs(extra_kwargs, "flex", "ncclep")
         extra_kwargs.update(
             moe_ncclep_zero_copy=True,
-            moe_ncclep_static_shape=True,
+            # zero-copy needs the static path; generous factor since the small test token
+            # counts make routing imbalance high and overflow hard-traps.
+            moe_expert_rank_capacity_factor=8.0,
             use_transformer_engine_op_fuser=True,
             gated_linear_unit=True,
             activation_func=F.silu,

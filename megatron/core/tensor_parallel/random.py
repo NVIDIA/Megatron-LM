@@ -478,6 +478,8 @@ def model_parallel_cuda_manual_seed(
     tp_rank: Optional[int] = None,
     ep_rank: Optional[int] = None,
     etp_rank: Optional[int] = None,
+    gtp_remat_rank: Optional[int] = None,
+    egtp_remat_rank: Optional[int] = None,
     force_reset_rng: bool = False,
 ):
     """Initialize model parallel cuda seed.
@@ -503,6 +505,10 @@ def model_parallel_cuda_manual_seed(
         ep_rank = get_expert_model_parallel_rank()
     if etp_rank is None:
         etp_rank = get_expert_tensor_parallel_rank()
+    if gtp_remat_rank is None:
+        gtp_remat_rank = get_gtp_weight_remat_rank()
+    if egtp_remat_rank is None:
+        egtp_remat_rank = get_expert_gtp_weight_remat_rank()
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
     tensor_model_parallel_seed = offset + tp_rank
@@ -527,11 +533,9 @@ def model_parallel_cuda_manual_seed(
     # must draw DIFFERENT values (everything above is identical across peers by design). The 65536
     # stride keeps these disjoint from the tp/ep/etp seeds. Added only when the axis is active, so
     # non-GTP runs keep a byte-identical tracker set (and checkpoint rng payload).
-    gtp_remat_rank = get_gtp_weight_remat_rank()
     if get_gtp_weight_remat_world_size() > 1:
         gtp_remat_seed = tensor_model_parallel_seed + 65536 * (1 + gtp_remat_rank)
         _CUDA_RNG_STATE_TRACKER.add(_GTP_REMAT_RNG_TRACKER_NAME, gtp_remat_seed)
-    egtp_remat_rank = get_expert_gtp_weight_remat_rank()
     if get_expert_gtp_weight_remat_world_size() > 1:
         egtp_remat_seed = expert_parallel_seed + 32768 + 65536 * (1 + egtp_remat_rank)
         _CUDA_RNG_STATE_TRACKER.add(_EXPERT_GTP_REMAT_RNG_TRACKER_NAME, egtp_remat_seed)
@@ -687,9 +691,11 @@ _Ts = TypeVarTuple('_Ts')
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
-    This function is adapted from torch.utils.checkpoint with two main changes:
+    This function is adapted from torch.utils.checkpoint with three main changes:
     1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`
     2) the states in the model parallel tracker are also properly tracked/set/reset.
+    3) the FP8 autocast state active at the forward is recorded and re-entered for the
+       recompute, which backward() runs outside the caller's autocast.
     """
 
     # pylint: disable=missing-function-docstring
@@ -709,7 +715,18 @@ class CheckpointFunction(torch.autograd.Function):
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
 
-        with torch.no_grad():
+        # Record the FP8 autocast state: backward() recomputes outside the caller's fp8_autocast,
+        # so the recompute has to re-enter the same state (as CheckpointWithoutOutput and TE's
+        # checkpoint do). Otherwise a TE module in the region recomputes in BF16 while its forward
+        # ran in FP8, or dequantizes FP8 parameters and loses their wgrad-fusion ``main_grad``.
+        ctx.fp8 = bool(HAVE_TE and FP8GlobalStateManager.is_fp8_enabled())
+        ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if ctx.fp8 else None
+        fwd_ctx = (
+            activation_recompute_forward(activation_recompute=True, recompute_phase=False)
+            if ctx.fp8
+            else contextlib.nullcontext()
+        )
+        with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
 
         # Divide hidden states across model parallel group and only keep
@@ -749,9 +766,17 @@ class CheckpointFunction(torch.autograd.Function):
             # Set the states to what it used to be before the forward pass.
             _set_all_rng_states(*ctx.rng_states)
 
-            # Compute the forward pass.
+            # Compute the forward pass under the FP8 state recorded in forward().
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
+            if ctx.fp8:
+                recompute_ctx = activation_recompute_forward(
+                    activation_recompute=True, recompute_phase=True
+                )
+                fp8_ctx = fp8_autocast(enabled=True, fp8_recipe=ctx.fp8_recipe)
+            else:
+                recompute_ctx = contextlib.nullcontext()
+                fp8_ctx = contextlib.nullcontext()
+            with torch.enable_grad(), fp8_ctx, recompute_ctx:
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):

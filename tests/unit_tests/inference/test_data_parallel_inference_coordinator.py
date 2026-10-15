@@ -878,6 +878,7 @@ class TestRoutingPolicies:
         coord.tokenizer = DummyTokenizer()
         coord.request_id_to_client_id = {11: b"client-A"}
         coord.request_id_to_client_request_id = {11: 7}
+        coord.client_request_to_request_id = {(b"client-A", 7): 11}
         coord.request_id_to_rank = {}
         coord.router_socket = unittest.mock.MagicMock()
 
