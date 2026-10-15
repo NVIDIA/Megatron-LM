@@ -1235,11 +1235,12 @@ class _HybridEPManager(_DispatchManager):
 
         probs = probs.reshape(num_tokens, self.num_experts)
 
-        # Dropless HybridEP consumes the routing metadata directly, so padding rows must be
-        # excluded here or they are dispatched to experts. Capacity-based modes keep their
-        # fixed-route layout, where padded rows are already accounted for by the capacity.
-        dropless = self.capacity_factor is None and self.moe_expert_rank_capacity_factor is None
-        if padding_mask is not None and dropless:
+        # HybridEP consumes the routing metadata directly, so padding rows must be excluded
+        # here or they are dispatched to experts. This includes a static expert-rank budget:
+        # padding rows would otherwise count against it and could push a rank over it, which
+        # costs a dropless rerun of the step. Per-expert capacity keeps its fixed-route layout,
+        # where padded rows are already accounted for by the capacity.
+        if padding_mask is not None and self.capacity_factor is None:
             # The mask is batch-first [b, s] while tokens are flattened from sequence-first
             # [s, b, h] hidden states, so transpose before flattening to line up token rows.
             padding_rows = padding_mask.transpose(0, 1).reshape(-1)
@@ -2313,8 +2314,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             probs (torch.Tensor): Routing probabilities for each token-expert pair
             padding_mask (torch.Tensor, optional): Batch-first [b, s] bool mask of padding
                 tokens, as given to the router. Backends that consume routing metadata directly
-                (dropless HybridEP) drop those rows before dispatch; the other backends keep
-                their fixed-route layout.
+                (HybridEP without per-expert capacity, with or without an expert-rank budget)
+                drop those rows before dispatch; the other backends keep their fixed-route
+                layout.
 
         Returns:
             A tuple of reshaped hidden states and token probabilities.

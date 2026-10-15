@@ -884,6 +884,122 @@ def test_hybridep_dropless_excludes_padding_rows(monkeypatch):
     torch.testing.assert_close(manager.token_probs[:3], probs[:3])
 
 
+def _hybridep_manager_for_padding(
+    dense_routing, capacity_factor=None, rank_capacity_factor=None
+) -> _HybridEPManager:
+    """A HybridEP manager over 2 experts with top-1 routing, built without a HybridEP buffer."""
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_variable_tokens=False,
+        moe_hybridep_routing_map_mode="indices" if dense_routing else "bool",
+        moe_router_topk=1,
+        moe_expert_rank_capacity_factor=rank_capacity_factor,
+        use_transformer_engine_op_fuser=False,
+        moe_use_grouped_tensor=True,
+    )
+    manager.group = object()
+    manager.num_experts = 2
+    manager.router_topk = 1
+    manager.moe_expert_rank_capacity_factor = rank_capacity_factor
+    manager.capacity_factor = capacity_factor
+    manager.drop_and_pad = False
+    manager.dense_routing_supported = dense_routing
+    manager.use_dense_routing_for_bool_map = False
+    manager.num_permuted_tokens = None
+    return manager
+
+
+def _padding_routes(dense_routing, device="cpu"):
+    """Routes, probs and a batch-first padding mask for s=2, b=2 (token s1b1 is padding)."""
+    if dense_routing:
+        routing_map = torch.tensor([[0], [1], [0], [1]], dtype=torch.int16, device=device)
+    else:
+        routing_map = torch.tensor(
+            [[True, False], [False, True], [True, False], [False, True]], device=device
+        )
+    probs = torch.tensor([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3], [0.4, 0.6]], device=device)
+    padding_mask = torch.tensor([[False, False], [False, True]], device=device)
+    return routing_map, probs, padding_mask
+
+
+def _hybridep_routes(manager):
+    return manager.topk_idx if manager.routing_map is None else manager.routing_map
+
+
+@pytest.mark.parametrize("dense_routing", [False, True])
+def test_hybridep_rank_budget_excludes_padding_rows(dense_routing):
+    """Under a static expert-rank budget HybridEP still drops padded rows from its routing
+    metadata, so padding does not count against the budget; the budget itself stays the
+    static size computed from all token rows."""
+    manager = _hybridep_manager_for_padding(dense_routing, rank_capacity_factor=1.5)
+    routing_map, probs, padding_mask = _padding_routes(dense_routing)
+
+    manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)
+
+    if dense_routing:
+        expected_routes = torch.tensor([[0], [1], [0], [-1]], dtype=torch.int16)
+    else:
+        expected_routes = routing_map.clone()
+        expected_routes[3] = False
+    assert torch.equal(_hybridep_routes(manager), expected_routes)
+    assert torch.count_nonzero(manager.token_probs[3]) == 0
+    torch.testing.assert_close(manager.token_probs[:3], probs[:3])
+    # int(4 tokens * top-1 * 1.5) rounded up to the 256-token grouped-tensor alignment.
+    assert manager.num_permuted_tokens == 256
+
+
+def test_hybridep_per_expert_capacity_keeps_padding_rows():
+    """Per-expert capacity keeps its fixed-route layout: the padding mask is not applied."""
+    manager = _hybridep_manager_for_padding(dense_routing=False, capacity_factor=1.0)
+    routing_map, probs, padding_mask = _padding_routes(dense_routing=False)
+
+    manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)
+
+    assert torch.equal(manager.routing_map, routing_map)
+    torch.testing.assert_close(manager.token_probs, probs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("dense_routing", [False, True])
+def test_hybridep_rank_budget_padding_exclusion_replays_in_cuda_graph(dense_routing):
+    """A captured setup_metadata (TE whole-MoE or moe_preprocess graph) applies the padding
+    mask it is replayed with, not the one it was captured with."""
+    manager = _hybridep_manager_for_padding(dense_routing, rank_capacity_factor=1.5)
+    reference = _hybridep_manager_for_padding(dense_routing, rank_capacity_factor=1.5)
+    routing_map, probs, padding_mask = _padding_routes(dense_routing, device="cuda")
+    padding_mask.zero_()
+
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)
+        captured_routes = _hybridep_routes(manager)
+        captured_probs = manager.token_probs
+
+        # Batch-first [b, s] masks: one padded token, one per sample, all padding, none.
+        for mask in (
+            [[False, False], [False, True]],
+            [[False, True], [False, True]],
+            [[True, True], [True, True]],
+            [[False, False], [False, False]],
+        ):
+            padding_mask.copy_(torch.tensor(mask, device="cuda"))
+            graph.replay()
+            reference.setup_metadata(routing_map, probs, padding_mask=padding_mask)
+            assert torch.equal(captured_routes, _hybridep_routes(reference))
+            torch.testing.assert_close(captured_probs, reference.token_probs, rtol=0, atol=0)
+            padded_tokens = torch.tensor(mask, device="cuda").transpose(0, 1).reshape(-1)
+            assert torch.count_nonzero(captured_probs[padded_tokens]) == 0
+        assert manager.num_permuted_tokens == 256
+    finally:
+        graph.reset()
+
+
 def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
     """With pad-to-capacity the routing map is the capacity mask (a token can carry more than
     topk assignments); the indices-mode topk reconstruction would drop the padded assignments
