@@ -367,6 +367,49 @@ def test_messages_passthrough_maps_legacy_tool_results_to_tool(result_role):
     assert sample.messages[3]["name"] == "python"
 
 
+def test_messages_passthrough_drops_arrow_none_placeholders():
+    # Arrow pads every message with the fields any message has, set to None.
+    padding = {"tool_calls": None, "name": None, "tool_call_id": None}
+    tool_call = {"type": "function", "function": {"name": "f", "arguments": "{}"}}
+    result = {"type": "tool-result", "toolCallId": "call-1", "toolName": "f", "output": "ok"}
+    sample = _messages_passthrough(
+        {
+            "messages": [
+                {"role": "user", "content": "q", **padding},
+                {**padding, "role": "assistant", "content": None, "tool_calls": [tool_call]},
+                {"role": "tool", "content": [result], **padding},
+            ],
+            "chat_template_kwargs": {"thinking": True, "unused": None},
+        }
+    )
+    assert set(sample.messages[1]) == {"role", "content"}
+    assert sample.messages[2] == {"role": "assistant", "content": "", "tool_calls": [tool_call]}
+    # Tool-result metadata now fills the keys Arrow had set to None.
+    assert sample.messages[3]["tool_call_id"] == "call-1"
+    assert sample.messages[3]["name"] == "f"
+    assert sample.chat_template_kwargs == {"thinking": True}
+
+
+def test_low_level_jsonl_messages_keep_only_present_fields(tmp_path):
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    tool_call = {"type": "function", "function": {"name": "f", "arguments": "{}"}}
+    path = _write_jsonl(
+        tmp_path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+                ]
+            }
+        ],
+    )
+    sample = VarlenLowLevelDataset(path)[0]
+    assert set(sample.messages[1]) == {"role", "content"}
+    assert sample.messages[2]["tool_calls"][0]["function"]["name"] == "f"
+
+
 def test_messages_passthrough_rejects_unknown_role():
     with pytest.raises(ValueError, match="unsupported messages"):
         _messages_passthrough({"messages": [{"role": "narrator", "content": "x"}]})

@@ -321,7 +321,10 @@ def _messages_passthrough(sample: Dict[str, Any]) -> ChatTemplateSample:
         content, content_metadata = _normalize_openai_content(
             m.get("content"), f"messages turn {index} role={role}"
         )
-        normalized = dict(m)
+        # Arrow gives every message the union of the fields seen in the column and
+        # fills the missing ones with None. Keep only the fields this message sets, so
+        # templates that test ``'tool_calls' in message`` see the original row.
+        normalized = {key: value for key, value in m.items() if value is not None}
         normalized["role"] = role
         normalized["content"] = content
         for key, value in content_metadata.items():
@@ -367,7 +370,10 @@ def _messages_passthrough(sample: Dict[str, Any]) -> ChatTemplateSample:
             "VarlenDataset: field 'chat_template_kwargs' must be an object or a "
             "JSON-encoded object."
         )
-    chat_template_kwargs = dict(chat_template_kwargs)
+    # A struct column gets the same None padding as messages.
+    chat_template_kwargs = {
+        key: value for key, value in chat_template_kwargs.items() if value is not None
+    }
 
     tools = _normalize_tools(sample.get("tools"))
     if tools:
