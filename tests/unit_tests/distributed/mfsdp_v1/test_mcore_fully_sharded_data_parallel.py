@@ -1066,6 +1066,7 @@ class TestMegatronFSDPE2E:
 
             fused_adam = optim.optimizer
             assert not fused_adam.master_weights
+            assert not fused_adam.store_param_remainders
             assert fused_adam.use_decoupled_grad
 
             # FusedAdam steps FSDP's FP32 main weights directly.

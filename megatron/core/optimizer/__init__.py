@@ -1225,7 +1225,10 @@ def get_megatron_optimizer(
                 # main weights, complete waste of memory as the optimizer step is still
                 # applied to the Megatron-FSDP main weight and extended to FusedAdam
                 # main weights. Override this here.
+                # NOTE(@CarlosGomes98): Param remainders are part of FusedAdam's main weights,
+                # so there are none either.
                 setattr(optimizer_part.optimizer, "master_weights", False)
+                setattr(optimizer_part.optimizer, "store_param_remainders", False)
                 # Megatron-FSDP always uses a decoupled gradient when using FusedAdam.
                 setattr(optimizer_part.optimizer, "use_decoupled_grad", True)
 
