@@ -212,7 +212,7 @@ class MiniMaxM3Config:
         _check(self.num_attention_heads % self.num_key_value_heads == 0, "heads not divisible by kv heads")
         _check(self.index_n_heads == self.num_key_value_heads, "MSA requires index_n_heads == num_key_value_heads")
         _check(0 < self.rotary_dim <= self.head_dim and self.rotary_dim % 2 == 0, "bad rotary_dim")
-        _check(self.head_dim == 128, "MSA flex backend / cuDNN paths validated for head_dim 128 only")
+        _check(self.head_dim == 128, "MSA (msa_v1 kernels) requires head_dim 128")
         _check(self.scoring_func == "sigmoid", "only sigmoid routing is supported")
         _check(self.use_gemma_norm and self.use_qk_norm and self.qk_norm_type == "per_head", "norm flags differ from M3")
         _check(not self.attention_output_gate, "attention_output_gate is not supported")

@@ -124,9 +124,9 @@ def test_minimax_m3_protocol_builds_the_magi_backend(monkeypatch):
     seen = {}
 
     class FakeModel(torch.nn.Module):
-        def __init__(self, _cfg, _train_cfg, _ps, *, msa_backend, **_kwargs):
+        def __init__(self, _cfg, _train_cfg, _ps, **kwargs):
             super().__init__()
-            seen["msa_backend"] = msa_backend
+            seen["kwargs"] = kwargs
             self.layers = torch.nn.ModuleList()
 
         def to(self, *_args, **_kwargs):
@@ -145,7 +145,7 @@ def test_minimax_m3_protocol_builds_the_magi_backend(monkeypatch):
     monkeypatch.setattr(P.magi_msa, "build_msa_config", lambda *_args, **_kwargs: object())
 
     bundle = P.build_model(MiniMaxM3Config(), impl_cfg=P.ImplConfig(optimizer=None))
-    assert seen["msa_backend"] == "magi"
+    assert seen["kwargs"] == {}
     assert bundle.forward_step is P._forward_step
     assert "magi_settings" not in bundle.extras
     assert bundle.chunks[0].magi_settings.deterministic is False

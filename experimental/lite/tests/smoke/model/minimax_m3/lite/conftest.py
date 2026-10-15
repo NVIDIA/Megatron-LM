@@ -69,20 +69,8 @@ def _hf_kwargs(*, hidden_size: int, num_attention_heads: int, num_key_value_head
 
 
 @pytest.fixture(scope="module")
-def flex_hf_kwargs() -> dict:
-    return _hf_kwargs(hidden_size=256, num_attention_heads=8, num_key_value_heads=2, topk_blocks=4)
-
-
-@pytest.fixture(scope="module")
 def magi_hf_kwargs() -> dict:
     return _hf_kwargs(hidden_size=512, num_attention_heads=64, num_key_value_heads=4, topk_blocks=16)
-
-
-@pytest.fixture(scope="module")
-def flex_cfg(flex_hf_kwargs):
-    from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
-
-    return MiniMaxM3Config._from_hf_dict(flex_hf_kwargs)
 
 
 @pytest.fixture(scope="module")
@@ -116,14 +104,14 @@ def dist():
 
 
 def save_random_source(cfg, dist, tmp_path_factory, tag: str, *, seed: int) -> str:
-    """Random bf16 flex model with non-trivial Gemma-norm weights and router bias, saved in HF format."""
+    """Random bf16 model with non-trivial Gemma-norm weights and router bias, saved in HF format."""
     from megatron.lite.model.minimax_m3.lite.checkpoint import save_hf_weights
     from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
     from megatron.lite.primitive.parallel import ParallelState
 
     ps0 = ParallelState()
     torch.manual_seed(seed)
-    model = MiniMaxM3Model(cfg, _train_config(ps0), ps0, msa_backend="flex").to(torch.bfloat16).cuda()
+    model = MiniMaxM3Model(cfg, _train_config(ps0), ps0).to(torch.bfloat16).cuda()
     with torch.no_grad():
         for name, p in model.named_parameters():
             if name.endswith("norm.weight") or name.endswith("layer_norm_weight"):
@@ -137,11 +125,6 @@ def save_random_source(cfg, dist, tmp_path_factory, tag: str, *, seed: int) -> s
     del model
     torch.cuda.empty_cache()
     return src[0]
-
-
-@pytest.fixture(scope="module")
-def flex_source(flex_cfg, dist, tmp_path_factory) -> str:
-    return save_random_source(flex_cfg, dist, tmp_path_factory, "flex", seed=20260910)
 
 
 @pytest.fixture(scope="module")

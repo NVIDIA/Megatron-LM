@@ -2,10 +2,9 @@
 """Adapter between MLite attention modules and the MagiAttention MSA extension.
 
 This is the only MLite module that imports ``magi_attention`` / ``magi_attn_extensions``.
-Everything is imported lazily so that models using the ``dense`` / ``flex`` MSA backends do
-not need MagiAttention installed.
+Everything is imported lazily so that importing MLite does not require MagiAttention.
 
-Ownership split for ``msa_backend="magi"``
+Ownership split
 * MLite owns the projections, QK-norm, RoPE, the indexer projections and the output linear.
 * Magi owns the CP token dispatch, the required-K / index-K communication, the ``msa_v1``
   indexer + sparse-attention kernels (MSA layers) and the varlen-causal attention of the
@@ -58,7 +57,7 @@ def _ensure_magi() -> SimpleNamespace:
         from magi_attn_extensions import MSA as msa
     except ImportError as e:
         raise ImportError(
-            "msa_backend='magi' requires MagiAttention (Magi-MSA branch feat/tree-attn-msa) and its "
+            "MiniMax-M3 MSA requires MagiAttention (Magi-MSA branch feat/tree-attn-msa) and its "
             "extensions plus MM-Sparse-Attention (msa_v1). Install with "
             "`MAGI_ATTENTION_SKIP_CUDA_BUILD=1 pip install --no-build-isolation -e <Magi-MSA>` and "
             "`pip install --no-build-isolation -e <Magi-MSA>/extensions` (with magi_attn_ext built for the dense "
@@ -121,14 +120,14 @@ def validate_kernel_shapes(
     bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
     if bad:
         raise ValueError(
-            "msa_backend='magi' uses the fixed-shape msa_v1 kernels; mismatched fields (got, required): "
-            f"{bad}. Use msa_backend='flex' for other shapes."
+            "MiniMax-M3 MSA uses the fixed-shape msa_v1 kernels; mismatched fields (got, required): "
+            f"{bad}."
         )
 
 
 def validate_device() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        raise RuntimeError("msa_backend='magi' requires an SM100-family GPU (B200/GB300)")
+        raise RuntimeError("MiniMax-M3 MSA requires an SM100-family GPU (B200/GB300)")
 
 
 def build_msa_config(settings: MagiMsaSettings, *, head_dim: int = HEAD_DIM, index_head_dim: int = INDEX_HEAD_DIM) -> Any:
@@ -169,7 +168,7 @@ def msa_cp_group(ps: ParallelState) -> dist.ProcessGroup:
     if ps.cp_group is not None:
         return ps.cp_group
     if not dist.is_initialized():
-        raise RuntimeError("msa_backend='magi' needs torch.distributed initialised (call ensure_single_process_group())")
+        raise RuntimeError("MiniMax-M3 MSA needs torch.distributed initialised (call ensure_single_process_group())")
     world = dist.get_world_size()
     group = _SINGLE_RANK_GROUPS.get(world)
     if group is None:
@@ -314,7 +313,7 @@ def dispatch_tokens(x: torch.Tensor, ctx: MagiMsaContext) -> torch.Tensor:
     """Global packed tensor ``[T_global, ...]`` -> this rank's dispatched tokens ``[T_local, ...]``."""
     if x.shape[0] != ctx.cu_seqlens_host[-1]:
         raise ValueError(
-            f"msa_backend='magi': every CP rank must receive the identical global (padded) batch; "
+            f"MiniMax-M3 MSA: every CP rank must receive the identical global (padded) batch; "
             f"got {x.shape[0]} tokens, expected {ctx.cu_seqlens_host[-1]}"
         )
     return _ensure_magi().msa.dispatch(x, ctx.key)

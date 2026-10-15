@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MiniMax-M3 lite vs HF ``MiniMaxM3VLForCausalLM`` on identical random weights (bf16, one GPU), flex and magi backends.
+"""MiniMax-M3 lite vs HF ``MiniMaxM3VLForCausalLM`` on identical random weights (bf16, one GPU).
 
 Gates are cosine-based (per-layer, logits + KL, gradients) because bf16 flips some indexer top-k rows; see
 ``skills/primitive/module/msa.md``.
@@ -21,7 +21,6 @@ LAYER_COS = 0.995
 LOGITS_COS, LOGITS_KL = 0.995, 5e-2
 LOSS_REL = 2e-2
 DENSE_GRAD_COS, EXPERT_GRAD_COS = 0.99, 0.95
-TOPK_FLIP_BUDGET = 0.25
 MAGI_CHUNK = 512
 
 
@@ -161,57 +160,9 @@ def _compare_layers_and_logits(tag, lite_layers, hf_layers, lite_logits, hf_logi
     assert cos > LOGITS_COS and kl < LOGITS_KL, (cos, kl)
 
 
-# ----------------------------------------------------------------------------------------- flex
 @pytest.mark.gpus(1)
 @pytest.mark.skipif(not _hf_available(), reason="transformers without minimax_m3_vl")
-def test_flex_matches_hf_forward_backward(tmp_path, flex_hf_kwargs, dist, grad_tools):
-    from megatron.lite.model.minimax_m3.lite import protocol as P
-    from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
-    from megatron.lite.primitive.parallel import ParallelState
-
-    hf, hf_cfg, src = _build_hf(flex_hf_kwargs, tmp_path, seed=0)
-    cfg = P.build_model_config(hf_cfg.to_dict())
-    ps = ParallelState()
-    lite = MiniMaxM3Model(cfg, _train_config(ps), ps, msa_backend="flex").to(torch.bfloat16).cuda()
-    P.load_hf_weights(lite, src, cfg, ps)
-    lite.eval()
-
-    torch.manual_seed(1234)
-    B, S = 2, 1024  # 8 KV blocks > top-4: the sparse layers are truly sparse
-    ids = torch.randint(0, cfg.vocab_size, (B, S), device=DEV)
-    labels = torch.randint(0, cfg.vocab_size, (B, S), device=DEV)
-    sparse_layers = [i for i in range(cfg.num_hidden_layers) if cfg.is_sparse_attention_layer(i)]
-    hf_dump, lite_dump = _ModuleDump(hf.model.layers), _ModuleDump(lite.layers)
-    hf_idx = _ModuleDump([hf.model.layers[i].self_attn.indexer for i in sparse_layers])
-    hf_out = hf(input_ids=ids, use_cache=False)
-    lite_out = lite(input_ids=ids, labels=labels)
-    for dump in (hf_dump, lite_dump, hf_idx):
-        dump.remove()
-    with torch.no_grad():
-        lite_logits = lite.head.gather(lite.head(lite.norm(lite_dump.out[cfg.num_hidden_layers - 1]))).transpose(0, 1)
-    _compare_layers_and_logits(
-        "flex_vs_hf", [lite_dump.out[i].transpose(0, 1) for i in range(cfg.num_hidden_layers)],
-        [hf_dump.out[i] for i in range(cfg.num_hidden_layers)], lite_logits, hf_out.logits,
-    )
-    for n, i in enumerate(sparse_layers):  # indexer selections as sets; bf16 may flip a few rows
-        got = lite.layers[i].attn.last_block_indices.sort(-1).values
-        want = hf_idx.out[n].sort(-1).values.to(torch.int32)
-        flips = (got != want).any(-1).float().mean().item()
-        print(f"flex_vs_hf layer={i} topk_flip_rows={flips:.3%}")
-        assert flips < TOPK_FLIP_BUDGET, (i, flips)
-
-    hf_loss = _hf_loss(hf_out.logits, labels)
-    loss_rel = abs(lite_out["loss"].item() - hf_loss.item()) / hf_loss.item()
-    print(f"flex_vs_hf loss lite={lite_out['loss'].item():.5f} hf={hf_loss.item():.5f} rel={loss_rel:.3e}")
-    assert loss_rel < LOSS_REL
-    lite_out["loss"].backward()
-    hf_loss.backward()
-    _compare_grads(_lite_grads_by_hf_module_name(lite, cfg, ps, grad_tools), hf, "flex_vs_hf")
-
-
-@pytest.mark.gpus(1)
-@pytest.mark.skipif(not _hf_available(), reason="transformers without minimax_m3_vl")
-def test_weight_round_trip_is_bitwise(tmp_path, flex_hf_kwargs, dist):
+def test_weight_round_trip_is_bitwise(tmp_path, magi_hf_kwargs, dist):
     from safetensors.torch import load_file
 
     from megatron.lite.model.minimax_m3.lite import protocol as P
@@ -219,10 +170,10 @@ def test_weight_round_trip_is_bitwise(tmp_path, flex_hf_kwargs, dist):
     from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
     from megatron.lite.primitive.parallel import ParallelState
 
-    _, hf_cfg, src = _build_hf(flex_hf_kwargs, tmp_path, seed=0)
+    _, hf_cfg, src = _build_hf(magi_hf_kwargs, tmp_path, seed=0)
     cfg = P.build_model_config(hf_cfg.to_dict())
     ps = ParallelState()
-    lite = MiniMaxM3Model(cfg, _train_config(ps), ps, msa_backend="flex").to(torch.bfloat16).cuda()
+    lite = MiniMaxM3Model(cfg, _train_config(ps), ps).to(torch.bfloat16).cuda()
     P.load_hf_weights(lite, src, cfg, ps)
 
     source = {}

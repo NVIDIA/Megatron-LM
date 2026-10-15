@@ -11,17 +11,11 @@ Composition (see ``skills/model-compose/minimax-m3.md``):
 
 Reference: HF ``transformers.models.minimax_m3_vl`` (5.16.1).
 
-``msa_backend`` selects the sparse-attention path of the whole model:
-* ``"magi"`` – production path built by ``protocol.build_model``: MagiAttention MSA
-  extension + msa_v1 kernels, packed documents via ``magi_ctx``, attention TP=1.
-* ``"flex"`` – pure-torch ``flex_attention`` path; supports TP/SP and all-gather CP on
-  zigzag shards. Position ids are 1-D ``[B, S_local]`` global positions (derived when
-  not given); THD/packed sequences are rejected.
+Attention runs on MagiAttention (MSA extension + msa_v1 kernels for sparse layers, native
+``calc_attn`` for dense layers) over packed documents described by ``magi_ctx``; attention TP=1.
 """
 
 from __future__ import annotations
-
-from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -43,28 +37,7 @@ from megatron.lite.primitive.parallel import (
     VocabParallelOutput,
     build_pipeline_chunk_layout,
     scatter_to_sequence_parallel,
-    zigzag_position_ids_for_cp,
 )
-
-_SP_GRAD_SUFFIXES: tuple[str, ...] = (
-    ".attn.qkv.linear.layer_norm_weight",
-    ".attn.q_norm.weight",
-    ".attn.k_norm.weight",
-    ".attn.indexer.q_norm.weight",
-    ".attn.indexer.k_norm.weight",
-    ".attn.indexer.k_proj.weight",
-    ".mlp.gate_up.linear.layer_norm_weight",
-    ".mlp_norm.weight",
-    ".moe.router.gate.weight",
-)
-
-
-def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
-    return [
-        p
-        for name, p in model.named_parameters()
-        if any(name.endswith(s) for s in _SP_GRAD_SUFFIXES) or name == "norm.weight"
-    ]
 
 
 def m3_activation(y: torch.Tensor, config: MiniMaxM3Config) -> torch.Tensor:
@@ -168,7 +141,6 @@ class MiniMaxM3Layer(nn.Module):
         ps: ParallelState,
         layer_idx: int,
         *,
-        msa_backend: str,
         moe_dispatcher: str = "alltoall",
         moe_hybridep_num_sms: int | None = None,
         moe_hybridep_fused_permute: bool = False,
@@ -198,7 +170,6 @@ class MiniMaxM3Layer(nn.Module):
                 block_size=config.index_block_size,
                 topk_blocks=config.index_topk_blocks,
                 local_blocks=config.index_local_blocks,
-                backend=msa_backend,
                 **attn_kwargs,
             )
         else:
@@ -210,10 +181,7 @@ class MiniMaxM3Layer(nn.Module):
                 ps,
                 use_thd=False,
                 output_gate=False,
-                # Dense (non-sparse) layers reuse the generic MagiAttention core-attention backend
-                # (primitive.modules.attention.magi.MagiDotProductAttention) rather than a bespoke
-                # MiniMax-M3 path; only the sparse MSA layers need msa_backend-specific machinery.
-                attention_backend="magi" if msa_backend == "magi" else "te",
+                attention_backend="magi",
                 **attn_kwargs,
             )
         if self.is_moe:
@@ -235,21 +203,14 @@ class MiniMaxM3Layer(nn.Module):
             self.moe = None
             self.mlp = M3DenseMLP(config, ps)
 
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None, magi_ctx=None):
-        if packed_seq_params is not None:
-            raise NotImplementedError("MiniMax-M3 lite does not support THD/packed sequences (MSA contract)")
-        if magi_ctx is not None:
-            if self.is_sparse_attention:
-                # MSAttention owns the sparse indexer + block-sparse attention on Magi's dispatch layout.
-                x = x + self.attn(x, magi_ctx=magi_ctx)
-            else:
-                # Dense layers go through GQAttention's generic attention_backend="magi" path on the
-                # same dispatch layout (magi_ctx.dense_packed_seq_params()), not a MiniMax-M3-specific one.
-                x = x + self.attn(
-                    x, position_ids=magi_ctx.position_ids, packed_seq_params=magi_ctx.dense_packed_seq_params()
-                )
+    def forward(self, x: torch.Tensor, magi_ctx):
+        if self.is_sparse_attention:
+            x = x + self.attn(x, magi_ctx=magi_ctx)
         else:
-            x = x + self.attn(x, position_ids=position_ids)
+            # dense layers: generic GQAttention magi backend on the same dispatch layout
+            x = x + self.attn(
+                x, position_ids=magi_ctx.position_ids, packed_seq_params=magi_ctx.dense_packed_seq_params()
+            )
         if self.moe is not None:
             assert self.mlp_norm is not None
             x = x + self.moe(self.mlp_norm(x))
@@ -270,14 +231,12 @@ class MiniMaxM3Model(nn.Module):
         train_config,
         ps: ParallelState,
         *,
-        msa_backend: str,
         vpp_chunk_id: int | None = None,
     ):
         super().__init__()
         self.config = config
         self.train_config = train_config
         self.ps = ps
-        self.msa_backend = msa_backend
         self._input_tensor: torch.Tensor | None = None
         layout = build_pipeline_chunk_layout(config.num_hidden_layers, ps, train_config.vpp, vpp_chunk_id)
         self.layer_indices = layout.layer_indices
@@ -302,7 +261,6 @@ class MiniMaxM3Model(nn.Module):
                     moe_hybridep_fused_permute=train_config.moe_hybridep_fused_permute,
                     moe_act_recompute=moe_act_recompute,
                     moe_permute_fusion=getattr(train_config, "moe_permute_fusion", True),
-                    msa_backend=msa_backend,
                 )
                 for idx in self.layer_indices
             ]
@@ -313,12 +271,10 @@ class MiniMaxM3Model(nn.Module):
             self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True)
             self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
 
-        self.sp_params: list[nn.Parameter] = _collect_sp_grad_params(self) if ps.tp_size > 1 else []
-
     def _reduce_loss(self, token_loss: torch.Tensor, loss_mask: torch.Tensor | None) -> torch.Tensor:
         """Mean over the supervised tokens of the whole sequence, also under context parallel.
 
-        Each CP rank holds a zigzag shard whose supervised-token count differs, so a local mean averaged by
+        Each CP rank holds a token shard whose supervised-token count differs, so a local mean averaged by
         DDP would weight shards unequally. Normalise by the CP-global count and sum the shares with an
         autograd all-reduce: every rank reports the true global mean, and the backward pass scales the
         local gradient by cp_size so the DDP average over dp x cp gives the correct per-token gradient.
@@ -349,8 +305,6 @@ class MiniMaxM3Model(nn.Module):
         self,
         input_ids: torch.Tensor | None = None,
         hidden_states: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        packed_seq_params=None,
         labels: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
         temperature: float | torch.Tensor = 1.0,
@@ -358,34 +312,20 @@ class MiniMaxM3Model(nn.Module):
         calculate_entropy: bool = False,
         magi_ctx=None,
     ) -> dict:
-        if packed_seq_params is not None:
-            raise NotImplementedError("MiniMax-M3 lite does not support THD/packed sequences (MSA contract)")
         if use_fused_kernels:
             raise NotImplementedError("fused linear cross-entropy is not wired for MiniMax-M3 yet")
-        if (magi_ctx is not None) != (self.msa_backend == "magi"):
-            raise ValueError("magi_ctx must be given exactly when msa_backend='magi' (built by the protocol forward step)")
+        if magi_ctx is None:
+            raise ValueError("MiniMaxM3Model requires magi_ctx (built by the protocol forward step)")
         if self.embed is not None:
             assert input_ids is not None
             h = self.embed(input_ids)  # [S, B, H]
         else:
             h = hidden_states if hidden_states is not None else self._input_tensor
             assert h is not None
-        if magi_ctx is not None:
-            position_ids = None  # RoPE positions come from magi_ctx (doc-local, dispatched layout)
-        elif position_ids is None and self.embed is not None:
-            # later PP stages receive SP-sharded hidden states; MSAttention derives the same ids from its full-S q
-            seq_local, batch = h.shape[:2]
-            position_ids = zigzag_position_ids_for_cp(
-                seq_local * self.ps.cp_size, self.ps.cp_rank, self.ps.cp_size, h.device
-            ).expand(batch, -1)
-        if position_ids is not None and position_ids.dim() != 2:
-            raise ValueError("MiniMax-M3 expects 1-D position_ids of shape [B, S_local] (global positions)")
-
-        with nullcontext():
-            if self.embed is not None:
-                h = scatter_to_sequence_parallel(h, self.ps)
-            for layer in self.layers:
-                h = layer(h, position_ids=position_ids, magi_ctx=magi_ctx)
+        if self.embed is not None:
+            h = scatter_to_sequence_parallel(h, self.ps)
+        for layer in self.layers:
+            h = layer(h, magi_ctx=magi_ctx)
 
         output = {"hidden_states": h}
         if self.head is not None:

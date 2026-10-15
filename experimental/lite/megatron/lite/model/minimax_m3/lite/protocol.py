@@ -89,14 +89,8 @@ def _moe_module(name: str) -> Callable[[nn.Module], nn.Module | None]:
     return getter
 
 
-def _core_attn(layer: nn.Module) -> nn.Module | None:
-    attn = getattr(layer, "attn", None)
-    # magi backend: the TE core_attn is never called; recompute/offload must target the Magi core instead
-    return getattr(attn, "magi_core", None) or getattr(attn, "core_attn", None)
-
-
 MODULE_MAP = {
-    "core_attn": _core_attn,
+    "core_attn": lambda layer: getattr(getattr(layer, "attn", None), "core_attn", None),
     "attn": _maybe("attn"),
     "experts": _moe_module("experts"),
     "moe": _maybe("moe"),
@@ -192,7 +186,6 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
         "input_ids": magi_msa.dispatch_tokens(input_ids, ctx).reshape(1, -1),
         "labels": magi_msa.dispatch_tokens(labels, ctx).reshape(1, -1) if labels is not None else None,
         "loss_mask": magi_msa.dispatch_tokens(loss_mask, ctx).reshape(1, -1) if loss_mask is not None else None,
-        "packed_seq_params": None,
         "magi_ctx": ctx,
     }
     add_cross_entropy_fusion(kwargs, model)
@@ -308,12 +301,11 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         recompute_modules=recompute_spec,
         deterministic=impl_cfg.deterministic,
     )
-    kwargs = dict(msa_backend="magi")
     if vpp is None:
-        chunks = [MiniMaxM3Model(model_cfg, train_cfg, ps, **kwargs).to(torch.bfloat16).cuda()]
+        chunks = [MiniMaxM3Model(model_cfg, train_cfg, ps).to(torch.bfloat16).cuda()]
     else:
         chunks = [
-            MiniMaxM3Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **kwargs).to(torch.bfloat16).cuda()
+            MiniMaxM3Model(model_cfg, train_cfg, ps, vpp_chunk_id=i).to(torch.bfloat16).cuda()
             for i in range(vpp)
         ]
     for chunk in chunks:
