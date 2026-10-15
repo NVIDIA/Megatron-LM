@@ -71,8 +71,11 @@ def _check_sm100(tensor: torch.Tensor) -> None:
     if not tensor.is_cuda:
         raise ValueError("fused_gdr_bwd requires CUDA tensors")
     capability = torch.cuda.get_device_capability(tensor.device)
-    if capability != (10, 0):
-        raise ValueError(f"fused_gdr_bwd requires SM100, got capability {capability}")
+    if capability[0] != 10:
+        raise ValueError(
+            "fused_gdr_bwd requires a Blackwell data-center GPU (SM10x), "
+            f"got capability {capability}"
+        )
 
 
 def _validate_chunk_offsets(

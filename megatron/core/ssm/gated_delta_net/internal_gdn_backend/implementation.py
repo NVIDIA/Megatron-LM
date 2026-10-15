@@ -924,15 +924,8 @@ def _cutedsl_support_reason(
             extra_kwargs.pop(name, None)
     if extra_kwargs:
         return f"extra options are not supported: {sorted(extra_kwargs)}"
-    if cp_context is None:
-        if cu_seqlens is None:
-            # [REMOVE BEFORE MERGE] Temporary CuTe forward kernels still require dense
-            # sequence lengths to align with their 64-token chunk contract.
-            if q.shape[1] % _CHUNK_SIZE:
-                return "sequence length must be a multiple of 64"
-        else:
-            if q.shape[0] != 1:
-                return "packed variable length inputs require batch size 1"
+    if cp_context is None and cu_seqlens is not None and q.shape[0] != 1:
+        return "packed variable length inputs require batch size 1"
     return None
 
 
@@ -1242,6 +1235,7 @@ def _cutedsl_forward(
     scale: float,
     cu_seqlens: torch.Tensor | None,
     chunk_indices: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
     packed_metadata: _PackedChunkMetadata | None = None,
     save_fused_bwd_state: bool = False,
     initial_state: torch.Tensor | None = None,
@@ -1259,12 +1253,19 @@ def _cutedsl_forward(
     dense_metadata = (
         _dense_chunk_metadata(batch_size, seqlen, q.device) if cu_seqlens is None else None
     )
-    if cu_seqlens is not None and chunk_indices is None:
-        if packed_metadata is not None:
-            chunk_indices = packed_metadata.chunk_indices
-        else:
-            chunk_indices = prepare_chunk_indices(cu_seqlens, _CHUNK_SIZE)
-    chunk_offsets = packed_metadata.chunk_offsets if packed_metadata is not None else None
+    if cu_seqlens is not None:
+        if chunk_indices is None:
+            if packed_metadata is not None:
+                chunk_indices = packed_metadata.chunk_indices
+            else:
+                chunk_indices = prepare_chunk_indices(cu_seqlens, _CHUNK_SIZE)
+        if chunk_offsets is None:
+            if packed_metadata is not None:
+                chunk_offsets = packed_metadata.chunk_offsets
+            else:
+                chunk_offsets = _build_chunk_offsets(cu_seqlens)
+    else:
+        chunk_offsets = dense_metadata.chunk_offsets
     launch_cu_seqlens = (
         dense_metadata.cu_seqlens
         if dense_metadata is not None
@@ -1285,20 +1286,16 @@ def _cutedsl_forward(
     flat_h = None
     checkpoint_cu_starts = None
     if save_fused_bwd_state:
+        if cu_seqlens is not None:
+            # One saved state per (sequence, chunk) pair, i.e. sum(ceil(len_i / 64)); the host
+            # already knows this count because prepare_chunk_indices materializes the rows.
+            num_chunks = int(chunk_indices.shape[0])
+        else:
+            num_chunks = batch_size * ((seqlen + _CHUNK_SIZE - 1) // _CHUNK_SIZE)
         flat_h = torch.empty(
-            (batch_size * seqlen // _CHUNK_SIZE, num_heads, head_size, head_size),
-            dtype=q.dtype,
-            device=q.device,
+            (num_chunks, num_heads, head_size, head_size), dtype=q.dtype, device=q.device
         )
-        checkpoint_cu_starts = (
-            chunk_offsets
-            if chunk_offsets is not None
-            else (
-                dense_metadata.chunk_offsets
-                if dense_metadata is not None
-                else launch_cu_seqlens // _CHUNK_SIZE
-            )
-        )
+        checkpoint_cu_starts = chunk_offsets
     chunk_gated_delta_rule_prefill_cute(
         q=flat_q,
         k=flat_k,
@@ -1323,11 +1320,7 @@ def _cutedsl_forward(
         flat_A.reshape(batch_size, seqlen, num_heads, _CHUNK_SIZE),
         flat_h,
         chunk_indices,
-        (
-            chunk_offsets
-            if chunk_offsets is not None
-            else (dense_metadata.chunk_offsets if dense_metadata is not None else None)
-        ),
+        chunk_offsets,
     )
 
 
@@ -1496,6 +1489,7 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 scale=scale,
                 cu_seqlens=forward_cu_seqlens,
                 chunk_indices=chunk_indices,
+                chunk_offsets=None if dense_local_cp else chunk_offsets,
                 packed_metadata=packed_metadata,
                 save_fused_bwd_state=save_fused_bwd_state,
                 initial_state=forward_initial_state,
@@ -1527,6 +1521,7 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 scale=scale,
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
                 packed_metadata=packed_metadata,
                 save_fused_bwd_state=save_fused_bwd_state,
             )

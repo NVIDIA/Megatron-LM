@@ -16,6 +16,14 @@ _SEQUENCE_LENGTH = 8192
 _HEADS = 64
 _HEAD_DIM = 128
 _SAMPLES = 5
+# Ragged packing: sequence cuts that are neither 64-aligned nor on CP rank boundaries.
+_RAGGED_LOCAL_LENGTHS = (4000, 3240, 65, 1, 886)
+_RAGGED_GLOBAL_CUTS = (12345, 20000)
+
+
+def _ragged_cu_seqlens(total_tokens, device):
+    cuts = [c for c in _RAGGED_GLOBAL_CUTS if c < total_tokens]
+    return torch.tensor([0, *cuts, total_tokens], device=device, dtype=torch.int32)
 
 
 def _make_inputs(device, *, packed=False):
@@ -41,7 +49,9 @@ def _make_inputs(device, *, packed=False):
     return inputs, torch.randn(shape, device=device, dtype=torch.bfloat16)
 
 
-def _forward_backward(implementation, inputs, grad_output, recompute_h=False, cp_context=None):
+def _forward_backward(
+    implementation, inputs, grad_output, recompute_h=False, cp_context=None, cu_seqlens=None
+):
     output, _ = implementation.chunk_gated_delta_rule(
         q=inputs[0],
         k=inputs[1],
@@ -50,15 +60,21 @@ def _forward_backward(implementation, inputs, grad_output, recompute_h=False, cp
         beta=inputs[4],
         scale=_HEAD_DIM**-0.5,
         recompute_h=recompute_h,
+        cu_seqlens=cu_seqlens,
         cp_context=cp_context,
     )
     gradients = torch.autograd.grad(output, inputs, grad_outputs=grad_output)
     return output, gradients
 
 
-def _median_gpu_ms(implementation, inputs, grad_output, cp_context=None):
+def _median_gpu_ms(implementation, inputs, grad_output, cp_context=None, cu_seqlens=None):
+    def run():
+        _forward_backward(
+            implementation, inputs, grad_output, cp_context=cp_context, cu_seqlens=cu_seqlens
+        )
+
     for _ in range(2):
-        _forward_backward(implementation, inputs, grad_output, cp_context=cp_context)
+        run()
     torch.cuda.synchronize()
 
     samples = []
@@ -66,22 +82,23 @@ def _median_gpu_ms(implementation, inputs, grad_output, cp_context=None):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        _forward_backward(implementation, inputs, grad_output, cp_context=cp_context)
+        run()
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end))
     return median(samples)
 
 
+@pytest.mark.parametrize("ragged", [False, True], ids=["aligned", "ragged"])
 @pytest.mark.parametrize("cp_size", [1, 4], ids=["non_cp", "cp4"])
-def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, request):
+def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, ragged, request):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    if torch.cuda.get_device_capability(device) != (10, 0):
-        pytest.skip("the fused CuTe DSL kernels require SM100")
+    if torch.cuda.get_device_capability(device)[0] != 10:
+        pytest.skip("the fused CuTe DSL kernels require a Blackwell data-center GPU (SM10x)")
     if not torch.version.cuda or int(torch.version.cuda.split(".", 1)[0]) < 13:
         pytest.skip("the fused CuTe DSL kernels require CUDA 13+")
     pytest.importorskip("cutlass")
@@ -91,8 +108,10 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
     from fla.ops.cp import build_cp_context
 
     from megatron.core import parallel_state
-    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import prepare_cp_context_metadata
-    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import implementation
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import (
+        implementation,
+        prepare_cp_context_metadata,
+    )
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_cp_cute
     from tests.unit_tests.test_utilities import Utils
 
@@ -104,21 +123,37 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
         request.addfinalizer(Utils.destroy_model_parallel)
         global_seqlen = _SEQUENCE_LENGTH * cp_size
-        cu_seqlens = torch.arange(_BATCH_SIZE + 1, device=device, dtype=torch.int32) * global_seqlen
+        if ragged:
+            cu_seqlens = _ragged_cu_seqlens(_BATCH_SIZE * global_seqlen, device)
+        else:
+            cu_seqlens = (
+                torch.arange(_BATCH_SIZE + 1, device=device, dtype=torch.int32) * global_seqlen
+            )
         cp_context = build_cp_context(
             cu_seqlens=cu_seqlens,
             group=parallel_state.get_context_parallel_group(),
             conv1d_kernel_size=4,
         )
         prepare_cp_context_metadata(
-            cp_context, global_num_sequences=_BATCH_SIZE, global_cu_seqlens=cu_seqlens
+            cp_context, global_num_sequences=cu_seqlens.numel() - 1, global_cu_seqlens=cu_seqlens
         )
 
-    inputs, grad_output = _make_inputs(device, packed=cp_context is not None)
+    # Non-CP ragged coverage packs several sequences with partial final chunks into one
+    # THD batch; the CP ragged variant cuts the global sequence inside rank windows.
+    packed = cp_context is not None or ragged
+    inputs, grad_output = _make_inputs(device, packed=packed)
+    cu_seqlens = None
+    if cp_context is None and ragged:
+        assert sum(_RAGGED_LOCAL_LENGTHS) == _BATCH_SIZE * _SEQUENCE_LENGTH
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(_RAGGED_LOCAL_LENGTHS).cumsum(0).tolist()],
+            device=device,
+            dtype=torch.int32,
+        )
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
     monkeypatch.setenv("MCORE_GDN_CP_CUTEDSL", "0")
     reference_output, reference_gradients = _forward_backward(
-        implementation, inputs, grad_output, cp_context=cp_context
+        implementation, inputs, grad_output, cp_context=cp_context, cu_seqlens=cu_seqlens
     )
 
     calls = {"fwd": 0, "bwd": 0}
@@ -160,7 +195,7 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
             lambda **_kwargs: pytest.fail("default save-h path must not recompute h"),
         )
         cute_output, cute_gradients = _forward_backward(
-            implementation, inputs, grad_output, cp_context=cp_context
+            implementation, inputs, grad_output, cp_context=cp_context, cu_seqlens=cu_seqlens
         )
     assert calls == {"fwd": 1, "bwd": 1}
     if cp_context is not None:
@@ -202,7 +237,7 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
         path_guard.setattr(implementation, "_fla_forward_for_fused_bwd", tracked_auto_fla_forward)
         path_guard.setattr(implementation, "_cutedsl_forward", tracked_auto_cute_forward)
         auto_output, auto_gradients = _forward_backward(
-            implementation, inputs, grad_output, cp_context=cp_context
+            implementation, inputs, grad_output, cp_context=cp_context, cu_seqlens=cu_seqlens
         )
     assert auto_forward_calls == (["fla"] if cp_context is None else ["cute"])
 
@@ -243,7 +278,12 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
             )
         path_guard.setattr(implementation, "_recompute_fused_bwd_h", tracked_recompute)
         recompute_output, recompute_gradients = _forward_backward(
-            implementation, inputs, grad_output, recompute_h=True, cp_context=cp_context
+            implementation,
+            inputs,
+            grad_output,
+            recompute_h=True,
+            cp_context=cp_context,
+            cu_seqlens=cu_seqlens,
         )
     assert recompute_calls == ([] if cp_context is not None else [True])
 
@@ -261,9 +301,13 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
         )
 
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
-    fla_ms = _median_gpu_ms(implementation, inputs, grad_output, cp_context=cp_context)
+    fla_ms = _median_gpu_ms(
+        implementation, inputs, grad_output, cp_context=cp_context, cu_seqlens=cu_seqlens
+    )
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
-    cute_ms = _median_gpu_ms(implementation, inputs, grad_output, cp_context=cp_context)
+    cute_ms = _median_gpu_ms(
+        implementation, inputs, grad_output, cp_context=cp_context, cu_seqlens=cu_seqlens
+    )
     if cp_context is not None:
         timings = torch.tensor([fla_ms, cute_ms], device=device)
         torch.distributed.all_reduce(

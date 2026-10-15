@@ -73,7 +73,6 @@ def _get_compiled_cache(
     training_side_outputs_only: bool,
     gate_is_log_cumsum: bool,
     gate_is_log_decay: bool,
-    enable_varlen_tail: bool,
     enable_timeline: bool,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
@@ -132,7 +131,6 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
     gate_is_log_cumsum: bool = False,
     gate_is_log_decay: bool = False,
     debug_timing: Optional[torch.Tensor] = None,
-    enable_varlen_tail: bool = False,
 ) -> None:
     """Execute the Blackwell chunked GDN forward kernel derived from FlashInfer prefill.
 
@@ -166,7 +164,12 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         gate_is_log_decay: when True, gate is raw Megatron log-decay and must be
             prefix-summed with the base-2 conversion in-kernel
         debug_timing: optional ``(6, 2, 32)`` int64 tensor for debug globaltimer tags
-        enable_varlen_tail: compile native partial-tile handling for packed lengths
+
+    Sequence lengths do not need to be multiples of 64: the kernel bounds every
+    per-sequence TMA descriptor at the logical sequence end, neutralizes the
+    gate/beta rows of a partial final chunk, and predicates the side-output
+    stores of that chunk. Zero-length sequences (trailing fixed-capacity
+    ``cu_seqlens`` entries) are skipped.
     """
     HQ = q.size(1)
     HV = v.size(1)
@@ -234,7 +237,6 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         training_side_outputs_only,
         gate_is_log_cumsum,
         gate_is_log_decay,
-        enable_varlen_tail,
         enable_timeline,
     )
 
@@ -267,7 +269,6 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
             training_side_outputs_only=training_side_outputs_only,
             gate_is_log_cumsum=gate_is_log_cumsum,
             gate_is_log_decay=gate_is_log_decay,
-            enable_varlen_tail=enable_varlen_tail,
             is_persistent=True,
             enable_timeline=enable_timeline,
         )

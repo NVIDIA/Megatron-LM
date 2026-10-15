@@ -53,10 +53,17 @@ launcher directly.
   to contiguous FP32 tensors before launch. Megatron training passes raw
   log-decay `g` with `gate_is_log_decay=True`; the kernel converts it to
   chunk-local cumulative base-2 log gates in registers.
-- `cu_seqlens` is required; every sequence length must be a multiple of the
-  64-token chunk size.
-- In-kernel QK L2 normalization and non-empty initial state are not supported
-  by the public Megatron wrapper.
+- `cu_seqlens` is required. Sequence lengths may be arbitrary: a partial final
+  chunk is handled natively (see below) and zero-length sequences, such as the
+  trailing fixed-capacity entries of `thd_max_packed_sequences`, are skipped.
+- `initial_state` (`[num_seqs, heads, 128, 128]`, FP32 or BF16) is accepted by
+  the wrapper and is how the context-parallel path injects the incoming
+  recurrent state; the public `chunk_gated_delta_rule` API rejects it. The
+  layout is FLA's `[K, V]` per head: the kernel keeps the state in TMEM as
+  `S^T` (the A operand of the `K @ S` and `Q @ S` GEMMs) and reads the initial
+  state through a transposed view, so a state produced by FLA or by the CP
+  preprocess kernels is consumed as is.
+- In-kernel QK L2 normalization is not supported.
 
 The wrapper returns the output tensor, or `(output, final_state)` when
 `output_final_state=True`. It also accepts preallocated output, `A`, final
@@ -117,8 +124,21 @@ chunk can be prefetched while the current chunk is processed.
   input state `h` and passes them directly to the fused backward kernel. With
   the flag set, it requests only `A` and transformed `g`, then recomputes `h`
   during backward.
-- Native partial chunk tails are not enabled by the public wrapper; supported
-  sequence lengths are 64-token aligned.
+- Every warp role tails only the pipelines it produces on. A producer tail on
+  a pipeline the role never used waits on that pipeline's empty barrier with a
+  fresh producer state, which passes only while the consumer has released an
+  even number of stages; such a tail on the O-store pipeline in warps 0-3
+  stalled tiles with an odd number of chunks whenever those warps reached it
+  after the epilogue's last O release (seen with an initial state on packed
+  two-sequence layouts under context parallelism).
+- Partial final chunks need no padding: every per-sequence TMA descriptor is
+  bounded at the logical sequence end (rows past the end read as zero and the
+  output store is clipped), the gate/beta producer fills the tail rows with
+  neutral values so the chunk-local cumulative gate carries the last valid
+  value, the triangular inverse is the identity on zero rows, the saved `A`
+  tile is stored with per-element predication on the last chunk, and the saved
+  per-chunk `h` slots follow the per-sequence `ceil(len / 64)` prefix passed as
+  `checkpoint_cu_starts`.
 - This document does not record performance numbers. Benchmark results should
   identify the exact commit, GPU, CUDA/CuTe DSL version, shape, warmup, and
   iteration count.

@@ -436,12 +436,9 @@ class GatedDeltaNet(_GDNBase):
             include_chunk_indices = True
             if chunkwise_cp_context is not None:
                 metadata_cu_seqlens = getattr(chunkwise_cp_context, "cu_seqlens", None)
-                # [REMOVE BEFORE MERGE] Current CP experiments rely on the temporary
-                # 64-token-chunk internal backend contract. For the single-local-sequence
-                # CP layout, FLA's local chunk primitives can run dense and only fused
-                # backward needs device chunk offsets prepared before the profiled GDR
-                # scope. Drop this shape-only shortcut when the internal backend grows
-                # full tail/layout support.
+                # Single-local-sequence CP layout: FLA's local chunk primitives run dense
+                # (any sequence length) and only the fused backward needs device chunk
+                # offsets prepared before the profiled GDR scope.
                 include_chunk_indices = not (
                     metadata_cu_seqlens is not None and metadata_cu_seqlens.numel() == 2
                 )

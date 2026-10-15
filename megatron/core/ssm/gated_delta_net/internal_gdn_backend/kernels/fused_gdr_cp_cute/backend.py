@@ -495,7 +495,7 @@ def _runtime_supported(*, device: torch.device, group) -> bool:
             and _has_module("cuda.bindings.driver")
             and _has_module("torch.distributed._symmetric_memory")
             and device.type == "cuda"
-            and torch.cuda.get_device_capability(device) == (10, 0)
+            and torch.cuda.get_device_capability(device)[0] == 10
             and str(dist.get_backend(group)).lower().endswith("nccl")
             and 2 <= dist.get_world_size(group) <= 8
         )

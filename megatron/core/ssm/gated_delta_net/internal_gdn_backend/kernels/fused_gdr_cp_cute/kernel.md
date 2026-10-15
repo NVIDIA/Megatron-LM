@@ -20,7 +20,8 @@ variable is unset.
 
 ## Supported fast path
 
-- NVIDIA SM100 B200/GB200 with an NCCL CP group of size 2 through 8.
+- NVIDIA Blackwell data-center GPUs (SM100 B200/GB200, SM103 GB300) with an NCCL
+  CP group of size 2 through 8.
 - Packed THD input with validated CPU sequence offsets attached to the CP
   context. Call `finalize_packed_seq_params()` after padding and before the
   model forward so the existing `cp_partition_route` owns that snapshot.

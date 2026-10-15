@@ -234,7 +234,6 @@ class GatedDeltaNetChunkedKernel:
         gate_is_log_decay: bool = False,
         is_persistent: bool = True,
         enable_timeline: bool = False,
-        enable_varlen_tail: bool = False,
     ):
         self.io_dtype = io_dtype
         self.acc_dtype = acc_dtype
@@ -273,7 +272,6 @@ class GatedDeltaNetChunkedKernel:
         self.training_side_outputs_only = False
         self.gate_is_log_cumsum = gate_is_log_cumsum
         self.gate_is_log_decay = gate_is_log_decay
-        self.enable_varlen_tail = enable_varlen_tail
         self.is_persistent = is_persistent
         self.enable_timeline = enable_timeline
 
@@ -724,13 +722,18 @@ class GatedDeltaNetChunkedKernel:
             assert output_h is None, "output_h must be None when store_h is False"
             h_tma_output = None
         if cutlass.const_expr(s_in is not None):
+            # The recurrent state lives in TMEM as S^T ([DV, DK], the A operand of GEMMs 3 and
+            # 4) and _load_initial_state copies GMEM rows straight into TMEM rows, while the
+            # caller hands the state in FLA's [N, H, DK, DV] layout. Present it transposed
+            # (modes (DV, DK)) so TMEM row v receives S[:, v]; the strided element loads run
+            # once per (sequence, head) tile.
             s_in = cute.make_tensor(
                 s_in.iterator,
                 cute.make_layout(
-                    (s_in.shape[2], s_in.shape[3], (h_r, h_qv), s_in.shape[0]),
+                    (s_in.shape[3], s_in.shape[2], (h_r, h_qv), s_in.shape[0]),
                     stride=(
-                        s_in.stride[2],
                         s_in.stride[3],
+                        s_in.stride[2],
                         (s_in.stride[1], h_r * s_in.stride[1]),
                         s_in.stride[0],
                     ),
@@ -1752,9 +1755,13 @@ class GatedDeltaNetChunkedKernel:
                     )
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
+            # Only the pipelines this group produces on. The O-store pipeline is produced by
+            # compute group 1 (which tails it); a tail here would wait on its empty barrier with
+            # a fresh producer state, which passes only while the epilogue has released an even
+            # number of O tiles and therefore stalls odd-chunk-count tiles whenever these warps
+            # reach it after the epilogue's last release.
             a_inv_ready_producer.tail()
             qk_ready_producer.tail()
-            o_store_producer.tail()
             group_order_producer.tail()
 
         # ==============================================================
@@ -1779,98 +1786,35 @@ class GatedDeltaNetChunkedKernel:
                 batch_start = cu_seqlens[batch_idx]
                 seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
-                checkpoint_offset = 0
-                if cutlass.const_expr(self.enable_checkpoints or self.store_h):
-                    checkpoint_offset = cu_checkpoints[batch_idx]
-                if cutlass.const_expr(self.use_initial_state):
-                    kv_acc_producer = self._load_initial_state(
-                        tidx,
-                        mS_init,
-                        head_idx,
-                        batch_idx,
-                        tmem_ptr,
-                        tiled_mma_kv,
-                        kv_acc_producer,
+                # Skip zero-length packed sequences (no chunk, no pipeline traffic).
+                if num_chunks_b > 0:
+                    checkpoint_offset = 0
+                    if cutlass.const_expr(self.enable_checkpoints or self.store_h):
+                        checkpoint_offset = cu_checkpoints[batch_idx]
+                    if cutlass.const_expr(self.use_initial_state):
+                        kv_acc_producer = self._load_initial_state(
+                            tidx,
+                            mS_init,
+                            head_idx,
+                            batch_idx,
+                            tmem_ptr,
+                            tiled_mma_kv,
+                            kv_acc_producer,
+                        )
+                    sV_pisl = self._transform_to_position_independent_layout(
+                        sV, v_smem_layout_staged.inner
                     )
-                sV_pisl = self._transform_to_position_independent_layout(
-                    sV, v_smem_layout_staged.inner
-                )
-                if cutlass.const_expr(self.store_w):
-                    sW_pisl = self._transform_to_position_independent_layout(
-                        sW, w_smem_layout_staged.inner
+                    if cutlass.const_expr(self.store_w):
+                        sW_pisl = self._transform_to_position_independent_layout(
+                            sW, w_smem_layout_staged.inner
+                        )
+                    else:
+                        sW_pisl = sV_pisl
+                    sO_pisl = self._transform_to_position_independent_layout(
+                        sO, o_smem_layout_staged.inner
                     )
-                else:
-                    sW_pisl = sV_pisl
-                sO_pisl = self._transform_to_position_independent_layout(
-                    sO, o_smem_layout_staged.inner
-                )
-                self._timeline_tag(
-                    debug_timing, 1, 0, 0, batch_idx, head_idx, tidx,
-                    self.compute_group_1_warp_ids[0] * self.threads_per_warp,
-                )
-                (
-                    load_v_consumer,
-                    load_w_consumer,
-                    load_gate_consumer,
-                    shared_acc_consumer,
-                    kv_acc_consumer,
-                    q_state_acc_consumer,
-                    group_order_consumer,
-                    kv_acc_producer,
-                    state_inp_ready_producer,
-                    shared_inp_ready_producer,
-                    o_store_producer,
-                    side_output_store_producer,
-                    checkpoint_idx,
-                ) = self.compute_group_1(
-                    tidx,
-                    tmem_ptr,
-                    scale,
-                    (tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv),
-                    (
-                        sV_pisl,
-                        sW_pisl,
-                        sCumsumlog,
-                        sCumprod,
-                        sBeta,
-                        sO_pisl,
-                        sSideOutput,
-                        sH,
-                    ),
-                    (mS_checkpoints, checkpoint_offset, checkpoint_every_n_tokens),
-                    (
-                        load_v_consumer,
-                        load_w_consumer,
-                        load_gate_consumer,
-                        shared_acc_consumer,
-                        kv_acc_consumer,
-                        q_state_acc_consumer,
-                        group_order_consumer,
-                        kv_acc_producer,
-                        state_inp_ready_producer,
-                        shared_inp_ready_producer,
-                        o_store_producer,
-                        side_output_store_producer,
-                    ),
-                    (mVNew_out, mW_out, mH_out, True, 0, head_idx, batch_start),
-                    (
-                        debug_timing,
-                        cutlass.Int32(1),
-                        cutlass.Int32(0),
-                        batch_idx,
-                        head_idx,
-                        tidx,
-                        self.compute_group_1_warp_ids[0] * self.threads_per_warp,
-                    ),
-                )
-                self._timeline_tag(
-                    debug_timing, 1, 0, 1, batch_idx, head_idx, tidx,
-                    self.compute_group_1_warp_ids[0] * self.threads_per_warp,
-                )
-                for chunk_idx in cutlass.range(1, num_chunks_b):
-                    chunk_offset = batch_start + chunk_idx * self.b_t
                     self._timeline_tag(
-                        debug_timing, 1, chunk_idx, 0, batch_idx, head_idx, tidx,
+                        debug_timing, 1, 0, 0, batch_idx, head_idx, tidx,
                         self.compute_group_1_warp_ids[0] * self.threads_per_warp,
                     )
                     (
@@ -1886,7 +1830,7 @@ class GatedDeltaNetChunkedKernel:
                         shared_inp_ready_producer,
                         o_store_producer,
                         side_output_store_producer,
-                        checkpoint_offset,
+                        checkpoint_idx,
                     ) = self.compute_group_1(
                         tidx,
                         tmem_ptr,
@@ -1917,11 +1861,11 @@ class GatedDeltaNetChunkedKernel:
                             o_store_producer,
                             side_output_store_producer,
                         ),
-                        (mVNew_out, mW_out, mH_out, False, chunk_idx, head_idx, chunk_offset),
+                        (mVNew_out, mW_out, mH_out, True, 0, head_idx, batch_start),
                         (
                             debug_timing,
                             cutlass.Int32(1),
-                            chunk_idx,
+                            cutlass.Int32(0),
                             batch_idx,
                             head_idx,
                             tidx,
@@ -1929,28 +1873,93 @@ class GatedDeltaNetChunkedKernel:
                         ),
                     )
                     self._timeline_tag(
-                        debug_timing, 1, chunk_idx, 1, batch_idx, head_idx, tidx,
+                        debug_timing, 1, 0, 1, batch_idx, head_idx, tidx,
                         self.compute_group_1_warp_ids[0] * self.threads_per_warp,
                     )
-                if cutlass.const_expr(
-                    self.store_final_state or self.enable_checkpoints
-                ):
-                    kv_acc_consumer = self._store_final_state(
-                        tidx,
-                        mS_out,
-                        head_idx,
-                        batch_idx,
-                        tmem_ptr,
-                        tiled_mma_kv,
-                        kv_acc_consumer,
-                        seqlen_b,
-                        mS_checkpoints,
-                        checkpoint_offset,
-                        checkpoint_every_n_tokens,
-                    )
-                else:
-                    kv_acc_handle = kv_acc_consumer.wait_and_advance()
-                    kv_acc_handle.release()
+                    for chunk_idx in cutlass.range(1, num_chunks_b):
+                        chunk_offset = batch_start + chunk_idx * self.b_t
+                        self._timeline_tag(
+                            debug_timing, 1, chunk_idx, 0, batch_idx, head_idx, tidx,
+                            self.compute_group_1_warp_ids[0] * self.threads_per_warp,
+                        )
+                        (
+                            load_v_consumer,
+                            load_w_consumer,
+                            load_gate_consumer,
+                            shared_acc_consumer,
+                            kv_acc_consumer,
+                            q_state_acc_consumer,
+                            group_order_consumer,
+                            kv_acc_producer,
+                            state_inp_ready_producer,
+                            shared_inp_ready_producer,
+                            o_store_producer,
+                            side_output_store_producer,
+                            checkpoint_offset,
+                        ) = self.compute_group_1(
+                            tidx,
+                            tmem_ptr,
+                            scale,
+                            (tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv),
+                            (
+                                sV_pisl,
+                                sW_pisl,
+                                sCumsumlog,
+                                sCumprod,
+                                sBeta,
+                                sO_pisl,
+                                sSideOutput,
+                                sH,
+                            ),
+                            (mS_checkpoints, checkpoint_offset, checkpoint_every_n_tokens),
+                            (
+                                load_v_consumer,
+                                load_w_consumer,
+                                load_gate_consumer,
+                                shared_acc_consumer,
+                                kv_acc_consumer,
+                                q_state_acc_consumer,
+                                group_order_consumer,
+                                kv_acc_producer,
+                                state_inp_ready_producer,
+                                shared_inp_ready_producer,
+                                o_store_producer,
+                                side_output_store_producer,
+                            ),
+                            (mVNew_out, mW_out, mH_out, False, chunk_idx, head_idx, chunk_offset),
+                            (
+                                debug_timing,
+                                cutlass.Int32(1),
+                                chunk_idx,
+                                batch_idx,
+                                head_idx,
+                                tidx,
+                                self.compute_group_1_warp_ids[0] * self.threads_per_warp,
+                            ),
+                        )
+                        self._timeline_tag(
+                            debug_timing, 1, chunk_idx, 1, batch_idx, head_idx, tidx,
+                            self.compute_group_1_warp_ids[0] * self.threads_per_warp,
+                        )
+                    if cutlass.const_expr(
+                        self.store_final_state or self.enable_checkpoints
+                    ):
+                        kv_acc_consumer = self._store_final_state(
+                            tidx,
+                            mS_out,
+                            head_idx,
+                            batch_idx,
+                            tmem_ptr,
+                            tiled_mma_kv,
+                            kv_acc_consumer,
+                            seqlen_b,
+                            mS_checkpoints,
+                            checkpoint_offset,
+                            checkpoint_every_n_tokens,
+                        )
+                    else:
+                        kv_acc_handle = kv_acc_consumer.wait_and_advance()
+                        kv_acc_handle.release()
 
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
@@ -1980,65 +1989,12 @@ class GatedDeltaNetChunkedKernel:
                 batch_start = cu_seqlens[batch_idx]
                 seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
-                # First chunk: no previous state (S_prev = 0), skip GEMMs 3/4.
-                chunk_offset = batch_start
-                self._timeline_tag(
-                    debug_timing, 2, 0, 0, batch_idx, head_idx, tidx,
-                    self.mma_warp_id * self.threads_per_warp,
-                )
-                (
-                    shared_acc_producer,
-                    q_state_acc_producer,
-                    kv_acc_producer,
-                    load_k_consumer,
-                    load_q_consumer,
-                    load_v_consumer,
-                    a_inv_ready_consumer,
-                    qk_ready_consumer,
-                    state_inp_ready_consumer,
-                    shared_inp_ready_consumer,
-                ) = self.mma_warp(
-                    tmem_ptr,
-                    (
-                        tiled_mma_qk,
-                        tiled_mma_qs,
-                        tiled_mma_qkv,
-                        tiled_mma_qkv_ss,
-                        tiled_mma_kv,
-                    ),
-                    (sQ, sK, sK_trans, sV, sAinv, sQk),
-                    (
-                        shared_acc_producer,
-                        q_state_acc_producer,
-                        kv_acc_producer,
-                        load_k_consumer,
-                        load_q_consumer,
-                        load_v_consumer,
-                        a_inv_ready_consumer,
-                        qk_ready_consumer,
-                        state_inp_ready_consumer,
-                        shared_inp_ready_consumer,
-                    ),
-                    (True,),
-                    (
-                        debug_timing,
-                        cutlass.Int32(2),
-                        cutlass.Int32(0),
-                        batch_idx,
-                        head_idx,
-                        tidx,
-                        self.mma_warp_id * self.threads_per_warp,
-                    ),
-                )
-                self._timeline_tag(
-                    debug_timing, 2, 0, 1, batch_idx, head_idx, tidx,
-                    self.mma_warp_id * self.threads_per_warp,
-                )
-
-                # Main loop: chunks 1..num_chunks_b-1 with previous state.
-                for chunk_idx in cutlass.range(1, num_chunks_b):  # noqa: B007
+                # Skip zero-length packed sequences (no chunk, no pipeline traffic).
+                if num_chunks_b > 0:
+                    # First chunk: no previous state (S_prev = 0), skip GEMMs 3/4.
+                    chunk_offset = batch_start
                     self._timeline_tag(
-                        debug_timing, 2, chunk_idx, 0, batch_idx, head_idx, tidx,
+                        debug_timing, 2, 0, 0, batch_idx, head_idx, tidx,
                         self.mma_warp_id * self.threads_per_warp,
                     )
                     (
@@ -2074,11 +2030,11 @@ class GatedDeltaNetChunkedKernel:
                             state_inp_ready_consumer,
                             shared_inp_ready_consumer,
                         ),
-                        (False,),
+                        (True,),
                         (
                             debug_timing,
                             cutlass.Int32(2),
-                            chunk_idx,
+                            cutlass.Int32(0),
                             batch_idx,
                             head_idx,
                             tidx,
@@ -2086,9 +2042,64 @@ class GatedDeltaNetChunkedKernel:
                         ),
                     )
                     self._timeline_tag(
-                        debug_timing, 2, chunk_idx, 1, batch_idx, head_idx, tidx,
+                        debug_timing, 2, 0, 1, batch_idx, head_idx, tidx,
                         self.mma_warp_id * self.threads_per_warp,
                     )
+
+                    # Main loop: chunks 1..num_chunks_b-1 with previous state.
+                    for chunk_idx in cutlass.range(1, num_chunks_b):  # noqa: B007
+                        self._timeline_tag(
+                            debug_timing, 2, chunk_idx, 0, batch_idx, head_idx, tidx,
+                            self.mma_warp_id * self.threads_per_warp,
+                        )
+                        (
+                            shared_acc_producer,
+                            q_state_acc_producer,
+                            kv_acc_producer,
+                            load_k_consumer,
+                            load_q_consumer,
+                            load_v_consumer,
+                            a_inv_ready_consumer,
+                            qk_ready_consumer,
+                            state_inp_ready_consumer,
+                            shared_inp_ready_consumer,
+                        ) = self.mma_warp(
+                            tmem_ptr,
+                            (
+                                tiled_mma_qk,
+                                tiled_mma_qs,
+                                tiled_mma_qkv,
+                                tiled_mma_qkv_ss,
+                                tiled_mma_kv,
+                            ),
+                            (sQ, sK, sK_trans, sV, sAinv, sQk),
+                            (
+                                shared_acc_producer,
+                                q_state_acc_producer,
+                                kv_acc_producer,
+                                load_k_consumer,
+                                load_q_consumer,
+                                load_v_consumer,
+                                a_inv_ready_consumer,
+                                qk_ready_consumer,
+                                state_inp_ready_consumer,
+                                shared_inp_ready_consumer,
+                            ),
+                            (False,),
+                            (
+                                debug_timing,
+                                cutlass.Int32(2),
+                                chunk_idx,
+                                batch_idx,
+                                head_idx,
+                                tidx,
+                                self.mma_warp_id * self.threads_per_warp,
+                            ),
+                        )
+                        self._timeline_tag(
+                            debug_timing, 2, chunk_idx, 1, batch_idx, head_idx, tidx,
+                            self.mma_warp_id * self.threads_per_warp,
+                        )
 
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
@@ -2273,9 +2284,38 @@ class GatedDeltaNetChunkedKernel:
                 seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
                 batch_end = batch_start + seqlen_b
-                # Full tiles (all but the last): unconditional loads
-                for chunk_idx in cutlass.range(num_chunks_b - 1):
-                    chunk_offset = batch_start + chunk_idx * self.b_t
+                # Zero-length packed sequences (trailing fixed-capacity cu_seqlens entries) own no
+                # chunk; every warp role must skip them consistently to keep the pipelines aligned.
+                if num_chunks_b > 0:
+                    # Full tiles (all but the last): unconditional loads
+                    for chunk_idx in cutlass.range(num_chunks_b - 1):
+                        chunk_offset = batch_start + chunk_idx * self.b_t
+                        self._timeline_tag(
+                            debug_timing, 4, chunk_idx, 0, batch_idx, head_idx, tidx,
+                            self.load_gate_beta_warp_id * self.threads_per_warp,
+                        )
+                        load_gate_producer, load_beta_producer = self.load_gate_beta_warp(
+                            tidx,
+                            (mGate, mBeta, mGateOut),
+                            (sCumsumlog, sCumprod, sBeta),
+                            (load_gate_producer, load_beta_producer),
+                            (chunk_offset, head_idx, False, batch_end),
+                            (
+                                debug_timing,
+                                cutlass.Int32(4),
+                                chunk_idx,
+                                batch_idx,
+                                head_idx,
+                                tidx,
+                                self.load_gate_beta_warp_id * self.threads_per_warp,
+                            ),
+                        )
+                        self._timeline_tag(
+                            debug_timing, 4, chunk_idx, 1, batch_idx, head_idx, tidx,
+                            self.load_gate_beta_warp_id * self.threads_per_warp,
+                        )
+                    # Last tile: is_last_tile=True, valid_tokens derived inside
+                    chunk_idx = num_chunks_b - 1
                     self._timeline_tag(
                         debug_timing, 4, chunk_idx, 0, batch_idx, head_idx, tidx,
                         self.load_gate_beta_warp_id * self.threads_per_warp,
@@ -2285,7 +2325,12 @@ class GatedDeltaNetChunkedKernel:
                         (mGate, mBeta, mGateOut),
                         (sCumsumlog, sCumprod, sBeta),
                         (load_gate_producer, load_beta_producer),
-                        (chunk_offset, head_idx, False, batch_end),
+                        (
+                            batch_start + (num_chunks_b - 1) * self.b_t,
+                            head_idx,
+                            True,
+                            batch_end,
+                        ),
                         (
                             debug_timing,
                             cutlass.Int32(4),
@@ -2300,37 +2345,6 @@ class GatedDeltaNetChunkedKernel:
                         debug_timing, 4, chunk_idx, 1, batch_idx, head_idx, tidx,
                         self.load_gate_beta_warp_id * self.threads_per_warp,
                     )
-                # Last tile: is_last_tile=True, valid_tokens derived inside
-                chunk_idx = num_chunks_b - 1
-                self._timeline_tag(
-                    debug_timing, 4, chunk_idx, 0, batch_idx, head_idx, tidx,
-                    self.load_gate_beta_warp_id * self.threads_per_warp,
-                )
-                load_gate_producer, load_beta_producer = self.load_gate_beta_warp(
-                    tidx,
-                    (mGate, mBeta, mGateOut),
-                    (sCumsumlog, sCumprod, sBeta),
-                    (load_gate_producer, load_beta_producer),
-                    (
-                        batch_start + (num_chunks_b - 1) * self.b_t,
-                        head_idx,
-                        True,
-                        batch_end,
-                    ),
-                    (
-                        debug_timing,
-                        cutlass.Int32(4),
-                        chunk_idx,
-                        batch_idx,
-                        head_idx,
-                        tidx,
-                        self.load_gate_beta_warp_id * self.threads_per_warp,
-                    ),
-                )
-                self._timeline_tag(
-                    debug_timing, 4, chunk_idx, 1, batch_idx, head_idx, tidx,
-                    self.load_gate_beta_warp_id * self.threads_per_warp,
-                )
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
             load_gate_producer.tail()
@@ -2877,11 +2891,9 @@ class GatedDeltaNetChunkedKernel:
         # --- Gate load ---
         if cutlass.const_expr(is_last_tile):
             if cutlass.const_expr(self.gate_is_log_cumsum):
-                if cutlass.const_expr(self.enable_varlen_tail):
-                    # Extend the last valid cumulative value across padded rows.
-                    tGrGate.fill(mGateHead[batch_end - 1])
-                else:
-                    tGrGate.fill(0.0)
+                # Extend the last valid cumulative value across the padded tail rows so
+                # exp2(g_last - g_r) stays finite and neutral for rows past the sequence.
+                tGrGate.fill(mGateHead[batch_end - 1])
             else:
                 if cutlass.const_expr(self.gate_is_log_decay):
                     # OOB neutral for raw Megatron log-decay: 0.0 contributes no decay.
@@ -3662,24 +3674,20 @@ class GatedDeltaNetChunkedKernel:
             )
             gA_tile = cute.flat_divide(gA_out, (self.b_t, self.b_t))[None, None, 0, 0]
             tCgAI = thr_ainv_s2r.partition_D(gA_tile)
-            if cutlass.const_expr(not self.enable_varlen_tail):
+            # Full chunks use the vectorized store; a partial final chunk predicates
+            # every element on the logical sequence end so the store never spills into
+            # the next packed sequence (or past the allocation).
+            if chunk_offset + self.b_t <= batch_end:
                 cute.autovec_copy(
                     tCrAI,
                     tCgAI,
                     l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                 )
             else:
-                if chunk_offset + self.b_t <= batch_end:
-                    cute.autovec_copy(
-                        tCrAI,
-                        tCgAI,
-                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                    )
-                else:
-                    for k in cutlass.range_constexpr(cute.size(tCrAI)):
-                        coord = tTR_tScS[k]
-                        if chunk_offset + coord[0] < batch_end:
-                            tCgAI[k] = tCrAI[k]
+                for k in cutlass.range_constexpr(cute.size(tCrAI)):
+                    coord = tTR_tScS[k]
+                    if chunk_offset + coord[0] < batch_end:
+                        tCgAI[k] = tCrAI[k]
 
         tCrAI_acc.store(tCrAI.load().to(self.acc_dtype))
         for k in cutlass.range(cute.size(tCrAI)):

@@ -2091,3 +2091,169 @@ def test_fused_backward_kernel_uses_named_layout_contracts():
             columns_overlap = max(lhs[1], rhs[1]) < min(lhs[2], rhs[2])
             phases_overlap = max(lhs[3], rhs[3]) < min(lhs[4], rhs[4])
             assert not (columns_overlap and phases_overlap), (lhs[0], rhs[0])
+
+
+def test_fused_forward_wrapper_accepts_unaligned_sequence_lengths():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_fwd_cute import (
+        fused_fwd,
+    )
+
+    cu_seqlens = torch.tensor([0, 65, 130, 131, 131], dtype=torch.int64)
+    launch = fused_fwd._validate_cu_seqlens(cu_seqlens, 131)
+    assert launch.dtype == torch.int32
+    assert torch.equal(launch, cu_seqlens.to(torch.int32))
+
+    with pytest.raises(ValueError, match="non-decreasing"):
+        fused_fwd._validate_cu_seqlens(torch.tensor([0, 65, 60], dtype=torch.int32), 60)
+    with pytest.raises(ValueError, match="start at 0"):
+        fused_fwd._validate_cu_seqlens(torch.tensor([1, 65], dtype=torch.int32), 65)
+    with pytest.raises(ValueError, match="final value"):
+        fused_fwd._validate_cu_seqlens(torch.tensor([0, 65], dtype=torch.int32), 64)
+
+
+def test_cutedsl_forward_sizes_saved_h_by_ceil_chunks_for_ragged_packed_input(monkeypatch):
+    implementation = _implementation()
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_fwd_cute
+
+    implementation._clear_packed_chunk_metadata_cache_for_test()
+    shape = (1, 131, 3, 4)
+    q = torch.empty(shape)
+    inputs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty(shape[:-1]),
+        "beta": torch.empty(shape[:-1]),
+    }
+    # Lengths 65, 65, 1 -> ceil chunks 2, 2, 1 = 5 saved states.
+    cu_seqlens = torch.tensor([0, 65, 130, 131], dtype=torch.int32)
+    chunk_indices = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1], [2, 0]], dtype=torch.int32)
+    seen = {}
+
+    def launcher(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(implementation, "prepare_chunk_indices", lambda *_a, **_k: chunk_indices)
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda g, **_kwargs: g)
+    monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
+
+    _g, _output, _A, saved_h, indices, chunk_offsets = implementation._cutedsl_forward(
+        **inputs, scale=0.5, cu_seqlens=cu_seqlens, save_fused_bwd_state=True
+    )
+
+    assert indices is chunk_indices
+    assert torch.equal(chunk_offsets, torch.tensor([0, 2, 4, 5], dtype=torch.int32))
+    assert tuple(saved_h.shape) == (5, 3, 4, 4)
+    assert seen["output_h"] is saved_h
+    assert seen["checkpoint_cu_starts"] is chunk_offsets
+    assert seen["checkpoint_every_n_tokens"] == 64
+    assert seen["assume_valid_cu_seqlens"] is True
+
+
+def test_cutedsl_forward_sizes_saved_h_by_ceil_chunks_for_ragged_dense_input(monkeypatch):
+    implementation = _implementation()
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_fwd_cute
+
+    implementation._clear_dense_chunk_metadata_cache_for_test()
+    shape = (2, 100, 3, 4)
+    q = torch.empty(shape)
+    inputs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty(shape[:-1]),
+        "beta": torch.empty(shape[:-1]),
+    }
+    seen = {}
+
+    def launcher(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
+
+    _g, _output, _A, saved_h, _indices, chunk_offsets = implementation._cutedsl_forward(
+        **inputs, scale=0.5, cu_seqlens=None, save_fused_bwd_state=True
+    )
+
+    dense_metadata = implementation._dense_chunk_metadata(2, 100, q.device)
+    assert torch.equal(seen["cu_seqlens"], torch.tensor([0, 100, 200], dtype=torch.int32))
+    assert torch.equal(chunk_offsets, torch.tensor([0, 2, 4], dtype=torch.int32))
+    assert chunk_offsets is dense_metadata.chunk_offsets
+    assert tuple(saved_h.shape) == (4, 3, 4, 4)
+    assert seen["checkpoint_cu_starts"] is chunk_offsets
+
+
+def _stub_fused_forward_launcher(monkeypatch):
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_fwd_cute import (
+        fused_fwd,
+    )
+
+    launcher_name = (
+        "megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels."
+        "fused_gdr_fwd_cute.launcher"
+    )
+    launcher_stub = ModuleType(launcher_name)
+    seen = {}
+
+    def launcher(**kwargs):
+        seen.update(kwargs)
+
+    launcher_stub.cutedsl_fused_chunk_gdn_fwd_sm100 = launcher
+    monkeypatch.setitem(sys.modules, launcher_name, launcher_stub)
+    monkeypatch.setattr(fused_fwd, "_check_cuda_sm100", lambda _tensor: None)
+    return fused_fwd, seen
+
+
+def _ragged_wrapper_inputs(dtype):
+    total_tokens = 130
+    return {
+        "q": torch.empty((total_tokens, 2, 128), dtype=dtype),
+        "k": torch.empty((total_tokens, 2, 128), dtype=dtype),
+        "v": torch.empty((total_tokens, 2, 128), dtype=dtype),
+        "g": torch.zeros((total_tokens, 2), dtype=torch.float32),
+        "beta": torch.ones((total_tokens, 2), dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, 65, 130, 130], dtype=torch.int32),
+        "gate_is_log_decay": True,
+        "checkpoint_every_n_tokens": 64,
+    }
+
+
+def test_fused_forward_wrapper_validates_ragged_chunk_metadata(monkeypatch):
+    fused_fwd, _seen = _stub_fused_forward_launcher(monkeypatch)
+    inputs = _ragged_wrapper_inputs(torch.bfloat16)
+
+    # The chunk prefix must have one entry per sequence boundary.
+    with pytest.raises(ValueError, match="same length as cu_seqlens"):
+        fused_fwd.chunk_gated_delta_rule_prefill_cute(
+            **inputs,
+            output_h=torch.empty((4, 2, 128, 128), dtype=torch.bfloat16),
+            checkpoint_cu_starts=torch.tensor([0, 4], dtype=torch.int32),
+        )
+
+    # Untrusted offsets: the saved state must hold sum(ceil(len / 64)) = 2 + 2 + 0 chunks.
+    with pytest.raises(ValueError, match="must hold 4 chunk states"):
+        fused_fwd.chunk_gated_delta_rule_prefill_cute(
+            **inputs,
+            output_h=torch.empty((3, 2, 128, 128), dtype=torch.bfloat16),
+            checkpoint_cu_starts=torch.tensor([0, 2, 4, 4], dtype=torch.int32),
+        )
+
+
+def test_fused_forward_wrapper_zeroes_first_slots_for_non_bf16_states(monkeypatch):
+    fused_fwd, seen = _stub_fused_forward_launcher(monkeypatch)
+    inputs = _ragged_wrapper_inputs(torch.float16)
+    output_h = torch.ones((4, 2, 128, 128), dtype=torch.float16)
+    checkpoint_cu_starts = torch.tensor([0, 2, 4, 4], dtype=torch.int32)
+
+    fused_fwd.chunk_gated_delta_rule_prefill_cute(
+        **inputs, output_h=output_h, checkpoint_cu_starts=checkpoint_cu_starts
+    )
+
+    # First slots of the two real sequences are zeroed; the trailing zero-length sequence
+    # owns no slot and must not index past the buffer.
+    assert torch.equal(output_h[0], torch.zeros_like(output_h[0]))
+    assert torch.equal(output_h[2], torch.zeros_like(output_h[2]))
+    assert torch.equal(output_h[1], torch.ones_like(output_h[1]))
+    assert torch.equal(output_h[3], torch.ones_like(output_h[3]))
+    assert seen["output_h"] is output_h
+    assert torch.equal(seen["cu_checkpoints"], checkpoint_cu_starts)
