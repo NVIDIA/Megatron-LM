@@ -3,6 +3,7 @@
 import copy
 import os
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -150,6 +151,107 @@ def test_kda_rejects_invalid_packed_boundaries():
     with pytest.raises(ValueError, match="at least one sequence in both Q and KV"):
         empty = torch.tensor([0], dtype=torch.int32)
         KimiDeltaAttention._validate_packed_cu_seqlens(empty, empty.clone())
+
+
+def _kda_shell(config: TransformerConfig) -> SimpleNamespace:
+    """Return the attributes ``_GDNBase.__init__`` sets before the variant hooks run."""
+
+    qk_dim = config.linear_key_head_dim * config.linear_num_key_heads
+    v_dim = config.linear_value_head_dim * config.linear_num_value_heads
+    return SimpleNamespace(
+        config=config,
+        qk_dim=qk_dim,
+        qk_dim_local_tp=qk_dim,
+        v_dim_local_tp=v_dim,
+        num_k_heads_local_tp=config.linear_num_key_heads,
+        conv_kernel_dim=config.linear_conv_kernel_dim,
+        _chunkwise_cp_context_cache={},
+    )
+
+
+@pytest.mark.parametrize("backend", ["internal", "fla", "torch", "cudnn"])
+def test_kda_binds_gated_delta_rule_by_backend(backend):
+    from megatron.core.ssm.gated_delta_net import kda as kda_module
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import chunk as internal_backend
+
+    shell = _kda_shell(replace(_make_config(), gdn_gdr_backend=backend))
+    KimiDeltaAttention._setup_variant_attrs(shell)
+
+    if backend == "internal":
+        assert shell.gated_delta_rule is internal_backend.chunk_kda
+    else:
+        # Every other backend value keeps FLA's chunk_kda (None when FLA is absent).
+        assert shell.gated_delta_rule is kda_module.chunk_kda
+    assert shell.in_proj_split_names == ["query", "key", "value", "g", "gate"]
+
+
+@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+@pytest.mark.parametrize("backend", ["internal", "fla"])
+def test_kda_chunkwise_cp_context_carries_internal_metadata(monkeypatch, layout, backend):
+    from megatron.core.ssm.gated_delta_net import kda as kda_module
+
+    config = replace(_make_config(cp_size=2, linear_cp_mode="chunkwise"), gdn_gdr_backend=backend)
+    shell = _kda_shell(config)
+    group = object()
+    built = []
+    prepared = []
+    real_prepare = kda_module.prepare_internal_gdr_cp_context_metadata
+
+    def build_cp_context(*, cu_seqlens, group, conv1d_kernel_size):
+        built.append((cu_seqlens, group, conv1d_kernel_size))
+        return SimpleNamespace(cu_seqlens=cu_seqlens)
+
+    def prepare(context, **kwargs):
+        prepared.append(kwargs)
+        return real_prepare(context, **kwargs)
+
+    monkeypatch.setattr(kda_module, "build_cp_context", build_cp_context)
+    monkeypatch.setattr(kda_module, "prepare_internal_gdr_cp_context_metadata", prepare)
+    monkeypatch.setattr(kda_module.torch.cuda, "current_device", lambda: "cpu")
+    build = KimiDeltaAttention._build_chunkwise_cp_context
+
+    if layout == "thd":
+        global_cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32)
+        cu_seqlens_q, context = build(shell, global_cu_seqlens, group, 64, 1)
+
+        assert cu_seqlens_q is global_cu_seqlens
+        assert built == [(global_cu_seqlens, group, config.linear_conv_kernel_dim)]
+        if backend == "internal":
+            assert len(prepared) == 1
+            assert set(prepared[0]) == {"config", "global_cu_seqlens"}
+            assert prepared[0]["config"] is config
+            # The padded global offsets reach the metadata, not the context's local ones.
+            assert prepared[0]["global_cu_seqlens"] is global_cu_seqlens
+            assert context.global_num_seqs == 2
+            assert context.global_cu_seqlens_cpu.tolist() == [0, 32, 64]
+        else:
+            assert prepared == []
+            assert not hasattr(context, "global_cu_seqlens_cpu")
+        return
+
+    cu_seqlens_q, context = build(shell, None, group, 64, 1)
+
+    assert cu_seqlens_q.dtype == torch.int32
+    assert cu_seqlens_q.tolist() == [0, 64]
+    assert built[0][0] is cu_seqlens_q and built[0][1] is group
+    cached_cu_seqlens, cached_context = shell._chunkwise_cp_context_cache[(64, 1)]
+    assert cached_cu_seqlens is cu_seqlens_q and cached_context is context
+
+    # A cache hit reuses the context and only refreshes the metadata (no new offsets).
+    again_cu_seqlens_q, again_context = build(shell, None, group, 64, 1)
+    assert again_cu_seqlens_q is cu_seqlens_q and again_context is context
+    assert len(built) == 1
+    if backend == "internal":
+        assert len(prepared) == 2
+        assert set(prepared[0]) == {"config", "global_num_sequences", "global_cu_seqlens"}
+        assert prepared[0]["global_num_sequences"] == 1
+        assert prepared[0]["global_cu_seqlens"] is cu_seqlens_q
+        assert set(prepared[1]) == {"config", "global_num_sequences"}
+        assert context.global_num_seqs == 1
+        assert context.global_cu_seqlens_cpu.tolist() == [0, 64]
+    else:
+        assert prepared == []
+        assert not hasattr(context, "global_cu_seqlens_cpu")
 
 
 @pytest.mark.internal

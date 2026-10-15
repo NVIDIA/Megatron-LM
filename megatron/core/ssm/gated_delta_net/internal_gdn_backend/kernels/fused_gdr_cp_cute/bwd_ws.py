@@ -1462,7 +1462,8 @@ class CuteDSLFusedCPBwdPreProcessWS(CPHostCaches):
     Aligned calls (``T % BT == 0``) compile the ragged-tail machinery away,
     so chunk alignment is the compile-cache key.  Both specializations
     coexist in the cache; a workload that alternates lengths pays one extra
-    compile, not one per call.
+    compile, not one per call.  Under per-key ``gk`` the ragged
+    specialization serves every ``T`` instead (see ``_launch``).
 
     The chain shape is deliberately NOT part of the key.  The engine is always
     built on the full chain -- rank r pushes to ``r-1 .. 0`` and folds
@@ -1676,10 +1677,17 @@ class CuteDSLFusedCPBwdPreProcessWS(CPHostCaches):
         )
         # Aligned / ragged specialization (see the class docstring).  The
         # geometry is otherwise fixed by the wrapper, so this is the whole key.
-        geometry = (int(T) % BT == 0,)
+        # Per-key `gk` always takes the ragged specialization: the aligned
+        # program really is different there (`need_lam` and `need_mask` both
+        # off), and compiling it lazily at the first non-64-aligned boundary
+        # window would stall one rank at a random mid-training step while its
+        # peers spin (see `fused_ws.PreProcessFwdFusedWS.build_key`).  One
+        # compile per wrapper, at the first launch, instead; the cost is the
+        # lambda table and the dV tail mask on aligned calls.
+        full_chunks = int(T) % BT == 0 and self.gate_mode != "gk"
+        geometry = (full_chunks,)
         op = self._ops.get(geometry)
         if op is None:
-            (full_chunks,) = geometry
             op = PreProcessBwdFusedWS(
                 self.H, self.HV, self.DK, self.DV, self.gate_mode,
                 self.R, self.rank, full_chunks=full_chunks,

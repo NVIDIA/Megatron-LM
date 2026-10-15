@@ -588,8 +588,11 @@ def test_cp_backward_preprocessing_produces_fused_dht_and_state(monkeypatch, use
     assert seen["cp_preprocess"]["context"] is cp_context
 
 
+@pytest.mark.parametrize("gate", ["g", "gk"])
 @pytest.mark.parametrize("direction", ["forward", "backward"])
-def test_cp_preprocess_prefers_local_cutedsl_and_preserves_fla_fallback(monkeypatch, direction):
+def test_cp_preprocess_prefers_local_cutedsl_and_preserves_fla_fallback(
+    monkeypatch, direction, gate
+):
     implementation = _implementation()
     shape = (1, 64, 2, 4)
     operands = {
@@ -599,12 +602,16 @@ def test_cp_preprocess_prefers_local_cutedsl_and_preserves_fla_fallback(monkeypa
         "u": torch.empty(shape, dtype=torch.bfloat16),
         "do": torch.empty(shape, dtype=torch.bfloat16),
         "dv": torch.empty(shape, dtype=torch.bfloat16),
+        # GDN's scalar gate and KDA's per-key gate; the shim takes exactly one.
         "g": torch.empty(shape[:-1], dtype=torch.float32),
+        "gk": torch.empty(shape, dtype=torch.float32),
     }
+    other_gate = "gk" if gate == "g" else "g"
     cp_context = SimpleNamespace(group=object())
     local_result = torch.empty((1, 2, 4, 4), dtype=torch.float32)
     fallback_result = torch.empty_like(local_result)
     calls = {"local": 0, "fla": 0}
+    seen = {}
 
     if direction == "forward":
         local_name = "try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl"
@@ -614,7 +621,7 @@ def test_cp_preprocess_prefers_local_cutedsl_and_preserves_fla_fallback(monkeypa
             "k": operands["k"],
             "w": operands["w"],
             "u": operands["u"],
-            "g": operands["g"],
+            gate: operands[gate],
             "cu_seqlens": None,
             "initial_state": None,
             "context": cp_context,
@@ -630,7 +637,7 @@ def test_cp_preprocess_prefers_local_cutedsl_and_preserves_fla_fallback(monkeypa
             "w": operands["w"],
             "do": operands["do"],
             "dv": operands["dv"],
-            "g": operands["g"],
+            gate: operands[gate],
             "scale": 0.5,
             "cu_seqlens": None,
             "dht": None,
@@ -639,12 +646,14 @@ def test_cp_preprocess_prefers_local_cutedsl_and_preserves_fla_fallback(monkeypa
         }
         expected_fallback = (fallback_result, None)
 
-    def local(**_kwargs):
+    def local(**local_kwargs):
         calls["local"] += 1
+        seen["local"] = local_kwargs
         return local_result
 
-    def fla(**_kwargs):
+    def fla(**fla_kwargs):
         calls["fla"] += 1
+        seen["fla"] = fla_kwargs
         return expected_fallback
 
     monkeypatch.setattr(implementation, local_name, local)
@@ -665,6 +674,13 @@ def test_cp_preprocess_prefers_local_cutedsl_and_preserves_fla_fallback(monkeypa
         assert actual_fallback[0] is fallback_result
         assert actual_fallback[1] is None
     assert calls == {"local": 1, "fla": 1}
+
+    # Both the in-tree hook and the FLA fallback receive the supplied gate under
+    # its own name and `None` under the other, so KDA's per-key `gk` is never
+    # mistaken for GDN's scalar `g` on either path.
+    for recorded in (seen["local"], seen["fla"]):
+        assert recorded[gate] is operands[gate]
+        assert recorded[other_gate] is None
 
 
 def test_cutedsl_cp_backward_feeds_preprocessed_dht_to_fused_kernel(monkeypatch):

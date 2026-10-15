@@ -22,7 +22,13 @@ The internal backend tries this package before FLA's CP preprocessing. Set
 - Packed THD input with validated CPU sequence offsets attached to the CP
   context. Call `finalize_packed_seq_params()` after padding and before the
   model forward so the existing `cp_partition_route` owns that snapshot.
-- BF16 operands, scalar `g` gate, chunk size 64.
+- BF16 operands, chunk size 64, and exactly one gate: GDN's scalar `g`
+  (`[1,T,HV]`, fp32 or bf16) or KDA's per-key `gk` (`[1,T,HV,K]` fp32, FLA's
+  chunk-local log2 cumsum). The kernels read only the chunk-last row of `gk`
+  and apply no per-token gating in that mode, so the `k` / `q` operands must
+  arrive pre-gated as FLA's `kg` / `qg` -- the same contract as FLA's own
+  Triton CP pre-process. `HV % 4 == 0` is required in both modes (only the
+  `g` TMA box needs it; the dispatcher keeps one head-geometry contract).
 - Equal key/value dimensions of 128.
 - Any local window length that is not a multiple of 64 is handled inside the
   kernels (the TMA descriptors carry the logical `T`, so a ragged tail is
@@ -45,7 +51,17 @@ Only the warp-specialized (tcgen05) engines remain:
 
 Each wrapper compiles one specialization per chunk alignment (`T % 64 == 0`
 or not); under scalar `g` the forward's two specializations are the same
-program and share one cache entry.
+program and share one cache entry. Under per-key `gk` both wrappers run the
+ragged (tail-masked) specialization for every `T`: the aligned program would
+differ there, and compiling it lazily at the first non-64-aligned boundary
+window would stall one rank at a random mid-training step while its peers
+spin in symmetric memory. Each direction therefore pays exactly one compile,
+at its first launch, right after the rank-consistent handshake; the cost is
+the lambda 1/0 table (and the backward's dV tail mask) on aligned calls, the
+same work scalar `g` already does for lambda. The wrapper cache key and the
+handshake signature carry the gate mode, so a GDN and a KDA layer of the same
+head geometry never share a wrapper. The forward engine's K = 64 `gk` pairing
+is unverified and unreachable: the dispatcher admits only K = V = 128.
 
 The production `GatedDeltaNet.forward` path preserves MCore's established
 chunkwise-CP contract: dense SBHD input with `B > 1` is rejected. Use packed THD

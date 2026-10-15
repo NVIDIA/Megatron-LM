@@ -120,8 +120,21 @@ class PreProcessFwdFusedWS(CPProtocolMixin):
         It reaches the emitted program only through
         `need_lam = use_g or not full_chunks`, so under scalar `g` both values
         produce the same binary and must share one cache entry.
+
+        Under per-key `gk` the two programs really do differ, and the wrapper
+        deliberately runs the ragged (tail-masked) one for every `T`: the key
+        is `True` regardless of `full_chunks`, and the wrapper constructs that
+        single entry with `full_chunks=False`.  One `cute.compile` per
+        wrapper, at the first launch (which every rank reaches in lockstep
+        right after the rank-consistent handshake), instead of a second
+        multi-second compile at the first non-64-aligned boundary window --
+        which under THD lands at a random mid-training step on one rank while
+        its peers spin in symmetric memory.  The cost is the lambda 1/0 table
+        on aligned calls, the same work scalar `g` already does for lambda.
+
+        `True` therefore means "the generic specialisation" in every mode.
         """
-        return gate_mode == "g" or not full_chunks
+        return gate_mode in ("g", "gk") or not full_chunks
 
     def __init__(self, H, HV, K, V, gate_mode, R, rank, n_sm=None,
                  full_chunks=False):
@@ -2041,15 +2054,20 @@ class CuteDSLFusedCPPreProcessWS(CPHostCaches):
             [self.bufs.hm_ptrs, self.bufs.fl_ptrs, self.bufs.ak_ptrs]
         ).contiguous()
         # Keep the canonical full-chunk specialization byte-for-byte: in
-        # none/gk mode it compiles out the lambda publication chain.  Ragged
+        # none mode it compiles out the lambda publication chain.  Ragged
         # calls lazily compile the generic tail-masked specialization instead
         # of slowing every T%64==0 production launch.  Under scalar `g` the two
         # are the same program (see `build_key`), so this one entry serves both
-        # and no ragged call ever triggers a second compile.
+        # and no ragged call ever triggers a second compile.  Under per-key
+        # `gk` the key is the same for every `T` and this one entry IS the
+        # ragged specialization (`full_chunks=False`), so again exactly one
+        # compile; see `build_key` for why that is preferred over a lazy
+        # mid-training compile of the aligned program.
         aligned_key = PreProcessFwdFusedWS.build_key(gate_mode, True)
         self._ops = {
             aligned_key: PreProcessFwdFusedWS(
-                H, HV, DK, DV, gate_mode, self.R, self.rank, full_chunks=True,
+                H, HV, DK, DV, gate_mode, self.R, self.rank,
+                full_chunks=gate_mode != "gk",
             )
         }
         self.op = self._ops[aligned_key]
@@ -2228,17 +2246,19 @@ class CuteDSLFusedCPPreProcessWS(CPHostCaches):
             self._cu_stream(_stream_handle),
         )
         # `full_chunks` reaches codegen through exactly one flag,
-        # `need_lam = use_g or not full_chunks`, so in g-mode -- the only mode
-        # `backend.py` dispatches -- the aligned and ragged specializations are
-        # the same program.  (Verified by compiling both and diffing the
-        # artifacts: identical sm_100a PTX and cubin.)  Keying the caches on
-        # `need_lam` instead of on `full_chunks` therefore costs nothing in
-        # none/gk mode, where the two really do differ, and in g-mode it stops
-        # the first non-64-aligned call from paying a multi-second
-        # `cute.compile` for a binary that is already loaded.  That mattered
-        # under THD specifically: the window is 64-aligned about one step in
-        # 64, so the ragged compile landed at a random mid-training step, with
-        # the peer rank spinning on 148 SMs for the duration.
+        # `need_lam = use_g or not full_chunks`, so in g-mode the aligned and
+        # ragged specializations are the same program.  (Verified by compiling
+        # both and diffing the artifacts: identical sm_100a PTX and cubin.)
+        # Keying the caches on `need_lam` instead of on `full_chunks`
+        # therefore costs nothing in none mode, where the two really do
+        # differ, and in g-mode it stops the first non-64-aligned call from
+        # paying a multi-second `cute.compile` for a binary that is already
+        # loaded.  That mattered under THD specifically: the window is
+        # 64-aligned about one step in 64, so the ragged compile landed at a
+        # random mid-training step, with the peer rank spinning on 148 SMs for
+        # the duration.  gk-mode pins the ragged program for every `T` for the
+        # same reason (see `build_key`), so its key never misses after the
+        # constructor's entry either.
         key = self.op.__class__.build_key(self.gate_mode, T % BT == 0)
         op = self._ops.get(key)
         if op is None:
