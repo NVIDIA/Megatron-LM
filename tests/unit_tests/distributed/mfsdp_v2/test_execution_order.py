@@ -77,22 +77,17 @@ def test_unique_calls_resynchronize_and_repeated_calls_validate():
         empty.advance(chunk0)
 
 
-def test_membership_reverse_and_weak_references():
+def test_iteration_and_weak_references():
     """Traversal preserves repeated occurrences without retaining deleted modules."""
     first, second = nn.Module(), nn.Module()
     order = ExecutionOrder([first, second, first, second])
-    assert first in order
-    assert second in order
     assert list(order) == [first, second, first, second]
-    assert list(reversed(order)) == [second, first, second, first]
 
     second_ref = ref(second)
     del second
     gc.collect()
     assert second_ref() is None
-    assert None not in order
     assert list(order) == [first, first]
-    assert list(reversed(order)) == [first, first]
     order.advance(first)
     assert order.next_item() is None
     # Traversal skips dead references, but the demand cursor must not skip a call.

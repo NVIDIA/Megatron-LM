@@ -44,20 +44,9 @@ class ExecutionOrder(Generic[T]):
         self._unique_index[item] = None if item in self._unique_index else len(self._items)
         self._items.append(ref(item))
 
-    def __contains__(self, item: object) -> bool:
-        """Return whether the sequence contains a live item."""
-        return item in self._unique_index
-
     def __iter__(self) -> Iterator[T]:
         """Iterate over live occurrences in execution order."""
         for item_ref in self._items:
-            item = item_ref()
-            if item is not None:
-                yield item
-
-    def __reversed__(self) -> Iterator[T]:
-        """Iterate over live occurrences in reverse order."""
-        for item_ref in reversed(self._items):
             item = item_ref()
             if item is not None:
                 yield item
