@@ -1013,6 +1013,55 @@ def test_getitem_thd_empty_text_does_not_crash():
     assert out["loss_mask"].numel() == out["tokens"].numel()
 
 
+class _ArrayTokenizer(_FakeTokenizer):
+    """Returns preset token / target ids for a conversation, keyed by its first message."""
+
+    def __init__(self, conversations, eod: int = 0, pad=None):
+        super().__init__(eod=eod, pad=pad)
+        self._conversations = conversations
+
+    def tokenize_conversation(
+        self, messages, return_target=True, add_generation_prompt=False, chat_template_kwargs=None
+    ):
+        tokens, targets = self._conversations[messages[0]["content"]]
+        return torch.tensor(tokens, dtype=torch.int64), torch.tensor(targets, dtype=torch.int64)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "targets", "expected_tokens", "expected_labels", "expected_loss_mask"),
+    [
+        # The cut (sequence_length + 1 ids) ends on a non-EOD id: it becomes EOD
+        # in both tokens and targets.
+        ([5, 6, 7, 8, 9, 10], [-100, 6, 7, 8, 9, 10], [5, 6, 7, 8], [6, 7, 8, 0], [1, 1, 1, 1]),
+        # The cut ends on EOD: kept as is, including an ignored target there.
+        (
+            [5, 6, 7, 8, 0, 10],
+            [-100, 6, 7, 8, -100, 10],
+            [5, 6, 7, 8],
+            [6, 7, 8, -100],
+            [1, 1, 1, 0],
+        ),
+    ],
+)
+def test_getitem_thd_truncates_to_sequence_length(
+    tokens, targets, expected_tokens, expected_labels, expected_loss_mask
+):
+    tok = _ArrayTokenizer({"conversation": (tokens, targets)})
+    ds = _make_varlen(
+        [[{"role": "user", "content": "conversation"}]], _make_config(tok, seq_length=4)
+    )
+    out = ds[0]
+    assert out["tokens"].tolist() == expected_tokens
+    assert out["labels"].tolist() == expected_labels
+    assert out["loss_mask"].tolist() == expected_loss_mask
+    assert int(out["original_seq_len"].item()) == int(out["padded_seq_len"].item()) == 4
+    # Every output owns a contiguous storage; labels is not a view of the tokens buffer.
+    for value in out.values():
+        assert value.is_contiguous() and value.storage_offset() == 0
+        assert value.untyped_storage().nbytes() == value.numel() * value.element_size()
+    assert out["tokens"].untyped_storage().data_ptr() != out["labels"].untyped_storage().data_ptr()
+
+
 def test_getitem_sbhd_pads_to_seq_length_and_masks_tail():
     tok = _FakeTokenizer(eod=0, pad=None)
     ds = _make_varlen(["abc"], _make_config(tok, seq_length=8, sbhd=True))
@@ -1125,6 +1174,17 @@ def test_mock_getitem_thd_keys_and_pad_fallback():
     assert int(out["padded_seq_len"].item()) % 4 == 0
 
 
+def test_mock_getitem_truncates_long_sample():
+    tok = _FakeTokenizer(eod=0, pad=None)
+    ds = _make_mock_varlen([np.arange(1, 10, dtype=np.int64)], _make_config(tok, seq_length=4))
+    out = ds[0]
+    # Keeps sequence_length - 1 ids plus EOD, then applies the next-token shift.
+    assert out["tokens"].tolist() == [1, 2, 3]
+    assert out["labels"].tolist() == [2, 3, 0]
+    assert out["loss_mask"].tolist() == [1.0, 1.0, 1.0]
+    assert int(out["original_seq_len"].item()) == int(out["padded_seq_len"].item()) == 3
+
+
 # ----------------------------------------------------------------------------
 # THD handoff: _unpack_batch contract for VarlenDataset-style samples
 #
@@ -1216,14 +1276,14 @@ def _build_varlen_for_loader(items, config, num_samples):
     return ds
 
 
-def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None):
+def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None, num_workers=0):
     return SimpleNamespace(
         dataloader_type='single',
         micro_batch_size=mbs,
         global_batch_size=mbs if gbs is None else gbs,
         full_validation=False,
         dynamic_context_parallel=dynamic_cp,
-        num_workers=0,
+        num_workers=num_workers,
         use_varlen_dataset=use_varlen,
         varlen_sbhd_validation=sbhd,
         sequence_packing_scheduler=scheduler,
@@ -1327,6 +1387,52 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler():
         assert isinstance(batch, list)
         assert len(batch) == mbs
         assert "padded_seq_len" in batch[0]
+    finally:
+        destroy_global_vars()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    ("scheduler", "expected_prefetch_factor"),
+    [("dp_balanced", 5), ("default_dynamic_cp", 5), (None, 2)],
+)
+def test_packing_scheduler_dataloader_prefetches_next_global_batch(
+    scheduler, expected_prefetch_factor
+):
+    from megatron.core import parallel_state
+    from megatron.core.datasets.utils import Split
+    from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+    from megatron.training.global_vars import destroy_global_vars, set_args
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        tok = _FakeTokenizer(eod=0, pad=7)
+        mbs, num_microbatches, num_workers = 2, 9, 2
+        dp = parallel_state.get_data_parallel_world_size()
+        gbs = mbs * dp * num_microbatches
+        dynamic_cp = scheduler == "default_dynamic_cp"
+        cfg = _make_config(tok, seq_length=64, dp=dp, dynamic_cp=dynamic_cp)
+        ds = _build_varlen_for_loader(["abc"] * gbs * 2, cfg, num_samples=gbs * 2)
+        set_args(
+            _loader_args(
+                use_varlen=True,
+                sbhd=False,
+                scheduler=scheduler,
+                mbs=mbs,
+                dynamic_cp=dynamic_cp,
+                gbs=gbs,
+                num_workers=num_workers,
+            )
+        )
+        # A packing scheduler pulls num_microbatches items at the start of every
+        # step, so the workers keep the next step's ceil(9 / 2) items per worker
+        # in flight; without a scheduler the PyTorch default (2) is kept.
+        loader = build_pretraining_data_loader(ds, consumed_samples=0)
+        assert loader.prefetch_factor == expected_prefetch_factor
+        # Evaluation loaders keep the default.
+        ds.index_split = Split.valid
+        assert build_pretraining_data_loader(ds, consumed_samples=0).prefetch_factor == 2
     finally:
         destroy_global_vars()
         Utils.destroy_model_parallel()

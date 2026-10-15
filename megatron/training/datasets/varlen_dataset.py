@@ -594,6 +594,23 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
         )
 
 
+def _right_padded_ids(
+    ids: np.ndarray, keep: int, eod_at: Optional[int], length: int, total: int, eod: int, pad: int
+) -> torch.Tensor:
+    """Return ``ids[:keep]`` as an int64 tensor of ``total`` tokens.
+
+    EOD is written at ``eod_at`` (overwriting or appending; None writes none), and
+    positions from ``length`` on hold ``pad``.
+    """
+    out = torch.empty(total, dtype=torch.int64)
+    buf = out.numpy()
+    buf[:keep] = ids[:keep]
+    if eod_at is not None:
+        buf[eod_at] = eod
+    buf[length:] = pad
+    return out
+
+
 class VarlenDataset(SFTDataset):
     """Variable-length single-sample SFT dataset for the packed-sequence path.
 
@@ -658,68 +675,83 @@ class VarlenDataset(SFTDataset):
         # 2. Tokenize. SFT schemas go through tokenize_conversation (chat
         #    template + role-aware target masking); pretrain-text bypasses
         #    chat templating and uses the plain ``tokenize`` interface,
-        #    treating every token as a target (no prompt masking).
+        #    treating every token as a target (no prompt masking). Ids stay in
+        #    int64 arrays from here on: building the sample as Python lists
+        #    costs ~4 ms per 50K tokens, and packing schedulers fetch the whole
+        #    global batch at the start of every step.
         if isinstance(item, str):
-            ids = list(tokenizer.tokenize(item))
-            tokens_list = ids
-            targets_list = list(ids)
-        elif isinstance(item, ChatTemplateSample):
-            tokens, targets = tokenizer.tokenize_conversation(
-                item.messages,
-                return_target=True,
-                add_generation_prompt=False,
-                chat_template_kwargs=item.chat_template_kwargs,
-            )
-            tokens_list = tokens.tolist()
-            targets_list = targets.tolist()
+            tokens = targets = np.array(list(tokenizer.tokenize(item)), dtype=np.int64)
         else:
-            tokens, targets = tokenizer.tokenize_conversation(
-                item, return_target=True, add_generation_prompt=False
-            )
-            tokens_list = tokens.tolist()
-            targets_list = targets.tolist()
+            if isinstance(item, ChatTemplateSample):
+                tokens, targets = tokenizer.tokenize_conversation(
+                    item.messages,
+                    return_target=True,
+                    add_generation_prompt=False,
+                    chat_template_kwargs=item.chat_template_kwargs,
+                )
+            else:
+                tokens, targets = tokenizer.tokenize_conversation(
+                    item, return_target=True, add_generation_prompt=False
+                )
+            tokens = np.asarray(tokens, dtype=np.int64)
+            targets = np.asarray(targets, dtype=np.int64)
 
         # 2b. Guard against an empty tokenization (e.g. a blank ``pretrain-text``
         #     row where ``tokenizer.tokenize("")`` returns no ids). Represent it
         #     as a single end-of-document token so the next-token shift still
         #     yields a valid 1-token sample instead of raising on
-        #     ``tokens_list[-1]`` below or producing a zero-length sequence.
-        if len(tokens_list) == 0:
-            tokens_list = [eod, eod]
-            targets_list = [eod, eod]
+        #     ``tokens[keep - 1]`` below or producing a zero-length sequence.
+        if len(tokens) == 0:
+            tokens = targets = np.array([eod, eod], dtype=np.int64)
+        assert len(targets) == len(
+            tokens
+        ), "VarlenDataset requires tokenize_conversation to return one target per token."
 
         # 3. Right-truncate to ``sequence_length + 1`` (we drop the last token
         #    after the input/label shift below). Keep an EOD at the end so a
         #    truncated assistant turn still has a valid stop token.
-        if len(tokens_list) > max_len + 1:
-            tokens_list = tokens_list[: max_len + 1]
-            targets_list = targets_list[: max_len + 1]
-            if tokens_list[-1] != eod:
-                tokens_list[-1] = eod
-                targets_list[-1] = eod
-
         # 4. Ensure EOD is the last token (unconditional for short samples).
-        if tokens_list[-1] != eod:
-            tokens_list.append(eod)
-            targets_list.append(eod)
+        keep = min(len(tokens), max_len + 1)
+        if tokens[keep - 1] == eod:
+            eod_at = None
+        elif keep < len(tokens):
+            eod_at = keep - 1  # truncated: overwrite the last kept token
+        else:
+            eod_at = keep  # append
+        length = keep + 1 if eod_at == keep else keep
+        valid_len = length - 1
 
-        valid_len = len(tokens_list) - 1
-
-        # 5a. SBHD validation mode: right-pad to sequence_length + 1, drop
-        #     packing metadata, return shape [sequence_length]. Useful as a
-        #     numerical reference for THD path verification (no scheduler,
-        #     no dynamic-cp).
         if self.config.varlen_sbhd_validation:
-            pad_len = max_len + 1 - len(tokens_list)
-            if pad_len > 0:
-                tokens_list.extend([pad] * pad_len)
-                targets_list.extend([pad] * pad_len)
-            assert len(tokens_list) == max_len + 1
-            input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
-            labels = torch.tensor(targets_list[1:], dtype=torch.int64)
-            loss_mask = torch.ones(max_len, dtype=torch.float32)
-            loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
-            loss_mask[labels == IGNORE_INDEX] = 0.0
+            # 5a. SBHD validation mode: right-pad to sequence_length + 1, drop
+            #     packing metadata, return shape [sequence_length]. Useful as a
+            #     numerical reference for THD path verification (no scheduler,
+            #     no dynamic-cp).
+            total = max(length, max_len + 1)
+            assert total == max_len + 1
+        else:
+            original_seq_len = length - 1  # length after the shift below
+            # 5b. THD path: pad to pad_granularity (dp_size * cp_size * 2 * sp),
+            #     the minimum alignment required by CP slicing. We deliberately
+            #     do NOT pad to sequence_length — the upstream packing scheduler
+            #     will combine variable-length samples up to
+            #     max_seqlen_per_dp_cp_rank.
+            pad_granularity = self._calculate_padding_divisor()
+            padded_seq_len = original_seq_len + (-original_seq_len % pad_granularity)
+            total = padded_seq_len + 1
+
+        # 6. Apply the next-token shift.
+        sequence = _right_padded_ids(tokens, keep, eod_at, length, total, eod, pad)
+        if targets is not tokens:
+            target_sequence = _right_padded_ids(targets, keep, eod_at, length, total, eod, pad)
+        else:
+            target_sequence = sequence
+        input_ids = sequence[:-1].clone()
+        labels = target_sequence[1:].clone()
+        loss_mask = torch.ones(total - 1, dtype=torch.float32)
+        loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
+        loss_mask[labels == IGNORE_INDEX] = 0.0
+
+        if self.config.varlen_sbhd_validation:
             # Keep physical padding separate from the LM loss mask: prompt
             # tokens may be loss-masked but must still participate in MoE.
             padding_mask = torch.zeros(max_len, dtype=torch.bool)
@@ -732,34 +764,11 @@ class VarlenDataset(SFTDataset):
                 'position_ids': torch.arange(max_len, dtype=torch.int64),
             }
 
-        original_seq_len = len(tokens_list) - 1  # length after the shift below
-
-        # 5b. THD path: pad to pad_granularity (dp_size * cp_size * 2 * sp),
-        #     the minimum alignment required by CP slicing. We deliberately
-        #     do NOT pad to sequence_length — the upstream packing scheduler
-        #     will combine variable-length samples up to
-        #     max_seqlen_per_dp_cp_rank.
-        pad_granularity = self._calculate_padding_divisor()
-        mod = original_seq_len % pad_granularity
-        if mod != 0:
-            pad_len = pad_granularity - mod
-            tokens_list.extend([pad] * pad_len)
-            targets_list.extend([pad] * pad_len)
-        padded_seq_len = len(tokens_list) - 1
-
-        # 6. Apply the next-token shift.
-        input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
-        labels = torch.tensor(targets_list[1:], dtype=torch.int64)
-        position_ids = torch.arange(padded_seq_len, dtype=torch.int64)
-        loss_mask = torch.ones(padded_seq_len, dtype=torch.float32)
-        loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
-        loss_mask[labels == IGNORE_INDEX] = 0.0
-
         return {
             'tokens': input_ids,
             'labels': labels,
             'loss_mask': loss_mask,
-            'position_ids': position_ids,
+            'position_ids': torch.arange(padded_seq_len, dtype=torch.int64),
             # The packing scheduler consumes these directly; cu_seqlens /
             # max_seqlen are produced downstream in _pack_sequences.
             'original_seq_len': torch.tensor([original_seq_len], dtype=torch.int32),
@@ -811,37 +820,27 @@ class MockVarlenDataset(MockSFTDataset):
 
         # MockSFTLowLevelDataset returns ``length - 1`` token ids; append EOD
         # to make the conversation end on a stop token, mirroring the real
-        # VarlenDataset path.
+        # VarlenDataset path. Mock data uses ``tokens == targets`` (no role
+        # masking), so inputs and labels are both cut from one buffer.
         raw = self.dataset[int(self.indices[idx % len(self.indices)])]
-        tokens_list = raw.tolist()
-        tokens_list.append(eod)
-        # Mock data uses ``tokens == targets`` (no role masking).
-        targets_list = list(tokens_list)
 
         # MockVarlenDataset only implements the THD (packed) path; SBHD
         # validation is a real-data numerical-reference mode (guarded against
         # --mock-data in validate_args).
-        # THD mode: unpacked single sample, pad to pad_granularity only.
-        if len(tokens_list) > max_len + 1:
-            tokens_list = tokens_list[: max_len - 1] + [eod]
-            targets_list = targets_list[: max_len - 1] + [eod]
-        original_seq_len = len(tokens_list) - 1
+        # THD mode: unpacked single sample, pad to pad_granularity only. A sample
+        # longer than sequence_length keeps sequence_length - 1 ids plus EOD.
+        keep = len(raw) if len(raw) <= max_len else max_len - 1
+        original_seq_len = keep
 
         pad_granularity = self._calculate_padding_divisor()
-        mod = original_seq_len % pad_granularity
-        if mod != 0:
-            pad_len = pad_granularity - mod
-            tokens_list.extend([pad] * pad_len)
-            targets_list.extend([pad] * pad_len)
-        padded_seq_len = len(tokens_list) - 1
+        padded_seq_len = original_seq_len + (-original_seq_len % pad_granularity)
 
-        input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
-        labels = torch.tensor(targets_list[1:], dtype=torch.int64)
+        sequence = _right_padded_ids(raw, keep, keep, keep + 1, padded_seq_len + 1, eod, pad)
         loss_mask = torch.ones(padded_seq_len, dtype=torch.float32)
         loss_mask[original_seq_len:] = 0.0  # mask the right-padded tail by position
         return {
-            'tokens': input_ids,
-            'labels': labels,
+            'tokens': sequence[:-1].clone(),
+            'labels': sequence[1:].clone(),
             'loss_mask': loss_mask,
             'position_ids': torch.arange(padded_seq_len, dtype=torch.int64),
             'original_seq_len': torch.tensor([original_seq_len], dtype=torch.int32),
