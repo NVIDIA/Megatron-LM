@@ -78,7 +78,6 @@ def main(
         model=model,
         test_case=test_case,
         environment=environment,
-        platform="dgx_gb200",
         container_tag="none",
     )
 
