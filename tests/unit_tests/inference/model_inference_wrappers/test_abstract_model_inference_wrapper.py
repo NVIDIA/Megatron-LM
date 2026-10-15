@@ -6,9 +6,14 @@ import pytest
 import torch
 
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
+from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
+    model_forward_kwargs,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 def _wrapper(prompt_config=None):
@@ -135,3 +140,17 @@ def test_wrapper_rejects_mhc_pipeline_inference(monkeypatch, enable_mhc, pp_size
     else:
         wrapper = GPTInferenceWrapper(model, context)
         assert wrapper.pp_group is pg_collection.pp
+
+
+@pytest.mark.parametrize("data_parallel", [False, True])
+@pytest.mark.parametrize("float16", [False, True])
+def test_model_forward_kwargs_turns_off_the_float16_module_upcast(float16, data_parallel):
+    """`fp32_output=False` whenever a Float16Module is in the `.module` chain, which DDP
+    and FSDP forward their kwargs down; nothing for a bare model."""
+    model = torch.nn.Linear(2, 2)
+    if float16:
+        config = TransformerConfig(num_layers=1, hidden_size=2, num_attention_heads=1, bf16=True)
+        model = Float16Module(config, model)
+    if data_parallel:
+        model = SimpleNamespace(module=model)
+    assert model_forward_kwargs(model) == ({"fp32_output": False} if float16 else {})
