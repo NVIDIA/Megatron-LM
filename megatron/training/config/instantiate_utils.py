@@ -25,11 +25,6 @@ _TARGET_ALLOWLIST_MUTATORS: tuple[str, ...] = (
 )
 _DISALLOWED_CANONICAL_TARGETS: set[str] = {"numpy.load", "torch.serialization.load"}
 _DISALLOWED_TARGETS: set[str] = {
-    "megatron.bridge.models.conversion.auto_bridge.AutoBridge.from_hf_pretrained",
-    "megatron.bridge.models.hf_pretrained.safe_config_loader.safe_load_config_with_retry",
-    "megatron.bridge.utils.import_utils.safe_import",
-    "megatron.bridge.utils.import_utils.safe_import_from",
-    "megatron.bridge.utils.instantiate_utils.register_allowed_target_prefix",
     "numpy.ctypeslib.load_library",
     "numpy.load",
     "torch.classes.load_library",
@@ -47,10 +42,6 @@ _DISALLOWED_TARGETS: set[str] = {
     "torch.utils.cpp_extension.load",
     "torch.utils.cpp_extension.load_inline",
     "transformers.pipeline",
-    *{
-        f"megatron.bridge.utils.instantiate_utils.target_allowlist.{method}"
-        for method in _TARGET_ALLOWLIST_MUTATORS
-    },
     *{
         f"megatron.training.config.instantiate_utils.target_allowlist.{method}"
         for method in _TARGET_ALLOWLIST_MUTATORS
