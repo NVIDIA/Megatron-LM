@@ -332,6 +332,19 @@ def mcore_to_pyt_state_dict(
     return pyt_state_dict
 
 
+def _gtp_restore_padded(sh_ten, data):
+    """Restore the physical buffer, zeroing unsaved alignment rows after a logical load."""
+    buffer = getattr(sh_ten, 'gtp_pad_buffer', None)
+    if buffer is None:
+        return data
+    rows = data.shape[0]
+    # Some loaders replace .data; do not assume the loaded tensor still aliases the buffer.
+    with torch.no_grad():
+        buffer[:rows].copy_(data)
+        buffer[rows:].zero_()
+    return buffer
+
+
 def _unwrap_pyt_sharded_tensor(
     sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any],
 ) -> Union[List[torch.Tensor], Any]:
@@ -341,9 +354,12 @@ def _unwrap_pyt_sharded_tensor(
     then the tensor has additional singleton dimensions which should be squeezed.
     """
     if isinstance(sh_ten, CheckpointableShardedTensor):
-        return [sh_ten._sh_ten.data]
+        return [_gtp_restore_padded(sh_ten._sh_ten, sh_ten._sh_ten.data)]
     if isinstance(sh_ten, LocalShardsContainer):
-        return [local_shard._sh_ten.data for local_shard in sh_ten._local_shards]
+        return [
+            _gtp_restore_padded(local_shard._sh_ten, local_shard._sh_ten.data)
+            for local_shard in sh_ten._local_shards
+        ]
     if not isinstance(sh_ten, TorchShardedTensor):
         return sh_ten
     mcore_sh_ten = sh_ten.mcore_sh_ten
@@ -353,7 +369,7 @@ def _unwrap_pyt_sharded_tensor(
         for _ in range(mcore_sh_ten.prepend_axis_num):
             assert ten.size(0) == 1
             ten = ten[0]  # NOTE: ten.squeeze(0) uses more memory for FP8 tensors
-        ret_tensors.append(ten)
+        ret_tensors.append(_gtp_restore_padded(mcore_sh_ten, ten))
     return ret_tensors
 
 

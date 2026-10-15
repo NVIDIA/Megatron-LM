@@ -39,14 +39,16 @@ from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
-from ..dist_checkpointing.dict_utils import nested_values
 from ..dist_checkpointing.mapping import (
     LocalNonpersistentObject,
     ShardedObject,
     ShardedStateDict,
     ShardedTensorFactory,
 )
-from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
+from ..dist_checkpointing.optimizer import (
+    get_param_id_to_sharded_metadata,
+    make_sharded_optimizer_fragment,
+)
 from ..distributed.param_and_grad_buffer import (
     _ParamAndGradBuffer,
     group_params_for_buffers,
@@ -1851,12 +1853,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return_on_all_ranks=return_on_all_ranks or is_loading,
         )
 
-        param_to_sharded_metadata = {}
-        model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(
-            model_sharded_state_dict
-        )
-        for sh_base in nested_values(model_sharded_state_dict):
-            param_to_sharded_metadata[sh_base.data] = sh_base
+        param_to_sharded_metadata = get_param_id_to_sharded_metadata(model_sharded_state_dict)
 
         prefix = 'optimizer.state'
         model_space_state = {}
@@ -1891,7 +1888,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     bucket_id,
                 ) in buffer.param_index_map.items():
                     try:
-                        sharded_metadata = param_to_sharded_metadata[model_param]
+                        sharded_metadata = param_to_sharded_metadata[id(model_param)]
                     except KeyError as e:
                         raise ValueError(
                             f"Model param {model_param} not in model_sharded_state_dict."
@@ -2109,12 +2106,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         This will allow changing TP and PP while using DistOpt (as with other optimizers).
         """
 
-        param_to_sharded_metadata = {}
-        model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(
-            model_sharded_state_dict
-        )
-        for sh_base in nested_values(model_sharded_state_dict):
-            param_to_sharded_metadata[sh_base.data] = sh_base
+        param_to_sharded_metadata = get_param_id_to_sharded_metadata(model_sharded_state_dict)
 
         prefix = 'optimizer.state'
         state = {}
@@ -2129,7 +2121,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Match optimizer parameter with model ShardedTensor (or
             # ShardedTensorFactory).
             try:
-                sharded_metadata = param_to_sharded_metadata[model_param]
+                sharded_metadata = param_to_sharded_metadata[id(model_param)]
             except KeyError as e:
                 raise ValueError(
                     f"Model param {model_param} not in model_sharded_state_dict"
@@ -2151,16 +2143,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # The optimizer state of STEP is handled
                     # specifically and is read from param_groups.
                     continue
-                replace_kwargs = dict(
-                    key=f'{prefix}.{state_key}.{sharded_metadata.key}',
-                    data=state_ten,
-                    dtype=state_ten.dtype,
-                    flattened_range=item_slice,
-                    replica_id=replica_id,
-                )
                 if isinstance(sharded_metadata, ShardedTensorFactory):
-                    replace_kwargs.pop('dtype')
-                tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                    tensors[state_key] = replace(
+                        sharded_metadata,
+                        key=f'{prefix}.{state_key}.{sharded_metadata.key}',
+                        data=state_ten,
+                        flattened_range=item_slice,
+                        replica_id=replica_id,
+                    )
+                else:
+                    tensors[state_key] = make_sharded_optimizer_fragment(
+                        sharded_metadata,
+                        state_ten,
+                        f'{prefix}.{state_key}',
+                        item_slice,
+                        replica_id=replica_id,
+                    )
                 tensors[state_key].validate_metadata_integrity()
             return tensors
 

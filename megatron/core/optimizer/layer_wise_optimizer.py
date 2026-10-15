@@ -1461,25 +1461,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         return success
 
-    # TODO(deyuf): need to improve dist checkpointing design to properly handle this
-    # fp32_from_fp16_params is list, each sub list could be empty if group is empty
-    # this breaks dist checkpointing assumption since extract_sharded_base drop list structure
-    # for now, we convert it to dict with index as key and convert back in load_state_dict
-    def load_state_dict(self, state_dict):
-        if len(self.chained_optimizers) == 1:
-            wrapped_state_dict = {1: state_dict}
-        else:
-            wrapped_state_dict = (
-                dict(enumerate(state_dict)) if isinstance(state_dict, list) else state_dict
-            )
-        for sd in wrapped_state_dict.values():
-            if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
-                logger.info('[layerwise] converting fp32_from_fp16_params from dict to list')
-                sd['fp32_from_fp16_params'] = [
-                    v for k, v in sorted(sd['fp32_from_fp16_params'].items())
-                ]
-        super().load_state_dict(state_dict)
-
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
@@ -1517,14 +1498,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for sd in wrapped_sharded_state_dict.values():
             # wrap empty containers into LocalNonpersistentObject so it won't be saved/loaded
             # params is already wrapped, we only need to handle fp32_from_fp16_params and state
-            # more details in load_state_dict comment
+            # Child optimizers preserve both group and parameter indices.
             if 'fp32_from_fp16_params' in sd:
-                sd['fp32_from_fp16_params'][:] = [
-                    group if group else LocalNonpersistentObject(group)
-                    for group in sd['fp32_from_fp16_params']
-                ]
+                masters = sd['fp32_from_fp16_params']
+                if isinstance(masters, list):
+                    masters = dict(enumerate(masters))
                 sd['fp32_from_fp16_params'] = {
-                    i: v for i, v in enumerate(sd['fp32_from_fp16_params'])
+                    index: group if group else LocalNonpersistentObject(group)
+                    for index, group in masters.items()
                 }
             # state is a single dict and will be empty if optimizer is fully empty
             if not sd['optimizer']['state']:
