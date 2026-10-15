@@ -261,12 +261,16 @@ class HyperCommGrid:
         if dist.is_initialized() and dist.get_rank() == 0:
             if self._is_base_pg_key(unique_group_key):
                 logging.info(
-                    f"Generated process group for {unique_group_key} with enumeration {rank_enum}"
+                    "Generated process group for %s with enumeration %s",
+                    unique_group_key,
+                    rank_enum,
                 )
             else:
                 logging.info(
-                    f"Generated process group for view {view_spec.name!r} {ordered_dims} with "
-                    f"enumeration {rank_enum}"
+                    "Generated process group for view %r %s with enumeration %s",
+                    view_spec.name,
+                    ordered_dims,
+                    rank_enum,
                 )
         self._pgs[unique_group_key] = pg
         return pg
