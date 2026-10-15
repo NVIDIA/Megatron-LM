@@ -125,9 +125,6 @@ class DistributedInitConfig:
     """If set to True, initialize_megatron() skips DDP initialization and returns function to complete it instead.
     Also turns on --use-cpu-initialization flag. This is for external DDP manager."""
 
-    use_megatron_fsdp: bool = False
-    """Use Megatron's Fully Sharded Data Parallel. Cannot be used together with use_torch_fsdp2."""
-
     use_torch_fsdp2: bool = False
     """Use the torch FSDP2 implementation. FSDP2 is not currently working with Pipeline Parallel.
     It is still not in a stable release stage, and may therefore contain bugs or other

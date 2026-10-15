@@ -87,6 +87,21 @@ def test_wrapped_config_adds_lsq_override(restore_optimizer_config_fn):
     assert len(overrides) == len(base_overrides) + 1
 
 
+@pytest.mark.parametrize("scale_lr", [3e-5, 1e-4])
+def test_lsq_override_uses_resolved_optimizer_config(restore_optimizer_config_fn, scale_lr):
+    install_lsq_optimizer_overrides()
+    owner = OptimizerConfig(lr=3e-5, min_lr=0.0, use_distributed_optimizer=True)
+    stale_args = _args(lr=9e-5, lsq_scale_lr=scale_lr)
+    config, overrides = training.get_megatron_optimizer_config(stale_args, config=owner)
+    assert config is owner
+    assert config.lr == 3e-5
+    assert config.use_distributed_optimizer is True
+    lsq_groups = [
+        value for key, value in overrides.items() if key.name == ("*_amax_pre", "*_amax_post")
+    ]
+    assert lsq_groups == ([] if scale_lr == owner.lr else [{"max_lr": scale_lr}])
+
+
 def test_propagate_expert_allreduce_to_lsq_params():
     model = _toy_model()
     model.linear.weight.allreduce = False

@@ -37,7 +37,8 @@ def test_token_normalization_scale(num_tokens, expected):
     torch.testing.assert_close(scale, torch.tensor(expected))
 
 
-def test_configure_grad_sync_installs_production_overlap_hooks():
+def test_configure_grad_sync_installs_production_overlap_hooks(run_config):
+    run_config.ddp.overlap_grad_reduce = True
     def no_sync():
         return None
 
@@ -56,7 +57,7 @@ def test_configure_grad_sync_installs_production_overlap_hooks():
     topology = SimpleNamespace(grids={MIMO_LANGUAGE_MODULE_KEY: language_grid}, module_pgs={})
 
     configure_grad_sync(
-        SimpleNamespace(overlap_grad_reduce=True, align_grad_reduce=True), model, topology
+        SimpleNamespace(align_grad_reduce=True), model, topology
     )
 
     assert config.no_sync_func is no_sync

@@ -1088,6 +1088,10 @@ def run_mimo_1f1b_test(
 class TestMimo1F1BSchedule:
     """Test MIMO model with 1F1B pipeline schedule."""
 
+    @pytest.fixture(autouse=True)
+    def configure_wrapper(self, run_config):
+        run_config.ddp.overlap_grad_reduce = True
+
     @classmethod
     def setup_class(cls):
         Utils.initialize_distributed()

@@ -2578,7 +2578,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-        if args.create_all_gather_group:
+        if wrap_with_ddp and cfg.ddp.create_all_gather_group:
             timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
             dp_cp_ag, expt_dp_ag = create_all_gather_groups(
                 for_expert_parallelism=(args.expert_model_parallel_size > 1),
@@ -2688,7 +2688,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [Float16Module(config, model_module) for model_module in model]
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
-    if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
+    if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not (
+        hasattr(cfg, "ddp") and cfg.ddp.use_megatron_fsdp
+    ):
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
@@ -2702,14 +2704,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         if args.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
-        elif args.use_megatron_fsdp:
+        elif cfg.ddp.use_megatron_fsdp:
             DP = FullyShardedDataParallel
         else:
             DP = DDP
 
         config = get_model_config(model[0])
 
-        ddp_config = get_megatron_ddp_config(args)
+        # Wrappers resolve model-dependent buckets in place; keep the saved config declarative.
+        ddp_config = copy.copy(cfg.ddp)
         if not getattr(args, "use_torch_fsdp2", False):
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(
@@ -2724,7 +2727,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # is on, or for non-zero pipeline-parallel ranks.
         pp_rank = get_pg_rank(pg_collection.pp)
         per_chunk_disable_bucketing = [
-            (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
+            (chunk_idx > 0) or cfg.optimizer.overlap_param_gather_with_optimizer_step
             for chunk_idx in range(len(model))
         ]
         per_chunk_bucket_sizes = [
@@ -2752,14 +2755,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 model,
                 config,
                 ddp_config,
-                use_layer_wise_distributed_optimizer=getattr(
-                    args, 'use_layer_wise_distributed_optimizer', False
-                ),
-                use_layer_wise_param_layout=getattr(
-                    args, 'use_layer_wise_param_layout', True
-                ),
+                use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+                use_layer_wise_param_layout=cfg.ddp.use_layer_wise_param_layout,
                 DP=DP,
-                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                pg_collection=pg_collection if cfg.ddp.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
@@ -2845,14 +2844,21 @@ def _reduce_sum_across_data_parallel_group(
     return None if value.item() == 0.0 else value.item()
 
 
-def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
-    """Return a Megatron optimizer config object from Megatron's arguments."""
+def get_megatron_optimizer_config(
+    args: Any, *, config: OptimizerConfig | None = None
+) -> tuple[OptimizerConfig, dict]:
+    """Normalize CLI optimizer inputs, or attach overrides to an existing config.
 
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
+    Runtime setup supplies its resolved config. Keeping this extension point also
+    preserves application-specific parameter-group overrides installed by model builders.
+    """
+
+    if config is None:
+        kwargs = {}
+        for f in dataclasses.fields(OptimizerConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        config = OptimizerConfig(**kwargs)
 
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
@@ -2865,7 +2871,11 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
 
     if getattr(args, "use_torch_fsdp2", False):
         reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-        return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+        return TorchFullyShardedDataParallelConfig(
+            reshard_after_forward=reshard_after_forward,
+            fp8_param_gather=getattr(args, "fp8_param_gather", False),
+            fp4_param_gather=getattr(args, "fp4_param_gather", False),
+        )
     else:
         kwargs = {}
         for f in dataclasses.fields(DistributedDataParallelConfig):
@@ -2913,6 +2923,7 @@ def setup_model_and_optimizer(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
+    cfg = cfg_container if cfg_container is not None else get_run_config()
     timers = get_timers()
     one_logger = get_one_logger()
 
@@ -2934,7 +2945,6 @@ def setup_model_and_optimizer(
 
             start_memory_history_recording(cfg_container.profiling)
 
-            cfg = cfg_container
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
@@ -2949,14 +2959,14 @@ def setup_model_and_optimizer(
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
-                ddp_config=cfg.ddp,
+                ddp_config=copy.copy(cfg.ddp),
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
-                use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+                use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
                 use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
-                use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
+                use_layer_wise_param_layout=cfg.ddp.use_layer_wise_param_layout,
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
@@ -2977,9 +2987,7 @@ def setup_model_and_optimizer(
             fp8_recipe=getattr(args, 'fp8_recipe', None),
             fp8=getattr(args, 'fp8', None) is not None,
             calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False),
-            reduce_scatter_with_fp32_accumulation=getattr(
-                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
-            ),
+            reduce_scatter_with_fp32_accumulation=cfg.ddp.gtp_remat_reduce_scatter_with_fp32_accumulation,
         )
 
         if getattr(args, 'gtp_remat_nccl_ub', False):
@@ -3028,7 +3036,10 @@ def setup_model_and_optimizer(
         if perform_rl_step:
             update_train_iters(args)
     else:
-        config, config_overrides = get_megatron_optimizer_config(args)
+        # The optimizer must consume the same settings used to derive the DDP layout.
+        config, config_overrides = get_megatron_optimizer_config(
+            args, config=copy.copy(cfg.optimizer)
+        )
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (
@@ -4837,7 +4848,7 @@ def train(
     # DDP and MFSDP v1 instead reduce during backward only when overlap_grad_reduce is on,
     # so without that flag there is nothing for no_sync to suppress.
     if isinstance(model[0], FullyShardedDataParallelV2) or (
-        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and args.overlap_grad_reduce
+        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and cfg.ddp.overlap_grad_reduce
     ):
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
@@ -4850,7 +4861,7 @@ def train(
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
-    if args.overlap_param_gather and args.align_param_gather:
+    if cfg.ddp.overlap_param_gather and cfg.ddp.align_param_gather:
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
@@ -4931,7 +4942,7 @@ def train(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        copy_main_params = cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag and cfg.ddp.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
@@ -5317,9 +5328,9 @@ def train(
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
-            getattr(args, "fsdp_manual_registration", False)
-            and getattr(args, "nccl_ub", False)
-            and getattr(args, "use_megatron_fsdp", False)
+            cfg.ddp.fsdp_manual_registration
+            and cfg.ddp.nccl_ub
+            and cfg.ddp.use_megatron_fsdp
             and iteration ==  start_iteration + 1
         ):
             for model_chunk in model:
@@ -5659,6 +5670,7 @@ def evaluate(
     """Evaluation."""
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
     train_state = get_train_state()
 
@@ -5703,7 +5715,7 @@ def evaluate(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        copy_main_params = cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag and cfg.ddp.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
@@ -6237,11 +6249,11 @@ def should_disable_forward_pre_hook(args):
     # so in order to disable them, we must check that the optimizer actually exists.
     has_optimizer = has_normal_optimizer or has_rl_optimizer
     return (
-        not args.use_megatron_fsdp
+        not cfg.ddp.use_megatron_fsdp
         and has_optimizer
         and (
-            args.use_distributed_optimizer
-            or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+            cfg.optimizer.use_distributed_optimizer
+            or cfg.optimizer.use_layer_wise_distributed_optimizer
         )
-        and args.overlap_param_gather
+        and cfg.ddp.overlap_param_gather
     )
