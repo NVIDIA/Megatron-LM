@@ -127,7 +127,7 @@ class M3MoELayer(nn.Module):
             ps,
             compute_aux_loss=False,
             router_dtype=torch.float32,
-            gate_fp32=True,  # fp32 router weight, as mcore keeps it for moe_router_dtype=fp32
+            gate_fp32=True,  # as mcore moe_router_dtype=fp32
             expert_bias_persistent=True,  # loaded from e_score_correction_bias, updated outside the optimizer
         )
         self.experts = Experts(config, ps, fp8=False, moe_act_recompute=moe_act_recompute)

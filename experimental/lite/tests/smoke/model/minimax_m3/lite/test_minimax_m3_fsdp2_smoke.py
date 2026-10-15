@@ -1,12 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MiniMax-M3 lite on the FSDP2 optimizer backend (Magi protocol, bf16 compute over fp32 shards), 2 GPUs.
-
-For each layout (DP2, EP2, CP2) the protocol is built with ``optimizer="fsdp2"``, the HF-format weights are loaded
-before the post-load hook wraps the chunk, and two training steps run through the runtime. The step-0 loss must match
-the dist_opt build of the same weights (both run the bf16 forward on identical parameters), the steps must succeed with
-finite grad norms, the Magi attributes attached to the chunk must survive ``fully_shard``, and the frozen indexer shards
-must be bitwise unchanged with no gradient.
-"""
+"""MiniMax-M3 lite on FSDP2 (Magi, 2 GPUs): per DP2/EP2/CP2, step-0 loss matches dist_opt, two steps stay finite,
+and the frozen indexer is unchanged."""
 
 from __future__ import annotations
 

@@ -40,9 +40,8 @@ def fsdp(task, implementation, config, reference, budget):
     }
     validation = primitive.validate(task, primitive=implementation.fsdp, implementation=implementation, budget=budget)
     risks = ["offload device mismatch", "optimizer state drift", "materialization timing bug",
-             "cast_forward_inputs walks the forward kwargs and rebuilds dataclasses with dataclasses.replace(): protocols that pass "
-             "runtime dataclasses with init=False fields (minimax_m3 magi_ctx) must build with cast_forward_inputs=False",
-             "one DeviceMesh is cached per rank set and resolves its process group by name: destroying the group breaks the next model on the same ranks"]
+             "cast_forward_inputs rebuilds kwarg dataclasses: disable it when they have init=False fields",
+             "DeviceMesh is cached per rank set: do not destroy its process groups between models"]
     if not validation.done:
         return blocked("FSDP validation failed", evidence=validation)
     return done(principle=principle, implementation_contract=implementation_contract, usage_contract=usage_contract, validation=validation, risks=risks)

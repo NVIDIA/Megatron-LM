@@ -67,8 +67,8 @@ class ImplConfig:
     optimizer_config: OptimizerConfig | None = None
     # Magi CP dispatch chunk (tokens; batch padded to chunk*cp), FP32 dK group-reduce, and the kernel
     # backend of the dense layers' native calc_attn. ``fa4`` is the production path; ``sdpa_ol`` is
-    # retained for tests only and materialises [H, S, S] logits in backward. ``fa4_varlen`` (cp=1) calls
-    # flash_attn.cute varlen directly, as mm_megatron_forward does.
+    # retained for tests only and materialises [H, S, S] logits in backward; ``fa4_varlen`` (cp=1) calls
+    # flash_attn.cute varlen directly.
     magi_chunk_size: int = 2048
     magi_high_precision_reduce: bool = False
     magi_dense_kernel_backend: str = "fa4"
@@ -358,7 +358,7 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
                     deterministic=impl_cfg.deterministic,
                     vpp=impl_cfg.parallel.vpp,
                     leaf_module_names=(),
-                    # inputs are int ids; the cast walks kwargs and rebuilds dataclasses (magi_ctx holds init=False fields)
+                    # inputs are int ids; magi_ctx has init=False fields
                     cast_forward_inputs=False,
                 )
             }

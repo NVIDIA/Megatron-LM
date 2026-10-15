@@ -365,7 +365,7 @@ def build_fsdp2_training_optimizer(
     use_fp32_shards: bool | None = None,
     use_fp32_master: bool | None = None,
     adamw_foreach: bool | str = _DEFAULT_ADAMW_FOREACH,
-    cast_forward_inputs: bool | None = True,
+    cast_forward_inputs: bool = True,
 ) -> FSDP2Optimizer:
     """Wrap model chunks with FSDP2 and build the matching AdamW adapter."""
 

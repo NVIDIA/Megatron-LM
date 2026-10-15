@@ -83,7 +83,7 @@ class MagiMsaSettings:
 
     chunk_size: int = 2048  # CP dispatch granularity (tokens); total tokens are padded to chunk_size * cp
     high_precision_reduce: bool = False  # FP32 required-dK group-reduce in backward
-    dense_kernel_backend: str = "fa4"  # dense layers' kernel: Magi calc_attn (fa4 | sdpa_ol) or flash_attn.cute varlen direct (fa4_varlen, cp=1)
+    dense_kernel_backend: str = "fa4"  # dense layers: fa4 | sdpa_ol (Magi calc_attn) | fa4_varlen (cp=1)
     deterministic: bool = False  # ordered msa_v1 backward (bitwise-reproducible, slower)
 
 
