@@ -360,7 +360,10 @@ class TransformerConfig(ModelParallelConfig):
     """Layer offset for DSA cross-layer top-k sharing."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
-    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+    """Coefficient for the DSA indexer KL divergence loss.
+    Set to 0 to disable indexer loss; in that mode the non-differentiable indexer projections are
+    frozen and excluded from gradient/optimizer bookkeeping.
+    """
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
@@ -381,6 +384,12 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
 
+    dsa_indexer_qk_proj_use_quantization: bool = True
+    """Whether indexer query/key projections use the enclosing FP8/FP4 context.
+    When disabled, these projections use the configured unquantized dtype (e.g. BF16).
+    This does not control ``linear_weights_proj`` or index-score quantization.
+    """
+
     dsa_indexer_k_norm_epsilon: Optional[float] = None
     """Optional epsilon override for the DSA indexer key LayerNorm."""
 
@@ -396,6 +405,23 @@ class TransformerConfig(ModelParallelConfig):
     """Output dtype of the ``DSAIndexer`` weights projection. BF16 preserves the existing
     path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
     backend. The final index scores remain FP32 independently of this option."""
+
+    dsa_indexer_kpool: int = 1
+    """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection.
+    When greater than one, ``dsa_indexer_topk`` must be divisible by this value.
+    """
+
+    dsa_indexer_kpool_use_quantization: bool = False
+    """Quantize KPool scoring inputs to E4M3 with power-of-two scales after Hadamard
+    rotation. This does not change projection parameter or GEMM precision.
+    """
+
+    dsa_indexer_kpool_always_select_tail: bool = True
+    """Append each query's incomplete causal pool after selected history pools.
+    This widens the output to ``dsa_indexer_topk + dsa_indexer_kpool - 1``; unused slots are -1.
+    Set to False for fixed-width pool-only selection. Only applies when
+    ``dsa_indexer_kpool > 1``.
+    """
 
     ####################
     # Compressed sparse attention
@@ -1796,11 +1822,13 @@ class TransformerConfig(ModelParallelConfig):
         if (
             self.dsa_indexer_weights_proj_output_dtype == "fp32"
             and self.dsa_kernel_backend == "cudnn"
+            and self.dsa_indexer_kpool <= 1
         ):
             raise ValueError(
                 "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
-                "dsa_kernel_backend='cudnn', which requires a BF16 indexer weights tensor. "
-                "Use dsa_kernel_backend='tilelang' or 'none'."
+                "dsa_kernel_backend='cudnn' for per-token DSA, which requires a BF16 indexer "
+                "weights tensor. KPool selection bypasses the cuDNN top-k path; use KPool or "
+                "dsa_kernel_backend='tilelang'/'none'."
             )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
@@ -1864,6 +1892,31 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
+                )
+            if self.dsa_indexer_kpool < 1:
+                raise ValueError(
+                    f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
+                )
+            if self.dsa_indexer_kpool > 1:
+                if self.dsa_indexer_topk is None:
+                    raise ValueError(
+                        "dsa_indexer_topk must be set when dsa_indexer_kpool is greater than 1."
+                    )
+                if self.dsa_indexer_topk < 1:
+                    raise ValueError(
+                        "dsa_indexer_topk must be positive"
+                        " when dsa_indexer_kpool is greater than 1."
+                    )
+                if self.dsa_indexer_topk % self.dsa_indexer_kpool != 0:
+                    raise ValueError(
+                        "dsa_indexer_topk must be divisible"
+                        " by dsa_indexer_kpool for pool selection; "
+                        f"got topk={self.dsa_indexer_topk}, kpool={self.dsa_indexer_kpool}."
+                    )
+            if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+                raise ValueError(
+                    "DSA indexer loss is not supported with kpool selection; set "
+                    "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
                 )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
@@ -3991,6 +4044,12 @@ class MLATransformerConfig(TransformerConfig):
 
     multi_latent_attention: bool = True
     """Whether to use Multi-Latent Attention."""
+
+    mla_proj_use_quantization: bool = True
+    """Whether absorbed-MLA projections use the enclosing FP8/FP4 context.
+    When disabled, they use the configured unquantized dtype (e.g. BF16). Core-attention
+    precision is unchanged.
+    """
 
     use_fused_mla_q_uproj: bool = False
     """Use the cuDNN fused MLA Q up-proj + per-head RoPE + MXFP8-quant kernel (SM100 only).
