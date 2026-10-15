@@ -1049,3 +1049,11 @@ The four-rank regression `test_kimi_latent_rmsnorm_gtp.py` compares padded
 and unpadded fused projections against native PyTorch RMSNorm plus a full
 linear weight, checking output, input/scale/bias gradients and summed
 weight gradients, including replicated parameter shapes.
+
+### Strict resume and unused runtime objects
+
+Normal rerun sentinels and explicitly unused RNG state still have saved sharded
+object keys. Strict resume requests those objects using their saved layouts,
+then discards them without applying incompatible runtime state. Model and
+optimizer keys remain subject to `raise_all`; this does not relax checkpoint
+validation or change the selected RNG restoration policy.
