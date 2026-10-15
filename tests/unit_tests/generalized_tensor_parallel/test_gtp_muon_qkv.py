@@ -82,11 +82,7 @@ class TestQKVRowCount:
     @pytest.mark.parametrize("gtp_size", [1, 2, 4, 64])
     def test_decision_is_layout_invariant(self, gtp_size):
         assert _ROWS % gtp_size == 0
-        assert _rows(_param(_ROWS // gtp_size), _SPLIT, gtp_size) == (
-            _ROWS,
-            gtp_size,
-            True,
-        )
+        assert _rows(_param(_ROWS // gtp_size), _SPLIT, gtp_size) == (_ROWS, gtp_size, True)
 
     def test_local_shard_would_have_disabled(self):
         local_rows, gtp_size = 102, 64
@@ -104,11 +100,7 @@ class TestQKVRowCount:
         assert (rows, splittable) == (120, False)
 
     def test_unsharded_param_ignores_group_and_padding(self):
-        assert _rows(_param(_GROUP, pad=4, sharded=False), _SPLIT, 4) == (
-            _GROUP,
-            1,
-            True,
-        )
+        assert _rows(_param(_GROUP, pad=4, sharded=False), _SPLIT, 4) == (_GROUP, 1, True)
 
 
 def _make_muon(
@@ -178,9 +170,7 @@ def _reference_split_orth(opt, weight, tp_group):
 def _init_model_parallel(gtp_remat_size):
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        gtp_remat_size=gtp_remat_size,
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=gtp_remat_size
     )
 
 
@@ -267,16 +257,12 @@ def _worker_padded_split_after_gather(rank, world_size, port):
         opt = _make_muon(pg_collection)
         weight = _full_weight(_PADDED_ROWS)
         expected = _reference_split_orth(opt, weight, pg_collection.tp)
-        local, gtp_rank, shard_rows, pad_length = _padded_local_qkv_shard(
-            weight, pg_collection
-        )
+        local, gtp_rank, shard_rows, pad_length = _padded_local_qkv_shard(weight, pg_collection)
 
         actual = opt.orthogonalize(local, local.clone())
 
         padded_expected = torch.nn.functional.pad(expected, (0, 0, 0, pad_length))
-        expected_local = padded_expected[
-            gtp_rank * shard_rows : (gtp_rank + 1) * shard_rows
-        ]
+        expected_local = padded_expected[gtp_rank * shard_rows : (gtp_rank + 1) * shard_rows]
         torch.testing.assert_close(actual, expected_local, atol=_ATOL, rtol=_RTOL)
     finally:
         ps.destroy_model_parallel()
@@ -316,7 +302,9 @@ def _worker_split_differs_from_whole(rank, world_size, port):
         local, _, _ = _local_qkv_shard(_full_weight(), pg_collection)
 
         split = opt.orthogonalize(local, local.clone())
-        whole = opt.scaled_orthogonalize_fn_with_gtp_remat(local, local.clone(), pg_collection.tp, None)
+        whole = opt.scaled_orthogonalize_fn_with_gtp_remat(
+            local, local.clone(), pg_collection.tp, None
+        )
 
         assert not torch.allclose(split, whole, atol=_ATOL, rtol=_RTOL)
     finally:
@@ -338,7 +326,9 @@ def _worker_distributed_fallback_warns_once(rank, world_size, port):
         )
         distributed_opt = _make_muon(pg_collection, tp_mode="distributed")
         with mock.patch.object(_eo_module, "log_single_rank") as logged:
-            distributed = distributed_opt.orthogonalize(distributed_param, distributed_param.clone())
+            distributed = distributed_opt.orthogonalize(
+                distributed_param, distributed_param.clone()
+            )
             distributed_opt.orthogonalize(distributed_param, distributed_param.clone())
 
         torch.testing.assert_close(distributed, duplicated, atol=_ATOL, rtol=_RTOL)

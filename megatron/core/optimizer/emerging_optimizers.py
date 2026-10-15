@@ -859,10 +859,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             gathered_grad,
             qkv_split_shapes,
             lambda head_grad: self.scaled_orthogonalize_fn(
-                head_grad,
-                tp_group=None,
-                partition_dim=None,
-                tp_mode_this_group="duplicated",
+                head_grad, tp_group=None, partition_dim=None, tp_mode_this_group="duplicated"
             ),
         )
 
@@ -886,10 +883,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             gathered_grad,
             split_shapes,
             lambda projection_grad: self.scaled_orthogonalize_fn(
-                projection_grad,
-                tp_group=None,
-                partition_dim=None,
-                tp_mode_this_group="duplicated",
+                projection_grad, tp_group=None, partition_dim=None, tp_mode_this_group="duplicated"
             ),
         )
         return self._restore_local_qkv_grad(gathered_grad, tp_slice, gtp_slice)
