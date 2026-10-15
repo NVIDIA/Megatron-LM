@@ -39,25 +39,30 @@ def reset_dsa_loss_scale():
     DSAIndexerLossAutoScaler.main_loss_backward_scale = None
 
 
-def test_reset_activation_offload_uses_language_model_group(mocker):
+@pytest.mark.parametrize("forward_only", [False, True])
+@pytest.mark.parametrize("multi_module", [False, True])
+def test_reset_activation_offload_uses_language_model_group(mocker, forward_only, multi_module):
     reset = mocker.patch.object(schedule.off_interface, "reset")
     language_group = object()
-    collection = MultiModuleProcessGroupCollection(
-        module_pgs={
-            "encoder_1": object(),
-            "encoder_2": object(),
-            "llm": SimpleNamespace(tp_dp_cp=language_group),
-        },
-        language_model_module_name="llm",
-    )
-    schedule._reset_activation_offload(collection)
-    reset.assert_called_once_with(process_group=language_group)
+    if multi_module:
+        collection = MultiModuleProcessGroupCollection(
+            module_pgs={
+                "encoder_1": object(),
+                "encoder_2": object(),
+                "llm": SimpleNamespace(tp_dp_cp=language_group),
+            },
+            language_model_module_name="llm",
+        )
+    else:
+        collection = ProcessGroupCollection(tp_dp_cp=language_group)
+    schedule._reset_activation_offload(collection, forward_only=forward_only)
+    reset.assert_called_once_with(process_group=language_group, forward_only=forward_only)
 
     reset.reset_mock()
     collection = MultiModuleProcessGroupCollection(
         module_pgs={"encoder_1": object(), "encoder_2": object()}
     )
-    schedule._reset_activation_offload(collection)
+    schedule._reset_activation_offload(collection, forward_only=forward_only)
     reset.assert_not_called()
 
 
