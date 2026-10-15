@@ -112,6 +112,7 @@ def calc_params_l2_norm(
             pg_collection,
             force_create_fp32_copy=force_create_fp32_copy,
             return_squared_tensor=return_squared_tensor,
+            main_param_getter=main_param_getter,
         )
 
     args = get_args()
@@ -289,6 +290,7 @@ def _calc_mimo_params_l2_norm(
     *,
     force_create_fp32_copy=False,
     return_squared_tensor=False,
+    main_param_getter=None,
 ):
     """Calculate a combined parameter L2 norm across MIMO model grids."""
     model_chunks = [unwrap_model(model_chunk) for model_chunk in model]
@@ -313,6 +315,7 @@ def _calc_mimo_params_l2_norm(
             pg_collection=pg_collection[name],
             return_squared_tensor=True,
             trainable_only=True,
+            main_param_getter=main_param_getter,
         )
         norm_sq[index].copy_(module_norm_sq.reshape(()))
 

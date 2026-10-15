@@ -164,6 +164,35 @@ def test_mimo_param_norm_skips_frozen_pp1_module(monkeypatch):
     assert all(call[2]["trainable_only"] for call in calls)
     assert all_reduce_calls == 1
 
+    # The optimizer's main param getter reaches the per-module norms, as without it the
+    # precision-aware optimizer's params would all be skipped.
+    calls.clear()
+    getter = lambda param: None
+    common_utils._calc_mimo_params_l2_norm([model], pg_collection, main_param_getter=getter)
+    assert calls and all(call[2]["main_param_getter"] is getter for call in calls)
+
+
+def test_calc_params_l2_norm_forwards_main_param_getter_to_mimo(monkeypatch):
+    pg_collection = object.__new__(common_utils.MultiModuleProcessGroupCollection)
+    captured = {}
+
+    def _mimo_norm(model, pg, **kwargs):
+        captured.update(kwargs, model=model, pg=pg)
+        return 1.0
+
+    monkeypatch.setattr(common_utils, "_calc_mimo_params_l2_norm", _mimo_norm)
+    getter = lambda param: None
+    model = torch.nn.Linear(1, 1)
+
+    assert (
+        common_utils.calc_params_l2_norm(
+            model, pg_collection=pg_collection, main_param_getter=getter
+        )
+        == 1.0
+    )
+    assert captured["main_param_getter"] is getter
+    assert captured["model"] == [model] and captured["pg"] is pg_collection
+
 
 @pytest.mark.parametrize(
     ("tensor_parallel_size", "expert_parallel_size", "expert_tensor_parallel_size"),

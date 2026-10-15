@@ -113,3 +113,32 @@ def test_chained_optimizer_returns_shard_from_owning_optimizer():
     assert chained.get_main_param_shard(dense) is dense_shard
     assert chained.get_main_param_shard(expert) is expert_shard
     assert chained.get_main_param_shard(unowned) is None
+
+
+def test_mimo_optimizer_returns_shard_from_owning_module_optimizer():
+    from megatron.core.models.mimo.optimizer import MimoOptimizer, ModuleOptimizerInfo
+
+    encoder, language, inactive, unowned = (torch.nn.Parameter(torch.ones(1)) for _ in range(4))
+    encoder_shard, language_shard = torch.ones(1), torch.zeros(1)
+    language_chain = object.__new__(ChainedOptimizer)
+    language_chain.chained_optimizers = [_FakeChainedMember({language: language_shard})]
+
+    def _info(optimizer, is_active=True):
+        return ModuleOptimizerInfo(
+            optimizer=optimizer, grid=None, pg_collection=None, is_active=is_active
+        )
+
+    mimo = MimoOptimizer(
+        {
+            "images": _info(_FakeChainedMember({encoder: encoder_shard})),
+            "language": _info(language_chain),
+            # Modules this rank does not run are not consulted.
+            "audio": _info(_FakeChainedMember({inactive: torch.ones(1)}), is_active=False),
+        },
+        config=None,
+    )
+
+    assert mimo.get_main_param_shard(encoder) is encoder_shard
+    assert mimo.get_main_param_shard(language) is language_shard
+    assert mimo.get_main_param_shard(inactive) is None
+    assert mimo.get_main_param_shard(unowned) is None

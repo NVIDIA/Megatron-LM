@@ -136,6 +136,20 @@ class MimoOptimizer(MegatronOptimizer):
             optimizers.extend(getattr(opt, 'chained_optimizers', [opt]))
         return optimizers
 
+    def get_main_param_shard(self, model_param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+        """Return the FP32 main param shard held by this rank for model_param, or None.
+
+        Delegates to the module optimizers that track main params (the distributed optimizer).
+        """
+        for opt in self.chained_optimizers:
+            get_main_param_shard = getattr(opt, 'get_main_param_shard', None)
+            if get_main_param_shard is None:
+                continue
+            shard = get_main_param_shard(model_param)
+            if shard is not None:
+                return shard
+        return None
+
     def prepare_model_params_for_param_sync(self) -> None:
         """Stage parameters for explicit synchronization in all active module optimizers."""
         for opt in self._active_optimizers:
