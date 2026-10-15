@@ -17,6 +17,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
@@ -100,6 +101,7 @@ class TextGenerationControllerTestBase:
         transformer_impl: str = None,
         position_embedding_type: str = None,
         mtp_use_repeated_layer: bool = False,
+        logit_dtype: torch.dtype = None,
     ):
         # When transformer_impl == "inference_optimized" the model is built with the
         # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
@@ -170,6 +172,7 @@ class TextGenerationControllerTestBase:
                 hybrid_layer_pattern=hybrid_layer_pattern,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
+                logit_dtype=logit_dtype,
             ).cuda()
             mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
         else:
@@ -197,6 +200,7 @@ class TextGenerationControllerTestBase:
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type=position_embedding_type,
+                logit_dtype=logit_dtype,
             ).cuda()
 
         model.eval()
@@ -250,6 +254,40 @@ class TextGenerationControllerTestBase:
         # Mirror what StaticInferenceEngine/DynamicInferenceEngine do at engine start:
         # the model is being driven by an inference workload, so InferenceMode is active.
         InferenceMode.set_active()
+
+    def _generate_dynamic(self, num_tokens_to_generate=8, prompt_seed=1234):
+        """Run `batch_size` seeded prompts through dynamic generation to completion;
+        returns the sampled tokens of every step."""
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda x, skip_special_tokens=False: ' '.join(
+            [
+                ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
+                for _ in range(len(x))
+            ]
+        )
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+            i for i, c in enumerate(s) if c == ' '
+        ] + [len(s)]
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        for request_id in range(self.batch_size):
+            generator = torch.Generator().manual_seed(prompt_seed + request_id)
+            context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.randint(
+                        0, self.vocab_size - 1, (7 + request_id,), generator=generator
+                    ).to(torch.cuda.current_device()),
+                    sampling_params=SamplingParams(
+                        top_k=10, num_tokens_to_generate=num_tokens_to_generate
+                    ),
+                )
+            )
+        sampled_per_step = []
+        while context.has_unfinished_requests():
+            result = self.text_generation_controller.generate_output_tokens_dynamic_batch()
+            sampled_per_step.append(result["sample"].tolist())
+        return sampled_per_step
 
 
 def _make_async_sched_context(total_request_count=2, paused_request_count=0):
@@ -358,6 +396,7 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller.model_config = model_config
     controller.num_speculative_tokens = 0
     controller._enable_cuda_graph = False
+    controller._logits_dtype = torch.float32
     controller._sampling_backend = "torch"
     controller._async_sched_forward = AsyncScheduleForwardState(is_valid=True)
     controller._async_sched_mtp_token_row_indices = None
@@ -4246,63 +4285,76 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
         InferenceMode.unset_active()
         Utils.destroy_model_parallel()
 
-    def setup_model(
-        self,
-        dtype,
-        symmetric_ar_type=None,
-        fp8: bool = False,
-        tensor_model_parallel_size: int = 2,
-        pipeline_model_parallel_size: int = 1,
-        batch_size: int = 4,
-        static: bool = True,
-        use_training_random_init: bool = False,
-        materialize_only_last_token_logits: bool = False,
-        num_speculative_tokens: int = 0,
-        block_size_tokens: int = 256,
-        enable_prefix_caching: bool = False,
-        max_requests: int = None,
-        mtp_num_layers: int = 0,
-        sequence_parallel: bool = False,
-        expert_model_parallel_size: int = 1,
-        num_moe_experts: int = None,
-        hybrid_layer_pattern: str = None,
-    ):
+    def setup_model(self, dtype, **kwargs):
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size,
-            pipeline_model_parallel_size=pipeline_model_parallel_size,
-            expert_model_parallel_size=expert_model_parallel_size,
+            tensor_model_parallel_size=kwargs.get("tensor_model_parallel_size", 2),
+            pipeline_model_parallel_size=kwargs.get("pipeline_model_parallel_size", 1),
+            expert_model_parallel_size=kwargs.get("expert_model_parallel_size", 1),
         )
-        super().setup_model(
-            dtype,
-            symmetric_ar_type=symmetric_ar_type,
-            fp8=fp8,
-            tensor_model_parallel_size=tensor_model_parallel_size,
-            pipeline_model_parallel_size=pipeline_model_parallel_size,
-            batch_size=batch_size,
-            static=static,
-            use_training_random_init=use_training_random_init,
-            materialize_only_last_token_logits=materialize_only_last_token_logits,
-            num_speculative_tokens=num_speculative_tokens,
-            block_size_tokens=block_size_tokens,
-            enable_prefix_caching=enable_prefix_caching,
-            max_requests=max_requests,
-            mtp_num_layers=mtp_num_layers,
-            sequence_parallel=sequence_parallel,
-            expert_model_parallel_size=expert_model_parallel_size,
-            num_moe_experts=num_moe_experts,
-            hybrid_layer_pattern=hybrid_layer_pattern,
-        )
+        super().setup_model(dtype, **kwargs)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "pp_size, logit_dtype, expected",
+        [
+            (1, None, torch.bfloat16),
+            (1, torch.float32, torch.float32),
+            (2, torch.float32, torch.float32),
+        ],
+        ids=["pp1-bf16", "pp1-fp32", "pp2-fp32"],
+    )
+    def test_logits_keep_the_head_dtype(self, pp_size, logit_dtype, expected):
+        """Inference holds logits in the dtype the head emits: the CUDA-graph buffer is
+        allocated in it, so an fp32 head (`logit_dtype`) is not narrowed to
+        `params_dtype` by the controller copy, and at PP 2 the first stage receives the
+        broadcast in it. Generation with and without the buffer samples the same tokens
+        (both run the same eager kernels here).
+        """
+        if logit_dtype is not None and te_general_gemm is None:
+            pytest.skip("fp32 logits need Transformer Engine general_gemm")
+        generated = {}
+        for cuda_graph_impl in ("none", "local"):
+            if generated:
+                self.teardown_method(None)
+            self.setup_model(
+                torch.bfloat16,
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=pp_size,
+                static=False,
+                use_training_random_init=True,
+                cuda_graph_impl=cuda_graph_impl,
+                logit_dtype=logit_dtype,
+            )
+            controller = self.text_generation_controller
+            assert controller._logits_dtype == expected
+            # The harness wraps bf16 models in Float16Module; the wrapper must not let it
+            # upcast the logits to fp32 on the way out.
+            assert controller.inference_wrapped_model._model_forward_kwargs == {
+                "fp32_output": False
+            }
+            generated[cuda_graph_impl] = self._generate_dynamic()
+            assert controller._all_logits_cuda.dtype == expected
+        assert generated["none"] == generated["local"]
 
     @pytest.mark.parametrize("static", [True, False])
     @pytest.mark.parametrize("tp_size", [1, 2])
     @pytest.mark.parametrize("pp_size", [1, 2])
-    def test_sampled_tokens_match_with_parallelism(self, static, tp_size, pp_size):
-        """Verify that sampled tokens match across all parallel ranks."""
+    @pytest.mark.parametrize("logit_dtype", [None, torch.float32])
+    def test_sampled_tokens_match_with_parallelism(self, static, tp_size, pp_size, logit_dtype):
+        """Verify that sampled tokens match across all parallel ranks, with the head
+        emitting its compute dtype or fp32 logits (`logit_dtype`), which every rank
+        must keep through the pipeline broadcast."""
         if tp_size == 1 and pp_size == 1:
             pytest.skip(reason="Test requires model parallel size > 1.")
 
         if not static and not is_fa_min_version("2.7.3"):
             pytest.skip(reason="Need latest flash attn for dynamic batching")
+
+        if logit_dtype is not None and te_general_gemm is None:
+            pytest.skip(reason="fp32 logits need Transformer Engine general_gemm")
 
         self.setup_model(
             dtype=torch.bfloat16,
@@ -4310,7 +4362,9 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
             pipeline_model_parallel_size=pp_size,
             static=static,
             use_training_random_init=True,
+            logit_dtype=logit_dtype,
         )
+        assert self.text_generation_controller._logits_dtype == (logit_dtype or torch.bfloat16)
 
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1

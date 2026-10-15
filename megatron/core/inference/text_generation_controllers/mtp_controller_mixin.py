@@ -639,7 +639,7 @@ class MTPControllerMixin:
                 nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/pp-broadcast")
                 mtp_logits_2d = broadcast_from_last_pipeline_stage(
                     [active_request_count, self.vocab_size],
-                    dtype=self.model_config.params_dtype,
+                    dtype=self._logits_dtype,
                     tensor=mtp_logits_2d,
                     pp_group=self.pp_group,
                 )
