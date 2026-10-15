@@ -218,7 +218,7 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/ssm/test_gated_delta_net.py]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net2.py]
     products:
       - environment: [lts, dev]
         tag: [latest]

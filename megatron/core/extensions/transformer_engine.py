@@ -3915,6 +3915,9 @@ try:
     _TE_FUSED_PARALLEL_CE_OVERWRITE_INPUT = (
         "overwrite_input" in inspect.signature(parallel_cross_entropy).parameters
     )
+    _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX = (
+        "return_argmax" in inspect.signature(parallel_cross_entropy).parameters
+    )
     current_te_version = get_te_version()
 
     def te_parallel_cross_entropy(
@@ -3923,8 +3926,13 @@ try:
         tp_group: torch.distributed.ProcessGroup,
         is_cg_capturable: bool = False,
         overwrite_input: bool = True,
+        return_argmax: bool = False,
     ):
-        """Wrapper function for TE's Cross Entropy Loss kernel"""
+        """Wrapper function for TE's Cross Entropy Loss kernel
+
+        With ``return_argmax``, returns ``(loss, argmax)``: the argmax of each row over the full
+        vocabulary, found by the loss kernel, or None if this TE version cannot return it.
+        """
         parallel_cross_entropy_kwargs = {
             "label_smoothing": 0.0,
             "reduce_loss": False,
@@ -3939,6 +3947,10 @@ try:
             parallel_cross_entropy_kwargs["is_cg_capturable"] = is_cg_capturable
             # According to TE CrossEntropyFunction, ignore_idx defaults to -100
             parallel_cross_entropy_kwargs["ignore_idx"] = -100
+        if return_argmax:
+            if not _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX:
+                return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs), None
+            parallel_cross_entropy_kwargs["return_argmax"] = True
         return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs)
 
 except ImportError:
@@ -3952,13 +3964,22 @@ def te_cross_entropy(
     *,
     cuda_graph_capturable: bool = False,
     overwrite_input: bool = True,
-) -> torch.Tensor:
-    """Adapt TE cross entropy to the backend target signature and required label stride."""
+    return_argmax: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+    """Adapt TE cross entropy to the backend target signature and required label stride.
+
+    With ``return_argmax``, returns ``(loss, argmax)`` as ``te_parallel_cross_entropy`` does.
+    """
     if te_parallel_cross_entropy is None:
         raise RuntimeError("Trying to use a TE block when it's not present.")
     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
     return te_parallel_cross_entropy(
-        logits, labels, tp_group, cuda_graph_capturable, overwrite_input=overwrite_input
+        logits,
+        labels,
+        tp_group,
+        cuda_graph_capturable,
+        overwrite_input=overwrite_input,
+        return_argmax=return_argmax,
     )
 
 
