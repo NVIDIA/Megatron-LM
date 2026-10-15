@@ -215,7 +215,7 @@ def test_static_cp_splits_a_single_packed_group_across_dp_ranks():
 def test_wrap_iterator_enables_padding_aware_capacity(
     monkeypatch, no_global_process_groups, scheduler_type, alignment
 ):
-    def run(scheduler, *args):
+    def run(scheduler, *args, validate_cuda_graph_limits=True):
         assert scheduler.pad_sequences == (alignment is not None)
         expected_capacity = 2048 if alignment == 32 else 2050
         assert scheduler.max_seqlen_per_dp_cp_rank == expected_capacity
@@ -254,7 +254,17 @@ def test_static_packing_spans_gtp_remat_peers(monkeypatch, no_global_process_gro
         pp=_group(1),
     )
 
-    def run(scheduler, iterator, count, dp_group, tp_group, pp_group, dp_cp_group, *args):
+    def run(
+        scheduler,
+        iterator,
+        count,
+        dp_group,
+        tp_group,
+        pp_group,
+        dp_cp_group,
+        *args,
+        validate_cuda_graph_limits=True,
+    ):
         assert (scheduler.dp_size, scheduler.cp_size) == (4, 2)
         assert (dp_group, dp_cp_group) == (pg.dp_gtp_remat, pg.dp_cp_gtp_remat)
         return None, 0, 0, 0
@@ -437,7 +447,17 @@ def test_dynamic_scheduler_uses_only_supplied_group_sizes(
         dynamic_cp={size: _group(size) for size in cp_sizes},
     )
 
-    def run(scheduler, iterator, count, dp_group, tp_group, pp_group, dp_cp_group, *args):
+    def run(
+        scheduler,
+        iterator,
+        count,
+        dp_group,
+        tp_group,
+        pp_group,
+        dp_cp_group,
+        *args,
+        validate_cuda_graph_limits=True,
+    ):
         assert scheduler.cp_group_sizes == cp_sizes
         assert (dp_group, tp_group, pp_group, dp_cp_group) == (pg.dp, pg.tp, pg.pp, pg.dp_cp)
         batches = scheduler.get_groups_and_subsamples(list(enumerate([16] * 12)))
@@ -483,7 +503,7 @@ def test_static_cp_keeps_default_dynamic_cp_scheduler(cpu_batch_communication, m
     config.dynamic_context_parallel = False
     calls = []
 
-    def run(scheduler, iterator, count, *args):
+    def run(scheduler, iterator, count, *args, validate_cuda_graph_limits=True):
         calls.append(scheduler.cp_group_sizes)
         return iterator, 1, 16, 256
 

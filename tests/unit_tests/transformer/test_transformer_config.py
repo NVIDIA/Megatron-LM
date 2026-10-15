@@ -905,25 +905,32 @@ def test_offload_modules_fused_group_mlp_excludes_unfused_expert_knobs():
 
 @requires_te_2_9
 @pytest.mark.parametrize(
-    "overrides, message",
+    "overrides, exception, message",
     [
         (
             {"calculate_per_token_loss": True, "cuda_graph_impl": "local"},
-            "Dynamic context parallelism not supported with CUDA Graph",
+            ValueError,
+            "Dynamic CP supports only layer-wise TE CUDA graphs",
         ),
         (
             {"calculate_per_token_loss": True, "enable_cuda_graph": True},
-            "Dynamic context parallelism not supported with CUDA Graph",
+            ValueError,
+            "Dynamic CP supports only layer-wise TE CUDA graphs",
         ),
-        ({}, "Dynamic context parallelism must be used with calculate_per_token_loss"),
+        (
+            {},
+            AssertionError,
+            "Dynamic context parallelism must be used with calculate_per_token_loss",
+        ),
         (
             {"calculate_per_token_loss": True, "moe_z_loss_coeff": 1e-3},
+            AssertionError,
             "Dynamic context parallelism not supported with moe_z_loss_coeff",
         ),
     ],
 )
-def test_dynamic_cp_rejects_unsupported_config(overrides, message):
-    with pytest.raises(AssertionError, match=message):
+def test_dynamic_cp_rejects_unsupported_config(overrides, exception, message):
+    with pytest.raises(exception, match=message):
         _make_packing_config(
             dynamic_context_parallel=True,
             sequence_packing_scheduler="default_dynamic_cp",

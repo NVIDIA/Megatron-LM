@@ -317,6 +317,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             return super()._te_cuda_graph_capture(*args, **kwargs)
 
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+        self._set_dynamic_cp_capture_packed_seq_params(kwargs)
         return self._forward_mhc_attention_cuda_graph_consumer(*args, **kwargs)
 
     def _forward_mhc_attention_post_cuda_graph(
@@ -634,7 +635,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_recompute_manager
         )
 
-        hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
+        if self.mlp_norm_manager is not None:
+            hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
+            self.mlp_norm_manager = None
 
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
@@ -656,6 +659,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if self.config.delay_offload_until_cuda_graph:
             self.off_interface.enter_replay()
         try:
+            # The split bypasses the parent's dynamic-CP graph-bank selection.
+            self._activate_dynamic_cp_cuda_graph(kwargs.get("packed_seq_params"))
             return self._te_cuda_graph_replay_impl(args, kwargs, None)
         finally:
             self._te_cuda_graph_route_replay_state = None
@@ -852,7 +857,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return (residual, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post)
 
-    def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+    def _te_cuda_graph_replay_impl(self, args, kwargs, context, eager_packed_seq_params=None):
         """Implementation of _te_cuda_graph_replay with hyper connection support.
 
         The caller owns the delay_offload_until_cuda_graph lifecycle
@@ -1039,7 +1044,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 *cuda_graph_output,
                 padding_mask=padding_mask,
                 input_ids=kwargs.get("input_ids", None),
-                packed_seq_params=kwargs.get("packed_seq_params", None),
+                packed_seq_params=eager_packed_seq_params,
                 mhc_recompute_manager=getattr(self, '_mhc_recompute_manager', None),
             )
         return output, context
