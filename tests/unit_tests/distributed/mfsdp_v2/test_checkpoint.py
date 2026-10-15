@@ -485,12 +485,23 @@ def test_metadata_attach_issues_no_collectives(
     assert model_state_dict.keys() == dict(model.named_parameters()).keys()
 
 
-@pytest.mark.parametrize("ep_size", [1, 2, 4])
-def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_size):
+@pytest.mark.parametrize(
+    ("ep_size", "load_path"),
+    [(1, "model"), (2, "model"), (4, "model"), (2, "optimizer"), (2, "reload")],
+    ids=["ep1", "ep2", "ep4", "ep2_optimizer_only", "ep2_reload_model_params"],
+)
+def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_size, load_path):
     """MCore checkpoint save/load reproduces uninterrupted BF16 MoE training.
 
     Use MCore's existing global expert names and optimizer checkpoint format.
-    EP=1 is the positive control; EP>1 exercises separate dense and expert-DP meshes.
+    EP>1 exercises separate dense and expert-DP meshes.
+
+    ``load_path`` selects what runs after DCP has written the checkpoint into the main weights:
+    ``model`` loads through ``FullyShardedDataParallelV2.load_state_dict`` like a normal resume.
+    ``optimizer`` skips it and loads only the optimizer, which is what the GPT->Hybrid
+    ``fsdp_dtensor`` load does. ``reload`` loads no optimizer state and calls
+    ``reload_model_params()``, as the same load does under ``--no-load-optim``. The last two
+    freeze the word embedding, so the refresh must also reach frozen parameter groups.
     """
     world_size, rank = Utils.world_size, Utils.rank
     if world_size % ep_size:
@@ -533,6 +544,8 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 hybrid_layer_pattern="*E",
                 pg_collection=groups,
             ).cuda()
+            if load_path != "model":
+                model.embedding.word_embeddings.weight.requires_grad_(False)
             model = FullyShardedDataParallel(
                 config=config,
                 ddp_config=DistributedDataParallelConfig(
@@ -587,13 +600,14 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 losses.append(loss)
             return losses
 
-        def checkpoint_state(model, optimizer, *, is_loading=False):
+        def checkpoint_state(model, optimizer, *, is_loading=False, with_optimizer=True):
             state = {
                 "model": handle_experts_in_state_dict(
                     model.state_dict_for_save_checkpoint(), model.config.num_moe_experts
-                ),
-                "optimizer": optimizer.sharded_state_dict({}, is_loading=is_loading),
+                )
             }
+            if with_optimizer:
+                state["optimizer"] = optimizer.sharded_state_dict({}, is_loading=is_loading)
             preprocess_state_dict_for_uneven_dtensor(state)
             return state
 
@@ -602,13 +616,26 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
             dcp.save(checkpoint_state(source, source_optimizer), checkpoint_id=path)
             destination, destination_optimizer = build(seed=987)
             raw_model_state = destination.state_dict_for_save_checkpoint()
-            state = checkpoint_state(destination, destination_optimizer, is_loading=True)
+            state = checkpoint_state(
+                destination,
+                destination_optimizer,
+                is_loading=True,
+                with_optimizer=load_path != "reload",
+            )
             dcp.load(state, checkpoint_id=path)
-            destination.load_state_dict(raw_model_state)
-            destination_optimizer.load_state_dict(state["optimizer"])
+            if load_path == "model":
+                destination.load_state_dict(raw_model_state)
+            if load_path == "reload":
+                destination_optimizer.reload_model_params()
+            else:
+                destination_optimizer.load_state_dict(state["optimizer"])
 
         expected_losses = train(source, source_optimizer)
         actual_losses = train(destination, destination_optimizer)
+        if load_path == "reload":
+            # Without optimizer state the steps diverge, but the first loss is computed before
+            # any step, from the loaded weights alone.
+            expected_losses, actual_losses = expected_losses[:1], actual_losses[:1]
         torch.testing.assert_close(
             torch.stack(actual_losses), torch.stack(expected_losses), rtol=0, atol=0
         )
