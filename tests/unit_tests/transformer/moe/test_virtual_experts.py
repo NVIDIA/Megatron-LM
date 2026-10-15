@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from functools import partialmethod
 from types import SimpleNamespace
@@ -64,7 +65,7 @@ from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridE
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
+from tests.unit_tests.determinism.utils import RacingStreams
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.internal
@@ -132,10 +133,13 @@ def grouped_mlp_fusions(monkeypatch, virtual_expert_environment):
         list(OperationFuser.forward_backward_fusion_functions),
     )
     try:
-        for cls, fuse in (
-            (grouped_mlp.GroupedMLP_CuTeGEMMGLU, grouped_mlp.fuse_ops),
-            (grouped_mlp.GroupedMLP_CuTeGEMMUnary, grouped_mlp.fuse_srelu_ops),
+        for cls, name, legacy_name in (
+            (grouped_mlp.GroupedMLP_CuTeGEMMGLU, "fuse_glu_ops", "fuse_ops"),
+            (grouped_mlp.GroupedMLP_CuTeGEMMUnary, "fuse_unary_activation_ops", "fuse_srelu_ops"),
         ):
+            fuse = getattr(grouped_mlp, name, None)
+            if fuse is None:
+                fuse = getattr(grouped_mlp, legacy_name)
             if cls.is_supported() and fuse not in OperationFuser.forward_backward_fusion_functions:
                 register_forward_backward_fusion(fuse, prepend=True)
         yield grouped_mlp
@@ -345,6 +349,8 @@ def _assert_bitwise_parity(actual, expected, name):
 def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
     """Match HybridEP losses, gradients and updates with repeated MTP, GTP/EGTP and offload."""
     monkeypatch.setenv('NVTE_GROUPED_LINEAR_SINGLE_PARAM', '0')
+    # Compare dispatch paths without nondeterministic TE dactivation/dprob accumulation.
+    monkeypatch.setenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO', '0')
     # Compile once per shape/process, including that first compilation in the time budget.
     # Model teardown releases transport buffers; later instances reload the real kernels.
     monkeypatch.setattr(
@@ -494,6 +500,9 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
             ]
             assert len(experts) == 3
             for name, layer in experts:
+                # Match MoonEP's shared-expert launch order in both A/B variants so BF16
+                # input-gradient accumulation compares the same execution schedule.
+                layer.run_shared_experts_after_router = True
                 # Tiny MXFP8 inputs round every nonempty expert to one block. Concentrate
                 # choices on one owner so this test still exercises real replica transfers.
                 layer.router.qb_beta.copy_(
@@ -626,14 +635,15 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
             assert values.keys() == expected.keys()
             for name in values:
                 # Storing split native/virtual wgrad partials in BF16 can erase tiny
-                # cancellation residuals. Adam's first step amplified eight zeroed
-                # gradients among 16,384 into 2.19% update L2 with 0.26% gradient L2.
+                # cancellation residuals, which Adam amplifies in individual updates.
+                # With matched launch order, observed maxima are 0.26% gradient L2
+                # (0.68% peak) and 1.20% update L2 (94.46% peak).
                 if name == 'loss':
-                    tolerance, peak_tolerance = 1e-4, 1e-4
+                    tolerance, peak_tolerance = 1e-5, 1e-5
                 elif name.startswith('optimizer update'):
-                    tolerance, peak_tolerance = 0.025, 2.1
+                    tolerance, peak_tolerance = 0.015, 1.1
                 else:
-                    tolerance, peak_tolerance = 0.01, 0.02
+                    tolerance, peak_tolerance = 0.005, 0.01
                 _assert_numerical_parity(
                     values[name],
                     expected[name],
@@ -997,7 +1007,7 @@ def _virtual_expert_hybridep_config(**overrides):
 def test_virtual_expert_recompute_offload_scopes(
     monkeypatch, grouped_mlp_fusions, precision, recompute, offload_scope, use_op_fuser
 ):
-    """Exercise real MoonEP transfers through two forwards and reverse-order backward."""
+    """Replay MoonEP transfers and shared-expert input gradients across recompute/offload."""
     if precision == "mxfp8" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("MXFP8 requires Blackwell")
     if offload_scope == "expert_fc1":
@@ -1030,6 +1040,7 @@ def test_virtual_expert_recompute_offload_scopes(
             ffn_hidden_size=256,
             moe_ffn_hidden_size=256,
             moe_router_topk=2,
+            moe_shared_expert_intermediate_size=256,
             moe_router_score_function="sigmoid",
             moe_router_topk_scaling_factor=3.16,
             moe_router_load_balancing_type="none",
@@ -1314,14 +1325,28 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, mode, compact_suppo
                     return manager.token_probs, indices
 
                 router.eval()
-                assert_replays_bit_exact(
-                    route,
-                    (logits.detach().view(128, 2, 512).requires_grad_(),),
-                    grad_outputs={"out[0]": dy.gather(1, ids)},
-                    replays=3,
-                    contention=True,
-                    what=f"MoonEP direct routing[{mode}]",
-                )
+                # Importing the kernel-suite harness enables process-wide determinism.
+                # Keep this replay local so collecting this module cannot change other tests.
+                replay_reference = None
+                for replay in range(3):
+                    with RacingStreams() if replay else nullcontext():
+                        replay_logits = logits.detach().view(128, 2, 512).clone().requires_grad_()
+                        replay_scores, replay_ids = route(replay_logits)
+                        (replay_grad,) = torch.autograd.grad(
+                            replay_scores, replay_logits, grad_outputs=dy.gather(1, ids)
+                        )
+                        observed = tuple(
+                            value.detach().clone()
+                            for value in (replay_scores, replay_ids, replay_grad)
+                        )
+                    torch.cuda.synchronize()
+                    if replay_reference is None:
+                        replay_reference = observed
+                    else:
+                        for name, actual, expected in zip(
+                            ("scores", "indices", "gradients"), observed, replay_reference
+                        ):
+                            _assert_bitwise_parity(actual, expected, f"router[{mode}] {name}")
                 with torch.no_grad():
                     static_logits = logits.detach().view(128, 2, 512).clone()
                     # Warm up before capture; replay must read new scores, not cached IDs.
