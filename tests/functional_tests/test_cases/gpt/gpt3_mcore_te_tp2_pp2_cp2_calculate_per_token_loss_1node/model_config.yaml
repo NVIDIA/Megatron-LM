@@ -52,6 +52,5 @@ MODEL_ARGS:
   --calculate-per-token-loss: true
   --async-save: true
   --use-persistent-ckpt-worker: true
-  --exit-interval: 50
 TEST_TYPE: regular
 LAUNCHER: ft_launcher

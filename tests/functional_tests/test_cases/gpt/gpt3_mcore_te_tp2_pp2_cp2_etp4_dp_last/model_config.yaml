@@ -54,6 +54,5 @@ MODEL_ARGS:
   --expert-tensor-parallel-size: 4
   --async-save: true
   --use-persistent-ckpt-worker: true
-  --exit-interval: 50
 TEST_TYPE: regular
 LAUNCHER: ft_launcher

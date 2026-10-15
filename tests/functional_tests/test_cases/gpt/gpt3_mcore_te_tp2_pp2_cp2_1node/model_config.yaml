@@ -52,6 +52,5 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --async-save: true
   --use-persistent-ckpt-worker: true
-  --exit-interval: 50
 TEST_TYPE: regular
 LAUNCHER: ft_launcher
