@@ -1669,7 +1669,7 @@ def validate_args(args, defaults={}):
     # Implementation lives in ``megatron/training/determinism.py`` so the
     # same setup is reachable from tests / profiling scripts that don't go
     # through argparse.
-    if not getattr(args, 'non_deterministic_mode', False):
+    if not getattr(args, 'disable_deterministic_mode', False):
         from megatron.training.determinism import apply_determinism_to_args
 
         apply_determinism_to_args(args)

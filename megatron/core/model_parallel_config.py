@@ -266,10 +266,10 @@ class ModelParallelConfig:
         metadata={
             "argparse_meta": {
                 # On by default on the CLI (the dataclass default stays False); opt out with
-                # --no-deterministic-mode. Stored as args.non_deterministic_mode and converted
+                # --no-deterministic-mode. Stored as args.disable_deterministic_mode and converted
                 # back to ``deterministic_mode`` in core_transformer_config_from_args.
                 "arg_names": ["--no-deterministic-mode", "--disable-deterministic-mode"],
-                "dest": "non_deterministic_mode",
+                "dest": "disable_deterministic_mode",
                 "action": "store_true",
                 "default": False,
                 "help": "Disable deterministic mode (enabled by default on the command line).",

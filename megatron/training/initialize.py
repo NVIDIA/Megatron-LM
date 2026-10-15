@@ -131,7 +131,7 @@ def initialize_megatron(
     # Before any Triton kernel runs, including the kernel warm-up before model construction.
     tuning.install(
         _triton_autotune_config_from_args(args),
-        deterministic=not getattr(args, 'non_deterministic_mode', False),
+        deterministic=not getattr(args, 'disable_deterministic_mode', False),
     )
 
     # torch.distributed initialization
