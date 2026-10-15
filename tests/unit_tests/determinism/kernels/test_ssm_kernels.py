@@ -348,7 +348,8 @@ def test_chunk_gated_delta_product_varlen_replays():
     )
 
 
-def test_fused_recurrent_gated_delta_rule_update_replays():
+@pytest.mark.parametrize("gate_in_kernel", [False, True])
+def test_fused_recurrent_gated_delta_rule_update_replays(gate_in_kernel):
     from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
@@ -359,6 +360,16 @@ def test_fused_recurrent_gated_delta_rule_update_replays():
     g = -torch.rand(B, 1, H, device="cuda") * 0.1
     beta = torch.rand(B, 1, H, device="cuda", dtype=torch.bfloat16)
     initial_state = torch.randn(B, H, K, V, device="cuda")
+    # The GDN decode form: raw gate and beta logits, with the decay formed in-kernel.
+    gate_kwargs = (
+        dict(
+            A_log=torch.randn(H, device="cuda"),
+            dt_bias=torch.randn(H, device="cuda"),
+            use_beta_sigmoid_in_kernel=True,
+        )
+        if gate_in_kernel
+        else {}
+    )
 
     def fn(q, k, v, g, beta, initial_state):
         return fused_recurrent_gated_delta_rule_update(
@@ -370,6 +381,7 @@ def test_fused_recurrent_gated_delta_rule_update_replays():
             initial_state=initial_state,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
+            **gate_kwargs,
         )
 
     assert_replays_bit_exact(
@@ -520,6 +532,41 @@ def test_gdp_l2norm_and_cumsum_replay():
 
 
 # --- Gated Delta Net (deterministic torch path vs FLA) ---------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [32, 128])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
+    """Preserve FLA's output/gradient contract while removing autotune-dependent rounding."""
+    from fla.modules.l2norm import l2norm
+
+    from megatron.core.ssm.gated_delta_net.common import torch_l2norm
+
+    seeded()
+    x = torch.randn(2, 256, head_dim, device="cuda", dtype=dtype)
+    # A zero row distinguishes additive epsilon from clamping the norm itself.
+    x[0, 0].zero_()
+    dy = torch.randn_like(x)
+    if dtype == torch.bfloat16:
+        # With an exactly parallel upstream gradient, differentiating an
+        # unrounded norm would erase FLA's saved-rounded-output contribution.
+        x[0, 1].fill_(0.5)
+        dy[0, 1].fill_(32.0)
+    actual_input = x.clone().requires_grad_(True)
+    expected_input = x.clone().requires_grad_(True)
+    normalize = torch.compile(torch_l2norm) if compiled else torch_l2norm
+    actual = normalize(actual_input)
+    expected = l2norm(expected_input)
+    actual.backward(dy)
+    expected.backward(dy)
+    if dtype == torch.bfloat16:
+        assert expected_input.grad[0, 1].abs().min().item() > 1e-4
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_input.grad, expected_input.grad)
+    assert_replays_bit_exact(
+        normalize, (x.requires_grad_(True),), replays=3, contention=True, what="GDN torch L2 norm"
+    )
 
 
 def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():

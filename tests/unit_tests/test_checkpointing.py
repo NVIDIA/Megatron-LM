@@ -1017,6 +1017,8 @@ def test_checkpoint_load_without_microbatch_calculator(
         )
 
         def build_model():
+            # CPU-initialized DP replicas must match the weights saved by rank 0.
+            torch.manual_seed(123)
             return (
                 GPTModel(
                     config=config,
