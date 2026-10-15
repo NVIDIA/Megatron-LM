@@ -1827,7 +1827,8 @@ class DynamicInferenceEngine(AbstractEngine):
         produces a client-visible failure reply.
 
         Called from the SUBMIT_REQUEST handler when image preprocessing or
-        add_request raises. Registering a placeholder record with
+        add_request raises, and when a KV handoff import fails before its
+        request is admitted. Registering a placeholder record with
         Status.FAILED lets ``_handle_failed_request`` publish the ENGINE_REPLY
         without leaving the client hanging or killing the engine loop.
         """

@@ -1194,6 +1194,13 @@ class InferenceStateHandoffMixin:
                 if not pending.future.done():
                     pending.future.set_exception(exc)
                 logging.exception("DISAGG_DECODE_PULL_FAILED request_id=%d", pending.request_id)
+                if pending.request_id not in self.requests:
+                    # The import never reached add_request(), so no request record can
+                    # carry an ENGINE_REPLY and the coordinator would keep its routing
+                    # entry forever. Every MP rank applies the same broadcast completion
+                    # decision to mirrored request state, so all ranks register the same
+                    # failed placeholder and only the MP coordinator sends the reply.
+                    self._fail_submission(pending.request_id, pending.sampling_params, exc)
                 if failed:
                     continue
                 remaining.extend(self._pending_kv_imports)

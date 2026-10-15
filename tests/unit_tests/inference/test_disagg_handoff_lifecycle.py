@@ -156,6 +156,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
         self.requests = {}
         self.blocks_to_bind = {}
         self.precomputed_hashes = {}
+        self.failed_submissions = []
         self.partial_admissions = set()
         self.track_generated_token_events = False
         self.use_coordinator = False
@@ -179,6 +180,9 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
 
     def get_request(self, request_id):
         return self.requests[request_id]
+
+    def _fail_submission(self, request_id, sampling_params, exc):
+        self.failed_submissions.append((request_id, sampling_params, exc))
 
     def _terminating_token_ids(self, request):
         termination_id = request.sampling_params.termination_id
@@ -663,6 +667,8 @@ def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
         "Quarantining request %d cache storage after an incomplete handoff", 4
     )
     log_exception.assert_called_once_with("DISAGG_DECODE_PULL_FAILED request_id=%d", 4)
+    # The import never reached add_request(), so the failure itself must reply.
+    assert engine.failed_submissions == [(4, pending.sampling_params, pending.future.exception())]
 
 
 def test_completed_handoff_keeps_notification_while_decode_is_full(handoff_loop):
@@ -1075,6 +1081,16 @@ def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(ha
     engine._handoff_completion_tracker.report.assert_called_once_with(8, True)
 
     engine._record_handoff_completion_notification(8, failed=True)
+    # Run the engine's real failure-reply path; only the coordinator socket is faked.
+    engine.rank = 1
+    engine.use_coordinator = True
+    engine.is_mp_coordinator = True
+    engine.failed_request_ids = []
+    engine.context.remove_vlm_request_data = mock.Mock()
+    engine._complete_request = DynamicInferenceEngine._complete_request
+    engine._handle_failed_request = DynamicInferenceEngine._handle_failed_request.__get__(engine)
+    engine._fail_submission = DynamicInferenceEngine._fail_submission.__get__(engine)
+    engine._send_requests_to_coordinator = mock.Mock()
     with mock.patch(
         "megatron.core.inference.disaggregation.inference_state_handoff.logging.exception"
     ) as log_exception:
@@ -1084,6 +1100,12 @@ def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(ha
     assert engine.context.kv_block_allocator.releases == [[10, 11, 12]]
     assert not engine._pending_kv_imports
     log_exception.assert_called_once_with("DISAGG_DECODE_PULL_FAILED request_id=%d", 8)
+    # The import never reached add_request(), so the failure itself replies exactly once.
+    assert engine.failed_request_ids == [8]
+    engine._send_requests_to_coordinator.assert_called_once()
+    (replies,) = engine._send_requests_to_coordinator.call_args.args
+    assert [(reply.request_id, reply.status) for reply in replies] == [(8, Status.FAILED)]
+    assert engine.requests[8].future.result() is replies[0]
 
 
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
