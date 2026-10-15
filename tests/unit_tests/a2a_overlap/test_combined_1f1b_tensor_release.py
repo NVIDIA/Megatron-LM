@@ -4,10 +4,12 @@
 
 import gc
 import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from megatron.core.models.gpt.fine_grained_callables import TransformerLayerNode
 from megatron.core.pipeline_parallel.combined_1f1b_tensor_release import Combined1F1BTensorRelease
 from megatron.core.pipeline_parallel.utils import NoopScheduleNode, ScheduleNode
 
@@ -559,3 +561,14 @@ def test_full_graph_capture_drains_during_capture_not_replay():
     # Python owner bookkeeping only ran during capture, not during replay.
     assert not _pending_releases(tensor_release)
     assert not _owner_bindings(tensor_release)
+
+
+@pytest.mark.parametrize("zero_copy", [False, True])
+def test_gpt_transformer_layer_node_forwards_ncclep_zero_copy(zero_copy):
+    """GPT schedule-plan layer nodes keep NCCL-EP zero-copy inputs out of free_input release."""
+    config = SimpleNamespace(moe_ncclep_zero_copy=zero_copy)
+    node = TransformerLayerNode(
+        None, None, None, None, None, name="moe_dispatch", extra_args={"config": config}
+    )
+
+    assert node.ncclep_zero_copy is zero_copy

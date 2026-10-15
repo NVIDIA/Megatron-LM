@@ -13,6 +13,7 @@
 :maxdepth: 1
 :caption: MoE Features
 
+moe_a2a_overlap
 multi_token_prediction
 multi_latent_attention
 ../../api-guide/router_replay

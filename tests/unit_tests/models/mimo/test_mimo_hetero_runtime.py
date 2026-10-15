@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
+from examples.mimo.training.runtime import (
+    _ddp_config_from_args,
+    configure_module_rng,
+    wrap_active_modules_with_ddp,
+)
 from examples.mimo.training.topology import ModuleGridSpec, create_topology
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
@@ -63,6 +67,43 @@ def _build_unwrapped_mimo_model(topo, bf16=False):
     mimo_model = MimoModel(mimo_config)
     mimo_model.to(torch.device("cuda"))
     return mimo_model
+
+
+def test_ddp_overlap_config_is_selected_per_module_role():
+    args = _args(overlap_grad_reduce=True, overlap_param_gather=True)
+
+    enabled = _ddp_config_from_args(args, enable_overlap=True)
+    disabled = _ddp_config_from_args(args, enable_overlap=False)
+
+    assert enabled.overlap_grad_reduce
+    assert enabled.overlap_param_gather
+    assert not disabled.overlap_grad_reduce
+    assert not disabled.overlap_param_gather
+
+
+def test_encoder_overlap_opt_in_reaches_encoder_ddp_config(mocker):
+    encoder = mocker.MagicMock()
+    wrapped_encoder = mocker.MagicMock()
+    mimo_model = SimpleNamespace(language_model=None, modality_submodules={ENCODER: encoder})
+    topology = SimpleNamespace(module_pgs={ENCODER: mocker.MagicMock()})
+    prepare = mocker.patch(
+        "examples.mimo.training.runtime.prepare_existing_model_chunks_for_distributed_training",
+        return_value=[wrapped_encoder],
+    )
+    mocker.patch("examples.mimo.training.runtime._freeze_modality_submodule")
+    mocker.patch("examples.mimo.training.runtime._module_config", return_value=mocker.MagicMock())
+    mocker.patch("examples.mimo.training.runtime.print_rank_0")
+
+    wrap_active_modules_with_ddp(
+        _args(encoder_ddp_overlap=True, overlap_grad_reduce=True, overlap_param_gather=True),
+        mimo_model,
+        topology,
+    )
+
+    ddp_config = prepare.call_args.kwargs["ddp_config"]
+    assert ddp_config.overlap_grad_reduce
+    assert ddp_config.overlap_param_gather
+    assert mimo_model.modality_submodules[ENCODER] is wrapped_encoder
 
 
 def _eight_gpu_topology():
@@ -143,6 +184,24 @@ def test_builder_encoder_role_sets_encoder_contract(mocker):
     seed.assert_called_once_with(args, encoder_pg, _ENCODER_SEED_OFFSET, False)
     assert model.pg_collection is encoder_pg
     assert model.rng_state_key_prefix == "encoder."
+
+
+def test_builder_rejects_padded_layer_wise_param_layout_request(mocker):
+    """MIMO DDP configs keep the compact LayerWise layout, so a padded request is rejected."""
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
+    wrap = mocker.patch("examples.mimo.training.builder.wrap_active_modules_with_ddp")
+
+    with pytest.raises(ValueError, match="compact LayerWise param layout"):
+        builder.build_distributed_models(
+            mocker.Mock(),
+            ddp_config=DistributedDataParallelConfig(),
+            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=True,
+        )
+
+    wrap.assert_not_called()
 
 
 def test_resolve_role_rejects_colocated_or_zero_active_roles(mocker):
