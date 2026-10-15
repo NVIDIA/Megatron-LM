@@ -935,7 +935,9 @@ def transport_groups():
     groups.pp = dist.new_group(list(range(size)))
     groups.control = create_pipeline_control_group(groups.pp, world_group=dist.group.WORLD)
     groups.tp = groups.cp = singleton_groups[rank]
-    dist.barrier()
+    # Initialize the full PP communicator before mixing batched and unbatched P2P.
+    # Lazy pairwise NCCL communicators can hang when this fixture shuts them down.
+    dist.barrier(group=groups.pp)
     yield groups, device
     dist.barrier()
     dist.destroy_process_group(groups.control)
