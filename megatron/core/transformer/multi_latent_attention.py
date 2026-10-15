@@ -173,9 +173,10 @@ class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
     def forward(ctx, kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim):
         """Split kv, apply RoPE to k_pos_emb and quantize key and value"""
         key, value = fused_mla_kv_rope_mxfp8(kv, k_pos_emb, cos, sin, v_dim)
-        ctx.save_for_backward(cos, sin)
+        # The key/value split RoPE backward reads cu_seqlens_kv (None: BSHD) from saved_tensors.
+        ctx.save_for_backward(cos, sin, None)
         ctx.emb_dim, ctx.k_dim, ctx.v_dim = emb_dim, k_dim, v_dim
-        ctx.cu_seqlens_kv, ctx.cp_rank, ctx.cp_size = None, 0, 1
+        ctx.cp_rank, ctx.cp_size = 0, 1
         ctx.remove_interleaving = False
         return key, value
 
