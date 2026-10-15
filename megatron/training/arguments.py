@@ -1669,7 +1669,7 @@ def validate_args(args, defaults={}):
     # Implementation lives in ``megatron/training/determinism.py`` so the
     # same setup is reachable from tests / profiling scripts that don't go
     # through argparse.
-    if args.deterministic_mode:
+    if not getattr(args, 'non_deterministic_mode', False):
         from megatron.training.determinism import apply_determinism_to_args
 
         apply_determinism_to_args(args)
@@ -2430,23 +2430,9 @@ def _add_network_size_args(parser):
         "max_seqlen_per_dp_cp_rank",
         "hybrid_context_parallel",
         "sequence_packing_scheduler",
-        # CLI flags are defined manually below: deterministic mode is on by default
-        # in training, while the config dataclass default stays False.
-        "deterministic_mode",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
-
-    transformer_group.add_argument('--deterministic-mode', action='store_true',
-                                   dest='deterministic_mode', default=True,
-                                   help='Deterministic mode is enabled by default; this flag is '
-                                        'kept for backward compatibility and is a no-op.')
-    transformer_group.add_argument('--no-deterministic-mode', '--disable-deterministic-mode',
-                                   action='store_false', dest='deterministic_mode', default=True,
-                                   help='Disable deterministic mode (enabled by default). '
-                                        'Deterministic mode chooses code with deterministic '
-                                        'execution, which usually means slower execution but is '
-                                        'good for debugging and testing.')
 
     group = parser.add_argument_group(title='network size')
 
