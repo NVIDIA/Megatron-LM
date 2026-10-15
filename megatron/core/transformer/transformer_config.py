@@ -4023,6 +4023,8 @@ class TransformerConfig(ModelParallelConfig):
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
         )
+        from megatron.core.context_parallel_layout.graph import supports_packed_gdn_graph
+
         # (dsa_cp_balance_indexer does NOT belong in this predicate: the balanced DSA
         # indexer operates natively on the contiguous layout and performs no
         # module-local THD CP layout conversion.)
@@ -4031,6 +4033,7 @@ class TransformerConfig(ModelParallelConfig):
             and self.sequence_packing_scheduler is not None
             and graph_captures_attention
             and cp_layout_conversion_required
+            and not supports_packed_gdn_graph(self)
         ):
             raise ValueError(
                 "THD context parallel layout conversion is required for this model "

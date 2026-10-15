@@ -2316,6 +2316,7 @@ class TECudaGraphHelper:
         self.dp_group = self.pg_collection.dp
         self.dp_cp_group = self.pg_collection.dp_cp
         self.pp_group = self.pg_collection.pp
+        self._validate_dynamic_cp_gdn_head_split()
         attention_in_graph_scope = (
             not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
@@ -3920,6 +3921,26 @@ class TECudaGraphHelper:
                 seen_dispatchers.add(id(dispatcher))
                 for attr_name in dispatcher.cudagraph_attrs:
                     dispatcher.set_cudagraph_attr(attr_name, None)
+
+    def _validate_dynamic_cp_gdn_head_split(self):
+        """Headwise GDN graphs split the TP-local heads over every captured dynamic-CP size."""
+        from megatron.core.context_parallel_layout.graph import captures_packed_gdn_attention
+
+        if not (
+            self._uses_dynamic_cp()
+            and self.config.linear_cp_mode == "headwise"
+            and captures_packed_gdn_attention(self.config)
+        ):
+            return
+        tp_size = self.config.tensor_model_parallel_size
+        for cp_size in self._get_dynamic_cp_capture_sizes():
+            for name in ("linear_num_key_heads", "linear_num_value_heads"):
+                heads = getattr(self.config, name)
+                if heads % (tp_size * cp_size):
+                    raise ValueError(
+                        f"Headwise GDN graphs cannot split {name}={heads} evenly across "
+                        f"TP{tp_size} x CP{cp_size}, one of the captured dynamic-CP sizes."
+                    )
 
     def _get_dynamic_cp_capture_sizes(self):
         """Return dynamic CP sizes in capture order."""

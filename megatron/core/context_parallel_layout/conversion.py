@@ -107,6 +107,22 @@ class CpPartitionModeConverter:
             return value
 
         resolved_seq_dim = seq_dim(value) if callable(seq_dim) else seq_dim
+        if getattr(self.packed_seq_params, 'gdn_graph_safe', False):
+            from megatron.core.context_parallel_layout.graph import convert_graph_packed_layout
+
+            if sequence_parallel and self.tp_group is not None and self.tp_group.size() > 1:
+                raise NotImplementedError(
+                    "Packed GDN graph layout conversion currently requires TP1"
+                )
+            converted = convert_graph_packed_layout(
+                value,
+                get_packed_seq_params_cp_partition_cu_seqlens(self.packed_seq_params),
+                self.cp_group,
+                resolved_seq_dim,
+                self.target_partition_mode,
+            )
+            self.packed_seq_params.cp_partition_mode = self.target_partition_mode
+            return converted
         converted = convert_cp_partition_mode(
             x=value,
             source_partition_mode=self.source_partition_mode,
