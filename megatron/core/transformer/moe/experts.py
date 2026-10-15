@@ -91,6 +91,11 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
     prepare_routed_mxfp8_weights,
     require_flashinfer_routed_mxfp8,
 )
+from megatron.core.inference.moe.flashinfer_nvfp4 import (
+    flashinfer_routed_nvfp4_moe,
+    prepare_routed_nvfp4_weights,
+    require_flashinfer_routed_nvfp4,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1252,6 +1257,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     Supports three forward paths:
     - Training: delegates to parent TEGroupedMLP
     - Inference + FlashInfer: CUTLASS fused MoE for BF16 or routed block-scale MoE for MXFP8
+      and per-token NVFP4
     - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
     - Inference + vLLM: Triton fused MoE for BF16, MCore scaled grouped GEMM for MXFP8
     """
@@ -1279,6 +1285,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
         self._uses_mxfp8_weights: bool | None = None
+        self._nvfp4_recipe = config.inference_moe_nvfp4_recipe
+        self._nvfp4_weights = None
 
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
@@ -1456,6 +1464,38 @@ class InferenceGroupedMLP(TEGroupedMLP):
             prepare_routed_mxfp8_weights(canonical_weight, out=routed_weight)
         return True
 
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def _build_flashinfer_nvfp4_weights(self):
+        """Quantize the BF16 expert stacks into routed per-token NVFP4 weights.
+
+        The BF16 stacks stay resident as the refit destination; the NVFP4 stacks
+        are a derived representation consumed only by the FlashInfer kernel.
+        """
+        require_flashinfer_routed_nvfp4()
+        self._nvfp4_weights = prepare_routed_nvfp4_weights(self._fc1_weight, self._fc2_weight)
+        logger.info(
+            "Prepared FlashInfer per-token NVFP4 weights: experts=%d "
+            "hidden=%d->%d intermediate=%d->%d",
+            self.num_local_experts,
+            self._nvfp4_weights.hidden_size,
+            self._nvfp4_weights.padded_hidden_size,
+            self._nvfp4_weights.intermediate_size,
+            self._nvfp4_weights.padded_intermediate_size,
+        )
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def refresh_flashinfer_nvfp4_weights(self) -> bool:
+        """Requantize routed NVFP4 expert weights in place after the BF16 weights change.
+
+        Returns whether derived FlashInfer weights were refreshed.
+        """
+        if self._nvfp4_weights is None:
+            return False
+        prepare_routed_nvfp4_weights(self._fc1_weight, self._fc2_weight, out=self._nvfp4_weights)
+        return True
+
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
@@ -1523,6 +1563,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
                 token_capacity=self._flashinfer_mxfp8_token_capacity,
                 use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
+            )
+            return output, None
+        if self._nvfp4_weights is not None:
+            output = flashinfer_routed_nvfp4_moe(
+                hidden_states,
+                routing_map,
+                probs,
+                self._nvfp4_weights,
+                num_experts=self.num_local_experts * self.ep_group.size(),
+                local_expert_offset=self.ep_group.rank() * self.num_local_experts,
+                activation_type=self._flashinfer_activation_type.value,
+                out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
             )
             return output, None
         output = fused_moe.cutlass_fused_moe(
@@ -1618,6 +1670,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 self._build_concatenated_mxfp8_weights()
             else:
                 self._build_concatenated_weights()
+                if self._nvfp4_recipe is not None:
+                    self._build_flashinfer_nvfp4_weights()
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
