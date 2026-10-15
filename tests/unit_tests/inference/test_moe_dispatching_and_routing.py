@@ -608,7 +608,10 @@ class TestNVLSAllGatherVDispatcher:
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
 
-    def test_cuda_graph_batch_invariant_moe_layer_uses_ordered_rsv(self, monkeypatch):
+    @pytest.mark.parametrize("ep_invariant_combine", [False, True])
+    def test_cuda_graph_batch_invariant_moe_layer_uses_ordered_rsv(
+        self, monkeypatch, ep_invariant_combine
+    ):
         """A real inference MoE layer should use ordered RSV combine in batch-invariant mode.
 
         This catches the production branch in InferenceGroupedMLP: mcore_fused_moe
@@ -645,6 +648,7 @@ class TestNVLSAllGatherVDispatcher:
             flash_attention_version=4,
             attention_dropout=0.0,
             moe_shared_expert_intermediate_size=None,
+            moe_ep_invariant_combine=ep_invariant_combine,
         )
         ep_group = get_expert_model_parallel_group()
         NVLSAllGatherVDispatcher.allocate_buffers(
@@ -652,6 +656,7 @@ class TestNVLSAllGatherVDispatcher:
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
             ep_group=ep_group,
+            ep_invariant_combine=ep_invariant_combine,
         )
 
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
@@ -676,6 +681,7 @@ class TestNVLSAllGatherVDispatcher:
 
         def _tracked_ordered_reduce_scatter_v(*args, **kwargs):
             ordered_calls["value"] += 1
+            assert kwargs.get("pairwise_tree", False) == ep_invariant_combine
             return orig_ordered_reduce_scatter_v(*args, **kwargs)
 
         monkeypatch.setattr(
@@ -846,6 +852,7 @@ class TestNVLSAllGatherVDispatcher:
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
             ep_group=get_expert_model_parallel_group(),
+            ep_invariant_combine=config.moe_ep_invariant_combine,
         )
 
         if mxfp8_swiglu:
@@ -920,6 +927,14 @@ class TestNVLSAllGatherVDispatcher:
                     inference_output, _ = layer(hidden_states.clone())
 
         torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("mxfp8_swiglu", [False, True])
+    def test_ep_invariant_combine_moe_matches_training(self, mxfp8_swiglu):
+        """moe_ep_invariant_combine: the engine's subtree partials and pairwise RSV combine
+        match the training AllToAll combine tree bitwise."""
+        self.test_batch_invariant_moe_matches_training(
+            "torch", None, mxfp8_swiglu, False, config_overrides={"moe_ep_invariant_combine": True}
+        )
 
     def test_batch_invariant_mxfp8_moe_matches_training_with_outlier_tokens(self):
         """Qwen3-30B-A3B experts and router, fed tokens with outlier scales.
