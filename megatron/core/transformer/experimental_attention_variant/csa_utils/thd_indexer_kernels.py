@@ -81,7 +81,8 @@ if _TRITON_AVAILABLE:
         BLOCK_TOPK: tl.constexpr,
     ):
         """Validate one row of top-k ids and reduce its valid length."""
-        row = tl.program_id(0)
+        # Packed score row offsets can exceed int32 even when every tensor dimension fits in int32.
+        row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK_TOPK)
         output_mask = cols < output_width
         candidate_mask = cols < candidate_width
