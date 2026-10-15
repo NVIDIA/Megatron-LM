@@ -121,6 +121,7 @@ def mcore_fused_moe(
     disable_fused_quant_kernels: bool = False,
     out: torch.Tensor = None,
     activation_clamp_scale: Optional[float] = None,
+    ep_invariant_limbs: int = 0,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -150,6 +151,9 @@ def mcore_fused_moe(
         activation_clamp_scale: config.activation_func_tanh_clamp_scale. When set, the
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before the
             square, bounding the activation output by ``s ** 2``.
+        ep_invariant_limbs: ``moe_ep_invariant_combine`` (batch-invariant mode): 1
+            returns this rank's [max_tokens, 2 * hidden_size] fp64 limb partial
+            (summed exactly by the EP combine), 2 the final fp32 rows at EP 1.
 
     Returns:
         [max_tokens, hidden_size] BF16 output. Only the first valid_tokens rows are
@@ -278,4 +282,5 @@ def mcore_fused_moe(
         valid_tokens,
         out=out,
         batch_invariant_inverse_map=batch_invariant_inverse_map,
+        ep_invariant_limbs=ep_invariant_limbs,
     )

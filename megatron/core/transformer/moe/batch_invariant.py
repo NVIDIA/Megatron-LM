@@ -56,14 +56,30 @@ def unpermute(
     probs: Optional[torch.Tensor],
     num_experts: int,
     inverse_map: torch.Tensor,
+    ep_invariant: bool = False,
 ) -> torch.Tensor:
     """Batch-invariant MoE unpermute.
 
     Accumulation is token-owned. The AllToAll inverse map avoids data-dependent
     shapes and adds contributions by EP rank then top-k slot, matching the
     inference NVLS rank-ordered combine.
+
+    With ``ep_invariant`` (``moe_ep_invariant_combine``) the token's slot rows are
+    summed through exact fixed-point limbs instead (``ep_invariant_combine``), which
+    gives the same bits at every EP size.
     """
     input_dtype = permuted_tokens.dtype
+    if ep_invariant:
+        from megatron.core.transformer.moe.ep_invariant_combine import slot_combine
+
+        rows, experts = inverse_map[0], inverse_map[1]
+        valid = (rows >= 0) & (experts >= 0) & (experts < num_experts)
+        slot_rows = torch.where(valid, rows, -1)
+        slot_probs = None
+        if probs is not None:
+            slot_probs = probs.gather(1, experts.clamp_min(0))
+        out = slot_combine(permuted_tokens, slot_rows, slot_probs, restore_shape[0])
+        return out.view(restore_shape).to(input_dtype)
     # Mirror the inference engine's summation tree exactly:
     # - When probs is None the activations were probability-weighted upstream
     #   (gated/SwiGLU convention) and the engine's within-rank _moe_sum

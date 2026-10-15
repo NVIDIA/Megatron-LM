@@ -336,6 +336,20 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _symm_rsv: Optional[dict] = None
 
     @classmethod
+    def _get_rsv_limb_tensor(cls) -> Optional[torch.Tensor]:
+        """The RSV symmetric memory viewed as [global_max, 2 * hidden] fp64 limbs.
+
+        Only sized for this when allocate_buffers ran with ep_invariant_combine=True.
+        """
+        if cls._symm_rsv is None or cls._symm_rsv["tensor"] is None:
+            return None
+        global_max, hidden = cls._symm_rsv["tensor"].shape
+        nbytes = global_max * 2 * hidden * 8
+        buf = SymmetricMemoryManager.get_buffer("ep_rsv").symm_buffer
+        assert buf.numel() >= nbytes, "RSV buffer was not sized for moe_ep_invariant_combine"
+        return buf[:nbytes].view(torch.float64).view(global_max, 2 * hidden)
+
+    @classmethod
     def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
         """Return the RSV symmetric buffer tensor so mcore_fused_moe can write
         unpermute output directly into it, avoiding a copy before RSV."""
@@ -392,6 +406,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         topk: int,
         hidden_size: int,
         ep_group: torch.distributed.ProcessGroup,
+        ep_invariant_combine: bool = False,
     ) -> None:
         """Allocate all symmetric buffers and initialize class-level metadata.
 
@@ -405,6 +420,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             topk: MoE router top-k value.
             hidden_size: Model hidden dimension.
             ep_group: Expert parallel process group.
+            ep_invariant_combine: size the RSV buffer for fp64 limb partials
+                ([global_max, 2 * hidden_size] fp64, 4x the fp32 rows;
+                moe_ep_invariant_combine).
         """
         ep_size = get_pg_size(ep_group)
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
@@ -438,8 +456,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
         ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
 
+        rsv_bytes_shape = [global_max, 2 * hidden_size] if ep_invariant_combine else rsv_shape
+        rsv_bytes_dtype = torch.float64 if ep_invariant_combine else torch.float32
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
+            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_bytes_shape, rsv_bytes_dtype)
         ).maybe_get_tensor(rsv_shape, dtype=torch.float32)
 
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
@@ -654,6 +674,27 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             return hidden_states.to(torch.bfloat16)
 
         rsv = self.__class__._symm_rsv
+
+        if hidden_states.dtype == torch.float64:
+            # moe_ep_invariant_combine: [global_max, 2 * hidden] fp64 limb partials;
+            # their sum over ranks is exact, so the result does not depend on EP.
+            limbs = self.__class__._get_rsv_limb_tensor()
+            if hidden_states.data_ptr() != limbs.data_ptr():
+                limbs[: hidden_states.shape[0]].copy_(hidden_states)
+            output = torch.empty(
+                self._local_tokens,
+                hidden_states.shape[1] // 2,
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            batch_invariant.limbs_reduce_scatter_v(
+                output,
+                rsv["handle"],
+                rank_token_offset=self._rank_token_offset(),
+                ep_max_tokens=self._ep_max_tokens(),
+                per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            )
+            return output.to(torch.bfloat16)
 
         if hidden_states is not rsv["tensor"]:
             rsv["tensor"].copy_(hidden_states)
