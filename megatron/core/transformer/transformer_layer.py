@@ -2042,7 +2042,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 #   cu_seqlens = [0, max_T, max_T, ..., max_T]
                 # which represents a single packed sequence followed by zero-length
                 # entries. cu_seqlens_q / kv / *_padded all share this layout.
-                max_T = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+                capture_cp_size, _ = self._get_thd_cuda_graph_capture_cp()
+                max_T = self.config.max_seqlen_per_dp_cp_rank * capture_cp_size
                 max_num_seqs = self.config.thd_max_packed_sequences
                 if max_num_seqs is None:
                     max_num_seqs = self.config.cuda_graph_thd_max_packed_sequences
@@ -2249,7 +2250,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """
         if 'cu_seqlens_q' not in kwargs:
             return
-        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        capture_cp_size, capture_cp_group = self._get_thd_cuda_graph_capture_cp()
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * capture_cp_size
         from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
         graph_dynamic_plan = cp_balanced_indexer.pop_graph_dynamic_plan_from_kwargs(
@@ -2264,6 +2266,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            local_cp_size=(capture_cp_size if self.config.dynamic_context_parallel else None),
+            cp_group=(capture_cp_group if self.config.dynamic_context_parallel else None),
             # CUDA graph inputs do not carry this Python bool. Sequence-packing
             # metadata may contain valid/physical gaps, so use the conservative
             # graph-static value instead of asking TE to infer it with a CUDA
@@ -2289,6 +2293,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         For THD format, PackedSeqParams is reconstructed from tensor kwargs.
         """
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+        self._set_dynamic_cp_capture_packed_seq_params(kwargs)
 
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
@@ -2361,6 +2366,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         For THD format, PackedSeqParams is decomposed into individual tensor kwargs.
         """
+        self._activate_dynamic_cp_cuda_graph(kwargs.get('packed_seq_params'))
+        eager_packed_seq_params = kwargs.get('packed_seq_params')
         context = None
         padding_mask = kwargs.get("padding_mask", None)
         if (
@@ -2390,7 +2397,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             self.off_interface.enter_replay()
 
         try:
-            return self._te_cuda_graph_replay_impl(args, kwargs, context)
+            return self._te_cuda_graph_replay_impl(
+                args, kwargs, context, eager_packed_seq_params=eager_packed_seq_params
+            )
         finally:
             if self.config.delay_offload_until_cuda_graph:
                 self.off_interface.exit_replay()
@@ -2447,7 +2456,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         nvtx_range_pop(suffix="mlp")
         return mlp_output_with_bias
 
-    def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+    def _te_cuda_graph_replay_impl(self, args, kwargs, context, eager_packed_seq_params=None):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         # The graph only takes padding_mask when it was captured with that input; the eager MoE
         # steps after the graph keep using the caller's mask from `kwargs`.
@@ -2582,7 +2591,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 hidden_states,
                 padding_mask=kwargs.get("padding_mask", None),
                 input_ids=kwargs.get("input_ids", None),
-                packed_seq_params=kwargs.get("packed_seq_params", None),
+                packed_seq_params=eager_packed_seq_params,
             )
         return output, context
 
@@ -3104,7 +3113,6 @@ class AttnResTransformerLayer(TransformerLayer):
         # checkpoint's hook (on the MLP output), so the aggregation is rebuilt first.
         self.mlp_attn_res.discard_output_and_register_recompute(output)
         return output
-
 
 class MoETransformerLayer(TransformerLayer):
     """
