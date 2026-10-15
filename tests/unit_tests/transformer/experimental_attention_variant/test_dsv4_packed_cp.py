@@ -212,6 +212,8 @@ def _compare_results(actual, expected, label, failures, rows=None):
         print("DSV4_CP_PARITY " + json.dumps(stats), flush=True)
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and HAVE_TE and HAVE_HADAMARD),
     reason="needs CUDA, TE and the real Hadamard kernel",

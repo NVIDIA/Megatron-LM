@@ -1,6 +1,7 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import inspect
 import warnings
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
@@ -41,6 +42,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     get_pg_rank,
@@ -680,8 +682,9 @@ class MTPLossLoggingHelper:
             tracker["correct_values"].zero_()
         if "total_values" in tracker:
             tracker["total_values"].zero_()
-        tracker["reduce_group"] = None
-        tracker["avg_group"] = None
+        # Keep the reduce_group and avg_group across logging intervals: CUDA graph replay
+        # updates the tensors but does not repeat save_metrics_to_tracker's Python
+        # assignments. A new eager forward will overwrite the groups.
 
     @staticmethod
     def reduce_metrics_in_tracker():
@@ -794,8 +797,13 @@ def _compute_mtp_acceptance_counts(
     mtp_labels: Tensor,
     loss_mask: Tensor,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    preds: Optional[Tensor] = None,
 ) -> tuple[Tensor, Tensor]:
-    """Compute MTP acceptance correct/total counts."""
+    """Compute MTP acceptance correct/total counts.
+
+    ``preds`` is the argmax of ``mtp_logits`` over the full vocabulary, [s, b], when the loss
+    already found it; otherwise it is computed here.
+    """
     with torch.no_grad():
         if (
             tp_group is None
@@ -808,10 +816,11 @@ def _compute_mtp_acceptance_counts(
             )
         tp_size = torch.distributed.get_world_size(group=tp_group) if tp_group is not None else 1
 
-        if tp_size > 1:
-            preds = _vocab_parallel_argmax(mtp_logits, tp_group, tp_size)
-        else:
-            preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
+        if preds is None:
+            if tp_size > 1:
+                preds = _vocab_parallel_argmax(mtp_logits, tp_group, tp_size)
+            else:
+                preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
 
         labels_match = mtp_labels.transpose(0, 1).contiguous()  # [b, s] => [s, b]
         mask_match = loss_mask.transpose(0, 1).contiguous()  # [b, s] => [s, b]
@@ -1099,6 +1108,14 @@ class _MTPHeadGradInjector(torch.autograd.Function):
         return grad_output, head_grad, None
 
 
+def _accepts_return_argmax(compute_language_model_loss: Callable) -> bool:
+    """Whether the loss callable takes ``return_argmax`` (LanguageModule's loss does)."""
+    try:
+        return "return_argmax" in inspect.signature(compute_language_model_loss).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Tensor,
@@ -1200,6 +1217,9 @@ def process_mtp_loss(
 
     cumulative_mtp_input_mask = None
     rolled_num_tokens = original_num_tokens
+    # LanguageModule's loss can return the argmax of the logits from its cross entropy, which
+    # spares the acceptance metric a pass over them.
+    loss_returns_argmax = is_training and _accepts_return_argmax(compute_language_model_loss)
     if mtp_input_mask is not None:
         assert mtp_input_mask.shape == loss_mask.shape, (
             f"mtp_input_mask shape {mtp_input_mask.shape} must match "
@@ -1229,12 +1249,18 @@ def process_mtp_loss(
                 sequence_dim=0,
                 batch_dim=1,
             )
+        mtp_preds = None
+        if loss_returns_argmax:
+            head_loss, mtp_preds = compute_language_model_loss(
+                head_labels, mtp_logits, return_argmax=True
+            )
+        else:
+            head_loss = compute_language_model_loss(head_labels, mtp_logits)
         correct = total = None
         if is_training:
             correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group
+                mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
             )
-        head_loss = compute_language_model_loss(head_labels, mtp_logits)
         head_loss = layer_loss_mask * head_loss
         return head_loss, correct, total
 
@@ -2064,49 +2090,27 @@ class MultiTokenPredictionLayer(MegatronModule):
             outer_quantization_context = nullcontext()
 
         def checkpoint_handler():
-            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            # fp4 quantization is internally implemented via TE's
-            # ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``), so
-            # quantized recompute on either fp8 or fp4 must go through
-            # ``te_checkpoint``. Matches ``transformer_block``'s policy.
-            if self.config.fp8 or self.config.fp4:
-                from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                return te_checkpoint(
-                    custom_forward,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
-                    hidden_states,
-                    decoder_input,
-                    attention_mask,
-                    padding_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    sequence_len_offset,
-                )
-            else:
-                # tensor_parallel.checkpoint stashes args via autograd's
-                # ``save_for_backward``, which only accepts tensors and ``None``.
-                # Pass tensor / ``None`` args positionally and capture the
-                # non-tensor objects via the ``custom_forward`` closure.
-                return tensor_parallel.checkpoint(
-                    custom_forward,
-                    self.config.distribute_saved_activations,
-                    hidden_states,
-                    decoder_input,
-                    attention_mask,
-                    padding_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    sequence_len_offset,
-                )
+            """Checkpoint ``custom_forward`` with the implementation its precision requires."""
+            # tensor_parallel.checkpoint stashes args via autograd's
+            # ``save_for_backward``, which only accepts tensors and ``None``.
+            # Pass tensor / ``None`` args positionally and capture the
+            # non-tensor objects via the ``custom_forward`` closure.
+            return precision_aware_checkpoint(
+                custom_forward,
+                self.config,
+                self.tp_group,
+                hidden_states,
+                decoder_input,
+                attention_mask,
+                padding_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                sequence_len_offset,
+                distribute_saved_activations=self.config.distribute_saved_activations,
+            )
 
         if self.config.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
