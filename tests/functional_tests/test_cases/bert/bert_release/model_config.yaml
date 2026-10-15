@@ -51,6 +51,7 @@ MODEL_ARGS:
   --attention-backend: unfused
   --exit-interval: 20000
   --wandb-save-dir: ${WANDB_SAVE_PATH}
+  --disable-deterministic-mode: true
 METRICS:
   - "iteration-time"
   - "lm loss"

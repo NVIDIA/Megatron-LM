@@ -55,5 +55,6 @@ MODEL_ARGS:
   --bf16: true
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
+  --disable-deterministic-mode: true
 TEST_TYPE: regular
 LAUNCHER: ft_launcher

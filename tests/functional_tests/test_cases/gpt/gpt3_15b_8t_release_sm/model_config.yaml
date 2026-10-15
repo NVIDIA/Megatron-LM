@@ -92,6 +92,7 @@ MODEL_ARGS:
   --wandb-save-dir: ${WANDB_SAVE_PATH}
   --async-save: true
   --use-persistent-ckpt-worker: true
+  --disable-deterministic-mode: true
 METRICS:
   - "iteration-time"
   - "lm loss"

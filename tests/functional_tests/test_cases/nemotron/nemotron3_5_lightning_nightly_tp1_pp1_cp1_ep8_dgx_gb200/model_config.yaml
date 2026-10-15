@@ -152,6 +152,7 @@ MODEL_ARGS:
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --timing-log-level: 0
   --seed: 1234
+  --disable-deterministic-mode: true
 
 METRICS:
   - iteration-time

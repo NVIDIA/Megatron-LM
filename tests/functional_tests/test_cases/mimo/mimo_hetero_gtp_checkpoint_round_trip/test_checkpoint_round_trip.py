@@ -83,6 +83,7 @@ def _run_launcher(
         "--no-save-tokenizer-assets",
         "--ckpt-format",
         "torch_dist",
+        "--disable-deterministic-mode",
         *placement_args,
         *args,
     ]

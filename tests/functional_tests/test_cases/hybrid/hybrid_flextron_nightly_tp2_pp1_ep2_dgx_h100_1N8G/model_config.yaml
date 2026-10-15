@@ -124,5 +124,6 @@ MODEL_ARGS:
   --linear-scaler-end: 10.0
   --slice: true
   --router-std: 0.1
+  --disable-deterministic-mode: true
 TEST_TYPE: regular
 LAUNCHER: ft_launcher
