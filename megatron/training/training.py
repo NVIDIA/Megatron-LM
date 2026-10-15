@@ -6593,6 +6593,7 @@ def train(
             optimizers=[optimizer],
             pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
+            **_get_dynamic_cp_cuda_graph_helper_kwargs(args),
         )
 
     # OTel: everything above in train() (the preamble: weight-hash check, sniff
@@ -7188,7 +7189,7 @@ def train(
         )
 
     # Destroy CUDA Graphs.
-    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
@@ -7377,8 +7378,14 @@ def evaluate(
 
             if getattr(config, "sequence_packing_scheduler", None) is not None:
                 try:
+                    # Evaluation runs eagerly, outside the captured training graph schedule.
                     packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
-                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                        wrap_data_iterator(
+                            data_iterator,
+                            config,
+                            eval_num_microbatches,
+                            validate_cuda_graph_limits=False,
+                        )
                     )
                 except StopIteration:
                     config.timers = get_timers()
@@ -7918,6 +7925,25 @@ def should_disable_forward_pre_hook(args):
             or getattr(args, 'use_layer_wise_distributed_optimizer', False)
         )
         and args.overlap_param_gather
+    )
+
+
+def _get_dynamic_cp_cuda_graph_helper_kwargs(args):
+    """Return the dynamic-CP arguments that train() passes to TECudaGraphHelper.
+
+    Without dynamic CP these are the helper defaults, so fixed-CP and non-THD runs do not depend
+    on THD-only arguments such as ``thd_max_packed_sequences`` (unset by default).
+    """
+    if not args.dynamic_context_parallel:
+        return dict(dynamic_cp_group_getter=None, thd_max_subsamples_per_item=1)
+    # The dynamic-CP scheduler unpacks dataset items. A varlen item is one sequence; other THD
+    # datasets yield pre-packed items of up to thd_max_packed_sequences sequences.
+    max_subsamples_per_item = 1
+    if not args.use_varlen_dataset and args.thd_max_packed_sequences is not None:
+        max_subsamples_per_item = args.thd_max_packed_sequences
+    return dict(
+        dynamic_cp_group_getter=get_dynamic_data_context_parallel_groups,
+        thd_max_subsamples_per_item=max_subsamples_per_item,
     )
 
 
