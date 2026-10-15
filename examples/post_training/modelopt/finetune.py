@@ -18,14 +18,13 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+from megatron.post_training.model_config import modelopt_model_config_from_args
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
 from megatron.training.utils import print_rank_0
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
-from model_provider import model_provider
 from megatron.core.parallel_state import get_context_parallel_group
 
 
@@ -577,7 +576,9 @@ if __name__ == "__main__":
         extra_args_provider=add_finetune_args,
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    full_config = pretrain_cfg_container_from_args(
+        args, modelopt_model_config_from_args(args, vocab_size_from_tokenizer=True)
+    )
     set_run_config(full_config)
     initialize_runtime_services(args, training=True)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
@@ -586,6 +587,5 @@ if __name__ == "__main__":
         train_valid_test_sft_datasets_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        partial(model_provider, modelopt_gpt_hybrid_builder),
         non_loss_data_func=non_loss_data_func,
     )

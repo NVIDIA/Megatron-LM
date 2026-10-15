@@ -27,6 +27,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.multi_token_prediction import (
@@ -63,9 +64,7 @@ from megatron.training.global_vars import (
 try:
     from megatron.elastification.loss_func import loss_func as loss_func_modelopt
     from megatron.post_training.arguments import add_modelopt_args
-    from megatron.post_training.model_builder import (
-        modelopt_gpt_mamba_builder as model_provider_modelopt,
-    )
+    from megatron.post_training.model_config import modelopt_model_config_from_args
     has_nvidia_modelopt = True
 except ImportError:
     print_rank_0("ModelOpt is not installed. Please install it using `pip install nvidia-modelopt`")
@@ -87,6 +86,18 @@ def count_parameters_in_layer(model, layer_name):
     return num_params
 
 
+def _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collection):
+    """Build one model stage with the stock builder for the ModelOpt config, running its pre-wrap hooks."""
+    model_config = modelopt_model_config_from_args(args)
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    builder = model_config.get_builder_cls()(model_config)
+    models = [builder.build_model(pg_collection, pre_process, post_process, vp_stage)]
+    for hook in model_config.pre_wrap_hooks:
+        models = hook(models)
+    return models[0]
+
+
 def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None, config = None, pg_collection = None) -> HybridModel:
     """Builds the model.
 
@@ -101,7 +112,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     args = get_args()
     if has_nvidia_modelopt:
 
-        model = model_provider_modelopt(args, pre_process, post_process, vp_stage=vp_stage, config=config, pg_collection=pg_collection)
+        model = _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collection)
         from megatron.elastification.flextron_utils import (
             inject_flextron_forward_logic,
             setup_flextron_model,

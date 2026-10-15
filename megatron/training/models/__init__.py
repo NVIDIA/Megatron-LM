@@ -5,6 +5,7 @@ from megatron.training.models.dist_utils import (
     build_virtual_pipeline_stages,
     unimodal_build_distributed_models,
 )
+from megatron.training.models.distillation import DistillationConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 
@@ -12,6 +13,7 @@ MambaModelConfig = HybridModelConfig
 MambaModelBuilder = HybridModelBuilder
 
 __all__ = [
+    "DistillationConfig",
     "ModelBuilder",
     "ModelConfig",
     "Serializable",

@@ -75,7 +75,7 @@ from model_provider import model_provider
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
-    from megatron.post_training.model_builder import ModelOptModelConfig
+    from megatron.post_training.model_config import modelopt_model_config_from_args
     from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
@@ -577,9 +577,7 @@ if __name__ == "__main__":
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = gpt_config_from_args(
-            args, model_config_cls=ModelOptModelConfig, vocab_size_from_tokenizer=True
-        )
+        model_cfg = modelopt_model_config_from_args(args, vocab_size_from_tokenizer=True)
     else:
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)

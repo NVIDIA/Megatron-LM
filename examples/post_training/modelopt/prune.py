@@ -5,7 +5,6 @@
 Read more about ModelOpt pruning at https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning
 """
 
-import functools
 import gc
 import json
 import os
@@ -42,15 +41,14 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+from megatron.post_training.model_config import build_modelopt_models
 from megatron.post_training.utils import report_current_memory_info
-from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
-from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
 
@@ -192,13 +190,7 @@ if __name__ == "__main__":
     # SequentialMLP, not the packed-tensor TEGroupedMLP). `disable_moe_grouped_gemm=True`
     # forces the export spec to SequentialMLP so mtp.prune can act on individual experts.
     # Other example scripts (quantize.py, generate.py, finetune.py) keep the default.
-    prune_builder = functools.partial(
-        modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True
-    )
-    model = get_model(
-        functools.partial(model_provider, prune_builder),
-        wrap_with_ddp=False,
-    )
+    model = build_modelopt_models(args, disable_moe_grouped_gemm=True)
     unwrapped_model = unwrap_model(model)[0]
     print_rank_0(f"Original Model: {unwrapped_model}")
 

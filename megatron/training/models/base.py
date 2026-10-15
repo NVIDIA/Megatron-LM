@@ -13,6 +13,7 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
+from megatron.training.models.distillation import DistillationConfig
 
 # Hooks and callbacks that each run attaches to the live config. Not to be serialized.
 _RUNTIME_FIELDS = frozenset(
@@ -108,6 +109,10 @@ class ModelConfig:
     # === ModelOpt ===
     restore_modelopt_state: bool = False
     """Restore ModelOpt quantization/sparsity state."""
+
+    distillation: DistillationConfig | None = None
+    """ModelOpt knowledge-distillation teacher. Applied by a pre-wrap hook (see
+    ``megatron.post_training.model_hooks``); the model builders themselves ignore it."""
 
     extra_checkpoint_metadata: dict[str, Any] | None = None
     """Store for additional model-related metadata to save in the checkpoint. This 

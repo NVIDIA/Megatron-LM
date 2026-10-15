@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Convert a GPTModel."""
-import functools
 import inspect
 import json
 import os
@@ -14,13 +13,11 @@ import modelopt.torch.speculative as mtsp
 import torch
 from modelopt.torch.export import import_mcore_gpt_from_hf
 
-from megatron.core import mpu
-from megatron.core.enums import ModelType
 from megatron.core.parallel_state import destroy_model_parallel
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
+from megatron.post_training.model_config import build_modelopt_models
+from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
@@ -28,7 +25,6 @@ from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0
-from model_provider import model_provider
 
 ALGO_TO_CONFIG = {
     "eagle3": mtsp.config.EAGLE3_DEFAULT_CFG,
@@ -73,24 +69,6 @@ def add_convert_args(parser):
     return parser
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
-    """Build the model."""
-    args = get_args()
-    args.model_type = model_type
-    pre_process = mpu.is_pipeline_first_stage()
-    post_process = mpu.is_pipeline_last_stage()
-
-    if args.init_model_with_meta_device:
-        with torch.device("meta"):
-            model = model_provider_func(pre_process=pre_process, post_process=post_process)
-        to_empty_if_meta(model, device="cuda")
-    else:
-        model = model_provider_func(pre_process=pre_process, post_process=post_process)
-
-    model.model_type = model_type
-    return [model]
-
-
 def check_arguments():
     """Checking user arguments."""
     args = get_args()
@@ -133,9 +111,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
-    )
+    model = build_modelopt_models(args, mixed_precision_wrapper=None)
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]

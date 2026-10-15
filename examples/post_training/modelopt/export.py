@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Export a GPTModel."""
-import functools
 import inspect
 import os
 import sys
@@ -15,14 +14,13 @@ import torch
 
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.training import get_args, get_model
+from megatron.post_training.model_config import build_modelopt_models
+from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
-from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
 
@@ -88,9 +86,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
-    )
+    model = build_modelopt_models(args)
 
     # Materialize the model from meta device to cpu before loading the checkpoint.
     unwrapped_model = unwrap_model(model)[0]

@@ -27,7 +27,7 @@ override the student arguments before being handed to the teacher constructor. T
 Unlike NeMo-generated checkpoints, Megatron-LM checkpoints do not contain this file by default and must be manually created.
 
 > NOTE: Not all keys in the NeMo-style yaml correspond 1:1 to the argument names for Megatron-LM. These
-are converted in `megatron/post_training/model_builder.py`.
+are converted in `megatron/post_training/model_hooks.py`.
 
 ### Distillation config format
 

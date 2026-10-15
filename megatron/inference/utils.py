@@ -28,7 +28,6 @@ from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import log_single_rank, unwrap_model
 from megatron.training import get_args
-from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import (
@@ -41,7 +40,7 @@ from megatron.training.checkpointing import (
 from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
 
 try:
-    from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+    from megatron.post_training.model_config import build_modelopt_models
 
     HAS_NVIDIA_MODELOPT = True
 except ImportError:
@@ -148,11 +147,8 @@ def get_model_for_inference() -> MegatronModule:
     args = get_args()
 
     if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
-        # ModelOpt path keeps the legacy callable-based builder because the
-        # modelopt hooks (custom layer specs, calibration, etc.) have not been
-        # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
-        # care of running the modelopt-checkpoint auto-detection side effect.
-        model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+        # ModelOpt layer specs and hooks come from the config; the builder is the stock one.
+        model = build_modelopt_models(args)
     else:
         builder = get_model_builder(args)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()

@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for --lsq-scale-lr and the LSQ scale-param handling in model_builder."""
+"""Unit tests for --lsq-scale-lr and the LSQ scale-param handling in model_hooks."""
 
 from argparse import Namespace
 
@@ -10,7 +10,7 @@ import torch
 import megatron.training.training as training
 from megatron.core.optimizer import OptimizerConfig, _get_param_groups
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
-from megatron.post_training.model_builder import _propagate_expert_allreduce_to_lsq_params
+from megatron.post_training.model_hooks import _propagate_expert_allreduce_to_lsq_params
 from megatron.post_training.optimizer import (
     get_lsq_config_overrides,
     install_lsq_optimizer_overrides,

@@ -2547,8 +2547,14 @@ def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_b
     elif freeze_base_model_for_mtp:
         freeze_hook = _freeze_base_model_for_mtp
 
-    if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
-        model_config.pre_wrap_hooks.append(freeze_hook)
+    hooks = model_config.pre_wrap_hooks
+    if freeze_hook is not None and freeze_hook not in hooks:
+        # A ModelOpt KD conversion hook must stay last so the freeze applies to the plain student.
+        kd_index = next(
+            (i for i, hook in enumerate(hooks) if getattr(hook, "modelopt_kd_convert", False)),
+            len(hooks),
+        )
+        hooks.insert(kd_index, freeze_hook)
 
 
 def _forward_backward_grad_context(args):

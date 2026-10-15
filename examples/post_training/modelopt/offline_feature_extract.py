@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 """Supervised Finetuning GPT."""
-import functools
 import os
 import sys
 
@@ -14,13 +13,12 @@ from examples.post_training.modelopt.finetune import SFTDataset
 from megatron.core import mpu
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.post_training.model_config import build_modelopt_models
+from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
-from model_provider import model_provider
 
 
 def add_extract_args(parser):
@@ -58,7 +56,7 @@ if __name__ == "__main__":
 
     args = get_args()
     tokenizer = get_tokenizer()
-    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
+    model = build_modelopt_models(args)
 
     load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
     print_rank_0("Done loading checkpoint")

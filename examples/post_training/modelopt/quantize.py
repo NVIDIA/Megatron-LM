@@ -2,7 +2,6 @@
 
 """Script for quantizing a HuggingFace or Megatron-LM checkpoint using ModelOpt."""
 
-import functools
 import gc
 import inspect
 import json
@@ -59,15 +58,14 @@ from megatron.core import parallel_state
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+from megatron.post_training.model_config import build_modelopt_models
 from megatron.post_training.utils import print_distributed_quant_summary, report_current_memory_info
-from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
-from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
 
@@ -503,9 +501,7 @@ if __name__ == "__main__":
 
     tokenizer = get_hf_tokenizer()
 
-    model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
-    )
+    model = build_modelopt_models(args)
 
     report_current_memory_info()
 
