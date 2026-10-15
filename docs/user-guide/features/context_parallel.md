@@ -7,9 +7,7 @@
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 -->
 
-# Context Parallel Package
-
-## Context Parallelism Overview
+# Context Parallel Overview
 
 ```{figure} ../../images/context_parallel/CP_overview.png
 :alt: Diagram of a transformer layer with tensor parallelism 2 and context parallelism 2, showing CP and TP communication patterns around attention and other blocks.
@@ -55,6 +53,11 @@ GDN-family `linear_cp_mode`, and the incompatibility between chunkwise CP and
 `"all_gather"` when a communication type is supplied. A supplied `cp_comm_type` must
 be a string or a list with one entry per transformer layer. Non-DSA configurations
 retain their existing behavior when `cp_comm_type=None`.
+
+GDN2 (`experimental_attention_variant="gdn2"`) implements only headwise CP: its layers
+split heads across CP ranks whatever `linear_cp_mode` says. With CP, validation requires
+its linear key and value head counts to be multiples of TP × CP, and rejects
+`cp_partition_mode="contiguous"` and Dynamic CP. GDN and KDA layers keep both modes.
 
 These are capability checks, not a prediction of each microbatch's group size.
 Numeric constraints such as head divisibility and hierarchical CP group sizes
