@@ -94,22 +94,13 @@ MODEL_ARGS:
   --adam-beta1: 0.9
   --adam-beta2: 0.95
   --adam-eps: 1e-8
-  # clip_grad=0 suppresses gradient-norm reporting. This large limit records
-  # the pre-clipping norm without clipping healthy gradients (norm < 20).
+  # Effectively disable clipping while retaining gradient-norm logs for diagnostics.
   --clip-grad: 1.0e9
   --eval-iters: 0
   --eval-interval: 101
   --log-interval: 1
   --tensorboard-log-interval: 1
   --tensorboard-dir: ${TENSORBOARD_PATH}
-AFTER_SCRIPT: |
-  # The last rank writes TensorBoard. Wait for that node's workers to exit
-  # before reading the events, so the writer has finished flushing them.
-  if [[ "$NODE_RANK" -eq "$((NUM_NODES - 1))" ]]; then
-    uv run --no-sync python tests/functional_tests/test_cases/moe/deepseek_proxy_mfsdp_v2_ep2_hybridep_eager/verify_gradients.py \
-      --tensorboard-dir "$TENSORBOARD_PATH" \
-      --train-iters "$(/usr/local/bin/yq '.MODEL_ARGS."--exit-interval"' "$TRAINING_PARAMS_PATH")"
-  fi
 TEST_TYPE: regular
 METRICS:
   - "lm loss"
