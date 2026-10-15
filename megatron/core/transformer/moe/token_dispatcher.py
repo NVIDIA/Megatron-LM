@@ -66,6 +66,20 @@ _HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
 """
 
 
+def _record_current_stream(*tensors: Optional[torch.Tensor]) -> None:
+    """Keep CUDA tensors alive until the work already queued on the current stream has used them.
+
+    Routing tensors are allocated on the compute stream, but under the EP A2A overlap schedule the
+    combine reads them on the communication stream; releasing their last reference there without
+    ``record_stream`` hands the storage back to the compute stream while the read is in flight.
+    On the allocating stream this is a no-op.
+    """
+    stream = torch.cuda.current_stream()
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+            tensor.record_stream(stream)
+
+
 class MoETokenDispatcher:
     """
     MoE Token Dispatcher
@@ -673,8 +687,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         ``probs`` carries the router's autograd graph back to the layer input. Kept until the
         layer's next forward, it holds that graph, and under full recompute the checkpointed
         layer input with its gradient, across the rest of the step. Shapes are left alone:
-        CUDA graph replay of the preprocess restores only tensor attributes.
+        CUDA graph replay of the preprocess restores only tensor attributes. The tensors are
+        recorded on the current stream first, because the EP A2A overlap schedule runs the
+        combine on the communication stream.
         """
+        _record_current_stream(
+            self.probs,
+            self.routing_map,
+            self.reversed_local_input_permutation_mapping,
+            self.batch_invariant_inverse_permutation_mapping,
+        )
         self.probs = None
         self.routing_map = None
         self.reversed_local_input_permutation_mapping = None
@@ -1054,6 +1076,19 @@ class _DispatchManager(ABC):
         "reversed_mapping_for_combine",
         "pad_offsets",
     )
+
+    def release_router_probs(self) -> None:
+        """Drop the router probabilities cached for this forward once combine has read them.
+
+        ``token_probs`` and ``dispatched_probs`` carry the router's autograd graph back to the
+        layer input. Other routing metadata stays: HybridEP drop-and-pad keeps a static
+        ``tokens_per_expert`` that only ``setup_metadata`` writes and CUDA graph replay skips.
+        """
+        _record_current_stream(
+            getattr(self, "token_probs", None), getattr(self, "dispatched_probs", None)
+        )
+        self.token_probs = None
+        self.dispatched_probs = None
 
     def reset_transient_forward_state(self) -> None:
         """Release the transient per-forward routing metadata cached on the manager.
@@ -2339,9 +2374,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
-        # The combine was the last reader of this forward's routing metadata; token_probs
-        # carries the router's autograd graph back to the layer input.
-        self._comm_manager.reset_transient_forward_state()
+        # The combine was the last reader of this forward's router probabilities.
+        self._comm_manager.release_router_probs()
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(hidden_states)
             self.shared_experts.post_forward_comm()
