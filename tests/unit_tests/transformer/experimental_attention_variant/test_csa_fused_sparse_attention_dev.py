@@ -1465,6 +1465,9 @@ class TestCPCommunicationOverlap:
                 saved_grad_k_indexer,
                 saved_grad_weights,
                 indexer_rank_map,
+                None,  # q_padding_mask
+                None,  # out_rope cu_seqlens_q
+                None,  # out_rope position_ids
             )
             cp_group = FakeGroup()
             compressed_kv_start = 2
@@ -1474,7 +1477,6 @@ class TestCPCommunicationOverlap:
             local_k_indexer_rows = 2
             local_compressed_kv_rows = 2
             softmax_scale = 0.5
-            q_padding_mask = None
             out_rope = None
             num_forward_inputs = 29
 
@@ -1970,6 +1972,50 @@ class TestDsaSparseAttn:
         expected_parts = expected_dkv.split((1, 4, 2), dim=0)
         for part, expected_grad in zip((boundary_kv, local_kv, compressed_kv), expected_parts):
             torch.testing.assert_close(part.grad, expected_grad)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_topk_length_uses_saved_tensor_hooks(self, reset_lazy_kernel_state):
+        """Protect compact lengths with the same saved-tensor lifecycle as indices."""
+        total_q, np_, d, n_kv = 4, 2, 512, 6
+        topk = _get_topk_alignment()
+        query = torch.randn(
+            total_q, np_, d, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        kv = torch.randn(n_kv, d, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        attn_sink = torch.zeros(np_, dtype=torch.float32, device="cuda", requires_grad=True)
+        topk_idxs = torch.zeros(total_q, topk, dtype=torch.int32, device="cuda")
+        topk_length = torch.full((total_q,), topk, dtype=torch.int32, device="cuda")
+
+        dk._flash_mla_sparse_fwd = _make_flash_mla_stub(d_v=d)
+        fake_dsa = MagicMock()
+        fake_dsa.sparse_attention_backward_wrapper.return_value = {
+            "dq": torch.zeros_like(query),
+            "dkv": torch.zeros_like(kv),
+            "d_sink": torch.zeros_like(attn_sink),
+        }
+        dk._DSA = fake_dsa
+
+        packed = []
+
+        def pack(tensor):
+            packed.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            out = csa_sparse_attn(
+                query,
+                kv,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=0.5,
+                topk_length=topk_length,
+                is_thd=True,
+            )
+
+        assert any(tensor.data_ptr() == topk_length.data_ptr() for tensor in packed)
+        out.sum().backward()
+        passed_length = fake_dsa.sparse_attention_backward_wrapper.call_args.kwargs["topk_length"]
+        assert passed_length.data_ptr() == topk_length.data_ptr()
 
 
 # ---------------------------------------------------------------------------
@@ -3237,22 +3283,31 @@ class TestFusedIndexerSparseAttnFromTopk:
         monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
         monkeypatch.setattr(dk, '_DSA', FakeDSA)
 
-        output, loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
-            *inputs.values(),
-            1.0,
-            1.0,
-            0.0,
-            float(total_q),
-            True,
-            2,
-            total_q,
-            (
-                torch.tensor([0, total_q], dtype=torch.int32),
-                torch.tensor([0, inputs['k_indexer'].shape[0]], dtype=torch.int32),
-                torch.tensor([0], dtype=torch.int32),
-            ),
-            q_padding_mask,
-        )
+        packed = []
+
+        def pack(tensor):
+            packed.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            output, loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+                *inputs.values(),
+                1.0,
+                1.0,
+                0.0,
+                float(total_q),
+                True,
+                2,
+                total_q,
+                (
+                    torch.tensor([0, total_q], dtype=torch.int32),
+                    torch.tensor([0, inputs['k_indexer'].shape[0]], dtype=torch.int32),
+                    torch.tensor([0], dtype=torch.int32),
+                ),
+                q_padding_mask,
+            )
+
+        assert any(tensor.data_ptr() == q_padding_mask.data_ptr() for tensor in packed)
         (output.sum() + loss).backward()
 
         torch.testing.assert_close(
@@ -5817,8 +5872,20 @@ class TestThdPaddingRowMasking:
         padded, cu_q_unpadded = self._build_per_seg_padded(
             real, self.SEG_LENS_PADDED, self.SHAPES, dev, fill_pad_random=False
         )
-        _, loss_with_pad = self._run_fused(
-            padded, self.SHAPES, sparse_loss=sparse_loss, cu_seqlens_q_unpadded=cu_q_unpadded
+        padded['q_indexer'] = padded['q_indexer'].detach().requires_grad_(True)
+        packed = []
+
+        def pack(tensor):
+            packed.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            _, loss_with_pad = self._run_fused(
+                padded, self.SHAPES, sparse_loss=sparse_loss, cu_seqlens_q_unpadded=cu_q_unpadded
+            )
+
+        assert any(
+            tensor.dtype == torch.bool and tensor.shape == (padded['total_q'],) for tensor in packed
         )
 
         assert torch.allclose(loss_with_pad, loss_no_pad, atol=5e-2, rtol=1e-1), (
@@ -6611,3 +6678,37 @@ class TestStableTopkIndices:
         whole = dk._stable_topk_indices(scores, seq_lens, topk_k=4)
         monkeypatch.setattr(dk, "_STABLE_TOPK_SORT_BYTES", 1)
         assert torch.equal(dk._stable_topk_indices(scores, seq_lens, topk_k=4), whole)
+
+
+def test_output_rope_tensors_round_trip_through_saved_tensors():
+    """Per-pack out_rope tensors leave ctx and are restored from saved_tensors."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        fused_sparse_attention as fsa,
+    )
+
+    out_rope = fsa.OutputRopeParams(
+        cos=torch.ones(4, 2),
+        sin=torch.zeros(4, 2),
+        nope_dim=2,
+        pos_dim=2,
+        cu_seqlens_q=torch.tensor([0, 3, 4], dtype=torch.int32),
+        cp_rank=1,
+        cp_size=2,
+        position_ids=torch.arange(4),
+    )
+
+    saved = fsa._out_rope_saved_tensors(out_rope)
+    kept = fsa._out_rope_without_saved_tensors(out_rope)
+    assert saved == (out_rope.cu_seqlens_q, out_rope.position_ids)
+    assert kept.cu_seqlens_q is None and kept.position_ids is None
+    assert kept.cos is out_rope.cos and kept.sin is out_rope.sin
+
+    restored = fsa._restore_out_rope(kept, *saved)
+    for field in ("cos", "sin", "cu_seqlens_q", "position_ids"):
+        assert getattr(restored, field) is getattr(out_rope, field)
+    for field in ("nope_dim", "pos_dim", "cp_rank", "cp_size", "sbhd_batch_size"):
+        assert getattr(restored, field) == getattr(out_rope, field)
+
+    assert fsa._out_rope_saved_tensors(None) == (None, None)
+    assert fsa._out_rope_without_saved_tensors(None) is None
+    assert fsa._restore_out_rope(None, None, None) is None
