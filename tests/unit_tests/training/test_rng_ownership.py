@@ -78,9 +78,13 @@ def test_container_derives_tracker_fields_one_way(
     before = asdict(cfg.rng)
     for _ in range(2):
         cfg.validate()
-        assert transformer.use_te_rng_tracker is te_tracker
-        assert transformer.inference_rng_tracker is inference_tracker
+        assert transformer.use_te_rng_tracker is not te_tracker
+        assert transformer.inference_rng_tracker is not inference_tracker
         assert asdict(cfg.rng) == before
+    cfg.finalize()
+    assert transformer.use_te_rng_tracker is te_tracker
+    assert transformer.inference_rng_tracker is inference_tracker
+    assert asdict(cfg.rng) == before
 
 
 def test_native_cuda_graph_requirement_is_resolved_before_seeding(run_config):
@@ -92,6 +96,8 @@ def test_native_cuda_graph_requirement_is_resolved_before_seeding(run_config):
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.rng = RNGConfig()
     run_config.validate()
+    assert run_config.rng.te_rng_tracker is False
+    run_config.finalize()
     assert run_config.rng.te_rng_tracker is True
     assert transformer.use_te_rng_tracker is True
     run_config.validate()
@@ -171,6 +177,7 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(
     finish = initialize.initialize_megatron(
         allow_no_cuda=True, skip_random_seed=skip, skip_dependency_compilation=True
     )
+    assert run_config._finalized
     if lazy:
         seed.assert_not_called()
         finish()

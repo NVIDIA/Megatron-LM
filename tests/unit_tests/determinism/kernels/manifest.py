@@ -534,10 +534,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             C + "test_gpt_model.py",
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
+            "tests/unit_tests/rl/test_rl_utils.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
-        "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay.",
+        "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
+        "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration.",
     ),
     KernelEntry(
         name="nccl_allocator",
