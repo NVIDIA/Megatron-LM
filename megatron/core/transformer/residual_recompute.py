@@ -25,6 +25,11 @@ from megatron.core.transformer.residual_connection import (
     ResidualConnection,
     ResidualConnectionState,
 )
+from megatron.core.transformer.residual_recompute_plan import (
+    build_recompute_block_end_plan,
+    build_recompute_layer_managers,
+    finalize_recompute_block,
+)
 from megatron.core.typed_torch import apply_module
 
 if TYPE_CHECKING:
@@ -50,8 +55,7 @@ class ResidualStreamRecomputeContext:
     def finalize(self, hidden_states: Tensor) -> None:
         """Discard this block's registered outputs once its live boundary exists."""
 
-        if self.is_block_end:
-            self.manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+        finalize_recompute_block(self.manager, hidden_states, self.is_block_end)
 
 
 def residual_stream_recompute_enabled(config: TransformerConfig, training: bool) -> bool:
@@ -89,69 +93,14 @@ def build_residual_stream_recompute_plan(
     [0, 1] and [2, 3], not [0, 1, 2] and [3].
     """
 
-    if num_layers < 0:
-        raise ValueError("Residual recompute plan requires a non-negative layer count.")
-    if num_layers == 0:
-        return []
-    if block_size is not None and (
-        isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < 1
-    ):
-        raise ValueError("Residual recompute block size must be a positive integer or None.")
-
-    pair_starts: dict[int, int] = {}
-    paired_indices: set[int] = set()
-    for pair in atomic_layer_pairs:
-        if not isinstance(pair, tuple) or len(pair) != 2:
-            raise ValueError("Atomic residual recompute layer pairs must be two-item tuples.")
-        start, end = pair
-        if (
-            isinstance(start, bool)
-            or not isinstance(start, int)
-            or isinstance(end, bool)
-            or not isinstance(end, int)
-        ):
-            raise ValueError("Atomic residual recompute layer-pair indices must be integers.")
-        if start < 0 or end >= num_layers or end != start + 1:
-            raise ValueError(
-                "Atomic residual recompute layer pairs must contain adjacent in-range indices."
-            )
-        if start in paired_indices or end in paired_indices:
-            raise ValueError("Atomic residual recompute layer pairs must not overlap.")
-        pair_starts[start] = end
-        paired_indices.update((start, end))
-
-    effective_block_size = block_size or num_layers
-    # Treat each unpaired layer or complete pair as one indivisible unit.
-    atomic_units = []
-    layer_index = 0
-    while layer_index < num_layers:
-        unit_end = pair_starts.get(layer_index, layer_index)
-        atomic_units.append((layer_index, unit_end))
-        layer_index = unit_end + 1
-
-    # Pack whole units in order, shortening a block instead of splitting a pair.
-    block_ends: set[int] = set()
-    layers_in_block = 0
-    for unit_start, unit_end in atomic_units:
-        unit_size = unit_end - unit_start + 1
-        if layers_in_block and layers_in_block + unit_size > effective_block_size:
-            block_ends.add(unit_start - 1)
-            layers_in_block = 0
-        layers_in_block += unit_size
-        if layers_in_block >= effective_block_size:
-            block_ends.add(unit_end)
-            layers_in_block = 0
-    block_ends.add(num_layers - 1)
-
-    # Keep physical-layer indexing while sharing one manager across each replay block.
-    contexts = []
-    manager = CheckpointWithoutOutputManager()
-    for layer_index in range(num_layers):
-        is_block_end = layer_index in block_ends
-        contexts.append(ResidualStreamRecomputeContext(manager=manager, is_block_end=is_block_end))
-        if is_block_end and layer_index + 1 < num_layers:
-            manager = CheckpointWithoutOutputManager()
-    return contexts
+    block_ends = build_recompute_block_end_plan(
+        num_layers, block_size, atomic_layer_pairs=atomic_layer_pairs
+    )
+    managers = build_recompute_layer_managers(block_ends)
+    return [
+        ResidualStreamRecomputeContext(manager=manager, is_block_end=is_block_end)
+        for manager, is_block_end in zip(managers, block_ends)
+    ]
 
 
 def checkpoint_residual_read(
