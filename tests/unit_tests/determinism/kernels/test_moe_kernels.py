@@ -457,6 +457,33 @@ class TestMoEModules:
             what=f"TopKRouter[{balancing}, hash={hash_routing}]",
         )
 
+    # aux_loss passes its already-reduced token count; these two build the count from the local
+    # token dimension.
+    @pytest.mark.parametrize("balancing", ["seq_aux_loss", "global_aux_loss"])
+    def test_topk_router_per_token_aux_loss_replays(self, balancing):
+        """With per-token loss the router scales the aux loss by the token count summed over TP
+        and CP ranks. Without a padding mask the local count is a Python int, which the router
+        fills into a device tensor before the all-reduce."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type=balancing,
+            calculate_per_token_loss=True,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        # global_aux_loss averages the token counts of every call so far, and the harness does
+        # not reset that buffer; with identical inputs the average is the same in every replay.
+        assert_module_replays_bit_exact(
+            router, (hidden,), replays=3, what=f"TopKRouter[{balancing}, per-token loss]"
+        )
+        moe_utils.get_moe_metrics_tracker().clear()
+
     @pytest.mark.skipif(
         not (HAVE_TE_ROUTER and moe_utils.fused_topk_with_score_function_supports_topk_indices),
         reason="TE dense fused router output is not available",
