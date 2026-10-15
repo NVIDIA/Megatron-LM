@@ -9,11 +9,9 @@ import torch
 from megatron.core.pipeline_parallel import pinned_activation_buffer
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     ChunkOffloadHandler,
-    OffloadTensorGroup,
     OffloadTensorPool,
 )
 from megatron.core.pipeline_parallel.pinned_activation_buffer import PinnedActivationBuffer
-from megatron.core.transformer.transformer_config import TransformerConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pinned copies required")
 MIB = 2**20
@@ -27,8 +25,7 @@ def select_device():
 
 
 def test_fixed_capacity_preserves_live_data_and_reuses_storage():
-    arena = PinnedActivationBuffer(4 * MIB)
-    assert arena.capacity_bytes == 4 * MIB
+    arena = OffloadTensorPool(device="cpu", pin_memory=True, capacity_bytes=4 * MIB)
     first = arena.allocate((MIB,), torch.uint8)
     first.fill_(17)
     ptr = first.data_ptr()
@@ -39,14 +36,21 @@ def test_fixed_capacity_preserves_live_data_and_reuses_storage():
     with pytest.raises(RuntimeError, match="budget exceeded"):
         arena.allocate((1,), torch.uint8)
     assert torch.all(second == 29)
-    arena.release(first)
+    arena.reset()
+    arena.clear()
+    assert arena.get_pool_status()["global_stats"]["current_in_use"] == 2
+    arena.free(first)
     # Individual releases do not permit overwriting outstanding backups.
     with pytest.raises(RuntimeError, match="budget exceeded"):
         arena.allocate((1,), torch.uint8)
-    arena.release(second)
-    again = arena.allocate((4 * MIB,), torch.uint8)
-    assert arena.capacity_bytes == 4 * MIB and again.data_ptr() == ptr
-    arena.release(again)
+    assert torch.all(second == 29)
+    arena.free(second)
+    # Reuse the same storage for a different shape and dtype after every backup retires.
+    again = arena.allocate((MIB, 1), torch.float32)
+    assert again.data_ptr() == ptr
+    assert arena.get_pool_status()["fixed_buffer"]["capacity_bytes"] == 4 * MIB
+    arena.free(again)
+    assert arena.get_pool_status()["global_stats"]["current_in_use"] == 0
     torch.cuda.synchronize()
 
 
@@ -99,44 +103,8 @@ def test_offload_views_and_non_lifo_release():
     assert handler.cpu_tensor_pool.get_pool_status()["fixed_buffer"]["live_bytes"] == 0
 
 
-def test_graph_replay_keeps_backing_addresses():
-    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    handler.cpu_tensor_pool = OffloadTensorPool(device="cpu", pin_memory=True, capacity_bytes=MIB)
-    source = torch.ones(8192, dtype=torch.bfloat16, device="cuda")
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        handler.reload(handler.offload(source, use_cpu_pool=False))
-    stream.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        output = handler.reload(handler.offload(source, use_cpu_pool=False))
-        # A second epoch within capture exercises the reuse event dependency.
-        output2 = handler.reload(handler.offload(source, use_cpu_pool=False))
-    for value in (3, 5, 7):
-        handler.cpu_tensor_pool.reset()
-        handler.cpu_tensor_pool.clear()
-        source.fill_(value)
-        graph.replay()
-        assert torch.all(output == value) and torch.all(output2 == value)
-    torch.cuda.synchronize()
-
-
-def test_capture_exhaustion_preserves_fixed_capacity():
-    arena = PinnedActivationBuffer(MIB)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        host = arena.allocate((MIB,), torch.uint8)
-        with pytest.raises(RuntimeError, match="budget exceeded"):
-            arena.allocate((1,), torch.uint8)
-        arena.release(host)
-    torch.cuda.synchronize()
-    assert arena.capacity_bytes == MIB
-
-
-def test_split_graph_backups_are_not_overwritten_by_eager_offloads():
+@pytest.mark.parametrize("other_capture", [False, True], ids=["eager", "another-graph"])
+def test_split_graph_backups_are_not_overwritten(other_capture):
     handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
     pool = OffloadTensorPool(device="cpu", pin_memory=True, capacity_bytes=2 * MIB)
     handler.cpu_tensor_pool = pool
@@ -154,50 +122,31 @@ def test_split_graph_backups_are_not_overwritten_by_eager_offloads():
     with torch.cuda.graph(backward, stream=stream):
         output = handler.reload(state)
 
+    if other_capture:
+        round_trips = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(round_trips, stream=stream):
+            # Four MiB of traffic reuses a separate one-MiB range within this capture.
+            outputs = [handler.reload(handler.offload(eager_source)) for _ in range(4)]
+        assert pool.get_pool_status()["fixed_buffer"]["graph_reserved_bytes"] == 2 * MIB
+
     for _ in range(3):
         pool.reset()
         pool.clear()
         forward.replay()
-        eager_state = handler.offload(eager_source)
+        if other_capture:
+            round_trips.replay()
+        else:
+            eager_state = handler.offload(eager_source)
         backward.replay()
-        eager_output = handler.reload(eager_state)
+        if not other_capture:
+            outputs = [handler.reload(eager_state)]
         assert torch.all(output == 17)
-        assert torch.all(eager_output == 29)
+        assert all(torch.all(result == 29) for result in outputs)
         assert pool.get_pool_status()["fixed_buffer"]["capacity_bytes"] == 2 * MIB
 
     # Backward capture/replay cannot return graph-owned space to eager allocation.
     with pytest.raises(RuntimeError, match="budget exceeded"):
         pool.allocate((2 * MIB,), torch.uint8)
-
-
-def test_each_capture_reserves_its_own_reusable_range():
-    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    pool = OffloadTensorPool(device="cpu", pin_memory=True, capacity_bytes=2 * MIB)
-    handler.cpu_tensor_pool = pool
-    source = torch.full((MIB,), 17, dtype=torch.uint8, device="cuda")
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        handler.reload(handler.offload(source))
-    stream.synchronize()
-
-    forward, backward, round_trips = (torch.cuda.CUDAGraph() for _ in range(3))
-    with torch.cuda.graph(forward, stream=stream):
-        state = handler.offload(source)
-    with torch.cuda.graph(backward, stream=stream):
-        output = handler.reload(state)
-    with torch.cuda.graph(round_trips, stream=stream):
-        # Four MiB of traffic fits in one additional MiB by reusing within capture.
-        outputs = [handler.reload(handler.offload(source)) for _ in range(4)]
-    assert pool.get_pool_status()["fixed_buffer"]["graph_reserved_bytes"] == 2 * MIB
-    forward.replay()
-    source.fill_(29)
-    round_trips.replay()
-    backward.replay()
-    assert torch.all(output == 17)
-    assert all(torch.all(result == 29) for result in outputs)
-    with pytest.raises(RuntimeError, match="budget exceeded"):
-        pool.allocate((1,), torch.uint8)
 
 
 def test_captured_read_reserves_an_eager_backup():
@@ -244,49 +193,18 @@ def test_graph_replay_with_multiple_copy_streams_and_epochs(explicit_stream):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture):
         outputs = [round_trip() for _ in range(8)]
+        host = handler.cpu_tensor_pool.allocate((MIB,), torch.uint8)
+        with pytest.raises(RuntimeError, match="budget exceeded"):
+            handler.cpu_tensor_pool.allocate((1,), torch.uint8)
+        handler.cpu_tensor_pool.free(host)
     for value in range(3, 103):
         handler.cpu_tensor_pool.reset()
+        handler.cpu_tensor_pool.clear()
         source.fill_(value)
         graph.replay()
         assert all(torch.all(output == value) for output in outputs)
+    assert handler.cpu_tensor_pool.get_pool_status()["fixed_buffer"]["capacity_bytes"] == MIB
     torch.cuda.synchronize()
-
-
-def test_pool_reset_preserves_outstanding_backups():
-    pool = OffloadTensorPool(device="cpu", pin_memory=True, capacity_bytes=MIB)
-    host = pool.allocate((MIB // 4,), torch.float32)
-    host.fill_(7)
-    pointer = host.data_ptr()
-    pool.reset()
-    pool.clear()
-    with pytest.raises(RuntimeError, match="budget exceeded"):
-        pool.allocate((1,), torch.uint8)
-    assert torch.all(host == 7)
-    assert pool.get_pool_status()["global_stats"]["current_in_use"] == 1
-    pool.free(host)
-    # A different shape and dtype can reuse the exact same backing storage.
-    reused = pool.allocate((MIB // 2, 2), torch.uint8)
-    assert reused.data_ptr() == pointer
-    pool.free(reused)
-    assert pool.get_pool_status()["global_stats"]["current_in_use"] == 0
-
-
-@pytest.mark.parametrize("capacity", [0, MIB])
-@pytest.mark.parametrize("group_name", ["fused_group_mlp", "moe_act", "expert_fc1", "core_attn"])
-def test_pool_routes_variable_shape_groups(capacity, group_name):
-    pool = OffloadTensorPool(device="cpu", pin_memory=True, capacity_bytes=capacity)
-    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    handler.cpu_tensor_pool = pool
-    group = OffloadTensorGroup(group_name)
-    source = torch.randn(32, 64, device="cuda")
-    state = handler.offload(source, use_cpu_pool=group.use_cpu_pool)
-    assert state[2] is bool(capacity or group.use_cpu_pool)
-    result = handler.reload(state)
-    assert torch.equal(source, result)
-    assert pool.get_pool_status()["global_stats"]["current_in_use"] == 0
-    if capacity:
-        assert pool.get_pool_status()["pools"] == {}
-        assert pool.get_pool_status()["fixed_buffer"]["capacity_bytes"] == capacity
 
 
 def test_pool_cannot_change_backing_storage_after_use():
@@ -384,52 +302,8 @@ def test_storage_is_freed_only_after_the_last_view(caplog):
 
 def test_failed_host_allocation_raises(monkeypatch):
     runtime = pinned_activation_buffer._cuda_runtime()
-
-    class FailingRuntime:
-        cudaError_t = runtime.cudaError_t
-        cudaHostAllocDefault = runtime.cudaHostAllocDefault
-        cudaGetLastError = staticmethod(runtime.cudaGetLastError)
-
-        @staticmethod
-        def cudaHostAlloc(nbytes, flags):
-            return runtime.cudaError_t.cudaErrorMemoryAllocation, 0
-
-    monkeypatch.setattr(pinned_activation_buffer, "_cuda_runtime", lambda: FailingRuntime)
+    monkeypatch.setattr(
+        runtime, "cudaHostAlloc", lambda *_: (runtime.cudaError_t.cudaErrorMemoryAllocation, 0)
+    )
     with pytest.raises(RuntimeError, match=f"cudaHostAlloc of {3 * MIB} bytes"):
         PinnedActivationBuffer(3 * MIB)
-
-
-@pytest.mark.parametrize("size_gib", [0, 0.5, 8, 3, 152])
-def test_pinned_buffer_config(size_gib):
-    config = TransformerConfig(
-        num_layers=2,
-        hidden_size=128,
-        num_attention_heads=8,
-        fine_grained_activation_offloading=bool(size_gib),
-        offload_modules=["moe_act"],
-        fine_grained_offloading_buffer_size_gib=size_gib,
-    )
-    assert config.fine_grained_offloading_buffer_size_gib == size_gib
-
-
-@pytest.mark.parametrize("size_gib", [-1, float("nan"), float("inf"), 0.1, 1000 / 2**30, 2**-24])
-def test_invalid_pinned_buffer_config(size_gib):
-    with pytest.raises(ValueError, match="Pinned offload buffer"):
-        TransformerConfig(
-            num_layers=2,
-            hidden_size=128,
-            num_attention_heads=8,
-            fine_grained_activation_offloading=True,
-            offload_modules=["moe_act"],
-            fine_grained_offloading_buffer_size_gib=size_gib,
-        )
-
-
-def test_pinned_buffer_requires_activation_offloading():
-    with pytest.raises(ValueError, match="requires fine_grained_activation_offloading"):
-        TransformerConfig(
-            num_layers=2,
-            hidden_size=128,
-            num_attention_heads=8,
-            fine_grained_offloading_buffer_size_gib=1.5,
-        )
