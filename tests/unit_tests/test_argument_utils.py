@@ -19,6 +19,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
+    _default_config_from_args,
     core_transformer_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
@@ -614,6 +615,36 @@ class TestArgumentGroupFactoryExclusion:
         assert hasattr(args, 'enabled')
 
 
+class TestArgumentGroupFactoryPrefix:
+    """Test prefixed argument names."""
+
+    def test_prefix_applies_to_names_and_destinations(self):
+        """Test that every flag and destination carries the prefix."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(DummyConfig, prefix="dummy")
+
+        factory.build_group(parser, title="Test Group")
+        args = parser.parse_args(
+            ["--dummy-name", "custom", "--dummy-enabled", "--no-dummy-disabled-feature"]
+        )
+
+        assert args.dummy_name == "custom"
+        assert args.dummy_enabled is True
+        assert args.dummy_disabled_feature is False
+        assert not hasattr(args, "name")
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--name", "custom"])
+
+    def test_default_config_from_args_reads_prefixed_arguments(self):
+        """Test that the same prefix maps parsed arguments back onto the dataclass."""
+        parser = ArgumentParser()
+        ArgumentGroupFactory(DummyConfig, prefix="dummy").build_group(parser, title="Test Group")
+
+        args = parser.parse_args(["--dummy-count", "7"])
+
+        assert _default_config_from_args(DummyConfig, args, prefix="dummy") == DummyConfig(count=7)
+
+
 class TestArgumentGroupFactoryOptional:
     """Test handling of Optional types."""
 
@@ -741,6 +772,14 @@ class TestArgumentGroupFactoryHelpers:
 
         result = factory._extract_type(list[str])
         assert result == {"type": str, "nargs": "+"}
+
+    def test_extract_type_variable_length_tuple(self):
+        """Test type extraction for variable-length tuples of one type."""
+        factory = ArgumentGroupFactory(DummyConfig)
+
+        assert factory._extract_type(tuple[str, ...]) == {"type": str, "nargs": "+"}
+        with pytest.raises(TypeInferenceError, match="Unsupported type"):
+            factory._extract_type(tuple[str, int])
 
     def test_extract_type_literal(self):
         """Test type extraction for Literal types."""

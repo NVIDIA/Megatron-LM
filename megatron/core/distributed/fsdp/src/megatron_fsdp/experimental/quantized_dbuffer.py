@@ -29,6 +29,7 @@ except ImportError as exc:
         "UnavailableError: QuantizedDBuffer requires Transformer Engine MXFP8 support"
     ) from exc
 
+from . import layout_builder
 from .dbuffer import DBuffer
 from .layout import GlobalLayout, Shape
 from .placement import BlockAtomic, RowAtomic
@@ -48,30 +49,24 @@ def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
 def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
     """Derive rowwise scales from the layout shared by rowwise_data and columnwise_data."""
     return GlobalLayout(
-        tensor_shapes=tuple(
-            torch.Size((shape[0], shape[1] // _MXFP8_BLOCK_SIZE))
-            for shape in data_layout.tensor_shapes
+        tensor_shapes=(
+            (shape[0], shape[1] // _MXFP8_BLOCK_SIZE) for shape in data_layout.tensor_shapes
         ),
-        tensor_to_offset=tuple(
-            offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
-        ),
+        tensor_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
-        rank_to_offset=tuple(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
+        rank_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
     )
 
 
 def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
     """Derive columnwise scales from the layout shared by rowwise_data and columnwise_data."""
     return GlobalLayout(
-        tensor_shapes=tuple(
-            torch.Size((shape[0] // _MXFP8_BLOCK_SIZE, shape[1]))
-            for shape in data_layout.tensor_shapes
+        tensor_shapes=(
+            (shape[0] // _MXFP8_BLOCK_SIZE, shape[1]) for shape in data_layout.tensor_shapes
         ),
-        tensor_to_offset=tuple(
-            offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
-        ),
+        tensor_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
-        rank_to_offset=tuple(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
+        rank_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
     )
 
 
@@ -162,7 +157,7 @@ class QuantizedDBuffer:
         device: torch.device | str,
     ) -> "QuantizedDBuffer":
         """Build an MXFP8 layout from logical tensor shapes and allocate its planes."""
-        layout = GlobalLayout.build_for_row_atomic(
+        layout = layout_builder.build_for_row_atomic(
             tensor_shapes, dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
         )
         return cls(mesh, placements, layout, device)

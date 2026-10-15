@@ -19,6 +19,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     InferenceBatchDimensions,
 )
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     PrefixCachingEvictionPolicy,
@@ -607,7 +608,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ):
             assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level != 0, (
                 "Static KV memory pointers require UVM or torch_memory_saver when not persisted. "
-                "Use --rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
+                "Use --inference-kv-cache-management-mode=persist, "
+                "UVM, or install torch_memory_saver."
             )
 
         # When not using `torch_memory_saver`, we manually offload/restore tensors.
@@ -2730,7 +2732,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
 
         if self.moe_enable_routing_replay:
-            if self.using_cuda_graph_this_step():
+            if (
+                self.config.async_sched_mode == AsyncScheduleMode.ASYNC
+                or self.using_cuda_graph_this_step()
+            ):
                 self.moe_routing_metadata.enable_static_buffer_recording()
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
