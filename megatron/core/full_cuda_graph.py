@@ -7,6 +7,7 @@ import logging
 
 import torch
 
+from megatron.core.tensor_parallel.gtp_symmetric_memory import symmetric_wgrad_pool
 from megatron.core.tensor_parallel.random import (
     cudagraph_needs_generator_registration,
     get_all_rng_states,
@@ -228,6 +229,7 @@ class FullCudaGraphWrapper:
                     FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
+            symmetric_wgrad_pool.reset_completed_reuse_events()
             with torch.cuda.graph(
                 FullCudaGraphWrapper.cuda_graph[training_str],
                 stream=capture_stream,
@@ -259,6 +261,7 @@ class FullCudaGraphWrapper:
 
     def reset_cuda_graph(self, stage=None):
         """Reset CUDA graph."""
+        captured = any(graph is not None for graph in FullCudaGraphWrapper.cuda_graph.values())
         if stage is None or stage == 'training':
             if FullCudaGraphWrapper.cuda_graph['training'] is not None:
                 del FullCudaGraphWrapper.cuda_graph['training']
@@ -271,4 +274,6 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['validation'] = None
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
+        if captured:
+            symmetric_wgrad_pool.reset_completed_reuse_events()
         gc.collect()
