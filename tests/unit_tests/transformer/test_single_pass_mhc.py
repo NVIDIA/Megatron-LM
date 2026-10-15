@@ -30,20 +30,22 @@ def test_previous_mix_controls_input_and_receives_gradients(dtype, fused):
     oracle = torch.einsum("sbn,sbnc->sbc", previous, x.float().unflatten(-1, (4, 16)))
     torch.testing.assert_close(branch, oracle.to(dtype))
     assert following.dtype == post.dtype == residual.dtype == torch.float32
+    bias = torch.randn(16, device="cuda", requires_grad=True)
     output = module.fused_h_res_h_post_bda(
-        residual, residual_input, post, (branch, None), 0.0, True, False
+        residual, residual_input, post, (branch, bias), 0.0, True, False
     )
     reference = torch.matmul(residual.transpose(-1, -2), x.float().unflatten(-1, (4, 16)))
-    reference = reference + post.unsqueeze(-1) * branch.float().unsqueeze(-2)
+    reference = reference + post.unsqueeze(-1) * (branch.float() + bias).unsqueeze(-2)
     torch.testing.assert_close(output, reference.flatten(-2).to(dtype))
     # Direct activation-dtype stores must preserve FP32 coefficient gradients.
-    leaves = (x, previous, module.mapping_proj.weight)
+    leaves = (x, previous, module.mapping_proj.weight, bias)
     actual_grads = torch.autograd.grad(output.float().square().mean(), leaves, retain_graph=True)
     reference_grads = torch.autograd.grad(
         reference.flatten(-2).to(dtype).float().square().mean(), leaves, retain_graph=True
     )
     for actual, expected in zip(actual_grads, reference_grads):
         torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
+    torch.testing.assert_close(actual_grads[-1], reference_grads[-1], atol=1e-6, rtol=1e-5)
     state.contract(output, 4).square().mean().backward()
     assert previous.grad is not None and previous.grad.abs().sum() > 0
     assert module.mapping_proj.weight.grad is not None
