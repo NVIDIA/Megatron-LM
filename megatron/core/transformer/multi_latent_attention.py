@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, NoReturn, Optional, Union
 import torch
 import torch.nn.functional as F
 
-from megatron.core.transformer.layer_interface import LayerInputs, as_addends, layer_inputs_forward
+from megatron.core.transformer.layer_interface import as_addends, layer_inputs_forward
 
 try:
     from einops import rearrange
@@ -359,25 +359,7 @@ class MultiLatentAttention(Attention):
 
         return _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim)
 
-    def forward_layer(self, x, inputs: LayerInputs):
-        """Run the core with shared inputs and leave any output bias deferred."""
-        return as_addends(
-            self.forward(
-                x,
-                attention_mask=inputs.attention_mask,
-                inference_context=inputs.inference_context,
-                rotary_pos_emb=inputs.rotary_pos_emb,
-                rotary_pos_cos=inputs.rotary_pos_cos,
-                rotary_pos_sin=inputs.rotary_pos_sin,
-                rotary_pos_cos_sin=inputs.rotary_pos_cos_sin,
-                attention_bias=inputs.attention_bias,
-                packed_seq_params=inputs.packed_seq_params,
-                sequence_len_offset=inputs.sequence_len_offset,
-                packed_sequence_cp_metadata=inputs.cp_metadata,
-            )
-        )
-
-    @layer_inputs_forward
+    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"}, output=as_addends)
     def forward(
         self,
         hidden_states: torch.Tensor,

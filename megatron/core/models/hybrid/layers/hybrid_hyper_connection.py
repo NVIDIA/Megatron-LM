@@ -53,47 +53,6 @@ class HyperConnectionHybridLayer(MegatronModule):
             return mixer.mamba_state_shapes_per_request()
         return None
 
-    def _call_inner_layer(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        inference_context: Optional[BaseInferenceContext],
-        rotary_pos_emb: Optional[Tensor],
-        sequence_len_offset: Optional[Tensor],
-        packed_seq_params: Optional[PackedSeqParams],
-        packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata],
-        padding_mask: Optional[Tensor],
-        input_ids: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
-        if isinstance(self.inner_layer, TransformerLayer):
-            output = self.inner_layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-                input_ids=input_ids,
-            )
-        else:
-            # Mamba-like layers only consume the common HybridStack arguments.
-            extra_kwargs = {}
-            if packed_sequence_cp_metadata is not None:
-                extra_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
-            output = self.inner_layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                packed_seq_params=packed_seq_params,
-                **extra_kwargs,
-            )
-
-        if isinstance(output, tuple):
-            context = output[1] if len(output) > 1 else None
-            return output[0], context
-        return output, None
-
     def _call_inner_transformer_layer_without_local_bda(
         self,
         hidden_states: Tensor,
@@ -162,28 +121,16 @@ class HyperConnectionHybridLayer(MegatronModule):
             layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
-    def forward_layer(self, hidden_states, inputs: LayerInputs):
-        """Adapt shared inputs to the mHC wrapper without changing its residual update."""
-        if inputs.residual_stream_recompute_context is not None:
-            raise TypeError(
+    @layer_inputs_forward(
+        aliases={"packed_sequence_cp_metadata": "cp_metadata"},
+        output=lambda result: result[0],
+        reject={
+            "residual_stream_recompute_context": TypeError(
                 "HyperConnectionHybridLayer does not support residual_stream recomputation; "
                 "select 'mhc' in recompute_modules and configure mhc_recompute_layer_num instead."
             )
-        output, _ = self.forward(
-            hidden_states,
-            attention_mask=inputs.attention_mask,
-            inference_context=inputs.inference_context,
-            rotary_pos_emb=inputs.rotary_pos_emb,
-            sequence_len_offset=inputs.sequence_len_offset,
-            packed_seq_params=inputs.packed_seq_params,
-            padding_mask=inputs.padding_mask,
-            packed_sequence_cp_metadata=inputs.cp_metadata,
-            mhc_recompute_manager=inputs.mhc_recompute_manager,
-            input_ids=inputs.input_ids if wants_input_ids(self.inner_layer) else None,
-        )
-        return output
-
-    @layer_inputs_forward
+        },
+    )
     def forward(
         self,
         hidden_states: Tensor,
@@ -209,22 +156,26 @@ class HyperConnectionHybridLayer(MegatronModule):
             sequence_len_offset,
             packed_seq_params,
             padding_mask,
-            input_ids,
+            # This path bypasses the inner LayerInputs adapter, which normally filters IDs.
+            input_ids if wants_input_ids(self.inner_layer) else None,
             mhc_recompute_manager,
         )
 
         if fast_path_result is None:
-            layer_output, context = self._call_inner_layer(
+            layer_output = self.inner_layer(
                 aggregated,
-                attention_mask,
-                inference_context,
-                rotary_pos_emb,
-                sequence_len_offset,
-                packed_seq_params,
-                packed_sequence_cp_metadata,
-                padding_mask,
-                input_ids,
+                LayerInputs(
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    sequence_len_offset=sequence_len_offset,
+                    packed_seq_params=packed_seq_params,
+                    cp_metadata=packed_sequence_cp_metadata,
+                    padding_mask=padding_mask,
+                    input_ids=input_ids,
+                ),
             )
+            context = None
             if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
                 aggregated = aggregated.to(layer_output.dtype)
             layer_output_with_bias = (layer_output - aggregated, None)

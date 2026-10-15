@@ -16,11 +16,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import (
-    LayerInputs,
-    LayerInterface,
-    layer_inputs_forward,
-)
+from megatron.core.transformer.layer_interface import LayerInterface, layer_inputs_forward
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -725,17 +721,9 @@ class MoELayer(BaseMoELayer, LayerInterface):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
-    def forward_layer(self, x, inputs: LayerInputs):
-        """Return routed and shared updates separately, with an optional core-owned norm."""
-        return self.forward(
-            self.pre_norm(x),
-            padding_mask=inputs.padding_mask,
-            input_ids=inputs.input_ids,
-            packed_seq_params=inputs.packed_seq_params,
-            _return_addends=True,
-        )
-
-    @layer_inputs_forward
+    @layer_inputs_forward(
+        input_transform=lambda module, x: module.pre_norm(x), extra_kwargs={"_return_addends": True}
+    )
     def forward(
         self,
         hidden_states: torch.Tensor,

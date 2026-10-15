@@ -9,11 +9,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
-from megatron.core.transformer.layer_interface import (
-    LayerInputs,
-    layer_inputs_forward,
-    wants_input_ids,
-)
+from megatron.core.transformer.layer_interface import layer_inputs_forward, wants_input_ids
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
@@ -1122,34 +1118,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return hidden_states, context
 
-    def forward_layer(self, hidden_states, inputs: LayerInputs):
-        """Adapt shared inputs while preserving the legacy graph argument set."""
-        kwargs = dict(
-            attention_mask=inputs.attention_mask,
-            inference_context=inputs.inference_context,
-            rotary_pos_emb=inputs.rotary_pos_emb,
-            sequence_len_offset=inputs.sequence_len_offset,
-            packed_seq_params=inputs.packed_seq_params,
-            padding_mask=inputs.padding_mask,
-        )
-        for name in (
+    @layer_inputs_forward(
+        output=lambda result: result[0],
+        exclude=("rotary_pos_cos_sin",),
+        omit_none=(
             "context",
             "context_mask",
             "rotary_pos_cos",
             "rotary_pos_sin",
             "attention_bias",
             "residual_stream_recompute_context",
-        ):
-            value = getattr(inputs, name)
-            if value is not None:
-                kwargs[name] = value
+            "input_ids",
+        ),
         # Only hash routers reserve a token-ID input in the legacy CUDA graph.
-        if inputs.input_ids is not None and wants_input_ids(self):
-            kwargs["input_ids"] = inputs.input_ids
-        output, _ = self(hidden_states=hidden_states, **kwargs)
-        return output
-
-    @layer_inputs_forward
+        include_if={"input_ids": wants_input_ids},
+    )
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
         """
@@ -2354,19 +2337,19 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
 
-        # Set per-call by __call__ from kwargs so forward can read it without re-piping
+        # Set per-call after input binding so forward can read it without re-piping
         # the manager through the CUDA-graph kwarg path (CheckpointWithoutOutputManager
         # is not a CUDA-graph-supported type and gets stripped during capture). Read by
         # _run_input_layernorm, _apply_self_attn_bda_step, _pre_mlp_layernorm_and_residual, and
         # _apply_mlp_bda_step — do not delete; appears unused only at the class level.
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
 
-    def __call__(self, *args, **kwargs):
-        # Pull the manager off kwargs before super().__call__ hands them to the
+    def _call_with_bound_args(self, *args, **kwargs):
+        # Pull the manager off kwargs before the graph dispatch hands them to the
         # CUDA-graph machinery (which can't handle a CheckpointWithoutOutputManager).
         # forward() reads the value back from self.
         self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
-        return super().__call__(*args, **kwargs)
+        return super()._call_with_bound_args(*args, **kwargs)
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Override to produce n-stream hidden_states of shape [s, b, n*C].

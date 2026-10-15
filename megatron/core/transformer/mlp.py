@@ -27,7 +27,6 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_b
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.layer_interface import (
-    LayerInputs,
     LayerInterface,
     as_addends,
     layer_inputs_forward,
@@ -262,11 +261,7 @@ class MLP(MegatronModule, LayerInterface):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-    def forward_layer(self, x, inputs: LayerInputs):
-        """Return the dense update and optional bias without adding either."""
-        return as_addends(self.forward(x))
-
-    @layer_inputs_forward
+    @layer_inputs_forward(output=as_addends)
     def forward(
         self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
     ):

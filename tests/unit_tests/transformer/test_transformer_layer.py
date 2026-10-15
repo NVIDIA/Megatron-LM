@@ -1289,9 +1289,9 @@ class TestMHCWithCudaGraph:
     def test_mcore_cudagraph_manager_with_mhc_recompute_manager(self):
         """MCore CudaGraphManager must not crash on mhc_recompute_manager kwarg.
 
-        When cuda_graph_impl="local" is set, HyperConnectionTransformerLayer.__call__
-        runs first and pops mhc_recompute_manager off kwargs before
-        super().__call__ → MegatronModule.__call__ → CudaGraphManager.__call__,
+        After input binding, HyperConnectionTransformerLayer._call_with_bound_args
+        pops mhc_recompute_manager off kwargs before graph dispatch reaches
+        CudaGraphManager.__call__,
         which iterates over all kwargs to check supported types.
         CheckpointWithoutOutputManager (used by mhc_recompute_manager) is not a
         CUDA-graph-supported type.

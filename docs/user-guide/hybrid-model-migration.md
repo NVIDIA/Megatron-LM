@@ -387,10 +387,54 @@ state-dict differences:
   HybridModel pattern.
 
 Custom layer classes placed in a `HybridStack` must accept
-`layer(hidden_states, LayerInputs)`: subclass `TransformerLayer` or `MambaLayer`
-to inherit the adapter, or implement `forward(x, inputs)` directly. Legacy
-keyword arguments remain supported everywhere else. `MoESubmodules.pre_norm`
-is available for core input normalization and defaults to `IdentityOp`.
+`layer(hidden_states, LayerInputs)` and return the updated hidden-state tensor.
+A `MegatronModule` can keep an ordinary explicit-argument `forward` and opt into
+shared input binding:
+
+```python
+from megatron.core.transformer.layer_interface import layer_inputs_forward
+from megatron.core.transformer.module import MegatronModule
+
+class CustomLayer(MegatronModule):
+    @layer_inputs_forward
+    def forward(self, hidden_states, attention_mask=None, inference_context=None):
+        # Implement the layer using the named arguments as usual.
+        return hidden_states + self.compute(hidden_states, attention_mask, inference_context)
+```
+
+The decorator prepares the field mapping once, using the forward signature.
+Callers pass `layer(hidden_states, inputs)` for every layer; layer implementations
+need neither a `forward_layer` method nor manual container unpacking. Only named
+fields are bound. A `**kwargs` parameter does not receive all container fields.
+Legacy calls such as `layer(hidden_states, attention_mask=mask)` still work and
+retain their original output contract. The `inputs` keyword is reserved for the
+container and cannot be mixed with legacy arguments.
+
+For a parameter with a different name, declare its source field with
+`aliases={"packed_sequence_cp_metadata": "cp_metadata"}`. A forwarding method
+with `*args, **kwargs` must expose a concrete signature, for example by placing
+`@copy_signature(the_forwarded_method)` beneath `@layer_inputs_forward`.
+Subclasses inherit the binding when they inherit `forward`; an overridden
+`forward` should declare its own binding. Native `forward(x, inputs)` methods
+continue to work without a decorator.
+
+Compute cores return `Addends`, while complete residual layers return a tensor.
+A legacy core returning `(output, bias)` declares
+`@layer_inputs_forward(output=as_addends)`. A legacy skeleton returning
+`(hidden_states, context)` declares `output=lambda result: result[0]`. The shared
+utility does not infer the meaning of a tuple or perform residual arithmetic.
+`MoESubmodules.pre_norm` is available for core input normalization and defaults to
+`IdentityOp`; the MoE binding applies it only for shared calls and requests
+separate routed and shared addends.
+
+`MegatronModule` binds shared inputs before module hooks and CUDA-graph selection.
+Hooks see the ordinary forward arguments and legacy result; output conversion
+happens after execution or graph replay. Direct `.forward(...)` calls also accept
+the container, but bypass module hooks and graph selection as usual. Graphable
+modules dispatch through `_call_with_bound_args`; per-call setup that must run
+after binding and before graph selection belongs at that boundary. The existing
+skeleton bindings preserve their graph argument sets, including omission of
+non-hash token IDs and absent optional recompute/context arguments.
 
 ### Validate before scaling up
 

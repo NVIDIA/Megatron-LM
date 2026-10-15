@@ -37,8 +37,6 @@ from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.layer_interface import (
-    Addends,
-    LayerInputs,
     LayerInterface,
     as_addends,
     layer_inputs_forward,
@@ -536,18 +534,7 @@ class GatedDeltaProductMixer(
         """Apply GDP's output projection to a recurrence output."""
         return self.out_proj(y)
 
-    def forward_layer(self, x: torch.Tensor, inputs: LayerInputs) -> Addends:
-        """Run GDP compute with shared inputs, leaving the output bias deferred."""
-        return as_addends(
-            self.forward(
-                x,
-                inference_context=inputs.inference_context,
-                packed_seq_params=inputs.packed_seq_params,
-                packed_sequence_cp_metadata=inputs.cp_metadata,
-            )
-        )
-
-    @layer_inputs_forward
+    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"}, output=as_addends)
     def forward(
         self,
         hidden_states,

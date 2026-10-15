@@ -7,7 +7,8 @@ only on the input container, never on the kind of layer or core.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import inspect
+from dataclasses import dataclass, fields
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -66,10 +67,10 @@ def as_addends(output: tuple[Tensor, Tensor | None]) -> Addends:
 class LayerInterface(Protocol):
     """A core consumes hidden-width input and returns additive tensor updates.
 
-    New cores implement ``forward(x, inputs) -> Addends`` directly and list this
-    protocol as a base. They own their norms and compute, and need no residual
-    wrapper, ``forward_layer`` method, or compatibility decorator to implement
-    this interface. Residual updates and output dropout belong to the caller.
+    Cores can implement ``forward(x, inputs) -> Addends`` directly, or decorate
+    an explicit-argument ``forward`` with ``layer_inputs_forward``. The shared
+    module entry point binds the fields before execution. Cores own their norms
+    and compute; residual updates and output dropout belong to the caller.
     """
 
     def forward(self, x: Tensor, inputs: LayerInputs) -> Addends:
@@ -84,32 +85,145 @@ def wants_input_ids(module) -> bool:
     return bool(getattr(router, "is_hash_layer", False))
 
 
-@internal_api
-def layer_inputs_forward(legacy_forward):
-    """Adapt an existing forward during migration; new cores implement the protocol directly.
+@experimental_api
+def layer_inputs_forward(
+    legacy_forward=None,
+    *,
+    aliases=None,
+    output=None,
+    omit_none=(),
+    exclude=(),
+    include_if=None,
+    extra_kwargs=None,
+    input_transform=None,
+    reject=None,
+):
+    """Accept ``(hidden_states, LayerInputs)`` through an ordinary forward signature.
 
-    The decorated legacy implementation supplies ``forward_layer(x, inputs)``
-    to translate inputs and results while keeping its old call shape available.
+    Binding is prepared at decoration time. Only named parameters matching input
+    fields are selected; ``**kwargs`` never opts a layer into every field. Use
+    ``copy_signature`` beneath this decorator for forwarding-only methods.
+
+    ``aliases`` maps forward parameter names to input field names, including
+    explicitly forwarded kwargs. ``exclude`` skips unused parameters, while
+    ``omit_none`` preserves legacy graph argument sets. ``include_if`` maps
+    parameter names to predicates on the module. ``extra_kwargs`` and
+    ``input_transform(module, hidden_states)`` express shared-call-only behavior.
+    ``reject`` is an exception for all shared calls, or a field-to-exception map
+    rejecting non-None values. ``output`` converts legacy results explicitly.
+
+    MegatronModule applies the attached binder before hooks and graph dispatch,
+    then converts the result after execution. The wrapper also supports direct
+    ``forward`` calls. Legacy calls bypass all shared-call policies. ``inputs``
+    is reserved for the container and cannot be mixed with legacy arguments.
     """
+    if legacy_forward is None:
+        return lambda forward: layer_inputs_forward(
+            forward,
+            aliases=aliases,
+            output=output,
+            omit_none=omit_none,
+            exclude=exclude,
+            include_if=include_if,
+            extra_kwargs=extra_kwargs,
+            input_transform=input_transform,
+            reject=reject,
+        )
+
+    parameters = list(inspect.signature(legacy_forward).parameters.values())[1:]
+    if not parameters or parameters[0].kind not in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    ):
+        raise TypeError("A LayerInputs forward needs an explicit hidden-state parameter")
+    hidden_parameter = parameters[0]
+    field_names = {field.name for field in fields(LayerInputs)}
+    aliases = dict(aliases or {})
+    include_if = dict(include_if or {})
+    extra_kwargs = dict(extra_kwargs or {})
+    omit_none, exclude = frozenset(omit_none), frozenset(exclude)
+    named = {
+        parameter.name: parameter
+        for parameter in parameters[1:]
+        if parameter.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    }
+    has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters)
+    if "inputs" in named:
+        raise TypeError("A decorated forward must use explicit fields, not an inputs parameter")
+    for name, source in aliases.items():
+        if (
+            name in {hidden_parameter.name, "inputs"}
+            or source not in field_names
+            or (name not in named and not has_kwargs)
+        ):
+            raise ValueError(f"Invalid LayerInputs alias: {name} <- {source}")
+    mapping = {
+        name: aliases.get(name, name)
+        for name in dict.fromkeys((*named, *aliases))
+        if name not in exclude and aliases.get(name, name) in field_names
+    }
+    if not (set(omit_none) | set(include_if)) <= mapping.keys():
+        raise ValueError("LayerInputs policies must name bound forward parameters")
+    if not exclude <= named.keys():
+        raise ValueError("LayerInputs exclusions must name forward parameters")
+    if set(extra_kwargs) & (mapping.keys() | {hidden_parameter.name, "inputs"}):
+        raise ValueError("Extra kwargs cannot overwrite LayerInputs arguments")
+    if not has_kwargs and not extra_kwargs.keys() <= named.keys():
+        raise ValueError("Extra kwargs must name forward parameters")
+    for name, parameter in named.items():
+        if name in mapping and parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
+            raise TypeError("LayerInputs fields must be keyword-capable parameters")
+        if parameter.default is inspect.Parameter.empty and name not in mapping | extra_kwargs:
+            raise ValueError(f"Required parameter {name} has no LayerInputs binding")
+    if isinstance(reject, dict):
+        if not reject.keys() <= field_names:
+            raise ValueError("Rejected inputs must name LayerInputs fields")
+        reject = tuple(reject.items())
+    binding = tuple(
+        (name, source, name in omit_none, include_if.get(name)) for name, source in mapping.items()
+    )
+
+    def adapter(module, call, args, kwargs, *, hidden_as_keyword=False):
+        positional_inputs = len(args) >= 2 and isinstance(args[1], LayerInputs)
+        if not positional_inputs and "inputs" not in kwargs:
+            return call(*args, **kwargs)
+        if positional_inputs:
+            if len(args) != 2 or kwargs:
+                raise TypeError("LayerInputs cannot be mixed with legacy arguments")
+            hidden_states, inputs = args
+        else:
+            inputs = kwargs["inputs"]
+            if not isinstance(inputs, LayerInputs):
+                raise TypeError("inputs must be a LayerInputs instance")
+            if len(args) == 1 and len(kwargs) == 1:
+                hidden_states = args[0]
+            elif not args and len(kwargs) == 2 and ("x" in kwargs or "hidden_states" in kwargs):
+                hidden_states = kwargs["x"] if "x" in kwargs else kwargs["hidden_states"]
+            else:
+                raise TypeError("Use layer(hidden_states, inputs) without legacy arguments")
+        if isinstance(reject, Exception):
+            raise type(reject)(*reject.args)
+        for source, error in reject or ():
+            if getattr(inputs, source) is not None:
+                raise type(error)(*error.args)
+        bound = dict(extra_kwargs)
+        for name, source, skip_none, predicate in binding:
+            value = getattr(inputs, source)
+            if (skip_none and value is None) or (predicate is not None and not predicate(module)):
+                continue
+            bound[name] = value
+        if input_transform is not None:
+            hidden_states = input_transform(module, hidden_states)
+        if hidden_as_keyword and hidden_parameter.kind != inspect.Parameter.POSITIONAL_ONLY:
+            bound[hidden_parameter.name] = hidden_states
+            result = call(**bound)
+        else:
+            result = call(hidden_states, **bound)
+        return output(result) if output is not None else result
 
     @wraps(legacy_forward)
     def forward(self, *args, **kwargs):
-        # ``inputs`` is a reserved keyword for decorated forwards.
-        inputs = kwargs.pop("inputs", None)
-        if inputs is None and len(args) == 2 and isinstance(args[1], LayerInputs):
-            args, inputs = args[:1], args[1]
-        if inputs is not None:
-            if not isinstance(inputs, LayerInputs):
-                raise TypeError("inputs must be a LayerInputs instance")
-            if args:
-                if len(args) != 1 or kwargs:
-                    raise TypeError("Use layer(hidden_states, inputs) without legacy arguments")
-                hidden_states = args[0]
-            else:
-                hidden_states = kwargs.pop("x") if "x" in kwargs else kwargs.pop("hidden_states")
-                if kwargs:
-                    raise TypeError("LayerInputs cannot be mixed with legacy arguments")
-            return self.forward_layer(hidden_states, inputs)
-        return legacy_forward(self, *args, **kwargs)
+        return adapter(self, lambda *a, **kw: legacy_forward(self, *a, **kw), args, kwargs)
 
+    forward._layer_input_adapter = adapter
     return forward

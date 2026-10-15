@@ -32,7 +32,6 @@ from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
-    LayerInputs,
     LayerInterface,
     as_addends,
     layer_inputs_forward,
@@ -356,20 +355,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 
-    def forward_layer(self, x, inputs: LayerInputs):
-        """Return the recurrence update through the variant's existing forward."""
-        return as_addends(
-            self.forward(
-                x,
-                attention_mask=inputs.attention_mask,
-                inference_context=inputs.inference_context,
-                packed_seq_params=inputs.packed_seq_params,
-                sequence_len_offset=inputs.sequence_len_offset,
-                packed_sequence_cp_metadata=inputs.cp_metadata,
-            )
-        )
-
-    @layer_inputs_forward
+    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"}, output=as_addends)
     def forward(
         self,
         hidden_states: torch.Tensor,

@@ -52,7 +52,6 @@ from megatron.core.transformer.residual_recompute import (
     residual_stream_recompute_enabled,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
@@ -452,15 +451,6 @@ class HybridStack(MegatronModule):
             if router is not None and getattr(router, "is_mtp_layer", False):
                 router.mtp_layer_number = mtp_layer_number
 
-    @staticmethod
-    def _uses_hash_routing(layer: torch.nn.Module) -> bool:
-        """Return whether a (possibly mHC-wrapped) TransformerLayer uses hash routing."""
-        inner_layer = getattr(layer, "inner_layer", layer)
-        if not isinstance(inner_layer, TransformerLayer):
-            return False
-        router = getattr(getattr(inner_layer, "mlp", None), "router", None)
-        return bool(getattr(router, "is_hash_layer", False))
-
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
 
@@ -544,20 +534,6 @@ class HybridStack(MegatronModule):
         """Finalize the current mHC recompute block when its last layer finishes."""
         if manager is not None and is_block_end:
             manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
-
-    def forward_layer(self, hidden_states, inputs: LayerInputs):
-        """Call an MTP hybrid stack using the shared invocation inputs."""
-        return self.forward(
-            hidden_states,
-            attention_mask=inputs.attention_mask,
-            inference_context=inputs.inference_context,
-            rotary_pos_emb=inputs.rotary_pos_emb,
-            packed_seq_params=inputs.packed_seq_params,
-            padding_mask=inputs.padding_mask,
-            input_ids=inputs.input_ids,
-            packed_seq_params_by_layout=inputs.packed_seq_params_by_layout,
-            cp_layout_plan=inputs.cp_layout_plan,
-        )
 
     @layer_inputs_forward
     def forward(

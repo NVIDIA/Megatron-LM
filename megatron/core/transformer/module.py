@@ -11,7 +11,6 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.transformer.layer_interface import LayerInputs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -74,10 +73,32 @@ class MegatronModule(torch.nn.Module):
         config (TransformerConfig): Transformer config
     """
 
+    # Keep hidden states positional for PyTorch's backward hooks. Graphable
+    # modules override this to preserve their graph managers' keyword contract.
+    _layer_input_hidden_as_keyword = False
+
     # def __init__(self, config: TransformerConfig, share_word_embeddings=True):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+
+    def __call__(self, *args, **kwargs):
+        # Bind once, before graph selection or PyTorch hooks, and convert the
+        # result only after the normal module execution path has completed.
+        adapter = getattr(self.forward, "_layer_input_adapter", None)
+        if adapter is not None:
+            return adapter(
+                self,
+                self._call_with_bound_args,
+                args,
+                kwargs,
+                hidden_as_keyword=self._layer_input_hidden_as_keyword,
+            )
+        return self._call_with_bound_args(*args, **kwargs)
+
+    def _call_with_bound_args(self, *args, **kwargs):
+        """Execute an ordinary forward call through PyTorch's hook/compile machinery."""
+        return super().__call__(*args, **kwargs)
 
     def refresh_cache(self) -> None:
         """Refresh state derived from parameters after an in-place weight refit.
@@ -204,6 +225,8 @@ class GraphableMegatronModule(MegatronModule):
     Args:
         config (TransformerConfig): Transformer config
     """
+
+    _layer_input_hidden_as_keyword = True
 
     def __init__(self, config: TransformerConfig, vp_stage: Optional[int] = None):
         super().__init__(config)
@@ -403,23 +426,8 @@ class GraphableMegatronModule(MegatronModule):
             and (is_graph_capturing() or self.cuda_graphs)
         )
 
-    def __call__(self, *args, **kwargs):
-        # Transitional skeleton adapter: graph managers still capture/replay the legacy
-        # tensor arguments, rather than treating LayerInputs as an opaque static value.
-        # Native cores implement forward(x, inputs) directly and need no adapter.
-        legacy_adapter = getattr(self, "forward_layer", None)
-        if legacy_adapter is not None:
-            inputs = kwargs.get("inputs")
-            if len(args) == 2 and isinstance(args[1], LayerInputs):
-                if kwargs:
-                    raise TypeError("LayerInputs cannot be mixed with legacy arguments")
-                return legacy_adapter(args[0], args[1])
-            if isinstance(inputs, LayerInputs):
-                if len(args) == 1 and len(kwargs) == 1:
-                    return legacy_adapter(args[0], inputs)
-                if not args and set(kwargs) in ({"hidden_states", "inputs"}, {"x", "inputs"}):
-                    hidden_states = kwargs["x"] if "x" in kwargs else kwargs["hidden_states"]
-                    return legacy_adapter(hidden_states, inputs)
+    def _call_with_bound_args(self, *args, **kwargs):
+        """Select capture/replay after shared inputs have become ordinary arguments."""
         if self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
         elif self._should_call_te_cudagraph(*args, **kwargs):
@@ -430,7 +438,7 @@ class GraphableMegatronModule(MegatronModule):
                 # Do CUDA Graphs replay.
                 cuda_graph_func = self._te_cuda_graph_replay
             return cuda_graph_func(*args, **kwargs)
-        return super().__call__(*args, **kwargs)
+        return super()._call_with_bound_args(*args, **kwargs)
 
 
 def conversion_helper(val, conversion):

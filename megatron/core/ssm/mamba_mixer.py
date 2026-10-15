@@ -39,7 +39,6 @@ from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.layer_interface import (
-    LayerInputs,
     LayerInterface,
     as_addends,
     layer_inputs_forward,
@@ -529,21 +528,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         """Apply the Mamba output projection to an SSM output tensor."""
         return self.out_proj(y)
 
-    def forward_layer(self, x, inputs: LayerInputs):
-        """Run the mixer through its existing training/inference entry point."""
-        if inputs.cp_metadata is not None:
-            raise NotImplementedError(
+    @layer_inputs_forward(
+        output=as_addends,
+        reject={
+            "cp_metadata": NotImplementedError(
                 "MambaMixer does not support packed-sequence chunkwise CP metadata."
             )
-        return as_addends(
-            self.forward(
-                x,
-                inference_context=inputs.inference_context,
-                packed_seq_params=inputs.packed_seq_params,
-            )
-        )
-
-    @layer_inputs_forward
+        },
+    )
     def forward(
         self,
         hidden_states,
