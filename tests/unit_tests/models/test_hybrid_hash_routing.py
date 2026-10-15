@@ -16,6 +16,7 @@ from megatron.core.models.hybrid.hybrid_model import (
     _validate_hash_moe_pipeline_placement,
 )
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.moe import router as router_module
 from megatron.core.transformer.moe.router import TopKRouter
@@ -96,11 +97,12 @@ class RecordingHashMlpTransformerLayer(TransformerLayer):
         return (torch.zeros_like(hidden_states), None), hidden_states
 
 
-class RecordingNonTransformerLayer(torch.nn.Module):
+class RecordingNonTransformerLayer(MambaLayer):
     """Mamba-like layer whose signature deliberately excludes input_ids."""
 
     def __init__(self, layer_number=2):
-        super().__init__()
+        torch.nn.Module.__init__(self)
+        self.config = SimpleNamespace(cuda_graph_impl="none")
         self.layer_number = layer_number
         self.num_calls = 0
 
@@ -110,8 +112,10 @@ class RecordingNonTransformerLayer(torch.nn.Module):
         attention_mask=None,
         inference_context=None,
         rotary_pos_emb=None,
+        residual_stream_recompute_context=None,
         *,
         packed_seq_params=None,
+        packed_sequence_cp_metadata=None,
     ):
         self.num_calls += 1
         return hidden_states
@@ -200,7 +204,7 @@ def run_stack(stack, input_ids):
     return output
 
 
-def test_hybrid_stack_forwards_input_ids_only_to_transformer_layers():
+def test_hybrid_stack_passes_shared_ids_and_mamba_ignores_them():
     transformer_layer = RecordingTransformerLayer()
     learned_transformer_layer = RecordingTransformerLayer(layer_number=2, is_hash_layer=False)
     non_transformer_layer = RecordingNonTransformerLayer()
@@ -214,7 +218,7 @@ def test_hybrid_stack_forwards_input_ids_only_to_transformer_layers():
     assert non_transformer_layer.num_calls == 1
 
 
-def test_hybrid_stack_omits_input_ids_keyword_when_not_provided():
+def test_hybrid_stack_omits_absent_ids_from_legacy_calls():
     transformer_layer = RecordingTransformerLayer()
     stack = make_stack([transformer_layer])
 

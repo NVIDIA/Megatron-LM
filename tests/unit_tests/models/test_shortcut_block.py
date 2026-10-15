@@ -333,9 +333,9 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     inference_context = object()
     observed = {}
 
-    def compute_forward(hidden_states, **kwargs):
-        observed["compute_context"] = kwargs["inference_context"]
-        return hidden_states + 1, None
+    def compute_forward(hidden_states, inputs):
+        observed["compute_context"] = inputs.inference_context
+        return hidden_states + 1
 
     def two_stage(*_args, **_kwargs):
         raise AssertionError("inference must not use the two-stage training path")

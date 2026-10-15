@@ -9,6 +9,8 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
+from megatron.core.transformer.layer_interface import LayerInputs, layer_inputs_forward
+
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 
@@ -1116,6 +1118,35 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return hidden_states, context
 
+    def forward_layer(self, hidden_states, inputs: LayerInputs):
+        """Adapt shared inputs while preserving the legacy graph argument set."""
+        kwargs = dict(
+            attention_mask=inputs.attention_mask,
+            inference_context=inputs.inference_context,
+            rotary_pos_emb=inputs.rotary_pos_emb,
+            sequence_len_offset=inputs.sequence_len_offset,
+            packed_seq_params=inputs.packed_seq_params,
+            padding_mask=inputs.padding_mask,
+        )
+        for name in (
+            "context",
+            "context_mask",
+            "rotary_pos_cos",
+            "rotary_pos_sin",
+            "attention_bias",
+            "residual_stream_recompute_context",
+        ):
+            value = getattr(inputs, name)
+            if value is not None:
+                kwargs[name] = value
+        # Only hash routers reserve a token-ID input in the legacy CUDA graph.
+        router = getattr(getattr(self, "mlp", None), "router", None)
+        if inputs.input_ids is not None and getattr(router, "is_hash_layer", False):
+            kwargs["input_ids"] = inputs.input_ids
+        output, _ = self(hidden_states=hidden_states, **kwargs)
+        return output
+
+    @layer_inputs_forward
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
         """

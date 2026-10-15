@@ -31,6 +31,12 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import (
+    LayerInputs,
+    LayerInterface,
+    as_addends,
+    layer_inputs_forward,
+)
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
@@ -91,7 +97,7 @@ class GatedDeltaRuleInterface(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
 
 
-class _GDNBase(MegatronModule, TwoStageAttentionLayer):
+class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
     """Common base class for the Gated Delta Net (GDN) family of layers.
 
     Hosts everything the GDN variants share: the fused input projection, causal
@@ -350,6 +356,20 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 
+    def forward_layer(self, x, inputs: LayerInputs):
+        """Return the recurrence update through the variant's existing forward."""
+        return as_addends(
+            self.forward(
+                x,
+                attention_mask=inputs.attention_mask,
+                inference_context=inputs.inference_context,
+                packed_seq_params=inputs.packed_seq_params,
+                sequence_len_offset=inputs.sequence_len_offset,
+                packed_sequence_cp_metadata=inputs.cp_metadata,
+            )
+        )
+
+    @layer_inputs_forward
     def forward(
         self,
         hidden_states: torch.Tensor,

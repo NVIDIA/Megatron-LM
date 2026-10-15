@@ -197,7 +197,7 @@ class MoETokenDispatcher:
         raise NotImplementedError("token_combine function not implemented.")
 
     @abstractmethod
-    def combine_postprocess(self, hidden_states):
+    def combine_postprocess(self, hidden_states, *, return_shared_expert_output=False):
         """Performs local processing after token combine.
 
         This method handles post-communication tasks like unpermuting and
@@ -209,6 +209,8 @@ class MoETokenDispatcher:
             same stream runs sequentially and may get exposed.
 
         Args:
+            return_shared_expert_output (bool): Return (routed, shared) without their add.
+                Defaults to False for the legacy forward.
             hidden_states (torch.Tensor): Combined hidden states from token combination
 
         Returns:
@@ -370,9 +372,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             ).to(hidden_states.dtype)
         return hidden_states
 
-    def combine_postprocess(self, hidden_states):
+    def combine_postprocess(self, hidden_states, *, return_shared_expert_output=False):
         """Restores the original tensor shape."""
-        return hidden_states.view(self.hidden_shape)
+        output = hidden_states.view(self.hidden_shape)
+        return (output, None) if return_shared_expert_output else output
 
 
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
@@ -876,7 +879,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
         return permutated_local_input_tokens
 
-    def combine_postprocess(self, permutated_local_input_tokens):
+    def combine_postprocess(
+        self, permutated_local_input_tokens, *, return_shared_expert_output=False
+    ):
         """Finalizes token reconstruction with un-permutation and reshaping.
 
         This method un-permutes the tokens back to their original order,
@@ -904,11 +909,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
 
-        # Add shared experts output
+        # Keep the overlap ordering; the new core entry point defers only the add.
+        shared_expert_output = None
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
-            output += shared_expert_output
-        return output
+            if not return_shared_expert_output:
+                output += shared_expert_output
+        return (output, shared_expert_output) if return_shared_expert_output else output
 
     def _maybe_update_cuda_sync_point(self, point: str):
         """
@@ -2163,7 +2170,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.wait_current_stream()
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
-    def combine_postprocess(self, hidden_states: torch.Tensor):
+    def combine_postprocess(
+        self, hidden_states: torch.Tensor, *, return_shared_expert_output=False
+    ):
         """
         Restores the original tensor shape and finalizes the MoE layer output.
 
@@ -2176,11 +2185,19 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
+        shared_expert_output = None
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(hidden_states)
             self.shared_experts.post_forward_comm()
-            hidden_states += self.shared_experts.get_output()
-        return hidden_states.view(self.hidden_shape)
+            shared_expert_output = self.shared_experts.get_output()
+            if not return_shared_expert_output:
+                hidden_states += shared_expert_output
+        output = hidden_states.view(self.hidden_shape)
+        if return_shared_expert_output:
+            if shared_expert_output is not None:
+                shared_expert_output = shared_expert_output.view(self.hidden_shape)
+            return output, shared_expert_output
+        return output
 
     def check_over_budget(self):
         """Check if the dispatcher has exceeded its budget."""

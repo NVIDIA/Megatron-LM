@@ -46,6 +46,7 @@ from megatron.core.transformer.hyper_connection import (
     learned_output_contract,
 )
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import LayerInputs, layer_inputs_forward
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute import (
     build_residual_stream_recompute_plan,
@@ -119,6 +120,8 @@ class HybridStack(MegatronModule):
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers.
     """
+
+    _uses_layer_inputs = True
 
     def __init__(
         self,
@@ -543,6 +546,21 @@ class HybridStack(MegatronModule):
         if manager is not None and is_block_end:
             manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
+    def forward_layer(self, hidden_states, inputs: LayerInputs):
+        """Call an MTP hybrid stack using the shared invocation inputs."""
+        return self.forward(
+            hidden_states,
+            attention_mask=inputs.attention_mask,
+            inference_context=inputs.inference_context,
+            rotary_pos_emb=inputs.rotary_pos_emb,
+            packed_seq_params=inputs.packed_seq_params,
+            padding_mask=inputs.padding_mask,
+            input_ids=inputs.input_ids,
+            packed_seq_params_by_layout=inputs.packed_seq_params_by_layout,
+            cp_layout_plan=inputs.cp_layout_plan,
+        )
+
+    @layer_inputs_forward
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -760,68 +778,22 @@ class HybridStack(MegatronModule):
                             layer_config, layer.layer_number - 1
                         )
                         with inner_quant_context:
-                            if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
-                                layer_kwargs = dict(
-                                    hidden_states=hidden_states,
+                            hidden_states = layer(
+                                hidden_states,
+                                LayerInputs(
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     rotary_pos_emb=rotary_pos_emb,
                                     sequence_len_offset=sequence_len_offset,
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=padding_mask,
-                                )
-                                if layer_cp_metadata is not None:
-                                    layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
-                                if residual_stream_recompute_context is not None:
-                                    if isinstance(layer, HyperConnectionHybridLayer):
-                                        raise TypeError(
-                                            "'residual_stream' recomputation cannot be applied to "
-                                            "HyperConnectionHybridLayer. Wide residuals replay "
-                                            "connection reads, connected norms, and writes "
-                                            "through ResidualStreamRecomputeContext, while mHC "
-                                            "uses its own mhc_recompute_manager. For mHC, select "
-                                            "'mhc' in recompute_modules and configure "
-                                            "mhc_recompute_layer_num instead."
-                                        )
-                                    layer_kwargs["residual_stream_recompute_context"] = (
-                                        residual_stream_recompute_context
-                                    )
-                                if mhc_manager is not None and isinstance(
-                                    layer, HyperConnectionHybridLayer
-                                ):
-                                    layer_kwargs["mhc_recompute_manager"] = mhc_manager
-                                if input_ids is not None and self._uses_hash_routing(layer):
-                                    layer_kwargs["input_ids"] = input_ids
-                                hidden_states, _ = layer(**layer_kwargs)
-                            elif isinstance(layer, MambaLayer):
-                                layer_kwargs = dict(
-                                    hidden_states=hidden_states,
-                                    attention_mask=attention_mask,
-                                    inference_context=inference_context,
-                                    packed_seq_params=layer_packed_seq_params,
-                                )
-                                if layer_cp_metadata is not None:
-                                    layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
-                                if residual_stream_recompute_context is not None:
-                                    layer_kwargs["residual_stream_recompute_context"] = (
-                                        residual_stream_recompute_context
-                                    )
-                                hidden_states = layer(**layer_kwargs)
-                            else:  # Expert or MLP
-                                if residual_stream_recompute_context is not None:
-                                    raise TypeError(
-                                        "Residual-stream recomputation in HybridStack supports "
-                                        "TransformerLayer and MambaLayer modules only."
-                                    )
-                                hidden_states = layer(
-                                    hidden_states=hidden_states,
-                                    attention_mask=attention_mask,
-                                    inference_context=inference_context,
-                                    packed_seq_params=layer_packed_seq_params,
-                                )
+                                    input_ids=input_ids,
+                                    cp_metadata=layer_cp_metadata,
+                                    residual_stream_recompute_context=residual_stream_recompute_context,
+                                    mhc_recompute_manager=mhc_manager,
+                                ),
+                            )
 
-                        if isinstance(hidden_states, tuple):
-                            hidden_states = hidden_states[0]
                         observe_layer_residuals(layer, residual_accumulator, hidden_states)
                         if cp_layout_state is not None:
                             hidden_states = cp_layout_state.finalize_layer(

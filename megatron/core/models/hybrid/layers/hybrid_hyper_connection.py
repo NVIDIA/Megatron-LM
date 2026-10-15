@@ -11,6 +11,7 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import LayerInputs, layer_inputs_forward
 from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
@@ -157,6 +158,25 @@ class HyperConnectionHybridLayer(MegatronModule):
             layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
+    def forward_layer(self, hidden_states, inputs: LayerInputs):
+        """Adapt shared inputs to the mHC wrapper without changing its residual update."""
+        if inputs.residual_stream_recompute_context is not None:
+            raise TypeError("Use mhc recomputation for HyperConnectionHybridLayer")
+        output, _ = self.forward(
+            hidden_states,
+            attention_mask=inputs.attention_mask,
+            inference_context=inputs.inference_context,
+            rotary_pos_emb=inputs.rotary_pos_emb,
+            sequence_len_offset=inputs.sequence_len_offset,
+            packed_seq_params=inputs.packed_seq_params,
+            padding_mask=inputs.padding_mask,
+            packed_sequence_cp_metadata=inputs.cp_metadata,
+            mhc_recompute_manager=inputs.mhc_recompute_manager,
+            input_ids=inputs.input_ids,
+        )
+        return output
+
+    @layer_inputs_forward
     def forward(
         self,
         hidden_states: Tensor,

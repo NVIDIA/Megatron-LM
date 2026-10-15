@@ -11,6 +11,8 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+from megatron.core.transformer.layer_interface import LayerInputs, layer_inputs_forward
+
 try:
     from nemo.lens.helpers import managed_span as _otel_managed_span
 except ImportError:
@@ -245,6 +247,20 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         return None
 
+    def forward_layer(self, hidden_states, inputs: LayerInputs):
+        """Adapt shared inputs to the unchanged Mamba skeleton."""
+        kwargs = dict(
+            attention_mask=inputs.attention_mask,
+            inference_context=inputs.inference_context,
+            packed_seq_params=inputs.packed_seq_params,
+        )
+        if inputs.cp_metadata is not None:
+            kwargs["packed_sequence_cp_metadata"] = inputs.cp_metadata
+        if inputs.residual_stream_recompute_context is not None:
+            kwargs["residual_stream_recompute_context"] = inputs.residual_stream_recompute_context
+        return self(hidden_states=hidden_states, **kwargs)
+
+    @layer_inputs_forward
     def forward(
         self,
         hidden_states: Tensor,

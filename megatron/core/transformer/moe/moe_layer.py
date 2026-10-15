@@ -15,6 +15,12 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_rout
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import (
+    LayerInputs,
+    LayerInterface,
+    layer_inputs_forward,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -34,6 +40,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
@@ -171,6 +178,7 @@ class MoESubmodules:
     experts: ExpertsBuilder
     shared_experts: SharedExpertsBuilder | None = None
     router: RouterBuilder = TopKRouter
+    pre_norm: ModuleSpec | type = IdentityOp
 
 
 class BaseMoELayer(MegatronModule, ABC):
@@ -226,7 +234,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
-class MoELayer(BaseMoELayer):
+class MoELayer(BaseMoELayer, LayerInterface):
     """Mixture of Experts layer.
 
     This layer implements a Mixture of Experts model, where each token is routed to a
@@ -258,6 +266,12 @@ class MoELayer(BaseMoELayer):
             layer_number=layer_number,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
+        )
+        self.pre_norm = build_module(
+            self.submodules.pre_norm,
+            config=config,
+            hidden_size=config.hidden_size,
+            eps=config.layernorm_epsilon,
         )
         # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
@@ -654,7 +668,13 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.token_combine(output)
         return output
 
-    def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
+    def postprocess(
+        self,
+        output: torch.Tensor,
+        shared_expert_output: Optional[torch.Tensor],
+        *,
+        _return_addends: bool = False,
+    ):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed.
 
@@ -662,12 +682,29 @@ class MoELayer(BaseMoELayer):
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
 
-        output = self.token_dispatcher.combine_postprocess(output)
+        if _return_addends:
+            output, overlapped_shared = self.token_dispatcher.combine_postprocess(
+                output, return_shared_expert_output=True
+            )
+            if overlapped_shared is not None:
+                shared_expert_output = overlapped_shared
+        else:
+            output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
 
+        if _return_addends:
+            if (
+                shared_expert_output is None
+                and isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
+                and self._latent_shared_expert_output is not None
+            ):
+                torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
+                shared_expert_output = self._latent_shared_expert_output
+                self._latent_shared_expert_output = None
+            return (output,) if shared_expert_output is None else (output, shared_expert_output)
         if shared_expert_output is not None:
             output = output + shared_expert_output
         elif (
@@ -688,6 +725,17 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
+    def forward_layer(self, x, inputs: LayerInputs):
+        """Return routed and shared updates separately, with an optional core-owned norm."""
+        return self.forward(
+            self.pre_norm(x),
+            padding_mask=inputs.padding_mask,
+            input_ids=inputs.input_ids,
+            packed_seq_params=inputs.packed_seq_params,
+            _return_addends=True,
+        )
+
+    @layer_inputs_forward
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -695,6 +743,8 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        _return_addends: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -714,6 +764,8 @@ class MoELayer(BaseMoELayer):
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
+        if _return_addends and intermediate_tensors is not None:
+            raise ValueError("The LayerInputs entry point requires a complete MoE forward")
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
@@ -762,6 +814,8 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     output, shared_expert_output = intermediate_tensors
 
+                if _return_addends:
+                    return self.postprocess(output, shared_expert_output, _return_addends=True)
                 output = self.postprocess(output, shared_expert_output)
 
                 if intermediate_tensors is not None:

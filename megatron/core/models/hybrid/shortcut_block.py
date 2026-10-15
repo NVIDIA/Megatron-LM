@@ -27,6 +27,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as Layer
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import LayerInputs
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
@@ -412,23 +413,17 @@ class ShortcutMoEBlock(MegatronModule):
 
         Uses the same per-layer arguments as HybridStack.forward passes to unpaired layers.
         """
-        if isinstance(self.compute_layer, MambaLayer):
-            return self.compute_layer(
-                hidden_states=hidden_states,
+        return self.compute_layer(
+            hidden_states,
+            LayerInputs(
                 attention_mask=attention_mask,
                 inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
                 packed_seq_params=packed_seq_params,
-            )
-        hidden_states, _ = self.compute_layer(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            sequence_len_offset=sequence_len_offset,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
+                padding_mask=padding_mask,
+            ),
         )
-        return hidden_states
 
     def forward(
         self,

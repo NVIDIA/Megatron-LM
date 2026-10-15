@@ -34,6 +34,7 @@ from megatron.core.tensor_parallel.inference_layers import (
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
+from megatron.core.transformer.layer_interface import LayerInputs
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -1774,22 +1775,11 @@ class MultiTokenPredictionLayer(MegatronModule):
             # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
             # can be triggered correctly.
             with transformer_layer_quantization_context:
-                if self.mtp_layer_pattern is not None:
-                    hidden_states = self.mtp_model_layer(
-                        hidden_states=hidden_states,
+                hidden_states = self.mtp_model_layer(
+                    hidden_states,
+                    LayerInputs(
                         attention_mask=attention_mask,
                         padding_mask=padding_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        inference_context=inference_params,
-                        packed_seq_params=packed_seq_params,
-                        packed_seq_params_by_layout=packed_seq_params_by_layout,
-                        cp_layout_plan=cp_layout_plan,
-                    )
-                else:
-                    # GPT path: single TransformerLayer
-                    hidden_states, _ = self.mtp_model_layer(
-                        hidden_states=hidden_states,
-                        attention_mask=attention_mask,
                         context=context,
                         context_mask=context_mask,
                         rotary_pos_emb=rotary_pos_emb,
@@ -1799,8 +1789,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
-                        padding_mask=padding_mask,
-                    )
+                        packed_seq_params_by_layout=packed_seq_params_by_layout,
+                        cp_layout_plan=cp_layout_plan,
+                    ),
+                )
 
         if not self.mhc_enabled:
             hidden_states = self._postprocess(hidden_states)
