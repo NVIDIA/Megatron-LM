@@ -1525,14 +1525,17 @@ _DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS = frozenset((16, 32, 64, 96, 128))
 # scratch alone is 128 fp32 shards of the whole KV, so there is deliberately one buffer per device
 # rather than one per stream or per graph, and its ownership is made explicit instead:
 #
+# * Configuration: a device's cache uses one fixed ``cuda_graph`` configuration. Mixing graph
+#   and non-graph callers is rejected before reuse or growth. This is the caller's config, not
+#   the capture state: graph-mode eager warmup and capture must use the same cache entry.
 # * Streams: the buffer is owned by one stream at a time (``owner_stream``). Handing it out on
 #   another stream first makes that stream wait for everything the previous owner has enqueued
 #   (its kernels were launched right after their own hand-out) and records the new stream on the
 #   allocation, so two streams never run the kernel on the scratch concurrently and a replaced
 #   buffer is not recycled by the allocator while the other stream may still read it.
 # * CUDA graphs: a hand-out while the current stream is capturing bakes the buffer's address into
-#   the graph. No event wait is possible (or needed) there: the capture stream never executes and
-#   the replay is stream-ordered with the rest of the compute stream's work. Such a buffer is
+#   the graph without an eager stream handover. Replay ordering is provided by Megatron's
+#   compute schedule; arbitrary cross-stream graph replay is not supported. Such a buffer is
 #   marked ``graph_owned``; when a larger request later replaces it, it is kept alive for the rest
 #   of the process (``_DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES``) whoever makes that request,
 #   because graph lifetimes are not observable here. With static graph shapes this never happens.
@@ -1544,6 +1547,7 @@ class _DeterministicSparseBwdWorkspace:
 
     buffer: Tensor
     owner_stream: torch.cuda.Stream
+    graph_mode: bool
     graph_owned: bool = False
 
 
@@ -1623,6 +1627,11 @@ def _get_deterministic_sparse_attention_workspace(
     capturing = torch.cuda.is_current_stream_capturing()
     with _DETERMINISTIC_SPARSE_BWD_LOCK:
         entry = _DETERMINISTIC_SPARSE_BWD_WORKSPACES.get(device.index)
+        if entry is not None and entry.graph_mode != bool(cuda_graph):
+            raise RuntimeError(
+                "Mixing CUDA-graph and non-graph deterministic CSA on the same device is not "
+                "supported. Use a consistent cuda_graph configuration for all callers."
+            )
         if entry is not None and entry.buffer.numel() < required_bytes:
             if entry.graph_owned:
                 # A captured graph may still hold this address: keep it alive.
@@ -1634,6 +1643,7 @@ def _get_deterministic_sparse_attention_workspace(
             entry = _DeterministicSparseBwdWorkspace(
                 buffer=torch.empty(required_bytes, dtype=torch.uint8, device=device),
                 owner_stream=stream,
+                graph_mode=bool(cuda_graph),
             )
             _DETERMINISTIC_SPARSE_BWD_WORKSPACES[device.index] = entry
         elif not capturing and entry.owner_stream.cuda_stream != stream.cuda_stream:

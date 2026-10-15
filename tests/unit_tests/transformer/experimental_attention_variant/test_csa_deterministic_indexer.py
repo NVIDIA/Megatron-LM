@@ -123,6 +123,7 @@ def test_deterministic_indexer_grads_match_reference_and_replay(
             )
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_deterministic_indexer_grads_match_cudnn_kernel():
     """The replacement must follow cuDNN's clipped-log KL, not only well-normalized targets."""
@@ -250,8 +251,10 @@ def _retired_ptrs():
     return [t.data_ptr() for t in dk._DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES]
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_sparse_bwd_kwargs_select_deterministic_kernel_and_bound_workspace(monkeypatch):
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_sparse_bwd_kwargs_select_deterministic_kernel_and_bound_workspace(monkeypatch, cuda_graph):
     _reset_workspace_cache(monkeypatch)
     device = torch.device("cuda", torch.cuda.current_device())
     args = _sparse_attn_sample(device)
@@ -259,42 +262,72 @@ def test_sparse_bwd_kwargs_select_deterministic_kernel_and_bound_workspace(monke
     # Not requested: the default (atomic) kernel, no extra kwargs.
     assert dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5) == {}
     with patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)):
-        kwargs = dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+        kwargs = dk._deterministic_sparse_bwd_kwargs(
+            *args, None, 0.5, requested=True, cuda_graph=cuda_graph
+        )
         assert kwargs["deterministic"] is True
         workspace = kwargs["workspace"]
         assert workspace.is_cuda and workspace.dtype == torch.uint8 and workspace.numel() == 4096
         entry = _workspace_entry(device)
         assert entry.owner_stream == torch.cuda.current_stream(device)
-        assert not entry.graph_owned
+        assert entry.graph_mode is cuda_graph
+        assert entry.graph_owned is cuda_graph
         # Same size again: the retained per-device buffer is reused (same storage).
-        again = dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+        again = dk._deterministic_sparse_bwd_kwargs(
+            *args, None, 0.5, requested=True, cuda_graph=cuda_graph
+        )
         assert again["workspace"].data_ptr() == workspace.data_ptr()
         # Smaller request: a slice of the same buffer, no new allocation.
         _FakeBackwardApi.workspace_bytes = 1024
-        smaller = dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+        smaller = dk._deterministic_sparse_bwd_kwargs(
+            *args, None, 0.5, requested=True, cuda_graph=cuda_graph
+        )
         assert smaller["workspace"].numel() == 1024
         assert smaller["workspace"].data_ptr() == workspace.data_ptr()
-        # Larger request while no graph ever saw the buffer: it is replaced and released.
+        # Growth preserves graph-owned storage, but releases eager-only storage.
         _FakeBackwardApi.workspace_bytes = 8192
-        bigger = dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+        bigger = dk._deterministic_sparse_bwd_kwargs(
+            *args, None, 0.5, requested=True, cuda_graph=cuda_graph
+        )
         assert bigger["workspace"].numel() == 8192
         assert len(dk._DETERMINISTIC_SPARSE_BWD_WORKSPACES) == 1
-        assert _retired_ptrs() == []
-        # A caller running with CUDA graphs (TransformerConfig.cuda_graph_impl != "none") marks
-        # the buffer itself as graph-owned ...
-        marked = dk._deterministic_sparse_bwd_kwargs(
-            *args, None, 0.5, requested=True, cuda_graph=True
+        assert _retired_ptrs() == ([workspace.data_ptr()] if cuda_graph else [])
+        assert _workspace_entry(device).graph_mode is cuda_graph
+        assert _workspace_entry(device).graph_owned is cuda_graph
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("initial_graph_mode", [False, True])
+@pytest.mark.parametrize("requested_bytes", [4096, 8192])
+def test_deterministic_sparse_bwd_workspace_rejects_mixed_graph_modes(
+    monkeypatch, initial_graph_mode, requested_bytes
+):
+    """Reject either configuration change before mutating a reused or growing cache entry."""
+    _reset_workspace_cache(monkeypatch)
+    device = torch.device("cuda", 0)
+    stream = types.SimpleNamespace(cuda_stream=1)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    q = types.SimpleNamespace(device=device)
+    # CPU storage and mocked stream identities isolate this configuration-only guard.
+    buffer = torch.empty(4096, dtype=torch.uint8)
+    with patch.object(torch, "empty", return_value=buffer) as allocate:
+        dk._get_deterministic_sparse_attention_workspace(
+            q, None, None, None, None, None, None, 0.5, cuda_graph=initial_graph_mode
         )
-        assert marked["workspace"].data_ptr() == bigger["workspace"].data_ptr()
-        assert _workspace_entry(device).graph_owned
-        # ... so when a later request outgrows it, it is kept alive whoever makes that request:
-        # here a caller without graphs.
-        _FakeBackwardApi.workspace_bytes = 16384
-        grown = dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
-        assert grown["workspace"].numel() == 16384
-        assert _retired_ptrs() == [bigger["workspace"].data_ptr()]
-        # The replacement has not been seen by any graph yet.
-        assert not _workspace_entry(device).graph_owned
+        entry = _workspace_entry(device)
+        _FakeBackwardApi.workspace_bytes = requested_bytes
+        with pytest.raises(RuntimeError, match="Mixing CUDA-graph and non-graph"):
+            dk._get_deterministic_sparse_attention_workspace(
+                q, None, None, None, None, None, None, 0.5, cuda_graph=not initial_graph_mode
+            )
+        assert allocate.call_count == 1
+        assert _workspace_entry(device) is entry
+        assert entry.buffer is buffer
+        assert entry.owner_stream is stream
+        assert entry.graph_mode is initial_graph_mode
+        assert entry.graph_owned is initial_graph_mode
+        assert _retired_ptrs() == []
 
 
 def _spin_cycles(milliseconds=100):
@@ -307,6 +340,7 @@ def _spin_cycles(milliseconds=100):
     return int(1_000_000 / max(start.elapsed_time(end), 1e-3) * milliseconds)
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_deterministic_sparse_bwd_workspace_handover_serialises_streams(monkeypatch):
     """One scratch buffer per device: handing it to a second stream makes that stream wait for
@@ -343,13 +377,13 @@ def test_deterministic_sparse_bwd_workspace_handover_serialises_streams(monkeypa
     assert _workspace_entry(device).owner_stream == second
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("graph_first", [True, False])
+@pytest.mark.parametrize("grow_before_capture", [False, True])
 def test_deterministic_sparse_bwd_workspace_survives_graph_replay_after_growth(
-    monkeypatch, graph_first
+    monkeypatch, grow_before_capture
 ):
-    """A buffer captured into a CUDA graph stays valid after any later caller outgrows it, while
-    a buffer no graph ever saw is released; both orders of events (real capture and replay)."""
+    """Graph-mode warmup/capture preserve the mode and captured storage across later growth."""
     _reset_workspace_cache(monkeypatch)
     device = torch.device("cuda", torch.cuda.current_device())
     args = _sparse_attn_sample(device)
@@ -357,45 +391,43 @@ def test_deterministic_sparse_bwd_workspace_survives_graph_replay_after_growth(
     capture_stream = torch.cuda.Stream(device=device)
     out = torch.zeros(16, dtype=torch.uint8, device=device)  # static output of the graph
 
-    def hand_out(cuda_graph):
+    def hand_out():
         return dk._deterministic_sparse_bwd_kwargs(
-            *args, None, 0.5, requested=True, cuda_graph=cuda_graph
+            *args, None, 0.5, requested=True, cuda_graph=True
         )["workspace"]
 
     with patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)):
-        if not graph_first:
-            # A caller without graphs creates the entry; the graph-mode caller then outgrows
-            # it. Nothing captured it, so it is simply released.
-            eager_only = hand_out(cuda_graph=False)
-            assert not _workspace_entry(device).graph_owned
+        warm = hand_out()
+        if grow_before_capture:
             _FakeBackwardApi.workspace_bytes = 8192
+            warm = hand_out()
+        retired_before_capture = _retired_ptrs()
         # Eager warmup under the graph config, then capture on a side stream, as Megatron does.
-        warm = hand_out(cuda_graph=True)
-        if not graph_first:
-            assert warm.data_ptr() != eager_only.data_ptr() and _retired_ptrs() == []
+        assert _workspace_entry(device).graph_mode
         assert _workspace_entry(device).graph_owned
         capture_stream.wait_stream(main)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.stream(capture_stream):
             with torch.cuda.graph(graph, stream=capture_stream):
-                captured = hand_out(cuda_graph=True)
+                captured = hand_out()
                 captured.fill_(7)
                 out.copy_(captured[:16])
         main.wait_stream(capture_stream)
         assert captured.data_ptr() == warm.data_ptr()
         # Capture bakes the address in but does not take stream ownership.
         assert _workspace_entry(device).owner_stream == main
-        # A caller without graphs now needs more scratch: the captured buffer must survive.
+        assert _workspace_entry(device).graph_mode
+        # A graph-mode eager call needs more scratch: the captured buffer must survive.
         _FakeBackwardApi.workspace_bytes *= 2
-        grown = hand_out(cuda_graph=False)
+        grown = hand_out()
         assert grown.data_ptr() != captured.data_ptr()
-        assert _retired_ptrs() == [captured.data_ptr()]
+        assert _retired_ptrs() == retired_before_capture + [captured.data_ptr()]
         grown.zero_()
         out.zero_()
         graph.replay()
         torch.cuda.synchronize()
         assert torch.all(out == 7)
-        assert torch.all(dk._DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES[0] == 7)
+        assert torch.all(dk._DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES[-1] == 7)
         assert torch.all(grown == 0), "replay wrote into the replacement buffer"
 
 
@@ -411,6 +443,7 @@ def _real_deterministic_sparse_attention_available():
     return wrapper is not None and "workspace" in inspect.signature(wrapper).parameters
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
     not _real_deterministic_sparse_attention_available(),
     reason="FlashMLA and cuDNN's deterministic DSA backward on SM100 required",
@@ -443,6 +476,8 @@ def test_deterministic_sparse_bwd_on_two_streams_matches_single_stream_bitwise()
         leaves, outs, grads = [], [], []
         for (q, kv, sink, idx, grad), stream in zip(problems, streams):
             q, kv = q.clone().requires_grad_(), kv.clone().requires_grad_()
+            # Input clones are produced on the caller stream; side-stream forward must wait.
+            stream.wait_stream(torch.cuda.current_stream(device))
             with torch.cuda.stream(stream):
                 outs.append(
                     dk.csa_sparse_attn(q, kv, sink, idx, d**-0.5, is_thd=True, deterministic=True)
