@@ -357,7 +357,8 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     prefix-cache configuration is inherited while hashes are recomputed for the
     expanded prompt. The add_engine event is inherited (or created) so
     downstream tooling can find it. RequestRecord.merge() collapses the chain
-    back into a single request with concatenated tokens, routing_indices, and
+    back into a single request with concatenated tokens, the routing rows
+    beyond what earlier segments recorded, and
     the record's latency while leaving text finalization to the caller. Both
     are non-trivial state machines."""
     sp = SamplingParams(num_tokens_to_generate=8, termination_id=0)
@@ -416,7 +417,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     record2.checkpoint()
     assert record2.requests[-1].event_add_engine is not None
 
-    # merge() concatenates tokens and ndarray routing_indices, but never segment text.
+    # merge() concatenates tokens and combines per-segment routing, but never segment text.
     a = DynamicInferenceRequest(
         request_id=3,
         prompt_tokens=torch.tensor([1, 2, 3]),
@@ -434,8 +435,10 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     a.generated_log_probs = None
     a.prompt_log_probs = [-1.0, -1.1]
     b.generated_log_probs = [-0.5]
-    a.routing_indices = np.array([[1, 2]])
-    b.routing_indices = np.array([[3, 4]])
+    # Each segment's routing starts at the sequence's first row: b ran the whole sequence
+    # again, so a's rows win for the prefix and b supplies the one row beyond it.
+    a.routing_indices = np.full((4, 1, 2), 1)
+    b.routing_indices = np.array([[[9, 9]]] * 4 + [[[2, 2]]])
     b.policy_epoch = [(0, 3)]
     b.finish_reason = "length"
     a.add_event_evict()
@@ -446,7 +449,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert (merged.prompt, merged.generated_text) == (None, None)
     assert merged.generated_log_probs == [-0.5]
     assert merged.generated_length == 3 and merged.latency == 4.2
-    assert merged.routing_indices.tolist() == [[1, 2], [3, 4]]
+    assert merged.routing_indices.tolist() == [[[1, 1]]] * 4 + [[[2, 2]]]
     # Every request mints a distinct chatcmpl- uid; merge() keeps the FIRST
     # segment's — the id the response and the finished-request ledger key on.
     assert a.uid.startswith("chatcmpl-") and a.uid != b.uid
@@ -462,7 +465,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     payload = snapshot.payload
     assert (payload.prompt_token_ids, payload.generated_token_ids) == ([1, 2, 3], [10, 11, 12])
     assert (payload.generated_log_probs, payload.prompt_log_probs) == ([-0.5], [-1.0, -1.1])
-    assert payload.routing_indices.tolist() == [[1, 2], [3, 4]]
+    assert payload.routing_indices.tolist() == [[[1, 1]]] * 4 + [[[2, 2]]]
 
     class NonComposableTokenizer:
         eod = 0
@@ -1013,6 +1016,10 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         ({**_WIRE, "finish_reason": "eos"}, "has a malformed finish reason"),
         ({**_WIRE, "finish_reason": "stop"}, "has a finish reason without finishing"),
         (
+            {**_WIRE, "finished": True, "routing_indices": serialize_ndarray(np.zeros((1, 1)))},
+            "has malformed routing indices",
+        ),
+        (
             {k: v for k, v in _WIRE.items() if k != "token_ids"},
             "wire is malformed: KeyError: 'token_ids'",
         ),
@@ -1020,6 +1027,7 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         ({**_WIRE, "token_ids": 1}, "wire is malformed: TypeError: .*"),
         ({**_WIRE, "policy_epoch": [3]}, "wire is malformed: TypeError: .*"),
         ({**_WIRE, "acceptance_step_lengths": None}, "wire is malformed: TypeError: .*"),
+        ({**_WIRE, "finished": True, "routing_indices": [1]}, "wire is malformed: TypeError: .*"),
     ],
     ids=[
         "non-int-tokens",
@@ -1039,11 +1047,13 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         "step-lengths-over-tokens",
         "unknown-finish-reason",
         "finish-reason-unfinished",
+        "flat-routing",
         "missing-field",
         "not-a-mapping",
         "unlistable-tokens",
         "unlistable-boundary",
         "unlistable-step-lengths",
+        "undecodable-routing",
     ],
 )
 def test_reject_malformed_resumed_generation(wire, reason):
@@ -1066,6 +1076,10 @@ def test_resumed_record_merge(new_epoch):
         ([10, 11, 12], [-0.1, -0.2, -0.3]),
         ([13, 14], [-0.4, -0.5]),
     )
+    # Routing replay: the rows a completion reconstructs for the eight-token sequence, and the
+    # rows a continuation that re-prefills the first six tokens records for them instead.
+    rows = np.arange(7 * 2, dtype=np.int32).reshape(7, 1, 2)
+    recomputed = np.concatenate([np.full((5, 1, 2), -1, dtype=np.int32), rows[5:]])
 
     def admitted():
         return _make_dynamic_request(
@@ -1097,9 +1111,10 @@ def test_resumed_record_merge(new_epoch):
         request.kv_cache_epoch = request.kv_cache_epoch or [(0, epoch)]
         return request
 
-    def finish(record):
+    def finish(record, routing):
         record[-1].status = Status.COMPLETED
         record[-1].finish_reason = "stop"
+        record[-1].routing_indices = routing  # reconstructed from the blocks it ran
         record[-1].add_event_finish()
         merged = record.merge()
         return OffloadedRequestPayload.from_request(merged), FinishedRequestRecord.from_request(
@@ -1112,11 +1127,12 @@ def test_resumed_record_merge(new_epoch):
     first.policy_epoch, first.kv_cache_epoch = [(0, 6), (2, 7)], [(0, 6), (2, 7)]
     generate(first, *part_one, scores)
     record = DynamicInferenceRequestRecord.from_request(first)
-    snapshot = LiveRequestSnapshot.from_record(record, finished=False)  # Run B's copy, taken here
+    # Run B's copy, taken here, with the routing the blocks hold for the six tokens so far.
+    snapshot = LiveRequestSnapshot.from_record(record, finished=False, routing_indices=rows[:5])
     record.checkpoint()
     record[-1].add_event_evict()
     generate(schedule(record[-1], new_epoch), *part_two, [-9.0])
-    expected_payload, expected_telemetry = finish(record)
+    expected_payload, expected_telemetry = finish(record, rows)
 
     # Run B: killed at the snapshot, resumed from it under new_epoch, finished the same way.
     resumed = ResumedGeneration.from_snapshot(snapshot)
@@ -1131,9 +1147,20 @@ def test_resumed_record_merge(new_epoch):
         [*part_one[0], *part_two[0]],
         10,
     )
-    payload, telemetry = finish(record)
+    # Without the blocks' rows the carried prefix is incomplete; with them, the prefix's own
+    # rows win over the re-prefill's and the continuation supplies the rest.
+    assert whole.payload.routing_indices is None
+    again = LiveRequestSnapshot.from_record(record, finished=False, routing_indices=recomputed)
+    assert again.payload.routing_indices.tolist() == rows.tolist()
+    payload, telemetry = finish(record, recomputed)
 
-    assert vars(payload) == vars(expected_payload) and payload.prompt_log_probs == scores
+    def plain(payload):
+        """The payload's fields with the routing as a list, which equality can compare."""
+        fields = dict(vars(payload))
+        return fields.pop("routing_indices").tolist(), fields
+
+    assert plain(payload) == plain(expected_payload) and payload.prompt_log_probs == scores
+    assert payload.routing_indices.tolist() == rows.tolist()
     assert payload.prompt_top_n_logprobs == [{"p": score} for score in scores]
     assert len(payload.generated_top_n_logprobs) == sum(payload.acceptance_step_lengths) == 5
     restamp = [] if new_epoch == 7 else [(5, new_epoch)]
