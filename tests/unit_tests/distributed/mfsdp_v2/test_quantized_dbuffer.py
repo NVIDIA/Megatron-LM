@@ -64,6 +64,60 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
             )
 
 
+def test_quantized_dbuffer_quantize_writes_only_the_local_shard(distributed_setup):
+    """Quantizing a sharded view must not write TE's scale padding outside this rank's shard.
+
+    TE's MXFP8 quantize kernel stores scale_inv in its padded physical layout and
+    writes a scale for every row of its 64-row chunk, including rows beyond the
+    tensor (https://github.com/NVIDIA/TransformerEngine/issues/3689). A rank whose
+    shard is shorter than that (32 rows here) used to get
+    out-of-bounds writes into the compact scale views: silently zeroing the next
+    rank's scales in a replicated plane, or raising an illegal memory access when
+    the view ended the local buffer. This mirrors FsdpParameterGroup, which
+    quantizes model_weight.view(main-weight placements).
+    """
+    if distributed_setup.world_size < 2:
+        pytest.skip("Detecting out-of-bounds writes requires at least two ranks.")
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    canary = 0xAA
+    shapes = [(32 * mesh.size(), 128)]  # every rank owns 32 rows; TE pads scales to 64+ rows
+    model_weight = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, device)
+    for plane in model_weight.planes:
+        plane.local_buffer.fill_(canary)
+    sharded = model_weight.view([BlockAtomic(32)])
+    main_weight = DBuffer(
+        mesh, [BlockAtomic(32)], model_weight.rowwise_data.layout, torch.float32, device
+    )
+    torch.manual_seed(1234 + distributed_setup.rank)
+    main_weight.local_buffer.normal_()
+
+    sharded.quantize_(main_weight)
+    torch.cuda.synchronize()
+
+    for name, plane in zip(
+        ("rowwise_data", "columnwise_data", "rowwise_scale", "columnwise_scale"),
+        model_weight.planes,
+    ):
+        chunks = plane.local_buffer.view(mesh.size(), -1)
+        for rank in range(mesh.size()):
+            if rank != mesh.get_local_rank():
+                assert chunks[rank].eq(canary).all(), f"{name} chunk of rank {rank} was written"
+    view = sharded.get_tensor_view(0)
+    reference = MXFP8Quantizer(tex.DType.kFloat8E4M3)(main_weight.get_tensor_view(0))
+    for attribute in (
+        "_rowwise_data",
+        "_columnwise_data",
+        "_rowwise_scale_inv",
+        "_columnwise_scale_inv",
+    ):
+        actual = getattr(view, attribute)
+        expected = getattr(reference, attribute)
+        torch.testing.assert_close(
+            actual, expected[: actual.shape[0], : actual.shape[1]], rtol=0, atol=0
+        )
+
+
 def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup):
     """Compute tensors prepare gathered scales for rowwise and columnwise GEMMs."""
     device = distributed_setup.device
