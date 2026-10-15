@@ -1222,7 +1222,7 @@ class DynamicInferenceRequestRecord:
         for _ in range(resumed.num_evictions):
             first.add_event_evict()
         record = cls.from_request(first)
-        if resumed.finished:
+        if resumed.finish_reason is not None:  # ended on its first engine: served as it stands
             first.status = Status.COMPLETED
             return record
         first.add_event_evict()
@@ -1562,14 +1562,12 @@ class LiveRequestSnapshot:
     offload_params: Optional[Dict[str, Any]]
     payload: OffloadedRequestPayload
     record: FinishedRequestRecord
-    finished: bool
 
     @classmethod
     def from_record(
         cls,
         record: "DynamicInferenceRequestRecord",
         *,
-        finished: bool,
         routing_indices: Optional[np.ndarray] = None,
     ) -> "LiveRequestSnapshot":
         """Copy a live record's merged state; the record itself is left untouched."""
@@ -1585,7 +1583,6 @@ class LiveRequestSnapshot:
             offload_params=merged.offload_params,
             payload=OffloadedRequestPayload.from_request(merged),
             record=FinishedRequestRecord.from_request(merged),
-            finished=finished,
         )
 
 
@@ -1617,7 +1614,6 @@ class ResumedGeneration:
     policy_epoch: Optional[List[Tuple[int, int]]] = None
     kv_cache_epoch: Optional[List[Tuple[int, int]]] = None
     num_evictions: int = 0
-    finished: bool = False
     finish_reason: Optional[str] = None
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
@@ -1632,14 +1628,14 @@ class ResumedGeneration:
             raise ValueError("resumed generation has a malformed budget")
         if type(self.num_evictions) is not int or self.num_evictions < 0:
             raise ValueError("resumed generation has a malformed eviction count")
-        if type(self.finished) is not bool:
-            raise ValueError("resumed generation has a malformed finished flag")
         if len(tokens) > budget:
             raise ValueError(
                 f"resumed generation holds {len(tokens)} tokens over a budget of {budget}"
             )
-        if len(tokens) == budget and not self.finished:
+        if len(tokens) == budget and self.finish_reason is None:
             raise ValueError(f"resumed generation filled its budget of {budget} without finishing")
+        if len(tokens) < budget and self.finish_reason == "length":
+            raise ValueError(f"resumed generation ended by length short of its budget of {budget}")
         if self.log_probs is not None and len(self.log_probs) != len(tokens):
             raise ValueError(
                 "resumed generation has log probs and tokens of different lengths, "
@@ -1647,8 +1643,6 @@ class ResumedGeneration:
             )
         if self.finish_reason not in (None, "stop", "length"):
             raise ValueError("resumed generation has a malformed finish reason")
-        if self.finish_reason is not None and not self.finished:
-            raise ValueError("resumed generation has a finish reason without finishing")
         for name, scores in (
             ("prompt", self.prompt_top_n_logprobs),
             ("generated", self.generated_top_n_logprobs),
@@ -1702,7 +1696,6 @@ class ResumedGeneration:
             policy_epoch=as_list(record.policy_epoch),
             kv_cache_epoch=as_list(record.kv_cache_epoch),
             num_evictions=record.num_evictions,
-            finished=snapshot.finished,
             finish_reason=record.finish_reason,
             prompt_top_n_logprobs=as_list(payload.prompt_top_n_logprobs),
             generated_top_n_logprobs=as_list(payload.generated_top_n_logprobs),
@@ -1732,7 +1725,6 @@ class ResumedGeneration:
                 None if self.kv_cache_epoch is None else [list(b) for b in self.kv_cache_epoch]
             ),
             "num_evictions": self.num_evictions,
-            "finished": self.finished,
             "finish_reason": self.finish_reason,
             "prompt_top_n_logprobs": top_n(self.prompt_top_n_logprobs),
             "generated_top_n_logprobs": top_n(self.generated_top_n_logprobs),
@@ -1759,7 +1751,6 @@ class ResumedGeneration:
                 policy_epoch=boundaries("policy_epoch"),
                 kv_cache_epoch=boundaries("kv_cache_epoch"),
                 num_evictions=obj["num_evictions"],
-                finished=obj["finished"],
                 finish_reason=obj["finish_reason"],
                 prompt_top_n_logprobs=obj["prompt_top_n_logprobs"],
                 generated_top_n_logprobs=obj["generated_top_n_logprobs"],
