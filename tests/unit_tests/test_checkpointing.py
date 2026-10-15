@@ -46,11 +46,12 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.usefixtures("run_config")
 
 
-def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop():
+@pytest.mark.parametrize("ckpt_args", [None, SimpleNamespace()])
+def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
     """Missing checkpoint args do not identify a model-only checkpoint as GPT."""
 
     args = SimpleNamespace(hybrid_layer_pattern="M*E")
-    assert _maybe_setup_gpt_to_hybrid_load(args, SimpleNamespace(), [object()]) == (None, False)
+    assert _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, [object()]) == (None, False)
 
 
 @pytest.mark.parametrize("auto_detect", [False, True])
