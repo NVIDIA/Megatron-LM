@@ -222,7 +222,7 @@ def accumulate_embedding_wgrad(
     max_long_runs = num_tokens // (_NROWS + 1) + 1
     long_runs = torch.empty(max_long_runs + 1, dtype=torch.int32, device=device)
     _sort_tokens_kernel[(1,)](
-        ids.reshape(-1),
+        ids.reshape(-1).contiguous(),
         sorted_ids,
         positions,
         run_start,

@@ -89,6 +89,26 @@ def test_transposed_gradient():
     _assert_same_bits(main_grad, expected)
 
 
+@pytest.mark.parametrize("layout", ["sliced", "column", "expanded", "broadcast"])
+def test_strided_token_ids(layout):
+    """Token id views whose flattened form is not contiguous, or not a view at all."""
+    torch.manual_seed(0)
+    if layout == "sliced":
+        ids = torch.arange(8192, device="cuda").view(1, 8192)[:, ::2]
+    elif layout == "column":
+        ids = _token_ids("zipf", 8192).view(4096, 2)[:, 1].view(1, 4096)
+    elif layout == "expanded":
+        ids = _token_ids("zipf", 2048).view(1, 2048).expand(2, 2048)
+    else:
+        ids = torch.full((1, 1), 5, device="cuda").expand(1, 4096)
+    grad = torch.randn(*ids.shape, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    main_grad = torch.zeros(VOCAB, HIDDEN, device="cuda")
+    assert can_accumulate_embedding_wgrad(ids, grad, main_grad)
+    expected = torch.ops.aten.embedding_dense_backward(grad, ids, VOCAB, -1, False).float()
+    accumulate_embedding_wgrad(ids, grad, main_grad)
+    _assert_same_bits(main_grad, expected)
+
+
 def test_token_count_window():
     main_grad = torch.zeros(VOCAB, HIDDEN, device="cuda")
     for num_tokens, supported in [
