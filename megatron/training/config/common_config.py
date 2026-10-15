@@ -111,7 +111,9 @@ class DistributedInitConfig:
     """Which backend to use for distributed training."""
 
     fake_process_group: bool = False
-    """Use fake process groups for single-GPU distributed memory profiling."""
+    """Initialize fake process groups and skip all distributed communication operations.
+    This allows profiling distributed training memory usage with a single GPU.
+    Set WORLD_SIZE and RANK to the desired distributed scale."""
 
     distributed_timeout_minutes: int = 10
     """Timeout minutes for torch.distributed."""
