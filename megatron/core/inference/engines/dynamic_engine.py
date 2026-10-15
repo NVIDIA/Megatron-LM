@@ -2726,8 +2726,10 @@ class DynamicInferenceEngine(AbstractEngine):
         entry = RequestEntry(record=record, future=self._loop.create_future())
         if resumed.finished:  # nothing to schedule
             served = record[-1]
-            if len(served.generated_tokens) < served.sampling_params.num_tokens_to_generate:
-                served.finish_reason = "stop"  # short of its budget: a stop this engine never saw
+            if served.finish_reason is None and (
+                len(served.generated_tokens) < served.sampling_params.num_tokens_to_generate
+            ):
+                served.finish_reason = "stop"
             self._set_finish_reason(served)
             self._complete_request(entry, reply_now=True)
         else:
