@@ -91,6 +91,37 @@ def test_dense_route_indices_dtype(
     assert TopKRouter._dense_route_indices_dtype(router) == expected_dtype
 
 
+@pytest.mark.parametrize(
+    "backend,routing_map_mode,compact_dtype",
+    [
+        ("deepep", "bool", torch.int64),
+        ("ncclep", "bool", torch.int64),
+        ("hybridep", "indices", torch.int16),
+    ],
+)
+def test_dense_route_indices_dtype_keeps_dense_routes_for_megakernel(
+    monkeypatch, backend, routing_map_mode, compact_dtype
+):
+    monkeypatch.setattr(router_module, "fused_topk_with_score_function_supports_topk_indices", True)
+    monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    config = SimpleNamespace(
+        moe_megakernel_backend=None,
+        moe_router_fusion=True,
+        moe_token_dispatcher_type="flex",
+        moe_expert_capacity_factor=None,
+        moe_flex_dispatcher_backend=backend,
+        moe_hybridep_routing_map_mode=routing_map_mode,
+        num_moe_experts=8,
+    )
+    router = SimpleNamespace(config=config, expt_tp_group=SimpleNamespace(size=lambda: 1))
+    assert TopKRouter._dense_route_indices_dtype(router) == compact_dtype
+
+    # A megakernel backend builds no token dispatcher and consumes the dense
+    # [tokens, experts] probs/routing_map pair, so the router must not compact the routes.
+    config.moe_megakernel_backend = "mok"
+    assert TopKRouter._dense_route_indices_dtype(router) is None
+
+
 @pytest.mark.parametrize("supports_topk_indices", [False, True])
 def test_fused_router_only_forwards_supported_topk_indices(monkeypatch, supports_topk_indices):
     received_kwargs = {}
@@ -500,6 +531,116 @@ class TestDynamicCPRouterDistributed:
         group_token_count = runtime_cp_size * (runtime_cp_size + 1) // 2
         expected_grad = 2 * aux_source.detach() * group_token_count
         torch.testing.assert_close(aux_source.grad, expected_grad)
+
+
+class TestPerTokenAuxLossCudaGraph:
+    """The per-token aux-loss scaling must stay capturable in a moe_router CUDA graph."""
+
+    @pytest.fixture(autouse=True)
+    def _private_metrics_tracker(self, monkeypatch):
+        # These routers record aux losses for a 2-layer model; keep those entries out of the
+        # global MoE metrics tracker that later tests read.
+        monkeypatch.setattr(
+            "megatron.core.transformer.moe.moe_logging._MOE_METRICS_TRACKER", MoEMetricsTracker()
+        )
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+    def teardown_method(self, method):
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+        Utils.destroy_model_parallel()
+
+    def _router(self, load_balancing_type):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type=load_balancing_type,
+            moe_router_topk=2,
+            moe_aux_loss_coeff=1e-2,
+            calculate_per_token_loss=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+        layer = MoELayer(config, submodules, layer_number=1)
+        return cast(TopKRouter, layer.router).cuda().train()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("load_balancing_type", ["aux_loss", "seq_aux_loss", "global_aux_loss"])
+    def test_router_forward_is_capturable(self, load_balancing_type):
+        router = self._router(load_balancing_type)
+        hidden = torch.randn((8, 2, 12), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        # Warm up on a side stream first, as graph capture requires (this also creates the
+        # NCCL communicators used by the token-count reductions).
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            eager_probs, eager_routing_map = router(hidden)
+        torch.cuda.current_stream().wait_stream(stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            graph_probs, graph_routing_map = router(hidden)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(graph_probs, eager_probs)
+        assert torch.equal(graph_routing_map, eager_routing_map)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_integer_token_count_scale_is_captured(self, monkeypatch):
+        router = self._router("global_aux_loss")
+        group = router.tp_dp_cp_group
+        scaled_aux_losses = []
+
+        def record_scaled_aux_loss(activation, scaled_aux_loss):
+            scaled_aux_losses.append(scaled_aux_loss)
+            return activation
+
+        monkeypatch.setattr(MoEAuxLossAutoScaler, "apply", record_scaled_aux_loss)
+        activation = torch.zeros(1, device="cuda", requires_grad=True)
+        aux_loss = torch.full((), 0.5, device="cuda")
+
+        def attach():
+            router.attach_and_log_load_balancing_loss(
+                activation,
+                aux_loss_coeff=1.0,
+                aux_loss=aux_loss,
+                aux_loss_name="per_token_graph_test",
+                reduce_group=None,
+                needs_dp_avg=False,
+                valid_token_count=7,
+                aux_loss_scale_reduce_groups=(group,),
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            attach()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            attach()
+        scaled_aux_losses[-1].zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        # The integer count is materialized on device, reduced over the group, and scales the loss.
+        expected = torch.full((), 0.5 * 7 * group.size(), device="cuda")
+        torch.testing.assert_close(scaled_aux_losses[-1], expected)
 
 
 class TestTop2Router:

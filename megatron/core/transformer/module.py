@@ -354,7 +354,16 @@ class GraphableMegatronModule(MegatronModule):
 
         for hook, hook_args in self.cuda_graph_manual_hooks:
             hook(*hook_args)
+        self._before_te_cuda_graph_replay()
         return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+
+    def _before_te_cuda_graph_replay(self):
+        """Run eager work that must follow the manual (parameter all-gather) hooks and precede the
+        graph replay on the current stream. No-op by default."""
+
+    def _after_te_cuda_graphs_deleted(self):
+        """Release state that this module's TE CUDA graphs pinned, after the graphs were deleted.
+        No-op by default."""
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         """Helper function to get tensor arguments for TE CUDA graph."""
