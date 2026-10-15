@@ -90,10 +90,20 @@ def test_nccl_ep_scan_mode_is_required_before_group_creation(scan_mode):
 
 @pytest.mark.parametrize(
     "nccl_algo, error",
-    [(None, None), ("", None), ("^NVLS", None), (" ", "only whitespace"), ("Tree", "each token")],
+    [
+        (None, None),
+        ("", None),
+        ("^NVLS", None),
+        ("Ring,NVLS", None),
+        ("NVLS,Ring", None),
+        (" ", "only whitespace"),
+        ("Tree", "each token"),
+        ("NVLS", "needs Ring"),
+    ],
 )
 def test_nccl_algo_is_kept_defaulted_or_rejected(nccl_algo, error):
-    """Unset becomes Ring, "" and ^NVLS are kept, and whitespace and Tree are rejected.
+    """Unset becomes Ring; "", ^NVLS and NVLS listed with Ring are kept; whitespace, Tree
+    and a bare NVLS are rejected.
 
     The accepted cases still get the other defaults; a rejected value leaves env unchanged.
     """
@@ -120,6 +130,8 @@ def test_empty_nccl_algo_warning_is_issued_on_rank_0(rank, monkeypatch, recwarn)
     apply_determinism_to_args(make_args())
     monkeypatch.setenv("NCCL_ALGO", "Ring")
     apply_determinism_to_args(make_args())
+    monkeypatch.setenv("NCCL_ALGO", "Ring,NVLS")
+    apply_determinism_to_args(make_args())
     assert not [w for w in recwarn if "NCCL_ALGO is empty" in str(w.message)]
     monkeypatch.setenv("NCCL_ALGO", "")
     apply_determinism_to_args(make_args())
@@ -128,10 +140,20 @@ def test_empty_nccl_algo_warning_is_issued_on_rank_0(rank, monkeypatch, recwarn)
 
 
 @pytest.mark.parametrize(
-    "nccl_algo, arch, error", [("", 9, "reproducible on Hopper"), ("", 10, None), (None, 9, None)]
+    "nccl_algo, arch, error",
+    [
+        ("", 9, "reproducible on Hopper"),
+        ("Ring,NVLS", 9, "reproducible on Hopper"),
+        ("", 10, None),
+        ("Ring,NVLS", 10, None),
+        ("^NVLS", 9, None),
+        (None, 9, None),
+    ],
 )
-def test_empty_nccl_algo_is_rejected_on_hopper(nccl_algo, arch, error, monkeypatch, recwarn):
-    """An empty NCCL_ALGO stops a Hopper run before the warning; unset still gets Ring there."""
+def test_nvls_capable_nccl_algo_is_rejected_on_hopper(nccl_algo, arch, error, monkeypatch, recwarn):
+    """A value that can let NCCL use NVLS ("" or a list with NVLS) stops a Hopper run before
+    the warning; ^NVLS and unset (the Ring default) still pass there.
+    """
     monkeypatch.setattr("megatron.training.utils.get_device_arch_version", lambda: arch)
     if nccl_algo is None:
         monkeypatch.delenv("NCCL_ALGO", raising=False)

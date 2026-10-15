@@ -71,7 +71,12 @@ DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
 #
 # An empty ``NCCL_ALGO`` is accepted as well and lets NCCL choose; see
 # :func:`apply_determinism_env`.
-ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset({"Ring", "CollnetDirect", "CollnetChain", "^NVLS"})
+#
+# ``NVLS`` is accepted only together with ``Ring`` and never on Hopper; see
+# :func:`apply_determinism_env` and :func:`apply_determinism_to_args`.
+ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset(
+    {"Ring", "CollnetDirect", "CollnetChain", "^NVLS", "NVLS"}
+)
 
 # Env vars whose valid deterministic values are a small fixed exact-match set
 # (unlike NCCL_ALGO which accepts comma-separated subsets of tokens). An unset
@@ -103,9 +108,10 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     Semantics per key:
 
     * ``NCCL_ALGO`` — if set, each comma-separated token must be in
-      :data:`ACCEPTED_NCCL_ALGO_TOKENS`. The empty string is accepted and kept:
-      NCCL (and a tuner plugin, if one is loaded) then chooses the algorithms.
-      A value of only whitespace is rejected.
+      :data:`ACCEPTED_NCCL_ALGO_TOKENS`, and ``NVLS`` needs ``Ring`` in the same
+      list. The empty string is accepted and kept: NCCL (and a tuner plugin, if
+      one is loaded) then chooses the algorithms. A value of only whitespace is
+      rejected.
     * ``NCCL_EP_HT_EM_AG_SCAN_MODE`` / ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` /
       ``CUBLAS_WORKSPACE_CONFIG`` —
       if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
@@ -139,6 +145,10 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
             f"to a subset of {sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
         )
         tokens = [t.strip() for t in nccl_algo.split(",") if t.strip()]
+        assert "NVLS" not in tokens or "Ring" in tokens, (
+            f"NCCL_ALGO={nccl_algo!r}: NVLS needs Ring in the list, because broadcast and "
+            "reduce run only with Ring. Use 'Ring,NVLS'."
+        )
         assert tokens and all(t in ACCEPTED_NCCL_ALGO_TOKENS for t in tokens), (
             f"NCCL_ALGO={nccl_algo!r}: each token must be in "
             f"{sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
@@ -200,9 +210,9 @@ def apply_determinism_to_args(args) -> None:
        ``CUBLAS_WORKSPACE_CONFIG``,
        ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``,
        ``TRITON_CACHE_AUTOTUNING`` and its required ``TRITON_CACHE_DIR``) and
-       setdefaults the canonical values. If ``NCCL_ALGO`` is empty, the run
-       is rejected on Hopper; elsewhere rank 0 warns that NCCL chooses the
-       algorithms.
+       setdefaults the canonical values. If ``NCCL_ALGO`` is empty or has
+       ``NVLS`` among its tokens, the run is rejected on Hopper; elsewhere, for
+       an empty value, rank 0 warns that NCCL chooses the algorithms.
     3. Calls ``torch.use_deterministic_algorithms(True)``, then clears
        ``torch.utils.deterministic.fill_uninitialized_memory``, which that call
        turns on and which reproducibility does not need.
@@ -237,20 +247,24 @@ def apply_determinism_to_args(args) -> None:
 
     # Delegate env-var validation + setdefault to the single-source helper.
     apply_determinism_env(os.environ)
-    if os.environ.get("NCCL_ALGO") == "":
-        from megatron.training.utils import get_device_arch_version, warn_rank_0
+    nccl_algo = os.environ.get("NCCL_ALGO")
+    if nccl_algo == "" or "NVLS" in [t.strip() for t in (nccl_algo or "").split(",")]:
+        from megatron.training.utils import get_device_arch_version
 
         assert get_device_arch_version() != 9, (
-            'NCCL_ALGO="" under --deterministic-mode lets NCCL 2.24 and later use NVLS, which may '
-            "not be reproducible on Hopper unless the kernel driver and Fabric Manager are "
+            f"NCCL_ALGO={nccl_algo!r} under --deterministic-mode can let NCCL use NVLS, which "
+            "may not be reproducible on Hopper unless the kernel driver and Fabric Manager are "
             "550.144.03 or later in the 550 branch, or 570 or later (the 560 branch has no fix); "
             "their versions are not checked here (NVIDIA/nccl#2360). Unset NCCL_ALGO to use the "
             "Ring default."
         )
+    if nccl_algo == "":
+        from megatron.training.utils import warn_rank_0
+
         warn_rank_0(
             "Deterministic mode: NCCL_ALGO is empty, so NCCL chooses the algorithm for each "
-            "collective. With NCCL >= 2.24 that includes Tree and, where available, NVLS, "
-            "neither of which is an accepted NCCL_ALGO token. Bit-exact reproducibility "
+            "collective. With NCCL >= 2.24 the candidates include NVLS, where available, and "
+            "Tree, which is not an accepted NCCL_ALGO token. Bit-exact reproducibility "
             'then rests on what NCCL selects; see "Letting NCCL choose the algorithm" in '
             "docs/user-guide/deterministic-training.md."
         )
