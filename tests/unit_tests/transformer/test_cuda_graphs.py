@@ -358,6 +358,37 @@ class TestCudaGraphConfigAndArguments:
 
         assert helper._captures_dsa_metric_writes is expected
 
+    @pytest.mark.parametrize(("value", "expected"), [(None, 1), (1, 1), (4, 4), (0, None)])
+    def test_te_helper_thd_max_subsamples_per_item(self, monkeypatch, value, expected):
+        """None means one sequence per dataset item; a non-positive bound is rejected."""
+        from megatron.core.pipeline_parallel import p2p_communication
+
+        monkeypatch.setattr(cuda_graphs_module, "HAVE_TE_GRAPHS", True)
+        monkeypatch.setattr(
+            TECudaGraphHelper,
+            "_discover_layers",
+            lambda helper: setattr(helper, "flattened_callables", []),
+        )
+        monkeypatch.setattr(p2p_communication, "P2PCommunicator", lambda **_kwargs: object())
+
+        def build():
+            return TECudaGraphHelper(
+                model=[torch.nn.Module()],
+                config=SimpleNamespace(cuda_graph_impl="transformer_engine", cuda_graph_modules=[]),
+                seq_length=1,
+                micro_batch_size=1,
+                pg_collection=SimpleNamespace(
+                    tp=object(), dp=object(), dp_cp=object(), pp=object()
+                ),
+                thd_max_subsamples_per_item=value,
+            )
+
+        if expected is None:
+            with pytest.raises(ValueError, match="thd_max_subsamples_per_item"):
+                build()
+        else:
+            assert build().thd_max_subsamples_per_item == expected
+
     def test_te_reset_after_capture_cleans_dsa_tracker_in_place(self, monkeypatch):
         from importlib import import_module
 
@@ -2291,7 +2322,10 @@ class TestTECudaGraphHelper:
         helper.flattened_callables = [layer]
         helper._captures_dsa_metric_writes = False
         helper.callables_per_chunk = []
+        helper.chunks_with_decoder = []
         helper.num_microbatches = 1
+        helper._thd_rotary_seq_lens = {}
+        helper._capture_finished = False
         helper._start_capturing = lambda: 0.0
         helper._finish_capturing = lambda _start_time: None
         helper._get_cuda_graph_input_data = lambda: ([()], {'_order': [1, -1]})
@@ -2610,6 +2644,38 @@ class TestTECudaGraphHelper:
         assert (
             len(order) == expected_order_length
         ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
+
+
+class TestSlotAliasedVariantOrder:
+    @staticmethod
+    def _dynamic_cp_capture_order():
+        helper = object.__new__(TECudaGraphHelper)
+        helper.flattened_callables = [torch.nn.Identity()]
+        helper.num_microbatches = 1
+        helper.num_layers_per_chunk = [1]
+        helper.num_model_chunks = 1
+        capture_banks = []
+        for cp_size in (4, 2, 1):
+            capture_banks.append(
+                (
+                    cp_size,
+                    None,
+                    ((),),
+                    {'_order': (1, -1), '_reuse_graph_input_output_buffers': True},
+                )
+            )
+        _, _, kwargs = helper._get_dynamic_cp_variant_capture_data(capture_banks)
+        return kwargs['_order']
+
+    def test_capture_uses_minimum_cp_as_canonical(self):
+        assert self._dynamic_cp_capture_order() == [3, -3, 1, -1, 2, -2]
+
+    def test_variant_major_starts_with_canonical_variant(self):
+        order = TECudaGraphHelper._build_slot_aliased_variant_order(
+            [1, 2, -2, -1], num_variants=4, num_model_chunks=2, canonical_variant=3
+        )
+
+        assert order == [7, 8, -8, -7, 1, 2, -2, -1, 3, 4, -4, -3, 5, 6, -6, -5]
 
 
 class TestRequiredNumMicrobatchSlots:

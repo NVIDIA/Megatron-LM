@@ -208,6 +208,61 @@ class TestHybridMHCAttentionGraphSplit:
             for slot, expected in zip(slots, graph_reads):
                 torch.testing.assert_close(slot, expected)
 
+    def test_replay_selects_dynamic_cp_bank_before_direct_write(
+        self, hybrid_split_wrapper, monkeypatch
+    ):
+        """The split replay activates the microbatch's CP bank before writing its graph input."""
+        wrapper = hybrid_split_wrapper
+        groups = {1: object(), 2: object()}
+        banks = {size: [Mock(name=f"cp{size}_graph")] for size in groups}
+        inputs = {size: (torch.empty(3, 1, 4),) for size in groups}
+        wrapper.cuda_graphs_by_dynamic_cp_size = banks
+        wrapper.cuda_graph_cp_groups_by_dynamic_cp_size = groups
+        wrapper.cuda_graphs = banks[1]
+        wrapper.cuda_graph_manual_hooks = []
+        wrapper._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size = inputs
+        wrapper._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size = {
+            size: tuple(tensor.data_ptr() for tensor in tensors) for size, tensors in inputs.items()
+        }
+        wrapper._te_cuda_graph_static_hidden_inputs = inputs[1]
+        wrapper._te_cuda_graph_static_hidden_input_ptrs = (inputs[1][0].data_ptr(),)
+        wrapper.current_microbatch = 0
+        manager = SimpleNamespace(
+            mhc_arena=SimpleNamespace(
+                bind_external_slot=Mock(side_effect=lambda key, slot: SimpleNamespace(writer=slot))
+            ),
+            is_last_layer_in_recompute_block=False,
+        )
+        wrapper._mhc_recompute_manager = manager
+
+        def producer(hidden, *, mhc_recompute_manager, output_slot, return_residual):
+            assert return_residual is True
+            return output_slot.writer.copy_(hidden[..., :4]), "h_res", "h_post", hidden
+
+        replayed = []
+
+        def replay(_self, aggregate, **kwargs):
+            replayed.append((wrapper.cuda_graphs, aggregate.data_ptr()))
+            return (aggregate * 2,)
+
+        wrapper.hyper_connection.side_effect = producer
+        wrapper.hyper_connection.fused_h_res_h_post_bda.side_effect = (
+            lambda h_res, residual, h_post, output, **kwargs: residual + output[0].repeat(1, 1, 2)
+        )
+        monkeypatch.setattr(GraphableMegatronModule, "_te_cuda_graph_replay", replay)
+
+        packed = PackedSeqParams(qkv_format="thd", local_cp_size=2, cp_group=groups[2])
+        wrapper._te_cuda_graph_replay(torch.ones(3, 1, 8), packed_seq_params=packed)
+        assert replayed == [(banks[2], inputs[2][0].data_ptr())]
+        manager.mhc_arena.bind_external_slot.assert_called_once_with(
+            ("attention", 1, "aggregate", 0), inputs[2][0]
+        )
+
+        wrong_group = PackedSeqParams(qkv_format="thd", local_cp_size=1, cp_group=groups[2])
+        with pytest.raises(RuntimeError, match="does not match"):
+            wrapper._te_cuda_graph_replay(torch.ones(3, 1, 8), packed_seq_params=wrong_group)
+        assert wrapper.hyper_connection.call_count == 1
+
     @pytest.mark.parametrize("is_group_end", [False, True])
     def test_post_preserves_group_boundary_and_residual_dtype(
         self, hybrid_split_wrapper, is_group_end
