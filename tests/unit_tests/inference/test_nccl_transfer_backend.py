@@ -136,3 +136,57 @@ def test_nccl_push_pull_tp2_to_tp1():
     result = torch.tensor(int(transfer_ok))
     dist.all_reduce(result, op=dist.ReduceOp.MIN, group=control_group)
     assert result.item() == 1
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.device_count() >= 3
+        and int(os.environ.get("WORLD_SIZE", "1")) >= 3
+    ),
+    reason="requires torchrun with >=3 CUDA ranks (prefill TP2 {0,1} + decode TP1 {2})",
+)
+def test_nccl_discard_consumes_a_push_so_the_next_hand_off_pairs_correctly():
+    """A discarded hand-off drains its sends, so the next hand-off lands intact.
+
+    Two-sided operations pair by post order per peer: without the discard, the
+    decode's receives for the second hand-off would pair with the first's sends.
+    """
+    import torch.distributed as dist
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = f"cuda:{local_rank}"
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
+
+    rank = dist.get_rank()
+    control_group = dist.new_group(backend="gloo")
+    dist.barrier()
+
+    transfer_ok = True
+    g = _global_blocks().to(device)
+    second_blocks = [2, 4]
+    if rank in (0, 1):  # prefill TP2
+        backend, buf = _backend(rank, 2, rank, device)
+        heads = slice(rank * (H // 2), (rank + 1) * (H // 2))
+        for i, (first, second) in enumerate(zip(BLOCKS, second_blocks)):
+            buf[:, :, first] = g[i, :, :, :, heads, :]
+            buf[:, :, second] = g[i, :, :, :, heads, :] + 10000
+        decode = {"tp_metas": [_meta_stub(2, 1, 0)]}
+        backend.begin_push_blocks(decode, BLOCKS).wait()
+        backend.begin_push_blocks(decode, second_blocks).wait()
+    elif rank == 2:  # decode TP1
+        backend, buf = _backend(rank, 1, 0, device)
+        metas = {"tp_metas": [_meta_stub(0, 2, 0), _meta_stub(1, 2, 1)]}
+        backend.begin_discard_blocks(metas, BLOCKS, len(BLOCKS)).wait()
+        transfer_ok = not bool(buf.any().item())
+        backend.begin_pull_blocks(metas, second_blocks, BLOCKS).wait()
+        expected = torch.zeros_like(buf)
+        for i, block in enumerate(BLOCKS):
+            expected[:, :, block] = g[i] + 10000
+        transfer_ok = transfer_ok and torch.equal(buf, expected)
+
+    result = torch.tensor(int(transfer_ok))
+    dist.all_reduce(result, op=dist.ReduceOp.MIN, group=control_group)
+    assert result.item() == 1

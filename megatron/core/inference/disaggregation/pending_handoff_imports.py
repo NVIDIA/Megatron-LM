@@ -13,7 +13,11 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 @dataclass(kw_only=True)
 class DeferredKvHandoff:
-    """Decode handoff waiting for local cache capacity before transfer starts."""
+    """Decode handoff waiting in FIFO order for local cache capacity before transfer starts.
+
+    A ``discard`` handoff is never imported. It keeps its FIFO position only so a push
+    transport posts the receives that drain its source's sends.
+    """
 
     request_id: int
     prompt: list
@@ -23,6 +27,7 @@ class DeferredKvHandoff:
     hashes: List[int]
     num_blocks: int
     future: asyncio.Future
+    discard: bool = False  # Rejected or aborted; only drains its source's sends.
 
 
 @dataclass(kw_only=True)
@@ -51,3 +56,4 @@ class PendingKvImport:
     local_error: Exception | None = None  # Exact local error, if this rank failed.
     destinations_safe: bool = True  # Whether allocated blocks may return to the pool.
     terminal_state_reported: bool = False  # Avoid repeat reports and premature block reuse.
+    cancelled: bool = False  # Aborted; retired without admission once its transfer settles.

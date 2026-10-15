@@ -31,6 +31,7 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
+    ContextOverflowError,
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
     PromptPreparationError,
@@ -635,6 +636,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _admit_pending_kv_imports(self) -> int:
         return 0
+
+    def _abort_kv_handoff(self, request_id: int) -> bool:
+        """Abort an unadmitted KV handoff (none here)."""
+        return False
 
     def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
         """Hook overridden by the KV-handoff engine composition."""
@@ -1827,7 +1832,8 @@ class DynamicInferenceEngine(AbstractEngine):
         produces a client-visible failure reply.
 
         Called from the SUBMIT_REQUEST handler when image preprocessing or
-        add_request raises. Registering a placeholder record with
+        add_request raises, and for a KV handoff that is rejected on arrival or
+        aborted before admission. Registering a placeholder record with
         Status.FAILED lets ``_handle_failed_request`` publish the ENGINE_REPLY
         without leaving the client hanging or killing the engine loop.
         """
@@ -1843,11 +1849,72 @@ class DynamicInferenceEngine(AbstractEngine):
             sampling_params=(sampling_params or SamplingParams()),
         )
         placeholder_request.status = Status.FAILED
+        if isinstance(exc, ContextOverflowError):
+            placeholder_request.add_event_error_nontransient(exc)
         self.requests[request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(placeholder_request),
             future=self._loop.create_future(),
         )
         self._handle_failed_request(request_id)
+
+    def _request_limit_errors(
+        self,
+        request_id: int,
+        prompt_length: int,
+        num_tokens_to_generate: int,
+        *,
+        prompt_is_prefilled: bool = False,
+        resident_block_count: int = 0,
+    ) -> Tuple[int, List[ContextOverflowError]]:
+        """Check a request against the engine's fixed sequence, token and KV-pool limits.
+
+        ``_add_request`` and the decode-side KV handoff share this check, so a
+        handoff that admission could never accept fails before it reserves cache
+        state or waits for capacity that cannot appear.
+
+        Args:
+            request_id (int): Request the errors name.
+            prompt_length (int): Number of prompt tokens.
+            num_tokens_to_generate (int): Generation budget, already resolved from
+                ``num_tokens_total`` and defaulted to the remaining sequence length.
+            prompt_is_prefilled (bool): Whether the prompt's KV was computed elsewhere,
+                so no prefill step runs and ``max_tokens`` does not bound it.
+            resident_block_count (int): KV blocks the request holds regardless of its
+                generation budget, such as a handoff's prompt and resume blocks.
+
+        Returns:
+            (Tuple[int, List[ContextOverflowError]]) The generation budget clamped to
+            the maximum sequence length, and the non-transient errors in the order
+            ``_add_request`` records them.
+        """
+        errors: List[ContextOverflowError] = []
+        # Clamp large `num_tokens_to_generate` instead of rejecting the request.
+        # This is included for compatibility with other frameworks.
+        remaining_tokens = self.context.max_sequence_length - prompt_length
+        if num_tokens_to_generate < 0 or remaining_tokens < 0:
+            errors.append(MaxSequenceLengthOverflowError(request_id))
+        elif num_tokens_to_generate > remaining_tokens:
+            num_tokens_to_generate = remaining_tokens
+
+        if (
+            not prompt_is_prefilled
+            and prompt_length > self.context.max_tokens
+            and not self.enable_chunked_prefill
+        ):
+            errors.append(TokenOverflowError(request_id))
+
+        # Check that the shared KV pool has enough blocks for this request's stored tokens:
+        # the prompt, all generated tokens but the last, and the final decode step's drafts.
+        max_stored_tokens = prompt_length
+        if num_tokens_to_generate > 1:
+            max_stored_tokens += num_tokens_to_generate - 1 + self.context.num_speculative_tokens
+        request_block_count = max(
+            math.ceil(max_stored_tokens / self.context.block_size_tokens), resident_block_count
+        )
+        usable_blocks = self.context.kv_block_allocator.pool_size - 1
+        if request_block_count > usable_blocks:
+            errors.append(BlockOverflowError(request_id))
+        return num_tokens_to_generate, errors
 
     def _collect_failed_requests(
         self, request_ids: Optional[set[int]] = None
@@ -1990,40 +2057,21 @@ class DynamicInferenceEngine(AbstractEngine):
                 eod = -1
             request.sampling_params.termination_id = eod
 
-        # Clamp large `num_tokens_to_generate` instead of rejecting the request.
-        # This is included for compatibility with other frameworks.
-        remaining_tokens = self.context.max_sequence_length - len(request.prompt_tokens)
-        if request.sampling_params.num_tokens_to_generate < 0 or remaining_tokens < 0:
-            request.status = Status.FAILED
-            request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
-        elif request.sampling_params.num_tokens_to_generate > remaining_tokens:
-            requested_tokens = request.sampling_params.num_tokens_to_generate
-            request.sampling_params.num_tokens_to_generate = remaining_tokens
+        requested_tokens = request.sampling_params.num_tokens_to_generate
+        clamped_tokens, limit_errors = self._request_limit_errors(
+            request_id, len(request.prompt_tokens), requested_tokens
+        )
+        if clamped_tokens != requested_tokens:
+            request.sampling_params.num_tokens_to_generate = clamped_tokens
             if self.rank == 0:
                 warnings.warn(
                     f"Request {request_id} requested num_tokens_to_generate={requested_tokens} "
                     f"which exceeds the maximum sequence length of the engine. "
-                    f"Clamping num_tokens_to_generate to {remaining_tokens}."
+                    f"Clamping num_tokens_to_generate to {clamped_tokens}."
                 )
-
-        if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
+        for limit_error in limit_errors:
             request.status = Status.FAILED
-            request.add_event_error_nontransient(TokenOverflowError(request_id))
-
-        # Check that the shared KV pool has enough blocks for this request's stored tokens:
-        # the prompt, all generated tokens but the last, and the final decode step's drafts.
-        max_stored_tokens = len(request.prompt_tokens)
-        if request.sampling_params.num_tokens_to_generate > 1:
-            max_stored_tokens += (
-                request.sampling_params.num_tokens_to_generate
-                - 1
-                + self.context.num_speculative_tokens
-            )
-        request_block_count = math.ceil(max_stored_tokens / self.context.block_size_tokens)
-        usable_blocks = self.context.kv_block_allocator.pool_size - 1
-        if request_block_count > usable_blocks:
-            request.status = Status.FAILED
-            request.add_event_error_nontransient(BlockOverflowError(request_id))
+            request.add_event_error_nontransient(limit_error)
 
         # Tokenize stop words if provided
         if request.sampling_params.stop_words:
@@ -4610,7 +4658,10 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])
                 entry = self.requests.get(request_id)
-                if entry is not None:
+                if entry is None:
+                    # An unadmitted decode handoff has no request entry yet.
+                    self._abort_kv_handoff(request_id)
+                else:
                     request = entry.record[-1]
                     # Force active requests to finish on the next step.
                     request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)

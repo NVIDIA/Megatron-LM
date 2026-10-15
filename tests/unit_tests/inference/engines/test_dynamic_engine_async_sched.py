@@ -2247,6 +2247,7 @@ def test_base_engine_rejects_kv_handoff_commands():
 
     assert InferenceStateHandoffMixin not in DynamicInferenceEngine.mro()
     assert engine.pending_kv_import_count == 0
+    assert not engine._abort_kv_handoff(1)
     with pytest.raises(RuntimeError, match="SUBMIT_REQUEST_WITH_KV"):
         engine.add_request_with_kv_handoff(1, [], SamplingParams(), {}, [])
     with pytest.raises(RuntimeError, match="RELEASE_KV"):

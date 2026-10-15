@@ -268,6 +268,49 @@ class NcclTransferBackend:
         works = dist.batch_isend_irecv(ops) if ops else []
         return NcclTransferHandle(works, buffers, scatters)
 
+    def begin_discard_blocks(
+        self, peer_meta: Any, src_block_ids: List[int], num_blocks: int
+    ) -> NcclTransferHandle:
+        """Post the receives matching the prefill's sends for a hand-off this
+        decode will not import, and drop what they receive.
+
+        The prefill pushes a hand-off whether or not the decode admits it, and
+        two-sided operations pair by post order per peer, so a rejected or
+        aborted hand-off must still consume its sends; otherwise every later
+        transfer from that peer pairs with the wrong receive. The receives are
+        enumerated exactly as `begin_pull_blocks` enumerates them for
+        `num_blocks` destination blocks (or SSM slots), but all receives of one
+        transfer share a scratch buffer and nothing is scattered, so a hand-off
+        too large for the cache costs one block's fragment per transfer.
+        """
+        if num_blocks <= 0:
+            return NcclTransferHandle([], [], [])
+        records = transfer_peer_records(peer_meta, src_block_ids)
+
+        ops: List[Any] = []
+        scratch: List[torch.Tensor] = []
+        device = self._memory_buffer.device
+        dtype = self._memory_buffer.dtype
+
+        if self._ssm_layout is not None:
+            for meta, layer, lo, hi in self._ssm_transfers(records, mine_is_src=False):
+                shape = self._memory_buffer[layer, 0, lo:hi].shape
+                scratch.append(torch.empty(shape, dtype=dtype, device=device))
+                peer = int(meta["nccl_rank"])
+                ops.extend(dist.P2POp(dist.irecv, scratch[-1], peer) for _ in range(num_blocks))
+        else:
+            geo = self._geometry
+            for meta, layers, heads in self._kv_transfers(records, mine_is_src=False):
+                n_layers = layers.stop - layers.start
+                n_heads = heads.stop - heads.start
+                shape = (2, n_layers, geo.tokens_per_block, n_heads, geo.head_dim)
+                scratch.append(torch.empty(shape, dtype=dtype, device=device))
+                peer = int(meta["nccl_rank"])
+                ops.extend(dist.P2POp(dist.irecv, scratch[-1], peer) for _ in range(num_blocks))
+
+        works = dist.batch_isend_irecv(ops) if ops else []
+        return NcclTransferHandle(works, scratch, [])
+
     # --- prefill side ----------------------------------------------------------
     def begin_push_blocks(self, peer_meta: Any, src_block_ids: List[int]) -> NcclTransferHandle:
         """Post the sends matching the decode's receives, straight out of the

@@ -2698,6 +2698,30 @@ def test_schedule_requests_drops_malformed_submit_request(malformed, caplog):
     assert msgpack.unpackb(broadcast[1], raw=False) == [len(malformed), len(good)]
 
 
+def test_schedule_requests_aborts_an_unadmitted_kv_handoff():
+    """ABORT_REQUEST for a request with no entry reaches the KV-handoff queues.
+
+    A decode handoff has no request entry until its import is admitted, so the
+    abort must not be dropped as an unknown request.
+    """
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = None
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    engine.requests, engine.failed_request_ids = {}, []
+    engine._abort_kv_handoff = mock.Mock(return_value=True)
+    socket = engine.socket_for_receiving_requests = mock.Mock()
+    abort = [msgpack.packb([Headers.ABORT_REQUEST.value, 42], use_bin_type=True)]
+    socket.recv_multipart.side_effect = [abort, dynamic_engine.zmq.Again]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
+    engine.local_metadata_ledger_enabled = False
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine._collect_failed_requests = mock.Mock(return_value=[])
+
+    engine.schedule_requests()
+
+    engine._abort_kv_handoff.assert_called_once_with(42)
+
+
 def test_handle_failed_request_releases_vlm_request_data():
     """Media registered before admission is dropped when the request fails."""
     request = DynamicInferenceRequest(

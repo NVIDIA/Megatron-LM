@@ -78,6 +78,7 @@ class InferenceStateHandoffMixin:
         self._handoff_completion_tracker: HandoffCompletionTracker | None = None
         self._handoff_completion_notifications: dict[int, bool] = {}  # Request ID -> failed.
         self._pending_kv_pushes: list = []
+        self._pending_kv_discards: list = []  # Decode receives draining discarded pushes.
         self._kv_transfer_role: str | None = None
 
     def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
@@ -108,12 +109,19 @@ class InferenceStateHandoffMixin:
 
     @property
     def pending_kv_import_count(self) -> int:
-        """Number of decode requests waiting for capacity or transfer completion.
+        """Number of decode handoffs waiting for capacity or transfer completion.
+
+        Includes discarded push handoffs whose receives are still draining their
+        source's sends, so the engine loop keeps polling until they finish.
 
         Side: decode engine; pull and push transport paths.
         """
 
-        return len(self._deferred_kv_handoffs) + len(self._pending_kv_imports)
+        return (
+            len(self._deferred_kv_handoffs)
+            + len(self._pending_kv_imports)
+            + len(self._pending_kv_discards)
+        )
 
     @property
     def has_admittable_kv_import(self) -> bool:
@@ -123,7 +131,11 @@ class InferenceStateHandoffMixin:
             failed = self._handoff_completion_notifications.get(pending.request_id)
             if failed is None:
                 continue
-            if failed or can_admit_prefilled_decode(self.context, len(pending.resume_tokens)):
+            if (
+                failed
+                or pending.cancelled
+                or can_admit_prefilled_decode(self.context, len(pending.resume_tokens))
+            ):
                 return True
         return False
 
@@ -146,6 +158,13 @@ class InferenceStateHandoffMixin:
             if not self._wait_for_transfer_handles(*handles):
                 unsafe_pushes.append((request_id, handles))
         self._pending_kv_pushes = unsafe_pushes
+        if not hasattr(self, "_pending_kv_discards"):
+            self._pending_kv_discards = []
+        self._pending_kv_discards = [
+            (request_id, handles)
+            for request_id, handles in self._pending_kv_discards
+            if not self._wait_for_transfer_handles(*handles)
+        ]
 
         if not hasattr(self, "_pending_kv_imports"):
             self._pending_kv_imports = deque()
@@ -178,7 +197,7 @@ class InferenceStateHandoffMixin:
             else:
                 quarantined.append(pending)
         self._quarantined_kv_imports = quarantined
-        if unsafe_pushes or unsafe or quarantined:
+        if unsafe_pushes or self._pending_kv_discards or unsafe or quarantined:
             raise RuntimeError(
                 "Cannot reset while KV handoff transfers may still access cache storage"
             )
@@ -663,6 +682,12 @@ class InferenceStateHandoffMixin:
 
         Side: decode engine; pull and push transport paths. A pull backend starts
         the read here, while a push backend posts the matching receive.
+
+        A handoff that admission could never fit fails on arrival, before it
+        reserves cache state or joins the capacity queue: it replies once with the
+        error ``add_request`` would record, and the returned future holds that
+        error. A rejected push handoff is still queued as a discard, because its
+        source sends regardless and two-sided transfers pair by post order.
         """
         allocator = self.context.kv_block_allocator
         if not allocator.enable_prefix_caching:
@@ -732,6 +757,18 @@ class InferenceStateHandoffMixin:
             num_blocks=num_blocks,
             future=future,
         )
+        # The KV-pool and sequence limits never change, so a handoff that exceeds them
+        # would otherwise hold the head of the capacity queue forever.
+        limit_error = self._handoff_limit_error(handoff, resume_tokens)
+        if limit_error is not None:
+            # Every MP rank applies the same limits to the same message, so all ranks
+            # register the same failed placeholder; only the MP coordinator replies.
+            self._fail_submission(request_id, sampling_params, limit_error)
+            future.set_exception(limit_error)
+            if self._kv_transfer_agent.is_push:
+                handoff.discard = True
+                self._deferred_kv_handoffs.append(handoff)
+            return future
         # Preserve receive order under backpressure. This is required by NCCL's
         # two-sided transport and also prevents a stream of small handoffs from
         # starving an older, larger one.
@@ -772,15 +809,8 @@ class InferenceStateHandoffMixin:
             else []
         )
         ssm_meta = handoff.kv_meta.get("ssm") if isinstance(handoff.kv_meta, dict) else None
-        continuation_block_count = (
-            additional_decode_blocks(
-                len(handoff.prompt),
-                len(resume_tokens),
-                self.context.block_size_tokens,
-                mtp_kv_cache=getattr(self.context, "enable_mtp_kv_cache", False),
-            )
-            if resume_tokens
-            else 0
+        continuation_block_count = self._handoff_continuation_block_count(
+            len(handoff.prompt), resume_tokens
         )
         if not self._handoff_capacity_available(
             num_blocks_to_import + continuation_block_count, cached_blocks
@@ -859,6 +889,52 @@ class InferenceStateHandoffMixin:
         self._loop.call_soon_threadsafe(self._loop.create_task, self._notify_cond_for_new_request())
         return True
 
+    def _handoff_continuation_block_count(self, prompt_length: int, resume_tokens: list) -> int:
+        """Return the empty KV blocks a handoff reserves for its resume-token writes.
+
+        Side: decode engine; pull and push transport paths.
+        """
+
+        if not resume_tokens:
+            return 0
+        return additional_decode_blocks(
+            prompt_length,
+            len(resume_tokens),
+            self.context.block_size_tokens,
+            mtp_kv_cache=getattr(self.context, "enable_mtp_kv_cache", False),
+        )
+
+    def _handoff_limit_error(
+        self, handoff: DeferredKvHandoff, resume_tokens: list
+    ) -> Exception | None:
+        """Return the first error admission would record for this handoff, if any.
+
+        Side: decode engine; pull and push transport paths. Applies the sequence
+        length and KV-pool limits that ``add_request`` applies at admission. The
+        pool must hold every prompt block, because transferred and reused cached
+        blocks stay resident alike, plus the blocks for its resume-token writes.
+        """
+
+        sampling_params = handoff.sampling_params
+        prompt_length = len(handoff.prompt)
+        if sampling_params.num_tokens_total is not None:
+            num_tokens_to_generate = sampling_params.num_tokens_total - prompt_length
+        elif sampling_params.num_tokens_to_generate is not None:
+            num_tokens_to_generate = sampling_params.num_tokens_to_generate
+        else:
+            num_tokens_to_generate = self.context.max_sequence_length - prompt_length
+        _, errors = self._request_limit_errors(
+            handoff.request_id,
+            prompt_length,
+            num_tokens_to_generate,
+            prompt_is_prefilled=True,
+            resident_block_count=(
+                handoff.num_blocks
+                + self._handoff_continuation_block_count(prompt_length, resume_tokens)
+            ),
+        )
+        return errors[0] if errors else None
+
     def _find_cached_handoff_prefix(self, hashes: list[int], num_blocks: int) -> list[int]:
         """Find the contiguous handoff prefix already cached on decode.
 
@@ -894,12 +970,19 @@ class InferenceStateHandoffMixin:
     def _drain_deferred_kv_handoffs(self) -> int:
         """Start queued handoffs in FIFO order while the queue head fits.
 
+        A discard reserves no cache state, so it never holds the queue: its
+        receives are posted in its FIFO position and draining moves on.
+
         Side: decode engine; pull and push transport paths.
         """
 
         started_count = 0
         while self._deferred_kv_handoffs:
             handoff = self._deferred_kv_handoffs[0]
+            if handoff.discard:
+                self._deferred_kv_handoffs.popleft()
+                self._start_kv_handoff_discard(handoff)
+                continue
             started = self._try_start_kv_handoff_import(handoff)
             if not started:
                 break
@@ -911,6 +994,52 @@ class InferenceStateHandoffMixin:
                 len(self._deferred_kv_handoffs),
             )
         return started_count
+
+    def _start_kv_handoff_discard(self, handoff: DeferredKvHandoff) -> None:
+        """Post receives that drain a discarded push handoff's sends into scratch.
+
+        Side: decode engine; push transport path only. The receives mirror those an
+        import posts, KV first and then each SSM state kind, so every later transfer
+        from the same source still pairs with its own receive. Push imports never
+        reuse a cached prefix, so the whole source block list is drained.
+        """
+
+        ssm_meta = handoff.kv_meta.get("ssm") if isinstance(handoff.kv_meta, dict) else None
+        handles = []
+        try:
+            handles.append(
+                self._kv_transfer_agent.begin_discard_blocks(
+                    handoff.kv_meta, handoff.src_block_ids, handoff.num_blocks
+                )
+            )
+            if ssm_meta and self._ssm_transfer_agents:
+                for state_kind in _SSM_STATE_KINDS:
+                    agent = self._ssm_transfer_agents[state_kind]
+                    handles.append(agent.begin_discard_blocks(ssm_meta[state_kind], [], 1))
+        except Exception:
+            # As for a failed import receive, the request has already failed; keep the
+            # engine running and wait on whatever was posted.
+            logging.exception("DISAGG_DECODE_DISCARD_FAILED request_id=%d", handoff.request_id)
+        if handles:
+            self._pending_kv_discards.append((handoff.request_id, handles))
+        logging.debug(
+            "DISAGG_DECODE_DISCARD_SUBMIT request_id=%d blocks=%d ssm=%d",
+            handoff.request_id,
+            handoff.num_blocks,
+            max(len(handles) - 1, 0),
+        )
+
+    def _reap_kv_handoff_discards(self) -> None:
+        """Drop discard receives that completed; unfinished ones stay pending.
+
+        Side: decode engine; push transport path only.
+        """
+
+        self._pending_kv_discards = [
+            (request_id, handles)
+            for request_id, handles in self._pending_kv_discards
+            if not all(handle.poll() for handle in handles)
+        ]
 
     @staticmethod
     def _pending_transfer_handles(pending: PendingKvImport) -> list:
@@ -1086,6 +1215,86 @@ class InferenceStateHandoffMixin:
             self.context.mamba_metadata.free_slot(pending.ssm.live_slot)
             pending.ssm = None
 
+    def _release_or_quarantine_kv_import(self, pending: PendingKvImport) -> None:
+        """Release an unadmitted import's storage, or quarantine it if still in use.
+
+        Side: decode engine; pull and push transport paths. A peer can fail before
+        posting its half of a two-sided transfer, so this rank's unmatched operation
+        is not waited on: its destination is quarantined unless its own handle
+        already reached a terminal state.
+        """
+
+        safe_to_release = pending.destinations_safe and pending.terminal_state_reported
+        safe_to_release = safe_to_release and self._wait_for_transfer_handles(
+            *self._pending_transfer_handles(pending)
+        )
+        if safe_to_release:
+            self._release_pending_kv_import(pending)
+        else:
+            self._quarantined_kv_imports.append(pending)
+            logging.error(
+                "Quarantining request %d cache storage after an incomplete handoff",
+                pending.request_id,
+            )
+
+    def _abort_kv_handoff(self, request_id: int) -> bool:
+        """Abort a decode handoff that has not been admitted, replying exactly once.
+
+        Side: decode engine; pull and push transport paths. ABORT_REQUEST reaches
+        every MP rank in the same order as the handoff messages, and the handoff
+        queues are mirrored, so every rank takes the same branch.
+
+        - A queued handoff has reserved nothing, so it replies now. A pull handoff
+          leaves the queue. A push handoff keeps its FIFO position as a discard,
+          because its source sends regardless and two-sided transfers pair by
+          post order.
+        - A discard has already replied, so it is left alone.
+        - A pending import may still be writing its destination, so it is only
+          marked cancelled. ``_admit_pending_kv_imports`` retires it and replies
+          once every MP rank's transfer is terminal.
+
+        Args:
+            request_id (int): Request named by ABORT_REQUEST.
+
+        Returns:
+            (bool) Whether ``request_id`` named a queued handoff or pending import.
+        """
+
+        for index, handoff in enumerate(self._deferred_kv_handoffs):
+            if handoff.request_id != request_id:
+                continue
+            if not handoff.discard:
+                if self._kv_transfer_agent.is_push:
+                    handoff.discard = True
+                else:
+                    del self._deferred_kv_handoffs[index]
+                self._reply_to_aborted_kv_handoff(
+                    request_id, handoff.sampling_params, handoff.future
+                )
+            return True
+        for pending in self._pending_kv_imports:
+            if pending.request_id == request_id:
+                pending.cancelled = True
+                return True
+        return False
+
+    def _reply_to_aborted_kv_handoff(
+        self, request_id: int, sampling_params: "SamplingParams", future: asyncio.Future
+    ) -> None:
+        """Cancel an aborted handoff's future and send its one failure reply.
+
+        Side: decode engine; pull and push transport paths. Every MP rank registers
+        the same failed placeholder; only the MP coordinator sends the reply.
+        """
+
+        if not future.done():
+            future.cancel()
+        self._fail_submission(
+            request_id,
+            sampling_params,
+            RuntimeError(f"Request {request_id} was aborted before its KV handoff was admitted"),
+        )
+
     @staticmethod
     def _wait_for_transfer_handles(*handles) -> bool:
         """Wait for known handles; return false if any may still be active."""
@@ -1143,6 +1352,7 @@ class InferenceStateHandoffMixin:
         """
 
         self._drain_deferred_kv_handoffs()
+        self._reap_kv_handoff_discards()
         if not self._pending_kv_imports:
             return 0
         self._report_completed_kv_imports()
@@ -1162,6 +1372,15 @@ class InferenceStateHandoffMixin:
             if failed is None:
                 remaining.append(pending)
                 continue
+            if pending.cancelled:
+                # Aborted while transferring. Every MP rank holds the same abort and
+                # completion decision, so all retire it here instead of admitting it.
+                self._handoff_completion_notifications.pop(pending.request_id)
+                self._release_or_quarantine_kv_import(pending)
+                self._reply_to_aborted_kv_handoff(
+                    pending.request_id, pending.sampling_params, pending.future
+                )
+                continue
             try:
                 if failed:
                     raise pending.local_error or RuntimeError(
@@ -1176,21 +1395,7 @@ class InferenceStateHandoffMixin:
                 ready += 1
             except Exception as exc:
                 self._handoff_completion_notifications.pop(pending.request_id, None)
-                # A peer can fail before posting its half of a two-sided transfer.
-                # Do not wait on this rank's unmatched operation; quarantine its
-                # destination unless its own handle already reached a terminal state.
-                safe_to_release = pending.destinations_safe and pending.terminal_state_reported
-                safe_to_release = safe_to_release and self._wait_for_transfer_handles(
-                    *self._pending_transfer_handles(pending)
-                )
-                if safe_to_release:
-                    self._release_pending_kv_import(pending)
-                else:
-                    self._quarantined_kv_imports.append(pending)
-                    logging.error(
-                        "Quarantining request %d cache storage after an incomplete handoff",
-                        pending.request_id,
-                    )
+                self._release_or_quarantine_kv_import(pending)
                 if not pending.future.done():
                     pending.future.set_exception(exc)
                 logging.exception("DISAGG_DECODE_PULL_FAILED request_id=%d", pending.request_id)

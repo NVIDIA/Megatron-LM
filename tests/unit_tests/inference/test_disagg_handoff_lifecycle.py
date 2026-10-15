@@ -11,6 +11,10 @@ import pytest
 import torch
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
+    MaxSequenceLengthOverflowError,
+)
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
@@ -49,10 +53,15 @@ class _PendingHandle:
 class _TransferAgent:
     def __init__(self):
         self.calls = []
+        self.discards = []
         self.is_push = False
 
     def begin_pull_blocks(self, peer_meta, src_block_ids, dst_block_ids):
         self.calls.append((peer_meta, list(src_block_ids), list(dst_block_ids)))
+        return _PendingHandle()
+
+    def begin_discard_blocks(self, peer_meta, src_block_ids, num_blocks):
+        self.discards.append((peer_meta, list(src_block_ids), num_blocks))
         return _PendingHandle()
 
 
@@ -65,6 +74,7 @@ class _KvAllocator:
         self.releases = []
         self.registered_parent_hashes = []
         self.block_ref_counts = torch.zeros(256, dtype=torch.int32)
+        self.pool_size = len(self.block_ref_counts)
         self.kv_hash_to_block_id = {}
 
     def is_memory_available(self, _count, potential_matched_count=0):
@@ -127,6 +137,8 @@ class _SchedulerHarness:
 
 
 class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
+    _request_limit_errors = DynamicInferenceEngine._request_limit_errors
+
     def __init__(self, loop, *, hybrid=False, available=0, extra_eos_token_id_set=()):
         self._loop = loop
         # Ids a model declares beyond the request's own termination_id, e.g. nanov3p5's
@@ -142,6 +154,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             max_requests=8,
             active_token_count=0,
             max_tokens=8,
+            max_sequence_length=64,
             is_hybrid_model=hybrid,
             kv_block_allocator=_KvAllocator(),
             mamba_slot_allocator=None,
@@ -160,6 +173,10 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
         self.track_generated_token_events = False
         self.use_coordinator = False
         self.is_mp_coordinator = False
+        self.failed_submissions = []
+
+    def _fail_submission(self, request_id, sampling_params, exc):
+        self.failed_submissions.append((request_id, exc))
 
     async def _notify_cond_for_new_request(self):
         return None
@@ -1084,6 +1101,194 @@ def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(ha
     assert engine.context.kv_block_allocator.releases == [[10, 11, 12]]
     assert not engine._pending_kv_imports
     log_exception.assert_called_once_with("DISAGG_DECODE_PULL_FAILED request_id=%d", 8)
+
+
+@pytest.mark.parametrize(
+    "limit, error_type",
+    [("kv_pool", BlockOverflowError), ("sequence_length", MaxSequenceLengthOverflowError)],
+)
+def test_pull_handoff_that_can_never_fit_fails_on_arrival(handoff_loop, limit, error_type):
+    """A handoff beyond a fixed limit replies once instead of holding the queue head."""
+    engine = _HandoffHarness(handoff_loop)
+    if limit == "kv_pool":
+        # Two prompt blocks plus one resume block exceed two usable blocks.
+        engine.context.kv_block_allocator.pool_size = 3
+    else:
+        engine.context.max_sequence_length = 6
+    kv_meta = {"request_id": 8, "resume_tokens": [99]}
+
+    future = engine.add_request_with_kv_handoff(
+        8, [1] * 8, SamplingParams(num_tokens_to_generate=2), kv_meta, [100, 101]
+    )
+
+    assert isinstance(future.exception(), error_type)
+    [(request_id, error)] = engine.failed_submissions
+    assert request_id == 8 and error is future.exception()
+    assert engine.pending_kv_import_count == 0
+    assert not engine._kv_transfer_agent.calls
+    assert not engine._kv_transfer_agent.discards
+    assert engine.context.kv_block_allocator.next_block == 10
+
+    # A later handoff that fits is not stuck behind the rejected one.
+    engine.context.kv_block_allocator.pool_size = 256
+    engine.context.max_sequence_length = 64
+    engine.add_request_with_kv_handoff(
+        9,
+        [2] * 8,
+        SamplingParams(num_tokens_to_generate=2),
+        {"request_id": 9, "resume_tokens": [99]},
+        [102, 103],
+    )
+    _drain_loop(handoff_loop)
+    assert [pending.request_id for pending in engine._pending_kv_imports] == [9]
+    assert len(engine.failed_submissions) == 1
+
+
+def test_rejected_push_handoff_still_drains_its_sends_in_fifo_order(handoff_loop):
+    """A push source sends regardless, so a rejection still posts the matching receives."""
+    engine = _HandoffHarness(handoff_loop, hybrid=True, available=1)
+    engine._kv_transfer_agent.is_push = True
+    engine.context.kv_block_allocator.capacity_available = False
+    # Two usable blocks: the one-block prompt fits, the two-block prompt never can.
+    engine.context.kv_block_allocator.pool_size = 3
+    engine.add_request_with_kv_handoff(
+        7, [1] * 4, SamplingParams(num_tokens_to_generate=2), _meta(7), [100]
+    )
+    rejected_meta = _meta(8)
+    future = engine.add_request_with_kv_handoff(
+        8, [2] * 8, SamplingParams(num_tokens_to_generate=2), rejected_meta, [102, 103]
+    )
+
+    assert isinstance(future.exception(), BlockOverflowError)
+    assert [request_id for request_id, _ in engine.failed_submissions] == [8]
+    queued = [(handoff.request_id, handoff.discard) for handoff in engine._deferred_kv_handoffs]
+    assert queued == [(7, False), (8, True)]
+    assert engine.pending_kv_import_count == 2
+
+    # The discard keeps its place behind the capacity-queued head.
+    engine._poll_pending_kv_imports()
+    assert not engine._kv_transfer_agent.discards
+    engine.context.kv_block_allocator.capacity_available = True
+    engine._poll_pending_kv_imports()
+    _drain_loop(handoff_loop)
+
+    assert not engine._deferred_kv_handoffs
+    assert [pending.request_id for pending in engine._pending_kv_imports] == [7]
+    assert engine._kv_transfer_agent.discards == [(rejected_meta, [102, 103], 2)]
+    for kind in ("conv", "recurrent"):
+        agent = engine._ssm_transfer_agents[kind]
+        assert agent.discards == [(rejected_meta["ssm"][kind], [], 1)]
+    assert engine.context.mamba_metadata.mamba_state_free_slot_count == 0
+    assert engine.pending_kv_import_count == 2  # Import 7 and the draining discard.
+
+    [(_, handles)] = engine._pending_kv_discards
+    for handle in handles:
+        handle.poll = lambda: True
+    engine._poll_pending_kv_imports()
+    assert not engine._pending_kv_discards
+    assert engine.pending_kv_import_count == 1
+    assert len(engine.failed_submissions) == 1
+
+
+@pytest.mark.parametrize("is_push", [False, True])
+def test_abort_of_a_capacity_queued_handoff_replies_once(handoff_loop, is_push):
+    """An aborted queued handoff replies now; a push one still drains its sends."""
+    engine = _HandoffHarness(handoff_loop)
+    engine._kv_transfer_agent.is_push = is_push
+    engine.context.kv_block_allocator.capacity_available = False
+    kv_meta = {"request_id": 8, "resume_tokens": [99]}
+    future = engine.add_request_with_kv_handoff(
+        8, [1] * 8, SamplingParams(num_tokens_to_generate=2), kv_meta, [100, 101]
+    )
+
+    assert engine._abort_kv_handoff(8)
+    assert future.cancelled()
+    [(request_id, error)] = engine.failed_submissions
+    assert request_id == 8 and "aborted" in str(error)
+    # A repeated abort never replies twice.
+    assert engine._abort_kv_handoff(8) is is_push
+    assert len(engine.failed_submissions) == 1
+
+    engine._poll_pending_kv_imports()
+    assert not engine._deferred_kv_handoffs
+    assert not engine._kv_transfer_agent.calls
+    assert engine.context.kv_block_allocator.next_block == 10
+    if is_push:
+        # Draining needs no cache capacity.
+        assert engine._kv_transfer_agent.discards == [(kv_meta, [100, 101], 2)]
+        assert engine.pending_kv_import_count == 1
+    else:
+        assert not engine._kv_transfer_agent.discards
+        assert engine.pending_kv_import_count == 0
+    assert not engine._abort_kv_handoff(9)
+
+
+def test_abort_of_a_transferring_handoff_retires_it_once_the_transfer_settles(handoff_loop):
+    """An import still writing its destination is retired only after it is terminal."""
+    engine = _HandoffHarness(handoff_loop)
+    kv_meta = {"request_id": 8, "resume_tokens": [99]}
+    future = engine.add_request_with_kv_handoff(
+        8, [1] * 8, SamplingParams(num_tokens_to_generate=2), kv_meta, [100, 101]
+    )
+    _drain_loop(handoff_loop)
+    [pending] = engine._pending_kv_imports
+
+    assert engine._abort_kv_handoff(8)
+    assert pending.cancelled and not future.done()
+    assert not engine.failed_submissions
+    assert engine._poll_pending_kv_imports() == 0
+    assert engine._admit_pending_kv_imports() == 0
+    assert [item.request_id for item in engine._pending_kv_imports] == [8]
+    assert engine.context.kv_block_allocator.releases == []
+
+    pending.handle.poll = lambda: True
+    assert engine._poll_pending_kv_imports() == 1
+    assert engine._admit_pending_kv_imports() == 0
+
+    assert future.cancelled()
+    [(request_id, error)] = engine.failed_submissions
+    assert request_id == 8 and "aborted" in str(error)
+    assert not engine._pending_kv_imports
+    assert not engine._handoff_completion_notifications
+    assert engine.context.kv_block_allocator.releases == [[10, 11, 12]]
+    assert not engine.requests
+
+
+def test_reset_waits_for_draining_handoff_discards(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    handle = mock.Mock()
+    engine._pending_kv_discards = [(8, [handle])]
+
+    engine._reset_pending_kv_imports()
+
+    handle.wait.assert_called_once_with()
+    assert not engine._pending_kv_discards
+    assert engine.pending_kv_import_count == 0
+
+
+def test_reset_rejects_an_active_handoff_discard(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    handle = mock.Mock()
+    handle.wait.side_effect = TimeoutError
+    engine._pending_kv_discards = [(8, [handle])]
+
+    with pytest.raises(RuntimeError, match="may still access cache storage"):
+        engine._reset_pending_kv_imports()
+
+    assert engine._pending_kv_discards == [(8, [handle])]
+
+
+def test_request_limits_bound_a_prefilled_prompt_by_its_resident_blocks(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    engine.context.kv_block_allocator.pool_size = 4  # Three usable blocks.
+
+    # A prefilled prompt is not bounded by the prefill token budget (max_tokens=8).
+    assert engine._request_limit_errors(1, 12, 1, prompt_is_prefilled=True) == (1, [])
+    # Resident blocks count even when the generation budget needs fewer.
+    _, errors = engine._request_limit_errors(
+        1, 12, 1, prompt_is_prefilled=True, resident_block_count=4
+    )
+    assert [type(error) for error in errors] == [BlockOverflowError]
 
 
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
