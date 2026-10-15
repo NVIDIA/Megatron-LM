@@ -24,6 +24,12 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.open
     json_safe_top_n_logprobs,
     openai_stream,
 )
+from megatron.core.tokenizers.text.parsers.deepseek_r1_reasoning_parser import (
+    DeepSeekR1ReasoningParser,
+)
+from megatron.core.tokenizers.text.parsers.nemotron_v3_reasoning_parser import (
+    NemotronV3ReasoningParser,
+)
 from megatron.core.tokenizers.text.parsers.qwen3_coder_tool_parser import Qwen3CoderToolParser
 
 NEG_INF = float("-inf")
@@ -410,6 +416,94 @@ def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
         )
         == "tool_calls"
     )
+
+
+def _deepseek_parse(text, finished=False):
+    return DeepSeekR1ReasoningParser.parse(text)
+
+
+def _parse_each_prefix(parser, model_output):
+    deltas = []
+    for end in range(1, len(model_output) + 1):
+        deltas.extend(parser.parse(model_output[:end]))
+    deltas.extend(parser.parse(model_output, finished=True))
+    return deltas
+
+
+def _joined(deltas, key):
+    return "".join(delta.get(key, "") for delta in deltas)
+
+
+def test_streaming_chat_parser_holds_partial_reasoning_end_marker():
+    parser = StreamingChatParser(_deepseek_parse)
+
+    assert parser.parse("<think>hel") == [{"reasoning_content": "hel"}]
+    # `</thi` may still become `</think>`, so it is held back instead of committed.
+    assert parser.parse("<think>hello</thi") == [{"reasoning_content": "lo"}]
+    # The completed marker ends the reasoning; no stale marker text was emitted.
+    assert parser.parse("<think>hello</think>") == []
+    assert parser.parse("<think>hello</think>Hi") == [{"content": "Hi"}]
+    assert parser.parse("<think>hello</think>Hi", finished=True) == []
+
+    # Character by character, partial `<think>` included, the deltas join to the final split.
+    deltas = _parse_each_prefix(StreamingChatParser(_deepseek_parse), "<think>hello</think>Hi")
+    assert _joined(deltas, "reasoning_content") == "hello"
+    assert _joined(deltas, "content") == "Hi"
+
+
+def test_streaming_chat_parser_holds_partial_implicit_reasoning_end_marker():
+    def parse(text, finished=False):
+        return DeepSeekR1ReasoningParser.parse(
+            text, implicit_reasoning_end_markers=("<tool_call>",)
+        )
+
+    parser = StreamingChatParser(parse, marker_prefixes=Qwen3CoderToolParser.streaming_markers)
+
+    assert parser.parse("<think>plan<tool_c") == [{"reasoning_content": "plan"}]
+    # `<tool_call>` ends the reasoning; the tool markup itself stays buffered as content.
+    assert parser.parse("<think>plan<tool_call>") == []
+
+
+@pytest.mark.parametrize(
+    "chat_template_kwargs",
+    [{"enable_thinking": False}, {"force_nonempty_content": True}],
+    ids=["thinking-disabled", "force-nonempty"],
+)
+def test_streaming_chat_parser_holds_nemotron_fallback_reasoning(chat_template_kwargs):
+    def parse(text, finished=False):
+        return NemotronV3ReasoningParser.parse(text, chat_template_kwargs=chat_template_kwargs)
+
+    parser = StreamingChatParser(parse)
+    # Until an answer follows `</think>`, Nemotron returns the reasoning as content. Neither
+    # channel may commit it, because it becomes reasoning once the answer starts.
+    for end in range(1, len("hello</think>") + 1):
+        assert parser.parse("hello</think>"[:end]) == []
+    assert parser.parse("hello</think>\n") == [{"reasoning_content": "hello"}, {"content": "\n"}]
+    assert parser.parse("hello</think>\nHi") == [{"content": "Hi"}]
+    assert parser.parse("hello</think>\nHi", finished=True) == []
+
+    # When no answer follows by the end of the stream, the reasoning is the content.
+    parser = StreamingChatParser(parse)
+    assert parser.parse("Hi") == []
+    assert parser.parse("Hi", finished=True) == [{"content": "Hi"}]
+
+
+def test_streaming_chat_parser_streams_nemotron_reasoning_when_not_forced():
+    def parse(text, finished=False):
+        return NemotronV3ReasoningParser.parse(text, chat_template_kwargs={"enable_thinking": True})
+
+    parser = StreamingChatParser(parse)
+
+    assert parser.parse("hel") == [{"reasoning_content": "hel"}]
+    assert parser.parse("hello</think>Hi") == [{"reasoning_content": "lo"}, {"content": "Hi"}]
+
+
+def test_streaming_chat_parser_flushes_literal_partial_reasoning_marker_at_finish():
+    parser = StreamingChatParser(_deepseek_parse)
+
+    assert parser.parse("<think>hello</thi") == [{"reasoning_content": "hello"}]
+    # The stream ended before the marker completed, so `</thi` is literal reasoning.
+    assert parser.parse("<think>hello</thi", finished=True) == [{"reasoning_content": "</thi"}]
 
 
 def test_huggingface_fast_incremental_detokenizer_preserves_utf8_boundaries():

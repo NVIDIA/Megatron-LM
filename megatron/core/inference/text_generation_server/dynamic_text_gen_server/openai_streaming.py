@@ -120,25 +120,73 @@ def _finish_reason(result):
     return generation_finish_reason(result)
 
 
+# Reasoning parsers split generated text on these tags.
+_REASONING_END = "</think>"
+_REASONING_MARKERS = ("<think>", _REASONING_END)
+
+
+def _partial_marker_start(text, markers):
+    """Return where a trailing, possibly incomplete control marker starts in `text`."""
+    safe_end = len(text)
+    for marker in markers:
+        for prefix_length in range(1, min(len(marker), len(text)) + 1):
+            if text.endswith(marker[:prefix_length]):
+                safe_end = min(safe_end, len(text) - prefix_length)
+    return safe_end
+
+
 def _safe_content_prefix(content, markers):
     """Hold text that may still become a parser control marker."""
-    safe_end = len(content)
+    safe_end = _partial_marker_start(content, markers)
     for marker in markers:
         marker_index = content.find(marker)
         if marker_index >= 0:
             safe_end = min(safe_end, marker_index)
-        for prefix_length in range(1, min(len(marker), len(content)) + 1):
-            if content.endswith(marker[:prefix_length]):
-                safe_end = min(safe_end, len(content) - prefix_length)
     return content[:safe_end]
+
+
+def _safe_reasoning_prefix(reasoning, markers):
+    """Hold a trailing partial marker that may still end the open reasoning.
+
+    Only the tail is held: the reasoning parser already split at every boundary it recognizes,
+    so a complete marker earlier in the reasoning is literal text.
+    """
+    return reasoning[: _partial_marker_start(reasoning, markers)]
 
 
 class StreamingChatParser:
     """Convert accumulated parser output into stable OpenAI chat deltas."""
 
-    def __init__(self, parse, *, marker_prefixes=(), named_tool_choice=False):
+    def __init__(
+        self,
+        parse,
+        *,
+        marker_prefixes=(),
+        named_tool_choice=False,
+        reasoning_markers=None,
+        force_content=None,
+    ):
+        """Create the delta state for one streamed chat choice.
+
+        Args:
+            parse: `(text, finished=False) -> (content, metadata)` run on the accumulated text.
+            marker_prefixes: Control markers, such as tool-call tags, held back from content.
+            named_tool_choice: Whether the request named the tool to call.
+            reasoning_markers: Markers held back from the tail of open reasoning because they
+                may still end it. Defaults to `<think>`, `</think>`, and `marker_prefixes`,
+                which carry implicit reasoning end markers such as `<tool_call>`.
+            force_content: Whether `parse` returns reasoning as content until a non-empty
+                answer follows it, like NemotronV3 with `enable_thinking=False` or
+                `force_nonempty_content=True`. `None` probes `parse` on the first delta.
+        """
         self._parse = parse
         self._marker_prefixes = tuple(marker_prefixes)
+        self._reasoning_markers = (
+            _REASONING_MARKERS + self._marker_prefixes
+            if reasoning_markers is None
+            else tuple(reasoning_markers)
+        )
+        self._force_content = force_content
         self._named_tool_choice = named_tool_choice
         # Retain emitted content/reasoning prefixes and stable per-tool IDs and emission flags.
         self._content_sent = ""
@@ -159,8 +207,23 @@ class StreamingChatParser:
         function = call.get("function", {}) if isinstance(call, dict) else {}
         return function if isinstance(function, dict) else {}
 
+    def _parse_forces_content(self):
+        """Whether `parse` returns reasoning as content while no answer follows it.
+
+        Probes `parse` with an empty, closed reasoning block. A reasoning parser reports it as
+        empty reasoning, and a pipeline without one keeps the tag as content. A parser that
+        backfills empty content from reasoning consumes the tag and reports neither.
+        """
+        try:
+            content, metadata = self._parse(_REASONING_END, finished=False)
+        except Exception:  # A failing probe keeps the default streaming behavior.
+            return False
+        return not content and "reasoning" not in (metadata or {})
+
     def parse(self, text, *, finished=False):
         """Parse accumulated text and return zero or more structured deltas."""
+        if self._force_content is None:
+            self._force_content = self._parse_forces_content()
         try:
             content, metadata = self._parse(text, finished=finished)
         except Exception:
@@ -169,15 +232,28 @@ class StreamingChatParser:
 
         content = content or ""
         metadata = metadata or {}
+        if self._force_content and not finished and "reasoning" not in metadata:
+            # Until a non-empty answer follows the reasoning, the parser returns the reasoning
+            # as content, and that text moves to the reasoning channel once an answer starts.
+            # Commit no channel, including tool calls parsed from it, until the split is stable.
+            return []
         tool_calls = metadata.get("tool_calls") or []
         reasoning = metadata.get("reasoning") or ""
         deltas = []
 
-        if reasoning.startswith(self._reasoning_sent):
-            reasoning_delta = reasoning[len(self._reasoning_sent) :]
+        # Until content or a tool call follows the reasoning, a trailing partial marker such
+        # as `</thi` may still end it, so hold that tail back instead of committing it.
+        reasoning_is_open = not (finished or content or tool_calls)
+        safe_reasoning = (
+            _safe_reasoning_prefix(reasoning, self._reasoning_markers)
+            if reasoning_is_open
+            else reasoning
+        )
+        if safe_reasoning.startswith(self._reasoning_sent):
+            reasoning_delta = safe_reasoning[len(self._reasoning_sent) :]
             if reasoning_delta:
                 deltas.append({"reasoning_content": reasoning_delta})
-                self._reasoning_sent = reasoning
+                self._reasoning_sent = safe_reasoning
 
         # Buffer partial control-marker prefixes so parser syntax is not emitted as content.
         safe_content = (
