@@ -71,7 +71,7 @@ class RecomputeSegment:
         layers: List["TransformerLayerSchedulePlan"],
         chunk_state: ModelChunkState,
         start_index: int,
-    ):
+    ) -> None:
         assert len(layers) > 0, "a recompute segment must contain at least one layer"
         self.layers = layers
         self.chunk_state = chunk_state
@@ -414,7 +414,7 @@ class TransformerLayerSchedulePlan:
         reusable for a recompute forward. Also clears the per-layer shared state."""
         for node in self._iter_recomputed_nodes():
             node.reset_for_recompute()
-        if getattr(self, 'layer_state', None) is not None:
+        if getattr(self, "layer_state", None) is not None:
             # Nodes hold a reference to this same layer_state object, so clear it
             # in place rather than replacing it.
             self.layer_state.__dict__.clear()
@@ -611,7 +611,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # Full activation recompute; see RecomputeSegment. This plan is only built for
         # the EP A2A overlap scheduler, so recompute_granularity alone decides (not
         # re-checking overlap_moe_expert_parallel_comm keeps the schedule unit-testable).
-        self.recompute_full = model.config.recompute_granularity == 'full'
+        self.recompute_full = model.config.recompute_granularity == "full"
         self._recompute_segments = []
         self._num_decoder_layers = 0
 
