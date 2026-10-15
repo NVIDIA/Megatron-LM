@@ -1394,9 +1394,11 @@ class TransformerConfig(ModelParallelConfig):
     stream carries itself to the next layer unchanged. The per-layer mapping projection then only
     produces H_pre and H_post (2n outputs instead of n^2 + 2n), and the Sinkhorn-Knopp projection,
     alpha_res and the H_res bias are dropped. The downstream H_res / H_post / BDA kernels are
-    unchanged and consume the identity matrix as-is. Requires enable_hyper_connections=True;
-    mhc_sinkhorn_iterations has no effect. mHC and iHC checkpoints are not interchangeable
-    because the hyper-connection parameter shapes differ.
+    unchanged and consume the identity matrix as-is. With use_fused_mhc the projection still uses
+    the fused proj_rms_compute_h kernel, fed zero H_res rows, so iHC does not fall back to the
+    slower native projection. Requires enable_hyper_connections=True; mhc_sinkhorn_iterations has
+    no effect. mHC and iHC checkpoints are not interchangeable because the hyper-connection
+    parameter shapes differ.
     """
 
     mhc_sinkhorn_iterations: int = 20

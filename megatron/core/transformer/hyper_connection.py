@@ -229,10 +229,12 @@ class HyperConnectionModule(MegatronModule):
 
     With ``config.enable_identity_hyper_connections`` (iHC, identity
     hyper-connections) H_res is fixed to the n x n identity: the mapping
-    projection only produces H_pre and H_post, and the Sinkhorn-Knopp
+    projection only learns H_pre and H_post, and the Sinkhorn-Knopp
     projection is skipped. The H_res consumers are unchanged and receive the
     identity matrix, so the propagation becomes
         x_{l+1} = x_l + H_post^T @ F(H_pre @ x_l)
+    With ``use_fused_mhc`` the projection still runs through the fused
+    proj_rms_compute_h kernel, fed zero H_res rows.
 
     Args:
         config: TransformerConfig with hyper-connection fields
@@ -307,15 +309,11 @@ class HyperConnectionModule(MegatronModule):
             self._h_aggregate_op = fused_h_aggregate
             self._h_aggregate_into_op = fused_h_aggregate_into
             self._h_post_bda_op = fused_h_post_bda
-            if self.identity_h_res:
-                # iHC has no Sinkhorn step, and the fused projection kernel
-                # assumes the mHC [n^2 + 2n] output layout, so the projection
-                # takes the native path. Aggregate and H_post_bda stay fused.
-                self._sinkhorn_op = None
-                self._proj_rms_compute_h_op = None
-            else:
-                self._sinkhorn_op = fused_sinkhorn
-                self._proj_rms_compute_h_op = fused_proj_rms_compute_h
+            # iHC also runs its projection through the fused kernel, fed the mHC
+            # [n^2 + 2n] layout with zero H_res rows (see _fused_mapping_params).
+            # It has no Sinkhorn step.
+            self._proj_rms_compute_h_op = fused_proj_rms_compute_h
+            self._sinkhorn_op = None if self.identity_h_res else fused_sinkhorn
         else:
             self._sinkhorn_op = None if self.identity_h_res else native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
@@ -400,6 +398,28 @@ class HyperConnectionModule(MegatronModule):
         eye = torch.eye(self.n, dtype=dtype, device=device)
         return eye.expand(s, b, self.n, self.n).contiguous()
 
+    def _fused_mapping_params(self) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Return ``(weight, alpha_res, bias)`` in the layout the fused projection expects.
+
+        The fused proj_rms_compute_h kernels are written for the mHC ``[n^2 + 2n]``
+        output layout. iHC only learns the H_pre / H_post rows, so its weight and bias
+        are padded with ``n^2`` zero rows and paired with a zero ``alpha_res``: the
+        padded H_res logits are exactly zero and are discarded by the caller, while
+        the kernel runs with the same shapes and tile configuration as for mHC. The
+        projection is bound by reading the n-stream input, so the extra output columns
+        cost next to nothing, unlike the native fallback, which materializes an FP32
+        copy of that input. Gradients reach only the real rows through the concat.
+        """
+        if not self.identity_h_res:
+            return self.mapping_proj.weight, self.alpha_res, self.bias
+        num_h_res = self.n * self.n
+        weight = self.mapping_proj.weight
+        weight = torch.cat([weight, weight.new_zeros(num_h_res, weight.shape[1])], dim=0)
+        bias = torch.cat([self.bias, self.bias.new_zeros(num_h_res)], dim=0)
+        alpha_res = self.alpha_pre.new_zeros(1)
+        return weight, alpha_res, bias
+
     @nvtx_decorator(message="HyperConnection::compute_mappings")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -419,16 +439,17 @@ class HyperConnectionModule(MegatronModule):
         s, b, _ = x.shape
 
         if self._proj_rms_compute_h_op is not None:
-            # Fused path (mHC only): proj_rms + compute_h in one kernel launch sequence
+            # Fused path: proj_rms + compute_h in one kernel launch sequence
             x_2d = x.reshape(s * b, self.n * self.hidden_size)
+            weight, alpha_res, bias = self._fused_mapping_params()
             with torch.cuda.nvtx.range("HyperConnection::fused_proj_rms_compute_h"):
                 h_pre, h_post, h_res, _ = self._proj_rms_compute_h_op(
                     x_2d,
-                    self.mapping_proj.weight,
+                    weight,
                     self.alpha_pre,
                     self.alpha_post,
-                    self.alpha_res,
-                    self.bias,
+                    alpha_res,
+                    bias,
                     self.n,
                     self.norm_eps,
                     self.compute_h_eps,
