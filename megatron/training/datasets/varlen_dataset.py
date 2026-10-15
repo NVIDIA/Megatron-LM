@@ -491,12 +491,15 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
 
     Each config/split remains a separate map-style component and is joined by
     index arithmetic. This avoids requiring Arrow feature compatibility across
-    components. A per-component converter is selected from its columns. Hub
+    components. With ``shuffle_seed`` (the dataset config's random seed), several
+    components are read through one seeded permutation, so contiguous ``--split``
+    ranges and sequential samplers mix all of them; a single component keeps its
+    row order. A per-component converter is selected from its columns. Hub
     JSON that fails Arrow schema unification is streamed into a cached JSON
     payload column and normalized per row.
     """
 
-    def __init__(self, dataset_path: str) -> None:
+    def __init__(self, dataset_path: str, shuffle_seed: Optional[int] = None) -> None:
         try:
             from datasets import (
                 Dataset,
@@ -622,6 +625,12 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
             if len(unique_schema_names) == 1
             else f"mixed({','.join(unique_schema_names)})"
         )
+        # Components are joined end to end, while ``--split`` takes contiguous index
+        # ranges and the default sampler reads them in order. A seeded permutation (the
+        # same on every rank) makes each range a mix of all components.
+        self._order = None
+        if shuffle_seed is not None and len(self._datasets) > 1:
+            self._order = np.random.default_rng(shuffle_seed).permutation(len(self))
 
     @property
     def schema_name(self) -> str:
@@ -638,6 +647,8 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
             idx += len(self)
         if idx < 0 or idx >= len(self):
             raise IndexError(idx)
+        if self._order is not None:
+            idx = int(self._order[idx])
         component_index = bisect_right(self._cumulative_sizes, idx)
         component_start = self._cumulative_sizes[component_index - 1] if component_index > 0 else 0
         return self._converters[component_index](
@@ -699,7 +710,9 @@ class VarlenDataset(SFTDataset):
 
     @staticmethod
     def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
-        return VarlenLowLevelDataset(dataset_path)
+        return VarlenLowLevelDataset(
+            dataset_path, shuffle_seed=getattr(config, "random_seed", None)
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         tokenizer = self.config.tokenizer

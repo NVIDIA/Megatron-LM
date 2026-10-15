@@ -803,6 +803,36 @@ def test_low_level_hub_loads_only_the_declared_default_config(monkeypatch):
     assert len(low_level) == 1
 
 
+def test_low_level_hub_interleaves_components_with_seed(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["cfg-a", "cfg-b"])
+    monkeypatch.setattr(datasets, "get_dataset_default_config_name", lambda path: None)
+    monkeypatch.setattr(datasets, "get_dataset_split_names", lambda path, config: ["train"])
+    monkeypatch.setattr(
+        datasets,
+        "load_dataset",
+        lambda path, name, split: _FakeHubDataset([{"text": f"{name}/{i}"} for i in range(50)]),
+    )
+    rows = [VarlenLowLevelDataset("owner/two-configs", shuffle_seed=1234)[i] for i in range(100)]
+
+    assert sorted(rows) == sorted(f"cfg-{c}/{i}" for c in "ab" for i in range(50))
+    # The last 10% (a --split validation range) mixes both components.
+    assert {row.split("/")[0] for row in rows[90:]} == {"cfg-a", "cfg-b"}
+    # Same seed, same order on every rank; VarlenDataset passes the config's random seed.
+    same_seed = VarlenDataset.build_low_level_dataset(
+        "owner/two-configs", SimpleNamespace(random_seed=1234)
+    )
+    assert [same_seed[i] for i in range(100)] == rows
+
+
+def test_low_level_single_component_keeps_row_order_with_seed(tmp_path):
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    path = _write_jsonl(tmp_path, [{"text": f"row {i}"} for i in range(5)])
+    low_level = VarlenLowLevelDataset(path, shuffle_seed=1234)
+    assert [low_level[i] for i in range(5)] == [f"row {i}" for i in range(5)]
+
+
 @pytest.mark.parametrize(
     ("split", "is_eval"),
     [
