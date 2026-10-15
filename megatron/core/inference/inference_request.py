@@ -1161,6 +1161,10 @@ class DynamicInferenceRequestRecord:
             raise ValueError(
                 "resumed generation carries no log probs for a request that returns them"
             )
+        if resumed.generated_top_n_logprobs is None and first.sampling_params.top_n_logprobs > 0:
+            raise ValueError(
+                "resumed generation carries no top-N log probs for a request that returns them"
+            )
         if resumed.policy_epoch is None and generation_epoch is not None:
             raise ValueError(
                 "resumed generation carries no policy epoch for an engine that stamps one"
@@ -1187,6 +1191,10 @@ class DynamicInferenceRequestRecord:
         first.generated_length = len(tokens)
         first.generated_log_probs = resumed.log_probs
         first.prompt_log_probs = resumed.prompt_log_probs
+        first.generated_top_n_logprobs = resumed.generated_top_n_logprobs
+        first.prompt_top_n_logprobs = resumed.prompt_top_n_logprobs
+        first.acceptance_step_lengths = list(resumed.acceptance_step_lengths)
+        first.finish_reason = resumed.finish_reason
         first.policy_epoch = None if resumed.policy_epoch is None else list(resumed.policy_epoch)
         first.kv_cache_epoch = (
             None if resumed.kv_cache_epoch is None else list(resumed.kv_cache_epoch)
@@ -1401,12 +1409,13 @@ class DynamicInferenceRequestRecord:
 
 @dataclass
 class FinishedRequestRecord:
-    """Stores per-request metadata that is not meant to be passed through the RESTful server."""
+    """Per-request metadata, outside of the RESTful reply, to be used by the stager."""
 
     policy_epoch: Optional[list[tuple[int, int]]]
     kv_cache_epoch: Optional[list[tuple[int, int]]]
     num_evictions: int
     num_tokens_to_generate: Optional[int] = None
+    finish_reason: Optional[str] = None
 
     @classmethod
     def from_request(cls, request: "DynamicInferenceRequest") -> "FinishedRequestRecord":
@@ -1426,6 +1435,7 @@ class FinishedRequestRecord:
                 1 for event in request.events if event.type is DynamicInferenceEventType.EVICT
             ),
             num_tokens_to_generate=None if params is None else params.num_tokens_to_generate,
+            finish_reason=request.finish_reason,
         )
         return record
 
@@ -1435,7 +1445,8 @@ class OffloadedRequestPayload:
     """A finished request's per-token payload, kept off the RESTful reply by payload offload.
 
     Self-contained: a consumer can rebuild the served sequence from it alone,
-    keyed by the request uid (the OpenAI response id).
+    keyed by the request uid (the OpenAI response id). The top-N scores and the
+    per-step token counts also stay on the reply; they ride here for a resume.
 
     ``prompt_token_ids`` is the prompt the model ran on. For a VLM request that is the
     *expanded* sequence (one media token per projected embedding), which is what a
@@ -1452,6 +1463,9 @@ class OffloadedRequestPayload:
     prompt_log_probs: Optional[list[float]]
     routing_indices: Optional[np.ndarray]
     media_tensors: Optional[Dict[str, torch.Tensor]] = None
+    prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
+    generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
+    acceptance_step_lengths: List[int] = field(default_factory=list)
 
     @classmethod
     def from_request(cls, request: "DynamicInferenceRequest") -> "OffloadedRequestPayload":
@@ -1487,6 +1501,9 @@ class OffloadedRequestPayload:
                     if tensor is not None
                 }
             ),
+            prompt_top_n_logprobs=to_plain_list(request.prompt_top_n_logprobs),
+            generated_top_n_logprobs=to_plain_list(request.generated_top_n_logprobs),
+            acceptance_step_lengths=list(request.acceptance_step_lengths),
         )
 
 
@@ -1569,6 +1586,10 @@ class ResumedGeneration:
     kv_cache_epoch: Optional[List[Tuple[int, int]]] = None
     num_evictions: int = 0
     finished: bool = False
+    finish_reason: Optional[str] = None
+    prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
+    generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
+    acceptance_step_lengths: List[int] = field(default_factory=list)
 
     def __post_init__(self):
         tokens, budget = self.token_ids, self.num_tokens_to_generate
@@ -1591,6 +1612,25 @@ class ResumedGeneration:
                 "resumed generation has log probs and tokens of different lengths, "
                 f"{len(self.log_probs)} and {len(tokens)}"
             )
+        if self.finish_reason not in (None, "stop", "length"):
+            raise ValueError("resumed generation has a malformed finish reason")
+        if self.finish_reason is not None and not self.finished:
+            raise ValueError("resumed generation has a finish reason without finishing")
+        for name, scores in (
+            ("prompt", self.prompt_top_n_logprobs),
+            ("generated", self.generated_top_n_logprobs),
+        ):
+            if scores is not None and not all(isinstance(entry, dict) for entry in scores):
+                raise ValueError(f"resumed generation has malformed {name} top-N log probs")
+        top_n = self.generated_top_n_logprobs
+        if top_n is not None and len(top_n) != len(tokens):
+            raise ValueError(
+                "resumed generation has top-N log probs and tokens of different lengths, "
+                f"{len(top_n)} and {len(tokens)}"
+            )
+        steps = self.acceptance_step_lengths
+        if not all(type(s) is int and s > 0 for s in steps) or sum(steps) > len(tokens):
+            raise ValueError("resumed generation has malformed acceptance step lengths")
         for name, boundaries in (
             ("policy_epoch", self.policy_epoch),
             ("kv_cache_epoch", self.kv_cache_epoch),
@@ -1614,20 +1654,33 @@ class ResumedGeneration:
     def from_snapshot(cls, snapshot: "LiveRequestSnapshot") -> "ResumedGeneration":
         """The resume of a live request from the engine's snapshot of it."""
         payload, record = snapshot.payload, snapshot.record
-        log_probs, prompt_log_probs = payload.generated_log_probs, payload.prompt_log_probs
+
+        def as_list(values):
+            return None if values is None else list(values)
+
         return cls(
             token_ids=[int(t) for t in payload.generated_token_ids],
             num_tokens_to_generate=record.num_tokens_to_generate,
-            log_probs=None if log_probs is None else list(log_probs),
-            prompt_log_probs=None if prompt_log_probs is None else list(prompt_log_probs),
-            policy_epoch=None if record.policy_epoch is None else list(record.policy_epoch),
-            kv_cache_epoch=None if record.kv_cache_epoch is None else list(record.kv_cache_epoch),
+            log_probs=as_list(payload.generated_log_probs),
+            prompt_log_probs=as_list(payload.prompt_log_probs),
+            policy_epoch=as_list(record.policy_epoch),
+            kv_cache_epoch=as_list(record.kv_cache_epoch),
             num_evictions=record.num_evictions,
             finished=snapshot.finished,
+            finish_reason=record.finish_reason,
+            prompt_top_n_logprobs=as_list(payload.prompt_top_n_logprobs),
+            generated_top_n_logprobs=as_list(payload.generated_top_n_logprobs),
+            acceptance_step_lengths=list(payload.acceptance_step_lengths),
         )
 
     def to_wire(self) -> Dict[str, Any]:
         """The msgpack form MP rank zero broadcasts."""
+
+        def top_n(scores):
+            if scores is None:
+                return None
+            return [{token: float(score) for token, score in entry.items()} for entry in scores]
+
         return {
             "token_ids": list(self.token_ids),
             "num_tokens_to_generate": self.num_tokens_to_generate,
@@ -1643,6 +1696,10 @@ class ResumedGeneration:
             ),
             "num_evictions": self.num_evictions,
             "finished": self.finished,
+            "finish_reason": self.finish_reason,
+            "prompt_top_n_logprobs": top_n(self.prompt_top_n_logprobs),
+            "generated_top_n_logprobs": top_n(self.generated_top_n_logprobs),
+            "acceptance_step_lengths": list(self.acceptance_step_lengths),
         }
 
     @classmethod
@@ -1663,6 +1720,10 @@ class ResumedGeneration:
                 kv_cache_epoch=boundaries("kv_cache_epoch"),
                 num_evictions=obj["num_evictions"],
                 finished=obj["finished"],
+                finish_reason=obj["finish_reason"],
+                prompt_top_n_logprobs=obj["prompt_top_n_logprobs"],
+                generated_top_n_logprobs=obj["generated_top_n_logprobs"],
+                acceptance_step_lengths=list(obj["acceptance_step_lengths"]),
             )
         except (KeyError, TypeError) as unreadable:
             raise ValueError(
