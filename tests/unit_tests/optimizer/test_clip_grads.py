@@ -60,7 +60,8 @@ def test_default_grad_norm_skip_threshold_does_not_compare_grad_norm():
 @pytest.mark.skipif(
     multi_tensor_scale_tensor_impl is None, reason="tensor-scale kernel (Transformer Engine) needed"
 )
-@pytest.mark.parametrize("max_norm", [1.0, 0.5])
+# 0.3 is not a power of two: a reciprocal-and-multiply coefficient would differ from the division.
+@pytest.mark.parametrize("max_norm", [1.0, 0.5, 0.3])
 def test_float64_device_norm_clips_like_the_python_float_path(max_norm):
     """ChainedOptimizer combines its optimizers' norms into a float64 device tensor (so that an
     optimizer-step CUDA graph capture has no host synchronization). Clipping with that tensor must

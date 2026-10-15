@@ -1948,8 +1948,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 # squares are summed in the norms' dtype and the root is taken in float64, but on
                 # the device, so that an optimizer-step CUDA graph capture needs no host
                 # synchronization (``math.sqrt(tensor)`` would be one). clip_grad_by_total_norm_fp32
-                # then forms the clip coefficient in float64 as well and rounds it once to fp32
-                # for the scale kernel, exactly like the Python-float path.
+                # then forms the clip coefficient with a float64 true division and rounds it once
+                # to fp32 for the scale kernel, as the Python-float path does.
                 grad_norm = torch.sqrt(sum(x**2 for x in grad_norms).to(torch.float64))
             else:
                 grad_norm = math.sqrt(sum(x**2 for x in grad_norms))

@@ -176,15 +176,21 @@ def clip_grad_by_total_norm_fp32(
                 grads.append(to_local_if_dtensor(param.grad).detach())
 
     # Scale.
-    clip_coeff = max_norm / (total_norm + 1.0e-6)
+    if isinstance(total_norm, torch.Tensor) and total_norm.dtype == torch.float64:
+        # ChainedOptimizer combines its optimizers' norms in float64 on the device. A true
+        # division (``scalar / tensor`` would be a reciprocal followed by a multiply, two
+        # roundings) keeps this coefficient bit-equal to the Python-float path's for any
+        # ``max_norm``. The fp32 tensor path below is unchanged.
+        clip_coeff = torch.full_like(total_norm, max_norm) / (total_norm + 1.0e-6)
+    else:
+        clip_coeff = max_norm / (total_norm + 1.0e-6)
     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
     if isinstance(clip_coeff, torch.Tensor):
         clip_coeff.clamp_max_(1.0)
         assert (
             multi_tensor_scale_tensor_impl is not None
         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
-        # The kernel reads a float32 scale. A float64 coefficient (ChainedOptimizer combines
-        # its optimizers' norms in float64 on the device) is rounded here, once, exactly as a
+        # The kernel reads a float32 scale. A float64 coefficient is rounded here, once, as a
         # Python float is when it is passed to the float-scalar kernel below.
         multi_tensor_applier(
             multi_tensor_scale_tensor_impl,
