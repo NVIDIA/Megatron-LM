@@ -234,6 +234,14 @@ def test_batch_invariant_inference_activations_replay():
         backward=False,
         what="weighted_silu_mul_bounded",
     )
+    assert_replays_bit_exact(
+        lambda x: batch_invariant.weighted_silu_mul_bounded(x, probs, bound_elems, xblock=2048)[
+            :n_used
+        ],
+        (x2,),
+        backward=False,
+        what="weighted_silu_mul_bounded (larger block)",
+    )
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
@@ -464,6 +472,39 @@ def test_inference_unpermute_batch_invariant_path_replays():
     )
 
 
+def test_inference_unpermute_batch_invariant_path_accumulates_in_fp64():
+    """The combine must equal an fp64 sum rounded once to fp32, as training's batch-invariant
+    unpermute does; an fp32 accumulator drops small contributions next to a large one."""
+    from megatron.core.inference.moe import batch_invariant
+
+    seeded()
+    num_tokens, hidden, num_local = 256, 1536, 8
+    valid_tokens = num_tokens - 13
+    routed = torch.rand(num_tokens, num_local, device="cuda") < 0.75
+    inverse_map = torch.full((num_tokens, num_local), -1, device="cuda", dtype=torch.int32)
+    inverse_map[routed] = torch.randperm(int(routed.sum()), device="cuda", dtype=torch.int32)
+    # Outlier tokens and channels: each row is scaled by its token's and channel's magnitude.
+    row_token = torch.empty(int(routed.sum()), device="cuda", dtype=torch.long)
+    row_token[inverse_map[routed].long()] = routed.nonzero()[:, 0]
+    token_scale = torch.randn(num_tokens, 1, device="cuda").exp()
+    channel_scale = (0.5 * torch.randn(1, hidden, device="cuda")).exp()
+    expert_output = torch.randn(row_token.numel(), hidden, device="cuda")
+    expert_output = (expert_output * token_scale[row_token] * channel_scale).to(torch.bfloat16)
+    # Token 0: one 2**24 contribution and seven 1.0s. fp32 accumulation gives 2**24; the
+    # fp64 sum 2**24 + 7 rounds to 2**24 + 8.
+    inverse_map[0] = torch.arange(num_local, device="cuda", dtype=torch.int32)
+    expert_output[:num_local] = 1.0
+    expert_output[0] = 2.0**24
+    valid = _dev_scalar(valid_tokens)
+
+    out = batch_invariant.unpermute_tokens_in_expert_order(expert_output, inverse_map, valid, None)
+
+    gathered = expert_output.double()[inverse_map.clamp(min=0).long()]
+    expected = (gathered * (inverse_map >= 0)[..., None]).sum(dim=1).float()
+    assert torch.equal(out[:valid_tokens], expected[:valid_tokens])
+    assert torch.all(out[0] == 2.0**24 + 8)
+
+
 @pytest.mark.xfail(
     strict=False,
     reason="Negative control: the default combine accumulates with fp32 tl.atomic_add, whose "
@@ -517,6 +558,33 @@ def test_vllm_fused_moe_and_moe_sum_replay():
         return out[: max_tokens - 100]
 
     assert_replays_bit_exact(moe_sum, (inp, probs), replays=4, backward=False, what="_moe_sum")
+
+
+def test_vllm_moe_align_block_size_replays():
+    """The counters are zeroed inside the init kernel, so a fresh ``torch.empty`` buffer that
+    reuses the previous replay's memory must still count from zero on every replay."""
+    from megatron.core.inference.moe.vllm_fused_moe import _moe_align_block_size_cuda_graphable
+
+    seeded()
+    max_tokens, topk, experts, num_local, local_start = 4096, 8, 64, 16, 16
+    routing_map = torch.randint(0, experts, (max_tokens, topk), device="cuda")
+    valid = _dev_scalar(max_tokens - 100)
+
+    def fn(routing_map):
+        sorted_token_ids, expert_ids, num_tokens_post_padded = _moe_align_block_size_cuda_graphable(
+            routing_map, 64, num_local, local_start, valid
+        )
+        # Atomic slot order within an expert may differ between replays; the multiset may not.
+        return torch.sort(sorted_token_ids).values, expert_ids, num_tokens_post_padded
+
+    assert_replays_bit_exact(
+        fn,
+        (routing_map,),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="_moe_align_block_size_cuda_graphable",
+    )
 
 
 # --- batch-invariant kernels -----------------------------------------------------------------

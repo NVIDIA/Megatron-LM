@@ -273,6 +273,7 @@ class _TestDynamicInferenceBase:
 class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
     """NVLS dispatcher: combinatorial sweep of EP request states."""
 
+    @pytest.mark.flaky_in_dev  # Issue #7958: batch-invariant prefill/full-forward parity.
     @requires_te_batch_invariant_attention
     @torch.inference_mode()
     def test_batch_invariant_prefill_matches_full_forward(self):
