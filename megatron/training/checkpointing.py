@@ -673,6 +673,28 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     )
 
 
+def _unwrap_checkpoint_model(model, args, ckpt_format=None):
+    """Keep MFSDP v2 checkpoint adapters while removing outer training wrappers."""
+    if ckpt_format is None:
+        ckpt_format = getattr(args, "ckpt_format", None)
+    if ckpt_format != "fsdp_dtensor" or getattr(args, "megatron_fsdp_version", 1) != 2:
+        return unwrap_model(model)
+
+    from megatron.core.distributed import DistributedDataParallel, TorchFullyShardedDataParallel
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
+    from megatron.core.transformer.module import Float16Module
+
+    return unwrap_model(
+        model,
+        module_instances=(
+            DistributedDataParallel,
+            TorchFullyShardedDataParallel,
+            FullyShardedDataParallelV1,
+            Float16Module,
+        ),
+    )
+
+
 def save_checkpoint(
     iteration,
     model,
@@ -737,7 +759,7 @@ def save_checkpoint(
     ft_integration.on_checkpointing_start()
 
     # Only rank zero of the data parallel writes to the disk.
-    model = unwrap_model(model)
+    model = _unwrap_checkpoint_model(model, args)
 
     # --freeze-all-layers: weights are frozen, so skip the weight write and its finalizers; dump
     # progress is recorded separately via the post-logits finalize (see the async block below).
@@ -2837,8 +2859,6 @@ def load_checkpoint(
         args.finetune = True
         loading_pretrained_checkpoint = True
 
-    model = unwrap_model(ddp_model)
-
     ckpt_format = args.ckpt_format
     state_dict = None
     release = False
@@ -2861,6 +2881,8 @@ def load_checkpoint(
             pass  # Not loaded.
         else:
             raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
+
+    model = _unwrap_checkpoint_model(ddp_model, args, ckpt_format=ckpt_format)
 
     if model_sharded_state_dict_modifier is not None and ckpt_format != 'torch_dist':
         raise NotImplementedError(

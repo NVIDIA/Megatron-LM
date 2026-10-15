@@ -68,6 +68,39 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
 # ============================================================================
 # Test the slice/path helpers shared by the SwiGLU, GDN and MLA handlers
 # ============================================================================
+class TestCheckpointParameterResolution:
+
+    @pytest.mark.parametrize("wrapper_depth", [0, 1, 2, 3])
+    @pytest.mark.parametrize("prefix", ["", "module.", "module.module.", "model.module."])
+    def test_resolves_model_and_optimizer_paths(self, wrapper_depth, prefix):
+        model = torch.nn.Module()
+        model.decoder = torch.nn.Linear(2, 2, bias=False)
+        parameter = model.decoder.weight
+        for _ in range(wrapper_depth):
+            wrapper = torch.nn.Module()
+            wrapper.module = model
+            model = wrapper
+
+        assert (
+            fsdp_dtensor_checkpoint._get_checkpoint_parameter(model, prefix + "decoder.weight")
+            is parameter
+        )
+
+    def test_prefers_exact_path(self):
+        model = torch.nn.Linear(2, 2, bias=False)
+        model.module = torch.nn.Linear(2, 2, bias=False)
+        assert (
+            fsdp_dtensor_checkpoint._get_checkpoint_parameter(model, "module.weight")
+            is model.module.weight
+        )
+
+    def test_missing_parameter_reports_original_path(self):
+        model = torch.nn.Module()
+        model.module = torch.nn.Linear(2, 2, bias=False)
+        with pytest.raises(AttributeError, match="module.decoder.missing"):
+            fsdp_dtensor_checkpoint._get_checkpoint_parameter(model, "module.decoder.missing")
+
+
 class TestSharedSliceHelpers:
     """These three are used by every fused-parameter handler, so pin their semantics."""
 

@@ -27,14 +27,6 @@ try:
     from torch.distributed.checkpoint.metadata import TensorStorageMetadata
     from torch.distributed.tensor.placement_types import Replicate, Shard
 
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-        get_containing_parameter_group,
-    )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtensor import (
-        _attach_dcp_hooks,
-        _build_chunk_metadata,
-        _dbuffer_chunk_metadata,
-    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
         make_fsdp_dtensor,
     )
@@ -65,6 +57,21 @@ def _strip_wrapper_prefixes(path):
     while parts and parts[0] in ('module', 'model'):
         parts = parts[1:]
     return '.'.join(parts)
+
+
+def _get_checkpoint_parameter(model, path):
+    """Resolve a checkpoint path through optional FSDP and Float16 module wrappers."""
+    candidates = tuple(dict.fromkeys((path, _strip_wrapper_prefixes(path))))
+    visited = set()
+    while model is not None and id(model) not in visited:
+        visited.add(id(model))
+        for candidate in candidates:
+            try:
+                return model.get_parameter(candidate)
+            except AttributeError:
+                pass
+        model = getattr(model, "module", None)
+    raise AttributeError(f"Checkpoint parameter {path!r} was not found in the model wrapper chain")
 
 
 def _intersect_slice(s1, s2):
@@ -289,6 +296,10 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         """
         Split the SWiGLU linear_fc1 parameter into two parts: weight_w and weight_v.
         """
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+            get_containing_parameter_group,
+        )
+
         assert data.shape[swiglu_shard_axis] % 2 == 0, (
             f"SWiGLU weights must have an even size along the shard axis {swiglu_shard_axis}, "
             f"got {data.shape[swiglu_shard_axis]}"
@@ -363,7 +374,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             if not _key_in_glu_layer(key):
                 _swiglu_skip_count += 1
                 continue
-            dist_param = model.get_parameter(f"module.{key}")
+            dist_param = _get_checkpoint_parameter(model, key)
             weight_w, weight_v = split_swiglu_linear_fc1(
                 model_state_dict[key],
                 dist_param,
@@ -395,8 +406,8 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :], num_experts)
+                    dist_param = _get_checkpoint_parameter(
+                        model, expert_param_local_key(_strip_wrapper_prefixes(key), num_experts)
                     )
                     weight_w, weight_v = split_swiglu_linear_fc1(
                         opt_state_dict[key][subkey],
@@ -535,7 +546,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if match is None:
             continue
         sizes, names, dim = match
-        dist_param = model.get_parameter(f"module.{key}")
+        dist_param = _get_checkpoint_parameter(model, key)
         sub_tensors = split_gdn_fused(model_state_dict[key], dist_param, sizes, dim)
         for sub_name, tensor in zip(names, sub_tensors):
             model_state_dict[f"{key}.{sub_name}"] = tensor
@@ -563,7 +574,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(key[len("module.") :])
+                    dist_param = _get_checkpoint_parameter(model, key)
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
@@ -574,6 +585,12 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
 def _split_mfsdp_v2_param(data, dist_param, split_sizes, group, split_dim):
     """Split logical dim-0 sections without copying the owning buffer's local storage."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtensor import (
+        _attach_dcp_hooks,
+        _build_chunk_metadata,
+        _dbuffer_chunk_metadata,
+    )
+
     if split_dim != 0:
         raise NotImplementedError("MFSDP v2 checkpoint splitting only supports dim 0.")
     index = next(
@@ -645,6 +662,10 @@ def split_fused_fsdp_param(data, dist_param, split_sizes, is_expert_param=False,
     Same flat-slice arithmetic as :func:`handle_swiglu_in_state_dict`, generalized from an
     even two-way split to arbitrary section sizes.
     """
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+        get_containing_parameter_group,
+    )
+
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
 
     group = get_containing_parameter_group(dist_param)
@@ -812,7 +833,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             continue
 
         sections = split_fused_fsdp_param(
-            model_state_dict[key], model.get_parameter(f'module.{key}'), split_sizes
+            model_state_dict[key], _get_checkpoint_parameter(model, key), split_sizes
         )
         for proj_name, section in zip(MLA_UNFUSED_DOWN_PROJS, sections):
             model_state_dict[f'{wrapper}{attention_path}.{proj_name}.{leaf}'] = section
@@ -848,7 +869,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             ]
             for new_key in new_keys:
                 new_optimizer_state[new_key] = optimizer_state[key].copy()
-            dist_param = model.get_parameter(key[len("module.") :])
+            dist_param = _get_checkpoint_parameter(model, key)
             for subkey in ["exp_avg", "exp_avg_sq"]:
                 sections = split_fused_fsdp_param(
                     optimizer_state[key][subkey], dist_param, split_sizes
