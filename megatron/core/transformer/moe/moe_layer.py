@@ -665,7 +665,8 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
-            # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
+            # Only the flex dispatcher takes the mask: HybridEP excludes padded rows unless it
+            # uses per-expert capacity.
             padding_mask = self._align_batch_first_to_sequence_parallel(padding_mask, hidden_states)
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
                 hidden_states, routing_map, probs, padding_mask=padding_mask
