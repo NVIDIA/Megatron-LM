@@ -5,6 +5,7 @@ import gc
 from collections import deque
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -191,6 +192,7 @@ class _StubEngine(DynamicInferenceEngine):
 
     def __init__(self, context: DynamicInferenceContext, *, enable_chunked_prefill=False):
         self.context = context
+        self.controller = SimpleNamespace(terminating_token_ids=Mock(return_value=frozenset()))
         self.enable_chunked_prefill = enable_chunked_prefill
         self.cuda_graph_all_prefills = False
         self._prefix_coordination_waits = 0
@@ -2138,11 +2140,31 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         assert future.result() is merged
         assert merged.generated_tokens == generated
         assert merged.generated_log_probs == [-0.1, -0.2, -0.3, -0.4]
+        assert merged.finish_reason == "length"
+        engine.controller.terminating_token_ids.assert_called_with(-1, stop_token_ids=None)
         np.testing.assert_array_equal(current.routing_indices, expected)
         np.testing.assert_array_equal(merged.routing_indices, expected)
         assert merged.routing_indices.shape[0] == (
             len(merged.prompt_tokens) + len(merged.generated_tokens) - 1
         )
+
+    @pytest.mark.internal
+    def test_store_routing_per_block_uses_explicit_forward_layout(self):
+        """A saved forward layout remains valid after context token rows change."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        block_ids = alloc.allocate_memory_blocks(2).tolist()
+        routing = np.arange(12, dtype=np.int16).reshape(3, 2, 2)
+        routing_block_ids = np.array([block_ids[1], block_ids[0], block_ids[1]])
+        routing_positions = np.array([2, 0, 1])
+
+        ctx.token_to_block_idx[:3] = -1
+        ctx.token_to_local_position_within_kv_block[:3] = -1
+        alloc.store_routing_per_block(routing, routing_block_ids, routing_positions)
+
+        assert np.array_equal(alloc.get_block_routing(block_ids[0])[0], routing[1])
+        assert np.array_equal(alloc.get_block_routing(block_ids[1])[1], routing[2])
+        assert np.array_equal(alloc.get_block_routing(block_ids[1])[2], routing[0])
 
     @pytest.mark.internal
     def test_store_and_get_block_routing(self):
@@ -2297,8 +2319,13 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         assert np.allclose(result[2 * bs :], expected_partial)
 
     @pytest.mark.internal
-    def test_reconstruct_returns_none_for_missing_block(self):
-        """Reconstruction returns None if a block has no routing data."""
+    @pytest.mark.parametrize("token_offset", [-1, 0, 1])
+    def test_reconstruct_requires_only_needed_blocks(self, token_offset):
+        """Reconstruction fails only if a required block has no routing data.
+
+        Args:
+            token_offset: Number of required routing tokens beyond the first block.
+        """
         ctx = self._ctx()
         alloc = ctx.kv_block_allocator
         bs = ctx.block_size_tokens
@@ -2307,12 +2334,15 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         bids = block_ids.tolist()
 
         # Only store routing for the first block
-        alloc.store_block_routing(
-            bids[0], np.arange(bs), np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
-        )
+        routing = np.arange(bs * 4 * 2, dtype=np.int16).reshape(bs, 4, 2)
+        alloc.store_block_routing(bids[0], np.arange(bs), routing)
 
-        result = alloc.reconstruct_routing_from_blocks(bids, 2 * bs)
-        assert result is None
+        total_routing_tokens = bs + token_offset
+        result = alloc.reconstruct_routing_from_blocks(bids, total_routing_tokens)
+        if token_offset > 0:
+            assert result is None
+        else:
+            np.testing.assert_array_equal(result, routing[:total_routing_tokens])
 
     @pytest.mark.internal
     def test_routing_survives_prefix_match_lru(self):
