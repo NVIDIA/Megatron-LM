@@ -1810,6 +1810,7 @@ def test_attention_only_cached_continuation_still_skips():
     assert match.already_allocated_blocks == 4
     assert match.overall_required_blocks == 11
     assert match.prefix_skip_tokens == 6 * ctx.block_size_tokens
+    assert match.effective_prefill_chunk_length == 2
 
 
 @pytest.mark.internal
@@ -1844,7 +1845,6 @@ def test_attention_only_stage_of_hybrid_pipeline_skips_like_recurrent_stages(
     else:
         assert match.prefix_skip_tokens == chunk_length - 1
         assert match.effective_prefill_chunk_length == 1
-    assert match.effective_prefill_chunk_length == 2
 
 
 def _make_cpu_mamba_slot_allocator(

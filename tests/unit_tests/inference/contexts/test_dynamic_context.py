@@ -2270,7 +2270,7 @@ class TestDynamicContext:
             assert context.mamba_slot_allocator is None
 
             pool_size = torch.tensor(
-                [context.kv_block_allocator.pool_size], device='cuda', dtype=torch.long
+                [context.kv_block_allocator.pool_size], device="cuda", dtype=torch.long
             )
             gathered = [torch.zeros_like(pool_size) for _ in range(2)]
             torch.distributed.all_gather(
