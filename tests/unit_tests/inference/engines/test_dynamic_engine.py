@@ -2097,29 +2097,82 @@ def test_generate_mixed_batch_waits_only_for_its_pending_future():
         loop.close()
 
 
-def test_snapshot_live_requests():
+@pytest.mark.parametrize("replay", [True, False], ids=["routing-replayed", "routing-off"])
+def test_snapshot_live_requests(replay):
     """Every entry but a failed one is copied; one a stop word or mid-block EOS has ended, which
-    bookkeeping has still to complete, reads finished, with the reason recorded at detection. Any
-    loop may run the snapshot while none runs the engine, as between a suspend and a resume driven
-    inline; a live engine loop refuses the others."""
+    bookkeeping has still to complete, reads finished, with the reason recorded at detection and,
+    under routing replay, the routing its blocks still hold. Any loop may run the snapshot while
+    none runs the engine, as between a suspend and a resume driven inline; a live engine loop
+    refuses the others."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._loop, other_loop = asyncio.new_event_loop(), asyncio.new_event_loop()
     active = Status.ACTIVE_AND_GENERATING_TOKENS
-    live, stop_hit, stop_masked, failed = (
+    live, stop_hit, stop_masked, failed, waiting = (
         _make_request_entry(engine._loop, request_id, status, resolve=False)
-        for request_id, status in ((1, active), (2, active), (3, active), (4, Status.FAILED))
+        for request_id, status in (
+            (1, active),
+            (2, active),
+            (3, active),
+            (4, Status.FAILED),
+            (5, active),
+        )
     )
-    engine.requests = {1: live, 2: stop_hit, 3: stop_masked, 4: failed}
+    engine.requests = {1: live, 2: stop_hit, 3: stop_masked, 4: failed, 5: waiting}
     engine.stop_word_finished_request_ids, engine.stop_word_being_finished_ids = {2}, {3}
     # The engine records a stop's reason when it detects it, a step before completion.
     stop_hit.record[-1].finish_reason = stop_masked.record[-1].finish_reason = "stop"
+    # Routing replay keeps each token's expert choices in the blocks a request owns and reads them
+    # back at completion; a snapshot reads every generating request's the same way, its last
+    # token's apart.
+    live.record[-1].generated_tokens, stop_hit.record[-1].generated_tokens = [9], [5, 6]
+    stop_masked.record[-1].generated_tokens = [8]  # the waiting entry has generated nothing yet
+    live.record[-1].sampling_params.num_tokens_to_generate = 4
+    stop_hit.record[-1].sampling_params.num_tokens_to_generate = 2
+    routing = {
+        20: np.full((3, 1, 2), 2),
+        30: np.full((2, 1, 2), 3),
+        40: np.full((2, 1, 2), 1),
+        50: np.full((1, 1, 2), 5),
+    }
+    reads = []
+
+    def reconstruct(block_ids, total_routing_tokens):
+        reads.append((block_ids, total_routing_tokens))
+        return routing[block_ids[0]]
+
+    engine.context = types.SimpleNamespace(
+        kv_block_allocator=types.SimpleNamespace(
+            block_routing=routing if replay else {}, reconstruct_routing_from_blocks=reconstruct
+        ),
+        get_index_of_request={1: 2, 2: 0, 3: 1, 5: 3}.__getitem__,
+        get_committed_kv_block_ids=[[20, 21], [30], [40], [50]].__getitem__,
+    )
     expected = [
         LiveRequestSnapshot.from_record(entry.record, finished=finished)
-        for entry, finished in ((live, False), (stop_hit, True), (stop_masked, True))
+        for entry, finished in (
+            (live, False),
+            (stop_hit, True),
+            (stop_masked, True),
+            (waiting, False),
+        )
     ]
-    assert [snapshot.record.finish_reason for snapshot in expected] == [None, "stop", "stop"]
-    assert engine._loop.run_until_complete(engine.snapshot_live_requests()) == expected
-    assert other_loop.run_until_complete(engine.snapshot_live_requests()) == expected
+    assert [s.record.finish_reason for s in expected] == [None, "stop", "stop", None]
+    routed = [routing[40], routing[20], routing[30], None] if replay else [None] * 4
+
+    def listed(arrays):
+        return [None if array is None else array.tolist() for array in arrays]
+
+    def check(snapshots):
+        # Dataclass equality cannot look through an array, so the routing is checked apart.
+        assert listed(s.payload.routing_indices for s in snapshots) == listed(routed)
+        resumes = [ResumedGeneration.from_snapshot(s) for s in snapshots]
+        assert listed(resume.routing_indices for resume in resumes) == listed(routed)
+        plain = [replace(s, payload=replace(s.payload, routing_indices=None)) for s in snapshots]
+        assert plain == expected
+
+    check(engine._loop.run_until_complete(engine.snapshot_live_requests()))
+    assert reads == ([([40], 2), ([20, 21], 3), ([30], 2)] if replay else [])
+    check(other_loop.run_until_complete(engine.snapshot_live_requests()))
 
     thread = threading.Thread(target=engine._loop.run_forever, daemon=True)
     thread.start()
@@ -2131,7 +2184,7 @@ def test_snapshot_live_requests():
         with pytest.raises(RuntimeError, match="engine loop"):
             other_loop.run_until_complete(engine.snapshot_live_requests())
         on_loop = asyncio.run_coroutine_threadsafe(engine.snapshot_live_requests(), engine._loop)
-        assert on_loop.result(timeout=5) == expected
+        check(on_loop.result(timeout=5))
     finally:
         engine._loop.call_soon_threadsafe(engine._loop.stop)
         thread.join(timeout=5)
@@ -2664,6 +2717,21 @@ _FILLED_BY_STOP = replace(_FILLED, finish_reason="stop")
 # A preparer's wire form that lost a field: refused as it is rebuilt, not as it is admitted.
 _UNREADABLE = ResumedGeneration([7, 8], 6, **_SCORED, **_STAMPED).to_wire()
 del _UNREADABLE["token_ids"]
+# A finished generation with the routing of its six-token sequence, all but the last token's:
+# the length of the expanded multimodal prompt, one more than the text prompt's.
+_ROUTED = ResumedGeneration(
+    [7, 8],
+    7,
+    finished=True,
+    routing_indices=np.arange(10, dtype=np.int32).reshape(5, 1, 2),
+    **_SCORED,
+    **_STAMPED,
+)
+# A cut generation with the routing of its five-token text sequence: carried on the resumed
+# prefix, kept through a snapshot, and left for the continuation to extend.
+_ROUTED_CONTINUED = ResumedGeneration(
+    [7, 8], 6, routing_indices=np.arange(8, dtype=np.int32).reshape(4, 1, 2), **_SCORED, **_STAMPED
+)
 
 
 def _engine_for_resumes(max_sequence_length=32):
@@ -2680,6 +2748,7 @@ def _engine_for_resumes(max_sequence_length=32):
     engine.finished_request_count = 0
     engine.stop_word_finished_request_ids, engine.stop_word_being_finished_ids = set(), set()
     engine.controller.terminating_token_ids.return_value = frozenset()
+    engine.context.kv_block_allocator.block_routing = {}  # no routing replay: snapshots read none
     engine._loop = asyncio.new_event_loop()
     return engine
 
@@ -2703,8 +2772,9 @@ def _resume(engine, wire, media):
     [
         (False, ResumedGeneration([7, 8], 6, policy_epoch=[(0, 9)], **_SCORED), None),
         (False, ResumedGeneration([7, 8], 5, **_SCORED, **_STAMPED), None),
+        (False, _ROUTED_CONTINUED, None),
         (True, ResumedGeneration([7, 8], 6, policy_epoch=[(0, 3), (5, 4)], **_SCORED), None),
-        (True, ResumedGeneration([7, 8], 7, finished=True, **_SCORED, **_STAMPED), None),
+        (True, _ROUTED, None),
         (False, _FILLED, None),
         (False, _FILLED_BY_STOP, None),
         (False, ResumedGeneration([], 5, **_STAMPED_EMPTY), "fresh"),
@@ -2748,11 +2818,13 @@ def _resume(engine, wire, media):
             ),
             "has kv_cache_epoch boundaries outside the sequence it resumes",
         ),
+        (False, _ROUTED, "has routing indices for 5 tokens of a sequence of 5"),
         (False, ResumedGeneration([7, 8], 6, **_SCORED, **_STAMPED), "overflow"),
     ],
     ids=[
         "text-continued-same-epoch-without-kv",
         "text-continued-under-the-banked-budget",
+        "text-continued-with-routing",
         "multimodal-continued-without-kv",
         "multimodal-served-under-the-banked-budget",
         "text-served-budget-filled",
@@ -2766,6 +2838,7 @@ def _resume(engine, wire, media):
         "stamped-past-the-generation-refused",
         "stamped-inside-the-prompt-refused",
         "kv-stamped-past-the-generation-refused",
+        "routed-off-the-sequence-refused",
         "overflow-fails-as-admission",
     ],
 )
@@ -2836,6 +2909,9 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
             resumed.prompt_top_n_logprobs,
         )
         assert payload.acceptance_step_lengths == resumed.acceptance_step_lengths
+        assert (payload.routing_indices is None) is (resumed.routing_indices is None)
+        if resumed.routing_indices is not None:
+            assert np.array_equal(payload.routing_indices, resumed.routing_indices)
         assert (payload.media_tensors is None) is not multimodal
         assert FinishedRequestRecord.from_request(completed) == FinishedRequestRecord(
             resumed.policy_epoch,
@@ -2859,6 +2935,9 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
         resumed.generated_top_n_logprobs,
         resumed.acceptance_step_lengths,
     )
+    routed = resumed.routing_indices is not None
+    assert (record[0].routing_indices is not None) is routed
+    assert not routed or np.array_equal(record[0].routing_indices, resumed.routing_indices)
     assert continuation.prompt_tokens.tolist() == [*prompt, *resumed.token_ids]
     banked = resumed.num_tokens_to_generate  # replaces the request's 6
     assert record[0].sampling_params.num_tokens_to_generate == banked
@@ -2884,12 +2963,16 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
         snapshot.payload.generated_top_n_logprobs,
         snapshot.payload.acceptance_step_lengths,
     ) == (resumed.generated_top_n_logprobs, resumed.acceptance_step_lengths)
+    assert (snapshot.payload.routing_indices is not None) is routed
     again = _engine_for_resumes()
     _resume(again, ResumedGeneration.from_snapshot(snapshot).to_wire(), media)
     resumed_again = again.requests[1].record[-1]
     assert resumed_again.prompt_tokens.tolist() == continuation.prompt_tokens.tolist()
     assert resumed_again.policy_epoch == continuation.policy_epoch
     assert again.requests[1].record[0].generated_top_n_logprobs == resumed.generated_top_n_logprobs
+    assert not routed or np.array_equal(
+        again.requests[1].record[0].routing_indices, resumed.routing_indices
+    )
 
 
 def test_engine_defers_expanded_multimodal_stitching_past_prompt_preparer():
@@ -8573,6 +8656,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 prompt_top_n_logprobs=payload.prompt_top_n_logprobs,
                 generated_top_n_logprobs=payload.generated_top_n_logprobs,
                 acceptance_step_lengths=payload.acceptance_step_lengths,
+                routing_indices=payload.routing_indices,
             )
 
         # RESTART: a fresh engine; the framework's preparer hands back the durable prefixes.

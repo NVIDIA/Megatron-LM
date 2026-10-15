@@ -446,6 +446,18 @@ def deserialize_ndarray(obj: dict) -> np.ndarray:
     return np.array(obj["data"], dtype=np.dtype(obj["dtype"]))
 
 
+def _merge_routing(parts: List[np.ndarray], total_rows: int) -> Optional[np.ndarray]:
+    """Combine the routing of a sequence's segments, each recorded from the sequence's first row."""
+    merged, covered = [], 0
+    for part in parts:
+        if len(part) > covered:
+            merged.append(part[covered:])
+            covered = len(part)
+    if not merged or covered != total_rows:
+        return None
+    return np.concatenate(merged)
+
+
 def unwrap_serialized_tensors(serialized_request: dict) -> dict:
     """Unwrap serialized tensor tuples produced by serialize() into plain lists.
 
@@ -1185,6 +1197,13 @@ class DynamicInferenceRequestRecord:
                 raise ValueError(
                     f"resumed generation has {name} boundaries outside the sequence it resumes"
                 )
+        routing, total_tokens = resumed.routing_indices, prompt_length + len(tokens)
+        # The last token never ran forward: a sequence of T tokens routes T - 1 of them.
+        if routing is not None and routing.shape[0] != total_tokens - 1:
+            raise ValueError(
+                f"resumed generation has routing indices for {routing.shape[0]} tokens of a "
+                f"sequence of {total_tokens}"
+            )
         first.sampling_params.num_tokens_to_generate = resumed.num_tokens_to_generate
         first.sampling_params.num_tokens_total = None
         first.generated_tokens = tokens
@@ -1195,6 +1214,7 @@ class DynamicInferenceRequestRecord:
         first.prompt_top_n_logprobs = resumed.prompt_top_n_logprobs
         first.acceptance_step_lengths = list(resumed.acceptance_step_lengths)
         first.finish_reason = resumed.finish_reason
+        first.routing_indices = routing
         first.policy_epoch = None if resumed.policy_epoch is None else list(resumed.policy_epoch)
         first.kv_cache_epoch = (
             None if resumed.kv_cache_epoch is None else list(resumed.kv_cache_epoch)
@@ -1349,11 +1369,15 @@ class DynamicInferenceRequestRecord:
         first_request = self.requests[0]
         prompt_tokens = first_request.prompt_tokens
         prompt_text = self.requests[0].prompt
+        generated_tokens = merge_lists("generated_tokens")
+        # A resumed request (checkpointing) grabs routing indices from its history.
+        # A recomputed request recomputes routing indices.
         routing_indices = None
         routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
         if routing_parts:
-            routing_indices = np.concatenate(routing_parts)
-        generated_tokens = merge_lists("generated_tokens")
+            routing_indices = _merge_routing(
+                routing_parts, len(prompt_tokens) + len(generated_tokens) - 1
+            )
 
         # Detach the merged result's outer epoch lists under the engine's append-only
         # mutation pattern described in checkpoint().
@@ -1542,11 +1566,19 @@ class LiveRequestSnapshot:
 
     @classmethod
     def from_record(
-        cls, record: "DynamicInferenceRequestRecord", *, finished: bool
+        cls,
+        record: "DynamicInferenceRequestRecord",
+        *,
+        finished: bool,
+        routing_indices: Optional[np.ndarray] = None,
     ) -> "LiveRequestSnapshot":
         """Copy a live record's merged state; the record itself is left untouched."""
         merged = record.merge()
         merged.media_tensors = None
+        if routing_indices is not None:
+            carried = [r.routing_indices for r in record.requests if r.routing_indices is not None]
+            total_rows = len(merged.prompt_tokens) + len(merged.generated_tokens) - 1
+            merged.routing_indices = _merge_routing([*carried, routing_indices], total_rows)
         return cls(
             uid=merged.uid,
             request_id=merged.request_id,
@@ -1590,6 +1622,7 @@ class ResumedGeneration:
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     acceptance_step_lengths: List[int] = field(default_factory=list)
+    routing_indices: Optional[np.ndarray] = None
 
     def __post_init__(self):
         tokens, budget = self.token_ids, self.num_tokens_to_generate
@@ -1631,6 +1664,9 @@ class ResumedGeneration:
         steps = self.acceptance_step_lengths
         if not all(type(s) is int and s > 0 for s in steps) or sum(steps) > len(tokens):
             raise ValueError("resumed generation has malformed acceptance step lengths")
+        routing = self.routing_indices
+        if routing is not None and not (isinstance(routing, np.ndarray) and routing.ndim == 3):
+            raise ValueError("resumed generation has malformed routing indices")
         for name, boundaries in (
             ("policy_epoch", self.policy_epoch),
             ("kv_cache_epoch", self.kv_cache_epoch),
@@ -1671,6 +1707,7 @@ class ResumedGeneration:
             prompt_top_n_logprobs=as_list(payload.prompt_top_n_logprobs),
             generated_top_n_logprobs=as_list(payload.generated_top_n_logprobs),
             acceptance_step_lengths=list(payload.acceptance_step_lengths),
+            routing_indices=payload.routing_indices,
         )
 
     def to_wire(self) -> Dict[str, Any]:
@@ -1700,6 +1737,9 @@ class ResumedGeneration:
             "prompt_top_n_logprobs": top_n(self.prompt_top_n_logprobs),
             "generated_top_n_logprobs": top_n(self.generated_top_n_logprobs),
             "acceptance_step_lengths": list(self.acceptance_step_lengths),
+            "routing_indices": (
+                None if self.routing_indices is None else serialize_ndarray(self.routing_indices)
+            ),
         }
 
     @classmethod
@@ -1724,6 +1764,11 @@ class ResumedGeneration:
                 prompt_top_n_logprobs=obj["prompt_top_n_logprobs"],
                 generated_top_n_logprobs=obj["generated_top_n_logprobs"],
                 acceptance_step_lengths=list(obj["acceptance_step_lengths"]),
+                routing_indices=(
+                    None
+                    if obj["routing_indices"] is None
+                    else deserialize_ndarray(obj["routing_indices"])
+                ),
             )
         except (KeyError, TypeError) as unreadable:
             raise ValueError(
