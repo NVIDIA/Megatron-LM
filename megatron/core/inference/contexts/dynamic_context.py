@@ -3948,6 +3948,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return matches[0].item()
         return -1
 
+    def get_index_of_request(self, request_id: int) -> int:
+        """Row of a resident request, paused or active, or -1 when it is not resident."""
+        matches = torch.where(self.request_ids[: self.total_request_count] == request_id)[0]
+        return int(matches[0].item()) if len(matches) > 0 else -1
+
     def is_chunked_prefill_enabled(self) -> bool:
         """Returns whether chunked prefill is enabled."""
         return self.enable_chunked_prefill
@@ -4273,6 +4278,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             + self.request_query_lengths[request_indexes]
         )
         return (token_counts + self.block_size_tokens - 1) // self.block_size_tokens
+
+    def get_committed_kv_block_ids(self, request_index: int) -> list[int]:
+        """Ids of the token-bearing blocks a resident request owns, in sequence order."""
+        committed_blocks = int(self.get_committed_kv_block_counts(request_index).item())
+        blocks = self.request_to_kv_block_ids[request_index, :committed_blocks]
+        return blocks[blocks >= 0].tolist()
 
     def _next_decode_block_counts(self, request_slice: slice) -> Tensor:
         """Additional owned blocks required before the next verification/draft step."""

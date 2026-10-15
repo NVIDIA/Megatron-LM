@@ -17,6 +17,7 @@ from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Set, Tuple, TypedDict, Union
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -2351,11 +2352,36 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         # The generation's stop condition may be detected one step before bookkeeping completes it.
         ending = self.stop_word_finished_request_ids | self.stop_word_being_finished_ids
-        return [
-            LiveRequestSnapshot.from_record(entry.record, finished=request_id in ending)
-            for request_id, entry in self.requests.items()
-            if entry.record[-1].status != Status.FAILED
-        ]
+        snapshots = []
+        for request_id, entry in self.requests.items():
+            request = entry.record[-1]
+            if request.status == Status.FAILED:
+                continue
+            snapshots.append(
+                LiveRequestSnapshot.from_record(
+                    entry.record,
+                    finished=request_id in ending,
+                    # The blocks hold the routing of every token that ran forward; a request
+                    # still in prefill has none that is complete.
+                    routing_indices=(
+                        self._routing_from_blocks(request) if request.generated_tokens else None
+                    ),
+                )
+            )
+        return snapshots
+
+    def _routing_from_blocks(self, request: DynamicInferenceRequest) -> Optional[np.ndarray]:
+        """A resident request's expert routing, read from its blocks as its completion reads it."""
+        allocator = self.context.kv_block_allocator
+        if not allocator.block_routing:  # routing replay off: nothing was recorded
+            return None
+        index = self.context.get_index_of_request(request.request_id)
+        if index < 0:
+            return None
+        total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
+        return allocator.reconstruct_routing_from_blocks(
+            self.context.get_committed_kv_block_ids(index), total_tokens - 1
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
