@@ -306,7 +306,8 @@ def _messages_passthrough(sample: Dict[str, Any]) -> ChatTemplateSample:
     """
     raw = _ensure_list_field(sample.get("messages"), "messages")
     out: List[Dict[str, Any]] = []
-    role_map = {"developer": "system"}
+    # Legacy OpenAI ``function`` replies and Llama ``ipython`` turns are tool results.
+    role_map = {"developer": "system", "function": "tool", "ipython": "tool"}
     supported_roles = {"system", "user", "assistant", "tool"}
     for index, m in enumerate(raw):
         if not isinstance(m, dict):

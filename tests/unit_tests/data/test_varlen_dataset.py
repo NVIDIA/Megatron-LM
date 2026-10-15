@@ -341,6 +341,37 @@ def test_messages_passthrough_normalizes_legacy_roles_and_function_call():
     ]
 
 
+@pytest.mark.parametrize("result_role", ["function", "ipython"])
+def test_messages_passthrough_maps_legacy_tool_results_to_tool(result_role):
+    sample = _messages_passthrough(
+        {
+            "messages": [
+                {"role": "user", "content": "calculate"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {"name": "python", "arguments": '{"code":"1+1"}'},
+                },
+                {"role": result_role, "name": "python", "content": "2"},
+                {"role": "assistant", "content": "2"},
+            ]
+        }
+    )
+    assert [message["role"] for message in sample.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert sample.messages[3]["name"] == "python"
+
+
+def test_messages_passthrough_rejects_unknown_role():
+    with pytest.raises(ValueError, match="unsupported messages"):
+        _messages_passthrough({"messages": [{"role": "narrator", "content": "x"}]})
+
+
 def test_messages_passthrough_preserves_agentic_chat_template_kwargs():
     sample = _messages_passthrough(
         {
