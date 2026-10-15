@@ -474,7 +474,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
-        notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
+        notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
+        "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
+        "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
+        "test_ssm_kernels.py.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -829,6 +832,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Tensor-based packed layout, index sanitation and compiled KL. "
         "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
         "numerical CP parity is covered by test_dsv4_packed_cp.py.",
+    ),
+    KernelEntry(
+        name="dsa_dispatch",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="dispatch",
+        notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
+        "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
