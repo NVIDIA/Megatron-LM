@@ -592,11 +592,10 @@ class TransformerConfig(ModelParallelConfig):
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
     fused_qkv_rope_fp8_attention: bool = False
-    """If set, fuse the RoPE of the single QKV tensor with the FP8 current-scaling quantization of
-    Q/K/V and pass FP8 Q/K/V to TransformerEngine attention (falls back to the regular fused RoPE
-    whenever attention does not run FP8 current-scaling fused attention). Requires
-    fused_single_qkv_rope, head dim 128, and no context parallelism; not used with checkpointed
-    or offloaded core attention."""
+    """If set, let TransformerEngine fuse the RoPE of the single QKV tensor with the FP8
+    current-scaling quantization of Q/K/V inside core attention (falls back to the regular fused
+    RoPE whenever attention does not run FP8 current-scaling fused attention). Requires
+    fused_single_qkv_rope and is disabled for checkpointed or offloaded core attention."""
 
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
