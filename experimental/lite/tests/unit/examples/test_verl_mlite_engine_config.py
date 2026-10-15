@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +64,52 @@ def _engine_config(**kwargs):
     values = {"custom_backend_module": None, "impl_cfg": {"use_thd": True}}
     values.update(kwargs)
     return MegatronLiteEngineConfig(**values)
+
+
+def test_compile_cache_isolation_prefers_global_rank_and_preserves_roots(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from verl_mlite.engine.mlite_engine import _isolate_compile_cache_per_rank
+
+    roots = {
+        "TORCHINDUCTOR_CACHE_DIR": tmp_path / "torchinductor",
+        "TRITON_CACHE_DIR": tmp_path / "triton",
+    }
+    monkeypatch.setenv("RANK", "7")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    for name, root in roots.items():
+        monkeypatch.setenv(name, str(root))
+        monkeypatch.delenv(f"VERL_MLITE_BASE_{name}", raising=False)
+
+    _isolate_compile_cache_per_rank()
+    _isolate_compile_cache_per_rank()
+    for name, root in roots.items():
+        assert Path(os.environ[name]) == root / "rank_7"
+
+    monkeypatch.setenv("RANK", "8")
+    _isolate_compile_cache_per_rank()
+    for name, root in roots.items():
+        assert Path(os.environ[name]) == root / "rank_8"
+
+    output = capsys.readouterr().out
+    assert "[compile-cache] rank=7" in output
+    assert "[compile-cache] rank=8" in output
+
+
+def test_compile_cache_isolation_ignores_unconfigured_cache_vars(monkeypatch, capsys) -> None:
+    from verl_mlite.engine.mlite_engine import _isolate_compile_cache_per_rank
+
+    monkeypatch.setenv("RANK", "3")
+    for name in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(f"VERL_MLITE_BASE_{name}", raising=False)
+
+    _isolate_compile_cache_per_rank()
+
+    for name in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        assert name not in os.environ
+        assert f"VERL_MLITE_BASE_{name}" not in os.environ
+    assert "TORCHINDUCTOR_CACHE_DIR: None -> None" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 4])
