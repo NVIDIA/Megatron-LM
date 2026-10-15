@@ -38,6 +38,17 @@ skill keyword — infer it from the artifact you read.
   or approvals.
 - Read [docs/developer/contribute.md](./docs/developer/contribute.md) for the full contribution policy, including code style, commit message conventions, and issue guidelines.
 
+### Code Provenance
+
+- Do not copy or adapt code from other repositories. Implement changes
+  independently.
+- Before opening a PR, review the provenance of all proposed changes and complete
+  the PR template's code provenance section. If the proposed changes already
+  contain external code, identify its sources, revisions, affected files,
+  applicable licenses, and required attribution.
+- Preserve all required license and copyright notices and attribution for any
+  external code in the proposed changes.
+
 ### Code Quality
 
 - After editing imports in any Python files, always run `uv run isort` on those files to fix import order before committing.
