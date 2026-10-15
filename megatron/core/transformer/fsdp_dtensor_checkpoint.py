@@ -1075,6 +1075,8 @@ def get_global_unique_param_name(model_chunks, param):
             if p is param:
                 param_name = name
                 break
+        if param_name is not None:
+            break
     if param_name is None:
         raise ValueError("Parameter not found in model chunks")
 

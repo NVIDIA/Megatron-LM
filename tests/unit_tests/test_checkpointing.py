@@ -20,7 +20,7 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import MegatronModule
+from megatron.core.transformer import MegatronModule, fsdp_dtensor_checkpoint
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import (
@@ -43,6 +43,39 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.usefixtures("run_config")
+
+
+@pytest.mark.parametrize("owning_chunk", [0, 1, 2])
+def test_fsdp_global_param_name_uses_owning_model_chunk(owning_chunk):
+    parameter = torch.nn.Parameter(torch.ones(1))
+    model_chunks = []
+    for chunk_index in range(3):
+        chunk_parameter = (
+            parameter if chunk_index == owning_chunk else torch.nn.Parameter(torch.zeros(1))
+        )
+        layer = mock.Mock(spec=fsdp_dtensor_checkpoint.TransformerLayer)
+        layer.layer_number = 3 + 4 * chunk_index
+        layer.parameters.return_value = [chunk_parameter]
+        model_chunk = mock.Mock()
+        model_chunk.config.num_moe_experts = None
+        model_chunk.named_parameters.return_value = [
+            ("module.decoder.layers.0.mlp.linear_fc1.weight", chunk_parameter)
+        ]
+        model_chunk.modules.return_value = [layer]
+        model_chunks.append(model_chunk)
+
+    with mock.patch.object(
+        fsdp_dtensor_checkpoint,
+        "handle_experts_in_state_dict",
+        side_effect=lambda state_dict, num_experts: state_dict,
+    ):
+        name = fsdp_dtensor_checkpoint.get_global_unique_param_name(model_chunks, parameter)
+
+    assert name == f"module.decoder.layers.{2 + 4 * owning_chunk}.mlp.linear_fc1.weight"
+    model_chunks[owning_chunk].modules.assert_called_once_with()
+    for chunk_index, model_chunk in enumerate(model_chunks):
+        if chunk_index != owning_chunk:
+            model_chunk.modules.assert_not_called()
 
 
 class MockModel(MegatronModule):
