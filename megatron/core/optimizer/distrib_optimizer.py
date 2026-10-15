@@ -1117,7 +1117,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 for key in self.optimizer_state_keys
                             }
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                                if self.config.store_param_remainders and self.config.bf16:
+                                if self.config.resolved_store_param_remainders and self.config.bf16:
                                     tensors["master_param"] = init_shard(torch.int16)
                                 else:
                                     tensors["master_param"] = init_shard(

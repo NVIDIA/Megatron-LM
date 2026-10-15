@@ -200,9 +200,18 @@ class OptimizerConfig:
     to be set to lower precision. Defaults to False.
     """
 
-    store_param_remainders: bool = True
+    store_param_remainders: Optional[bool] = None
     """If true, store the 16-bit FP32 parameter remainders in the optimizer state, excluding the
-        16 bits shared with the BF16 parameters. This lowers GPU memory usage. Defaults to True.
+        16 bits shared with the BF16 parameters. This lowers GPU memory usage, and changes the
+        optimizer checkpoint's master params from FP32 to int16 remainders.
+
+        None (default) resolves to True, except when the precision-aware path is enabled only
+        because the model params are BF16 with FP32 main params and a non-delayed FP8 recipe.
+        Before that path existed, such runs kept MCore-managed FP32 master weights in their
+        optimizer checkpoints, which int16 remainders could not load, so for backward compatibility
+        the default is False there. Users who want the lower memory must set it to True explicitly
+        and accept that their optimizer checkpoints are not interchangeable with older ones.
+        The value in effect is resolved_store_param_remainders.
     """
 
     main_grads_dtype: torch.dtype = torch.float32
@@ -441,17 +450,75 @@ class OptimizerConfig:
         exception because the Adam optimizer in TransformerEngine supports it in the kernel
         computation. This is also the flag that selects param.grad vs param.decoupled_grad.
         """
+        return self._use_precision_aware_optimizer_regardless_of_param_dtype() or (
+            # Params are BF16, so only activations are quantized and TE can own the masters.
+            # None (unresolved) conservatively counts as possibly quantized.
+            self.use_precision_aware_optimizer
+            and self.fp8_param_gather is False
+        )
+
+    def _use_precision_aware_optimizer_regardless_of_param_dtype(self) -> bool:
+        """The cases where TE owns the master weights whether or not the params are quantized.
+
+        These predate the BF16-params case of _use_precision_aware_optimizer_no_fp8_or_ds_fp8.
+        """
         return self.use_precision_aware_optimizer and (
             # Non-FP32 main params are always owned by TE.
             self.main_params_dtype != torch.float32
             # Delayed scaling (or no FP8) is handled inside the Adam kernel.
             or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
-            # Params are BF16, so only activations are quantized and TE can own the masters.
-            # None (unresolved) conservatively counts as possibly quantized.
-            or self.fp8_param_gather is False
             # Hybrid-device optimizer has its own decoupled-grad support.
             or self.optimizer_cpu_offload
         )
+
+    def _use_precision_aware_optimizer_only_for_bf16_params(self) -> bool:
+        """Whether TE owns the master weights only because the params are BF16, i.e. FP32 main
+        params with a non-delayed FP8 recipe. Such runs used MCore-managed FP32 main params before
+        this case was supported."""
+        return (
+            self._use_precision_aware_optimizer_no_fp8_or_ds_fp8()
+            and not self._use_precision_aware_optimizer_regardless_of_param_dtype()
+        )
+
+    def _resolve_store_param_remainders(self) -> bool:
+        """The store_param_remainders value in effect (see the field's docstring)."""
+        if not self.use_precision_aware_optimizer:
+            # Unused without the precision-aware optimizer.
+            return self.store_param_remainders is not False
+        if not is_te_min_version("2.1.0"):
+            return False
+
+        only_for_bf16_params = self._use_precision_aware_optimizer_only_for_bf16_params()
+        if self.store_param_remainders is None:
+            # Default to False when TE owns the masters only because the params are BF16, for
+            # backward compatibility with checkpoints written before that case was supported:
+            # those hold MCore-managed FP32 master weights, which cannot be loaded as int16
+            # remainders. Users who want the lower memory must opt in with
+            # --store-param-remainders and accept that the optimizer checkpoints are not
+            # interchangeable with older ones.
+            store_param_remainders = not only_for_bf16_params
+        else:
+            store_param_remainders = self.store_param_remainders
+            if store_param_remainders and only_for_bf16_params and not self.optimizer_cuda_graph:
+                warnings.warn(
+                    "store_param_remainders with BF16 params, FP32 main params and the "
+                    f"{self.fp8_recipe!r} FP8 recipe stores the optimizer's master params as "
+                    "int16 remainders. Optimizer checkpoints are not interchangeable with runs "
+                    "that keep FP32 master params, including runs from before Megatron Core "
+                    "supported the precision-aware optimizer for this configuration."
+                )
+
+        # TE FusedAdam's capturable (CUDA graph) mode cannot store param remainders, so keep
+        # the full FP32 master weights. This costs 2 extra bytes per (DP-sharded) parameter and
+        # changes the optimizer checkpoint format (FP32 instead of int16 master_param).
+        if self.optimizer_cuda_graph and store_param_remainders:
+            warnings.warn(
+                "--optimizer-cuda-graph is incompatible with store_param_remainders; "
+                "disabling it. Optimizer checkpoints will not be interchangeable with "
+                "runs that store param remainders."
+            )
+            store_param_remainders = False
+        return store_param_remainders
 
     def check_fp8_param_gather_consistency(self, ddp_fp8_param_gather: bool) -> None:
         """Raise if an explicit ``fp8_param_gather`` enables the precision-aware path where the DDP
@@ -492,6 +559,10 @@ class OptimizerConfig:
         self.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
             self._use_precision_aware_optimizer_no_fp8_or_ds_fp8()
         )
+        # Derived rather than written back to the field: the default depends on fp8_param_gather,
+        # which is usually resolved later (with dataclasses.replace, which re-runs __post_init__),
+        # so the field must keep the user's intent (None) to be resolved again then.
+        self.resolved_store_param_remainders = self._resolve_store_param_remainders()
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
@@ -536,19 +607,6 @@ class OptimizerConfig:
             assert (
                 self.optimizer == 'adam'
             ), '--use-precision-aware-optimizer only supported with adam'
-            if not is_te_min_version("2.1.0"):
-                self.store_param_remainders = False
-
-            # TE FusedAdam's capturable (CUDA graph) mode cannot store param remainders, so keep
-            # the full FP32 master weights. This costs 2 extra bytes per (DP-sharded) parameter and
-            # changes the optimizer checkpoint format (FP32 instead of int16 master_param).
-            if self.optimizer_cuda_graph and self.store_param_remainders:
-                warnings.warn(
-                    "--optimizer-cuda-graph is incompatible with store_param_remainders; "
-                    "disabling it. Optimizer checkpoints will not be interchangeable with "
-                    "runs that store param remainders."
-                )
-                self.store_param_remainders = False
 
             # Only the FusedAdam in TE and HybridDeviceOptimizer supports
             # --use-precision-aware-optimizer.
