@@ -15,13 +15,9 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
-def _optimizer_config(fp8_recipe, fp8_param_gather=None, **kwargs) -> OptimizerConfig:
+def _optimizer_config(fp8_recipe, **kwargs) -> OptimizerConfig:
     return OptimizerConfig(
-        bf16=True,
-        use_precision_aware_optimizer=True,
-        fp8_recipe=fp8_recipe,
-        fp8_param_gather=fp8_param_gather,
-        **kwargs,
+        bf16=True, use_precision_aware_optimizer=True, fp8_recipe=fp8_recipe, **kwargs
     )
 
 
@@ -52,49 +48,12 @@ def test_resolve_does_not_mutate_caller_config():
     assert not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
 
 
-@pytest.mark.parametrize("fp8_recipe", ["mxfp8", "blockwise"])
-def test_explicit_false_with_ddp_fp8_params_raises(fp8_recipe):
-    """FP8 params in the DDP config but False here would silently take the precision-aware path,
-    which cannot update quantized params."""
-    config = _optimizer_config(fp8_recipe, fp8_param_gather=False)
-    assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-    with pytest.raises(ValueError, match="conflicts with"):
-        config.check_fp8_param_gather_consistency(True)
-    with pytest.raises(ValueError, match="conflicts with"):
-        config.resolve_fp8_param_gather(True)
-
-
-@pytest.mark.parametrize("fp8_recipe", ["mxfp8", "blockwise"])
-def test_matching_explicit_value_does_not_raise(fp8_recipe):
-    for value in (True, False):
-        config = _optimizer_config(fp8_recipe, fp8_param_gather=value)
-        assert config.resolve_fp8_param_gather(value) is config
-
-
-@pytest.mark.parametrize("fp8_recipe", ["mxfp8", "blockwise"])
-def test_explicit_true_with_bf16_ddp_params_does_not_raise(fp8_recipe):
-    """Over-conservative but safe (MCore-managed masters), so not an error."""
-    config = _optimizer_config(fp8_recipe, fp8_param_gather=True)
-    config.check_fp8_param_gather_consistency(False)
-
-
-@pytest.mark.parametrize("fp8_recipe", [None, "delayed"])
-def test_recipes_that_always_use_precision_aware_path_do_not_raise(fp8_recipe):
-    """Not affected by fp8_param_gather, so a mismatch is not a new failure mode."""
-    config = _optimizer_config(fp8_recipe, fp8_param_gather=False)
-    config.check_fp8_param_gather_consistency(True)
-
-
-def test_non_fp32_main_params_do_not_raise():
-    """main_params_dtype != fp32 already selected the precision-aware path before the flag."""
-    config = _optimizer_config("mxfp8", fp8_param_gather=False, main_params_dtype=torch.float16)
-    config.check_fp8_param_gather_consistency(True)
-
-
-def test_without_precision_aware_optimizer_does_not_raise():
-    config = OptimizerConfig(bf16=True, fp8_recipe="mxfp8", fp8_param_gather=False)
-    assert not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-    config.check_fp8_param_gather_consistency(True)
+def test_resolving_again_takes_the_new_ddp_value():
+    """The DDP config is the source of truth, so a config already resolved for one model follows
+    the DDP config of the next model it is resolved for."""
+    config = _optimizer_config("mxfp8").resolve_fp8_param_gather(False)
+    assert config.resolve_fp8_param_gather(True).fp8_param_gather is True
+    assert config.fp8_param_gather is False
 
 
 # The tests below build the optimizer with get_megatron_optimizer, which resolves fp8_param_gather
@@ -159,10 +118,8 @@ def test_get_megatron_optimizer_resolves_fp8_param_gather(
     assert optimizer.config.fp8_param_gather is ddp_fp8_param_gather
     bf16_params = not ddp_fp8_param_gather
     assert optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 == bf16_params
-    # The default keeps FP32 master params when TE owns them only because the params are BF16.
-    assert optimizer.config.resolved_store_param_remainders == (not bf16_params)
     # The caller's config is not modified.
-    assert config.fp8_param_gather is None and config.resolved_store_param_remainders
+    assert config.fp8_param_gather is None
 
     fused_adam = optimizer.optimizer
     assert bool(fused_adam.master_weights) == bf16_params
@@ -170,15 +127,15 @@ def test_get_megatron_optimizer_resolves_fp8_param_gather(
         assert not fused_adam.store_param_remainders
         assert all(p.dtype == torch.bfloat16 for g in fused_adam.param_groups for p in g["params"])
     else:
-        # MCore-managed FP32 main params, as before the BF16-params path existed.
+        # FP8 params: MCore-managed FP32 main params.
         assert all(p.dtype == torch.float32 for g in fused_adam.param_groups for p in g["params"])
 
 
 @pytest.mark.parametrize("store_param_remainders", [None, True])
 def test_bf16_params_master_param_format(model_parallel, store_param_remainders):
-    """With BF16 params and a non-delayed recipe the optimizer checkpoint's master params stay
-    FP32 by default (as with the MCore-managed main params that were used before), and are int16
-    remainders only when explicitly requested. Either way get_main_param_shard is exact."""
+    """With BF16 params and a non-delayed recipe the optimizer checkpoint's master params are
+    FP32 by default, and int16 remainders only when explicitly requested. Either way
+    get_main_param_shard is exact."""
     model = _ddp_model()
     _, optimizer = _get_optimizer(model, store_param_remainders=store_param_remainders)
     assert optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
@@ -236,8 +193,8 @@ def test_precision_aware_optimizer_requires_distributed_optimizer(model_parallel
 
 
 # (format saved with, format loaded with, whether the checkpoint records its format). The
-# checkpoints without a record stand for the ones written before the BF16-params path existed,
-# which held MCore-managed FP32 main params for this configuration.
+# unrecorded ones stand for checkpoints written before the format was recorded, which hold
+# MCore-managed FP32 main params for this configuration, so only those are left unrecorded.
 _CHECKPOINT_COMPATIBILITY_CASES = [
     (None, None, True),
     (True, True, True),
@@ -254,9 +211,9 @@ _CHECKPOINT_COMPATIBILITY_CASES = [
 def test_param_remainders_checkpoint_compatibility(
     model_parallel, tmp_path_dist_ckpt, save_remainders, load_remainders, record_format
 ):
-    """Loading int16 param remainders as FP32 master params, or the reverse, used to be a silent
-    value cast in dist-checkpointing that corrupted the master weights. It must raise instead,
-    and matching formats must load the exact master weights."""
+    """dist-checkpointing would load int16 param remainders as FP32 master params, or the
+    reverse, with a silent value cast that corrupts the master weights, so a format mismatch must
+    raise, and matching formats must load the exact master weights."""
     metadata = {"distrib_optim_sharding_type": "dp_reshardable", "checkpoint_version": 3.1}
     name = f"remainders_{save_remainders}_{load_remainders}_{record_format}"
     with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:

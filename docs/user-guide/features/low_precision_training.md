@@ -227,12 +227,10 @@ Once a recipe is stable, the following options reduce memory further:
     store only the 16 low bits of each FP32 master weight that the BF16 param
     does not already hold. Enabled by default, except when a non-delayed
     `--fp8-recipe` (`tensorwise`, `mxfp8`, `blockwise`, `custom`) is used
-    without `--fp8-param-gather`: Megatron Core only lets `FusedAdam` own the
-    master weights in that configuration since recently, and the default keeps
-    full FP32 master weights there so that optimizer checkpoints written
-    before stay loadable. Pass `--store-param-remainders` to save the memory,
-    at the cost of optimizer checkpoints that are not interchangeable with
-    runs that keep FP32 master weights. Always off with `--optimizer-cuda-graph`.
+    without `--fp8-param-gather`, for backward compatibility with checkpoints
+    produced without this feature. Explicitly pass `--store-param-remainders`
+    to enable this feature if you do not require loading such checkpoints. 
+    Always off with `--optimizer-cuda-graph`.
 
 ## Configuration Cookbook
 

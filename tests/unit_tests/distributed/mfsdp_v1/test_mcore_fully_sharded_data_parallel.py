@@ -1060,7 +1060,8 @@ class TestMegatronFSDPE2E:
         _skip_if_fp8_recipe_unsupported(fp8_recipe)
 
         def check_optimizer(optim, model_chunks):
-            # The combination under test, which used to be excluded from the precision-aware path.
+            # The combination under test: TE owns the master weights of BF16 params (for the
+            # distributed optimizer).
             assert optim.config.fp8_param_gather is False
             assert optim.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
 

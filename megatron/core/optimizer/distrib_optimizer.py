@@ -815,7 +815,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
 
-        config.check_fp8_param_gather_consistency(self.ddp_config.fp8_param_gather)
+        # The config decides who owns the master weights from fp8_param_gather, so it must have
+        # been resolved for this model (or not at all, which conservatively means quantized).
+        assert config.fp8_param_gather in (None, self.ddp_config.fp8_param_gather), (
+            f"OptimizerConfig resolved with fp8_param_gather={config.fp8_param_gather} for a "
+            f"model whose ddp_config.fp8_param_gather is {self.ddp_config.fp8_param_gather}"
+        )
 
         # Model grad buffer ranges.
         assert per_model_buffers is not None, "per_model_buffers must be provided"
@@ -1764,23 +1769,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
 
     def _check_loaded_param_remainders(self, state_dict: dict) -> None:
-        """Raise if the checkpoint's "param" entries are in a different format than this run's.
+        """Refuse to load a checkpoint whose master weights are stored in another format.
 
-        Loading int16 param remainders as main params, or the reverse, is a silent value cast
-        that corrupts the master weights, so it must fail instead.
+        The "param" entries of the parameter state hold either full main params or, with
+        store_param_remainders, the int16 low bits of the FP32 master weights. dist-checkpointing
+        casts each loaded tensor to the dtype this run expects, so loading one format as the other
+        does not fail but silently corrupts the master weights. This compares the format of the
+        checkpoint with the format of this run and raises if they differ.
         """
         stored = state_dict.get('param_state_param_remainders')
         if stored is None:
-            # Written before the format was recorded. Infer it as it was resolved then: the
-            # precision-aware optimizer did not own the masters of BF16 params with FP32 main
-            # params and a non-delayed FP8 recipe, and param remainders were stored unless
-            # disabled (they were incompatible with --optimizer-cuda-graph, so it was not used).
-            stored = bool(
-                self.config._use_precision_aware_optimizer_regardless_of_param_dtype()
-                and self.config.bf16
-                and self.config.store_param_remainders is not False
-                and is_te_min_version("2.1.0")
-            )
+            stored = self._param_remainders_in_checkpoint_without_format()
         current = self._stores_param_remainders()
         if stored == current:
             return
@@ -1796,6 +1795,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             f"{'Set --store-param-remainders' if stored else 'Set --no-store-param-remainders'} "
             "to match the checkpoint (param remainders are not supported with "
             "--optimizer-cuda-graph), or skip loading the optimizer state with --no-load-optim."
+        )
+
+    def _param_remainders_in_checkpoint_without_format(self) -> bool:
+        """Backward compatibility: infer whether a checkpoint written before the format was recorded
+        holds param remainders.
+        """
+        # Such checkpoints never combined param remainders with --optimizer-cuda-graph (TE
+        # rejected it), so this run's --optimizer-cuda-graph is ignored.
+        return bool(
+            self.config._te_master_weights_in_checkpoint_without_format()
+            and self.config.bf16
+            and self.config.store_param_remainders is not False
+            and is_te_min_version("2.1.0")
         )
 
     def _param_groups_to_param2group_meta(

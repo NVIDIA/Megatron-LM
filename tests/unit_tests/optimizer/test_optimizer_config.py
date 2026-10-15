@@ -35,81 +35,92 @@ _PAO = dict(bf16=True, use_precision_aware_optimizer=True)
 _NON_DELAYED_FP8_RECIPES = ["tensorwise", "mxfp8", "blockwise", "custom"]
 
 
+def _config(fp8_param_gather=None, **kwargs) -> OptimizerConfig:
+    """An OptimizerConfig, resolved like get_megatron_optimizer does unless fp8_param_gather is
+    None (no DDP config to take it from)."""
+    config = OptimizerConfig(**kwargs)
+    if fp8_param_gather is None:
+        return config
+    return config.resolve_fp8_param_gather(fp8_param_gather)
+
+
+def test_fp8_param_gather_is_not_user_settable():
+    """Whether the params are quantized is a property of the model, taken from its DDP config."""
+    with pytest.raises(TypeError):
+        OptimizerConfig(fp8_param_gather=False)
+    with pytest.raises(TypeError):
+        OptimizerConfig(_fp8_param_gather=False)
+    config = OptimizerConfig()
+    with pytest.raises(AttributeError):
+        config.fp8_param_gather = False
+    assert config.fp8_param_gather is None
+
+
 def test_optimizer_cuda_graph_disables_store_param_remainders():
     """TE FusedAdam capturable mode rejects param remainders, so the config must turn them off."""
     _skip_without_param_remainders_support()
 
     assert OptimizerConfig(**_PAO).resolved_store_param_remainders
-    # Warns, and resolving the config again (which re-runs __post_init__) stays off.
-    with pytest.warns(UserWarning, match="store_param_remainders"):
-        config = OptimizerConfig(optimizer_cuda_graph=True, **_PAO)
-    assert not config.resolved_store_param_remainders
-    assert not config.resolve_fp8_param_gather(False).resolved_store_param_remainders
-    # An explicit request is overridden as well.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert not OptimizerConfig(
+            optimizer_cuda_graph=True, **_PAO
+        ).resolved_store_param_remainders
+    # An explicit request is overridden too, with a warning.
     with pytest.warns(UserWarning, match="optimizer-cuda-graph"):
         config = OptimizerConfig(optimizer_cuda_graph=True, store_param_remainders=True, **_PAO)
     assert not config.resolved_store_param_remainders
-    # Without the precision-aware optimizer the setting is irrelevant and left alone.
-    assert OptimizerConfig(optimizer_cuda_graph=True).resolved_store_param_remainders
 
 
 @pytest.mark.parametrize("fp8_param_gather", [None, True, False])
 @pytest.mark.parametrize("optimizer_cpu_offload", [False, True])
 @pytest.mark.parametrize("main_params_dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("fp8_recipe", [None, "delayed"] + _NON_DELAYED_FP8_RECIPES)
-def test_store_param_remainders_default(
+def test_precision_aware_gate_and_store_param_remainders_default(
     fp8_recipe, main_params_dtype, optimizer_cpu_offload, fp8_param_gather
 ):
-    """The default stores remainders, except when the precision-aware optimizer owns the masters
-    only because the params are BF16 (FP32 main params and a non-delayed FP8 recipe): such runs
-    used to keep FP32 masters in their checkpoints, which must stay loadable."""
+    """With FP32 main params and a non-delayed FP8 recipe, TE owns the master weights only for BF16
+    params, and param remainders default to off so the checkpoints keep FP32 master weights. In
+    all other configurations TE owns the master weights and param remainders default to on."""
     _skip_without_param_remainders_support()
 
-    config = OptimizerConfig(
+    config = _config(
+        fp8_param_gather,
         fp8_recipe=fp8_recipe,
         main_params_dtype=main_params_dtype,
         optimizer_cpu_offload=optimizer_cpu_offload,
-        fp8_param_gather=fp8_param_gather,
         **_PAO,
     )
-    only_for_bf16_params = (
+    only_with_bf16_params = (
         fp8_recipe in _NON_DELAYED_FP8_RECIPES
         and main_params_dtype == torch.float32
         and not optimizer_cpu_offload
-        and fp8_param_gather is False
     )
+    assert config._te_master_weights_in_checkpoint_without_format() == (not only_with_bf16_params)
     assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 == (
-        only_for_bf16_params
-        or fp8_recipe not in _NON_DELAYED_FP8_RECIPES
-        or main_params_dtype != torch.float32
-        or optimizer_cpu_offload
+        not only_with_bf16_params or fp8_param_gather is False
     )
-    assert config._use_precision_aware_optimizer_only_for_bf16_params() == only_for_bf16_params
     assert config.store_param_remainders is None  # The field keeps the user's intent.
-    assert config.resolved_store_param_remainders == (not only_for_bf16_params)
+    # Only takes effect where TE owns the master weights.
+    assert config.resolved_store_param_remainders == (not only_with_bf16_params)
 
 
 @pytest.mark.parametrize("fp8_recipe", _NON_DELAYED_FP8_RECIPES)
-def test_store_param_remainders_default_follows_fp8_param_gather_resolution(fp8_recipe):
-    """The default must not be frozen when the config is created before fp8_param_gather is
-    resolved from the DDP config (resolution copies the config with dataclasses.replace)."""
-    _skip_without_param_remainders_support()
-
+def test_gate_follows_fp8_param_gather_resolution(fp8_recipe):
+    """The gate is derived on access, so it follows fp8_param_gather when the config is resolved
+    after construction, and resolution does not modify the config it is called on."""
     config = OptimizerConfig(fp8_recipe=fp8_recipe, **_PAO)
     assert config.fp8_param_gather is None
-    assert config.resolved_store_param_remainders  # Unresolved: same as before (MCore masters).
+    assert not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8  # Possibly quantized.
 
     bf16_params = config.resolve_fp8_param_gather(False)
     assert bf16_params.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-    assert not bf16_params.resolved_store_param_remainders
-    assert bf16_params.resolve_fp8_param_gather(False).resolved_store_param_remainders is False
+    assert not bf16_params.resolve_fp8_param_gather(
+        True
+    ).use_precision_aware_optimizer_no_fp8_or_ds_fp8
 
-    fp8_params = config.resolve_fp8_param_gather(True)
-    assert not fp8_params.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-    assert fp8_params.resolved_store_param_remainders
-
-    # The caller's config is not modified.
-    assert config.fp8_param_gather is None and config.resolved_store_param_remainders
+    assert config.fp8_param_gather is None
+    assert bf16_params.fp8_param_gather is False
 
 
 @pytest.mark.parametrize("fp8_recipe", [None, "delayed", "tensorwise"])
@@ -117,41 +128,16 @@ def test_store_param_remainders_default_follows_fp8_param_gather_resolution(fp8_
 def test_store_param_remainders_explicit_value_wins(fp8_recipe, store_param_remainders):
     _skip_without_param_remainders_support()
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        config = OptimizerConfig(
-            fp8_recipe=fp8_recipe,
-            fp8_param_gather=False,
-            store_param_remainders=store_param_remainders,
-            **_PAO,
-        )
+    config = _config(
+        False, fp8_recipe=fp8_recipe, store_param_remainders=store_param_remainders, **_PAO
+    )
     assert config.store_param_remainders is store_param_remainders
     assert config.resolved_store_param_remainders is store_param_remainders
 
 
-def test_store_param_remainders_explicit_true_warns_only_for_bf16_params_case():
-    """Opting in where the default is off for checkpoint compatibility warns about it."""
-    _skip_without_param_remainders_support()
-
-    # Unresolved fp8_param_gather: the BF16-params case is not known yet, so no warning.
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        config = OptimizerConfig(fp8_recipe="tensorwise", store_param_remainders=True, **_PAO)
-        OptimizerConfig(fp8_recipe="delayed", store_param_remainders=True, **_PAO)
-    with pytest.warns(UserWarning, match="not interchangeable"):
-        resolved = config.resolve_fp8_param_gather(False)
-    assert resolved.resolved_store_param_remainders
-
-
-def test_store_param_remainders_without_precision_aware_optimizer():
-    """Unused without the precision-aware optimizer; the resolved value mirrors the old default."""
-    assert OptimizerConfig().resolved_store_param_remainders
-    assert OptimizerConfig(store_param_remainders=True).resolved_store_param_remainders
-    assert not OptimizerConfig(store_param_remainders=False).resolved_store_param_remainders
-    # Not the precision-aware path, whatever the params are.
-    config = OptimizerConfig(fp8_recipe="tensorwise", fp8_param_gather=False)
+def test_gate_without_precision_aware_optimizer():
+    config = _config(False, fp8_recipe="tensorwise")
     assert not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-    assert not config._use_precision_aware_optimizer_only_for_bf16_params()
 
 
 def test_paramkey_matches():
