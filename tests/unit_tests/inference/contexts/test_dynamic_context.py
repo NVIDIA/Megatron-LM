@@ -103,6 +103,95 @@ def _processed_rows_context(sampling_and_counts, num_sampled=None):
     return expected_context, sampled_rows
 
 
+def _context_with_real_token_count(real_token_count: int) -> DynamicInferenceContext:
+    """A bare context whose GPU view only holds the real-token-count scalar."""
+    context = DynamicInferenceContext.__new__(DynamicInferenceContext)
+    context.gpu_view = SimpleNamespace(
+        real_token_count=torch.tensor([real_token_count], dtype=torch.int32, device="cuda")
+    )
+    return context
+
+
+def _token_major_activations(num_rows: int, contiguous: bool = True) -> torch.Tensor:
+    """Non-zero `[tokens, 1, 8]` activations, so zeroed rows are unambiguous.
+
+    The non-contiguous variant is a strided view, which takes the fallback path.
+    """
+    step = 1 if contiguous else 2
+    values = torch.arange(1, num_rows * 8 * step + 1, dtype=torch.float32, device="cuda")
+    return values.view(num_rows, 1, 8 * step)[..., ::step]
+
+
+CONTIGUITY = pytest.mark.parametrize("contiguous", [True, False], ids=["kernel", "fallback"])
+
+
+@CONTIGUITY
+@pytest.mark.parametrize("num_rows, real_token_count", [(16, 10), (16, 16), (16, 0), (7, 1)])
+def test_zero_padding_tokens_zeroes_rows_past_real_token_count(
+    num_rows, real_token_count, contiguous
+):
+    """Rows at or past the real token count are zeroed; real rows are untouched."""
+    context = _context_with_real_token_count(real_token_count)
+    activations = _token_major_activations(num_rows, contiguous)
+    original = activations.clone()
+
+    context.zero_padding_tokens(activations)
+
+    assert torch.equal(activations[:real_token_count], original[:real_token_count])
+    assert torch.all(activations[real_token_count:] == 0)
+
+
+@CONTIGUITY
+@pytest.mark.parametrize("real_token_count, num_real_local_rows", [(11, 3), (8, 0), (16, 8)])
+def test_zero_padding_tokens_offsets_sequence_parallel_shard(
+    real_token_count, num_real_local_rows, contiguous
+):
+    """On sequence-parallel rank 1, local row r of an 8-row shard is token r + 8."""
+    context = _context_with_real_token_count(real_token_count)
+    activations = _token_major_activations(8, contiguous)
+    original = activations.clone()
+
+    context.zero_padding_tokens(activations, sequence_parallel_rank=1)
+
+    assert torch.equal(activations[:num_real_local_rows], original[:num_real_local_rows])
+    assert torch.all(activations[num_real_local_rows:] == 0)
+
+
+@CONTIGUITY
+@pytest.mark.parametrize("capture_count", [16, 0], ids=["capture_all_real", "capture_no_real"])
+@pytest.mark.parametrize("stale_value", [1.0e4, float("nan")], ids=["finite", "nan"])
+def test_zero_padding_tokens_reads_real_token_count_at_cuda_graph_replay(
+    capture_count, stale_value, contiguous
+):
+    """A captured zeroing follows the count published for each replay, not the one at capture.
+
+    CUDA graphs are captured with dummy requests that fill the graph, so the Python-side
+    `padding_slice` is empty at capture, and the context publishes a real token count of 0.
+    """
+    num_rows = 16
+    context = _context_with_real_token_count(capture_count)
+    activations = _token_major_activations(num_rows, contiguous)
+    original = activations.clone()
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        context.zero_padding_tokens(activations)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        context.zero_padding_tokens(activations)
+
+    for real_token_count in (5, num_rows, 0, 11):
+        # Rows past the real tokens hold whatever the kernels left there.
+        activations.copy_(original)
+        activations[real_token_count:] = stale_value
+        context.gpu_view.real_token_count.fill_(real_token_count)
+        graph.replay()
+        assert torch.equal(activations[:real_token_count], original[:real_token_count])
+        assert torch.all(activations[real_token_count:] == 0)
+
+
 class TestDynamicContext:
 
     @classmethod
@@ -570,6 +659,53 @@ class TestDynamicContext:
             dynamic_context.gpu_view.token_to_input_ids[:num_tokens].cpu(),
             torch.tensor([31, 32, 33, 34], dtype=torch.int64),
         )
+
+    @pytest.mark.internal
+    @rounder_override(4)
+    def test_real_token_count_for_padding_zeroing(self):
+        """The count read by `zero_padding_tokens` is 0 on graph capture, else the active count."""
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=256,
+            buffer_size_gb=0.05,
+            block_size_tokens=256,
+            max_tokens=None,
+            num_cuda_graphs=4,
+            max_requests=16,
+        )
+
+        # Graph capture fills the graph with dummy requests, none of which is real.
+        graph_dimensions = min(
+            dims
+            for dims in dynamic_context.cuda_graph_batch_dimensions_list
+            if dims.prefill_req_count == 0
+        )
+        dynamic_context.initialize_attention_state(construct_graph_dimensions=graph_dimensions)
+        assert dynamic_context.gpu_view.real_token_count.item() == 0
+        dynamic_context.reset()
+
+        for request_id, prompt_length in enumerate((5, 9, 13)):
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(prompt_length, device="cuda"),
+                    sampling_params=SamplingParams(num_tokens_to_generate=2, termination_id=-1),
+                )
+            )
+        dynamic_context.initialize_attention_state()
+        assert dynamic_context.using_cuda_graph_this_step()
+        assert dynamic_context.padded_active_token_count > dynamic_context.active_token_count
+        assert dynamic_context.gpu_view.real_token_count.item() == 27
+
+        # Called eagerly, it zeroes exactly the rows `padding_slice` covers.
+        activations = torch.randn(dynamic_context.padded_active_token_count, 1, 16, device="cuda")
+        expected = activations.clone()
+        expected[dynamic_context.padding_slice] = 0.0
+        dynamic_context.zero_padding_tokens(activations)
+        assert torch.equal(activations, expected)
 
     @pytest.mark.internal
     @rounder_override(8)

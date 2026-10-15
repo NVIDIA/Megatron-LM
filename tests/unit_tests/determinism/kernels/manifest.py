@@ -597,6 +597,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
     ),
     KernelEntry(
+        name="inference_zero_padding_rows",
+        sources=("megatron/core/inference/contexts/zero_padding_rows_kernel.py",),
+        tests=(K + "test_inference_kernels.py",),
+        kind="triton",
+        training_path=False,
+    ),
+    KernelEntry(
         name="inference_moe_kernels",
         sources=(
             "megatron/core/inference/moe/activations.py",
