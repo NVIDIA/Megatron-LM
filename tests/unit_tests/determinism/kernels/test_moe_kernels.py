@@ -7,7 +7,7 @@ Operator level: token permute / unpermute (torch and TE-fused, both branches of 
 and TE-fused), group-limited routing, the load-balancing aux loss (torch and TE-fused), and
 the router gating GEMM. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
 deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
-the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
+the all-gather and all-to-all dispatchers (plus the flex DeepEP and HybridEP dispatchers from
 ``fused_a2a.py`` when the dependency and the GPUs are available).
 """
 
@@ -50,7 +50,15 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 HAVE_TE = moe_utils.HAVE_TE
 HAVE_TE_PERMUTE = HAVE_TE and moe_utils.fused_permute is not None
 HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
-from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2
+from megatron.core.transformer.moe import fused_a2a
+from megatron.core.transformer.moe.fused_a2a import (
+    HAVE_DEEP_EP,
+    HAVE_DEEP_EP_V2,
+    HAVE_HYBRIDEP,
+    reset_hybrid_ep_buffer,
+)
+
+HAVE_HYBRIDEP_CUSTOM_AG = HAVE_HYBRIDEP and fused_a2a._hybridep_custom_allgather_traps_on_timeout()
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
 
@@ -324,6 +332,7 @@ class _InQuantizationContext(torch.nn.Module):
 
 class TestMoEModules:
     def teardown_method(self, method):
+        reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
 
     def _init(self, ep=1):
@@ -667,6 +676,26 @@ class TestMoEModules:
                 id="flex-deepepv2-ep2",
                 marks=pytest.mark.skipif(not HAVE_DEEP_EP_V2, reason="DeepEP v2 not installed"),
             ),
+            pytest.param(
+                "flex",
+                2,
+                {"moe_flex_dispatcher_backend": "hybridep"},
+                id="flex-hybridep-ep2",
+                marks=pytest.mark.skipif(not HAVE_HYBRIDEP, reason="HybridEP not installed"),
+            ),
+            pytest.param(
+                "flex",
+                2,
+                {
+                    "moe_flex_dispatcher_backend": "hybridep",
+                    "moe_hybridep_enable_custom_allgather": True,
+                },
+                id="flex-hybridep-custom-allgather-ep2",
+                marks=pytest.mark.skipif(
+                    not HAVE_HYBRIDEP_CUSTOM_AG,
+                    reason="HybridEP custom allgather missing or does not trap on timeout",
+                ),
+            ),
         ],
     )
     def test_moe_layer_replays(self, dispatcher, ep, extra):
@@ -699,7 +728,7 @@ class TestMoEModules:
         with deterministic_algorithms(True):
             prev_fill = torch.utils.deterministic.fill_uninitialized_memory
             try:
-                if extra.get("moe_flex_dispatcher_backend") in ("deepep", "deepepv2"):
+                if extra.get("moe_flex_dispatcher_backend") in ("deepep", "deepepv2", "hybridep"):
                     # PyTorch memory-fill kernels can race with DeepEP communication.
                     torch.utils.deterministic.fill_uninitialized_memory = False
                 assert_module_replays_bit_exact(

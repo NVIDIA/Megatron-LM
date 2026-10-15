@@ -1,6 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+import functools
+import inspect
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -137,6 +140,9 @@ class MoEModelTestContainer:
             moe_router_fusion=kwargs.get("moe_router_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_hybridep_routing_map_mode=kwargs.get("moe_hybridep_routing_map_mode", "bool"),
+            moe_hybridep_enable_custom_allgather=kwargs.get(
+                "moe_hybridep_enable_custom_allgather", False
+            ),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
             moe_dispatch_fwd_dtype=kwargs.get("moe_dispatch_fwd_dtype", 'bf16'),
@@ -883,6 +889,140 @@ def test_hybridep_dispatch_passes_dense_routing_metadata(monkeypatch):
     assert "dense_routing" not in fake_buffer.kwargs
 
 
+class _FakeFixedHybridEPBuffer:
+    """DeepEP with #682: the custom allgather traps on timeout and defaults to off."""
+
+    def __init__(self, enable_custom_allgather: bool = False, **kwargs):
+        self.kwargs = dict(kwargs, enable_custom_allgather=enable_custom_allgather)
+
+
+class _FakeUnfixedHybridEPBuffer:
+    """DeepEP before #682: the custom allgather reuses stale routing on timeout and defaults on."""
+
+    def __init__(self, enable_custom_allgather: bool = True, **kwargs):
+        self.kwargs = dict(kwargs, enable_custom_allgather=enable_custom_allgather)
+
+
+class _FakeNoCustomAllgatherHybridEPBuffer:
+    """DeepEP without a custom allgather option."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+@pytest.mark.parametrize(
+    "buffer_cls,requested,expected,warns",
+    [
+        (_FakeFixedHybridEPBuffer, True, True, False),
+        (_FakeFixedHybridEPBuffer, False, False, False),
+        (_FakeUnfixedHybridEPBuffer, True, False, True),
+        (_FakeUnfixedHybridEPBuffer, False, False, False),
+        (_FakeNoCustomAllgatherHybridEPBuffer, True, None, True),
+        (_FakeNoCustomAllgatherHybridEPBuffer, False, None, False),
+    ],
+)
+def test_init_hybrid_ep_buffer_custom_allgather(
+    monkeypatch, buffer_cls, requested, expected, warns
+):
+    """The custom allgather is opt-in and only enabled on DeepEP builds that trap on timeout."""
+    monkeypatch.setattr(fused_a2a, "HybridEPBuffer", buffer_cls, raising=False)
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
+
+    def init():
+        fused_a2a.init_hybrid_ep_buffer(
+            object(),
+            hidden_dim=8,
+            num_tokens=4,
+            num_local_experts=2,
+            enable_custom_allgather=requested,
+        )
+
+    if warns:
+        with pytest.warns(UserWarning, match="Falling back to the NCCL allgather"):
+            init()
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            init()
+
+    kwargs = fused_a2a._hybrid_ep_buffer.kwargs
+    if expected is None:
+        assert "enable_custom_allgather" not in kwargs
+    else:
+        assert kwargs["enable_custom_allgather"] is expected
+
+
+def test_hybridep_dispatch_forwards_custom_allgather_to_buffer_init(monkeypatch):
+    class FakeHybridEPBuffer:
+        def dispatch_with_permute(self, **kwargs):
+            return kwargs["hidden"], kwargs["probs"], None, torch.ones(2, dtype=torch.int32), ()
+
+        def combine_with_unpermute(self, **kwargs):
+            return kwargs["hidden"], kwargs["probs"]
+
+    init_args = {}
+    signature = inspect.signature(fused_a2a.init_hybrid_ep_buffer)
+
+    def fake_init(*args, **kwargs):
+        init_args.update(signature.bind(*args, **kwargs).arguments)
+        fused_a2a._hybrid_ep_buffer = FakeHybridEPBuffer()
+
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
+    monkeypatch.setattr(fused_a2a, "init_hybrid_ep_buffer", fake_init)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
+    hidden = torch.randn(2, 4)
+    probs = torch.randn(2, 4)
+    routing_map = torch.tensor([[True, False, False, True], [False, True, True, False]])
+
+    ctx = SimpleNamespace()
+    fused_a2a.HybridEPDispatch.forward(
+        ctx, hidden, routing_map, probs, object(), 2, enable_custom_allgather=True
+    )
+    assert init_args["enable_custom_allgather"] is True
+
+    # backward must return one gradient per forward input.
+    grads = fused_a2a.HybridEPDispatch.backward(ctx, hidden, probs, None, None, None)
+    assert len(grads) == len(inspect.signature(fused_a2a.HybridEPDispatch.forward).parameters) - 1
+
+
+@pytest.mark.parametrize("enable_custom_allgather", [True, False])
+def test_hybridep_manager_passes_custom_allgather_config(monkeypatch, enable_custom_allgather):
+    dispatch_kwargs = {}
+
+    def fake_hybrid_ep_dispatch(**kwargs):
+        dispatch_kwargs.update(kwargs)
+        return kwargs["x"], kwargs["probs"], None, torch.ones(2, dtype=torch.int32), ()
+
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", fake_hybrid_ep_dispatch)
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_flex_dispatcher_num_sms=None,
+        moe_hybridep_num_blocks_permute=None,
+        moe_hybridep_num_blocks_unpermute=None,
+        moe_permute_fusion_into_hybridep=False,
+        moe_hybridep_num_sms_preprocessing=32,
+        moe_hybridep_enable_custom_allgather=enable_custom_allgather,
+        use_transformer_engine_op_fuser=False,
+        moe_use_grouped_tensor=False,
+        fp8=None,
+        fp4=None,
+    )
+    manager.token_probs = torch.ones(2, 4)
+    manager.routing_map = torch.ones(2, 4, dtype=torch.bool)
+    manager.topk_idx = None
+    manager.group = object()
+    manager.num_local_experts = 2
+    manager.num_experts = 4
+    manager.num_permuted_tokens = 4
+    manager.pad_multiple = None
+    manager._padded_num_tokens = None
+    manager.moe_expert_rank_capacity_factor = None
+
+    manager.dispatch(torch.randn(2, 8))
+
+    assert dispatch_kwargs["enable_custom_allgather"] is enable_custom_allgather
+
+
 @pytest.mark.skipif(
     not is_deep_ep_available() and not is_deep_ep_v2_available() and not is_hybrid_ep_available(),
     reason="Deep EP, Deep EP v2 and Hybrid EP are not available",
@@ -929,6 +1069,68 @@ class TestFlexDispatcher:
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_dropless_test()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_hybridep_custom_allgather_matches_nccl(self, monkeypatch):
+        """The custom NVLink allgather runs its own kernel and dispatches exactly like NCCL."""
+        if not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
+        if not fused_a2a._hybridep_custom_allgather_traps_on_timeout():
+            pytest.skip("Installed DeepEP's custom allgather does not trap on timeout")
+
+        buffer_kwargs = []
+        base_cls = fused_a2a.HybridEPBuffer
+
+        class RecordingHybridEPBuffer(base_cls):
+            @functools.wraps(base_cls.__init__)
+            def __init__(self, *args, **kwargs):
+                buffer_kwargs.append(kwargs)
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(fused_a2a, "HybridEPBuffer", RecordingHybridEPBuffer)
+
+        results = {}
+        for enable in (False, True):
+            reset_hybrid_ep_buffer()
+            container = MoEModelTestContainer(
+                tp_size=1,
+                ep_size=8,
+                pp_size=1,
+                num_moe_experts=8,
+                moe_router_topk=2,
+                moe_router_load_balancing_type="aux_loss",
+                moe_token_dispatcher_type="flex",
+                moe_flex_dispatcher_backend="hybridep",
+                moe_hybridep_enable_custom_allgather=enable,
+                hidden_size=1024,
+                test_dtype=torch.bfloat16,
+            )
+            moe_layer = container.moe_layer
+            torch.manual_seed(1000 + torch.distributed.get_rank())
+            hidden_states = torch.randn((256, 1024), dtype=torch.bfloat16, device="cuda")
+            probs, routing_map = apply_module(moe_layer.router)(hidden_states)
+            probs = torch.ones_like(probs) / moe_layer.router.topk
+
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+                permuted, tokens_per_expert, _ = token_permutation(
+                    moe_layer.token_dispatcher, hidden_states, probs, routing_map
+                )
+                torch.cuda.synchronize()
+            ran_custom_kernel = any("ag_nvl_kernel" in e.name for e in prof.events())
+            results[enable] = (permuted.clone(), tokens_per_expert.clone(), ran_custom_kernel)
+            token_unpermutation(moe_layer.token_dispatcher, permuted)
+
+            # Full dispatch/combine round trip, forward and backward.
+            container.dispatcher_dropless_test()
+            reset_hybrid_ep_buffer()
+            Utils.destroy_model_parallel()
+
+        assert [kwargs["enable_custom_allgather"] for kwargs in buffer_kwargs] == [False, True]
+        assert results[True][2], "custom allgather kernel did not run"
+        assert not results[False][2], "custom allgather kernel ran with the option off"
+        assert torch.equal(results[True][0], results[False][0])
+        assert torch.equal(results[True][1], results[False][1])
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
