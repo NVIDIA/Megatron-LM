@@ -376,12 +376,11 @@ class HyperConnectionModule(MegatronModule):
         h_res = h[..., 2 * self.n :]
         return h_pre, h_post, h_res
 
-    def _compute_single_pass_mappings(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Predict coefficients before mixing, retaining full precision and gradients."""
+    @torch.compile
+    def _single_pass_coefficients(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Fuse FP32 normalization and coefficient activations around the projection."""
         x = hidden_states.float()
-        # V4's fused coefficient projection adds epsilon after sqrt. V4.1 adds
-        # it inside sqrt, so keep that projection explicit and fuse the other
-        # operations without changing the zero/small-input gradient.
+        # V4.1 requires epsilon inside sqrt, including for zero/small inputs.
         with torch.autocast(device_type=x.device.type, enabled=False):
             projected = F.linear(x, self.mapping_proj.weight.float())
         projected = projected * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
@@ -392,15 +391,13 @@ class HyperConnectionModule(MegatronModule):
         residual = (
             projected[..., 2 * self.n :] * self.alpha_res + self.bias[2 * self.n :]
         ).unflatten(-1, (self.n, self.n))
-        if self.config.use_fused_mhc:
-            residual = self._sinkhorn_op(residual, self.sinkhorn_iterations, self.sinkhorn_eps)
-            return pre + self.compute_h_eps, 2 * post, residual
-        residual = residual.softmax(-1) + self.sinkhorn_eps
-        residual = residual / (residual.sum(-2, keepdim=True) + self.sinkhorn_eps)
-        for _ in range(self.sinkhorn_iterations - 1):
-            residual = residual / (residual.sum(-1, keepdim=True) + self.sinkhorn_eps)
-            residual = residual / (residual.sum(-2, keepdim=True) + self.sinkhorn_eps)
         return pre + self.compute_h_eps, 2 * post, residual
+
+    def _compute_single_pass_mappings(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Predict FP32 coefficients, then apply the configured Sinkhorn kernel."""
+        pre, post, residual = self._single_pass_coefficients(hidden_states)
+        residual = self._sinkhorn_op(residual, self.sinkhorn_iterations, self.sinkhorn_eps)
+        return pre, post, residual
 
     @nvtx_decorator(message="HyperConnection::compute_mappings")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -830,16 +827,17 @@ class HyperConnectionModule(MegatronModule):
     ) -> Tensor:
         """Apply residual mixing and branch expansion once, preserving FP32 coefficients."""
         with torch.autocast(device_type=x.device.type, enabled=False):
-            streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
+            streams = original_residual.unflatten(-1, (self.n, self.hidden_size))
             if self.config.use_fused_mhc and (not training or dropout_prob == 0.0):
-                return (
-                    self._h_post_bda_op(
-                        h_res, streams, h_post, x.float(), None if bias is None else bias.float()
-                    )
-                    .flatten(-2)
-                    .to(x.dtype)
-                )
-            mixed = torch.einsum("sbij,sbic->sbjc", h_res.float(), streams)
+                return self._h_post_bda_op(
+                    h_res,
+                    streams,
+                    h_post,
+                    x,
+                    None if bias is None else bias.float(),
+                    output_dtype=x.dtype,
+                ).flatten(-2)
+            mixed = torch.einsum("sbij,sbic->sbjc", h_res.float(), streams.float())
             branch = x.float() if bias is None else x.float() + bias.float()
             expanded = h_post.float().unsqueeze(-1) * branch.unsqueeze(-2)
             expanded = F.dropout(expanded, p=dropout_prob, training=training)

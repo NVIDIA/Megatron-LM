@@ -36,6 +36,14 @@ def test_previous_mix_controls_input_and_receives_gradients(dtype, fused):
     reference = torch.matmul(residual.transpose(-1, -2), x.float().unflatten(-1, (4, 16)))
     reference = reference + post.unsqueeze(-1) * branch.float().unsqueeze(-2)
     torch.testing.assert_close(output, reference.flatten(-2).to(dtype))
+    # Direct activation-dtype stores must preserve FP32 coefficient gradients.
+    leaves = (x, previous, module.mapping_proj.weight)
+    actual_grads = torch.autograd.grad(output.float().square().mean(), leaves, retain_graph=True)
+    reference_grads = torch.autograd.grad(
+        reference.flatten(-2).to(dtype).float().square().mean(), leaves, retain_graph=True
+    )
+    for actual, expected in zip(actual_grads, reference_grads):
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
     state.contract(output, 4).square().mean().backward()
     assert previous.grad is not None and previous.grad.abs().sum() > 0
     assert module.mapping_proj.weight.grad is not None
