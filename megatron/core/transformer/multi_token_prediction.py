@@ -1128,10 +1128,10 @@ def process_mtp_loss(
         loss_group_lengths (Optional[tuple[int, ...]]): CP-local lengths of independently
             normalized packed groups. Each group keeps the original/rolled token-count
             correction it would have in its own call, so combining forwards does not change
-            its MTP gradient. Requires per-token loss and the zigzag CP layout (or CP=1).
-            Each group must consist of whole packed sequences: its CP-local boundaries must be
-            the physical sequence boundaries (``cu_seqlens_q_padded``, or ``cu_seqlens_q``
-            when unpadded) divided by the CP size; this is not checked.
+            its MTP gradient. Requires per-token loss, ``packed_seq_params`` and the zigzag
+            CP layout (or CP=1). Each group must consist of whole packed sequences: its
+            CP-local boundaries must be physical sequence boundaries (``cu_seqlens_q_padded``,
+            or ``cu_seqlens_q`` when unpadded) divided by the CP size.
 
     Returns:
         Tensor: Main-model hidden states with the MTP loss attached.
@@ -1205,6 +1205,25 @@ def process_mtp_loss(
             raise NotImplementedError(
                 "grouped MTP normalization requires the zigzag CP layout at CP>1"
             )
+        # Rolls stop at packed-sequence ends; a group boundary inside a sequence (or a
+        # single unpacked sequence) would let labels roll across groups.
+        if packed_seq_params is None:
+            raise ValueError("grouped MTP normalization requires packed_seq_params")
+        cu_seqlens = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        cp_size = cp_group.size() if cp_group is not None else 1
+        sequence_ends = {end // cp_size for end in cu_seqlens.tolist() if end % cp_size == 0}
+        group_end = 0
+        for length in loss_group_lengths[:-1]:
+            group_end += length
+            if group_end not in sequence_ends:
+                raise ValueError(
+                    "MTP loss groups must consist of whole packed sequences: CP-local group "
+                    f"boundary {group_end} is not a sequence boundary"
+                )
         original_group_counts = tuple(
             part.sum() for part in loss_mask.split(loss_group_lengths, dim=-1)
         )
