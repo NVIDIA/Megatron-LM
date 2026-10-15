@@ -103,6 +103,17 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="cross_layer_tensor_state",
+        sources=(
+            "megatron/core/transformer/state_boundary.py",
+            "megatron/core/transformer/stateful_module.py",
+            "megatron/core/context_parallel/shared_state.py",
+        ),
+        tests=(K + "test_shared_tensor_state.py",),
+        kind="dispatch",
+        notes="Eager/checkpoint/Torch and TE graph state replay, plus explicit CP layout/gather gradients.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
@@ -233,7 +244,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fusions/fused_mhc_kernels.py",
             "megatron/core/transformer/hyper_connection.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py",),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            "tests/unit_tests/transformer/test_single_pass_mhc.py",
+            "tests/unit_tests/models/test_v41_state_integration.py",
+        ),
         kind="triton",
         notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",
     ),
@@ -846,6 +861,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Tensor-based packed layout, index sanitation and compiled KL. "
         "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
         "numerical CP parity is covered by test_dsv4_packed_cp.py.",
+    ),
+    KernelEntry(
+        name="v41_engram_embedding",
+        sources=("megatron/core/models/engram/distributed_embedding.py",),
+        tests=("tests/unit_tests/models/test_v41_engram.py",),
+        kind="torch-op",
+        notes="Sorted repeated-row accumulation in deterministic mode; real Gloo EP lookup "
+        "and gradient parity, including uneven shards. NCCL GPU replay remains to be qualified.",
     ),
     KernelEntry(
         name="dsa_dispatch",
