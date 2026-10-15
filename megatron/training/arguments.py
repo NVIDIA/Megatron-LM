@@ -1933,6 +1933,12 @@ def validate_args(args, defaults={}):
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
+    if args.store_param_remainders is not None and not args.use_precision_aware_optimizer:
+        warn_rank_0(
+            '--store-param-remainders only applies with --use-precision-aware-optimizer; '
+            'ignoring it.'
+        )
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -3615,6 +3621,16 @@ def _add_experimental_args(parser):
                        help='Use the precision-aware optimizer in TransformerEngine, which allows '
                        'setting the main params and optimizer states to lower precision, such as '
                        'fp16, bf16 and fp8.')
+    group.add_argument('--store-param-remainders', action=argparse.BooleanOptionalAction,
+                       default=None,
+                       help='With --use-precision-aware-optimizer, BF16 params and FP32 main '
+                       'params, store only the 16 low bits of the FP32 master weights that the '
+                       'BF16 params do not hold, which saves memory and changes the optimizer '
+                       'checkpoint format. Enabled by default, except with a non-delayed '
+                       '--fp8-recipe and no --fp8-param-gather, where it is off so that '
+                       'optimizer checkpoints stay compatible with those written before Megatron '
+                       'Core supported the precision-aware optimizer for that configuration. '
+                       'Disabled with --optimizer-cuda-graph. Ignored by Megatron-FSDP.')
     group.add_argument('--main-grads-dtype', default='fp32', choices=['fp32', 'bf16'],
                        help='Dtype of main grads when enabling precision-aware-optimizer.')
     group.add_argument('--main-params-dtype', default='fp32', choices=['fp32', 'fp16'],
