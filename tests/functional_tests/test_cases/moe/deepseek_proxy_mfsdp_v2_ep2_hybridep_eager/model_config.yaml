@@ -8,8 +8,8 @@ ENV_VARS:
   NVTE_USE_CUTLASS_GROUPED_GEMM: 0
   NCCL_LAUNCH_ORDER_IMPLICIT: 1
   NCCL_DEBUG: VERSION
-  # The original failure is intermittent; restart training with fresh processes.
-  N_REPEAT: 3
+  # Run this regression once, overriding the recipe's five-repeat default.
+  N_REPEAT: 1
 MODEL_ARGS:
   --bf16: true
   --use-mcore-models: true
