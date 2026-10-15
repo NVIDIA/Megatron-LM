@@ -292,6 +292,115 @@ def test_mla_rope_contiguous_thd_global_start_matches_position_ids(
     torch.testing.assert_close(contiguous_input.grad, position_input.grad)
 
 
+def _channel_permuting_rope_reference(x, cos, sin, emb_dim, rope_first, backward):
+    """fp32 result of the in-place kernels with ``remove_interleaving=False``.
+
+    The forward rotates the interleaved pairs of the RoPE channels and stores them as two halves;
+    the backward applies the transposed rotation to the halves and stores interleaved pairs.
+    ``cos`` and ``sin`` hold one row per input row.
+    """
+    out = x.to(torch.float32, copy=True)
+    rope = out[..., :emb_dim] if rope_first else out[..., -emb_dim:]
+    half = emb_dim // 2
+    cos = cos.float()[:, None, :]
+    sin = sin.float()[:, None, :]
+    if backward:
+        left, right = rope[..., :half], rope[..., half:]
+        x1 = left * cos[..., :half] + right * sin[..., half:]
+        x2 = right * cos[..., half:] - left * sin[..., :half]
+        rotated = torch.stack((x1, x2), dim=-1).flatten(-2)
+    else:
+        x1, x2 = rope[..., 0::2], rope[..., 1::2]
+        left = x1 * cos[..., :half] - x2 * sin[..., :half]
+        right = x2 * cos[..., half:] + x1 * sin[..., half:]
+        rotated = torch.cat((left, right), dim=-1)
+    rope.copy_(rotated)
+    return out
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("block_h", [1, 2, 4, 8, 16, 32, 64, 128])
+@pytest.mark.parametrize(
+    ("num_heads", "head_dim", "rope_first"),
+    [pytest.param(16, 192, False, id="mla-query"), pytest.param(32, 128, True, id="dsa-indexer")],
+)
+def test_mla_rope_inplace_channel_permutation_is_race_free(
+    monkeypatch, num_heads, head_dim, rope_first, block_h
+):
+    """In-place RoPE with ``remove_interleaving=False`` must not depend on thread timing.
+
+    The MLA query RoPE (``fused_apply_mla_rope_for_q``) and the DSA indexer RoPE
+    (``rope_first=True``) use this mode: the forward kernel rotates their inputs in place, and in
+    training the backward kernel un-rotates the incoming gradient in place. The forward kernel
+    loads interleaved pairs and stores halves of the same channels, and the backward kernel does
+    the reverse, so the stores of one thread overwrite values that other threads of the same
+    program load. Without a barrier in between, the backward kernel at BLOCK_H=2 returned wrong
+    values whenever its warps drifted apart, which many short packed sequences make likely (every
+    row first walks ``cu_seqlens_q``). The backward kernel is run in place and with ``out=``
+    aliasing its input (which also copies the leading channels), so both need the barrier. The
+    forward barrier cannot be caught here: with Triton 3.6 the forward kernel keeps every head
+    within one warp at BLOCK_H <= 2 and converts its layout through shared memory, with a
+    barrier, from BLOCK_H=4 on.
+    """
+    triton = pytest.importorskip("triton")
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as rope_kernels
+
+    # A single-config autotuner runs that config without benchmarking.
+    for autotuner in (rope_kernels._mla_rope_fwd_inplace_kernel, rope_kernels._mla_rope_bwd_kernel):
+        monkeypatch.setattr(autotuner, "configs", [triton.Config({"BLOCK_H": block_h})])
+
+    emb_dim = 64
+    nope_dim = head_dim - emb_dim
+    seq_len, num_seqs = 64, 64
+    rows = seq_len * num_seqs
+    torch.manual_seed(1234)
+    cu_seqlens = torch.arange(0, rows + 1, seq_len, dtype=torch.int32, device="cuda")
+    freqs = torch.randn(seq_len, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    positions = torch.arange(rows, device="cuda") % seq_len
+    x = torch.randn(rows, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+
+    def unapply_into_input(t, *args, **kwargs):
+        return rope_kernels.mla_rope_unapply_raw(t, *args, out=t, **kwargs)
+
+    variants = (
+        ("forward", rope_kernels.fused_mla_rope_inplace, False),
+        ("backward", rope_kernels.mla_rope_unapply_raw, True),
+        ("backward into out=input", unapply_into_input, True),
+    )
+    for name, apply_rope, backward in variants:
+        expected = _channel_permuting_rope_reference(
+            x, cos[positions], sin[positions], emb_dim, rope_first, backward
+        )
+        first = None
+        for run in range(8):
+            out = apply_rope(
+                x.clone(),
+                cos,
+                sin,
+                nope_dim,
+                emb_dim,
+                cu_seqlens_q=cu_seqlens,
+                rope_first=rope_first,
+            )
+            label = f"{name} run {run}"
+            torch.testing.assert_close(
+                out.float(),
+                expected,
+                msg=lambda msg: f"Mismatch in {label}: {msg}",
+                **dtype_tols(torch.bfloat16),
+            )
+            if first is None:
+                first = out
+            torch.testing.assert_close(
+                out, first, rtol=0, atol=0, msg=lambda msg: f"{label} differs from run 0: {msg}"
+            )
+
+
 def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
     assert fused_mla_rope_kv_split is not None
     num_heads = 32
