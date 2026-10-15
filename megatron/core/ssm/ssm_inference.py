@@ -300,6 +300,6 @@ class SSMDynamicInferenceMixin:
 
         # Zero padding positions to avoid corrupting quantization amax calculations.
         if is_using_quantization_scales(self.config):
-            y[context.padding_slice] = 0.0
+            context.zero_padding_tokens(y)
 
         return self.out_proj(y)
