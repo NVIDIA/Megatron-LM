@@ -659,9 +659,14 @@ def test_save_checkpoint(
 
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
-    args.ckpt_transformer_engine_calibration = ckpt_format == "torch"
+    # PTQ calibration export is controlled by the model config, not legacy global args.
+    args.ckpt_transformer_engine_calibration = False
 
-    config = TransformerConfig(num_layers=1, kv_channels=1)
+    config = TransformerConfig(
+        num_layers=1,
+        kv_channels=1,
+        ckpt_transformer_engine_calibration=ckpt_format == "torch",
+    )
     model = MockModel(config)
     optimizer = MockState({"optimizer": "optimizer_state"})
     if ckpt_format == "fsdp_dtensor":
@@ -701,7 +706,7 @@ def test_save_checkpoint(
                 cp_group=cp_group,
             )
         assert save_dataloader_state.call_args.kwargs["cp_group"] is cp_group
-        if args.ckpt_transformer_engine_calibration:
+        if config.ckpt_transformer_engine_calibration:
             export_calibration_metadata.assert_called_once()
             assert export_calibration_metadata.call_args.args[1] == [model]
         else:

@@ -890,7 +890,14 @@ def save_checkpoint(
 
         # If exporting post-training quantization calibration metadata for inference,
         # add the metadata to the checkpoint state dictionary.
-        if getattr(args, "ckpt_transformer_engine_calibration", False):
+        if any(
+            getattr(
+                getattr(model_chunk, "config", None),
+                "ckpt_transformer_engine_calibration",
+                False,
+            )
+            for model_chunk in model
+        ):
             add_ptq_calibration_metadata_to_state_dict(state_dict, model)
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
