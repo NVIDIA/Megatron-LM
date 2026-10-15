@@ -3,7 +3,7 @@
 # Derived from flash-linear-attention; see this package's __init__.py for the
 # inline MIT license notice and upstream contributor link.
 
-"""Symmetric-memory buffer set shared by the fused CP kernels (TileLang/CuteDSL).
+"""Symmetric-memory buffer set shared by the fused CP kernels (CuteDSL).
 
 Allocates, zeroes and rendezvous the three symmetric tensors of the protocol
 and builds the per-process peer pointer tables:
@@ -19,7 +19,7 @@ BT = 64
 
 
 class CPSymmBuffers:
-    def __init__(self, group, HV, DK, DV, device, smax=1, B=1):
+    def __init__(self, group, HV, DK, DV, device):
         import torch.distributed as dist
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -28,24 +28,16 @@ class CPSymmBuffers:
         self.NV, self.NK = DV // 64, DK // 64
         self.NSTRIPS = self.NV + self.NK
         self.device = device
-        # batch (BS>1): a leading batch mode on every payload/flag/ack tensor
-        # (independent sequences share the buffer set). B == 1 is byte-for-byte
-        # identical to the pre-batch layout (a size-1 mode is a no-op).
-        self.B = B
-        # tsplit design-(b): producer rank r's segment s pushes at virtual
-        # rank r*smax + s, so the payload/flag slot dimension is R*smax
-        self.smax = smax
-        RV = self.R * smax
 
         self.hm_sym = symm_mem.empty(
-            (2, RV, B, HV, self.NSTRIPS, DK, BT),
+            (2, self.R, HV, self.NSTRIPS, DK, BT),
             dtype=torch.float32, device=device,
         )
         self.flags = symm_mem.empty(
-            (RV, B, HV, self.NSTRIPS), dtype=torch.uint32, device=device
+            (self.R, HV, self.NSTRIPS), dtype=torch.uint32, device=device
         )
         self.acks = symm_mem.empty(
-            (self.R, B, HV, self.NV), dtype=torch.uint32, device=device
+            (self.R, HV, self.NV), dtype=torch.uint32, device=device
         )
         self.flags.zero_()
         self.acks.zero_()

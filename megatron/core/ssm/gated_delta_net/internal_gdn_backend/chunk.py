@@ -141,6 +141,33 @@ def prepare_validated_chunk_metadata(
     return helper(cu_seqlens, include_chunk_indices=include_chunk_indices)
 
 
+def _validate_public_options(
+    *,
+    use_beta_sigmoid_in_kernel: bool,
+    allow_neg_eigval: bool,
+    state_v_first: bool,
+    kwargs: dict,
+) -> bool:
+    """Reject unsupported FLA options and fold the deprecated ``transpose_state_layout``.
+
+    Shared by the FLA-free public entry point below and by the dispatcher in
+    ``implementation.py`` (which the e2e tests call directly). ``kwargs`` is mutated:
+    ``transpose_state_layout`` is popped once it is folded into the returned
+    ``state_v_first``.
+    """
+    if use_beta_sigmoid_in_kernel:
+        raise ValueError("The internal GDR backend does not support in-kernel beta sigmoid.")
+    if allow_neg_eigval:
+        raise ValueError("The internal GDR backend does not support negative eigenvalues.")
+
+    transpose_state_layout = kwargs.pop("transpose_state_layout", None)
+    if transpose_state_layout is not None:
+        if state_v_first and not bool(transpose_state_layout):
+            raise ValueError("state_v_first conflicts with transpose_state_layout=False.")
+        state_v_first = bool(transpose_state_layout)
+    return state_v_first
+
+
 def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -162,16 +189,12 @@ def chunk_gated_delta_rule(
     **kwargs: object,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the in-tree CuTe DSL GDR path with FLA fallback."""
-    if use_beta_sigmoid_in_kernel:
-        raise ValueError("The internal GDR backend does not support in-kernel beta sigmoid.")
-    if allow_neg_eigval:
-        raise ValueError("The internal GDR backend does not support negative eigenvalues.")
-
-    transpose_state_layout = kwargs.pop("transpose_state_layout", None)
-    if transpose_state_layout is not None:
-        if state_v_first and not bool(transpose_state_layout):
-            raise ValueError("state_v_first conflicts with transpose_state_layout=False.")
-        state_v_first = bool(transpose_state_layout)
+    state_v_first = _validate_public_options(
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        state_v_first=state_v_first,
+        kwargs=kwargs,
+    )
 
     implementation = _load_internal_chunk_gated_delta_rule()
     return implementation(

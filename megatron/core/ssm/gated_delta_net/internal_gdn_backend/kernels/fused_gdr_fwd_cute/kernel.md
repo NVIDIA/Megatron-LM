@@ -2,8 +2,9 @@
 
 This package implements the chunked Gated Delta Rule forward path for
 Blackwell SM100 with CuTe DSL. It computes the sequence output while carrying
-the recurrent state across 64-token chunks and can materialize the auxiliary
-tensors needed by training.
+the recurrent state across 64-token chunks and can materialize the three side
+outputs the fused training path needs: the unscaled `A` tile, the transformed
+gate `g`, and every chunk's input recurrent state `h`.
 
 ## Recommended usage
 
@@ -33,7 +34,7 @@ standalone `gdn_gdr_backend="fla"` backend.
 The production call path is:
 
 ```text
-implementation._cutedsl_forward
+gdn._cutedsl_forward
   -> chunk_gated_delta_rule_prefill_cute
   -> cutedsl_fused_chunk_gdn_fwd_sm100
   -> GatedDeltaNetChunkedKernel
@@ -52,7 +53,8 @@ launcher directly.
 - `g` and `beta` have shape `[total_tokens, output_heads]` and are converted
   to contiguous FP32 tensors before launch. Megatron training passes raw
   log-decay `g` with `gate_is_log_decay=True`; the kernel converts it to
-  chunk-local cumulative base-2 log gates in registers.
+  chunk-local cumulative base-2 log gates in registers. This is the only gate
+  mode the kernel implements, so `gate_is_log_decay` must be `True`.
 - `cu_seqlens` is required. Sequence lengths may be arbitrary: a partial final
   chunk is handled natively (see below) and zero-length sequences, such as the
   trailing fixed-capacity entries of `thd_max_packed_sequences`, are skipped.
@@ -65,14 +67,16 @@ launcher directly.
   preprocess kernels is consumed as is.
 - In-kernel QK L2 normalization is not supported.
 
-The wrapper returns the output tensor, or `(output, final_state)` when
-`output_final_state=True`. It also accepts preallocated output, `A`, final
-state, per-chunk input state `h`, and checkpoint buffers for the training
-path.
-When `output_h` is provided, it stores every 64-token chunk's input state and
-therefore requires `checkpoint_every_n_tokens=64`. The BF16 TMA kernel path
-initializes the first saved state of each packed sequence in-kernel; non-BF16
-fallback paths keep the wrapper-side initialization.
+The wrapper returns the output tensor. It also accepts a preallocated `output`
+and the training side outputs `output_A`, `output_g`, and `output_h` (one
+`[heads, 128, 128]` input state per 64-token chunk). `output_h` requires
+`checkpoint_every_n_tokens=64` together with `checkpoint_cu_starts`, the
+per-sequence chunk prefix that gives each sequence's first `h` slot;
+`checkpoint_every_n_tokens` is validated but the chunk size fixes the stride.
+The BF16 TMA kernel path (BF16 `output_h` without an FP32 `initial_state`)
+zero-fills the first saved slot of each packed sequence in-kernel; the
+direct-store path used with an FP32 `initial_state` writes that state into the
+first slot; a non-BF16 `output_h` is zero-initialized by the wrapper.
 
 
 ## Algorithm
@@ -91,8 +95,8 @@ performs seven tensor-core GEMM stages:
 
 The epilogue combines the intra- and inter-chunk output terms and advances the
 state using the final cumulative gate value for the chunk. When requested, the
-kernel also stores `A`, corrected values, `W`, chunk states, final state, or
-periodic state checkpoints.
+kernel also stores the unscaled `A` tile, the transformed gate `g`, and every
+chunk's input state `h`.
 
 ## SM100 execution structure
 
@@ -100,21 +104,27 @@ The persistent kernel launches 12 warps with specialized roles:
 
 - Warps 0-3 compute gate transfer factors, score epilogues, and the
   hierarchical triangular inverse.
-- Warps 4-7 compute state/value corrections, state updates, and output
-  epilogues.
+- Warps 4-7 compute state/value corrections, state updates, output
+  epilogues, and the `h` side-output stores.
 - Warp 8 issues the seven `tcgen05` MMA stages.
-- Warps 9-10 perform TMA loads for Q/K/V and gate/beta tensors.
-- Warp 11 stores the output epilogue.
+- Warp 9 performs the TMA loads of Q/K/V.
+- Warp 10 loads gate/beta with `ldg` and `cp.async`, converts the gate in
+  registers, and writes the `output_g` side output.
+- Warp 11 issues the TMA stores of the output tile and, on the BF16 `h` path,
+  of the per-chunk `h` staging tile.
 
-The implementation uses approximately 225.5 KB of shared memory for staged
-Q/K/V, intermediate matrices, output staging, and gate data. TMEM holds the
-FP32 recurrent state and MMA accumulators. K is double-buffered so the next
-chunk can be prefetched while the current chunk is processed.
+The implementation uses about 130 KB of shared memory (about 98 KB when the
+BF16 `h` staging tile is not compiled in; both figures are computed from the
+layout definitions, not measured) for staged Q/K/V, the `A` inverse and QK
+tiles, output and `h` staging, and gate data. TMEM holds the FP32 recurrent
+state and MMA accumulators. K is double-buffered so the next chunk can be
+prefetched while the current chunk is processed.
 
 ## Notes
 
-- The token dimension is dynamic, while head counts, dtypes, and optional
-  output features are part of the CuTe DSL compilation-cache key.
+- The token dimension is dynamic, while the io and state dtypes, head counts,
+  the presence of `initial_state`, and which of `A`/`g`/`h` are stored are part
+  of the CuTe DSL compilation-cache key.
 - Dense BTHD inputs are flattened to packed THD layout by the Megatron adapter.
 - The adapter passes raw Megatron log-decay gates to the kernel and requests a
   transformed-g side output. The kernel writes the same chunk-local cumulative

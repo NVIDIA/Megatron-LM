@@ -13,7 +13,7 @@ to import FlashInfer.
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import torch
 
@@ -79,28 +79,31 @@ def chunk_gated_delta_rule_prefill_cute(
     beta: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     initial_state: Optional[torch.Tensor] = None,
-    output_final_state: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
     output_A: Optional[torch.Tensor] = None,
     output_g: Optional[torch.Tensor] = None,
-    output_state: Optional[torch.Tensor] = None,
-    state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     output_h: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     assume_valid_cu_seqlens: bool = False,
-    gate_is_log_cumsum: bool = False,
     gate_is_log_decay: bool = False,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+) -> torch.Tensor:
     """Run the local SM100 GDN prefill kernel.
 
     The accepted signature mirrors the FlashInfer API used by Megatron, but the
     implementation is local to Megatron Core and only supports the SM100 path.
+    The kernel implements only the raw Megatron log-decay gate, so
+    ``gate_is_log_decay`` must be True. ``checkpoint_every_n_tokens`` is validated
+    (``output_h`` stores one state per 64-token chunk and therefore requires 64)
+    but not forwarded: the kernel's chunk size fixes the checkpoint stride.
     """
-    if gate_is_log_cumsum and gate_is_log_decay:
-        raise ValueError("gate_is_log_cumsum and gate_is_log_decay are mutually exclusive")
+    if not gate_is_log_decay:
+        raise NotImplementedError(
+            "Megatron GDN prefill CuTe kernel only implements raw log-decay gates; "
+            "pass gate_is_log_decay=True"
+        )
     if use_qk_l2norm_in_kernel:
         raise NotImplementedError("QK L2 norm inside the GDN prefill kernel is not supported")
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -201,11 +204,9 @@ def chunk_gated_delta_rule_prefill_cute(
                 "checkpoint_cu_starts must be the per-sequence chunk prefix with the same "
                 f"length as cu_seqlens ({cu_i32.numel()}), got {tuple(checkpoint_cu_starts.shape)}"
             )
-        if state_checkpoints is None and output_h is None:
-            raise ValueError(
-                "state_checkpoints or output_h is required when checkpointing is enabled"
-            )
-    elif state_checkpoints is not None or checkpoint_cu_starts is not None or output_h is not None:
+        if output_h is None:
+            raise ValueError("output_h is required when checkpointing is enabled")
+    elif checkpoint_cu_starts is not None or output_h is not None:
         raise ValueError("checkpoint tensors must be None when checkpoint_every_n_tokens is 0")
 
     if output_h is not None and not assume_valid_cu_seqlens:
@@ -223,17 +224,6 @@ def chunk_gated_delta_rule_prefill_cute(
         owns_chunks = (starts[1:] - starts[:-1]) > 0
         first_chunk_slots = torch.where(owns_chunks, starts[:-1], torch.zeros_like(starts[:-1]))
         output_h.index_fill_(0, first_chunk_slots, 0)
-
-    if output_final_state and output_state is None:
-        # Zero-initialized so a zero-length sequence (which the kernel skips) reports a
-        # zero final state instead of uninitialized memory.
-        output_state = torch.zeros(
-            (cu_i32.numel() - 1, num_o_heads, head_size, head_size),
-            dtype=torch.float32,
-            device=q.device,
-        )
-    if not output_final_state:
-        output_state = None
 
     gate = (
         g
@@ -270,15 +260,11 @@ def chunk_gated_delta_rule_prefill_cute(
         output=output,
         cu_seqlens=cu_i32,
         initial_state=initial_state,
-        output_state=output_state,
         scale=kernel_scale,
-        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         cu_checkpoints=cu_checkpoints,
-        output_checkpoints=state_checkpoints,
         output_A=output_A,
         output_g=output_g,
         output_h=output_h,
-        gate_is_log_cumsum=gate_is_log_cumsum,
         gate_is_log_decay=gate_is_log_decay,
     )
-    return (output, output_state) if output_final_state else output
+    return output

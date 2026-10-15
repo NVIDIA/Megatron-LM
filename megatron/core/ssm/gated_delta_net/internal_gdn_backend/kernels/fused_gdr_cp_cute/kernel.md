@@ -15,9 +15,6 @@ The internal backend tries this package before FLA's CP preprocessing. Set
   for unsupported operands.
 - `0`: disable this package and use FLA CP preprocessing.
 
-`FLA_CP_CUTEDSL` is accepted as a compatibility alias when the Megatron
-variable is unset.
-
 ## Supported fast path
 
 - NVIDIA Blackwell data-center GPUs (SM100 B200/GB200, SM103 GB300) with an NCCL
@@ -26,9 +23,29 @@ variable is unset.
   context. Call `finalize_packed_seq_params()` after padding and before the
   model forward so the existing `cp_partition_route` owns that snapshot.
 - BF16 operands, scalar `g` gate, chunk size 64.
-- Equal key/value dimensions of 64 or 128.
-- A local sequence length of at least 64 that is not divisible by 64 is handled
-  inside the kernels; inputs are not padded or copied.
+- Equal key/value dimensions of 128.
+- Any local window length that is not a multiple of 64 is handled inside the
+  kernels (the TMA descriptors carry the logical `T`, so a ragged tail is
+  zero-filled by the hardware); inputs are not padded or copied. Windows
+  shorter than one chunk (`T < 64`) rely on the same zero-fill and are
+  covered by the `cp_tiny_window` GDR harness case.
+
+## Modules
+
+Only the warp-specialized (tcgen05) engines remain:
+
+| Module | Role |
+| --- | --- |
+| `backend.py` | dispatcher: predicates, chain classification, emit flags, wrapper cache and rendezvous, launch counters, fallback reasons |
+| `protocol.py` | `CPProtocolMixin`: protocol geometry (`NV`, `NK`, `NSTRIPS`, `STRIP`, gate mode), sys-scope flag/ack spins and signals, `hm_sym` strip offsets, the cp.async staging + bf16 hi/lo warp-MMA fold both merge roles run, and the tcgen05 gemm issue helper |
+| `fused_ws.py` | `PreProcessFwdFusedWS` (forward compute + merge roles) and its host wrapper `CuteDSLFusedCPPreProcessWS` |
+| `bwd_ws.py` | `PreProcessBwdFusedWS` (reverse compute + suffix fold) and its host wrapper `CuteDSLFusedCPBwdPreProcessWS` |
+| `_host.py` | host helpers shared by the wrappers: pointer / CUstream memoization, gate normalization |
+| `symm.py` | `CPSymmBuffers`: the symmetric `hm_sym` / `flags` / `acks` tensors and peer pointer tables |
+
+Each wrapper compiles one specialization per chunk alignment (`T % 64 == 0`
+or not); under scalar `g` the forward's two specializations are the same
+program and share one cache entry.
 
 The production `GatedDeltaNet.forward` path preserves MCore's established
 chunkwise-CP contract: dense SBHD input with `B > 1` is rejected. Use packed THD

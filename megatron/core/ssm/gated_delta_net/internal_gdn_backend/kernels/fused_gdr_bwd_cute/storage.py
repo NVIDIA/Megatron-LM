@@ -10,7 +10,6 @@ _BT = 64
 _TMA_VECTOR_HEADS = 4
 _DK = 128
 _DV = 128
-_THREADS_PER_CTA = 384
 _BUFFER_ALIGN_BYTES = 128
 _SM100_OPTIN_SMEM_BYTES = 232_448
 
@@ -33,20 +32,6 @@ TMEM_RANGES = (
     ("dh_right", 320, 384, 0, 16),
     ("mask", 384, 416, 0, 16),
 )
-
-# Keep the extracted declarations source-compatible with the original kernel.
-_TMEM_COLUMNS = TMEM_COLUMNS
-_TMEM_ALLOCATION_COLUMNS = TMEM_ALLOCATION_COLUMNS
-_TMEM_RANGES = TMEM_RANGES
-
-
-@dataclass(frozen=True)
-class LayoutBudget:
-    """Physical CTA storage required by the structured kernel shell."""
-
-    smem_bytes: int
-    tmem_columns: int
-    threads: int
 
 
 def _validate_tmem_ranges() -> None:
@@ -77,6 +62,37 @@ def _validate_tmem_ranges() -> None:
 
 
 _validate_tmem_ranges()
+
+
+def _tmem_range_placement() -> tuple[dict[str, int], dict[str, int]]:
+    """Allocation block index and in-block column offset of every named TMEM range."""
+
+    blocks, offsets = {}, {}
+    for name, begin, end, _, _ in TMEM_RANGES:
+        base = 0
+        for block, columns in enumerate(TMEM_ALLOCATION_COLUMNS):
+            if begin < base + columns:
+                break
+            base += columns
+        assert end <= base + columns, f"{name} crosses a TMEM allocation boundary"
+        blocks[name] = block
+        offsets[name] = begin - base
+    return blocks, offsets
+
+
+_TMEM_RANGE_BLOCKS, _TMEM_RANGE_OFFSETS = _tmem_range_placement()
+# The raw-pointer TMEM accesses in kernel.py address these ranges at their
+# allocation base, and the three square aliases share one physical range.
+assert _TMEM_RANGE_OFFSETS["p"] == _TMEM_RANGE_OFFSETS["mask"] == 0
+assert _TMEM_RANGE_OFFSETS["a"] == _TMEM_RANGE_OFFSETS["dp"] == _TMEM_RANGE_OFFSETS["at"]
+# make_tmem_views pairs each range with a fixed base pointer: primary (block 0),
+# secondary (block 1), mask (block 2), vprime (block 3). Pin that pairing so a
+# TMEM_RANGES edit that moves a range across blocks fails here instead of
+# silently aliasing another allocation.
+assert {_TMEM_RANGE_BLOCKS[n] for n in ("u", "dq", "dk", "dv", "da", "a", "dp", "at", "p")} == {0}
+assert {_TMEM_RANGE_BLOCKS[n] for n in ("dh_left", "dh_right")} == {1}
+assert _TMEM_RANGE_BLOCKS["mask"] == 2
+assert {_TMEM_RANGE_BLOCKS[n] for n in ("vprime", "dog")} == {3}
 
 
 @cute.struct
@@ -262,16 +278,6 @@ class SharedStorage:
 assert SharedStorage.size_in_bytes() <= _SM100_OPTIN_SMEM_BYTES
 
 
-def get_layout_budget() -> LayoutBudget:
-    """Return the real decorated-struct size and fixed SM100 CTA budgets."""
-
-    return LayoutBudget(
-        smem_bytes=SharedStorage.size_in_bytes(),
-        tmem_columns=TMEM_COLUMNS,
-        threads=_THREADS_PER_CTA,
-    )
-
-
 @dataclass(frozen=True)
 class CanonicalSharedViews:
     """Canonical SMEM aliases used by TMA and consumer warp groups."""
@@ -297,7 +303,6 @@ class CanonicalSharedViews:
     tmp23_left_square_transposed: Any
     tmp23_right_square_transposed: Any
     tmp41: Any
-    tmp41_padded: Any
 
 
 @dataclass(frozen=True)
@@ -439,10 +444,6 @@ def make_shared_views(
             square_transposed_layout.outer,
         ),
         tmp41=get(storage.sTmp41, state_layout),
-        tmp41_padded=cute.make_tensor(
-            storage.sTmp41.data_ptr(),
-            cute.make_layout((_BT, _BT), stride=(_BT + 2, 1)),
-        ),
     )
     packed = PackedSharedViews(
         tmp11_p1=get(storage.sTmp11, packed_dvprime_pg_a),
@@ -516,14 +517,10 @@ def make_shared_views(
 
 @dataclass(frozen=True)
 class TmemViews:
-    """Named TMEM pointers, MMA accumulators, and direct-copy aliases."""
+    """Named TMEM pointers and MMA accumulator views."""
 
     primary_ptr: Any
-    secondary_ptr: Any
     mask_ptr: Any
-    vprime_ptr: Any
-    dog_ptr: Any
-    dq_ptr: Any
     da_ptr: Any
     square_ptr: Any
     u_acc: Any
@@ -534,11 +531,6 @@ class TmemViews:
     dv_acc: Any
     dh_left_acc: Any
     dh_right_acc: Any
-    p_copy_acc: Any
-    dp_copy_acc: Any
-    a_copy_acc: Any
-    da_copy_acc: Any
-    mask_acc: Any
 
 
 def _make_tmem_accumulator(tmem_ptr, tiled_mma, shape, offset):
@@ -555,56 +547,42 @@ def make_tmem_views(tmem_ptrs, mma_64x128, mma_128x64) -> TmemViews:
     primary_ptr, secondary_ptr, mask_ptr, vprime_ptr = tmem_ptrs
     dog_ptr = vprime_ptr
     dq_ptr = primary_ptr
-    da_ptr = primary_ptr + 128
-    square_ptr = primary_ptr + 160
-    square_copy_layout = cute.make_layout(
-        ((16, 4), (32, 2)),
-        stride=((65536, 32 * 65536), (1, 16 * 65536)),
-    )
+    da_ptr = primary_ptr + _TMEM_RANGE_OFFSETS["da"]
+    square_ptr = primary_ptr + _TMEM_RANGE_OFFSETS["a"]
     return TmemViews(
         primary_ptr=primary_ptr,
-        secondary_ptr=secondary_ptr,
         mask_ptr=mask_ptr,
-        vprime_ptr=vprime_ptr,
-        dog_ptr=dog_ptr,
-        dq_ptr=dq_ptr,
         da_ptr=da_ptr,
         square_ptr=square_ptr,
         u_acc=_make_tmem_accumulator(
-            primary_ptr, mma_64x128, (64, 128), 192
+            primary_ptr, mma_64x128, (64, 128), _TMEM_RANGE_OFFSETS["u"]
         ),
         vprime_acc=_make_tmem_accumulator(
-            vprime_ptr, mma_64x128, (64, 128), 0
+            vprime_ptr, mma_64x128, (64, 128), _TMEM_RANGE_OFFSETS["vprime"]
         ),
         dog_acc=_make_tmem_accumulator(
-            dog_ptr, mma_64x128, (64, 128), 0
+            dog_ptr, mma_64x128, (64, 128), _TMEM_RANGE_OFFSETS["dog"]
         ),
         dq_acc=_make_tmem_accumulator(
-            dq_ptr, mma_64x128, (64, 128), 192
+            dq_ptr, mma_64x128, (64, 128), _TMEM_RANGE_OFFSETS["dq"]
         ),
         dk_acc=_make_tmem_accumulator(
-            primary_ptr, mma_64x128, (64, 128), 0
+            primary_ptr, mma_64x128, (64, 128), _TMEM_RANGE_OFFSETS["dk"]
         ),
         dv_acc=_make_tmem_accumulator(
-            primary_ptr, mma_64x128, (64, 128), 64
+            primary_ptr, mma_64x128, (64, 128), _TMEM_RANGE_OFFSETS["dv"]
         ),
         dh_left_acc=_make_tmem_accumulator(
-            secondary_ptr, mma_128x64, (128, 64), 0
+            secondary_ptr, mma_128x64, (128, 64), _TMEM_RANGE_OFFSETS["dh_left"]
         ),
         dh_right_acc=_make_tmem_accumulator(
-            secondary_ptr, mma_128x64, (128, 64), 64
+            secondary_ptr, mma_128x64, (128, 64), _TMEM_RANGE_OFFSETS["dh_right"]
         ),
-        p_copy_acc=cute.make_tensor(primary_ptr, square_copy_layout),
-        dp_copy_acc=cute.make_tensor(square_ptr, square_copy_layout),
-        a_copy_acc=cute.make_tensor(square_ptr, square_copy_layout),
-        da_copy_acc=cute.make_tensor(da_ptr, square_copy_layout),
-        mask_acc=cute.make_tensor(mask_ptr, square_copy_layout),
     )
 
 
 __all__ = [
     "CanonicalSharedViews",
-    "LayoutBudget",
     "PackedSharedViews",
     "SharedStorage",
     "SharedViews",
@@ -613,7 +591,6 @@ __all__ = [
     "TMEM_RANGES",
     "TmemViews",
     "VectorSharedViews",
-    "get_layout_budget",
     "make_shared_views",
     "make_tmem_views",
 ]

@@ -108,10 +108,10 @@ class _SerializedWrapper:
 
             self._input_ready.record(caller_stream)
             self._owner_stream.wait_event(self._input_ready)
-            # The wrappers perform ATen preprocessing (padding, gate conversion,
-            # and descriptor updates) before the compiled launch. Run the whole
-            # call on the owner stream so the ready event orders those operations
-            # together with the kernel that consumes their results.
+            # The wrappers perform ATen preprocessing (gate normalisation) before
+            # the compiled launch. Run the whole call on the owner stream so the
+            # ready event orders that operation together with the kernel that
+            # consumes its result.
             with torch.cuda.stream(self._owner_stream):
                 result = self._wrapper.launch_validated(*args, **kwargs)
             self._completion.record(self._owner_stream)
@@ -169,7 +169,7 @@ def _cuda_graphs_enabled(context: FLACPContext) -> bool:
 
 
 def _backend_mode() -> str:
-    value = os.environ.get("MCORE_GDN_CP_CUTEDSL", os.environ.get("FLA_CP_CUTEDSL", "auto")).lower()
+    value = os.environ.get("MCORE_GDN_CP_CUTEDSL", "auto").lower()
     if value in {"0", "false", "no", "off"}:
         return "disabled"
     if value in {"1", "true", "yes", "on"}:
@@ -389,8 +389,8 @@ def _emit_flags(context: FLACPContext, *, forward: bool) -> tuple[bool, bool]:
     if context.pre_num_ranks is None or context.post_num_ranks is None:
         # A context built without chain metadata can only be the whole-group
         # single-sequence case, which suppresses nothing.  `_classify_chain`
-        # never produces one -- it cross-checks both fields -- but the
-        # standalone harness entry in `bwd_fused.py` does not go through it.
+        # never produces one -- it cross-checks both fields -- so this is a
+        # guard for direct callers only.
         return True, True
     pre = int(context.pre_num_ranks)
     post = int(context.post_num_ranks)
@@ -540,8 +540,8 @@ def _is_supported(
         return _reject(f"B={B} (only 1)")
     if T < 1:
         return _reject("empty local shard")
-    if K != V or K not in {64, 128}:
-        return _reject(f"K={K},V={V} (need K==V in 64,128)")
+    if K != V or K != 128:
+        return _reject(f"K={K},V={V} (need K==V==128)")
     if H < 1 or HV % H != 0 or HV % 4 != 0:
         return _reject(f"head geometry H={H},HV={HV}")
     if u.shape != (B, T, HV, V) or w.shape != (B, T, HV, K) or g.shape != (B, T, HV):
@@ -680,7 +680,7 @@ def try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
             key,
             lambda: _SerializedWrapper(
                 CuteDSLFusedCPPreProcessWS(
-                    context.group, H, HV, K, V, gate_mode="g", device=k.device, split=1
+                    context.group, H, HV, K, V, gate_mode="g", device=k.device
                 ),
                 k.device,
             ),
@@ -770,8 +770,8 @@ def _is_supported_bwd(
         return _reject(f"bwd: B={B} (only 1)")
     if T < 1:
         return _reject("bwd: empty local shard")
-    if K != V or K not in {64, 128}:
-        return _reject(f"bwd: K={K},V={V} (need K==V in 64,128)")
+    if K != V or K != 128:
+        return _reject(f"bwd: K={K},V={V} (need K==V==128)")
     if H < 1 or HV % H != 0 or HV % 4 != 0:
         return _reject(f"bwd: head geometry H={H},HV={HV}")
     if k.shape != (B, T, H, K) or w.shape != (B, T, HV, K):
@@ -886,27 +886,22 @@ def try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
             dht_out = dht_out.transpose(-1, -2).contiguous()
         return dht_out
 
-    # Keyed on the same tuple the wrapper class is chosen from, so the class
-    # itself is only imported and selected on a cache miss (see the forward).
     key = _wrapper_cache_key(context.group, q.device, H, HV, K, V)
     fused = _BWD_WRAPPER_CACHE.get(key)
     if fused is None:
-        from .bwd_fused import CuteDSLFusedCPBwdPreProcess
-        from .bwd_ws import CuteDSLFusedCPBwdPreProcessWS, ws_supported
-
+        # The wrapper module is only imported on a cache miss (see the forward).
         # The warp-specialized Blackwell engine is 2.7x exact FLA at the
-        # canonical shape versus 0.99x for the SM80 engine it replaces. Other
-        # shapes keep the non-WS engine.
-        wrapper_cls = (
-            CuteDSLFusedCPBwdPreProcessWS
-            if ws_supported(K, V, "g")
-            else CuteDSLFusedCPBwdPreProcess
-        )
+        # canonical shape; `_is_supported_bwd` admits only its K == V == 128.
+        from .bwd_ws import CuteDSLFusedCPBwdPreProcessWS
+
         fused = _get_or_create_wrapper(
             _BWD_WRAPPER_CACHE,
             key,
             lambda: _SerializedWrapper(
-                wrapper_cls(context.group, H, HV, K, V, gate_mode="g", device=q.device), q.device
+                CuteDSLFusedCPBwdPreProcessWS(
+                    context.group, H, HV, K, V, gate_mode="g", device=q.device
+                ),
+                q.device,
             ),
             group=context.group,
             device=q.device,

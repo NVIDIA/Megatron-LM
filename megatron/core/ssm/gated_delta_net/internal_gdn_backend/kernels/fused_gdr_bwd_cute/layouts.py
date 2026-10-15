@@ -1,6 +1,5 @@
 """Trace-time layout contracts for the SM100 fused GDR backward kernel."""
 
-import hashlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -94,22 +93,6 @@ class MmaOperandLayouts:
 
 
 @dataclass(frozen=True)
-class PackedMmaLayouts:
-    """Named aliases whose 64x128 N mode is explicitly packed."""
-
-    mm_64_128_64_mn_mn: MmaOperandLayouts
-    mm_64_128_64_k_mn: MmaOperandLayouts
-    mm_64_128_128_k_mn: MmaOperandLayouts
-    mm_64_128_128_k_k: MmaOperandLayouts
-    mm_64_64_128_k_k: MmaOperandLayouts
-    mm_64_64_64_mn_mn: MmaOperandLayouts
-    mm_64_64_64_k_k: MmaOperandLayouts
-
-    def __getitem__(self, name: str) -> MmaOperandLayouts:
-        return getattr(self, name)
-
-
-@dataclass(frozen=True)
 class MmaOperationBinding:
     """Resolved production wiring for one logical MMA operation."""
 
@@ -160,7 +143,6 @@ class BackwardLayoutPlan:
     canonical: CanonicalLayouts
     canonical_staged: CanonicalLayouts
     operations: MmaOperationBindings
-    packed: PackedMmaLayouts
     physical_columns_by_variant: dict[str, int]
 
 
@@ -233,16 +215,6 @@ _CANONICAL_LAYOUT_SIZES = {
     "state_direct": 128 * 128,
     "state_transposed": 128 * 128,
 }
-
-_PACKED_VARIANT_NAMES = (
-    "mm_64_128_64_mn_mn",
-    "mm_64_128_64_k_mn",
-    "mm_64_128_128_k_mn",
-    "mm_64_128_128_k_k",
-    "mm_64_64_128_k_k",
-    "mm_64_64_64_mn_mn",
-    "mm_64_64_64_k_k",
-)
 
 
 def _major_mode(name: str):
@@ -460,9 +432,6 @@ def build_backward_layout_plan(io_dtype, acc_dtype) -> BackwardLayoutPlan:
         )
     operations = MmaOperationBindings(**operation_values)
 
-    packed = PackedMmaLayouts(
-        **{name: _operand_layouts(variants[name]) for name in _PACKED_VARIANT_NAMES}
-    )
     physical_columns = _validate_accumulator_layouts(variants)
 
     for name, expected in _CANONICAL_LAYOUT_SIZES.items():
@@ -477,68 +446,8 @@ def build_backward_layout_plan(io_dtype, acc_dtype) -> BackwardLayoutPlan:
         canonical,
         canonical_staged,
         operations,
-        packed,
         physical_columns,
     )
-
-
-def _layout_snapshot(layout) -> tuple[str, ...]:
-    """Return a stable structural description for baseline comparisons."""
-
-    return (
-        str(layout),
-        str(cute.size(layout)),
-        str(cute.cosize(layout)),
-        str(getattr(layout, "inner", None)),
-        str(getattr(layout, "offset", None)),
-        str(getattr(layout, "outer", None)),
-    )
-
-
-def layout_plan_snapshot(plan: BackwardLayoutPlan) -> tuple:
-    """Serialize every physical layout contract without tensor descriptors."""
-
-    variants = tuple(
-        (
-            spec.name,
-            spec.family,
-            spec.tile,
-            spec.a_major,
-            spec.b_major,
-            _layout_snapshot(plan.variants[spec.name].smem_a_staged),
-            _layout_snapshot(plan.variants[spec.name].smem_b_staged),
-            plan.physical_columns_by_variant[spec.name],
-        )
-        for spec in MMA_VARIANT_SPECS
-    )
-    canonical = tuple(
-        (
-            name,
-            _layout_snapshot(plan.canonical[name]),
-            _layout_snapshot(plan.canonical_staged[name]),
-        )
-        for name in CanonicalLayouts.__dataclass_fields__
-    )
-    operations = tuple(
-        (
-            spec.name,
-            spec.stage,
-            spec.variant,
-            spec.a_view,
-            spec.b_view,
-            _layout_snapshot(plan.operations[spec.name].operands.a),
-            _layout_snapshot(plan.operations[spec.name].operands.b),
-        )
-        for spec in MMA_OPERATION_SPECS
-    )
-    return variants, canonical, operations
-
-
-def layout_plan_fingerprint(plan: BackwardLayoutPlan) -> str:
-    """Hash the deterministic snapshot for concise IR/test reporting."""
-
-    snapshot = repr(layout_plan_snapshot(plan)).encode("utf-8")
-    return hashlib.sha256(snapshot).hexdigest()
 
 
 __all__ = [
@@ -553,9 +462,6 @@ __all__ = [
     "MmaOperandLayouts",
     "MmaVariantBindings",
     "MmaVariantSpec",
-    "PackedMmaLayouts",
     "TmaDescriptorBundle",
     "build_backward_layout_plan",
-    "layout_plan_fingerprint",
-    "layout_plan_snapshot",
 ]

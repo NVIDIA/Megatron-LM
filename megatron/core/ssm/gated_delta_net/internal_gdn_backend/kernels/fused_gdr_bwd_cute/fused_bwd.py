@@ -7,7 +7,6 @@ Licensed under the MIT License.
 from __future__ import annotations
 
 import math
-import weakref
 from dataclasses import dataclass
 
 import torch
@@ -19,52 +18,12 @@ _D = 128
 
 @dataclass(frozen=True)
 class _VarlenMetadata:
-    _cu_seqlens_ref: weakref.ReferenceType
+    cu_seqlens: torch.Tensor
     chunk_offsets: torch.Tensor
     num_sequences: int
     num_chunks: int
     uniform_sequence_length: int
     has_partial_chunks: bool
-
-    @property
-    def cu_seqlens(self) -> torch.Tensor:
-        tensor = self._cu_seqlens_ref()
-        if tensor is None:
-            raise RuntimeError("cu_seqlens owner is no longer alive")
-        return tensor
-
-
-@dataclass
-class _MetadataEntry:
-    owner: weakref.ReferenceType
-    version: int
-    total_tokens: int
-    chunk_size: int
-    uses_supplied_chunk_offsets: bool
-    metadata: _VarlenMetadata
-
-
-_METADATA_CACHE: dict[tuple[int, tuple[int, int] | None], _MetadataEntry] = {}
-
-
-def _clear_metadata_cache_for_test() -> None:
-    _METADATA_CACHE.clear()
-
-
-def _current_stream_cache_key(tensor_or_device: torch.Tensor | torch.device) -> tuple[int, int] | None:
-    device = (
-        tensor_or_device.device
-        if isinstance(tensor_or_device, torch.Tensor)
-        else torch.device(tensor_or_device)
-    )
-    if device.type != "cuda":
-        return None
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-        device = torch.device("cuda", device_index)
-    stream = torch.cuda.current_stream(device)
-    return (device_index, int(stream.cuda_stream))
 
 
 def _check_sm100(tensor: torch.Tensor) -> None:
@@ -109,32 +68,13 @@ def _prepare_varlen_metadata(
         raise TypeError("cu_seqlens must be a torch.Tensor")
     if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous():
         raise TypeError("cu_seqlens must be contiguous torch.int32")
-    uses_supplied_chunk_offsets = chunk_offsets is not None
-    if uses_supplied_chunk_offsets:
+    if chunk_offsets is not None:
         chunk_offsets = _validate_chunk_offsets(chunk_offsets, cu_seqlens)
         if cu_seqlens.device.type != "cpu" and not trusted_chunk_offsets:
             raise ValueError(
                 "non-CPU chunk_offsets require trusted_chunk_offsets=True after "
                 "host-side metadata validation"
             )
-
-    stream_key = _current_stream_cache_key(cu_seqlens)
-    key = (id(cu_seqlens), stream_key)
-    version = cu_seqlens._version
-    cached = _METADATA_CACHE.get(key)
-    if (
-        cached is not None
-        and cached.owner() is cu_seqlens
-        and cached.version == version
-        and cached.total_tokens == total_tokens
-        and cached.chunk_size == chunk_size
-        and (
-            (not uses_supplied_chunk_offsets and not cached.uses_supplied_chunk_offsets)
-            or (uses_supplied_chunk_offsets and cached.metadata.chunk_offsets is chunk_offsets)
-        )
-        and (num_chunks is None or cached.metadata.num_chunks == num_chunks)
-    ):
-        return cached.metadata
 
     if cu_seqlens.device.type == "cpu":
         values = cu_seqlens.detach().tolist()
@@ -202,29 +142,14 @@ def _prepare_varlen_metadata(
             total_tokens if num_sequences == 1 and not has_partial_chunks else 0
         )
 
-    def remove_cached_owner(owner_ref):
-        current = _METADATA_CACHE.get(key)
-        if current is not None and current.owner is owner_ref:
-            _METADATA_CACHE.pop(key, None)
-
-    owner_ref = weakref.ref(cu_seqlens, remove_cached_owner)
-    metadata = _VarlenMetadata(
-        _cu_seqlens_ref=owner_ref,
+    return _VarlenMetadata(
+        cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         num_sequences=num_sequences,
         num_chunks=num_chunks,
         uniform_sequence_length=uniform_sequence_length,
         has_partial_chunks=has_partial_chunks,
     )
-    _METADATA_CACHE[key] = _MetadataEntry(
-        owner=owner_ref,
-        version=version,
-        total_tokens=total_tokens,
-        chunk_size=chunk_size,
-        uses_supplied_chunk_offsets=uses_supplied_chunk_offsets,
-        metadata=metadata,
-    )
-    return metadata
 
 
 def _require_tensor(
@@ -314,12 +239,6 @@ def _allocate_outputs(q, k, v, g, beta, dht):
     )
 
 
-def _launch_fused_gdr_bwd_out(**kwargs):
-    from .launcher import launch_fused_gdr_bwd
-
-    launch_fused_gdr_bwd(**kwargs)
-
-
 def fused_gdr_bwd(
     q,
     k,
@@ -375,7 +294,10 @@ def fused_gdr_bwd(
         num_chunks=metadata.num_chunks,
     )
     outputs = _allocate_outputs(q, k, v, g, beta, dht)
-    _launch_fused_gdr_bwd_out(
+    # Imported lazily so the wrapper's validation stays importable without CuTe DSL.
+    from .launcher import launch_fused_gdr_bwd
+
+    launch_fused_gdr_bwd(
         q=q,
         k=k,
         v=v,

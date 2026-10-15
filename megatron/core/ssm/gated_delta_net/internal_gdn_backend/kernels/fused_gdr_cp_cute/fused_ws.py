@@ -5,10 +5,10 @@
 
 """Warp-specialized tcgen05 (Blackwell) fused CP pre-process — v4 "WS".
 
-v3 engine (pair ping-pong). Same wire protocol as `fused_gdr_cp_cute.fused`
-(parity-buffered hm_sym, monotonic flags, credit acks, merge role); compute
-engine built on warp specialization + TMA + tensor memory. Design history:
-docs/ws_kernel_design.md; API notes: refs/ws_*.md.
+v3 engine (pair ping-pong). Wire protocol (parity-buffered hm_sym, monotonic
+flags, credit acks, merge role) and SM80 fold from `protocol.CPProtocolMixin`;
+compute engine built on warp specialization + TMA + tensor memory. Design
+history: docs/ws_kernel_design.md; API notes: refs/ws_*.md.
 
 MATH (per value-head hv; T tokens in NT = ceil(T/64) chunks of BT=64).
 Inputs per chunk t (all bf16): W_t = w[t0:t0+64] in R^{64xK} (beta-scaled
@@ -73,12 +73,9 @@ warps 0-3 between full-CTA item barriers (their staging overlays the
 compute smem).
 
 Restrictions kept: K == V in {64, 128}; g-mode needs HV % 4 == 0;
-modes none/g/gk; no DPLR.  Optional T-split uses a second segment-fold
-kernel; BS>1 and T-split are not combined.
+modes none/g/gk; no DPLR; B = 1 (packed sequences are windowed by the
+caller); one whole-head scan per item (no T-split).
 """
-
-import os
-from collections import OrderedDict
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -88,85 +85,13 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import make_ptr
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .fused import PreProcessFwdFused
+from ._host import CPHostCaches, _normalize_gate
+from .protocol import BT, CPProtocolMixin, tmem_alloc_ptr
 
-
-def tmem_alloc_ptr(field):
-    """SMEM pointer for ``TmemAllocator``'s ``alloc_result_dst_smem_ptr``.
-
-    The shape of a scalar ``@cute.struct`` field changed across CuTeDSL
-    releases: 4.6.0.dev0 hands back a ``_ScalarData`` wrapper that exposes the
-    pointer as ``.ptr``, while newer releases hand back the ``_Pointer``
-    itself, where ``.ptr`` raises
-    ``AttributeError: '_Pointer' object has no attribute 'ptr'``.
-    Both are accepted here so one source tree runs on either toolchain --
-    hardcoding either form breaks the other.
-    """
-    return getattr(field, "ptr", field)
-
-
-BT = 64
 NS = 64               # strip width
 VGS = 2               # V/gate pipeline stages (3 measured 5us WORSE: smem carve-out shrinks L1)
-# The walk descriptor is keyed on nt = ceil(T_window / BT). With a single
-# global sequence T_window is constant, so 8 entries never missed. A packed
-# (THD) batch resamples its packing every step, so the straddling
-# sub-sequence's nt varies over the whole reachable range [1, ceil(T/BT)] --
-# and a miss costs a ~2.2 ms Python rebuild, which measured up to 5x SLOWER
-# than Triton on a >8-shape working set. The reachable set is bounded by the
-# shard length, so size the cache to cover it: 256 entries covers a 16384-token
-# shard at BT=64, for a few MB of host memory.
-WS_DESCRIPTOR_CACHE_SIZE = 256
-# CuTeDSL pointer objects memoized by device address. THD gives most arguments
-# a fresh address every step (the producer window starts at a moving `bos`), so
-# this must evict rather than fill and stop -- see `_p`.
-PTR_CACHE_SIZE = 4096
-
-# Walk-table instrumentation.  A rebuild is the expensive event (host build of
-# the table); an upload is the 8 KB pageable H2D that goes with it; a retune is
-# any change of chunk cover, most of which are neither.  Exported so a
-# varying-length benchmark can ASSERT "no host rebuild occurred" instead of
-# inferring it from a timing that is flat in nt.
-_DESC_REBUILD_COUNT = 0
-_DESC_UPLOAD_COUNT = 0
-_DESC_RETUNE_COUNT = 0
-
-
-def get_walk_descriptor_rebuild_count() -> int:
-    """Host rebuilds of the walk table (`walk_descriptor` calls)."""
-    return _DESC_REBUILD_COUNT
-
-
-def get_walk_descriptor_upload_count() -> int:
-    """Host-to-device uploads of the walk table."""
-    return _DESC_UPLOAD_COUNT
-
-
-def get_walk_descriptor_retune_count() -> int:
-    """Chunk-cover changes handled, however they were serviced."""
-    return _DESC_RETUNE_COUNT
-
-
-def _make_raw_stream():
-    """Cheapest available "current CUDA stream handle for this device".
-
-    `torch._C._cuda_getCurrentRawStream` is what inductor's generated launchers
-    use; it returns the raw pointer without building a `torch.cuda.Stream`
-    (0.09 us against 3.1 us).  It is private, so fall back to the public API on
-    a build that does not have it.
-    """
-    raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    if raw is None:
-        def raw(_index):
-            return torch.cuda.current_stream().cuda_stream
-    return raw
-
-
-_raw_stream = _make_raw_stream()
-
 
 # (a pair-B FMA-chain start-offset probe — "SKEW" — lived here; probed
 # 200/400/800 steps, all ~= +1us: phase-collision hypothesis dead)
@@ -179,43 +104,15 @@ NB_TMEM_ALLOC = 4     # tmem alloc retrieve (all threads)
 NB_ITEM = 5           # merge item boundaries (all threads)
 # (deadlock-triage printf tracing: see dbg/cutedsl_fused_ws7.py, WS_DEBUG)
 
-# ---- clock64 barrier probes (docs/ws_pipeline_map.md §7): WS_PROF=1
-# brackets every chunk-loop barrier wait with clock64 and stores per-chunk
-# cycle deltas into the (otherwise unwritten on compute ranks) h0 buffer as
-# prof[cta][chunk][slot] fp32. const_expr-gated: codegen is untouched when
-# off. Isolation-harness only (rank < R-1, no tsplit) — the PROF build adds
-# ~8 clock reads + up to 8 predicated STGs per chunk and can perturb register
-# allocation, so treat absolute wall time with suspicion; ratios are useful.
-WS_PROF = os.environ.get("WS_PROF", "0") == "1"
-PROF_NCH = 128        # chunk trace depth; later chunks clamp onto the last row
-PROF_SLOTS = 32       # K128: 12p+{0..5}/pair; K64: 6s+{0..5}/strip;
-                      # 24-29 MMA, 30-31 TMA
-
-# K=128 peer-push remap.  The native row-owner epilogue emits
-# one 16B vector from each 256B-separated row per warp instruction, consuming
-# only half of every 32B global-store sector.  The remap uses the now-dead sX
-# storage as one 32x32 fp32 tile per compute warp, then redistributes each
-# vector instruction across four adjacent rows so every sector is populated.
-WS_COALESCED_PUSH = os.environ.get("WS_DSL_COALESCED_PUSH", "1") == "1"
-
-# WS_PROF=2: timestamp-trace mode for timeline drawing (draw-gpu-timeline).
-# Same probe sites, but stores ABSOLUTE event timestamps (32-bit %clock —
-# the low word of the same SM counter clock64 reads — minus a per-item base
-# stamped into sItem[5] by thread 0, so all lanes share one skew-free
-# origin) for chunks [PROF2_LO, PROF2_LO+PROF2_NCH). Event slots per
-# (cta, chunk): K128 pair p uses 16p+{0..6}; K64 strip s uses
-# 8s+{0..6}. Events are {loop-top, g2-wait-end, pass1a-end, vg-wait-end,
-# pass1b-end, g1-wait-end, pass2-end}; the remaining local slots are unused.
-# MMA 32..39 = {chunk-start, wk-wait-end, g1p0-commit,
-# g1p1-commit, px0h0-wait-end, g2p0-commit, px1h0-wait-end, g2p1-commit};
-# TMA 40..43 = {wk-acq-start, wk-acq-end, vg-acq-start, vg-acq-end}.
-WS_PROF_TS = os.environ.get("WS_PROF", "0") == "2"
-PROF2_LO = 8          # first traced chunk (steady state)
-PROF2_NCH = 8         # traced chunks
-PROF2_SLOTS = 48
+# K=128 peer push: the native row-owner epilogue would emit one 16B vector
+# from each 256B-separated row per warp instruction, consuming only half of
+# every 32B global-store sector.  The epilogue instead stages through the
+# now-dead sX storage as one 32x32 fp32 tile per compute warp and
+# redistributes each vector instruction across four adjacent rows so every
+# sector is populated (see `_pair_item` / `_wg_item`).
 
 
-class PreProcessFwdFusedWS(PreProcessFwdFused):
+class PreProcessFwdFusedWS(CPProtocolMixin):
     @staticmethod
     def build_key(gate_mode, full_chunks):
         """Compile-cache key: what `full_chunks` actually changes in codegen.
@@ -227,12 +124,10 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         return gate_mode == "g" or not full_chunks
 
     def __init__(self, H, HV, K, V, gate_mode, R, rank, n_sm=None,
-                 tsplit=False, B=1, full_chunks=False):
-        super().__init__(H, HV, K, V, gate_mode, R, rank, split=1, B=B)
-        assert K == V and K in (64, 128), "WS supports K == V in {64,128}"
+                 full_chunks=False):
+        CPProtocolMixin.__init__(self, H, HV, K, V, gate_mode, R, rank)
         if self.use_g:
             assert HV % 4 == 0, "WS g-mode needs HV % 4 == 0 (TMA box)"
-        assert not (tsplit and B > 1), "BS>1 + tsplit not supported yet"
         self.NG = self.NSTRIPS
         self.SPP = max(self.NSTRIPS // 2, 1)  # strips per MMA pair
         # K=128 combines the two strips of each MMA pair into one warpgroup:
@@ -270,32 +165,17 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         if n_sm is None:
             n_sm = torch.cuda.get_device_properties(
                 torch.cuda.current_device()).multi_processor_count
-        # BS>1: an item is (batch, hv); the compute/merge item counts scale by
-        # the batch, and a CTA walks B*HV work-heads instead of HV.
-        self.n_citems = B * HV if rank < R - 1 else 0
-        self.n_mitems = B * HV * self.NB if rank > 0 else 0
+        self.n_citems = HV if rank < R - 1 else 0
+        self.n_mitems = HV * self.NB if rank > 0 else 0
         self.n_items = self.n_citems + self.n_mitems
         assert self.n_items > 0
-        # tsplit: balance the HV*NT chunk-units over ALL SMs with
-        # host-precomputed contiguous ranges (a head cut mid-range becomes
-        # segments composed by the head's first CTA — NOT bit-exact vs the
-        # unsplit scan; the fold is the same hi/lo bf16 3-pass MMA
-        # numerics class as the CP rank fold)
-        self.tsplit = tsplit and self.n_citems > 0
-        if self.tsplit:
-            self.n_ctas = n_sm
-        else:
-            self.n_ctas = min(n_sm, self.n_items)
+        self.n_ctas = min(n_sm, self.n_items)
         self.n_sm = n_sm
-        # compute items per CTA (a range spans at most 2 heads since
-        # ranges <= NT; whole-head walks may need ceil(HV/eff) slots)
-        if self.tsplit:
-            self.NSLOT = 2
-        else:
-            # whole work-head walk over B*HV heads (each item = one (batch, hv))
-            nwork = B * HV
-            eff0 = max(1, min(self.n_ctas, nwork))
-            self.NSLOT = -(-nwork // eff0)
+        # compute items per CTA: whole-head walk over HV heads, so a CTA may
+        # need ceil(HV/eff) slots
+        nwork = HV
+        eff0 = max(1, min(self.n_ctas, nwork))
+        self.NSLOT = -(-nwork // eff0)
 
     # ------------------------------------------------------------------ host
     @cute.jit
@@ -309,8 +189,7 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         pHMloc: cute.Pointer,  # local hm_sym base, fp32 [2,R,HV,NSTRIPS,K,64]
         pPtrs: cute.Pointer,   # int64 [3, R]
         pH0: cute.Pointer,     # fp32 [HV, K, V] out
-        pHMseg: cute.Pointer,  # segment payload scratch (dummy if unsplit)
-        pSegFl: cute.Pointer,  # walk/fold descriptors (and fold metadata)
+        pSegFl: cute.Pointer,  # walk descriptors (per-(CTA, slot) items)
         T: cutlass.Int32,
         step: cutlass.Int32,
         emit: cutlass.Int32,   # bit 0 = push h half, bit 1 = push M half
@@ -320,31 +199,25 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         NG = self.NG
         dtype = self.io_dtype
 
-        # ---- gmem views shaped for the TMA atoms.  BS>1: inputs are
-        # [B, T, ...] contiguous, so the leading batch mode COLLAPSES into the
-        # (major) time mode — the descriptor box is just B*T rows tall and the
-        # per-item chunk offset carries a batch*T (== batch*NT chunks) shift.
-        # Strides are unchanged from B == 1; nothing else in the load path
-        # moves.
-        BT_rows = self.B * T
+        # ---- gmem views shaped for the TMA atoms (B = 1: the batch mode is
+        # dropped and the descriptor box is T rows tall)
         mW3 = cute.make_tensor(
-            pW, cute.make_layout((BT_rows, K, HV), stride=(HV * K, 1, K))
+            pW, cute.make_layout((T, K, HV), stride=(HV * K, 1, K))
         )
         mK3 = cute.make_tensor(
-            pK, cute.make_layout((K, BT_rows, H), stride=(1, H * K, K))
+            pK, cute.make_layout((K, T, H), stride=(1, H * K, K))
         )
         mV3 = cute.make_tensor(
-            pV, cute.make_layout((BT_rows, self.V, HV),
+            pV, cute.make_layout((T, self.V, HV),
                                  stride=(HV * self.V, 1, self.V))
         )
-        mG2 = cute.make_tensor(pG, cute.make_layout((BT_rows, HV),
+        mG2 = cute.make_tensor(pG, cute.make_layout((T, HV),
                                                     stride=(HV, 1)))
         mGk2 = cute.make_tensor(
-            pGK, cute.make_layout((BT_rows * HV, K), stride=(K, 1)))
+            pGK, cute.make_layout((T * HV, K), stride=(K, 1)))
         mPtrs = cute.make_tensor(
             pPtrs, cute.make_layout((3, self.R), stride=(self.R, 1))
         )
-        # h0 is [B, HV, K, V] fp32 out; the merge role offsets by batch.
         mH0 = cute.make_tensor(
             pH0, cute.make_layout((HV, K, self.V), stride=(K * self.V, self.V, 1))
         )
@@ -510,20 +383,6 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
 
         self.shared_storage = SharedStorage
 
-        @cute.struct
-        class FoldStorage:
-            fRaw: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32,
-                                     self.NK * self.STRIP], 1024]
-            fHe: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.STRIP], 1024]
-            fHi: cute.struct.Align[
-                cute.struct.MemRange[dtype, K * (K + 8)], 1024]
-            fLo: cute.struct.Align[
-                cute.struct.MemRange[dtype, K * (K + 8)], 1024]
-
-        self.fold_storage = FoldStorage
-
         self.ws_kernel(
             atom_w, tW, atom_kt, tKt, atom_v, tV, atom_g, tG,
             atom_gk, tGk,
@@ -531,25 +390,13 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             sW_lay, sX_lay, sKt_lay, sXf_lay, sWb_lay, sxt_lay,
             sV_lay, sG_lay, sGk_lay,
             tiled_mma_sm80, tiled_copy_M, sM_layout,
-            mPtrs, mH0, T, step, emit, pHMloc, pHMseg, pSegFl,
+            mPtrs, mH0, T, step, emit, pHMloc, pSegFl,
         ).launch(
             grid=[self.n_ctas, 1, 1],
             block=[self.num_threads, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
         )
-        if cutlass.const_expr(self.tsplit):
-            # segmented heads: fold + push + flags in a small second
-            # kernel — stream order replaces all segment flags, and the
-            # fold code stays out of the register-heavy compute kernel
-            self.fold_kernel(
-                tiled_mma_sm80, tiled_copy_M, sM_layout,
-                mPtrs, pHMseg, pSegFl, step, emit,
-            ).launch(
-                grid=[self.n_ctas, 1, 1],
-                block=[128, 1, 1],
-                stream=stream,
-            )
 
     # ---------------------------------------------------------------- kernel
     @cute.kernel
@@ -582,7 +429,6 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         step: cutlass.Int32,
         emit: cutlass.Int32,
         pHMloc: cute.Pointer,
-        pHMseg: cute.Pointer,
         pSegFl: cute.Pointer,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -784,18 +630,13 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             st_x_p = mps(Prod, 2)
             st_x_c = mps(Cons, 2)
             st_x_cb = mps(Cons, 2)
-            # WS_PROF trace buffer view over h0 (dead view when PROF off;
-            # h0 is only ever written by merge items, which need rank > 0)
-            prof_t = cute.make_tensor(
-                mH0.iterator,
-                cute.make_layout(self.n_ctas * PROF_NCH * PROF_SLOTS))
 
         # ==================== persistent item loop =====================
         # compute items come from a host-precomputed per-(CTA, slot) table
-        # (hv, c0, c1, n_later, valid): constexpr slot loop + one dynamic
-        # validity branch — the same shape as the plain per-head loop
-        # (walk arithmetic in registers, or device integer division
-        # anywhere in this function, can tip register allocation into spills)
+        # (hv, 0, 0, 0, valid): constexpr slot loop + one dynamic validity
+        # branch — the same shape as the plain per-head loop (walk arithmetic
+        # in registers, or device integer division anywhere in this function,
+        # can tip register allocation into spills)
         if cutlass.const_expr(has_compute):
             for slot in cutlass.range_constexpr(self.NSLOT):
                 nb_item.arrive_and_wait()
@@ -807,71 +648,50 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                         cute.make_layout(8))
                     for q in cutlass.range_constexpr(5):
                         sI_t[q] = dsc[q].to(cutlass.Int32)
-                    # slot 6 = batch (BS>1); read only at the cold push/ack/
-                    # flag sites so it never lives across the chunk loop
-                    sI_t[6] = dsc[6].to(cutlass.Int32)
                     # slot 7 = this launch's emit mask.  It rides the item
-                    # descriptor rather than a threaded argument for the same
-                    # reason `batch` does: the push epilogue is the only reader,
-                    # and a kernel argument would otherwise stay live in a
-                    # register across the whole chunk loop of a function that
-                    # is already at its spill cliff.  Not part of the host walk
-                    # table -- that is cached on `nt`, and the mask changes with
-                    # the packing, not the length.
+                    # descriptor rather than a threaded argument because the
+                    # push epilogue is the only reader, and a kernel argument
+                    # would otherwise stay live in a register across the whole
+                    # chunk loop of a function that is already at its spill
+                    # cliff.  Not part of the host walk table -- that is
+                    # uploaded once per wrapper, and the mask changes with the
+                    # packing.
                     sI_t[7] = emit
-                    if cutlass.const_expr(WS_PROF_TS):
-                        # shared per-item clock origin for all lanes
-                        sI_t[5] = cute.arch.clock()
                 nb_item.arrive_and_wait()
                 if sI_t[4] != 0:
-                    # ------------- compute item: (hv, [c0, c1)) ---------
+                    # ------------- compute item: head hv, chunks [0, nc) ---
                     hv = sI_t[0]
                     c0 = sI_t[1]
-                    if cutlass.const_expr(self.tsplit):
-                        nc = sI_t[2] - c0
-                    else:
-                        # Whole-head walk: every live row has c0 == 0 and
-                        # c1 == ceil(T/BT) (`walk_descriptor`'s non-tsplit
-                        # branch writes only hv/c1/valid/batch), so the chunk
-                        # count is a function of the dynamic `T` alone. Reading
-                        # it from `T` instead of from the c1 column is what
-                        # lets the resident walk table stay untouched when the
-                        # length changes -- under THD `nt` changes every step,
-                        # and the retune it replaces was a ~5.7 us host
-                        # `index_fill_` dispatch plus its own kernel launch,
-                        # per direction per layer per step.
-                        nc = (T + (BT - 1)) // BT
+                    # Whole-head walk: every live row has c0 == 0, so the
+                    # chunk count is a function of the dynamic `T` alone.
+                    # Reading it from `T` instead of from the table is what
+                    # lets the resident walk table stay untouched when the
+                    # length changes -- under THD `nt` changes every step,
+                    # and a per-length retune was a ~5.7 us host
+                    # `index_fill_` dispatch plus its own kernel launch,
+                    # per direction per layer per step.
+                    nc = (T + (BT - 1)) // BT
                     if warp_idx == self.tma_warp:
                         st_wk_p, st_vg_p = self._tma_item(
                             atom_w, tW, atom_kt, tKt, atom_v, tV, atom_g, tG,
                             atom_gk, tGk, tiled_mma1, tiled_mma2,
                             sW_t, sKt_t, sV_t, sG_t, sGk_t,
                             T, c0, nc, hv, p_wk, p_vg, st_wk_p, st_vg_p,
-                            prof_t, sI_t,
                         )
-                        # ack throttle before anyone pushes (folded
-                        # heads are pushed and acked by the fold kernel)
-                        do_ack = cutlass.Boolean(True)
-                        if cutlass.const_expr(self.tsplit):
-                            do_ack = (c0 == 0) & (sI_t[3] == 0)
-                        if do_ack:
-                            ackv = cutlass.max(step - 2, 0).to(
-                                cutlass.Uint32)
-                            ak_loc = mPtrs[2, rank]
-                            # cold (after the TMA loop); folds to 0 at B == 1
-                            batch = (sI_t[6] if cutlass.const_expr(self.B > 1)
-                                     else 0)
-                            if tidx == self.tma_warp * 32:
-                                for cc in cutlass.range_constexpr(
-                                        rank + 1, R):
-                                    for b in cutlass.range_constexpr(
-                                            self.NB):
-                                        self._spin_ge_sys(
-                                            ak_loc,
-                                            ((cc * self.B + batch) * self.HV
-                                             + hv) * self.NB + b,
-                                            ackv,
-                                        )
+                        # ack throttle before anyone pushes
+                        ackv = cutlass.max(step - 2, 0).to(
+                            cutlass.Uint32)
+                        ak_loc = mPtrs[2, rank]
+                        if tidx == self.tma_warp * 32:
+                            for cc in cutlass.range_constexpr(
+                                    rank + 1, R):
+                                for b in cutlass.range_constexpr(
+                                        self.NB):
+                                    self._spin_ge_sys(
+                                        ak_loc,
+                                        (cc * self.HV + hv) * self.NB + b,
+                                        ackv,
+                                    )
                         nb_epilog.arrive_and_wait()
                     elif warp_idx == self.mma_warp:
                         (st_wk_c, st_pub_c, st_x_c,
@@ -880,7 +700,6 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                             sWb_t, sKt_t, sXf_t, sxt_t, tAcc1ps, tXps,
                             p_wk, p_g1s, p_g2s, p_pubs, p_xs, p_lam,
                             st_wk_c, st_pub_c, st_x_c, st_x_cb, st_one,
-                            prof_t, sI_t,
                         )
                         nb_epilog.arrive_and_wait()
                     else:
@@ -908,15 +727,15 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                                             and warp_idx < 4 * (pp + 1)):
                                         (st_vg_c, st_g1_c, st_g2_c,
                                          st_x_p) = self._pair_item(
-                                            pp, slot, tidx % 128, hv, T, c0,
-                                            nc, par, sI_t, mPtrs, pHMseg,
+                                            pp, tidx % 128, hv, T, c0,
+                                            nc, par, sI_t, mPtrs,
                                             tAcc1ps[pp], tXps[pp],
                                             sX_t, sPush_t, sxt_t,
                                             sV_t, sG_t, sGk_t, sLam_t,
                                             p_vg, p_g1s[pp], p_g2s[pp],
                                             p_pubs[pp], p_xs[pp], p_lam,
                                             st_vg_c, st_g1_c, st_g2_c,
-                                            st_x_p, st_one, prof_t,
+                                            st_x_p, st_one,
                                         )
                         else:
                             # K=64: one existing strip group per MMA pair.
@@ -932,8 +751,8 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                                         and warp_idx < 4 * (s + 1)):
                                     (st_vg_c, st_g1_c, st_g2_c,
                                      st_x_p) = self._wg_item(
-                                        s, slot, tidx % 128, hv, T, c0, nc,
-                                        par, sI_t, mPtrs, pHMseg,
+                                        s, tidx % 128, hv, T, c0, nc,
+                                        par, sI_t, mPtrs,
                                         tAcc1ps[s // self.SPP], tXts[s],
                                         sX_t, sPush_t, sxt_t,
                                         sV_t, sG_t, sGk_t, sLam_t,
@@ -942,23 +761,13 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                                         p_pubs[s // self.SPP],
                                         p_xs[s // self.SPP], p_lam,
                                         st_vg_c, st_g1_c, st_g2_c,
-                                        st_x_p, st_one, prof_t,
+                                        st_x_p, st_one,
                                     )
-                    # item tail: flags for whole (pushed) heads;
-                    # segmented heads are folded, pushed, and flagged by
-                    # the FOLD KERNEL launched after this one (stream
-                    # order makes all parked segments visible — no seg
-                    # flags, and no fold code in this register-heavy region)
+                    # item tail: flags for the pushed head
                     nb_epilog.arrive_and_wait()
                     cute.arch.fence_acq_rel_sys()
                     if tidx == 0:
-                        do_flags = cutlass.Boolean(True)
-                        if cutlass.const_expr(self.tsplit):
-                            do_flags = (sI_t[1] == 0) & (sI_t[3] == 0)
-                        if do_flags:
-                            fbatch = (sI_t[6]
-                                      if cutlass.const_expr(self.B > 1) else 0)
-                            self._flag_consumers(mPtrs, fbatch, hv, stepu)
+                        self._flag_consumers(mPtrs, hv, stepu)
 
         if cutlass.const_expr(self.n_mitems > 0):
             wi = cutlass.Int32(bidx)
@@ -968,18 +777,13 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                 # compute smem, and the TMA warp of a preceding compute item
                 # may still be prefetching into it
                 nb_item.arrive_and_wait()
-                # flat merge index over (batch, hv, V-subtile): wi in
-                # [0, B*HV*NB); the merge loop is separate from the compute
-                # chunk loop, so holding mbatch here costs nothing.
+                # flat merge index over (hv, V-subtile): wi in [0, HV*NB)
                 mb = wi % self.NB
-                gh = wi // self.NB
-                mhv = gh % self.HV
-                mbatch = gh // self.HV
+                mhv = wi // self.NB
                 if warp_idx <= 3:
                     self._merge_role(
                         tidx, mb, mhv, par, stepu, mPtrs, mH0, pHMloc,
                         storage, tiled_mma_sm80, tiled_copy_M, sM_layout,
-                        mbatch,
                     )
                 nb_item.arrive_and_wait()
                 wi += self.n_ctas
@@ -991,62 +795,18 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             ).arrive_and_wait()
             tmem.free(tmem_ptr)
 
-    # ------------------------------------------------------ WS_PROF=2 mark
-    @cute.jit
-    def _ts_mark(self, prof_t, basec, bidx, tq, slot: cutlass.Constexpr,
-                 pred):
-        """Store one absolute event timestamp (cycles since the item base)
-        if this chunk is in the trace window and `pred` selects the
-        recorder lane. The clock read sits after the window branch, so
-        out-of-window chunks pay only the (warp-uniform) compare."""
-        if pred & (tq >= PROF2_LO) & (tq < PROF2_LO + PROF2_NCH):
-            idx = ((bidx * PROF2_NCH + (tq - PROF2_LO)) * PROF2_SLOTS
-                   + slot)
-            prof_t[idx] = (cute.arch.clock() - basec).to(cutlass.Float32)
-
-    # ----------------------------------------------------------- MMA warp
-    @cute.jit
-    def _exec_gemm(self, tiled_mma, tAcc, tCrA, tCrB, a_stage, b_stage,
-                   acc_init: cutlass.Constexpr = False,
-                   kp_lo: cutlass.Constexpr = 0,
-                   kp_hi: cutlass.Constexpr = -1):
-        n_kp = cute.size(tCrB, mode=[2])
-        hi = n_kp if kp_hi < 0 else kp_hi
-        for kpi in cutlass.range(hi - kp_lo, unroll_full=True):
-            kp = kp_lo + kpi
-            tiled_mma.set(tcgen05.Field.ACCUMULATE,
-                          cutlass.Boolean(acc_init or kp != 0))
-            cute.gemm(
-                tiled_mma, tAcc,
-                tCrA[None, None, kp, a_stage],
-                tCrB[None, None, kp, b_stage],
-                tAcc,
-            )
-        return tiled_mma
-
     # ----------------------------------------------------------- TMA warp
     @cute.jit
     def _tma_item(
         self, atom_w, tW, atom_kt, tKt, atom_v, tV, atom_g, tG,
         atom_gk, tGk, tiled_mma1, tiled_mma2,
         sW_t, sKt_t, sV_t, sG_t, sGk_t,
-        T, c0, nc, hv, p_wk, p_vg, st_wk, st_vg, prof_t, sI_t,
+        T, c0, nc, hv, p_wk, p_vg, st_wk, st_vg,
     ):
         hk = hv // (self.HV // self.H)
         thr_mma1 = tiled_mma1.get_slice(0)
         thr_mma2 = tiled_mma2.get_slice(0)
         K = self.K
-        # BS>1: this item's sequence starts at global row batch*T in the
-        # B*T-tall descriptor; per-chunk offsets are clamped within [0, T)
-        # first (no cross-sequence reads) then shifted by batch*T.  For B == 1
-        # bT is the python int 0, so every "bT + ..." folds away at trace time
-        # (byte-identical TMA-warp codegen to the pre-batch kernel).
-        bT = (sI_t[6] * T) if cutlass.const_expr(self.B > 1) else 0
-        if cutlass.const_expr((WS_PROF or WS_PROF_TS) and not self.tsplit):
-            lidx = cute.arch.lane_idx()
-            bidx_, _, _ = cute.arch.block_idx()
-        if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-            basec = sI_t[5]
 
         # one bulk-tensor load: offset the gmem view to the (clamped)
         # chunk window, tile it through the MMA-A partition shape, and
@@ -1078,38 +838,16 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
 
         for tq in cutlass.range(nc, unroll=1):
             t0 = (c0 + tq) * BT
-            t_ofs = bT + cutlass.max(cutlass.min(t0, T - BT), 0)
+            t_ofs = cutlass.max(cutlass.min(t0, T - BT), 0)
 
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pbase = (bidx_ * PROF_NCH
-                         + cutlass.min(tq, PROF_NCH - 1)) * PROF_SLOTS
-                pc0 = cute.arch.clock64()
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_, tq, 40, lidx == 0)
             p_wk.producer_acquire(st_wk)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pc1 = cute.arch.clock64()
-                if lidx == 0:
-                    prof_t[pbase + 30] = (pc1 - pc0).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_, tq, 41, lidx == 0)
             bar_wk = p_wk.producer_get_barrier(st_wk)
             tma_ld(atom_w, tW[None, None, hv], (t_ofs, 0), (BT, NS, K),
                    thr_mma1, sW_t, st_wk.index, bar_wk)
             tma_ld(atom_kt, tKt[None, None, hk], (0, t_ofs), (K, NS, BT),
                    thr_mma2, sKt_t, st_wk.index, bar_wk)
 
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pc2 = cute.arch.clock64()
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_, tq, 42, lidx == 0)
             p_vg.producer_acquire(st_vg)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pc3 = cute.arch.clock64()
-                if lidx == 0:
-                    prof_t[pbase + 31] = (pc3 - pc2).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_, tq, 43, lidx == 0)
             bar_vg = p_vg.producer_get_barrier(st_vg)
             tma_ld(atom_v, tV[None, None, hv], (t_ofs, 0), (BT, NS, K),
                    thr_mma1, sV_t, st_vg.index, bar_vg)
@@ -1117,7 +855,7 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                 gate_ld(atom_g, tG, (t_ofs, (hv // 4) * 4), (BT, 4),
                         sG_t, st_vg.index, bar_vg)
             if cutlass.const_expr(self.use_gk):
-                last_idx = bT + t0 + cutlass.min(T - t0, BT) - 1
+                last_idx = t0 + cutlass.min(T - t0, BT) - 1
                 gate_ld(atom_gk, tGk, (last_idx * self.HV + hv, 0),
                         (1, self.K), sGk_t, st_vg.index, bar_vg)
 
@@ -1165,13 +903,13 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
     # ---------------------------------------------------------- pair groups
     @cute.jit
     def _pair_item(
-        self, pair: cutlass.Constexpr, slot: cutlass.Constexpr,
+        self, pair: cutlass.Constexpr,
         ltid, hv, T, c0, nc, par,
-        sI_t, mPtrs, pHMseg,
+        sI_t, mPtrs,
         tAcc1, tX,
         sX_t, sPush_t, sxt_t, sV_t, sG_t, sGk_t, sLam_t,
         p_vg, p_g1, p_g2, p_pub, p_x, p_lam,
-        st_vg, st_g1c, st_g2c, st_xp, st_one, prof_t,
+        st_vg, st_g1c, st_g2c, st_xp, st_one,
     ):
         """K=128 worker: one warpgroup owns both strips of an MMA pair."""
         K = self.K
@@ -1303,29 +1041,8 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         cute.copy(r2t_x, rX, tXst[(None, 0, 0)])
         cute.arch.fence_view_async_tmem_store()
 
-        if cutlass.const_expr((WS_PROF or WS_PROF_TS) and not self.tsplit):
-            bidx_p, _, _ = cute.arch.block_idx()
-        if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-            basec = sI_t[5]
-
         for tq in cutlass.range(nc, unroll=1):
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pofs = ((bidx_p * PROF_NCH
-                         + cutlass.min(tq, PROF_NCH - 1)) * PROF_SLOTS
-                        + 12 * pair)
-                pk0 = cute.arch.clock64()
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(
-                    prof_t, basec, bidx_p, tq, 16 * pair, ltid == 0)
-
             p_g2.consumer_wait(st_g2c)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk1 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 1] = (pk1 - pk0).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(
-                    prof_t, basec, bidx_p, tq, 16 * pair + 1, ltid == 0)
             st_g2c.advance()
 
             # pass 1a: one x128 TMEM drain, then publish both strips.
@@ -1342,26 +1059,10 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             for w in cutlass.range_constexpr(4):
                 if wig == w:
                     p_pub[w].producer_commit(st_one)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk2 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 2] = (pk2 - pk1).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(
-                    prof_t, basec, bidx_p, tq, 16 * pair + 2, ltid == 0)
 
             # V/gate stage is independent of the W/K stage and normally
             # becomes ready while gemm1 consumes the just-published X.
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk3 = cute.arch.clock64()
             p_vg.consumer_wait(st_vg)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk4 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 0] = (pk4 - pk3).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(
-                    prof_t, basec, bidx_p, tq, 16 * pair + 3, ltid == 0)
 
             t0 = (c0 + tq) * BT
             n_valid = T - t0
@@ -1387,24 +1088,9 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                     rX[i] = gscale * rX[i]
                 cute.copy(r2t_x, rX, tXst[(None, 0, 0)])
 
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk5 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 3] = (pk5 - pk4).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(
-                    prof_t, basec, bidx_p, tq, 16 * pair + 4, ltid == 0)
-
             p_g1.consumer_wait(st_g1c)
             if cutlass.const_expr(self.need_lam and pair == 0):
                 p_lam.consumer_wait(st_vg)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk6 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 4] = (pk6 - pk5).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(
-                    prof_t, basec, bidx_p, tq, 16 * pair + 5, ltid == 0)
 
             # pass 2, half 0. Full-pair fragments remove the former `gip`
             # selection; one arrival now publishes all 128 x rows.
@@ -1467,14 +1153,6 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             p_x.producer_commit(st_xp)
             st_xp.advance()
 
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk7 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 5] = (pk7 - pk6).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(
-                    prof_t, basec, bidx_p, tq, 16 * pair + 6, ltid == 0)
-
             p_vg.consumer_release(st_vg)
             st_vg.advance()
             st_g1c.advance()
@@ -1496,14 +1174,9 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         # has already been arrived at, so the arrival counts are untouched, and
         # `_flag_consumers` still signals every strip (a consumer that reads M
         # is by construction reading a rank that still pushes it).
-        if cutlass.const_expr(not (is_h or self.push_transition)
-                              and not self.tsplit):
+        if cutlass.const_expr(not (is_h or self.push_transition)):
             return st_vg, st_g1c, st_g2c, st_xp
 
-        do_push = cutlass.Boolean(True)
-        if cutlass.const_expr(self.tsplit):
-            do_push = (sI_t[1] == 0) & (sI_t[3] == 0)
-        batch = sI_t[6] if cutlass.const_expr(self.B > 1) else 0
         cute.copy(t2r_x, tXt[(None, 0, 0)], rX)
         cute.arch.fence_view_async_tmem_load()
         # Emit mask (see `CuteDSLFusedCPPreProcessWS.launch_validated`): a rank
@@ -1512,103 +1185,78 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         # skipped.  Zeroed, not scaled by 0.0: the value being suppressed is a
         # scan over tokens this rank's consumers do not belong to, and 0.0 * inf
         # is NaN.
-        # Only on the pushing path.  Under tsplit a non-pushing item parks a raw
-        # segment that the fold kernel still has to COMPOSE (h_composed uses the
-        # M strips), so suppressing one half of a segment there would corrupt
-        # the other; the fold kernel applies the mask to its own final push.
-        if do_push & ((sI_t[7] & (1 if is_h else 2)) == 0):
+        if (sI_t[7] & (1 if is_h else 2)) == 0:
             for i in cutlass.range_constexpr(2 * NS):
                 rX[i] = cutlass.Float32(0.0)
         lane = ltid & 31
         warp_row0 = row0 - lane
 
+        # Coalesced peer push: stage one 32-column half at a time through the
+        # warp-private 32x32 fp32 tile with a vector-XOR row layout, then have
+        # each lane write a float4 from eight rows, so every STG instruction
+        # covers four adjacent rows and fills all 32B sectors.
         for ss in cutlass.range_constexpr(2):
             strip = strip0 + ss
             xbase = ss * NS
-            src_row = cute.make_tensor(
-                rX.iterator + xbase, cute.make_layout(NS))
-            off0 = self._hm_off(par, self.rank, hv, strip, batch)
+            off0 = self._hm_off(par, self.rank, hv, strip)
 
-            if cutlass.const_expr(self.tsplit):
-                if ~do_push:
-                    bidx_, _, _ = cute.arch.block_idx()
-                    segb = (((bidx_ * self.NSLOT + slot) * self.NSTRIPS
-                             + strip) * self.STRIP
-                            + row0 * NS)
-                    seg_row = cute.make_tensor(
-                        (pHMseg + segb).align(16),
-                        cute.make_layout(src_row.shape))
-                    cute.autovec_copy(src_row, seg_row)
-
-            if do_push:
-                if cutlass.const_expr(WS_COALESCED_PUSH):
-                    warp_slot = (4 * strip + ltid // 32) * (32 * 32)
-                    for half in cutlass.range_constexpr(2):
-                        for v4 in cutlass.range_constexpr(8):
-                            src4 = cute.make_tensor(
-                                (rX.iterator + xbase + 32 * half
-                                 + 4 * v4).align(16),
-                                cute.make_layout(4),
-                            )
-                            phys = (lane * 32
-                                    + 4 * (v4 ^ (lane & 7)))
-                            dst4 = cute.make_tensor(
-                                (sPush_t.iterator
-                                 + warp_slot + phys).align(16),
-                                cute.make_layout(4),
-                            )
-                            cute.copy(atom_f32x4, src4, dst4)
-                        cute.arch.sync_warp()
-                        for q in cutlass.range_constexpr(8):
-                            lr = 4 * q + lane // 8
-                            v4 = lane & 7
-                            phys = (lr * 32
-                                    + 4 * (v4 ^ (lr & 7)))
-                            src4 = cute.make_tensor(
-                                (sPush_t.iterator
-                                 + warp_slot + phys).align(16),
-                                cute.make_layout(4),
-                            )
-                            col = 32 * half + 4 * v4
-                            for j in cutlass.range_constexpr(
-                                    self.rank + 1, self.R):
-                                dst4 = cute.make_tensor(
-                                    cute.make_ptr(
-                                        cutlass.Float32,
-                                        mPtrs[0, j]
-                                        + 4 * (off0
-                                               + (warp_row0 + lr) * NS
-                                               + col),
-                                        cute.AddressSpace.gmem,
-                                        assumed_align=16,
-                                    ),
-                                    cute.make_layout(4),
-                                )
-                                cute.copy(atom_f32x4, src4, dst4)
-                        cute.arch.sync_warp()
-                else:
-                    rowb = (off0 + row0 * NS) * 4
+            warp_slot = (4 * strip + ltid // 32) * (32 * 32)
+            for half in cutlass.range_constexpr(2):
+                for v4 in cutlass.range_constexpr(8):
+                    src4 = cute.make_tensor(
+                        (rX.iterator + xbase + 32 * half
+                         + 4 * v4).align(16),
+                        cute.make_layout(4),
+                    )
+                    phys = (lane * 32
+                            + 4 * (v4 ^ (lane & 7)))
+                    dst4 = cute.make_tensor(
+                        (sPush_t.iterator
+                         + warp_slot + phys).align(16),
+                        cute.make_layout(4),
+                    )
+                    cute.copy(atom_f32x4, src4, dst4)
+                cute.arch.sync_warp()
+                for q in cutlass.range_constexpr(8):
+                    lr = 4 * q + lane // 8
+                    v4 = lane & 7
+                    phys = (lr * 32
+                            + 4 * (v4 ^ (lr & 7)))
+                    src4 = cute.make_tensor(
+                        (sPush_t.iterator
+                         + warp_slot + phys).align(16),
+                        cute.make_layout(4),
+                    )
+                    col = 32 * half + 4 * v4
                     for j in cutlass.range_constexpr(
                             self.rank + 1, self.R):
-                        dst_row = cute.make_tensor(
+                        dst4 = cute.make_tensor(
                             cute.make_ptr(
-                                cutlass.Float32, mPtrs[0, j] + rowb,
-                                cute.AddressSpace.gmem, assumed_align=16),
-                            cute.make_layout(src_row.shape))
-                        cute.autovec_copy(src_row, dst_row)
+                                cutlass.Float32,
+                                mPtrs[0, j]
+                                + 4 * (off0
+                                       + (warp_row0 + lr) * NS
+                                       + col),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            ),
+                            cute.make_layout(4),
+                        )
+                        cute.copy(atom_f32x4, src4, dst4)
+                cute.arch.sync_warp()
 
         return st_vg, st_g1c, st_g2c, st_xp
 
     # -------------------------------------------------------- strip groups
     @cute.jit
     def _wg_item(
-        self, strip: cutlass.Constexpr, slot: cutlass.Constexpr,
+        self, strip: cutlass.Constexpr,
         ltid, hv, T, c0, nc, par,
-        sI_t, mPtrs, pHMseg,
+        sI_t, mPtrs,
         tAcc1, tX,
         sX_t, sPush_t, sxt_t, sV_t, sG_t, sGk_t, sLam_t,
         p_vg, p_g1, p_g2, p_pub, p_x, p_lam,
-        st_vg, st_g1c, st_g2c, st_xp, st_one, prof_t,
+        st_vg, st_g1c, st_g2c, st_xp, st_one,
     ):
         K = self.K
         SPP = self.SPP
@@ -1814,10 +1462,6 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         cute.arch.fence_view_async_tmem_store()
 
         base = sub_a1 * gip
-        if cutlass.const_expr((WS_PROF or WS_PROF_TS) and not self.tsplit):
-            bidx_p, _, _ = cute.arch.block_idx()
-        if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-            basec = sI_t[5]
         for tq in cutlass.range(nc, unroll=1):
             # ---- loop order (v6): pass 1a runs FIRST (right after the
             # g2 wait) — X(t) is its only input, so the V/gate wait and
@@ -1830,23 +1474,8 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             # exactly the extra state the 96-reg cliff punishes (the
             # per-thread-lambda variant of this reorder measured pass 2
             # at +500..+900 cyc from the spills it caused).
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pofs = ((bidx_p * PROF_NCH
-                         + cutlass.min(tq, PROF_NCH - 1)) * PROF_SLOTS
-                        + 6 * strip)
-                pk0 = cute.arch.clock64()
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_p, tq, 8 * strip + 0,
-                              ltid == 0)
             # gemm2(t-1) done -> X(t) final (t=0: the pre-loop dummy commit)
             p_g2.consumer_wait(st_g2c)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk1 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 1] = (pk1 - pk0).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_p, tq, 8 * strip + 1,
-                              ltid == 0)
             st_g2c.advance()
 
             # ---- pass 1a: publish X_bf16 (gemm1 operand). K=128:
@@ -1876,13 +1505,6 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             else:
                 # per-thread arrive = "all strips' X_bf16 published"
                 p_pub[0].producer_commit(st_one)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk2 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 2] = (pk2 - pk1).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_p, tq, 8 * strip + 2,
-                              ltid == 0)
 
             # ---- V/gate wait + gate math (v6: under gemm1's flight).
             # gates are log2-domain chunk-local cumsums: g_last = g[last
@@ -1890,16 +1512,7 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             # to the carried state X in pass 1b (ragged tail: the TMA
             # window is clamped, `shift` re-indexes so g_last still lands
             # on token T-1)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk3 = cute.arch.clock64()
             p_vg.consumer_wait(st_vg)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk4 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 0] = (pk4 - pk3).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_p, tq, 8 * strip + 3,
-                              ltid == 0)
             t0 = (c0 + tq) * BT
             n_valid = T - t0
             shift = t0 - cutlass.max(cutlass.min(t0, T - BT), 0)
@@ -1976,13 +1589,6 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                 if cutlass.const_expr(K != 128):
                     cute.arch.fence_view_async_tmem_store()
 
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk5 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 3] = (pk5 - pk4).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_p, tq, 8 * strip + 4,
-                              ltid == 0)
             p_g1.consumer_wait(st_g1c)    # gemm1f done -> acc1^T readable
             # v8 (K=128): pair-0 λ visibility (strip-1 written, commits
             # ~700-900; this point is ~1100+ — always satisfied, ~20 cyc
@@ -1997,13 +1603,6 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             if cutlass.const_expr(
                     self.need_lam and K == 128 and strip < SPP):
                 p_lam.consumer_wait(st_vg)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk6 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 4] = (pk6 - pk5).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_p, tq, 8 * strip + 5,
-                              ltid == 0)
 
             # ---- pass 2 (flip): x^T = lam ⊙ ([v|0]^T - acc1^T) -> bf16
             # -> smem (k-major B of gemm2). This group handles M-subtile
@@ -2080,13 +1679,6 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             cute.arch.fence_proxy("async.shared", space="cta")
             p_x.producer_commit(st_xp)
             st_xp.advance()
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pk7 = cute.arch.clock64()
-                if ltid == 0:
-                    prof_t[pofs + 5] = (pk7 - pk6).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_p, tq, 8 * strip + 6,
-                              ltid == 0)
             p_vg.consumer_release(st_vg)
 
             st_vg.advance()
@@ -2100,141 +1692,93 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             barrier_id=NB_EPILOG, num_threads=self.num_threads
         ).arrive_and_wait()
         # See `_pair_item`: rank 0's transition strips are read by nobody.
-        if cutlass.const_expr(not (is_h or self.push_transition)
-                              and not self.tsplit):
+        if cutlass.const_expr(not (is_h or self.push_transition)):
             return st_vg, st_g1c, st_g2c, st_xp
-        do_push = cutlass.Boolean(True)
-        if cutlass.const_expr(self.tsplit):
-            # read post-loop from the smem descriptor so no role flag
-            # stays live across the chunk loop
-            do_push = (sI_t[1] == 0) & (sI_t[3] == 0)
-        # BS>1: read batch post-loop (cold) so it never lives across the chunk
-        # loop; the push targets this batch's hm_sym slot.  Folds to 0 at B==1.
-        batch = sI_t[6] if cutlass.const_expr(self.B > 1) else 0
         if cutlass.const_expr(K == 128):
             cute.copy(t2r_x32, tXt32[(None, 0, 0)], rX)
             cute.arch.fence_view_async_tmem_load()
-            # See `_pair_item`: suppressed halves are zeroed on the pushing
-            # path only.
-            if do_push & ((sI_t[7] & (1 if is_h else 2)) == 0):
+            # See `_pair_item`: suppressed halves are zeroed, not skipped.
+            if (sI_t[7] & (1 if is_h else 2)) == 0:
                 for i in cutlass.range_constexpr(cute.size(rX)):
                     rX[i] = cutlass.Float32(0.0)
-            off0 = self._hm_off(par, self.rank, hv, strip, batch)
-            rowb = (off0 + cX32[0][0] * 64) * 4
-            if cutlass.const_expr(self.tsplit):
-                if ~do_push:
-                    # segment: park the strip in this (CTA, slot)'s hm_seg
-                    # slot for the head's first CTA to fold (a 2-slot CTA
-                    # would otherwise overwrite its slot-0 later-segment
-                    # while the neighbouring folder still reads it)
-                    bidx_, _, _ = cute.arch.block_idx()
-                    segb = (((bidx_ * self.NSLOT + slot) * self.NSTRIPS
-                             + strip) * self.STRIP
-                            + cX32[0][0] * 64)
-                    seg_row = cute.make_tensor(
-                        (pHMseg + segb).align(16),
-                        cute.make_layout(rX.shape))
-                    cute.autovec_copy(rX, seg_row)
-            if do_push:
-                if cutlass.const_expr(WS_COALESCED_PUSH):
-                    # ltid owns one complete state row.  Stage one 32-column
-                    # half at a time with a vector-XOR row layout, then have
-                    # each lane write a float4 from eight rows.  Across the
-                    # warp each STG instruction therefore covers four
-                    # adjacent rows and fills all 32B sectors.
-                    lane = ltid & 31
-                    warp_slot = (4 * strip + ltid // 32) * (32 * 32)
-                    warp_row0 = cX32[0][0] - lane
-                    for half in cutlass.range_constexpr(2):
-                        for v4 in cutlass.range_constexpr(8):
-                            src4 = cute.make_tensor(
-                                (rX.iterator
-                                 + 32 * half + 4 * v4).align(16),
-                                cute.make_layout(4),
-                            )
-                            phys = (lane * 32
-                                    + 4 * (v4 ^ (lane & 7)))
-                            dst4 = cute.make_tensor(
-                                (sPush_t.iterator
-                                 + warp_slot + phys).align(16),
-                                cute.make_layout(4),
-                            )
-                            cute.copy(atom_f32x4, src4, dst4)
-                        cute.arch.sync_warp()
-                        for q in cutlass.range_constexpr(8):
-                            lr = 4 * q + lane // 8
-                            v4 = lane & 7
-                            phys = (lr * 32
-                                    + 4 * (v4 ^ (lr & 7)))
-                            src4 = cute.make_tensor(
-                                (sPush_t.iterator
-                                 + warp_slot + phys).align(16),
-                                cute.make_layout(4),
-                            )
-                            col = 32 * half + 4 * v4
-                            for j in cutlass.range_constexpr(
-                                    self.rank + 1, self.R):
-                                dst4 = cute.make_tensor(
-                                    cute.make_ptr(
-                                        cutlass.Float32,
-                                        mPtrs[0, j]
-                                        + 4 * (off0
-                                               + (warp_row0 + lr) * 64
-                                               + col),
-                                        cute.AddressSpace.gmem,
-                                        assumed_align=16,
-                                    ),
-                                    cute.make_layout(4),
-                                )
-                                cute.copy(atom_f32x4, src4, dst4)
-                        cute.arch.sync_warp()
-                else:
-                    for j in cutlass.range_constexpr(self.rank + 1, self.R):
-                        dst_row = cute.make_tensor(
-                            cute.make_ptr(cutlass.Float32,
-                                          mPtrs[0, j] + rowb,
-                                          cute.AddressSpace.gmem,
-                                          assumed_align=16),
-                            cute.make_layout(rX.shape))
-                        cute.autovec_copy(rX, dst_row)
+            off0 = self._hm_off(par, self.rank, hv, strip)
+            # ltid owns one complete state row.  Stage one 32-column
+            # half at a time with a vector-XOR row layout, then have
+            # each lane write a float4 from eight rows.  Across the
+            # warp each STG instruction therefore covers four
+            # adjacent rows and fills all 32B sectors.
+            lane = ltid & 31
+            warp_slot = (4 * strip + ltid // 32) * (32 * 32)
+            warp_row0 = cX32[0][0] - lane
+            for half in cutlass.range_constexpr(2):
+                for v4 in cutlass.range_constexpr(8):
+                    src4 = cute.make_tensor(
+                        (rX.iterator
+                         + 32 * half + 4 * v4).align(16),
+                        cute.make_layout(4),
+                    )
+                    phys = (lane * 32
+                            + 4 * (v4 ^ (lane & 7)))
+                    dst4 = cute.make_tensor(
+                        (sPush_t.iterator
+                         + warp_slot + phys).align(16),
+                        cute.make_layout(4),
+                    )
+                    cute.copy(atom_f32x4, src4, dst4)
+                cute.arch.sync_warp()
+                for q in cutlass.range_constexpr(8):
+                    lr = 4 * q + lane // 8
+                    v4 = lane & 7
+                    phys = (lr * 32
+                            + 4 * (v4 ^ (lr & 7)))
+                    src4 = cute.make_tensor(
+                        (sPush_t.iterator
+                         + warp_slot + phys).align(16),
+                        cute.make_layout(4),
+                    )
+                    col = 32 * half + 4 * v4
+                    for j in cutlass.range_constexpr(
+                            self.rank + 1, self.R):
+                        dst4 = cute.make_tensor(
+                            cute.make_ptr(
+                                cutlass.Float32,
+                                mPtrs[0, j]
+                                + 4 * (off0
+                                       + (warp_row0 + lr) * 64
+                                       + col),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            ),
+                            cute.make_layout(4),
+                        )
+                        cute.copy(atom_f32x4, src4, dst4)
+                cute.arch.sync_warp()
         else:
             for sm in cutlass.range_constexpr(n_x_m):
                 for sn in cutlass.range_constexpr(n_x_n):
                     cute.copy(t2r_x, tXt[(None, sm, sn)], rXs)
                     cute.arch.fence_view_async_tmem_load()
-                    # See `_pair_item`: suppressed halves are zeroed on the
-                    # pushing path only.
-                    if do_push & ((sI_t[7] & (1 if is_h else 2)) == 0):
+                    # See `_pair_item`: suppressed halves are zeroed, not
+                    # skipped.
+                    if (sI_t[7] & (1 if is_h else 2)) == 0:
                         for i in cutlass.range_constexpr(sub_x):
                             rXs[i] = cutlass.Float32(0.0)
                     base = sub_x * (sm + n_x_m * sn)
-                    if cutlass.const_expr(self.tsplit):
-                        if ~do_push:
-                            bidx_, _, _ = cute.arch.block_idx()
-                            dstS = cute.make_tensor(
-                                pHMseg
-                                + ((bidx_ * self.NSLOT + slot)
-                                   * self.NSTRIPS + strip) * self.STRIP,
-                                cute.make_layout(self.STRIP))
-                            for i in cutlass.range_constexpr(sub_x):
-                                crd = cX[base + i]
-                                dstS[crd[0] * 64 + crd[1]] = rXs[i]
-                    off0 = self._hm_off(par, self.rank, hv, strip, batch)
-                    if do_push:
-                        for j in cutlass.range_constexpr(
-                                self.rank + 1, self.R):
-                            hm_j = mPtrs[0, j]
-                            dst = cute.make_tensor(
-                                cute.make_ptr(cutlass.Float32, hm_j,
-                                              cute.AddressSpace.gmem,
-                                              assumed_align=4),
-                                cute.make_layout(2 * self.R * self.B * self.HV
-                                                 * self.NSTRIPS
-                                                 * self.STRIP),
-                            )
-                            for i in cutlass.range_constexpr(sub_x):
-                                crd = cX[base + i]
-                                dst[off0 + crd[0] * 64 + crd[1]] = rXs[i]
+                    off0 = self._hm_off(par, self.rank, hv, strip)
+                    for j in cutlass.range_constexpr(
+                            self.rank + 1, self.R):
+                        hm_j = mPtrs[0, j]
+                        dst = cute.make_tensor(
+                            cute.make_ptr(cutlass.Float32, hm_j,
+                                          cute.AddressSpace.gmem,
+                                          assumed_align=4),
+                            cute.make_layout(2 * self.R * self.HV
+                                             * self.NSTRIPS
+                                             * self.STRIP),
+                        )
+                        for i in cutlass.range_constexpr(sub_x):
+                            crd = cX[base + i]
+                            dst[off0 + crd[0] * 64 + crd[1]] = rXs[i]
         return st_vg, st_g1c, st_g2c, st_xp
 
     # ----------------------------------------------------------- MMA warp
@@ -2243,7 +1787,7 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         self, nc, tiled_mma1f, tiled_mma2f,
         sWb_t, sKt_t, sXf_t, sxt_t, tAcc1ps, tXps,
         p_wk, p_g1s, p_g2s, p_pubs, p_xs, p_lam,
-        st_wk, st_pub, st_xc, st_xcb, st_one, prof_t, sI_t,
+        st_wk, st_pub, st_xc, st_xcb, st_one,
     ):
         # flip: gemm1 is acc1^T = X^T @ W^T -> A = X^T (stage = pair),
         # B = W (stage = wk); gemm2 keeps A = K^T (stage = wk) but B is
@@ -2263,36 +1807,13 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             p_g2s[pp].producer_commit(st_one)
         # ping-pong: pair A's gemm executes while pair B publishes and
         # vice versa; each pair's chain only waits on its own commits
-        if cutlass.const_expr((WS_PROF or WS_PROF_TS) and not self.tsplit):
-            lidx = cute.arch.lane_idx()
-            bidx_, _, _ = cute.arch.block_idx()
-        if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-            basec = sI_t[5]
         for t in cutlass.range(nc, unroll=1):
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pbase = (bidx_ * PROF_NCH
-                         + cutlass.min(t, PROF_NCH - 1)) * PROF_SLOTS
-                pt0 = cute.arch.clock64()
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_, t, 32, lidx == 0)
             p_wk.consumer_wait(st_wk)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pt1 = cute.arch.clock64()
-                if lidx == 0:
-                    prof_t[pbase + 24] = (pt1 - pt0).to(cutlass.Float32)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_, t, 33, lidx == 0)
             if cutlass.const_expr(self.K == 128):
                 # staircase: k-phase pair w starts once X rows
                 # [32w, 32w+32) of both strips are published
-                if cutlass.const_expr(WS_PROF and not self.tsplit):
-                    pw0 = cutlass.Int64(0)
                 for w in cutlass.range_constexpr(4):
-                    if cutlass.const_expr(WS_PROF and not self.tsplit):
-                        pa = cute.arch.clock64()
                     p_pubs[0][w].consumer_wait(st_pub)
-                    if cutlass.const_expr(WS_PROF and not self.tsplit):
-                        pw0 = pw0 + (cute.arch.clock64() - pa)
                     mma1 = self._exec_gemm(mma1, tAcc1ps[0], tCrX, tCrW,
                                            0, st_wk.index,
                                            kp_lo=2 * w, kp_hi=2 * w + 2)
@@ -2300,22 +1821,12 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                 # 18-warp s1-writer scheme) gated the commit on the lambda
                 # tail; the direct pair-0 reader wait remains preferable.
                 p_g1s[0].producer_commit(st_one)
-                if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                    self._ts_mark(prof_t, basec, bidx_, t, 34, lidx == 0)
-                if cutlass.const_expr(WS_PROF and not self.tsplit):
-                    if lidx == 0:
-                        prof_t[pbase + 25] = pw0.to(cutlass.Float32)
-                    pw1 = cutlass.Int64(0)
                 # Pair 1 is the transition half; on a rank whose transition is
                 # unreadable it has no warps to feed and its gemms are dropped
                 # along with the edges that would order them.
                 if cutlass.const_expr(self.n_groups_live > 1):
                     for w in cutlass.range_constexpr(4):
-                        if cutlass.const_expr(WS_PROF and not self.tsplit):
-                            pa = cute.arch.clock64()
                         p_pubs[1][w].consumer_wait(st_pub)
-                        if cutlass.const_expr(WS_PROF and not self.tsplit):
-                            pw1 = pw1 + (cute.arch.clock64() - pa)
                         mma1 = self._exec_gemm(mma1, tAcc1ps[1], tCrX, tCrW,
                                                1, st_wk.index,
                                                kp_lo=2 * w, kp_hi=2 * w + 2)
@@ -2326,19 +1837,8 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                     if cutlass.const_expr(self.need_lam):
                         p_lam.consumer_wait(st_wk)
                     p_g1s[1].producer_commit(st_one)
-                if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                    self._ts_mark(prof_t, basec, bidx_, t, 35, lidx == 0)
-                if cutlass.const_expr(WS_PROF and not self.tsplit):
-                    if lidx == 0:
-                        prof_t[pbase + 26] = pw1.to(cutlass.Float32)
             else:
-                if cutlass.const_expr(WS_PROF and not self.tsplit):
-                    pa = cute.arch.clock64()
                 p_pubs[0][0].consumer_wait(st_pub)  # pair A X published
-                if cutlass.const_expr(WS_PROF and not self.tsplit):
-                    if lidx == 0:
-                        prof_t[pbase + 25] = (
-                            cute.arch.clock64() - pa).to(cutlass.Float32)
                 mma1 = self._exec_gemm(mma1, tAcc1ps[0], tCrX, tCrW,
                                        0, st_wk.index)
                 # K=64 keeps the v6 λ edge: strip-0 writer, waited before
@@ -2346,212 +1846,47 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                 if cutlass.const_expr(self.need_lam):
                     p_lam.consumer_wait(st_wk)
                 p_g1s[0].producer_commit(st_one)
-                if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                    self._ts_mark(prof_t, basec, bidx_, t, 34, lidx == 0)
-                if cutlass.const_expr(WS_PROF and not self.tsplit):
-                    pa = cute.arch.clock64()
                 # See the K=128 branch: pair B is the transition half.
                 if cutlass.const_expr(self.n_groups_live > 1):
                     p_pubs[1][0].consumer_wait(st_pub)  # pair B X published
-                    if cutlass.const_expr(WS_PROF and not self.tsplit):
-                        if lidx == 0:
-                            prof_t[pbase + 26] = (
-                                cute.arch.clock64() - pa).to(cutlass.Float32)
                     mma1 = self._exec_gemm(mma1, tAcc1ps[1], tCrX, tCrW,
                                            1, st_wk.index)
                     p_g1s[1].producer_commit(st_one)
-                if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                    self._ts_mark(prof_t, basec, bidx_, t, 35, lidx == 0)
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pa = cute.arch.clock64()
             p_xs[0].consumer_wait(st_xc)      # pair A x^T half 0
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                px0 = cute.arch.clock64() - pa
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_, t, 36, lidx == 0)
             mma2 = self._exec_gemm(mma2, tXps[0], tCrKt, tCrx,
                                    st_wk.index, 0, acc_init=True,
                                    kp_lo=0, kp_hi=NKH)
             st_xc.advance()
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                pa = cute.arch.clock64()
             p_xs[0].consumer_wait(st_xc)      # pair A x^T half 1
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                px0 = px0 + (cute.arch.clock64() - pa)
-                if lidx == 0:
-                    prof_t[pbase + 27] = px0.to(cutlass.Float32)
             mma2 = self._exec_gemm(mma2, tXps[0], tCrKt, tCrx,
                                    st_wk.index, 0, acc_init=True,
                                    kp_lo=NKH)
             p_g2s[0].producer_commit(st_one)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_, t, 37, lidx == 0)
             # Pair B's gemm2. Dropped with the rest of the transition pair when
             # it is dead; `st_xcb` then advances once per chunk instead of
             # twice, which is unobservable because nothing waits on p_xs[1].
             if cutlass.const_expr(self.n_groups_live > 1):
-                if cutlass.const_expr(WS_PROF and not self.tsplit):
-                    pa = cute.arch.clock64()
                 p_xs[1].consumer_wait(st_xcb)     # pair B x^T half 0
-                if cutlass.const_expr(WS_PROF and not self.tsplit):
-                    px1 = cute.arch.clock64() - pa
-                if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                    self._ts_mark(prof_t, basec, bidx_, t, 38, lidx == 0)
                 mma2 = self._exec_gemm(mma2, tXps[1], tCrKt, tCrx,
                                        st_wk.index, 1, acc_init=True,
                                        kp_lo=0, kp_hi=NKH)
                 st_xcb.advance()
-                if cutlass.const_expr(WS_PROF and not self.tsplit):
-                    pa = cute.arch.clock64()
                 p_xs[1].consumer_wait(st_xcb)     # pair B x^T half 1
-                if cutlass.const_expr(WS_PROF and not self.tsplit):
-                    px1 = px1 + (cute.arch.clock64() - pa)
-                    if lidx == 0:
-                        prof_t[pbase + 28] = px1.to(cutlass.Float32)
                 mma2 = self._exec_gemm(mma2, tXps[1], tCrKt, tCrx,
                                        st_wk.index, 1, acc_init=True,
                                        kp_lo=NKH)
                 p_g2s[1].producer_commit(st_one)
-            if cutlass.const_expr(WS_PROF_TS and not self.tsplit):
-                self._ts_mark(prof_t, basec, bidx_, t, 39, lidx == 0)
             p_wk.consumer_release(st_wk)  # frees W/K once all gemms drain
-            if cutlass.const_expr(WS_PROF and not self.tsplit):
-                if lidx == 0:
-                    prof_t[pbase + 29] = (
-                        cute.arch.clock64() - pt0).to(cutlass.Float32)
             st_wk.advance()
             st_pub.advance()
             st_xc.advance()
             st_xcb.advance()
         return st_wk, st_pub, st_xc, st_xcb
 
-    # ----------------------------------------------------------- fold kernel
-    @cute.kernel
-    def fold_kernel(self, tiled_mma: cute.TiledMma,
-                    tiled_copy_M: cute.TiledCopy, sM_layout: cute.Layout,
-                    mPtrs: cute.Tensor, pHMseg: cute.Pointer,
-                    pSegFl: cute.Pointer, step: cutlass.Int32,
-                    emit: cutlass.Int32):
-        """Second launch (tsplit): CTA i composes the later segments of
-        the head whose first segment CTA i computed — per strip b,
-        X_b <- M_m @ X_b + [h_m,b | 0] over segments m in time order
-        (SM80 hi/lo bf16 fold = the CP rank-fold numerics) — then pushes
-        the folded strips and signals the consumer flags. Stream order
-        makes all hm_seg parking visible; no flags or spins between the
-        two kernels. 128 threads/CTA: no register cliff, so all NSTRIPS
-        accumulators stay in registers and M stages+converts once per
-        segment (m-outer)."""
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        par = step % 2
-        stepu = step.to(cutlass.Uint32)
-        R, rank = self.R, self.rank
-        K = self.K
-        dtype = self.io_dtype
-
-        smem = utils.SmemAllocator()
-        fstorage = smem.allocate(self.fold_storage)
-
-        # fold descriptor row i: (valid, hv, own_slot, n_later)
-        dsc = cute.make_tensor(
-            pSegFl + (cutlass.Int32(self.n_sm
-                                    + self.n_ctas * self.NSLOT * 8)
-                      + cutlass.Int32(bidx) * 8),
-            cute.make_layout(8))
-        if dsc[0].to(cutlass.Int32) != 0:
-            hv = dsc[1].to(cutlass.Int32)
-            own_slot = dsc[2].to(cutlass.Int32)
-            n_later = dsc[3].to(cutlass.Int32)
-
-            mRaw = fstorage.fRaw.get_tensor(
-                cute.make_layout(self.NK * self.STRIP))
-            mRawHe = fstorage.fHe.get_tensor(
-                cute.make_layout(self.STRIP))
-            sMhi = fstorage.fHi.get_tensor(sM_layout)
-            sMlo = fstorage.fLo.get_tensor(sM_layout)
-            stripT_layout = cute.make_layout((64, K), stride=(1, 64))
-            mAddT_smem = cute.make_tensor(mRawHe.iterator, stripT_layout)
-            thr_mma = tiled_mma.get_slice(tidx)
-            tHe0 = thr_mma.partition_C(mAddT_smem)
-
-            # ack throttle before the pushes
-            ackv = cutlass.max(step - 2, 0).to(cutlass.Uint32)
-            ak_loc = mPtrs[2, rank]
-            if tidx == 0:
-                for cc in cutlass.range_constexpr(rank + 1, R):
-                    for b in cutlass.range_constexpr(self.NB):
-                        self._spin_ge_sys(
-                            ak_loc, (cc * self.HV + hv) * self.NB + b,
-                            ackv)
-            cute.arch.barrier()
-
-            # ONE accumulator (a [64,K] tile over 128 threads is 64
-            # regs/thread — four of them spilled even at the 255 cap):
-            # strip-outer, M re-staged per (strip, segment); the extra
-            # ~64KB L2 reads per strip are cheap in this tiny kernel
-            macc = cute.make_rmem_tensor(
-                thr_mma.partition_shape_C((64, K)), cutlass.Float32)
-            rAhi = cute.make_fragment_like(macc, dtype)
-            rAlo = cute.make_fragment_like(macc, dtype)
-
-            for b in cutlass.range_constexpr(self.NSTRIPS):
-                # init: our own segment's strip b
-                self._stage_he_issue(
-                    pHMseg + (own_slot * self.NSTRIPS + b) * self.STRIP,
-                    mRawHe, tiled_copy_M, tidx)
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.barrier()
-                for i in cutlass.range_constexpr(cute.size(macc)):
-                    macc[i] = tHe0[i]
-                cute.arch.barrier()  # reads done before restaging
-                m = cutlass.Int32(1)
-                while m <= n_later:
-                    # producers' later-segments live in THEIR slot 0
-                    pslot = (cutlass.Int32(bidx) + m) * self.NSLOT
-                    self._stage_issue(
-                        pHMseg
-                        + (pslot * self.NSTRIPS + self.NV) * self.STRIP,
-                        mRaw, tiled_copy_M, tidx)
-                    self._stage_he_issue(
-                        pHMseg + (pslot * self.NSTRIPS + b) * self.STRIP,
-                        mRawHe, tiled_copy_M, tidx)
-                    cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(0)
-                    cute.arch.barrier()  # raw M + addend landed
-                    self._convert_raw(mRaw, sMhi, sMlo, tidx)
-                    self._snapshot_and_init(thr_mma, macc, rAhi, rAlo,
-                                            mAddT_smem, b < self.NV)
-                    cute.arch.barrier()  # hi/lo published; raw read done
-                    self._fold_gemms(thr_mma, tiled_mma, macc,
-                                     rAhi, rAlo, sMhi, sMlo, tidx)
-                    m += 1
-                # See `_pair_item`: the emit mask is applied to the COMPOSED
-                # summary, not to the parked segments the compose reads.
-                if (emit & (1 if b < self.NV else 2)) == 0:
-                    for i in cutlass.range_constexpr(cute.size(macc)):
-                        macc[i] = cutlass.Float32(0.0)
-                # push folded strip b to every consumer rank
-                for j in cutlass.range_constexpr(rank + 1, R):
-                    dptr = cute.make_ptr(
-                        cutlass.Float32, mPtrs[0, j],
-                        cute.AddressSpace.gmem, assumed_align=16,
-                    ) + self._hm_off(par, rank, hv, b)
-                    gBlk = cute.make_tensor(dptr, stripT_layout)
-                    tBlk = thr_mma.partition_C(gBlk)
-                    for i in cutlass.range_constexpr(cute.size(macc)):
-                        tBlk[i] = macc[i]
-                cute.arch.barrier()  # pushes done before next restage
-            cute.arch.fence_acq_rel_sys()
-            if tidx == 0:
-                # fold kernel is tsplit-only (B == 1 asserted), so batch = 0
-                self._flag_consumers(mPtrs, 0, hv, stepu)
-
-    # one monotonic step flag per (strip, consumer rank) — shared by the
-    # compute item tail and the fold kernel
+    # one monotonic step flag per (strip, consumer rank)
     @cute.jit
-    def _flag_consumers(self, mPtrs, batch, hv, stepu):
-        rb = (self.rank * self.B + batch) * self.HV + hv
+    def _flag_consumers(self, mPtrs, hv, stepu):
+        rb = self.rank * self.HV + hv
         for j in cutlass.range_constexpr(self.rank + 1, self.R):
             for s in cutlass.range_constexpr(self.NSTRIPS):
                 self._signal_relaxed_sys(
@@ -2562,11 +1897,11 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
     # ------------------------------------------------------------ merge role
     @cute.jit
     def _merge_role(self, tidx, b, hv, par, stepu, mPtrs, mH0, pHMloc,
-                    storage, tiled_mma, tiled_copy_M, sM_layout, batch=0):
-        """SM80 warp-MMA fold chain (parent kernel's merge role) on warps
+                    storage, tiled_mma, tiled_copy_M, sM_layout):
+        """SM80 warp-MMA fold chain (`CPProtocolMixin` helpers) on warps
         0-3, NamedBarrier(NB_MERGE, 128) instead of CTA barriers.
 
-        `b` is the V-subtile (0..NB); `batch` is the BS>1 sequence index."""
+        `b` is the V-subtile (0..NB)."""
         bar = pipeline.NamedBarrier(barrier_id=NB_MERGE, num_threads=128)
         dtype = self.io_dtype
         K = self.K
@@ -2597,10 +1932,10 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
         if tidx == 0:
             self._spin_ge_sys(
                 fl_loc,
-                ((0 * self.B + batch) * self.HV + hv) * self.NSTRIPS + b,
+                (0 * self.HV + hv) * self.NSTRIPS + b,
                 stepu)
         bar.arrive_and_wait()
-        self._stage_he_issue(pHMloc + self._hm_off(par, 0, hv, b, batch),
+        self._stage_he_issue(pHMloc + self._hm_off(par, 0, hv, b),
                              mRawHe, tiled_copy_M, tidx)
         cute.arch.cp_async_commit_group()
         rAhi = cute.make_fragment_like(macc, dtype)
@@ -2614,12 +1949,12 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
 
         if cutlass.const_expr(rank > 1):
             if tidx == 0:
-                self._spin_producer_sys(fl_loc, 1, hv, b, stepu, batch)
+                self._spin_producer_sys(fl_loc, 1, hv, b, stepu)
             bar.arrive_and_wait()
             self._stage_issue(
-                pHMloc + self._hm_off(par, 1, hv, self.NV, batch),
+                pHMloc + self._hm_off(par, 1, hv, self.NV),
                 mRaw, tiled_copy_M, tidx)
-            self._stage_he_issue(pHMloc + self._hm_off(par, 1, hv, b, batch),
+            self._stage_he_issue(pHMloc + self._hm_off(par, 1, hv, b),
                                  mRawHe, tiled_copy_M, tidx)
             cute.arch.cp_async_commit_group()
         for j in cutlass.range_constexpr(1, rank):
@@ -2630,23 +1965,22 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
                                     mAddT_smem, True)
             if cutlass.const_expr(j + 1 < rank):
                 if tidx == 0:
-                    self._spin_producer_sys(fl_loc, j + 1, hv, b, stepu, batch)
+                    self._spin_producer_sys(fl_loc, j + 1, hv, b, stepu)
             bar.arrive_and_wait()
             if cutlass.const_expr(j + 1 < rank):
                 self._stage_issue(
-                    pHMloc + self._hm_off(par, j + 1, hv, self.NV, batch),
+                    pHMloc + self._hm_off(par, j + 1, hv, self.NV),
                     mRaw, tiled_copy_M, tidx)
                 self._stage_he_issue(
-                    pHMloc + self._hm_off(par, j + 1, hv, b, batch),
+                    pHMloc + self._hm_off(par, j + 1, hv, b),
                     mRawHe, tiled_copy_M, tidx)
                 cute.arch.cp_async_commit_group()
             self._fold_gemms(thr_mma, tiled_mma, macc, rAhi, rAlo,
                              sMhi, sMlo, tidx)
 
-        # h0 is [B, HV, K, V]; batch stride = HV*K*V
+        # h0[hv, k, 64b + c] transposed block view (64, K):(1, V)
         gH0 = cute.make_tensor(
-            mH0.iterator + (batch * self.HV * self.K * self.V
-                            + hv * self.K * self.V + b * 64),
+            mH0.iterator + (hv * self.K * self.V + b * 64),
             cute.make_layout((64, self.K), stride=(1, self.V)),
         )
         tH0 = thr_mma.partition_C(gH0)
@@ -2658,91 +1992,44 @@ class PreProcessFwdFusedWS(PreProcessFwdFused):
             for j in cutlass.range_constexpr(rank):
                 self._signal_relaxed_sys(
                     mPtrs[2, j],
-                    ((rank * self.B + batch) * self.HV + hv) * self.NB + b,
+                    (rank * self.HV + hv) * self.NB + b,
                     stepu
                 )
 
 
 # ---------------------------------------------------------------------- host
-def walk_descriptor(T, HV, n_ctas, nslot, tsplit, B=1):
-    """Host-precomputed per-(CTA, slot) compute items for the balanced walk:
-    int32 rows (hv, c0, c1, n_later, valid, 0, batch, 0).
+def walk_descriptor(HV, n_ctas, nslot):
+    """Host-precomputed per-(CTA, slot) compute items of the whole-head walk:
+    int32 rows (hv, 0, 0, 0, valid, 0, 0, 0).
 
-    Non-tsplit: whole WORK-HEADS over B*HV (each item is a full [0, NT) scan
-    of one (batch, hv)); CTA i owns heads {i, i+eff0, i+2*eff0, ...}.  For
-    B == 1 and n_ctas >= HV this is byte-identical to the pre-batch table.
-    tsplit (B == 1): contiguous ~total/eff chunk-unit ranges; a head crossing
-    a range boundary becomes segments (later segments produced by consecutive
-    CTAs, in their slot 0 — the wait graph is acyclic).
+    Each item is a full [0, NT) scan of one head; CTA i owns heads
+    {i, i+eff0, i+2*eff0, ...}.  The table is a pure function of the geometry
+    (the kernel derives its chunk count from the dynamic `T`), so a wrapper
+    builds and uploads it once.
 
-    Vectorized over CTAs.  Every field is an affine or floor-div function of
+    Vectorized over CTAs: every field is an affine or floor-div function of
     the CTA index, so the scalar `n_ctas x nslot` walk collapses to a handful
-    of integer tensor ops; the remaining Python loop is over `nslot`, which is
-    1 (whole-head) or 2 (tsplit).  THD resamples the packing every step, so
-    this runs on the per-step critical path — the scalar form cost 2.13 ms to
-    fill 8 KB.  Byte-identical to that form; see
-    `tests/context_parallel/test_walk_descriptor_vectorized.py`."""
-    NT = (T + BT - 1) // BT
+    of integer tensor ops."""
     d = torch.zeros(n_ctas, nslot, 8, dtype=torch.int32)
-    f = torch.zeros(n_ctas, 8, dtype=torch.int32)
     idx = torch.arange(n_ctas, dtype=torch.int64)
-    if not tsplit:
-        nwork = B * HV
-        eff0 = min(n_ctas, nwork)
-        assert nslot * eff0 >= nwork, "NSLOT too small for the walk"
-        slots = torch.arange(nslot, dtype=torch.int64)
-        wh = idx[:, None] + slots[None, :] * eff0       # [n_ctas, nslot]
-        live = wh < nwork
-        whm = torch.where(live, wh, torch.zeros_like(wh))
-        d[..., 0] = torch.where(live, whm % HV, 0).to(torch.int32)   # hv
-        d[..., 2] = torch.where(live, NT, 0).to(torch.int32)         # c1
-        d[..., 4] = live.to(torch.int32)                             # valid
-        d[..., 6] = torch.where(live, whm // HV, 0).to(torch.int32)  # batch
-        return torch.cat([d.flatten(), f.flatten()])
-    # tsplit path (B == 1): chunk-balanced ranges + mid-head folding
-    total = HV * NT
-    eff = min(n_ctas, max(HV, total // 32))
-    lo = torch.clamp(idx * total // eff, max=total)
-    hi = torch.clamp((idx + 1) * total // eff, max=total)
-    for slot in range(nslot):
-        live = lo < hi
-        if not bool(live.any()):
-            break
-        hv = torch.where(live, lo // NT, torch.zeros_like(lo))
-        c0 = lo - hv * NT
-        c1 = torch.clamp(hi - hv * NT, max=NT)
-        fold = live & (c0 == 0) & (c1 < NT)
-        nlater = torch.where(
-            fold, ((hv + 1) * NT * eff - 1) // total - idx,
-            torch.zeros_like(lo))
-        d[:, slot, 0] = torch.where(live, hv, 0).to(torch.int32)
-        d[:, slot, 1] = torch.where(live, c0, 0).to(torch.int32)
-        d[:, slot, 2] = torch.where(live, c1, 0).to(torch.int32)
-        d[:, slot, 3] = torch.where(live, nlater, 0).to(torch.int32)
-        d[:, slot, 4] = live.to(torch.int32)
-        # fold-kernel row: (valid, hv, own_slot, n_later).  The scalar loop
-        # overwrites f[i] on a later qualifying slot, so assign in slot order.
-        f64 = f.to(torch.int64)
-        f[:, 0] = torch.where(fold, 1, f64[:, 0]).to(torch.int32)
-        f[:, 1] = torch.where(fold, hv, f64[:, 1]).to(torch.int32)
-        f[:, 2] = torch.where(fold, idx * nslot + slot, f64[:, 2]).to(torch.int32)
-        f[:, 3] = torch.where(fold, nlater, f64[:, 3]).to(torch.int32)
-        lo = torch.where(live, hv * NT + c1, lo)
-    assert not bool((lo < hi).any()), "NSLOT too small for the walk"
-    return torch.cat([d.flatten(), f.flatten()])
+    eff0 = min(n_ctas, HV)
+    assert nslot * eff0 >= HV, "NSLOT too small for the walk"
+    slots = torch.arange(nslot, dtype=torch.int64)
+    wh = idx[:, None] + slots[None, :] * eff0       # [n_ctas, nslot]
+    live = wh < HV
+    d[..., 0] = torch.where(live, wh, 0).to(torch.int32)   # hv
+    d[..., 4] = live.to(torch.int32)                       # valid
+    return d.flatten()
 
 
-class CuteDSLFusedCPPreProcessWS:
-    """Host wrapper for whole-head or balanced T-split WS execution."""
+class CuteDSLFusedCPPreProcessWS(CPHostCaches):
+    """Host wrapper for whole-head WS execution."""
 
-    def __init__(self, group, H, HV, DK, DV, gate_mode="g", device=None,
-                 split=1, auto_split=True):
+    def __init__(self, group, H, HV, DK, DV, gate_mode="g", device=None):
         import torch.distributed as dist
 
         from .symm import CPSymmBuffers
 
-        del auto_split
-        assert split >= 1, "split must be >= 1"
         self.group = group
         self.R = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
@@ -2753,9 +2040,6 @@ class CuteDSLFusedCPPreProcessWS:
         self.ptrs = torch.stack(
             [self.bufs.hm_ptrs, self.bufs.fl_ptrs, self.bufs.ak_ptrs]
         ).contiguous()
-        # split != 1 enables the balanced T-split over all SMs (segment
-        # compose = CP-fold numerics, not bit-exact vs the unsplit scan)
-        self.tsplit = split > 1 and self.rank < self.R - 1
         # Keep the canonical full-chunk specialization byte-for-byte: in
         # none/gk mode it compiles out the lambda publication chain.  Ragged
         # calls lazily compile the generic tail-masked specialization instead
@@ -2765,58 +2049,28 @@ class CuteDSLFusedCPPreProcessWS:
         aligned_key = PreProcessFwdFusedWS.build_key(gate_mode, True)
         self._ops = {
             aligned_key: PreProcessFwdFusedWS(
-                H, HV, DK, DV, gate_mode, self.R, self.rank,
-                tsplit=self.tsplit, full_chunks=True,
+                H, HV, DK, DV, gate_mode, self.R, self.rank, full_chunks=True,
             )
         }
         self.op = self._ops[aligned_key]
-        nstrips = DV // 64 + DK // 64
-        if self.tsplit:
-            self.hm_seg = torch.zeros(
-                self.op.n_ctas * self.op.NSLOT * nstrips * DK * 64,
-                dtype=torch.float32, device=self.device)
-        else:
-            self.hm_seg = torch.zeros(1, dtype=torch.float32,
-                                      device=self.device)
-        # [n_sm flags][n_ctas x NSLOT x 8 int32 walk descriptors]
+        # [n_sm reserved words][n_ctas x NSLOT x 8 int32 walk descriptors].
+        # Only producer ranks own a walk table.  It is a pure function of the
+        # geometry -- the kernel derives its chunk count from the dynamic `T`
+        # (see `ws_kernel`) -- so it is uploaded once here and never touched
+        # again; under THD `nt` changes every step, and a per-length retune
+        # used to be a ~5.7 us host dispatch plus its own kernel launch per
+        # direction per layer per step.
         self.seg_flags = torch.zeros(
-            self.op.n_sm + self.op.n_ctas * (self.op.NSLOT + 1) * 8,
+            self.op.n_sm + self.op.n_ctas * self.op.NSLOT * 8,
             dtype=torch.uint32, device=self.device)
-        self._desc_nt = None
-        # The walk depends on ceil(T / BT), not the exact logical T. Keep a
-        # small CPU LRU so recurring mixed lengths avoid rebuilding the table;
-        # one live device table retains the existing stream-order semantics.
-        self._descriptor_cache = OrderedDict()
-        self._descriptor_cache_limit = WS_DESCRIPTOR_CACHE_SIZE
-        # Whole-head walk: `nt` enters the table in exactly one place, the c1
-        # column of the live (CTA, slot) rows — every other field is fixed by
-        # the geometry.  THD packs a fresh partitioning every step, so `nt`
-        # changes every step; retuning then costs one small device fill on the
-        # compute stream instead of a host rebuild plus an 8 KB pageable H2D.
-        # tsplit repartitions the whole HV*NT unit space with `nt`, so it keeps
-        # the rebuild-and-upload path (now vectorized).
-        self._c1_idx = None
-        self._seg_i32 = None
-        # Only producer ranks own a walk table; the last rank never retunes.
-        if not self.tsplit and self.rank < self.R - 1:
-            nwork = self.HV
-            eff0 = min(self.op.n_ctas, nwork)
-            i = torch.arange(self.op.n_ctas, dtype=torch.int64)
-            s = torch.arange(self.op.NSLOT, dtype=torch.int64)
-            live = (i[:, None] + s[None, :] * eff0) < nwork
-            flat = (i[:, None] * self.op.NSLOT + s[None, :])[live]
-            try:
-                self._seg_i32 = self.seg_flags.view(torch.int32)
-            except RuntimeError:      # no same-width dtype view on this build
-                self._seg_i32 = None
-            if self._seg_i32 is not None:
-                self._c1_idx = (
-                    self.op.n_sm + flat * 8 + 2
-                ).to(device=self.device)
+        if self.rank < self.R - 1:
+            self.seg_flags[self.op.n_sm:].copy_(
+                walk_descriptor(self.HV, self.op.n_ctas, self.op.NSLOT)
+                .view(torch.uint32)
+            )
         self.step = 0
         self._compiled = {}
-        self._ptr_cache = OrderedDict()
-        self._stream_cache = {}
+        self._init_host_caches()
         self._h0_zero = None
         # The inactive gate still occupies a positional kernel argument.
         # Keep one stable device allocation per wrapper instead of allocating
@@ -2825,68 +2079,6 @@ class CuteDSLFusedCPPreProcessWS:
             1, 1, 1, dtype=torch.float32, device=self.device)
         self._dummy_gk = torch.zeros(
             1, 1, 1, 1, dtype=torch.float32, device=self.device)
-
-    def _p(self, t, dtype):
-        """Memoize the CuTeDSL pointer object for a device address.
-
-        LRU, not fill-and-stop.  Under THD the producer window starts at a
-        different `bos` every step, so most arguments arrive with an address
-        never seen before; a cache that stops inserting once full ends up
-        holding only the addresses from the first thousand steps and misses on
-        every call thereafter.  Evicting keeps the entries that recur (the
-        symmetric buffers, the descriptors, the dummy gates) resident and bounds
-        the retained pointer objects at the same time.
-        """
-        key = (t.data_ptr(), dtype)
-        p = self._ptr_cache.get(key)
-        if p is not None:
-            self._ptr_cache.move_to_end(key)
-            return p
-        p = make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem,
-                     assumed_align=16)
-        self._ptr_cache[key] = p
-        if len(self._ptr_cache) > PTR_CACHE_SIZE:
-            self._ptr_cache.popitem(last=False)
-        return p
-
-    def _descriptor_for_nt(self, nt):
-        descriptor = self._descriptor_cache.get(nt)
-        if descriptor is None:
-            global _DESC_REBUILD_COUNT
-            _DESC_REBUILD_COUNT += 1
-            descriptor = walk_descriptor(
-                nt * BT,
-                self.HV,
-                self.op.n_ctas,
-                self.op.NSLOT,
-                self.tsplit,
-            )
-            self._descriptor_cache[nt] = descriptor
-            if len(self._descriptor_cache) > self._descriptor_cache_limit:
-                self._descriptor_cache.popitem(last=False)
-        else:
-            self._descriptor_cache.move_to_end(nt)
-        return descriptor
-
-    def _retune_descriptor(self, nt):
-        """Point the resident device walk table at a new chunk cover.
-
-        Whole-head walk: the table is `nt`-invariant apart from the c1 column,
-        so once it is resident a new length is one `index_fill_` on the compute
-        stream — no host build, no H2D, no sync.  The first call still uploads
-        the full table (c1 lands on it for free).
-        """
-        global _DESC_RETUNE_COUNT, _DESC_UPLOAD_COUNT
-        _DESC_RETUNE_COUNT += 1
-        if self._c1_idx is not None and self._desc_nt is not None:
-            self._seg_i32.index_fill_(0, self._c1_idx, nt)
-            self._desc_nt = nt
-            return
-        _DESC_UPLOAD_COUNT += 1
-        self.seg_flags[self.op.n_sm:].copy_(
-            self._descriptor_for_nt(nt).view(torch.uint32)
-        )
-        self._desc_nt = nt
 
     @torch.no_grad()
     def launch_validated(
@@ -3005,33 +2197,6 @@ class CuteDSLFusedCPPreProcessWS:
                 f"{self.device}"
             )
 
-    def _cu_stream(self, handle=None):
-        """`cuda.CUstream` for the current torch stream, memoized by handle.
-
-        The handle still has to be read every call -- the caller may have
-        switched streams -- but `torch.cuda.current_stream()` builds a
-        `torch.cuda.Stream` object to then throw it away, which costs ~3.1 us
-        against 0.09 us for the raw accessor. Wrapping the handle allocates a
-        ctypes object too, and a training run uses a handful of distinct
-        streams for its whole life, so that is cached on the handle.
-        """
-        if handle is None:
-            handle = _raw_stream(self.device.index)
-        stream = self._stream_cache.get(handle)
-        if stream is None:
-            stream = cuda.CUstream(handle)
-            self._stream_cache[handle] = stream
-        return stream
-
-    @staticmethod
-    def _normalize_gate(gate, dummy):
-        """fp32-contiguous view of a gate slot, without a no-op ATen call."""
-        if gate is None:
-            return dummy
-        if gate.dtype is not torch.float32:
-            gate = gate.float()
-        return gate if gate.is_contiguous() else gate.contiguous()
-
     def _launch(
         self, k, v, w, g, gk, h0_out, emit_h=True, emit_m=True, _stream_handle=None
     ):
@@ -3046,29 +2211,9 @@ class CuteDSLFusedCPPreProcessWS:
             else:
                 h0_out = torch.empty(self.HV, self.DK, self.DV,
                                      dtype=torch.float32, device=self.device)
-        # The gate normalisation used to be an unconditional
-        # `.float().contiguous()` on both slots. The dummies are already fp32
-        # and contiguous, and the live gate arrives fp32 from
-        # `chunk_local_cumsum` and contiguous by the caller's contract, so all
-        # four ATen dispatches were no-ops that still cost host time on the
-        # per-step path. The predicates below are cheap C calls and keep the
-        # old behaviour for a caller that does hand over a bf16 or strided
-        # gate.
-        g = self._normalize_gate(g, self._dummy_g)
-        gk = self._normalize_gate(gk, self._dummy_gk)
+        g = _normalize_gate(g, self._dummy_g)
+        gk = _normalize_gate(gk, self._dummy_gk)
 
-        # Only producer ranks own a walk table. The whole-head walk is now
-        # fully `nt`-invariant -- the kernel derives its chunk count from the
-        # dynamic `T` (see `ws_kernel`) -- so the table is uploaded once and
-        # never touched again. tsplit repartitions the whole HV*NT unit space
-        # with `nt` and keeps the per-length retune.
-        if self.rank < self.R - 1:
-            nt = (T + BT - 1) // BT
-            if self.tsplit:
-                if nt != self._desc_nt:
-                    self._retune_descriptor(nt)
-            elif self._desc_nt is None:
-                self._retune_descriptor(nt)
         self.step += 1
         args = (
             self._p(k, cutlass.BFloat16), self._p(v, cutlass.BFloat16),
@@ -3077,7 +2222,6 @@ class CuteDSLFusedCPPreProcessWS:
             self._p(self.bufs.hm_sym, cutlass.Float32),
             self._p(self.ptrs, cutlass.Int64),
             self._p(h0_out, cutlass.Float32),
-            self._p(self.hm_seg, cutlass.Float32),
             self._p(self.seg_flags, cutlass.Uint32),
             cutlass.Int32(T), cutlass.Int32(self.step),
             cutlass.Int32((1 if emit_h else 0) | (2 if emit_m else 0)),
@@ -3100,7 +2244,7 @@ class CuteDSLFusedCPPreProcessWS:
         if op is None:
             op = PreProcessFwdFusedWS(
                 self.H, self.HV, self.DK, self.DV, self.gate_mode,
-                self.R, self.rank, tsplit=self.tsplit, full_chunks=False,
+                self.R, self.rank, full_chunks=False,
             )
             self._ops[key] = op
             # Geometry and scratch sizing are protocol-visible and must not
