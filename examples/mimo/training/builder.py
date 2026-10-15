@@ -123,10 +123,18 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool | None = None,
     ) -> list[MimoModel]:
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
         if wrap_with_ddp and ddp_config is None:
             raise ValueError("ddp_config is required when wrap_with_ddp is True")
+        # MIMO derives each module's DDP config from args (_ddp_config_from_args), which
+        # keeps the default compact LayerWise layout, so a padded-layout request cannot hold.
+        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
+            raise ValueError(
+                "MIMO uses the compact LayerWise param layout; "
+                "use_layer_wise_param_layout=True is not supported. Leave it as None."
+            )
 
         topology = self._topology
         args = get_args()

@@ -1,0 +1,167 @@
+ENV_VARS:
+  NCCL_NVLS_ENABLE: 0
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCH_NCCL_AVOID_RECORD_STREAMS: 1
+  TORCH_NCCL_HIGH_PRIORITY: 1
+  CUDA_DEVICE_MAX_CONNECTIONS: 32
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 20
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 20
+  NVTE_NORM_BWD_USE_CUDNN: 1
+  NVTE_NORM_FWD_USE_CUDNN: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NON_DETERMINSTIC_RESULTS: 1
+
+# Loads the frozen checkpoint from ${CHECKPOINT_LOAD_PATH} in a single run.
+TEST_TYPE: frozen-start
+
+MODEL_ARGS:
+  # Distributed topology: 1 node x 4 GB200 GPUs.
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --context-parallel-size: 1
+  --expert-model-parallel-size: 4
+  --expert-tensor-parallel-size: 1
+  --data-parallel-sharding-strategy: optim_grads_params
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+
+  # Functional-test training budget.
+  --micro-batch-size: 2
+  --global-batch-size: 32
+  --train-iters: 20
+  --manual-gc: true
+  --manual-gc-interval: 100
+  --cross-entropy-loss-fusion: true
+  # Bridge uses TE here, but current MCore rejects TE cross-entropy fusion.
+  --cross-entropy-fusion-impl: native
+  --attention-backend: fused
+  --te-rng-tracker: true
+
+  # Nemotron 3.5 Lightning architecture, scaled down to fit a single node.
+  # The 6:6:2 Mamba/MoE/attention ratio mirrors the 23:23:6 of the 52-layer model.
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
+  --hybrid-layer-pattern: MEMEM*EMEMEM*E/*E/*E
+  --num-layers: 14
+  --hidden-size: 768
+  --ffn-hidden-size: 512
+  --moe-ffn-hidden-size: 512
+  --num-attention-heads: 8
+  --group-query-attention: true
+  --num-query-groups: 2
+  --kv-channels: 64
+  --mamba-num-heads: 16
+  --mamba-head-dim: 64
+  --mamba-state-dim: 128
+  --mamba-num-groups: 8
+  --position-embedding-type: none
+  --normalization: RMSNorm
+  --norm-epsilon: 1.0e-5
+  --untie-embeddings-and-output-weights: true
+  --disable-bias-linear: true
+  --squared-relu: true
+  --use-fused-weighted-squared-relu: true
+  --init-method-std: 0.0173
+  --make-vocab-size-divisible-by: 128
+  --transformer-impl: transformer_engine
+
+  # Mixture of experts. alltoall keeps the test portable across GB200 hosts;
+  # the 2-node nightly variant uses the HybridEP flex dispatcher instead.
+  --num-experts: 32
+  --moe-router-topk: 4
+  --moe-router-topk-scaling-factor: 2.5
+  --moe-router-num-groups: 1
+  --moe-router-group-topk: 1
+  --moe-router-score-function: sigmoid
+  --moe-router-enable-expert-bias: true
+  --moe-router-dtype: fp32
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-aux-loss-coeff: 1.0e-4
+  --moe-shared-expert-intermediate-size: 1024
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+  --moe-permute-fusion: true
+
+  # Lightning multi-token prediction. The unified pattern above carries both depths.
+  --mtp-num-layers: 2
+  --mtp-use-repeated-layer: true
+  --mtp-loss-scaling-factor: 0.3
+
+  # the_pile shard00 + GPT-2 BPE, the same corpus the other 1-node GB200 tests
+  # use, so it is already staged at ${DATA_PATH} on the CI runner.
+  --seq-length: 2048
+  --max-position-embeddings: 2048
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --split: 949,50,1
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --dataloader-type: single
+  --num-workers: 2
+  --no-create-attention-mask-in-dataloader: true
+
+  # BF16 compute and BF16 gradient reduction with FP32 optimizer state.
+  --bf16: true
+  --grad-reduce-in-bf16: true
+  --main-grads-dtype: fp32
+  --main-params-dtype: fp32
+  --exp-avg-dtype: fp32
+  --exp-avg-sq-dtype: fp32
+
+  # Adam and cosine schedule inherited from Bridge.
+  --optimizer: adam
+  --lr: 1.6e-3
+  --min-lr: 1.6e-5
+  --lr-decay-style: cosine
+  --lr-decay-iters: 39735
+  --lr-warmup-iters: 333
+  --lr-warmup-init: 0.0
+  --lr-wsd-decay-style: minus_sqrt
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  --adam-eps: 1.0e-8
+  --weight-decay: 0.1
+  --clip-grad: 1.0
+  --override-opt-param-scheduler: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+
+  # The point of this test: adopt the frozen checkpoint's weights but start the
+  # optimizer from scratch, the way SFT / post-training loads a pretrained model.
+  # --finetune resets the iteration counter to 0 so the run logs steps 1..20;
+  # --no-load-optim is what actually drops the optimizer state.
+  --load: ${CHECKPOINT_LOAD_PATH}/model/nemotron3_5_lightning_1n4g/v1
+  --no-load-optim: true
+  --no-load-rng: true
+  --finetune: true
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --save-interval: 50
+  --ckpt-format: torch_dist
+  --ckpt-assume-constant-structure: true
+  --ckpt-fully-parallel-load: true
+  --dist-ckpt-strictness: log_all
+
+  # Validation and functional metrics. eval-interval < train-iters so the
+  # evaluation loop actually runs during the test.
+  --eval-interval: 10
+  --eval-iters: 5
+  --log-interval: 1
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --timing-log-level: 0
+  --seed: 1234
+
+# iteration-time is deliberately not compared: it varies ~4% run-to-run against
+# a 5% tolerance, and this is a correctness test, not a perf test.
+METRICS:
+  - lm loss
+  - mtp_1 loss
+  - mtp_2 loss
+  - num-zeros
+  - mem-allocated-bytes
+  - mem-max-allocated-bytes
+
+LAUNCHER: ft_launcher

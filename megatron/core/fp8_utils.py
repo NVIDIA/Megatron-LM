@@ -895,20 +895,19 @@ if HAVE_TE:
         return fp8_context
 
     def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
-        """Return a context manager that forces high-precision execution.
+        """Return a context manager that disables TE quantization.
 
-        Use this around the construction or forward pass of submodules that must stay in
-        high precision (BF16/FP32) while the enclosing layer is built or run under an
-        FP8/FP4 quantization context (e.g. the DeepSeek V4 CSA compressor and indexer).
+        Use this around submodule construction or execution that must stay in a higher
+        precision while its enclosing module uses an FP8 or FP4 context.
 
-        Arguments:
-            config (TransformerConfig): Configuration object.
-            is_init (bool): Whether the context is used for module initialization
-                (overrides fp8_model_init) or for the forward pass (overrides fp8_autocast).
+        Args:
+            config: Transformer configuration that controls quantization.
+            is_init: Whether to disable the parameter-initialization context instead of
+                the forward autocast context.
 
         Returns:
-            A context manager that disables any enclosing TE quantization context, or
-            nullcontext() when no quantization is configured.
+            A disabled TE quantization context when quantization is active, otherwise a
+            no-op context.
         """
         if is_init:
             if not (config.fp8_param or config.fp4_param):
@@ -929,7 +928,7 @@ else:
         return nullcontext()
 
     def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
-        """Returns dummy context manager since TE is not available."""
+        """Return a no-op context manager since TE is not available."""
         return nullcontext()
 
 

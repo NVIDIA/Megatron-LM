@@ -12,7 +12,7 @@ from megatron.core.distributed.distributed_data_parallel import (
     _BucketParamReadyCallback,
 )
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR, ensure_params_ready
@@ -123,7 +123,7 @@ class TestDSAFineGrainedReadiness:
             dsa_indexer_weights_proj_output_dtype="fp32",
         )
 
-        recurse_types = FullyShardedDataParallel._fine_grained_recurse_module_types(
+        recurse_types = FullyShardedDataParallelV1._fine_grained_recurse_module_types(
             config, DistributedDataParallelConfig()
         )
 
@@ -132,7 +132,7 @@ class TestDSAFineGrainedReadiness:
     def test_bf16_projection_keeps_leaf_level_gather(self):
         config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
 
-        recurse_types = FullyShardedDataParallel._fine_grained_recurse_module_types(
+        recurse_types = FullyShardedDataParallelV1._fine_grained_recurse_module_types(
             config, DistributedDataParallelConfig()
         )
 

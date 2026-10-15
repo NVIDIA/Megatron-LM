@@ -13,7 +13,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.megakernel import (
     build_megakernel_backend,
@@ -305,9 +305,11 @@ class MoELayer(BaseMoELayer):
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
-            # TODO: When LatentMoE gains GTP plumbing on dev, resolve the non-expert GTP
-            # rematerialization group when `moe_latent_proj` is opted in, and pass that group
-            # plus `pg_collection.dp_cp` as the replica group to both latent projections.
+            gtp_remat_group = (
+                resolve_gtp_remat_group(pg_collection, is_expert=False)
+                if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
+                else None
+            )
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -319,6 +321,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
+                gtp_remat_group=gtp_remat_group,
             )
             fc2_linear_cls = (
                 TERMSNormDuplicatedLinear
@@ -328,10 +331,11 @@ class MoELayer(BaseMoELayer):
             fc2_extra_kwargs = (
                 {"tp_group": pg_collection.tp}
                 if fc2_linear_cls is TERMSNormDuplicatedLinear
-                else {}
+                else {"gtp_remat_group": gtp_remat_group}
             )
-            # TODO: When those GTP kwargs are added, carry them into this wrapper together with
-            # its owning TP group; TE tensor-parallel execution remains local with `tp_size=1`.
+            # TODO: When TERMSNormDuplicatedLinear accepts `gtp_remat_group`, carry it into this
+            # wrapper together with its owning TP group; TE tensor-parallel execution remains
+            # local with `tp_size=1`.
             self.fc2_latent_proj = fc2_linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
