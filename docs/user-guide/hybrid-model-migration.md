@@ -386,6 +386,12 @@ state-dict differences:
 - Expand per-layer settings such as attention-window schedules to the full
   HybridModel pattern.
 
+Custom layer classes placed in a `HybridStack` must accept
+`layer(hidden_states, LayerInputs)`: subclass `TransformerLayer` or `MambaLayer`
+to inherit the adapter, or implement `forward(x, inputs)` directly. Legacy
+keyword arguments remain supported everywhere else. `MoESubmodules.pre_norm`
+is available for core input normalization and defaults to `IdentityOp`.
+
 ### Validate before scaling up
 
 Before starting a long run:

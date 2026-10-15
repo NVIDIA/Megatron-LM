@@ -765,7 +765,10 @@ class MoELayer(BaseMoELayer, LayerInterface):
             A tuple containing the output tensor and the MLP bias, if any.
         """
         if _return_addends and intermediate_tensors is not None:
-            raise ValueError("The LayerInputs entry point requires a complete MoE forward")
+            raise ValueError(
+                "intermediate_tensors cannot be combined with _return_addends; "
+                "use a complete MoE forward"
+            )
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"

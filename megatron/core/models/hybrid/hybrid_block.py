@@ -36,7 +36,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
-from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
@@ -778,21 +777,19 @@ class HybridStack(MegatronModule):
                             layer_config, layer.layer_number - 1
                         )
                         with inner_quant_context:
-                            hidden_states = layer(
-                                hidden_states,
-                                LayerInputs(
-                                    attention_mask=attention_mask,
-                                    inference_context=inference_context,
-                                    rotary_pos_emb=rotary_pos_emb,
-                                    sequence_len_offset=sequence_len_offset,
-                                    packed_seq_params=layer_packed_seq_params,
-                                    padding_mask=padding_mask,
-                                    input_ids=input_ids,
-                                    cp_metadata=layer_cp_metadata,
-                                    residual_stream_recompute_context=residual_stream_recompute_context,
-                                    mhc_recompute_manager=mhc_manager,
-                                ),
+                            layer_inputs = LayerInputs(
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                rotary_pos_emb=rotary_pos_emb,
+                                sequence_len_offset=sequence_len_offset,
+                                packed_seq_params=layer_packed_seq_params,
+                                padding_mask=padding_mask,
+                                input_ids=input_ids,
+                                cp_metadata=layer_cp_metadata,
+                                residual_stream_recompute_context=residual_stream_recompute_context,
+                                mhc_recompute_manager=mhc_manager,
                             )
+                            hidden_states = layer(hidden_states, layer_inputs)
 
                         observe_layer_residuals(layer, residual_accumulator, hidden_states)
                         if cp_layout_state is not None:

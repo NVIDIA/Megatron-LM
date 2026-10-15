@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from torch import Tensor
 
+from megatron.core.utils import experimental_api, internal_api
+
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -20,6 +22,7 @@ if TYPE_CHECKING:
     from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 
 
+@experimental_api
 @dataclass(frozen=True)
 class LayerInputs:
     """Invocation inputs; cores consume only the fields they need.
@@ -51,26 +54,47 @@ class LayerInputs:
 Addends = tuple[Tensor, ...]
 
 
+@experimental_api
 def as_addends(output: tuple[Tensor, Tensor | None]) -> Addends:
     """Preserve output/bias order without performing any arithmetic."""
     value, bias = output
     return (value,) if bias is None else (value, bias)
 
 
+@experimental_api
 @runtime_checkable
 class LayerInterface(Protocol):
-    """A core consumes hidden-width input and returns additive tensor updates."""
+    """A core consumes hidden-width input and returns additive tensor updates.
+
+    New cores implement ``forward(x, inputs) -> Addends`` directly and list this
+    protocol as a base. They own their norms and compute, and need no residual
+    wrapper, ``forward_layer`` method, or compatibility decorator to implement
+    this interface. Residual updates and output dropout belong to the caller.
+    """
 
     def forward(self, x: Tensor, inputs: LayerInputs) -> Addends:
         """Run compute without the residual connection or output dropout."""
         ...
 
 
+@internal_api
+def wants_input_ids(module) -> bool:
+    """Whether a layer's MLP uses token IDs for hash routing."""
+    router = getattr(getattr(module, "mlp", None), "router", None)
+    return bool(getattr(router, "is_hash_layer", False))
+
+
+@internal_api
 def layer_inputs_forward(legacy_forward):
-    """Accept the new call shape while preserving legacy positional and keyword calls."""
+    """Adapt an existing forward during migration; new cores implement the protocol directly.
+
+    The decorated legacy implementation supplies ``forward_layer(x, inputs)``
+    to translate inputs and results while keeping its old call shape available.
+    """
 
     @wraps(legacy_forward)
     def forward(self, *args, **kwargs):
+        # ``inputs`` is a reserved keyword for decorated forwards.
         inputs = kwargs.pop("inputs", None)
         if inputs is None and len(args) == 2 and isinstance(args[1], LayerInputs):
             args, inputs = args[:1], args[1]

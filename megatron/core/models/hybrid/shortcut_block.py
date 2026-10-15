@@ -24,7 +24,6 @@ import torch
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import LayerInputs

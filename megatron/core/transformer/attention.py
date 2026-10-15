@@ -2181,6 +2181,10 @@ class CrossAttention(Attention):
     [s, b, h] and returns output of the same size.
     """
 
+    def forward_layer(self, x, inputs: LayerInputs):
+        """Cross-attention has no hybrid LayerInputs adapter yet."""
+        raise NotImplementedError("CrossAttention does not support the LayerInputs call shape")
+
     def __init__(
         self,
         config: TransformerConfig,

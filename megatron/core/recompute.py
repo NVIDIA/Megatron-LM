@@ -10,6 +10,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.layer_interface import LayerInputs
 from megatron.core.transformer.module import MegatronModule
@@ -110,9 +111,11 @@ def checkpointed_forward(
 
                 with inner_quantization_context:
                     if getattr(self, "_uses_layer_inputs", False):
+                        # Match the eager HybridStack rule: only Mamba consumes chunkwise CP.
                         layer_cp_metadata = (
                             packed_sequence_cp_metadata
-                            if getattr(layer.config, "linear_cp_mode", None) == "chunkwise"
+                            if type(layer.config) is MambaLayerConfig
+                            and layer.config.linear_cp_mode == "chunkwise"
                             else None
                         )
                         hidden_states = layer(

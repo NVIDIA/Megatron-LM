@@ -406,17 +406,20 @@ class GraphableMegatronModule(MegatronModule):
     def __call__(self, *args, **kwargs):
         # Transitional skeleton adapter: graph managers still capture/replay the legacy
         # tensor arguments, rather than treating LayerInputs as an opaque static value.
-        inputs = kwargs.get("inputs")
-        if len(args) == 2 and isinstance(args[1], LayerInputs):
-            if kwargs:
-                raise TypeError("LayerInputs cannot be mixed with legacy arguments")
-            return self.forward_layer(args[0], args[1])
-        if isinstance(inputs, LayerInputs):
-            if len(args) == 1 and len(kwargs) == 1:
-                return self.forward_layer(args[0], inputs)
-            if not args and set(kwargs) in ({"hidden_states", "inputs"}, {"x", "inputs"}):
-                hidden_states = kwargs["x"] if "x" in kwargs else kwargs["hidden_states"]
-                return self.forward_layer(hidden_states, inputs)
+        # Native cores implement forward(x, inputs) directly and need no adapter.
+        legacy_adapter = getattr(self, "forward_layer", None)
+        if legacy_adapter is not None:
+            inputs = kwargs.get("inputs")
+            if len(args) == 2 and isinstance(args[1], LayerInputs):
+                if kwargs:
+                    raise TypeError("LayerInputs cannot be mixed with legacy arguments")
+                return legacy_adapter(args[0], args[1])
+            if isinstance(inputs, LayerInputs):
+                if len(args) == 1 and len(kwargs) == 1:
+                    return legacy_adapter(args[0], inputs)
+                if not args and set(kwargs) in ({"hidden_states", "inputs"}, {"x", "inputs"}):
+                    hidden_states = kwargs["x"] if "x" in kwargs else kwargs["hidden_states"]
+                    return legacy_adapter(hidden_states, inputs)
         if self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
         elif self._should_call_te_cudagraph(*args, **kwargs):

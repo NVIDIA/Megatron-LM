@@ -11,7 +11,11 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import LayerInputs, layer_inputs_forward
+from megatron.core.transformer.layer_interface import (
+    LayerInputs,
+    layer_inputs_forward,
+    wants_input_ids,
+)
 from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
@@ -161,7 +165,10 @@ class HyperConnectionHybridLayer(MegatronModule):
     def forward_layer(self, hidden_states, inputs: LayerInputs):
         """Adapt shared inputs to the mHC wrapper without changing its residual update."""
         if inputs.residual_stream_recompute_context is not None:
-            raise TypeError("Use mhc recomputation for HyperConnectionHybridLayer")
+            raise TypeError(
+                "HyperConnectionHybridLayer does not support residual_stream recomputation; "
+                "select 'mhc' in recompute_modules and configure mhc_recompute_layer_num instead."
+            )
         output, _ = self.forward(
             hidden_states,
             attention_mask=inputs.attention_mask,
@@ -172,7 +179,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             padding_mask=inputs.padding_mask,
             packed_sequence_cp_metadata=inputs.cp_metadata,
             mhc_recompute_manager=inputs.mhc_recompute_manager,
-            input_ids=inputs.input_ids,
+            input_ids=inputs.input_ids if wants_input_ids(self.inner_layer) else None,
         )
         return output
 

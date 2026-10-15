@@ -532,7 +532,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
     def forward_layer(self, x, inputs: LayerInputs):
         """Run the mixer through its existing training/inference entry point."""
         if inputs.cp_metadata is not None:
-            raise ValueError("Chunkwise CP metadata is handled by MambaLayer during migration")
+            raise NotImplementedError(
+                "MambaMixer does not support packed-sequence chunkwise CP metadata."
+            )
         return as_addends(
             self.forward(
                 x,

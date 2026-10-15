@@ -9,7 +9,11 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
-from megatron.core.transformer.layer_interface import LayerInputs, layer_inputs_forward
+from megatron.core.transformer.layer_interface import (
+    LayerInputs,
+    layer_inputs_forward,
+    wants_input_ids,
+)
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
@@ -1140,8 +1144,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if value is not None:
                 kwargs[name] = value
         # Only hash routers reserve a token-ID input in the legacy CUDA graph.
-        router = getattr(getattr(self, "mlp", None), "router", None)
-        if inputs.input_ids is not None and getattr(router, "is_hash_layer", False):
+        if inputs.input_ids is not None and wants_input_ids(self):
             kwargs["input_ids"] = inputs.input_ids
         output, _ = self(hidden_states=hidden_states, **kwargs)
         return output
