@@ -867,6 +867,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Sorted repeated-row accumulation in deterministic mode; real Gloo EP lookup "
         "and gradient parity, including uneven shards. NCCL GPU replay remains to be qualified.",
     ),
+    KernelEntry(
+        name="dsa_dispatch",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="dispatch",
+        notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
+        "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
+    ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
         name="dsa_tilelang_kernels",
