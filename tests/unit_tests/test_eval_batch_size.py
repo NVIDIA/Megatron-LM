@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from megatron.training.argument_utils import ArgumentGroupFactory
-from megatron.training.arguments import parse_args, validate_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.config import ValidationConfig
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_train_valid_test_num_samples
@@ -166,10 +166,10 @@ class TestEvalBatchSizeDivisibilityWithGTP:
 
     @staticmethod
     def _build_args(
-        monkeypatch, num_weight_shards, eval_global_batch_size, eval_micro_batch_size=1
+        monkeypatch, num_weight_shards, eval_global_batch_size, eval_micro_batch_size=1, cli_args=()
     ):
         """Build a minimal GTP config: world_size 8 = gtp_weight_remat_size x data_parallel_size."""
-        monkeypatch.setattr(sys, 'argv', ['test_eval_batch_size.py'])
+        monkeypatch.setattr(sys, 'argv', ['test_eval_batch_size.py', *cli_args])
         args = parse_args()
         # parse_args reads WORLD_SIZE from the environment. Pin it, since data_parallel_size is
         # derived from it and the test must not depend on how the job was launched.
@@ -196,7 +196,7 @@ class TestEvalBatchSizeDivisibilityWithGTP:
         # 4 % (1 * 1) == 0 satisfies the two-factor check, but evaluate() divides by
         # eval_micro_batch_size * data_parallel_size * gtp_weight_remat_size, which floors to
         # 4 // 8 == 0 microbatches: evaluation would silently do nothing.
-        with pytest.raises(AssertionError, match="gtp_weight_remat_size"):
+        with pytest.raises(AssertionError, match="batch_parallel_size"):
             validate_args(args)
 
     def test_gtp_remat_divisible_config_passes(self, monkeypatch):
@@ -205,11 +205,68 @@ class TestEvalBatchSizeDivisibilityWithGTP:
         validate_args(args)
         assert args.gtp_weight_remat_size == 8
         assert args.data_parallel_size == 1
+        assert args.batch_parallel_size == 8
         # The division evaluate() performs; it must leave at least one microbatch.
         num_microbatches = args.eval_global_batch_size // (
             args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
         )
         assert num_microbatches == 1
+
+    @pytest.mark.parametrize(
+        "cp,sequence_shards,weight_shards,samples", [(2, 2, 2, 2), (1, 2, 4, 4), (2, 2, 4, 2)]
+    )
+    def test_gtp_remat_sequence_shards_use_independent_sample_count(
+        self, monkeypatch, cp, sequence_shards, weight_shards, samples
+    ):
+        """Sequence partitions do not multiply the eval batch size."""
+        monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+        args = self._build_args(
+            monkeypatch, num_weight_shards=weight_shards, eval_global_batch_size=samples
+        )
+        args.context_parallel_size = cp
+        args.tensor_parallel_num_sequence_shards = sequence_shards
+        args.ckpt_format = "torch_dist"
+        validate_args(args)
+        assert args.batch_parallel_size == samples
+        assert args.eval_global_batch_size // (args.eval_micro_batch_size * samples) == 1
+
+    @pytest.mark.parametrize(
+        "tp,sp,shards,total_cp,samples",
+        [
+            (1, False, 64, 128, 1),
+            (2, True, 64, 64, 1),
+            (2, True, 16, 16, 4),
+            (2, True, None, 2, 32),
+            (2, False, None, 2, 32),
+            (1, False, None, 2, 64),
+        ],
+    )
+    def test_sequence_shard_cli_resolves_runtime_cp(
+        self, monkeypatch, tp, sp, shards, total_cp, samples
+    ):
+        monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+        cli_args = ["--tensor-model-parallel-size", str(tp), "--context-parallel-size", "2"]
+        if sp:
+            cli_args.append("--sequence-parallel")
+        if shards is not None:
+            cli_args.extend(["--tensor-parallel-num-sequence-shards", str(shards)])
+        args = self._build_args(monkeypatch, 64, samples, cli_args=cli_args)
+        args.world_size = 128
+        args.global_batch_size = 128
+        args.ckpt_format = "torch_dist"
+        validate_args(args)
+        assert args.context_parallel_size == total_cp
+        assert args.data_parallel_size == 1
+        assert args.batch_parallel_size == samples
+        assert args.tensor_parallel_num_sequence_shards == (
+            shards if shards is not None else (tp if sp else 1)
+        )
+        config = core_transformer_config_from_args(args)
+        assert config.context_parallel_size == total_cp
+        assert config.gtp_remat_num_sequence_shards == total_cp // 2
+        assert (
+            config.tensor_parallel_num_sequence_shards == args.tensor_parallel_num_sequence_shards
+        )
 
 
 class TestGetTrainValidTestNumSamples:
