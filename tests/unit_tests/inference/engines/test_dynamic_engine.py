@@ -2619,11 +2619,10 @@ def test_generate_mixed_batch_waits_only_for_its_pending_future():
 
 @pytest.mark.parametrize("replay", [True, False], ids=["routing-replayed", "routing-off"])
 def test_snapshot_live_requests(replay):
-    """Every entry but a failed one is copied; one a stop word or mid-block EOS has ended, which
-    bookkeeping has still to complete, reads finished, with the reason recorded at detection and,
-    under routing replay, the routing its blocks still hold. Any loop may run the snapshot while
-    none runs the engine, as between a suspend and a resume driven inline; a live engine loop
-    refuses the others."""
+    """Every entry but a failed one is copied, with the finish reason the engine records when it
+    detects a stop, one pass before completion, and, under routing replay, the routing its blocks
+    still hold. Any loop may run the snapshot while none runs the engine, as between a suspend and
+    a resume driven inline; a live engine loop refuses the others."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._loop, other_loop = asyncio.new_event_loop(), asyncio.new_event_loop()
     active = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -2638,7 +2637,6 @@ def test_snapshot_live_requests(replay):
         )
     )
     engine.requests = {1: live, 2: stop_hit, 3: stop_masked, 4: failed, 5: waiting}
-    engine.stop_word_finished_request_ids, engine.stop_word_being_finished_ids = {2}, {3}
     # The engine records a stop's reason when it detects it, a step before completion.
     stop_hit.record[-1].finish_reason = stop_masked.record[-1].finish_reason = "stop"
     # Routing replay keeps each token's expert choices in the blocks a request owns and reads them
@@ -2668,13 +2666,8 @@ def test_snapshot_live_requests(replay):
         get_committed_kv_block_ids=[[20, 21], [30], [40], [50]].__getitem__,
     )
     expected = [
-        LiveRequestSnapshot.from_record(entry.record, finished=finished)
-        for entry, finished in (
-            (live, False),
-            (stop_hit, True),
-            (stop_masked, True),
-            (waiting, False),
-        )
+        LiveRequestSnapshot.from_record(entry.record)
+        for entry in (live, stop_hit, stop_masked, waiting)
     ]
     assert [s.record.finish_reason for s in expected] == [None, "stop", "stop", None]
     routed = [routing[40], routing[20], routing[30], None] if replay else [None] * 4
@@ -3315,7 +3308,6 @@ def test_schedule_kv_handoff_preserves_optional_offload_metadata(offload_params)
             policy_epoch=[(0, 3), (5, 4)],
             kv_cache_epoch=[(0, 3)],
             num_evictions=2,
-            finished=True,
             finish_reason="stop",
             generated_top_n_logprobs=[{"7": -0.5}, {"8": -0.25}],
             acceptance_step_lengths=[1, 1],
@@ -3388,7 +3380,7 @@ _FILLED = ResumedGeneration(
     policy_epoch=[(0, 7)],
     kv_cache_epoch=[(0, 6)],
     num_evictions=2,
-    finished=True,
+    finish_reason="length",
     prompt_top_n_logprobs=[{"p": -1.0}, {"p": -1.1}, {"p": -1.2}],
     generated_top_n_logprobs=[{str(t): -0.1} for t in range(7, 13)],
     acceptance_step_lengths=[1, 3, 2],
@@ -3404,7 +3396,7 @@ del _UNREADABLE["token_ids"]
 _ROUTED = ResumedGeneration(
     [7, 8],
     7,
-    finished=True,
+    finish_reason="stop",
     routing_indices=np.arange(10, dtype=np.int32).reshape(5, 1, 2),
     **_SCORED,
     **_STAMPED,
@@ -3463,7 +3455,12 @@ def _resume(engine, wire, media):
         (
             False,
             ResumedGeneration(
-                [], 6, log_probs=[], generated_top_n_logprobs=[], finished=True, **_STAMPED_EMPTY
+                [],
+                6,
+                log_probs=[],
+                generated_top_n_logprobs=[],
+                finish_reason="stop",
+                **_STAMPED_EMPTY,
             ),
             None,
         ),
@@ -3528,8 +3525,8 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
     """add_request admits a resume on the request as built, under the banked budget rather than
     the request's; a resume's boundaries are the engine's own, counted on the expanded prompt,
     and are kept as they are; one with nothing generated yet is admitted fresh, or served empty
-    when the preparer says it ended; a served one ends for the reason it saved, or for its length
-    when it filled its budget without one; a refusal, of a wire that does not read back, of what the
+    when the preparer says it ended; a served one ends for the reason it saved; a refusal, of a
+    wire that does not read back, of what the
     payload lacks or of a stamp off the sequence, names its reason and leaves the request as it
     was; a continued request snapshots whole and resumes again unchanged."""
     engine = _engine_for_resumes(max_sequence_length=2 if outcome == "overflow" else 32)
@@ -3567,16 +3564,14 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
             assert failed.generated_tokens == []
             assert failed.sampling_params.num_tokens_to_generate == 6
         return
-    if resumed.finished:
+    if resumed.finish_reason is not None:
         completed = future.result()
         payload = OffloadedRequestPayload.from_request(completed)
         engine.context.remove_vlm_request_data.assert_called_once_with(1)
         assert completed.status == Status.COMPLETED and engine.requests == {}
         assert not engine.waiting_request_ids and completed.offload_params == {"ng_capture": "c"}
         assert completed.sampling_params.num_tokens_to_generate == resumed.num_tokens_to_generate
-        filled = len(resumed.token_ids) == resumed.num_tokens_to_generate
-        # A saved reason is served as it is; without one, a filled budget reads as a length stop.
-        reason = resumed.finish_reason or ("length" if filled else "stop")
+        reason = resumed.finish_reason  # served as saved, never re-derived
         assert completed.finish_reason == reason
         assert (payload.prompt_token_ids, payload.generated_token_ids) == (
             prompt,
@@ -9319,7 +9314,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             params["call_id"]: (payload, telemetry, True)
             for payload, telemetry, params in engine.payload_stager.by_uid.values()
         }
-        live = {s.offload_params["call_id"]: (s.payload, s.record, s.finished) for s in snapshots}
+        live = {
+            s.offload_params["call_id"]: (s.payload, s.record, s.record.finish_reason is not None)
+            for s in snapshots
+        }
         assert set(banked) | set(live) == set(call_ids.values()) and not set(banked) & set(live)
         truth = {**banked, **live}
         # A live call resumes from its snapshot; a finished one from the payload and record the
@@ -9336,7 +9334,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 policy_epoch=telemetry.policy_epoch,
                 kv_cache_epoch=telemetry.kv_cache_epoch,
                 num_evictions=telemetry.num_evictions,
-                finished=True,
                 finish_reason=telemetry.finish_reason,
                 prompt_top_n_logprobs=payload.prompt_top_n_logprobs,
                 generated_top_n_logprobs=payload.generated_top_n_logprobs,

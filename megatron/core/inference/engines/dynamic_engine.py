@@ -2350,17 +2350,16 @@ class DynamicInferenceEngine(AbstractEngine):
             raise RuntimeError(
                 "snapshot_live_requests must run on the engine loop while it is running"
             )
-        # The generation's stop condition may be detected one step before bookkeeping completes it.
-        ending = self.stop_word_finished_request_ids | self.stop_word_being_finished_ids
+        # A stop the engine has detected but has yet to complete sits on the record
+        # as its finish reason, so the record alone says whether a request ended.
         snapshots = []
-        for request_id, entry in self.requests.items():
+        for entry in self.requests.values():
             request = entry.record[-1]
             if request.status == Status.FAILED:
                 continue
             snapshots.append(
                 LiveRequestSnapshot.from_record(
                     entry.record,
-                    finished=request_id in ending,
                     # The blocks hold the routing of every token that ran forward; a request
                     # still in prefill has none that is complete.
                     routing_indices=(
@@ -2737,7 +2736,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 DynamicInferenceRequestRecord.from_resumed_generation(
                     request, resumed, generation_epoch=self._generation_epoch
                 )
-                if resumed.token_ids or resumed.finished
+                if resumed.token_ids or resumed.finish_reason is not None
                 else None  # nothing generated yet
             )
         except ValueError as invalid:
@@ -2750,13 +2749,7 @@ class DynamicInferenceEngine(AbstractEngine):
             return self._add_request(request)
 
         entry = RequestEntry(record=record, future=self._loop.create_future())
-        if resumed.finished:  # nothing to schedule
-            served = record[-1]
-            if served.finish_reason is None and (
-                len(served.generated_tokens) < served.sampling_params.num_tokens_to_generate
-            ):
-                served.finish_reason = "stop"
-            self._set_finish_reason(served)
+        if resumed.finish_reason is not None:  # ended on its first engine: nothing to schedule
             self._complete_request(entry, reply_now=True)
         else:
             self.requests[request.request_id] = entry
