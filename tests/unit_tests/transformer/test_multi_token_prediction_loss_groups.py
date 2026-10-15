@@ -207,3 +207,42 @@ def test_grouped_mtp_normalization_rejects_contiguous_cp():
             cp_group=SimpleNamespace(size=lambda: 2),
             loss_group_lengths=(2, 2),
         )
+
+
+def _grouped_call(packed_seq_params, groups):
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.multi_token_prediction import process_mtp_loss
+
+    config = SimpleNamespace(
+        mtp_num_layers=1,
+        mtp_detach_heads=False,
+        calculate_per_token_loss=True,
+        attention_cp_layout="zigzag",
+    )
+    process_mtp_loss(
+        hidden_states=torch.zeros(16, 1, _HIDDEN),
+        labels=torch.zeros(1, 8, dtype=torch.long),
+        loss_mask=torch.ones(1, 8),
+        output_layer=None,
+        output_weight=None,
+        is_training=True,
+        compute_language_model_loss=None,
+        config=config,
+        packed_seq_params=packed_seq_params,
+        loss_group_lengths=groups,
+    )
+
+
+def test_grouped_mtp_normalization_requires_packed_sequences():
+    """Without packed sequences the label roll would cross the group boundary."""
+    with pytest.raises(ValueError, match="requires packed_seq_params"):
+        _grouped_call(None, (4, 4))
+
+
+def test_grouped_mtp_normalization_rejects_groups_splitting_a_sequence():
+    """Every group boundary must be a packed-sequence boundary."""
+    cumulative = torch.tensor([0, 4, 8], dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cumulative, cu_seqlens_kv=cumulative)
+    with pytest.raises(ValueError, match="whole packed sequences"):
+        _grouped_call(packed, (3, 5))
