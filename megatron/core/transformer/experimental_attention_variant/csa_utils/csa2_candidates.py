@@ -36,7 +36,9 @@ except ImportError:
 # Score tiles are transient, including on the candidate-source layer. The
 # unavoidable output is [queries, topk_blocks], never [queries, global keys].
 _SCORE_CHUNK_MAX_BYTES = 32 * 1024 * 1024
-_QUERY_CHUNK_SIZE = 128
+# Enough query rows to amortize scorer/selection launches; the byte cap still
+# bounds each tile for long contexts, including the ordinary no-candidate path.
+_QUERY_CHUNK_SIZE = 2048
 
 
 @dataclass(frozen=True)
