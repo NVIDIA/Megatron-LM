@@ -566,9 +566,10 @@ def test_handoff_salt_is_used_for_lookup_and_retained_after_import(handoff_loop)
 
 
 @pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("already_finalized", [False, True])
 @pytest.mark.parametrize("decode_epoch, budget", [(3, 3), (4, 3), (4, 1)])
 def test_handoff_records_rl_metadata_only_on_final_decode(
-    handoff_loop, native, decode_epoch, budget
+    handoff_loop, native, already_finalized, decode_epoch, budget
 ):
     cls = DisaggDynamicInferenceEngine if native else StateHandoffDynamicInferenceEngine
     prefill = object.__new__(cls)
@@ -599,9 +600,17 @@ def test_handoff_records_rl_metadata_only_on_final_decode(
         "block_ids": [100],
         "kv_meta": {"resume_tokens": [99]},
     }
-    completed = prefill._complete_request(
-        RequestEntry(record=record, future=handoff_loop.create_future())
-    )
+    entry = RequestEntry(record=record, future=handoff_loop.create_future())
+    finalized = record.merge() if already_finalized else None
+    with mock.patch.object(record, "merge", wraps=record.merge) as merge:
+        if already_finalized:
+            completed = prefill._complete_request(entry, finalized)
+            assert completed is finalized
+            merge.assert_not_called()
+        else:
+            completed = prefill._complete_request(entry)
+            merge.assert_called_once_with()
+    assert entry.future.result() is completed
     prefill._send_requests_to_coordinator([completed])
     assert prefill.local_metadata_ledger == {}
     prefill.payload_stager.stage.assert_not_called()

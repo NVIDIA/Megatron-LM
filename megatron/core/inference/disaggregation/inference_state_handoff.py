@@ -74,9 +74,11 @@ class InferenceStateHandoffMixin:
 
     requires_recurrent_state_dummy_slot = True
 
-    def _complete_request(self, request_entry: RequestEntry) -> DynamicInferenceRequest:
+    def _complete_request(
+        self, request_entry: RequestEntry, finished_request: DynamicInferenceRequest | None = None
+    ) -> DynamicInferenceRequest:
         """Attach merged RL history before the completion is consumed or sent."""
-        request = super()._complete_request(request_entry)
+        request = super()._complete_request(request_entry, finished_request)
         if request.disaggregated_params:
             # The merged record includes evictions from all prefill checkpoints.
             # No await intervenes before the completion future's consumers resume.

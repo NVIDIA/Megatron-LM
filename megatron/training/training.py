@@ -1720,7 +1720,12 @@ def pretrain(
         warmup_tp_group = pg_collection.tp
     else:
         warmup_tp_group = mpu.get_tensor_model_parallel_group()
-    warmup_training_kernels(args, warmup_tp_group)
+    warmup_training_kernels(
+        cfg_container.model,
+        warmup_tp_group,
+        seq_length=args.seq_length,
+        micro_batch_size=cfg_container.train.micro_batch_size,
+    )
     print_rank_0("Finished training-kernel warmup.")
 
     timestamp_after_set_jit_fusion_options = time.time()
