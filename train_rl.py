@@ -24,8 +24,7 @@ from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.global_vars import get_run_config, initialize_runtime_services, set_run_config
+from megatron.training.global_vars import get_run_config, set_run_config
 from model_provider import model_provider
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -429,8 +428,6 @@ if __name__ == "__main__":
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
-    initialize_runtime_services(args, training=True)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         None,  # we don't need to build any datasets for RL training

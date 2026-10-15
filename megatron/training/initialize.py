@@ -44,7 +44,7 @@ from megatron.training import (
 from megatron.training.argument_utils import _triton_autotune_config_from_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
-from megatron.training.global_vars import get_run_config
+from megatron.training.global_vars import get_run_config, initialize_runtime_services
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,7 @@ def initialize_megatron(
     skip_dependency_compilation=False,
     *,
     training: bool = False,
+    build_tokenizer: bool = True,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -75,6 +76,7 @@ def initialize_megatron(
     use the C++ dataset helpers.
     `training` enables training rerun, checkpoint workers, autoresume and dataset
     compilation in addition to the shared distributed execution and RNG setup.
+    `build_tokenizer` is False for workloads that provide their own tokenization.
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
@@ -92,6 +94,9 @@ def initialize_megatron(
             "inference initialization. Disable it until inference has a validated buffer-sizing "
             "contract. Inference-specific communication optimizations are unaffected."
         )
+
+    # Runtime services consume the validated config, before distributed/RNG setup.
+    initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=training)
 
     # set logging level
     setup_logging()

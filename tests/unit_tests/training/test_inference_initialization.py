@@ -42,7 +42,6 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
     calls = {}
     for name in (
         "set_run_config",
-        "initialize_runtime_services",
         "initialize_megatron",
         "load_checkpoint",
         "generate_and_write_samples_conditional",
@@ -55,7 +54,6 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
     script.main()
 
     calls["set_run_config"].assert_called_once_with(cfg)
-    calls["initialize_runtime_services"].assert_called_once_with(args)
     calls["initialize_megatron"].assert_called_once_with()
     if load_checkpoint:
         calls["load_checkpoint"].assert_called_once_with([model], None, None)
@@ -118,7 +116,7 @@ def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restor
 @pytest.mark.parametrize("enable_runtime_flags", [False, True])
 @pytest.mark.parametrize("training_kwargs", [{}, {"training": False}, {"training": True}])
 def test_runtime_services_initialize_training_only_when_requested(
-    monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs
+    monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs, run_config
 ):
     args = Namespace(
         enable_experimental=enable_runtime_flags, disable_jit_fuser=enable_runtime_flags
@@ -206,6 +204,7 @@ def test_inference_distributed_initialization_without_training_fields(
     ):
         delattr(args, name)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(initialize, "initialize_runtime_services", Mock())
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize, "set_default_log_ranks", Mock())
@@ -252,6 +251,7 @@ def test_distributed_training_services_require_explicit_opt_in(monkeypatch, run_
     monkeypatch.setattr(initialize, "set_default_log_ranks", Mock())
     events = []
     for name in (
+        "initialize_runtime_services",
         "init_persistent_async_worker",
         "initialize_rerun_state_machine",
         "_initialize_distributed",
@@ -269,6 +269,7 @@ def test_distributed_training_services_require_explicit_opt_in(monkeypatch, run_
     initialize.initialize_megatron(allow_no_cuda=True, training=True)
 
     assert events == [
+        "initialize_runtime_services",
         "init_persistent_async_worker",
         "initialize_rerun_state_machine",
         "_initialize_distributed",
