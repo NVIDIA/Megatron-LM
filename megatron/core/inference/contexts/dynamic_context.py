@@ -365,6 +365,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     REQUEST_ROUNDER = 4
     TMS_TAG = "inference_context"
 
+    # True when any pipeline stage holds recurrent (Mamba/GDN) layers. `__init__` sets it
+    # from a pipeline collective; the default describes an attention-only model.
+    pipeline_has_recurrent_layers: bool = False
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message=(
@@ -677,10 +681,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # If using pipeline parallelism synchronize the total block count in case the
         # pipeline stages have different layer allocations. Non-uniform block counts
         # can lead to some ranks pausing requests earlier than other ranks
-        # (i.e., divergence in the scheduling behavior).
+        # (i.e., divergence in the scheduling behavior). The same collective reports
+        # whether every stage holds recurrent (Mamba/GDN) layers; the MIN of the
+        # negated flag is the negated MAX.
+        self.pipeline_has_recurrent_layers = self.is_hybrid_model
         if pp_size > 1:
+            has_recurrent_layers = int(self.is_hybrid_model)
             block_count_tensor = torch.tensor(
-                (block_count, paused_block_count),
+                (block_count, paused_block_count, has_recurrent_layers, -has_recurrent_layers),
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
@@ -691,6 +699,34 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
             block_count = block_count_tensor[0].item()
             paused_block_count = block_count_tensor[1].item()
+            all_stages_recurrent = block_count_tensor[2].item() == 1
+            self.pipeline_has_recurrent_layers = block_count_tensor[3].item() == -1
+
+            # Every stage must skip the same prompt tokens on a prefix-cache hit. With a
+            # Mamba cache budget, a recurrent stage skips only the blocks whose Mamba
+            # state it can restore, which a stage without recurrent layers cannot track;
+            # the recurrent stages would also wait alone in the cache-capacity
+            # negotiation. Every stage sees the same reduced flags, so all of them raise
+            # here together. Memory-only prefix caching skips no prompt tokens on any
+            # stage (see `_compute_prefix_match`), so it stays available.
+            mamba_prefix_cache_requested = (
+                self.enable_prefix_caching
+                and inference_config.prefix_caching_mamba_gb is not None
+                and inference_config.prefix_caching_mamba_gb > 0
+            )
+            if (
+                mamba_prefix_cache_requested
+                and self.pipeline_has_recurrent_layers
+                and not all_stages_recurrent
+            ):
+                raise ValueError(
+                    "Mamba prefix caching (prefix_caching_mamba_gb > 0) with pipeline "
+                    "parallelism requires every pipeline stage of a hybrid model to hold at "
+                    "least one Mamba or GDN layer, but this stage holds "
+                    f"{'some' if self.is_hybrid_model else 'none'} and another stage "
+                    "differs. Place a recurrent layer on every pipeline stage, or leave "
+                    "prefix_caching_mamba_gb unset for memory-only prefix caching."
+                )
 
         self.kv_block_allocator = KVBlockAllocator(
             context=self,
@@ -3264,7 +3300,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     prefix_skip_tokens = raw_skip
             else:
                 prefix_skip_tokens = 0
-        elif self.is_hybrid_model:
+        elif self.is_hybrid_model or self.pipeline_has_recurrent_layers:
+            # A stage without recurrent layers in a hybrid pipeline follows the
+            # recurrent stages' rule, so every stage skips the same prompt tokens.
             if record_mamba_match:
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0

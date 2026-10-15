@@ -1810,6 +1810,40 @@ def test_attention_only_cached_continuation_still_skips():
     assert match.already_allocated_blocks == 4
     assert match.overall_required_blocks == 11
     assert match.prefix_skip_tokens == 6 * ctx.block_size_tokens
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("pipeline_has_recurrent_layers", [False, True])
+def test_attention_only_stage_of_hybrid_pipeline_skips_like_recurrent_stages(
+    pipeline_has_recurrent_layers,
+):
+    """A stage without recurrent layers in a hybrid pipeline skips no prompt tokens.
+
+    Its recurrent peers restore no Mamba state in memory-only mode, so every stage must
+    recompute the whole prompt while still inheriting the matched KV blocks.
+    """
+    ctx = object.__new__(DynamicInferenceContext)
+    ctx.block_size_tokens = 256
+    ctx.enable_prefix_caching = True
+    ctx.enable_mtp_kv_cache = False
+    ctx.is_hybrid_model = False
+    ctx.pipeline_has_recurrent_layers = pipeline_has_recurrent_layers
+    ctx.mamba_slot_allocator = None
+    hashes = list(range(1, 11))
+    ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
+    req = SimpleNamespace(finished_chunk_token_count=0, precomputed_block_hashes=hashes)
+    chunk_length = 4 * ctx.block_size_tokens
+
+    match = ctx._compute_prefix_match(req, chunk_length)
+
+    assert match.matched_block_ids == hashes[:4]
+    assert match.num_blocks_from_pool == 0
+    if pipeline_has_recurrent_layers:
+        assert match.prefix_skip_tokens == 0
+        assert match.effective_prefill_chunk_length == chunk_length
+    else:
+        assert match.prefix_skip_tokens == chunk_length - 1
+        assert match.effective_prefill_chunk_length == 1
     assert match.effective_prefill_chunk_length == 2
 
 
