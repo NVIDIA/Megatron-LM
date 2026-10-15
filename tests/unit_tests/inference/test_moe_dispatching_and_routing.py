@@ -35,6 +35,12 @@ requires_torch_grouped_mm = pytest.mark.skipif(
 )
 
 
+_NVFP4_ACTIVATIONS = {
+    "squared_relu": dict(activation_func=squared_relu, gated_linear_unit=False),
+    "swiglu": dict(activation_func=torch.nn.functional.silu, gated_linear_unit=True),
+}
+
+
 def _skip_unless_flashinfer_nvfp4():
     from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
 
@@ -920,7 +926,10 @@ class TestNVLSAllGatherVDispatcher:
         )
         return get_inference_optimized_moe_spec()(config=config).cuda().eval()
 
-    def test_cuda_graph_batch_invariant_nvfp4_moe_layer_uses_ordered_rsv(self, monkeypatch):
+    @pytest.mark.parametrize("activation", _NVFP4_ACTIVATIONS)
+    def test_cuda_graph_batch_invariant_nvfp4_moe_layer_uses_ordered_rsv(
+        self, monkeypatch, activation
+    ):
         """A captured per-token NVFP4 MoE layer replays like eager in batch-invariant mode.
 
         The FlashInfer kernel writes local partials into the symmetric RSV buffer and the
@@ -936,7 +945,7 @@ class TestNVLSAllGatherVDispatcher:
 
         torch.manual_seed(2027)
         torch.cuda.manual_seed(2027)
-        layer = self._make_nvfp4_inference_layer()
+        layer = self._make_nvfp4_inference_layer(**_NVFP4_ACTIVATIONS[activation])
         assert isinstance(layer._inference_token_dispatcher, NVLSAllGatherVDispatcher)
 
         used_rsv = {"value": False}
@@ -992,7 +1001,8 @@ class TestNVLSAllGatherVDispatcher:
         assert ordered_calls["value"] > 0
         torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
 
-    def test_batch_invariant_nvfp4_moe_matches_training(self, monkeypatch):
+    @pytest.mark.parametrize("activation", _NVFP4_ACTIVATIONS)
+    def test_batch_invariant_nvfp4_moe_matches_training(self, monkeypatch, activation):
         """Per-token NVFP4 generation against TE row-scaled NVFP4 training.
 
         TE's NVFP4 recipe with row-scaled activations, 1D weight blocks and no random
@@ -1028,7 +1038,10 @@ class TestNVLSAllGatherVDispatcher:
 
         torch.manual_seed(2028)
         torch.cuda.manual_seed(2028)
-        layer = self._make_nvfp4_inference_layer(use_fused_weighted_squared_relu=True)
+        activation_overrides = dict(_NVFP4_ACTIVATIONS[activation])
+        if activation == "squared_relu":
+            activation_overrides["use_fused_weighted_squared_relu"] = True
+        layer = self._make_nvfp4_inference_layer(**activation_overrides)
         # Batch-invariant MoE configs reject fp4, so training gets its own config.
         training_config = _make_base_config(
             expert_model_parallel_size=Utils.world_size,
@@ -1038,9 +1051,9 @@ class TestNVLSAllGatherVDispatcher:
             flash_attention_version=4,
             attention_dropout=0.0,
             moe_shared_expert_intermediate_size=None,
-            use_fused_weighted_squared_relu=True,
             fp4="e2m1",
             fp4_recipe="nvfp4",
+            **activation_overrides,
         )
         training_layer = (
             get_moe_module_spec(

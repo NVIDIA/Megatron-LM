@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""FlashInfer routed-MoE support for per-token NVFP4 x NVFP4 squared-ReLU experts.
+"""FlashInfer routed-MoE support for per-token NVFP4 x NVFP4 squared-ReLU and SwiGLU experts.
 
 Expert weights are quantized from MCore's BF16 expert stacks with one FP32
 global scale per expert. Activations are quantized online with one FP32 scale
@@ -46,6 +46,8 @@ FLOAT8_E4M3_MAX = 448.0
 PER_TOKEN_ACTIVATION_GLOBAL_SCALE = 1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
 # GEMM K/N padding: the CuTe DSL grouped GEMMs need N % 128 and full 256-wide FP4 K tiles.
 _ALIGNMENT = 256
+# Gated FC1 rows are [up, gate] blocks of this many rows each, alternating.
+_GLU_INTERLEAVE_ROWS = 64
 
 _CUTE_DSL_WRAPPERS: dict = {}
 
@@ -72,12 +74,15 @@ class FlashInferRoutedNVFP4Weights:
     of the 128x4-swizzled E4M3 block scales held in ``*_scale_swizzled``.
     ``*_alpha`` are the per-expert FP32 dequantization scales and
     ``fc2_input_scale`` is the per-token recipe constant for the FC2 input.
+    Gated (SwiGLU) FC1 has ``2 * padded_intermediate_size`` rows in FlashInfer's
+    interleaved up/gate order.
     """
 
     hidden_size: int
     intermediate_size: int
     padded_hidden_size: int
     padded_intermediate_size: int
+    gated: bool
     fc1_data: torch.Tensor
     fc1_scale_swizzled: torch.Tensor
     fc1_scale: torch.Tensor
@@ -101,18 +106,35 @@ def _global_encode_scale(weight: torch.Tensor) -> torch.Tensor:
     return torch.where(amax > 0, encode, torch.ones_like(encode))
 
 
+def _zero_pad(weight: torch.Tensor, padded_rows: int, padded_cols: int) -> torch.Tensor:
+    rows, cols = weight.shape
+    padded = weight.new_zeros(padded_rows, padded_cols, dtype=torch.bfloat16)
+    padded[:rows, :cols].copy_(weight)
+    return padded
+
+
+def _pad_fc1(weight: torch.Tensor, gated: bool, padded_i: int, padded_h: int) -> torch.Tensor:
+    """Zero-pad one FC1 expert weight into the CuTe DSL row order.
+
+    MCore stores gated FC1 as ``[gate; up]``. FlashInfer expects ``[up; gate]`` with each half
+    padded separately and the halves interleaved in ``_GLU_INTERLEAVE_ROWS``-row blocks.
+    """
+    if not gated:
+        return _zero_pad(weight, padded_i, padded_h)
+    gate, up = weight.chunk(2, dim=0)
+    halves = torch.stack((_zero_pad(up, padded_i, padded_h), _zero_pad(gate, padded_i, padded_h)))
+    blocks = halves.view(2, padded_i // _GLU_INTERLEAVE_ROWS, _GLU_INTERLEAVE_ROWS, padded_h)
+    return blocks.transpose(0, 1).reshape(2 * padded_i, padded_h)
+
+
 def _quantize_expert(
-    weight: torch.Tensor,
-    padded_rows: int,
-    padded_cols: int,
+    padded: torch.Tensor,
     data_out: torch.Tensor,
     swizzled_scale_out: torch.Tensor,
     alpha_out: torch.Tensor,
 ) -> None:
-    """Zero-pad one ``[rows, cols]`` expert weight and quantize it into CuTe DSL NVFP4 storage."""
-    rows, cols = weight.shape
-    padded = weight.new_zeros(padded_rows, padded_cols, dtype=torch.bfloat16)
-    padded[:rows, :cols].copy_(weight)
+    """Quantize one zero-padded ``[rows, cols]`` expert weight into CuTe DSL NVFP4 storage."""
+    padded_rows, padded_cols = padded.shape
     encode = _global_encode_scale(padded)
     data, scale = nvfp4_quantize(padded, encode, sfLayout=SfLayout.layout_128x4)
     data_out.copy_(data.view(torch.uint8).reshape(padded_rows, padded_cols // 2))
@@ -122,29 +144,41 @@ def _quantize_expert(
     alpha_out.copy_(encode.reciprocal())
 
 
-def _validate_stacks(fc1_weight: torch.Tensor, fc2_weight: torch.Tensor) -> tuple[int, int, int]:
+def _validate_stacks(
+    fc1_weight: torch.Tensor, fc2_weight: torch.Tensor
+) -> tuple[int, int, int, bool]:
+    """Return (experts, intermediate, hidden, gated); gated FC1 has twice FC2's input width."""
     if fc1_weight.ndim != 3 or fc2_weight.ndim != 3:
         raise ValueError(
             "expected [experts, M, K] expert stacks, got "
             f"fc1={tuple(fc1_weight.shape)}, fc2={tuple(fc2_weight.shape)}"
         )
-    experts, intermediate_size, hidden_size = fc1_weight.shape
-    if tuple(fc2_weight.shape) != (experts, hidden_size, intermediate_size):
+    experts, hidden_size, intermediate_size = fc2_weight.shape
+    fc1_rows = fc1_weight.shape[1]
+    gated = fc1_rows == 2 * intermediate_size
+    if tuple(fc1_weight.shape) != (experts, fc1_rows, hidden_size) or fc1_rows not in (
+        intermediate_size,
+        2 * intermediate_size,
+    ):
         raise ValueError(
-            f"FC2 shape {tuple(fc2_weight.shape)} does not match FC1 shape "
-            f"{tuple(fc1_weight.shape)} for non-gated experts"
+            f"FC1 shape {tuple(fc1_weight.shape)} does not match FC2 shape "
+            f"{tuple(fc2_weight.shape)}: expected [experts, intermediate or 2 * intermediate, "
+            "hidden]"
         )
-    return experts, intermediate_size, hidden_size
+    return experts, intermediate_size, hidden_size, gated
 
 
-def _check_refresh_metadata(out, experts, hidden_size, intermediate_size, padded_h, padded_i):
-    expected = (experts, hidden_size, intermediate_size, padded_h, padded_i)
+def _check_refresh_metadata(
+    out, experts, hidden_size, intermediate_size, padded_h, padded_i, gated
+):
+    expected = (experts, hidden_size, intermediate_size, padded_h, padded_i, gated)
     actual = (
         out.num_local_experts,
         out.hidden_size,
         out.intermediate_size,
         out.padded_hidden_size,
         out.padded_intermediate_size,
+        out.gated,
     )
     if actual != expected:
         raise ValueError(
@@ -159,18 +193,20 @@ def prepare_routed_nvfp4_weights(
     fc2_weight: torch.Tensor,
     out: FlashInferRoutedNVFP4Weights | None = None,
 ) -> FlashInferRoutedNVFP4Weights:
-    """Quantize BF16 squared-ReLU expert stacks into the per-token NVFP4 kernel layout.
+    """Quantize BF16 squared-ReLU or SwiGLU expert stacks into the per-token NVFP4 kernel layout.
 
     Args:
-        fc1_weight: ``[experts, intermediate, hidden]`` BF16 FC1 weights.
+        fc1_weight: ``[experts, intermediate, hidden]`` BF16 FC1 weights, or
+            ``[experts, 2 * intermediate, hidden]`` as MCore's ``[gate; up]`` for SwiGLU.
         fc2_weight: ``[experts, hidden, intermediate]`` BF16 FC2 weights.
         out: When provided, its tensors are refreshed in place. This preserves
             addresses captured by CUDA graphs across model refits.
     """
     require_flashinfer_routed_nvfp4()
-    experts, intermediate_size, hidden_size = _validate_stacks(fc1_weight, fc2_weight)
+    experts, intermediate_size, hidden_size, gated = _validate_stacks(fc1_weight, fc2_weight)
     padded_h = _round_up(hidden_size, _ALIGNMENT)
     padded_i = _round_up(intermediate_size, _ALIGNMENT)
+    fc1_rows = 2 * padded_i if gated else padded_i
     device = fc1_weight.device
 
     if out is None:
@@ -181,7 +217,7 @@ def prepare_routed_nvfp4_weights(
         # Each expert's row count is a multiple of 128, so per-expert 128x4-swizzled
         # scale blocks concatenate into the swizzled layout of the stacked matrix.
         fc1_scale_swizzled = _empty(
-            experts * padded_i, padded_h // NVFP4_BLOCK_SIZE, dtype=torch.uint8
+            experts * fc1_rows, padded_h // NVFP4_BLOCK_SIZE, dtype=torch.uint8
         )
         fc2_scale_swizzled = _empty(
             experts * padded_h, padded_i // NVFP4_BLOCK_SIZE, dtype=torch.uint8
@@ -191,10 +227,11 @@ def prepare_routed_nvfp4_weights(
             intermediate_size=intermediate_size,
             padded_hidden_size=padded_h,
             padded_intermediate_size=padded_i,
-            fc1_data=_empty(experts, padded_i, padded_h // 2, dtype=torch.uint8),
+            gated=gated,
+            fc1_data=_empty(experts, fc1_rows, padded_h // 2, dtype=torch.uint8),
             fc1_scale_swizzled=fc1_scale_swizzled,
             fc1_scale=convert_sf_to_mma_layout(
-                fc1_scale_swizzled, m=padded_i, k=padded_h, num_groups=experts
+                fc1_scale_swizzled, m=fc1_rows, k=padded_h, num_groups=experts
             ),
             fc1_alpha=_empty(experts, dtype=torch.float32),
             fc2_data=_empty(experts, padded_h, padded_i // 2, dtype=torch.uint8),
@@ -208,27 +245,25 @@ def prepare_routed_nvfp4_weights(
             ),
         )
     else:
-        _check_refresh_metadata(out, experts, hidden_size, intermediate_size, padded_h, padded_i)
+        _check_refresh_metadata(
+            out, experts, hidden_size, intermediate_size, padded_h, padded_i, gated
+        )
 
     for expert in range(experts):
         _quantize_expert(
-            fc1_weight[expert],
-            padded_i,
-            padded_h,
+            _pad_fc1(fc1_weight[expert], gated, padded_i, padded_h),
             out.fc1_data[expert],
-            out.fc1_scale_swizzled[expert * padded_i : (expert + 1) * padded_i],
+            out.fc1_scale_swizzled[expert * fc1_rows : (expert + 1) * fc1_rows],
             out.fc1_alpha[expert : expert + 1],
         )
         _quantize_expert(
-            fc2_weight[expert],
-            padded_h,
-            padded_i,
+            _zero_pad(fc2_weight[expert], padded_h, padded_i),
             out.fc2_data[expert],
             out.fc2_scale_swizzled[expert * padded_h : (expert + 1) * padded_h],
             out.fc2_alpha[expert : expert + 1],
         )
     for swizzled, mma, m, k in (
-        (out.fc1_scale_swizzled, out.fc1_scale, padded_i, padded_h),
+        (out.fc1_scale_swizzled, out.fc1_scale, fc1_rows, padded_h),
         (out.fc2_scale_swizzled, out.fc2_scale, padded_h, padded_i),
     ):
         converted = convert_sf_to_mma_layout(swizzled, m=m, k=k, num_groups=experts)
@@ -321,16 +356,17 @@ def flashinfer_routed_nvfp4_moe(
     activation_type: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run the FlashInfer per-token NVFP4 squared-ReLU MoE.
+    """Run the FlashInfer per-token NVFP4 squared-ReLU or SwiGLU MoE.
 
     Rows whose routing entries are -1 contribute zero output, so a graph-stable
     dispatcher buffer may be passed in full.
     """
     require_flashinfer_routed_nvfp4()
-    if activation_type != ActivationType.Relu2.value:
+    expected_activation = ActivationType.Swiglu if weights.gated else ActivationType.Relu2
+    if activation_type != expected_activation.value:
         raise ValueError(
-            "FlashInfer per-token NVFP4 MoE supports only Relu2 (squared-ReLU) experts; "
-            f"got activation_type={activation_type}"
+            f"{'Gated' if weights.gated else 'Non-gated'} per-token NVFP4 expert weights need "
+            f"activation_type={expected_activation.name}; got activation_type={activation_type}"
         )
     if hidden_states.shape[-1] != weights.hidden_size:
         raise ValueError(

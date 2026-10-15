@@ -733,7 +733,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         training_path=False,
         notes="FlashInfer nvfp4_quantize (per-expert weights and per-token activations) feeding "
-        "CuteDslMoEWrapper (Relu2; two-stage finalize under deterministic algorithms or "
+        "CuteDslMoEWrapper (Relu2 or SwiGLU; two-stage finalize under deterministic algorithms or "
         "batch_invariant_mode). The quantizer and the MoE are replayed in "
         "test_inference_kernels.py (MoELayer level in "
         "test_inference_nvfp4_moe_layer_replays) and checked for batch invariance across batch "

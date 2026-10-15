@@ -14,6 +14,11 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.kernels.harness import deterministic_algorithms
 from tests.unit_tests.test_utilities import Utils
 
+_ACTIVATIONS = {
+    "squared_relu": dict(activation_func=squared_relu, gated_linear_unit=False),
+    "swiglu": dict(activation_func=F.silu, gated_linear_unit=True),
+}
+
 
 def _make_nvfp4_config(**overrides):
     kwargs = dict(
@@ -35,8 +40,9 @@ def _make_nvfp4_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
-def test_flashinfer_nvfp4_config_accepts_squared_relu_moe():
-    config = _make_nvfp4_config()
+@pytest.mark.parametrize("activation", _ACTIVATIONS)
+def test_flashinfer_nvfp4_config_accepts_moe(activation):
+    config = _make_nvfp4_config(**_ACTIVATIONS[activation])
     assert config.inference_moe_nvfp4_recipe == "per_token"
 
 
@@ -69,6 +75,15 @@ def test_flashinfer_nvfp4_batch_invariant_mode_requires_nvls_with_ep():
         ({"inference_grouped_gemm_backend": "torch"}, "requires inference_grouped_gemm_backend"),
         ({"activation_func": F.silu}, "supports only non-gated squared-ReLU"),
         ({"gated_linear_unit": True}, "supports only non-gated squared-ReLU"),
+        (
+            {**_ACTIVATIONS["swiglu"], "activation_func_clamp_value": 7.0},
+            "supports only plain SwiGLU",
+        ),
+        ({**_ACTIVATIONS["swiglu"], "glu_linear_offset": 1.0}, "supports only plain SwiGLU"),
+        (
+            {**_ACTIVATIONS["swiglu"], "moe_mlp_glu_interleave_size": 64},
+            "supports only plain SwiGLU",
+        ),
         ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True}, "cannot be combined"),
         ({"transformer_impl": "transformer_engine"}, "requires transformer_impl"),
         ({"activation_func_tanh_clamp_scale": 10.0}, "does not support activation_func_tanh"),
@@ -169,6 +184,40 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
     assert captured["out"] is None
 
 
+def test_gated_fc1_is_padded_per_half_and_interleaved_up_gate():
+    """MCore's [gate; up] FC1 becomes FlashInfer's alternating 64-row [up, gate] blocks."""
+    from megatron.core.inference.moe.flashinfer_nvfp4 import _pad_fc1
+
+    intermediate, hidden, padded_i, padded_h = 96, 40, 256, 256
+    gate = torch.arange(intermediate * hidden, dtype=torch.float32).view(intermediate, hidden) + 1
+    up = -gate
+    padded = _pad_fc1(torch.cat([gate, up]).bfloat16(), True, padded_i, padded_h)
+
+    def _half(x):
+        out = torch.zeros(padded_i, padded_h, dtype=torch.bfloat16)
+        out[:intermediate, :hidden] = x.bfloat16()
+        return out
+
+    expected = torch.cat(
+        [
+            torch.cat([_half(up)[rows], _half(gate)[rows]])
+            for rows in torch.arange(padded_i).split(64)
+        ]
+    )
+    assert padded.shape == (2 * padded_i, padded_h)
+    assert torch.equal(padded, expected)
+
+
+def test_validate_stacks_infers_gating_from_shapes():
+    from megatron.core.inference.moe.flashinfer_nvfp4 import _validate_stacks
+
+    fc2 = torch.empty(2, 64, 48)
+    assert _validate_stacks(torch.empty(2, 48, 64), fc2) == (2, 48, 64, False)
+    assert _validate_stacks(torch.empty(2, 96, 64), fc2) == (2, 48, 64, True)
+    with pytest.raises(ValueError, match="does not match FC2 shape"):
+        _validate_stacks(torch.empty(2, 72, 64), fc2)
+
+
 def _blackwell_or_newer() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
@@ -183,17 +232,30 @@ requires_flashinfer_nvfp4 = pytest.mark.skipif(
 )
 
 
-def _reference_squared_relu_moe(hidden, fc1, fc2, topk_ids, topk_weights):
+def _reference_moe(hidden, fc1, fc2, topk_ids, topk_weights):
+    """BF16 squared-ReLU MoE, or SwiGLU when FC1 holds MCore's [gate; up] halves."""
+    gated = fc1.shape[1] == 2 * fc2.shape[2]
     output = torch.zeros_like(hidden, dtype=torch.float32)
     for slot in range(topk_ids.shape[1]):
         for expert in range(fc1.shape[0]):
             rows = topk_ids[:, slot] == expert
             if not rows.any():
                 continue
-            intermediate = F.relu(hidden[rows].float() @ fc1[expert].float().t()).square()
+            fc1_out = hidden[rows].float() @ fc1[expert].float().t()
+            if gated:
+                gate, up = fc1_out.chunk(2, dim=-1)
+                intermediate = F.silu(gate) * up
+            else:
+                intermediate = F.relu(fc1_out).square()
             expert_out = intermediate @ fc2[expert].float().t()
             output[rows] += topk_weights[rows, slot : slot + 1] * expert_out
     return output
+
+
+def _activation_type(gated):
+    from flashinfer import ActivationType
+
+    return (ActivationType.Swiglu if gated else ActivationType.Relu2).value
 
 
 def _assert_close_to_reference(output, reference):
@@ -293,10 +355,9 @@ def test_per_token_nvfp4_quantize_matches_reference(monkeypatch, tokens, hidden_
 
 @requires_blackwell
 @requires_flashinfer_nvfp4
+@pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
 @pytest.mark.parametrize(("hidden_size", "intermediate_size"), [(512, 512), (320, 384)])
-def test_flashinfer_routed_nvfp4_moe_matches_bf16_reference(hidden_size, intermediate_size):
-    from flashinfer import ActivationType
-
+def test_flashinfer_routed_nvfp4_moe_matches_bf16_reference(hidden_size, intermediate_size, gated):
     from megatron.core.inference.moe.flashinfer_nvfp4 import (
         flashinfer_routed_nvfp4_moe,
         prepare_routed_nvfp4_weights,
@@ -305,7 +366,8 @@ def test_flashinfer_routed_nvfp4_moe_matches_bf16_reference(hidden_size, interme
     torch.manual_seed(0)
     experts, top_k, tokens = 4, 2, 64
     device = torch.device("cuda")
-    fc1 = torch.randn(experts, intermediate_size, hidden_size, device=device) * 0.05
+    fc1_rows = 2 * intermediate_size if gated else intermediate_size
+    fc1 = torch.randn(experts, fc1_rows, hidden_size, device=device) * 0.05
     fc2 = torch.randn(experts, hidden_size, intermediate_size, device=device) * 0.05
     fc1, fc2 = fc1.bfloat16(), fc2.bfloat16()
     # Spread per-token magnitudes so a single tensor-wide activation scale would underflow.
@@ -317,6 +379,7 @@ def test_flashinfer_routed_nvfp4_moe_matches_bf16_reference(hidden_size, interme
     topk_weights = torch.softmax(torch.randn(tokens, top_k, device=device), dim=-1)
 
     weights = prepare_routed_nvfp4_weights(fc1, fc2)
+    assert weights.gated == gated
     output = flashinfer_routed_nvfp4_moe(
         hidden,
         topk_ids,
@@ -324,9 +387,9 @@ def test_flashinfer_routed_nvfp4_moe_matches_bf16_reference(hidden_size, interme
         weights,
         num_experts=experts,
         local_expert_offset=0,
-        activation_type=ActivationType.Relu2.value,
+        activation_type=_activation_type(gated),
     )
-    reference = _reference_squared_relu_moe(hidden, fc1, fc2, topk_ids, topk_weights)
+    reference = _reference_moe(hidden, fc1, fc2, topk_ids, topk_weights)
 
     assert output.shape == (tokens, hidden_size)
     _assert_close_to_reference(output, reference)
@@ -343,20 +406,30 @@ def test_flashinfer_routed_nvfp4_moe_matches_bf16_reference(hidden_size, interme
         weights,
         num_experts=experts,
         local_expert_offset=0,
-        activation_type=ActivationType.Relu2.value,
+        activation_type=_activation_type(gated),
     )
-    reference_negated = _reference_squared_relu_moe(hidden, -fc1, fc2, topk_ids, topk_weights)
+    reference_negated = _reference_moe(hidden, -fc1, fc2, topk_ids, topk_weights)
     _assert_close_to_reference(output_negated, reference_negated)
+
+    with pytest.raises(ValueError, match="need activation_type"):
+        flashinfer_routed_nvfp4_moe(
+            hidden,
+            topk_ids,
+            topk_weights,
+            weights,
+            num_experts=experts,
+            local_expert_offset=0,
+            activation_type=_activation_type(not gated),
+        )
 
 
 @requires_blackwell
 @requires_flashinfer_nvfp4
+@pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
 @pytest.mark.parametrize("mode", ["deterministic", "batch_invariant"])
 @pytest.mark.parametrize("local_expert_offset", [0, 2, 4, 6])
-def test_flashinfer_routed_nvfp4_is_batch_invariant(local_expert_offset, mode):
+def test_flashinfer_routed_nvfp4_is_batch_invariant(local_expert_offset, mode, gated):
     """A token's local-EP output must not depend on its batch or row position."""
-    from flashinfer import ActivationType
-
     from megatron.core.inference.moe.flashinfer_nvfp4 import (
         flashinfer_routed_nvfp4_moe,
         prepare_routed_nvfp4_weights,
@@ -369,8 +442,9 @@ def test_flashinfer_routed_nvfp4_is_batch_invariant(local_expert_offset, mode):
     num_experts, local_experts, hidden_size, intermediate_size = 8, 2, 512, 512
     num_tokens, topk = 512, 2
     local = slice(local_expert_offset, local_expert_offset + local_experts)
+    fc1_rows = 2 * intermediate_size if gated else intermediate_size
     weights = prepare_routed_nvfp4_weights(
-        (torch.randn(num_experts, intermediate_size, hidden_size, device="cuda") * 0.05)[local]
+        (torch.randn(num_experts, fc1_rows, hidden_size, device="cuda") * 0.05)[local]
         .bfloat16()
         .contiguous(),
         (torch.randn(num_experts, hidden_size, intermediate_size, device="cuda") * 0.05)[local]
@@ -400,7 +474,7 @@ def test_flashinfer_routed_nvfp4_is_batch_invariant(local_expert_offset, mode):
             weights,
             num_experts=num_experts,
             local_expert_offset=local_expert_offset,
-            activation_type=ActivationType.Relu2.value,
+            activation_type=_activation_type(gated),
         )[target_row]
 
     context = (
@@ -484,7 +558,7 @@ class TestNVFP4MoELayer:
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
-    def _make_layer(self, dispatcher):
+    def _make_layer(self, dispatcher, activation):
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -495,7 +569,9 @@ class TestNVFP4MoELayer:
         if dispatcher == "nvls":
             if Utils.world_size < 2 or Utils.world_size & (Utils.world_size - 1):
                 pytest.skip("NVLS dispatcher requires a power-of-two EP size > 1.")
-        config = _make_nvfp4_layer_config(inference_moe_token_dispatcher_type=dispatcher)
+        config = _make_nvfp4_layer_config(
+            inference_moe_token_dispatcher_type=dispatcher, **_ACTIVATIONS[activation]
+        )
         if dispatcher == "nvls":
             NVLSAllGatherVDispatcher.allocate_buffers(
                 per_rank_worst_case_token_count=_NVLS_MAX_TOKENS,
@@ -515,16 +591,20 @@ class TestNVFP4MoELayer:
         return hidden.to(torch.bfloat16)
 
     @staticmethod
-    def _assert_close_to_bf16(inference_output, training_output):
+    def _assert_close_to_bf16(inference_output, training_output, activation):
         cosine = F.cosine_similarity(
             inference_output.float().flatten(0, 1), training_output.float().flatten(0, 1), dim=-1
         )
-        assert cosine.mean().item() > 0.98, cosine.mean().item()
+        # SwiGLU multiplies two NVFP4 projections, so it lands near 0.978 where squared ReLU
+        # exceeds 0.98; a wrong gate/up layout drops far below either bound.
+        min_mean = 0.97 if activation == "swiglu" else 0.98
+        assert cosine.mean().item() > min_mean, cosine.mean().item()
         assert cosine.min().item() > 0.9, cosine.min().item()
 
+    @pytest.mark.parametrize("activation", _ACTIVATIONS)
     @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
-    def test_nvfp4_moe_layer_matches_bf16_training_path(self, dispatcher):
-        layer = self._make_layer(dispatcher)
+    def test_nvfp4_moe_layer_matches_bf16_training_path(self, dispatcher, activation):
+        layer = self._make_layer(dispatcher, activation)
         # NCCL AllGather (non-v) requires equal token counts on every rank.
         local_tokens = 32 if dispatcher == "nccl" else 17 + torch.distributed.get_rank()
         hidden_states = self._hidden_states(local_tokens, layer.config.hidden_size)
@@ -537,15 +617,17 @@ class TestNVFP4MoELayer:
         nvfp4_weights = layer.experts._nvfp4_weights
         assert nvfp4_weights.padded_hidden_size == 256
         assert nvfp4_weights.padded_intermediate_size == 512
+        assert nvfp4_weights.gated == (activation == "swiglu")
         assert inference_output.shape == training_output.shape
         assert inference_output.dtype == torch.bfloat16
         assert not torch.equal(inference_output, training_output), "NVFP4 path did not run"
-        self._assert_close_to_bf16(inference_output, training_output)
+        self._assert_close_to_bf16(inference_output, training_output, activation)
 
+    @pytest.mark.parametrize("activation", _ACTIVATIONS)
     @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
-    def test_nvfp4_moe_layer_refresh_tracks_bf16_weight_updates(self, dispatcher):
+    def test_nvfp4_moe_layer_refresh_tracks_bf16_weight_updates(self, dispatcher, activation):
         """Simulates an optimizer step on a colocated model followed by a refresh."""
-        layer = self._make_layer(dispatcher)
+        layer = self._make_layer(dispatcher, activation)
         local_tokens = 32
         hidden_states = self._hidden_states(local_tokens, layer.config.hidden_size)
 
@@ -570,12 +652,15 @@ class TestNVFP4MoELayer:
         assert layer.experts._nvfp4_weights is nvfp4_weights
         assert nvfp4_weights.fc2_data.data_ptr() == fc2_data_ptr
         assert not torch.equal(refreshed, before)
-        self._assert_close_to_bf16(refreshed, training_output)
+        self._assert_close_to_bf16(refreshed, training_output, activation)
 
+    @pytest.mark.parametrize("activation", _ACTIVATIONS)
     @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
-    def test_nvfp4_moe_layer_cuda_graph_replay_tracks_inputs_and_refresh(self, dispatcher):
+    def test_nvfp4_moe_layer_cuda_graph_replay_tracks_inputs_and_refresh(
+        self, dispatcher, activation
+    ):
         """A captured layer replays like eager, and an in-place refresh reaches the graph."""
-        layer = self._make_layer(dispatcher)
+        layer = self._make_layer(dispatcher, activation)
         local_tokens = 32 if dispatcher == "nccl" else 17 + torch.distributed.get_rank()
         hidden_size = layer.config.hidden_size
         static_hidden = self._hidden_states(local_tokens, hidden_size)

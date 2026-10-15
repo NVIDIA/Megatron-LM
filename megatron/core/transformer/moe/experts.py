@@ -1304,7 +1304,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         ), "flashinfer-python is required to resolve FlashInfer activation type."
         func = self.config.activation_func
         if func == F.silu:
-            return ActivationType.Silu
+            return ActivationType.Swiglu if self.config.gated_linear_unit else ActivationType.Silu
         elif func == F.gelu:
             return ActivationType.Gelu
         elif func == F.relu:

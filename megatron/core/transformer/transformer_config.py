@@ -1444,7 +1444,8 @@ class TransformerConfig(ModelParallelConfig):
     activations online, so no calibration is required. Uses the
     FlashInfer CuTe DSL grouped GEMMs (requires nvidia-cutlass-dsl) and requires
     transformer_impl='inference_optimized', inference_grouped_gemm_backend='flashinfer',
-    non-gated squared-ReLU experts, BF16 expert parameters, and FlashInfer >= 0.7.0 on
+    non-gated squared-ReLU or gated SiLU (SwiGLU) experts without GLU clamping, offset or
+    interleaving, BF16 expert parameters, and FlashInfer >= 0.7.0 on
     Blackwell (SM100/SM103). The BF16 expert weights stay resident as the refit
     destination alongside the padded NVFP4 copy. Supports batch_invariant_mode (with
     the NVLS dispatcher when EP > 1), like FlashInfer MXFP8.
@@ -2055,16 +2056,28 @@ class TransformerConfig(ModelParallelConfig):
                         "inference_grouped_gemm_backend='flashinfer', got "
                         f"'{self.inference_grouped_gemm_backend}'."
                     )
-                if self.gated_linear_unit or self.activation_func != squared_relu:
+                if self.activation_func != (F.silu if self.gated_linear_unit else squared_relu):
                     raise ValueError(
-                        "inference_moe_nvfp4_recipe supports only non-gated squared-ReLU "
-                        "experts. Set activation_func=squared_relu and gated_linear_unit=False."
+                        "inference_moe_nvfp4_recipe supports only non-gated squared-ReLU or "
+                        "gated SiLU (SwiGLU) experts. Set activation_func=squared_relu with "
+                        "gated_linear_unit=False, or activation_func=F.silu with "
+                        "gated_linear_unit=True."
                     )
                 if self.activation_func_tanh_clamp_scale is not None:
                     raise ValueError(
                         "inference_moe_nvfp4_recipe does not support "
                         "activation_func_tanh_clamp_scale: the FlashInfer per-token NVFP4 "
-                        "kernels only implement unclamped Relu2."
+                        "kernels only implement unclamped Relu2 and SwiGLU."
+                    )
+                if self.gated_linear_unit and (
+                    self.activation_func_clamp_value is not None
+                    or self.glu_linear_offset != 0.0
+                    or self.moe_mlp_glu_interleave_size is not None
+                ):
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe supports only plain SwiGLU: "
+                        "activation_func_clamp_value, glu_linear_offset and "
+                        "moe_mlp_glu_interleave_size must be unset."
                     )
                 if self.fp8 or self.fp4_param:
                     raise ValueError(
@@ -2073,14 +2086,17 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
             # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vLLM
-            # grouped-GEMM backends.
-            if self.gated_linear_unit and self.inference_grouped_gemm_backend not in (
-                InferenceGroupedGemmBackend.TORCH,
-                InferenceGroupedGemmBackend.VLLM,
+            # grouped-GEMM backends, and SwiGLU by FlashInfer per-token NVFP4.
+            if (
+                self.gated_linear_unit
+                and self.inference_grouped_gemm_backend
+                not in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
+                and self.inference_moe_nvfp4_recipe is None
             ):
                 raise ValueError(
                     "--transformer-impl='inference_optimized' supports gated linear units "
                     "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
+                    "or with inference_moe_nvfp4_recipe, "
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 

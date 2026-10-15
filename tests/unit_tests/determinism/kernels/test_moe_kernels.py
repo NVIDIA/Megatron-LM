@@ -518,8 +518,9 @@ class TestMoEModules:
             what="TEGroupedMLP",
         )
 
-    def test_inference_nvfp4_moe_layer_replays(self):
-        """Inference MoELayer through the FlashInfer per-token NVFP4 squared-ReLU experts."""
+    @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+    def test_inference_nvfp4_moe_layer_replays(self, gated):
+        """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""
         from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
         from megatron.core.inference.utils import InferenceMode
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
@@ -550,7 +551,8 @@ class TestMoEModules:
             moe_router_enable_expert_bias=True,
             moe_router_dtype="fp32",
             moe_grouped_gemm=True,
-            activation_func=squared_relu,
+            activation_func=F.silu if gated else squared_relu,
+            gated_linear_unit=gated,
             add_bias_linear=False,
             bf16=True,
             params_dtype=torch.bfloat16,

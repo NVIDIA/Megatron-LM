@@ -724,10 +724,11 @@ def _require_flashinfer_nvfp4():
         pytest.skip("FlashInfer >= 0.7.0 per-token NVFP4 MoE is unavailable")
 
 
-def _nvfp4_expert_weights(num_experts, hidden_size, intermediate_size):
+def _nvfp4_expert_weights(num_experts, hidden_size, intermediate_size, gated):
     from megatron.core.inference.moe.flashinfer_nvfp4 import prepare_routed_nvfp4_weights
 
-    fc1 = torch.randn(num_experts, intermediate_size, hidden_size, device="cuda") * 0.05
+    fc1_rows = 2 * intermediate_size if gated else intermediate_size
+    fc1 = torch.randn(num_experts, fc1_rows, hidden_size, device="cuda") * 0.05
     fc2 = torch.randn(num_experts, hidden_size, intermediate_size, device="cuda") * 0.05
     return prepare_routed_nvfp4_weights(fc1.bfloat16(), fc2.bfloat16())
 
@@ -748,11 +749,16 @@ def test_per_token_nvfp4_quantize_replays():
     assert_replays_bit_exact(fn, (x,), backward=False, what="per-token nvfp4_quantize")
 
 
-@pytest.mark.launch_on_gb200
-def test_flashinfer_nvfp4_moe_replays():
-    """Batch-invariant mode selects an order-fixed top-k combine, so replays are exact."""
+def _nvfp4_activation_type(gated):
     from flashinfer import ActivationType
 
+    return (ActivationType.Swiglu if gated else ActivationType.Relu2).value
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+def test_flashinfer_nvfp4_moe_replays(gated):
+    """Batch-invariant mode selects an order-fixed top-k combine, so replays are exact."""
     from megatron.core.inference.moe.flashinfer_nvfp4 import flashinfer_routed_nvfp4_moe
     from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
         set_batch_invariant_mode,
@@ -761,7 +767,7 @@ def test_flashinfer_nvfp4_moe_replays():
     _require_flashinfer_nvfp4()
     seeded()
     num_experts, tokens, topk = 8, 384, 4
-    weights = _nvfp4_expert_weights(num_experts, 512, 512)
+    weights = _nvfp4_expert_weights(num_experts, 512, 512, gated)
     x = torch.randn(tokens, 512, device="cuda", dtype=torch.bfloat16)
     routes = torch.stack(
         [torch.randperm(num_experts, device="cuda")[:topk] for _ in range(tokens)]
@@ -776,7 +782,7 @@ def test_flashinfer_nvfp4_moe_replays():
             weights,
             num_experts=num_experts,
             local_expert_offset=0,
-            activation_type=ActivationType.Relu2.value,
+            activation_type=_nvfp4_activation_type(gated),
         )
 
     with torch.no_grad(), set_batch_invariant_mode(True):
@@ -784,14 +790,13 @@ def test_flashinfer_nvfp4_moe_replays():
 
 
 @pytest.mark.launch_on_gb200
-def test_flashinfer_nvfp4_moe_is_batch_invariant():
+@pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+def test_flashinfer_nvfp4_moe_is_batch_invariant(gated):
     """A routed token must be bitwise stable as the batch and its expert loads change.
 
     Unlike a fixed-size buffer with inactive rows, the batch size itself changes here, so
     kernel tactic and tile selection see a different M.
     """
-    from flashinfer import ActivationType
-
     from megatron.core.inference.moe.flashinfer_nvfp4 import flashinfer_routed_nvfp4_moe
     from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
         set_batch_invariant_mode,
@@ -800,7 +805,7 @@ def test_flashinfer_nvfp4_moe_is_batch_invariant():
     _require_flashinfer_nvfp4()
     torch.manual_seed(1234)
     num_experts, hidden_size, topk = 4, 512, 2
-    weights = _nvfp4_expert_weights(num_experts, hidden_size, hidden_size)
+    weights = _nvfp4_expert_weights(num_experts, hidden_size, hidden_size, gated)
     target = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
     target_experts = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     target_probs = torch.tensor([0.625, 0.375], device="cuda", dtype=torch.float32)
@@ -822,7 +827,7 @@ def test_flashinfer_nvfp4_moe_is_batch_invariant():
             weights,
             num_experts=num_experts,
             local_expert_offset=0,
-            activation_type=ActivationType.Relu2.value,
+            activation_type=_nvfp4_activation_type(gated),
         )[target_row]
 
     with torch.no_grad(), set_batch_invariant_mode(True):
