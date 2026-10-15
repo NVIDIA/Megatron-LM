@@ -87,16 +87,6 @@ class MoKMegakernel(MegakernelBackend):
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
-        if self.use_mxfp8_weights:
-            from megatron.core import fp8_utils
-
-            if fp8_utils.te_post_all_gather_processing is None:
-                raise RuntimeError(
-                    "MOK MXFP8 requires Transformer Engine with "
-                    "post_all_gather_processing support (normally TE >= 2.10.0). Older TE "
-                    "versions rely on a later TE expert forward to refresh columnwise weights, "
-                    "but MOK bypasses that forward path."
-                )
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
         try:
             self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
@@ -238,7 +228,15 @@ class MoKMegakernel(MegakernelBackend):
 
     @torch.no_grad()
     def quantized_routed_weights(self):
-        """Build or refresh cached MOK routed-weight views."""
+        """Alias native payloads and refresh the converted scales after parameter sync.
+
+        With overlapped parameter gathering, DDP's pre-hook on our aliases finishes
+        all-gather before forward.
+        Grad-buffer reuse requantizes into TE storage and clears the staging buffer;
+        the MOK payload views reference TE storage, not that temporary buffer.
+        Scale conversion still needs to run after each optimizer update, in place
+        so descriptors keep their addresses. It does not requantize the weights.
+        """
         needs_weight_view_update = self._routed_weight_view_cache is None or (
             self.use_mxfp8_weights and self.is_first_microbatch
         )

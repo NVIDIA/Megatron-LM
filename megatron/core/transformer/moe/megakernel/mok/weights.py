@@ -50,6 +50,8 @@ def _storage_view(
     storage: torch.Tensor, shape: tuple[int, ...], *, dtype: torch.dtype, name: str
 ) -> torch.Tensor:
     """Return a zero-copy dense view over a TE grouped backing tensor."""
+    if storage is None:
+        raise RuntimeError(f"MOK {name} requires native TE payload storage")
     if not storage.is_cuda or not storage.is_contiguous():
         raise RuntimeError(f"MOK {name} storage must be contiguous CUDA storage")
     if storage.dtype != dtype:
