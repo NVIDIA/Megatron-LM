@@ -437,6 +437,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     a.routing_indices = np.array([[1, 2]])
     b.routing_indices = np.array([[3, 4]])
     b.policy_epoch = [(0, 3)]
+    b.finish_reason = "length"
     a.add_event_evict()
     rec = DynamicInferenceRequestRecord(requests=[a, b])
     rec.latency = 4.2
@@ -454,6 +455,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     finished = FinishedRequestRecord.from_request(merged)
     assert finished.policy_epoch == [(0, 3)] and finished.kv_cache_epoch is None
     assert (finished.num_evictions, finished.num_tokens_to_generate) == (1, 8)
+    assert finished.finish_reason == "length"
     # A live snapshot is the merged payload and record, keyed like a completion.
     snapshot = LiveRequestSnapshot.from_record(rec, finished=False)
     assert (snapshot.uid, snapshot.request_id, snapshot.record) == (a.uid, 3, finished)
@@ -920,6 +922,9 @@ def test_offloaded_request_payload_and_serialize():
         req.generated_log_probs = [-0.5, -0.25]
         req.prompt_log_probs = torch.tensor([-1.0, -2.0])
         req.routing_indices = routing
+        req.generated_top_n_logprobs = [{"a": -0.5}, {"b": -0.25}]
+        req.prompt_top_n_logprobs = [{"p": -1.0}, {"q": -2.0}]
+        req.acceptance_step_lengths = [1, 1]
         return req
 
     req = make_request()
@@ -929,6 +934,10 @@ def test_offloaded_request_payload_and_serialize():
     assert payload.generated_log_probs == [-0.5, -0.25]
     assert payload.prompt_log_probs == [-1.0, -2.0]  # coerced from tensor
     assert payload.routing_indices is routing
+    assert payload.generated_top_n_logprobs == [{"a": -0.5}, {"b": -0.25}]
+    assert payload.prompt_top_n_logprobs == [{"p": -1.0}, {"q": -2.0}]
+    assert payload.acceptance_step_lengths == [1, 1]
+    assert payload.acceptance_step_lengths is not req.acceptance_step_lengths
     assert payload.media_tensors is None
 
     vlm_payload = OffloadedRequestPayload.from_request(make_request(multimodal=True))
@@ -958,6 +967,7 @@ def test_offloaded_request_payload_and_serialize():
     assert obj["generated_log_probs"] is None
     assert obj["prompt_log_probs"] is None and obj["routing_indices"] is None
     assert obj["generated_tokens"] == [10, 11]  # token ids stay: they are the response
+    assert obj["generated_top_n_logprobs"] == [{"a": -0.5}, {"b": -0.25}]  # top-N stays too
     # The drop is wire-only: local state is restored after the send.
     assert req.generated_log_probs == [-0.5, -0.25] and req.routing_indices is routing
 
@@ -994,12 +1004,22 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
             "has policy_epoch boundaries out of order",
         ),
         (
+            {**_WIRE, "generated_top_n_logprobs": [{"a": -0.1}, {"b": -0.2}]},
+            "has top-N log probs and tokens of different lengths, 2 and 1",
+        ),
+        ({**_WIRE, "prompt_top_n_logprobs": [[-0.1]]}, "has malformed prompt top-N log probs"),
+        ({**_WIRE, "acceptance_step_lengths": [0, 1]}, "has malformed acceptance step lengths"),
+        ({**_WIRE, "acceptance_step_lengths": [2]}, "has malformed acceptance step lengths"),
+        ({**_WIRE, "finish_reason": "eos"}, "has a malformed finish reason"),
+        ({**_WIRE, "finish_reason": "stop"}, "has a finish reason without finishing"),
+        (
             {k: v for k, v in _WIRE.items() if k != "token_ids"},
             "wire is malformed: KeyError: 'token_ids'",
         ),
         (list(_WIRE.values()), "wire is malformed: TypeError: .*"),
         ({**_WIRE, "token_ids": 1}, "wire is malformed: TypeError: .*"),
         ({**_WIRE, "policy_epoch": [3]}, "wire is malformed: TypeError: .*"),
+        ({**_WIRE, "acceptance_step_lengths": None}, "wire is malformed: TypeError: .*"),
     ],
     ids=[
         "non-int-tokens",
@@ -1013,10 +1033,17 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         "empty-kv-cache-epoch",
         "policy-epoch-not-at-admission",
         "policy-epoch-out-of-order",
+        "misaligned-top-n",
+        "malformed-prompt-top-n",
+        "zero-step-length",
+        "step-lengths-over-tokens",
+        "unknown-finish-reason",
+        "finish-reason-unfinished",
         "missing-field",
         "not-a-mapping",
         "unlistable-tokens",
         "unlistable-boundary",
+        "unlistable-step-lengths",
     ],
 )
 def test_reject_malformed_resumed_generation(wire, reason):
@@ -1043,13 +1070,25 @@ def test_resumed_record_merge(new_epoch):
     def admitted():
         return _make_dynamic_request(
             prompt_tokens=torch.tensor([1, 2, 3]),
-            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=-1),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10,
+                termination_id=-1,
+                return_log_probs=True,
+                top_n_logprobs=1,
+            ),
         )
 
     def generate(request, tokens, log_probs, prompt_log_probs):
+        """One speculative step emits every token, each scored with its top-1 alternative."""
         request.generated_tokens += tokens
         request.generated_log_probs = (request.generated_log_probs or []) + log_probs
-        request.prompt_log_probs = prompt_log_probs  # a prefill rescores the prompt it ran on
+        request.generated_top_n_logprobs = (request.generated_top_n_logprobs or []) + [
+            {str(token): score} for token, score in zip(tokens, log_probs)
+        ]
+        request.acceptance_step_lengths.append(len(tokens))
+        # A prefill rescores the prompt it ran on.
+        request.prompt_log_probs = prompt_log_probs
+        request.prompt_top_n_logprobs = [{"p": score} for score in prompt_log_probs]
 
     def schedule(request, epoch):
         if request.policy_epoch[-1][1] != epoch:
@@ -1060,6 +1099,7 @@ def test_resumed_record_merge(new_epoch):
 
     def finish(record):
         record[-1].status = Status.COMPLETED
+        record[-1].finish_reason = "stop"
         record[-1].add_event_finish()
         merged = record.merge()
         return OffloadedRequestPayload.from_request(merged), FinishedRequestRecord.from_request(
@@ -1094,9 +1134,11 @@ def test_resumed_record_merge(new_epoch):
     payload, telemetry = finish(record)
 
     assert vars(payload) == vars(expected_payload) and payload.prompt_log_probs == scores
+    assert payload.prompt_top_n_logprobs == [{"p": score} for score in scores]
+    assert len(payload.generated_top_n_logprobs) == sum(payload.acceptance_step_lengths) == 5
     restamp = [] if new_epoch == 7 else [(5, new_epoch)]
     assert (
         telemetry
         == expected_telemetry
-        == FinishedRequestRecord([(0, 6), (2, 7), *restamp], [(0, new_epoch)], 1, 10)
+        == FinishedRequestRecord([(0, 6), (2, 7), *restamp], [(0, new_epoch)], 1, 10, "stop")
     )
