@@ -31,6 +31,30 @@ except ImportError:
     HAVE_TRITON = False
 
 
+def _ensure_signal_pad_size(world_size: int) -> None:
+    """Grow torch's signal pad so the Triton collectives' barrier slots fit for this group.
+
+    symm_mem_sync uses one int32 slot per (block, peer). torch reads the signal pad size
+    when each allocation is made, so this must run before symm_mem.empty. It only grows
+    the size, and every rank runs the same allocations in the same order, so all ranks of
+    a group allocate the same pad.
+    """
+    # Imported here to avoid an import cycle: parallel_state imports this module, and the
+    # kernel package imports megatron.core.utils, which imports parallel_state.
+    from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+        SYMM_MEM_KERNEL_CONFIG,
+    )
+
+    if not hasattr(symm_mem, "set_signal_pad_size"):
+        # Older torch (e.g. 2.9) has a fixed 2 KiB pad and no setter. Its allocator puts the
+        # pad after the data and zeroes the whole granularity-rounded block, so barrier slots
+        # past the pad land in zeroed memory that nothing else uses.
+        return
+    needed = SYMM_MEM_KERNEL_CONFIG.signal_pad_bytes(world_size)
+    if symm_mem.get_signal_pad_size() < needed:
+        symm_mem.set_signal_pad_size(needed)
+
+
 class SymmetricMemoryBuffer:
     """
      symmetric memory buffer used in inference.
@@ -52,6 +76,7 @@ class SymmetricMemoryBuffer:
             numel = int(size_in_mb * 1024 * 1024)  # size in bytes
             try:
                 symm_mem.enable_symm_mem_for_group(process_group.group_name)
+                _ensure_signal_pad_size(process_group.size())
                 self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
                 self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
             except RuntimeError as e:
