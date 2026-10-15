@@ -23,6 +23,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule, fsdp_dtensor_checkpoint
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from megatron.training import checkpointing
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
@@ -76,6 +77,264 @@ def test_fsdp_global_param_name_uses_owning_model_chunk(owning_chunk):
     for chunk_index, model_chunk in enumerate(model_chunks):
         if chunk_index != owning_chunk:
             model_chunk.modules.assert_not_called()
+
+
+@pytest.fixture
+def fsdp_dtensor_checkpoint_case(monkeypatch):
+    def split_handler(chunk, model_state, optimizer_state):
+        split_model = {}
+        for name, value in model_state.items():
+            assert name == chunk.local_name
+            assert chunk.get_parameter(name) is chunk.parameter
+            split_model[name + "_w"] = memoryview(value)[:2]
+            split_model[name + "_v"] = memoryview(value)[2:]
+        if optimizer_state is None:
+            return split_model, None
+        split_optimizer = optimizer_state.copy()
+        split_optimizer["state"] = {}
+        for name, value in optimizer_state["state"].items():
+            local_name = name.removeprefix("module.")
+            if chunk.experts:
+                local_name = local_name.replace("weight2", "weight0")
+            assert local_name == chunk.local_name
+            assert chunk.get_parameter(local_name) is chunk.parameter
+            for suffix, section in (("_w", slice(0, 2)), ("_v", slice(2, 4))):
+                split_optimizer["state"][name + suffix] = {
+                    "exp_avg": memoryview(value["exp_avg"])[section]
+                }
+        return split_model, split_optimizer
+
+    def drop_extra_state(model_state):
+        model_state.pop("ignored._extra_state", None)
+
+    def rename_experts(state, num_experts):
+        return {name.replace("weight0", "weight2"): value for name, value in state.items()}
+
+    def identity_handler(chunk, model_state, optimizer_state):
+        return model_state, optimizer_state
+
+    monkeypatch.setattr(checkpointing, "handle_swiglu_in_state_dict", split_handler)
+    monkeypatch.setattr(checkpointing, "handle_mla_down_proj_in_state_dict", identity_handler)
+    monkeypatch.setattr(checkpointing, "handle_mtp_in_state_dict", identity_handler)
+    monkeypatch.setattr(checkpointing, "handle_fp8_extra_state_case", drop_extra_state)
+    monkeypatch.setattr(checkpointing, "handle_experts_in_state_dict", rename_experts)
+    monkeypatch.setattr(fsdp_dtensor_checkpoint, "handle_experts_in_state_dict", rename_experts)
+    preprocess_metadata = mock.Mock()
+    monkeypatch.setattr(
+        checkpointing, "preprocess_state_dict_for_uneven_dtensor", preprocess_metadata
+    )
+
+    def make_case(num_chunks, optimizer_layout, experts=False):
+        args = SimpleNamespace(swiglu=True, num_experts=4 if experts else None)
+        state_dict = {"iteration": 17}
+        chunks = []
+        optimizer_state = {"state": {}, "param_to_group_meta": {}}
+        for chunk_index in range(num_chunks):
+            chunk = mock.Mock()
+            chunk.parameter = object()
+            chunk.experts = experts
+            mlp = "mlp.experts.linear_fc1.weight0" if experts else "mlp.linear_fc1.weight"
+            chunk.local_name = f"decoder.layers.0.{mlp}"
+            chunk.global_name = chunk.local_name.replace(
+                "layers.0.", f"layers.{2 + 4 * chunk_index}."
+            )
+            if experts:
+                chunk.global_name = chunk.global_name.replace("weight0", "weight2")
+            chunk.get_parameter.side_effect = {chunk.local_name: chunk.parameter}.__getitem__
+            layer = mock.Mock(spec=fsdp_dtensor_checkpoint.TransformerLayer)
+            layer.layer_number = 3 + 4 * chunk_index
+            layer.parameters.return_value = [chunk.parameter]
+            chunk.modules.return_value = [layer]
+            chunk.config.num_moe_experts = args.num_experts
+            chunk.named_modules.return_value = [("module.decoder.layers.0", layer)]
+            chunk.named_parameters.return_value = [("module." + chunk.local_name, chunk.parameter)]
+            chunks.append(chunk)
+            model_key = "model" if num_chunks == 1 else f"model{chunk_index}"
+            state_dict[model_key] = {
+                chunk.local_name: bytearray([chunk_index + 1] * 4),
+                "ignored._extra_state": None,
+            }
+            global_name = "module." + chunk.global_name
+            optimizer_state["state"][global_name] = {"exp_avg": bytearray([chunk_index + 11] * 4)}
+            optimizer_state["param_to_group_meta"][global_name] = {"lr": 0.01}
+        if optimizer_layout == "single":
+            state_dict["optimizer"] = optimizer_state
+        elif optimizer_layout == "chained":
+            state_dict["optimizer"] = {
+                0: optimizer_state,
+                1: {"state": {}, "param_to_group_meta": {}},
+            }
+        return args, chunks, state_dict, preprocess_metadata
+
+    return make_case
+
+
+@pytest.mark.parametrize("num_chunks", [1, 2])
+@pytest.mark.parametrize("optimizer_layout", ["none", "single", "chained"])
+@pytest.mark.parametrize("experts", [False, True])
+def test_fsdp_dtensor_preprocess_all_chunks(
+    fsdp_dtensor_checkpoint_case, num_chunks, optimizer_layout, experts
+):
+    args, chunks, raw_state, preprocess_metadata = fsdp_dtensor_checkpoint_case(
+        num_chunks, optimizer_layout, experts
+    )
+    model = chunks[0] if num_chunks == 1 else chunks
+    processed = checkpointing.preprocess_fsdp_dtensor_state_dict(args, raw_state, model)
+
+    preprocess_metadata.assert_called_once_with(processed)
+    for chunk_index, chunk in enumerate(chunks):
+        model_key = "model" if num_chunks == 1 else f"model{chunk_index}"
+        assert set(processed[model_key]) == {chunk.global_name + "_w", chunk.global_name + "_v"}
+        assert set(raw_state[model_key]) == {chunk.local_name, "ignored._extra_state"}
+        assert bytes(processed[model_key][chunk.global_name + "_w"]) == bytes([chunk_index + 1] * 2)
+    if optimizer_layout == "none":
+        assert "optimizer" not in processed
+        return
+
+    processed_optimizer = processed["optimizer"]
+    raw_optimizer = raw_state["optimizer"]
+    if optimizer_layout == "chained":
+        assert processed_optimizer[1] == raw_optimizer[1]
+        processed_optimizer = processed_optimizer[0]
+        raw_optimizer = raw_optimizer[0]
+    assert processed_optimizer["param_to_group_meta"] is raw_optimizer["param_to_group_meta"]
+    assert set(processed_optimizer["state"]) == {
+        "module." + chunk.global_name + suffix for chunk in chunks for suffix in ("_w", "_v")
+    }
+    assert set(raw_optimizer["state"]) == {"module." + chunk.global_name for chunk in chunks}
+
+
+@pytest.mark.parametrize("optimizer_layout", ["none", "single", "chained"])
+@pytest.mark.parametrize("gpt_compat", [False, True])
+def test_fsdp_dtensor_load_restores_all_raw_chunks(
+    fsdp_dtensor_checkpoint_case, monkeypatch, optimizer_layout, gpt_compat
+):
+    args, chunks, raw_state, _ = fsdp_dtensor_checkpoint_case(2, optimizer_layout, experts=True)
+    args.non_persistent_global_ckpt_dir = None
+    args.ckpt_step = 17
+    args.strict_fsdp_dtensor_load = True
+    raw_models = {key: value for key, value in raw_state.items() if key.startswith("model")}
+    raw_state["_model"] = chunks
+
+    def load_views(state_dict, **kwargs):
+        for chunk_index, chunk in enumerate(chunks):
+            model_state = state_dict[f"model{chunk_index}"]
+            assert set(model_state) == {chunk.global_name + "_w", chunk.global_name + "_v"}
+            for value in model_state.values():
+                value[:] = bytes([77] * len(value))
+        if optimizer_layout != "none":
+            optimizer_state = state_dict["optimizer"]
+            if optimizer_layout == "chained":
+                optimizer_state = optimizer_state[0]
+            for state in optimizer_state["state"].values():
+                state["exp_avg"][:] = bytes([88] * len(state["exp_avg"]))
+
+    monkeypatch.setattr(checkpointing, "HAVE_MEGATRON_FSDP", True)
+    monkeypatch.setattr(checkpointing, "_get_non_persistent_iteration", mock.Mock(return_value=-1))
+    monkeypatch.setattr(checkpointing, "set_loaded_iteration", mock.Mock())
+    monkeypatch.setattr(checkpointing, "get_checkpoint_name", mock.Mock(return_value="checkpoint"))
+    monkeypatch.setattr(
+        checkpointing, "_get_checkpoint_format", mock.Mock(return_value="fsdp_dtensor")
+    )
+    monkeypatch.setattr(checkpointing, "print_rank_0", mock.Mock())
+    reader = mock.Mock()
+    reader.read_metadata.return_value.state_dict_metadata = {}
+    monkeypatch.setattr(
+        checkpointing.torch.distributed.checkpoint,
+        "FileSystemReader",
+        mock.Mock(return_value=reader),
+    )
+    monkeypatch.setattr(checkpointing.torch.distributed.checkpoint, "load_state_dict", load_views)
+
+    if gpt_compat:
+        with pytest.raises(NotImplementedError, match="virtual pipeline parallelism"):
+            _load_base_checkpoint(
+                "/nonexistent-fsdp-checkpoint",
+                args,
+                sharded_state_dict=raw_state,
+                gpt_compat_layer_maps=object(),
+            )
+        reader.read_metadata.assert_not_called()
+        return
+
+    loaded, _, _, ckpt_type = _load_base_checkpoint(
+        "/nonexistent-fsdp-checkpoint", args, sharded_state_dict=raw_state
+    )
+
+    assert ckpt_type == CheckpointType.FSDP_DTENSOR
+    assert "_model" not in loaded
+    assert "model" not in loaded
+    for chunk_index, chunk in enumerate(chunks):
+        model_state = loaded[f"model{chunk_index}"]
+        assert set(model_state) == set(raw_models[f"model{chunk_index}"])
+        assert model_state[chunk.local_name] is raw_models[f"model{chunk_index}"][chunk.local_name]
+        assert model_state[chunk.local_name] == bytearray([77] * 4)
+    if optimizer_layout != "none":
+        optimizer_state = loaded["optimizer"]
+        if optimizer_layout == "chained":
+            optimizer_state = optimizer_state[0]
+        assert set(optimizer_state["state"]) == {"module." + chunk.global_name for chunk in chunks}
+        for state in optimizer_state["state"].values():
+            assert state["exp_avg"] == bytearray([88] * 4)
+
+
+def test_fsdp_dtensor_optimizer_rejects_nonunique_names(fsdp_dtensor_checkpoint_case):
+    args, chunks, raw_state, _ = fsdp_dtensor_checkpoint_case(2, "single")
+    chunks[1].named_modules.return_value[0][1].layer_number = 3
+    with pytest.raises(ValueError, match="Non-unique Megatron-FSDP optimizer parameter name"):
+        checkpointing.preprocess_fsdp_dtensor_state_dict(args, raw_state, chunks)
+
+
+@pytest.mark.parametrize("experts", [False, True])
+def test_fsdp_dtensor_chunk_names_match_optimizer_fqns(fsdp_dtensor_checkpoint_case, experts):
+    _, chunks, _, _ = fsdp_dtensor_checkpoint_case(2, "single", experts)
+    for chunk in chunks:
+        name = fsdp_dtensor_checkpoint.get_global_unique_param_name(chunks, chunk.parameter)
+        assert name == "module." + chunk.global_name
+
+
+def test_fsdp_dtensor_optimizer_rejects_unowned_names(fsdp_dtensor_checkpoint_case):
+    args, chunks, raw_state, _ = fsdp_dtensor_checkpoint_case(2, "single")
+    raw_state["optimizer"]["state"]["module.unowned.weight"] = {"exp_avg": bytearray(4)}
+    with pytest.raises(ValueError, match="optimizer parameter has no model owner"):
+        checkpointing.preprocess_fsdp_dtensor_state_dict(args, raw_state, chunks)
+
+
+def test_fsdp_dtensor_pipeline_stages_have_disjoint_model_names(fsdp_dtensor_checkpoint_case):
+    processed_stages = []
+    for pipeline_rank in range(2):
+        args, chunks, raw_state, _ = fsdp_dtensor_checkpoint_case(2, "none")
+        for chunk in chunks:
+            chunk.named_modules.return_value[0][1].layer_number += 2 * pipeline_rank
+        processed_stages.append(
+            checkpointing.preprocess_fsdp_dtensor_state_dict(args, raw_state, chunks)
+        )
+    for model_key in ("model0", "model1"):
+        assert set(processed_stages[0][model_key]).isdisjoint(processed_stages[1][model_key])
+
+
+@pytest.mark.parametrize("first_layer_number", [1, 3, 11])
+def test_fsdp_dtensor_layer_name_mapping_is_reversible(first_layer_number):
+    chunk = mock.Mock()
+    layers = [mock.Mock(spec=fsdp_dtensor_checkpoint.TransformerLayer) for _ in range(2)]
+    for layer_index, layer in enumerate(layers):
+        layer.layer_number = first_layer_number + layer_index
+    chunk.named_modules.return_value = [
+        (f"module.decoder.layers.{layer_index}", layer) for layer_index, layer in enumerate(layers)
+    ]
+    layer_names = checkpointing._fsdp_dtensor_layer_name_map(chunk)
+    inverse_names = {global_name: name for name, global_name in layer_names.items()}
+    if first_layer_number == 1:
+        assert not layer_names
+    for layer_index in range(2):
+        local_name = f"module.decoder.layers.{layer_index}.mlp.linear_fc1.weight_w"
+        global_name = checkpointing._map_fsdp_dtensor_layer_name(local_name, layer_names)
+        assert global_name == (
+            f"module.decoder.layers.{first_layer_number + layer_index - 1}.mlp.linear_fc1.weight_w"
+        )
+        assert checkpointing._map_fsdp_dtensor_layer_name(global_name, inverse_names) == local_name
+    adjacent_name = "module.decoder.layers.100.mlp.linear_fc1.weight"
+    assert checkpointing._map_fsdp_dtensor_layer_name(adjacent_name, layer_names) == adjacent_name
 
 
 class MockModel(MegatronModule):

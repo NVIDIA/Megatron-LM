@@ -27,6 +27,14 @@ try:
     from torch.distributed.checkpoint.metadata import TensorStorageMetadata
     from torch.distributed.tensor.placement_types import Replicate, Shard
 
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+        get_containing_parameter_group,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtensor import (
+        _attach_dcp_hooks,
+        _build_chunk_metadata,
+        _dbuffer_chunk_metadata,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
         make_fsdp_dtensor,
     )
@@ -285,6 +293,15 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             f"SWiGLU weights must have an even size along the shard axis {swiglu_shard_axis}, "
             f"got {data.shape[swiglu_shard_axis]}"
         )
+
+        if get_containing_parameter_group(dist_param) is not None:
+            return split_fused_fsdp_param(
+                data,
+                dist_param,
+                [data.shape[swiglu_shard_axis] // 2] * 2,
+                is_expert_param=is_expert_param,
+                split_dim=swiglu_shard_axis,
+            )
 
         fsdp_slice = dist_param.megatron_fsdp_slice
         megatron_fsdp_dist_index = dist_param.megatron_fsdp_dist_index
@@ -555,6 +572,66 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     return model_state_dict, optimizer_state_dict
 
 
+def _split_mfsdp_v2_param(data, dist_param, split_sizes, group, split_dim):
+    """Split logical dim-0 sections without copying the owning buffer's local storage."""
+    if split_dim != 0:
+        raise NotImplementedError("MFSDP v2 checkpoint splitting only supports dim 0.")
+    index = next(
+        index
+        for index, parameter in enumerate(group.fsdp_parameters)
+        if parameter.sharded is dist_param
+    )
+    buffer = group.main_weight
+    shape = buffer.layout.tensor_shapes[index]
+    if not isinstance(data, DTensor) or data.shape != shape or data.device_mesh != buffer.mesh:
+        raise ValueError("Checkpoint tensor must match the MFSDP v2 parameter shape and mesh.")
+    if any(
+        not placement.is_replicate() and not (isinstance(placement, Shard) and placement.dim == 0)
+        for placement in data.placements
+    ):
+        raise ValueError("MFSDP v2 checkpoint splitting requires replicated or dim-0 shards.")
+    placements = tuple(
+        Shard(placement.dim) if isinstance(placement, Shard) else placement
+        for placement in buffer.placements
+    )
+    if data.placements != placements:
+        raise ValueError("Checkpoint tensor must match the MFSDP v2 parameter placements.")
+    if not split_sizes or any(size <= 0 for size in split_sizes) or sum(split_sizes) != shape[0]:
+        raise ValueError("Checkpoint split sizes must be positive and cover the fused dimension.")
+    chunk = _dbuffer_chunk_metadata(buffer, index)
+    local_tensor = data.to_local()
+    if local_tensor.shape != chunk.sizes:
+        raise ValueError("Checkpoint tensor must match the MFSDP v2 local parameter shard.")
+    local_start = chunk.offsets[0]
+    local_rows = chunk.sizes[0]
+    results = []
+    section_start = 0
+    for size in split_sizes:
+        start = min(max(section_start - local_start, 0), local_rows)
+        stop = min(max(section_start + size - local_start, 0), local_rows)
+        section_data = local_tensor.narrow(0, start, stop - start)
+        section_shape = torch.Size((size, *shape[1:]))
+        section = DTensor.from_local(
+            section_data,
+            device_mesh=data.device_mesh,
+            placements=data.placements,
+            run_check=False,
+            shape=section_shape,
+            stride=torch.empty(section_shape, device="meta").stride(),
+        )
+        _attach_dcp_hooks(
+            section,
+            _build_chunk_metadata(
+                row_offset=min(max(local_start - section_start, 0), size),
+                rows=stop - start,
+                shape=section_shape,
+            ),
+        )
+        results.append(section)
+        section_start += size
+    return results
+
+
 def split_fused_fsdp_param(data, dist_param, split_sizes, is_expert_param=False, split_dim=0):
     """Split a fused Megatron-FSDP parameter along ``split_dim`` into per-section DTensors.
 
@@ -569,6 +646,10 @@ def split_fused_fsdp_param(data, dist_param, split_sizes, is_expert_param=False,
     even two-way split to arbitrary section sizes.
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+
+    group = get_containing_parameter_group(dist_param)
+    if group is not None:
+        return _split_mfsdp_v2_param(data, dist_param, split_sizes, group, split_dim)
 
     fsdp_slice = dist_param.megatron_fsdp_slice
     dist_index = dist_param.megatron_fsdp_dist_index
