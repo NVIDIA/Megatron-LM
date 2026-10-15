@@ -21,7 +21,15 @@ import torch
 
 # Maps each arg name to the value it must hold for bit-exact execution;
 # verified by :func:`apply_determinism_to_args`.
-ARG_VALUES_REQUIRED_FOR_DETERMINISM = {"cross_entropy_loss_fusion": False, "tp_comm_overlap": False}
+ARG_VALUES_REQUIRED_FOR_DETERMINISM = {
+    "cross_entropy_loss_fusion": False,
+    "tp_comm_overlap": False,
+    # TE's fused router path (``fused_moe_aux_loss``) accumulates the load-balancing aux loss
+    # with float atomicAdd across blocks; the loss value and the router gradient derived from it
+    # are not bit-reproducible. Rejected explicitly rather than silently swapped for the
+    # unfused kernels, so the deterministic run uses the kernels the config asks for.
+    "moe_router_fusion": False,
+}
 
 # Env-var defaults required for bit-exact reproducibility.
 DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
