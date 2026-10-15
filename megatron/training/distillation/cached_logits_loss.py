@@ -645,8 +645,13 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             # coming from possibly-different saved iterations always
             # share a K and the cat is a single allocation.
             if len(slices_v) == 1:
-                v = slices_v[0]
-                i = slices_i[0]
+                # A sample-dim slice of the monolith is non-contiguous, and
+                # pinning a strided view allocates pinned storage spanning
+                # (nearly) the whole monolith; it also forces the H2D copy
+                # through a pageable temporary. Compact it before the
+                # DataLoader pins it.
+                v = slices_v[0].contiguous()
+                i = slices_i[0].contiguous()
             else:
                 v = torch.cat(slices_v, dim=1)
                 i = torch.cat(slices_i, dim=1)

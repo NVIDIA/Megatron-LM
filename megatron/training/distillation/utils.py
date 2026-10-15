@@ -827,8 +827,9 @@ def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any, Optional[torch.Tenso
     * v2 (``format_version >= 2``): returns ``(values, indices,
       cu_seqlens_padded)``. ``values``/``indices`` are monolithic
       per-iteration tensors of shape ``(seq, samples_per_dp_per_iter, K)``;
-      slicing along the sample dim is a zero-copy view, which keeps
-      pinned-memory transfers efficient. ``cu_seqlens_padded`` is a
+      slicing along the sample dim is a zero-copy (but non-contiguous)
+      view, so callers should make slices contiguous before pinning
+      them. ``cu_seqlens_padded`` is a
       ``(samples_per_dp_per_iter, max_boundaries)`` int tensor of
       per-sample document boundaries when the saving run had any
       (``--sft``), else ``None``.
