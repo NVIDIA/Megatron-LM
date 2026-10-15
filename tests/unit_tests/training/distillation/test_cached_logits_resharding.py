@@ -122,11 +122,12 @@ def _assert_dataset_indices(
         )
         loaded = list(dataset)
         assert len(loaded) == expected_iterations
-        for iteration, values_list, indices_list in loaded:
+        for iteration, (sample_start, values_list, indices_list) in enumerate(loaded):
+            assert sample_start == iteration * gbs_load
             assert len(values_list) == num_mb_load
             assert len(indices_list) == num_mb_load
             for microbatch, indices in enumerate(indices_list):
-                start = iteration * gbs_load + (microbatch * dp_load + dp_rank) * mbs_load
+                start = sample_start + (microbatch * dp_load + dp_rank) * mbs_load
                 expected = list(range(start, start + mbs_load))
                 assert indices.reshape(-1).tolist() == expected
 
@@ -281,7 +282,7 @@ def test_reshard_plan_sources_reconstruct_global_indices_with_mbs_gt_1(
 def _bare_kd_loss(dataloader_items):
     """Construct a CachedLogitsKDLoss without running __init__ (which touches
     parallel_state), pre-loaded with a plain-iterator "DataLoader" that yields
-    ``(loaded_iteration, values_list, indices_list)`` tuples.
+    ``(loaded_sample_start, values_list, indices_list)`` tuples.
     """
     loss = CachedLogitsKDLoss.__new__(CachedLogitsKDLoss)
     loss.logprobs_dir = "unused"
@@ -290,8 +291,8 @@ def _bare_kd_loss(dataloader_items):
     loss.tp_group = None
     loss._is_packed = False
     loss._dataloader_iter = iter(dataloader_items)
-    loss._current_iteration = None
-    loss._loaded_iteration = None
+    loss._current_sample_start = None
+    loss._loaded_sample_start = None
     loss._microbatch_counter = 0
     loss._current_values = None
     loss._current_indices = None
@@ -303,7 +304,7 @@ def test_advance_iteration_skips_behind_shards(monkeypatch, caplog):
     indices0 = [torch.randint(0, 2, (2, 1, 2))]
     values1 = [torch.randn(2, 1, 2)]
     indices1 = [torch.randint(0, 2, (2, 1, 2))]
-    loss = _bare_kd_loss([(3, values0, indices0), (5, values1, indices1)])
+    loss = _bare_kd_loss([(24, values0, indices0), (40, values1, indices1)])
 
     calls = []
     monkeypatch.setattr(
@@ -314,11 +315,11 @@ def test_advance_iteration_skips_behind_shards(monkeypatch, caplog):
 
     student_logits = torch.randn(2, 1, 4)
     with caplog.at_level("WARNING"):
-        loss(student_logits, iteration=5)
+        loss(student_logits, sample_start=40)
 
-    assert loss._current_iteration == 5
-    assert loss._loaded_iteration == 5
-    assert any("behind training" in message for message in caplog.messages)
+    assert loss._current_sample_start == 40
+    assert loss._loaded_sample_start == 40
+    assert any("behind the training batch" in message for message in caplog.messages)
     # Both shards (behind + aligned) were consumed from the dataloader.
     with pytest.raises(StopIteration):
         next(loss._dataloader_iter)
@@ -327,11 +328,71 @@ def test_advance_iteration_skips_behind_shards(monkeypatch, caplog):
 def test_call_raises_runtime_error_on_gap():
     values = [torch.randn(2, 1, 2)]
     indices = [torch.randint(0, 2, (2, 1, 2))]
-    loss = _bare_kd_loss([(7, values, indices)])  # ahead of requested iteration=5
+    loss = _bare_kd_loss([(56, values, indices)])  # ahead of requested sample_start=40
 
     student_logits = torch.randn(2, 1, 4)
     with pytest.raises(RuntimeError, match="misaligned"):
-        loss(student_logits, iteration=5)
+        loss(student_logits, sample_start=40)
+
+
+def test_call_raises_when_global_batch_size_changes_mid_run():
+    """A varying global batch (e.g. batch-size rampup) shifts the trainer's
+    sample position away from the fixed-size batches the cache is indexed by."""
+    values = [torch.randn(2, 1, 2)]
+    indices = [torch.randint(0, 2, (2, 1, 2))]
+    loss = _bare_kd_loss([(0, values, indices), (8, values, indices)])
+    student_logits = torch.randn(2, 1, 4)
+    loss(student_logits, sample_start=0)
+
+    with pytest.raises(RuntimeError, match="misaligned"):
+        loss(student_logits, sample_start=6)
+
+
+def test_call_defaults_to_consumed_train_samples(monkeypatch):
+    values = [torch.randn(2, 1, 2)]
+    indices = [torch.randint(0, 2, (2, 1, 2))]
+    loss = _bare_kd_loss([(16, values, indices)])
+    monkeypatch.setattr(cached_logits_loss, "get_consumed_train_samples", lambda: 16)
+    monkeypatch.setattr(
+        cached_logits_loss, "topk_kl_div", lambda *args, **kwargs: torch.zeros(1, 2)
+    )
+
+    loss(torch.randn(2, 1, 4))
+
+    assert loss._current_sample_start == 16
+
+
+def test_init_dataloader_rejects_partial_global_batch(monkeypatch):
+    loss = _bare_kd_loss([])
+    monkeypatch.setattr(
+        cached_logits_loss, "get_args", lambda: SimpleNamespace(global_batch_size=8)
+    )
+
+    with pytest.raises(RuntimeError, match="not a multiple of the global batch"):
+        loss._init_dataloader(12)
+
+
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_dataset_yields_global_start_sample_when_resuming(tmp_path, monkeypatch, format_version):
+    gbs = 8
+    if format_version == 1:
+        _write_v1_cache(tmp_path, mbs=1, dp=2, gbs=gbs, iterations=3)
+    else:
+        _write_v2_cache(tmp_path, mbs=1, dp=2, gbs=gbs, iterations=3)
+    args = SimpleNamespace(micro_batch_size=1, global_batch_size=gbs)
+    monkeypatch.setattr(cached_logits_loss, "get_args", lambda: args)
+
+    dataset = make_teacher_tar_dataset(
+        str(tmp_path),
+        cp_rank=0,
+        cp_size=1,
+        dp_rank=0,
+        dp_size=2,
+        start_iteration=1,
+        ignore_hash=True,
+    )
+
+    assert [sample_start for sample_start, _, _ in dataset] == [gbs, 2 * gbs]
 
 
 def test_advance_iteration_raises_stopiteration_on_exhaustion():
@@ -366,7 +427,7 @@ def test_teacher_logits_trimmed_to_student_seq_len(monkeypatch):
     monkeypatch.setattr(cached_logits_loss, "safe_get_rank", lambda: 0)
 
     loss = _bare_kd_loss([])
-    loss._current_iteration = 5
+    loss._current_sample_start = 40
     loss._current_values = [torch.randn(4, 1, 2)]
     loss._current_indices = [torch.randint(0, 2, (4, 1, 2))]
 
@@ -381,7 +442,7 @@ def test_teacher_logits_trimmed_to_student_seq_len(monkeypatch):
 
     student_logits = torch.randn(3, 1, 4)  # shorter than the teacher's seq_len=4
     with pytest.warns(UserWarning, match="trimming"):
-        loss(student_logits, iteration=5)
+        loss(student_logits, sample_start=40)
 
     assert captured["teacher_values"].size(0) == 3
     assert captured["teacher_indices"].size(0) == 3
@@ -389,7 +450,7 @@ def test_teacher_logits_trimmed_to_student_seq_len(monkeypatch):
 
 def test_teacher_logits_equal_len_no_trim_no_warning(monkeypatch, recwarn):
     loss = _bare_kd_loss([])
-    loss._current_iteration = 5
+    loss._current_sample_start = 40
     loss._current_values = [torch.randn(3, 1, 2)]
     loss._current_indices = [torch.randint(0, 2, (3, 1, 2))]
 
@@ -402,7 +463,7 @@ def test_teacher_logits_equal_len_no_trim_no_warning(monkeypatch, recwarn):
     monkeypatch.setattr(cached_logits_loss, "topk_kl_div", _fake_topk_kl_div)
 
     student_logits = torch.randn(3, 1, 4)
-    loss(student_logits, iteration=5)
+    loss(student_logits, sample_start=40)
 
     assert captured["teacher_values"].size(0) == 3
     assert len(recwarn) == 0
@@ -415,7 +476,7 @@ def test_teacher_logits_trimmed_raises_when_packed(monkeypatch):
     size mismatch there should surface loudly instead."""
     loss = _bare_kd_loss([])
     loss._is_packed = True
-    loss._current_iteration = 5
+    loss._current_sample_start = 40
     loss._current_values = [torch.randn(4, 1, 2)]
     loss._current_indices = [torch.randint(0, 2, (4, 1, 2))]
 
@@ -427,7 +488,7 @@ def test_teacher_logits_trimmed_raises_when_packed(monkeypatch):
 
     student_logits = torch.randn(3, 1, 4)  # shorter than the teacher's seq_len=4
     with pytest.raises(RuntimeError, match="packed"):
-        loss(student_logits, iteration=5)
+        loss(student_logits, sample_start=40)
 
 
 def test_teacher_shorter_than_student_is_not_trimmed_known_gap(monkeypatch):
@@ -436,7 +497,7 @@ def test_teacher_shorter_than_student_is_not_trimmed_known_gap(monkeypatch):
     through unchanged, which would surface as a shape mismatch downstream in
     topk_kl_div if this test's stub weren't absorbing the mismatch."""
     loss = _bare_kd_loss([])
-    loss._current_iteration = 5
+    loss._current_sample_start = 40
     loss._current_values = [torch.randn(2, 1, 2)]  # shorter than student
     loss._current_indices = [torch.randint(0, 2, (2, 1, 2))]
 
@@ -449,7 +510,7 @@ def test_teacher_shorter_than_student_is_not_trimmed_known_gap(monkeypatch):
     monkeypatch.setattr(cached_logits_loss, "topk_kl_div", _fake_topk_kl_div)
 
     student_logits = torch.randn(4, 1, 4)
-    loss(student_logits, iteration=5)
+    loss(student_logits, sample_start=40)
 
     # Unchanged: still the teacher's original (shorter) sequence length.
     assert captured["teacher_values"].size(0) == 2

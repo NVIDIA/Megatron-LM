@@ -124,10 +124,13 @@ load-side microbatch, which saved DP-rank shard(s) and row ranges to read.
   resharding support. Older `format_version == 1` shards are still readable but are
   restricted to DP-only resharding, via a legacy reader slated for removal once existing
   caches are regenerated.
-- The loader enforces sequential, non-overlapping shard consumption per saved DP rank
-  and raises a clear error (rather than silently reading duplicate/overlapping data) if
-  training and cached iterations fall out of alignment — for example, if teacher data is
-  missing for the current training iteration.
+- The loader enforces sequential, non-overlapping shard consumption per saved DP rank,
+  and checks every iteration that the cached teacher data starts at the same global
+  sample as the student's batch (`consumed_train_samples`). Teacher data that is behind
+  (duplicate/overlapping shards) is skipped with a warning; teacher data that is ahead
+  (missing shards, or a global batch size that changes mid-run such as
+  `--rampup-batch-size`) raises a clear error instead of training on misaligned targets.
+  These checks verify sample positions, not token contents.
 - If the teacher's saved sequence length is longer than the student's, the loader trims
   the teacher tensors to match; the reverse (teacher shorter than student) is not
   currently handled.

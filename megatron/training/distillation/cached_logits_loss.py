@@ -101,7 +101,7 @@ from megatron.training.distillation.utils import (
     compute_dataset_hash,
     decode_logprobs_payload,
     detect_saved_dp_size,
-    get_current_iteration,
+    get_consumed_train_samples,
     is_packed_sequence_run,
     is_remote_storage_path,
     iter_logprobs_tar_entries,
@@ -215,8 +215,12 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     use a per-PP-stage rank-0 broadcast (TP×DP×CP group) to avoid object-store
     list storms without deadlocking under PP>1.
 
-    Yields ``(iteration, values_list, indices_list)``, one entry per load
-    microbatch step, with CP sequence slicing already applied.
+    Yields ``(start_sample, values_list, indices_list)``, one entry per load
+    iteration (lists have one entry per load microbatch step), with CP
+    sequence slicing already applied.  ``start_sample`` is the global sample
+    index the load iteration begins at; :meth:`_build_load_iteration`
+    verifies it against the sample ranges in the tar member names, so the
+    consumer can compare it against the trainer's ``consumed_train_samples``.
     """
 
     def __init__(
@@ -700,7 +704,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 values_list, indices_list = self._slice_cp_sequences(
                     values_list, indices_list, cu_seqlens_list
                 )
-                yield i_load, values_list, indices_list
+                yield i_load * self._plan.gbs_load, values_list, indices_list
                 i_load += 1
 
         # One prefetcher shared across all needed d_save streams: each
@@ -816,6 +820,10 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
                 "Regenerate the teacher cache with format_version=2 to "
                 "enable GBS resharding."
             )
+
+        # v1 members are keyed by iteration and require gbs_load == gbs_save,
+        # so iteration * gbs is the member's global start sample.
+        self._gbs = int(args.global_batch_size)
 
         # Map each current-rank microbatch to the saved rank and local
         # microbatch slot that holds the same global samples.
@@ -984,7 +992,7 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
         for decoded_group in zip(*decoded_iters):
             iteration, values_list, indices_list = self._remap_decoded_group(decoded_group)
             values_list, indices_list = self._slice_cp_sequences(values_list, indices_list)
-            yield iteration, values_list, indices_list
+            yield iteration * self._gbs, values_list, indices_list
 
     def _iter_group(self, pool, group):
         yield from self._iter_remapped_group(pool, group)
@@ -1195,18 +1203,30 @@ class CachedLogitsKDLoss:
         self._dataloader_iter: Optional[Iterator] = None
 
         # ---- iteration / microbatch tracking ----
-        self._current_iteration: Optional[int] = None
-        # Iteration label of the shard most recently pulled from the DataLoader,
-        # used to verify teacher/student alignment.
-        self._loaded_iteration: Optional[int] = None
+        # Both are global sample indices at which an iteration's batch starts:
+        # the trainer's (args.consumed_train_samples) and the one the most
+        # recently pulled teacher entry covers. Comparing the two verifies
+        # teacher/student alignment.
+        self._current_sample_start: Optional[int] = None
+        self._loaded_sample_start: Optional[int] = None
         self._microbatch_counter: int = 0
 
         # ---- current iteration's teacher data (pinned CPU tensors) ----
         self._current_values: Optional[List[torch.Tensor]] = None
         self._current_indices: Optional[List[torch.Tensor]] = None
 
-    def _init_dataloader(self, start_iteration: int) -> None:
-        """Create the DataLoader starting from *start_iteration*."""
+    def _init_dataloader(self, start_sample: int) -> None:
+        """Create the DataLoader starting from global sample *start_sample*."""
+        global_batch_size = int(get_args().global_batch_size)
+        if start_sample % global_batch_size != 0:
+            raise RuntimeError(
+                f"Cached-logits KD: training resumes at consumed sample "
+                f"{start_sample}, which is not a multiple of the global batch "
+                f"size ({global_batch_size}). The teacher cache is indexed by "
+                "whole fixed-size global batches (e.g. --rampup-batch-size is "
+                "unsupported)."
+            )
+        start_iteration = start_sample // global_batch_size
         # Keep the iterable dataset in the training process so ordered shard
         # streaming and dynamic discovery stay simple (no dataloader workers).
         # ``make_teacher_tar_dataset`` peeks ``_meta.json`` to pick the
@@ -1230,16 +1250,16 @@ class CachedLogitsKDLoss:
         self._dataloader_iter = iter(loader)
 
     def _advance_iteration(self) -> None:
-        """Fetch the next shard from the DataLoader and record its iteration label."""
+        """Fetch the next entry from the DataLoader and record its start sample."""
         assert self._dataloader_iter is not None
         try:
-            loaded_iteration, values_list, indices_list = next(self._dataloader_iter)
+            loaded_sample_start, values_list, indices_list = next(self._dataloader_iter)
         except StopIteration as e:
             raise StopIteration(
                 f"No more teacher log-prob data available in "
                 f"{self.logprobs_dir}.  The DataLoader has been exhausted."
             ) from e
-        self._loaded_iteration = int(loaded_iteration)
+        self._loaded_sample_start = int(loaded_sample_start)
         self._current_values = values_list
         self._current_indices = indices_list
         self._microbatch_counter = 0
@@ -1247,7 +1267,7 @@ class CachedLogitsKDLoss:
     def __call__(
         self,
         student_logits: torch.Tensor,
-        iteration: Optional[int] = None,
+        sample_start: Optional[int] = None,
         microbatch_idx: Optional[int] = None,
     ) -> torch.Tensor:
         """Compute KL-divergence loss for one microbatch.
@@ -1255,7 +1275,10 @@ class CachedLogitsKDLoss:
         Args:
             student_logits: ``(seq_len, batch, local_vocab_size)`` – raw
                 (pre-softmax) student logits from this TP rank's vocab shard.
-            iteration: Training iteration.  Defaults to ``args.curr_iteration``.
+            sample_start: Global sample index the current training iteration's
+                batch starts at.  Defaults to ``args.consumed_train_samples``,
+                which ``training.py`` only advances after ``train_step()``
+                returns.
             microbatch_idx: Microbatch index within the current iteration.
                 Defaults to an auto-incremented counter that resets on each
                 new iteration.
@@ -1264,37 +1287,47 @@ class CachedLogitsKDLoss:
             Tensor of shape ``(batch, seq_len)`` – per-token forward KL
             divergence (unreduced).
         """
-        # ---- resolve iteration ----
-        if iteration is None:
-            iteration = get_current_iteration()
+        # ---- resolve the trainer's sample position ----
+        if sample_start is None:
+            sample_start = get_consumed_train_samples()
 
         # ---- lazy DataLoader init ----
         if self._dataloader_iter is None:
-            self._init_dataloader(iteration)
+            self._init_dataloader(sample_start)
 
         # ---- detect iteration change → pull next prefetched item ----
-        if self._current_iteration != iteration:
+        if self._current_sample_start != sample_start:
             self._advance_iteration()
-            # ---- verify teacher/student alignment and skip shards if needed ----
-            while self._loaded_iteration is not None and self._loaded_iteration < iteration:
+            # ---- verify teacher/student alignment and skip entries if needed ----
+            # The loaded start sample comes from tar member names (v1:
+            # iteration * gbs; v2: checked against member sample ranges in
+            # TeacherTarDataset._build_load_iteration), while sample_start is
+            # the trainer's own data position, so a mismatch here means the
+            # teacher targets do not belong to this batch (gap, duplicate
+            # shard, skipped iterations, or a varying global batch size).
+            while (
+                self._loaded_sample_start is not None and self._loaded_sample_start < sample_start
+            ):
                 logger.warning(
-                    "Teacher logit shard for iteration %s is behind training "
-                    "iteration %s (overlapping/duplicate shard in %s); skipping "
-                    "to resync alignment.",
-                    self._loaded_iteration,
-                    iteration,
+                    "Teacher logits starting at global sample %s are behind "
+                    "the training batch starting at sample %s (overlapping/"
+                    "duplicate shard in %s); skipping to resync alignment.",
+                    self._loaded_sample_start,
+                    sample_start,
                     self.logprobs_dir,
                 )
                 self._advance_iteration()
-            if self._loaded_iteration != iteration:
+            if self._loaded_sample_start != sample_start:
                 raise RuntimeError(
-                    f"Teacher logit data misaligned: training iteration "
-                    f"{iteration} but the next available cached shard is "
-                    f"iteration {self._loaded_iteration} (gap / missing teacher "
-                    f"data in '{self.logprobs_dir}'). Refusing to train on "
-                    f"misaligned distillation targets."
+                    f"Teacher logit data misaligned: the training batch starts "
+                    f"at global sample {sample_start} but the next available "
+                    f"cached teacher data starts at sample "
+                    f"{self._loaded_sample_start} (gap / missing teacher data in "
+                    f"'{self.logprobs_dir}', or a global batch size that differs "
+                    f"between iterations). Refusing to train on misaligned "
+                    f"distillation targets."
                 )
-            self._current_iteration = iteration
+            self._current_sample_start = sample_start
 
         # ---- resolve microbatch index ----
         if microbatch_idx is None:
@@ -1305,7 +1338,7 @@ class CachedLogitsKDLoss:
             raise IndexError(
                 f"Microbatch index {microbatch_idx} out of range: only "
                 f"{len(self._current_values)} microbatches were saved for "
-                f"iteration {iteration}."
+                f"the batch starting at global sample {sample_start}."
             )
 
         # ---- move teacher data to GPU (non-blocking: tensors are pinned) ----
