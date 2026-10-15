@@ -55,6 +55,7 @@ map-style single-payload-column cache so Megatron can still index them.
 import json
 import logging
 import os
+import re
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -126,6 +127,15 @@ def _looks_like_hf_id(path: str) -> bool:
     if path.startswith(("/", "./", "../")):
         return False
     return "/" in path
+
+
+# Words that mark held-out Hub splits, e.g. ``test_sft`` or ``validation``.
+_EVAL_SPLIT_WORDS = frozenset({"test", "validation", "valid", "val", "dev", "eval", "evaluation"})
+
+
+def _is_eval_split(split_name: str) -> bool:
+    """Whether a Hub split name marks evaluation data rather than a training topic."""
+    return any(word in _EVAL_SPLIT_WORDS for word in re.split(r"[^0-9a-z]+", split_name.lower()))
 
 
 def _first_present(sample: Dict[str, Any], fields: Iterable[str]) -> Optional[str]:
@@ -467,7 +477,8 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
         and does not exist locally. The repo's default config is used when it
         declares one (its only config, or the one named or marked default);
         otherwise all configs are combined. Each config uses ``train`` when
-        available, otherwise all thematic splits.
+        available, otherwise all thematic splits; evaluation splits (``test``,
+        ``validation``, ``dev``, ...) are skipped.
       * Local ``.parquet`` — loaded via
         ``datasets.load_dataset("parquet", data_files=path, split="all")``;
         parquet's footer schema makes chunked loading safe.
@@ -537,13 +548,34 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
             selected_sources: List[Tuple[str, str]] = []
             for selected_config in selected_configs:
                 available_splits = get_dataset_split_names(dataset_path, selected_config)
-                selected_splits = ["train"] if "train" in available_splits else available_splits
+                if "train" in available_splits:
+                    selected_splits = ["train"]
+                else:
+                    # Thematic splits (e.g. ``python``, ``cpp``) are training data;
+                    # evaluation splits are never trained on.
+                    selected_splits = [s for s in available_splits if not _is_eval_split(s)]
+                    skipped_splits = [s for s in available_splits if _is_eval_split(s)]
+                    if skipped_splits:
+                        logger.warning(
+                            "VarlenDataset: skipping evaluation splits %s of %s:%s.",
+                            skipped_splits,
+                            dataset_path,
+                            selected_config,
+                        )
                 selected_sources.extend(
                     (selected_config, selected_split) for selected_split in selected_splits
                 )
 
             if not selected_sources:
-                raise ValueError(f"VarlenDataset: no config/split was found in {dataset_path}.")
+                raise ValueError(
+                    f"VarlenDataset: no config/split was found in {dataset_path} "
+                    "(evaluation splits are not used for training)."
+                )
+            logger.info(
+                "VarlenDataset: loading %s from %s.",
+                ", ".join(f"{config}/{split}" for config, split in selected_sources),
+                dataset_path,
+            )
 
             for selected_config, selected_split in selected_sources:
                 source = f"{dataset_path}:{selected_config}/{selected_split}"

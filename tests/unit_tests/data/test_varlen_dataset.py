@@ -33,6 +33,7 @@ from megatron.training.datasets.varlen_dataset import (
     VarlenLowLevelDataset,
     _alpaca_to_messages,
     _ensure_list_field,
+    _is_eval_split,
     _looks_like_hf_id,
     _messages_passthrough,
     _raw_text_loader,
@@ -800,6 +801,61 @@ def test_low_level_hub_loads_only_the_declared_default_config(monkeypatch):
 
     assert calls == [("HuggingFaceFW/fineweb-edu", "default", "train")]
     assert len(low_level) == 1
+
+
+@pytest.mark.parametrize(
+    ("split", "is_eval"),
+    [
+        ("test", True),
+        ("test_sft", True),
+        ("validation", True),
+        ("val", True),
+        ("dev", True),
+        ("eval-2024", True),
+        ("train_sft", False),
+        ("python", False),
+        ("text_to_sql", False),
+        ("stem_de", False),
+        ("reasoning_on", False),
+    ],
+)
+def test_is_eval_split(split, is_eval):
+    assert _is_eval_split(split) is is_eval
+
+
+def _patch_single_config_hub(monkeypatch, datasets, splits, calls):
+    monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["default"])
+    monkeypatch.setattr(datasets, "get_dataset_default_config_name", lambda path: "default")
+    monkeypatch.setattr(datasets, "get_dataset_split_names", lambda path, config: splits)
+
+    def fake_load_dataset(path, name, split):
+        calls.append((path, name, split))
+        return _FakeHubDataset([{"messages": [{"role": "user", "content": split}]}])
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+
+
+def test_low_level_hub_skips_evaluation_splits(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    calls = []
+    # ultrachat_200k layout: no ``train`` split, evaluation splits next to training ones.
+    _patch_single_config_hub(
+        monkeypatch, datasets, ["train_sft", "test_sft", "train_gen", "test_gen"], calls
+    )
+    low_level = VarlenLowLevelDataset("HuggingFaceH4/ultrachat_200k")
+
+    assert calls == [
+        ("HuggingFaceH4/ultrachat_200k", "default", "train_sft"),
+        ("HuggingFaceH4/ultrachat_200k", "default", "train_gen"),
+    ]
+    assert len(low_level) == 2
+
+
+def test_low_level_hub_rejects_repo_with_only_evaluation_splits(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    _patch_single_config_hub(monkeypatch, datasets, ["validation", "test"], [])
+    with pytest.raises(ValueError, match="no config/split was found"):
+        VarlenLowLevelDataset("owner/eval-only")
 
 
 def test_low_level_hub_falls_back_to_raw_json_payload(monkeypatch, tmp_path):
