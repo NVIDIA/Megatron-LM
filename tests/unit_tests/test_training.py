@@ -9,7 +9,7 @@ import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
-from megatron.training.global_vars import set_args
+from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
@@ -60,7 +60,6 @@ def create_test_args():
     args.start_eval_at_iter = None
     args.full_validation = False
     args.multiple_validation_sets = False
-    args.perform_rl_step = False
     args.phase_transition_iterations = None
 
     return args
@@ -126,8 +125,9 @@ class TestTraining:
         Utils.initialize_model_parallel(1, 1)
         args = create_test_args()
         set_args(args)
+        _set_train_state()
 
-    def test_build_train_valid_test_data_iterators(self):
+    def test_build_train_valid_test_data_iterators(self, run_config):
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
             mock_train_valid_test_datasets_provider
         )
@@ -153,7 +153,7 @@ class TestTraining:
         args.log_params_norm = False
         assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
 
-    def test_build_train_valid_test_data_iterators_multi_full_validation(self):
+    def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
         """multiple_validation_sets + full_validation builds a list of iterators
         (one per validation set) and sets args.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""
@@ -199,6 +199,7 @@ class TestTraining:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        destroy_global_vars()
 
 
 class TestGetModelBucketSizingPgCollection:
@@ -248,6 +249,37 @@ class TestGetModelBucketSizingPgCollection:
 
 
 class TestPackedSampleAccounting:
+    @pytest.mark.parametrize(
+        "total_cp,num_sequence_shards,weight_shards,samples",
+        [(1, 1, 4, 8), (4, 2, 2, 2), (2, 2, 4, 4)],
+    )
+    def test_static_cp_sample_count_and_scheduler(
+        self, monkeypatch, total_cp, num_sequence_shards, weight_shards, samples
+    ):
+        """Sequence shards count each sample once for progress and sample-based LR schedules."""
+        import megatron.training.training as training
+
+        args = SimpleNamespace(
+            gtp_remat_num_sequence_shards=num_sequence_shards,
+            world_size=8,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=total_cp,
+            gtp_weight_remat_size=weight_shards,
+            data_parallel_size=2,
+            micro_batch_size=2,
+            train_iters=None,
+            train_samples=10_000,
+        )
+        monkeypatch.setattr(training, "get_num_microbatches", lambda: 3)
+        monkeypatch.setattr(training, "is_pp_last_stage", lambda group: True)
+        monkeypatch.setattr(training, "get_pg_size", lambda group: 1)
+
+        count = training._get_samples_seen_in_iteration([{}] * 3, args, SimpleNamespace(pp=None))
+
+        assert count == 3 * 2 * samples
+        assert _get_optimizer_param_scheduler_increment(args, count) == 3 * 2 * samples
+
     def test_pop_samples_seen_sums_and_removes_metadata(self):
         losses = [
             {"lm loss": torch.tensor(1.0), "_samples_seen": torch.tensor(3.0)},

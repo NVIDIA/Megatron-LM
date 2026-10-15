@@ -390,6 +390,7 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
                 "run_testmon_phase() { return 0; }",
                 'merge_rank_selections() { mkdir -p "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1"; '
                 'echo tests/unit_tests/test_example.py > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/selected-tests"; }',
+                'apply_mandatory_tests() { : > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
                 "run_selected_phase() { return 1; }",
                 "run_full_tests() { echo UNEXPECTED_FULL_BUCKET; }",
                 "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",

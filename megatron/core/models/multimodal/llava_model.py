@@ -108,6 +108,9 @@ class LLaVAModel(MegatronModule):
         vp_stage (int): Virtual pipeline stage.
     """
 
+    # Set by vision encoders (e.g. ViTModel) that read the per-image patch grid on the host.
+    _vision_reads_host_imgs_sizes = False
+
     def __init__(
         self,
         language_transformer_config: TransformerConfig,
@@ -442,6 +445,7 @@ class LLaVAModel(MegatronModule):
                 class_token_len = 0
                 vmt = vision_transformer_config.vision_model_type
                 if vmt in ("pixtral-vit", "pixtral-vit-large"):
+                    self._vision_reads_host_imgs_sizes = True
                     self.vision_model = ViTModel(
                         transformer_config=vision_transformer_config,
                         transformer_layer_spec=vision_transformer_layer_spec,
@@ -454,6 +458,9 @@ class LLaVAModel(MegatronModule):
                         pg_collection=self.pg_collection,
                         vp_stage=self.vp_stage,
                     )
+                    # The native 2x2 merger always reduces the image tokens, whatever the
+                    # conv_merging argument says; token accounting must follow it.
+                    self._conv_merging = self._conv_merging or self.vision_model.merger is not None
                 elif vmt == "qwen-vl":
                     num_pos_per_side = int(
                         getattr(vision_transformer_config, 'num_position_embeddings', 2304) ** 0.5
@@ -1474,7 +1481,16 @@ class LLaVAModel(MegatronModule):
                 if vision_packed_seq_params is not None:
                     vision_kwargs["packed_seq_params"] = vision_packed_seq_params
                 if imgs_sizes is not None:
-                    vision_kwargs["imgs_sizes"] = imgs_sizes
+                    # The inference engine keeps imgs_sizes on the device; copy them to the host for
+                    # ViTModel there. Training keeps ViTModel's error on device imgs_sizes, which
+                    # guards against unintended host syncs.
+                    vision_kwargs["imgs_sizes"] = (
+                        imgs_sizes.cpu()
+                        if self._vision_reads_host_imgs_sizes
+                        and inference_context is not None
+                        and torch.is_tensor(imgs_sizes)
+                        else imgs_sizes
+                    )
                 image_embeddings = self.vision_model(
                     vision_images, **vision_kwargs
                 )  # [num_tiles, img_seq_len, h_vision]
