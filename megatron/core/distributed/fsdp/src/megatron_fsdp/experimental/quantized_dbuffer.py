@@ -109,37 +109,47 @@ def _pad_columnwise_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 def update_mxfp8_tensor(
-    tensor_view: MXFP8Tensor, tensor: MXFP8Tensor, *, rowwise: bool = True, columnwise: bool = True
+    src: MXFP8Tensor, dst: MXFP8Tensor, *, rowwise: bool = True, columnwise: bool = True
 ) -> None:
-    """Install a compact view, padding selected scales and preserving the other orientation."""
+    """Update ``dst`` in place from ``src``, a compact view of the allocated planes.
+
+    ``rowwise`` and ``columnwise`` select the newly gathered planes, which are taken
+    from ``src`` with padded scales. Planes gathered earlier for the other phase stay
+    as installed on ``dst``, and planes absent from ``src`` are cleared. ``src`` is
+    not modified.
+    """
     # Work around TE rejecting compact MXFP8 scales in GEMM:
     # https://github.com/NVIDIA/TransformerEngine/issues/3518
     # Pad only newly installed planes. Repadding the other phase's scales
     # would replace them with a new copy not covered by its readiness event.
     # TODO: Remove update_mxfp8_tensor once TE accepts compact scales.
-    # Callers can assign tensor.data = tensor_view directly; there will be
+    # Callers can assign dst.data = src directly; there will be
     # no padded copies to preserve across phases.
-    if tensor_view._rowwise_data is not None:
+    # Planes installed earlier for the other phase; dst.data = src replaces them.
+    rowwise_planes = (dst._rowwise_data, dst._rowwise_scale_inv)
+    columnwise_planes = (dst._columnwise_data, dst._columnwise_scale_inv)
+    # MXFP8Tensor's data setter shares src's plane tensors with dst without copying.
+    # It also takes src's quantizer, whose usage matches the allocated planes as TE
+    # checks, and src's unswizzled-scales flag. Planes absent from src are cleared.
+    # dst stays the same object, which TE may have saved for backward. The fixes
+    # below only rebind dst's attributes, so src is left untouched.
+    dst.data = src
+    if src._rowwise_data is not None:
         if rowwise:
-            tensor_view._rowwise_scale_inv = _pad_rowwise_scale(tensor_view._rowwise_scale_inv)
+            dst._rowwise_scale_inv = _pad_rowwise_scale(src._rowwise_scale_inv)
         else:
             # Allocated but not newly gathered: the other phase installed these planes.
-            assert tensor._rowwise_data is not None, "Expected previously installed rowwise planes."
-            tensor_view._rowwise_data = tensor._rowwise_data
-            tensor_view._rowwise_scale_inv = tensor._rowwise_scale_inv
-    if tensor_view._columnwise_data is not None:
+            assert rowwise_planes[0] is not None, "Expected previously installed rowwise planes."
+            dst._rowwise_data, dst._rowwise_scale_inv = rowwise_planes
+    if src._columnwise_data is not None:
         if columnwise:
-            tensor_view._columnwise_scale_inv = _pad_columnwise_scale(
-                tensor_view._columnwise_scale_inv
-            )
+            dst._columnwise_scale_inv = _pad_columnwise_scale(src._columnwise_scale_inv)
         else:
             # Allocated but not newly gathered: the other phase installed these planes.
             assert (
-                tensor._columnwise_data is not None
+                columnwise_planes[0] is not None
             ), "Expected previously installed columnwise planes."
-            tensor_view._columnwise_data = tensor._columnwise_data
-            tensor_view._columnwise_scale_inv = tensor._columnwise_scale_inv
-    tensor.data = tensor_view
+            dst._columnwise_data, dst._columnwise_scale_inv = columnwise_planes
 
 
 class QuantizedDBuffer:
