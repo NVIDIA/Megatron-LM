@@ -119,10 +119,7 @@ def checkpoint_residual_read(
 
     def run_read(stream: Tensor) -> tuple[Tensor, ...]:
         branch_input, state = apply_module(connection)(
-            stream,
-            operation="read",
-            fp32_residual_connection=False,
-            branch_input_dtype=branch_input_dtype,
+            stream, fp32_residual_connection=False, branch_input_dtype=branch_input_dtype
         )
         if state[0].shape != stream.shape:
             raise ValueError("Residual connection read returned an incompatible carried stream.")
@@ -167,7 +164,6 @@ def checkpoint_residual_write(
         value = (branch_update, branch_bias) if return_tuple else branch_update
         return apply_module(connection)(
             value,
-            operation="write",
             state=connection_state,
             dropout_probability=dropout_probability,
             training=training,
