@@ -2536,6 +2536,8 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
                 raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
             if self.moe_latent_size is not None:
+                # Native latent MoE projects only the routed branch; its shared expert
+                # stays in the original hidden space. MOK currently fuses both branches.
                 raise ValueError("MOK does not support latent MoE")
             if self.recompute_modules and "shared_experts" in self.recompute_modules:
                 raise ValueError(
@@ -3667,6 +3669,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_megakernel_backend == "mok":
             if self.cuda_graph_impl in ("local", "transformer_engine"):
+                # Empty modules mean whole-layer capture here, not full_iteration.
+                # Per-layer replay needs per-microbatch ownership or recomputation
+                # of MOK's saved schedule/activations; this bridge has no stash integration.
                 if not self.cuda_graph_modules:
                     raise ValueError(
                         "MOK does not support per-layer whole-layer CUDA Graph capture"

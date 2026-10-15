@@ -623,7 +623,7 @@ The pinned API does not provide the optional shared-expert output gate used by n
 | Area | Current MOK support |
 |------|---------------------|
 | GPU architecture | NVIDIA Blackwell SM100/SM103; upstream integration validated on GB300 |
-| Routed precision | BF16, or MXFP8 with FP8 parameter gather (Transformer Engine 2.10 or later) |
+| Routed precision | BF16, or MXFP8 with `fp8_param=True` and native TE rowwise/columnwise payloads and scales |
 | Shared experts | Required; BF16; same intermediate size as routed experts |
 | Activation | SwiGLU, without a linear offset or tanh clamp |
 | Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
@@ -632,6 +632,21 @@ The pinned API does not provide the optional shared-expert output gate used by n
 | Recomputation | Whole-MoE activation recompute |
 | CUDA Graph | Full-iteration capture |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
+
+Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the reduction-store
+precision: FP32 retains FP32 contributions, while BF16 rounds each contribution before adding it
+to the BF16 gradient buffer. This is independent of the BF16 shared-expert weight dtype.
+The pinned MOK entrypoint requires shared and routed expert main-grad buffers to use the same dtype.
+
+With `reuse_grad_buf_for_mxfp8_param_ag`, MCore completes parameter all-gather, requantizes into
+native TE storage, and clears the staging buffer before MOK runs. Single-grouped MXFP8 parameters
+require this mode in the current MCore buffer implementation. MOK aliases the native payloads
+and refreshes its converted scale buffers once per optimizer iteration. The adapter requires
+both native weight layouts; TE's `post_all_gather_processing` is not an MXFP8 capability check.
+
+Per-layer whole-layer capture is distinct from `cuda_graph_impl=full_iteration`. Supporting
+per-layer MOK replay needs saved-state stashing or a recompute path for pending microbatches;
+static input token counts alone do not establish that lifecycle.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
