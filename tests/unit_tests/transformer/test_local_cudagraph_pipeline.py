@@ -11,10 +11,9 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import (
-    CudaGraphManager,
-    _CudagraphGlobalRecord,
     _CudaGraphRunner,
     create_cudagraphs,
+    delete_cuda_graphs,
 )
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -65,10 +64,9 @@ class TestLocalCudagraphPipelineOutput:
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
+        # Release captured TP collectives before destroying their process groups.
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
 
     def test_record_and_replay_outputs_support_pipeline_deallocation(self):
         config = TransformerConfig(
