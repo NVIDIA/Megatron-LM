@@ -12,14 +12,23 @@ description: Shows the commands to build and preview the Megatron Core documenta
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 */}
 
-To generate docs locally, use the following commands:
+To generate a preview copy of the docs:
 
-```
-cd docs
-SKIP_PUBLIC_DOCS_FEATURES=true uv run --only-group docs sphinx-autobuild . _build/html --port 8080 --host 127.0.0.1
-```
+1. Commit and push your work to the Megatron repository.
+2. Wait for CI checks to complete on your PR.
+3. Review the content built for you at the preview link associated with your PR.
 
-Docs will be generated at [http://localhost:8080/](http://localhost:8080/).
 
-**Recommended:** set the environment variable `SKIP_AUTODOC=true` when generating docs 
-to skip the generation of `apidocs`.
+
+To generate docs locally:
+
+1. Review the [Fern Quick Start](https://buildwithfern.com/learn/docs/getting-started/quickstart).
+2. Install the Fern CLI. For example:
+   ```bash
+   npm install -g fern-api
+   ```
+3. From the `docs/fern` directory, run `fern docs dev`. For example:
+   ```bash
+   fern docs dev
+   ```
+
