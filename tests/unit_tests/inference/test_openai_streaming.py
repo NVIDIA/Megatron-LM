@@ -456,7 +456,7 @@ def test_huggingface_fast_incremental_detokenizer_skips_special_tokens():
 
 
 def _with_chat_markers(eos_marker=None):
-    """A byte-level tokenizer whose chat markers are added tokens flagged ``special`` but kept out
+    """A byte-level tokenizer whose chat markers are added tokens flagged `special` but kept out
     of the special-tokens map, as in chat tokenizers that mark reasoning and tool calls."""
     from tokenizers import AddedToken
 

@@ -44,12 +44,12 @@ class HuggingFaceFastIncrementalDetokenizer:
 
         self._native_tokenizer = huggingface_tokenizer._tokenizer
         # Streaming must drop exactly what the non-streaming response drops, or its
-        # concatenated deltas differ from ``generated_text``. That is the tokens in the
-        # tokenizer's special-tokens map (``all_special_ids``) and the trailing EOS ids
-        # (``remove_EOD``), not every added token flagged ``special``: chat models flag
-        # their reasoning and tool-call markers (``<think>``, ``</think>``,
-        # ``<tool_call>``) as special, and the reasoning and tool parsers need them.
-        # ``DecodeStream(skip_special_tokens=True)`` would drop those markers too.
+        # concatenated deltas differ from `generated_text`. That is the tokens in the
+        # tokenizer's special-tokens map (`all_special_ids`) and the trailing EOS ids
+        # (`remove_EOD`), not every added token flagged `special`: chat models flag
+        # their reasoning and tool-call markers (`<think>`, `</think>`,
+        # `<tool_call>`) as special, and the reasoning and tool parsers need them.
+        # `DecodeStream(skip_special_tokens=True)` would drop those markers too.
         self._skipped_token_ids = frozenset(huggingface_tokenizer.all_special_ids) | (
             model_eos_token_ids(tokenizer)
         )
