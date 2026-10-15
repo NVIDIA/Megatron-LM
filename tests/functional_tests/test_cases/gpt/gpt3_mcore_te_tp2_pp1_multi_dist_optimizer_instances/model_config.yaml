@@ -43,7 +43,6 @@ MODEL_ARGS:
   --num-distributed-optimizer-instances: 2
   --overlap-grad-reduce: true
   --overlap-param-gather: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-mcore-models: true

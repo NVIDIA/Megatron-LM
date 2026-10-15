@@ -26,7 +26,6 @@ MODEL_ARGS:
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1
-  --deterministic-mode: true
   --ckpt-format: torch_dist
   --dist-ckpt-optim-fully-reshardable: true
   --bf16: true

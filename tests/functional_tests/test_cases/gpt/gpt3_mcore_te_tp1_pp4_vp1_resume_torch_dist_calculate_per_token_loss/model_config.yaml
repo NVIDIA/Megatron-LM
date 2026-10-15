@@ -41,7 +41,6 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 4
   --num-layers-per-virtual-pipeline-stage: 1
   --calculate-per-token-loss: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-checkpoint-opt_param-scheduler: true

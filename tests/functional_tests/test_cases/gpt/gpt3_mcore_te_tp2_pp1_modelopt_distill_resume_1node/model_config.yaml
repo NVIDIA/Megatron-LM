@@ -57,7 +57,6 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 1
   --sequence-parallel: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --use-checkpoint-opt_param-scheduler: true
   --ckpt-format: torch_dist

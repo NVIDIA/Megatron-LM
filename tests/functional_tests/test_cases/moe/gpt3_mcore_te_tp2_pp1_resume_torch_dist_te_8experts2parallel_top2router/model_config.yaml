@@ -46,7 +46,6 @@ MODEL_ARGS:
   --moe-router-load-balancing-type: aux_loss
   --moe-router-topk: 2
   --moe-aux-loss-coeff: 1e-2
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --moe-grouped-gemm: true
   --attention-softmax-in-fp32: true

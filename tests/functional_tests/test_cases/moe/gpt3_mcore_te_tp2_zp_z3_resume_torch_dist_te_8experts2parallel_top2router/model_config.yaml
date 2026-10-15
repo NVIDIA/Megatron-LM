@@ -50,7 +50,6 @@ MODEL_ARGS:
   --calculate-per-token-loss: true
   --data-parallel-sharding-strategy: optim_grads_params
   --use-distributed-optimizer: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --moe-grouped-gemm: true
   --attention-softmax-in-fp32: true

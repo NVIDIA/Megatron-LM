@@ -41,7 +41,6 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 2
   --no-persist-layer-norm: true
   --no-masked-softmax-fusion: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true

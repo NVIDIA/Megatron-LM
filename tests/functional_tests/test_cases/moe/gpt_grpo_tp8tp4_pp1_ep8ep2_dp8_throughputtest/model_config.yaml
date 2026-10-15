@@ -84,7 +84,6 @@ MODEL_ARGS:
   --attention-backend: flash
   --no-create-attention-mask-in-dataloader: true
   --num-workers: 8
-  --deterministic-mode: true
   --seed: 42
 
   # RL / GRPO settings

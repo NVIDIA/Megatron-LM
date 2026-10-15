@@ -48,7 +48,6 @@ MODEL_ARGS:
   --position-embedding-type: rope
   --transformer-impl: transformer_engine
   --bf16: true
-  --deterministic-mode: true
   --gdn-kernel-backend: torch
   --use-distributed-optimizer: true
   --no-gradient-accumulation-fusion: true

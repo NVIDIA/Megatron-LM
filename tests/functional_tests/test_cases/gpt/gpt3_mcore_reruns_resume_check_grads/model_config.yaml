@@ -37,7 +37,6 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --override-opt_param-scheduler: true
   --no-load-optim: true
   --recompute-num-layers: 1
-  --deterministic-mode: true
   --bf16: true
   --train-iters: 1
   --eval-iters: 0

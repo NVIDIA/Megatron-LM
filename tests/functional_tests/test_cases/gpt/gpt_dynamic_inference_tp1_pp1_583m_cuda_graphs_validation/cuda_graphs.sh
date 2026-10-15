@@ -54,7 +54,6 @@ ARGS=" \
   --transformer-impl transformer_engine \
   --tensor-model-parallel-size 1 \
   --pipeline-model-parallel-size 1 \
-  --deterministic-mode \
   --ckpt-format torch_dist \
   --bf16 \
   --log-memory-to-tensorboard \

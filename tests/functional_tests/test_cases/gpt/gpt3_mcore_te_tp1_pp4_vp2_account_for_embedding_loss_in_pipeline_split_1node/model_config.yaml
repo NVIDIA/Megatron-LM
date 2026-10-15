@@ -41,7 +41,6 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 4
   --num-virtual-stages-per-pipeline-rank: 2
   --untie-embeddings-and-output-weights: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-mcore-models: true
