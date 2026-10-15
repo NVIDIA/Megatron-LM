@@ -44,6 +44,8 @@ try:
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
+from megatron.core.transformer.attention import HAVE_FUSED_QKV_NORM_ROPE
+
 
 @pytest.mark.parametrize("output_gate", [False, True])
 class TestParallelAttention:
@@ -151,6 +153,58 @@ class TestParallelAttention:
         assert bias.shape[0] == config.hidden_size
         self.parallel_attention.config.apply_rope_fusion = False
         self.parallel_attention.config.rotary_interleaved = False
+
+    @pytest.mark.skipif(
+        not HAVE_FUSED_QKV_NORM_ROPE, reason="TE fused QKV RoPE cannot apply the QK norm."
+    )
+    def test_fused_qkv_rope_with_qk_layernorm(self):
+        if self.transformer_config.attention_output_gate:
+            pytest.skip("Fused QKV RoPE does not support gated attention for now.")
+        config = copy.deepcopy(self.transformer_config)
+        config.normalization = "RMSNorm"
+        config.qk_layernorm = True
+        config.apply_rope_fusion = True
+        config.attention_dropout = 0.0
+        model_parallel_cuda_manual_seed(123)
+        attention = SelfAttention(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules(
+                qk_layernorm=True
+            ).self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        ).cuda()
+        assert attention.qk_norm_fusable_into_qkv_rope()
+
+        sequence_length, micro_batch_size = 32, 2
+        hidden_states = torch.randn(
+            (sequence_length, micro_batch_size, config.hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        rotary_pos_emb = torch.rand(sequence_length, 1, 1, config.kv_channels, device="cuda")
+
+        results = {}
+        for fused in (False, True):
+            attention.config.fused_single_qkv_rope = fused
+            attention.zero_grad(set_to_none=True)
+            output, _ = attention(hidden_states, None, rotary_pos_emb=rotary_pos_emb)
+            assert torch.isfinite(output).all()
+            output.float().sum().backward()
+            results[fused] = (
+                output.detach().clone(),
+                attention.q_layernorm.weight.grad.clone(),
+                attention.k_layernorm.weight.grad.clone(),
+                attention.linear_qkv.weight.grad.clone(),
+            )
+        # The split path rounds the normalized Q/K to bf16 before the rotation and the fused
+        # path rounds once, so the two agree up to bf16 rounding of the Q/K values, which the
+        # attention and the weight-gradient reductions spread over elements of any magnitude.
+        for split_result, fused_result in zip(results[False], results[True]):
+            expected = split_result.float()
+            torch.testing.assert_close(
+                fused_result.float(), expected, rtol=1.6e-2, atol=1e-2 * expected.abs().max().item()
+            )
 
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
