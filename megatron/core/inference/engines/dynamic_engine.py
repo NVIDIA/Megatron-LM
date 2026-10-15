@@ -1904,7 +1904,11 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling requires one MTP depth per speculative token.")
 
     def _add_request(
-        self, request: DynamicInferenceRequest, *, is_resume: bool = False
+        self,
+        request: DynamicInferenceRequest,
+        *,
+        is_resume: bool = False,
+        prompt_is_prefilled: bool = False,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add a request to the engine.
 
@@ -1912,6 +1916,10 @@ class DynamicInferenceEngine(AbstractEngine):
             request (DynamicInferenceRequest): Request to add.
             is_resume (bool): Whether an existing record is being explicitly
                 re-admitted after suspend/resume.
+            prompt_is_prefilled (bool): Whether the prompt's KV cache already
+                exists, as for a disaggregated decode handoff, so the prompt never
+                runs as prefill work. Such a prompt skips the per-step
+                ``max_tokens`` check; the sequence-length and KV-pool checks apply.
 
         Returns:
             asyncio.Future[DynamicInferenceRequest]: Future completed when the request finishes.
@@ -2006,7 +2014,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"Clamping num_tokens_to_generate to {remaining_tokens}."
                 )
 
-        if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
+        # Only a prompt this engine must prefill is bounded by the per-step token budget.
+        if (
+            len(request.prompt_tokens) > self.context.max_tokens
+            and not self.enable_chunked_prefill
+            and not prompt_is_prefilled
+        ):
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
@@ -2057,6 +2070,7 @@ class DynamicInferenceEngine(AbstractEngine):
         media_tokens_preexpanded: bool = False,
         offload_params: Optional[Dict] = None,
         media_cache_key: Optional[str] = None,
+        prompt_is_prefilled: bool = False,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -2096,6 +2110,10 @@ class DynamicInferenceEngine(AbstractEngine):
             media_cache_key (Optional[str]): Media identity computed by the submitting
                 inference client. Direct callers may omit it and let the engine derive
                 an identity from the resolved media tensors.
+            prompt_is_prefilled (bool): Whether the prompt's KV cache was already
+                computed elsewhere, as for a disaggregated decode handoff. The prompt
+                then skips the per-step ``max_tokens`` check that only bounds prefill
+                work; the sequence-length and KV-pool checks still apply.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -2182,7 +2200,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # exhaustion, ...), those tensors would linger in the context
             # dicts and leak GPU memory. Clean them up on failure.
             try:
-                return self._add_request(request)
+                return self._add_request(request, prompt_is_prefilled=prompt_is_prefilled)
             except Exception:
                 self.context.remove_vlm_request_data(request_id)
                 raise
@@ -2205,7 +2223,7 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             self._apply_prompt_preparation_error(request, offload_params)
 
-        return self._add_request(request)
+        return self._add_request(request, prompt_is_prefilled=prompt_is_prefilled)
 
     def _apply_prompt_preparation_error(self, request, offload_params) -> None:
         """Fail a request whose prompt preparer reported an error on MP rank zero."""

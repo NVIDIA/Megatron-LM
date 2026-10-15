@@ -973,6 +973,8 @@ class InferenceStateHandoffMixin:
             len(self._pending_kv_imports),
         )
 
+        # The transferred KV already covers the prompt, so this engine never runs it
+        # as prefill work and the per-step prefill token budget does not apply.
         request_future = self.add_request(
             pending.request_id,
             pending.prompt,
@@ -980,6 +982,7 @@ class InferenceStateHandoffMixin:
             precomputed_block_hashes=(
                 pending.hashes[:registration_end] if registration_end > 0 else None
             ),
+            prompt_is_prefilled=True,
         )
 
         request = self.get_request(pending.request_id)

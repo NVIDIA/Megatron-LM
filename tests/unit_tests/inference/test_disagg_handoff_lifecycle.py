@@ -11,6 +11,11 @@ import pytest
 import torch
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
+    MaxSequenceLengthOverflowError,
+    TokenOverflowError,
+)
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
@@ -30,6 +35,7 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
 )
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
 from megatron.core.inference.inference_request import (
+    DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
@@ -156,6 +162,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
         self.requests = {}
         self.blocks_to_bind = {}
         self.precomputed_hashes = {}
+        self.prefilled_prompts = {}
         self.partial_admissions = set()
         self.track_generated_token_events = False
         self.use_coordinator = False
@@ -164,7 +171,15 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
     async def _notify_cond_for_new_request(self):
         return None
 
-    def add_request(self, request_id, prompt, sampling_params, precomputed_block_hashes=None):
+    def add_request(
+        self,
+        request_id,
+        prompt,
+        sampling_params,
+        precomputed_block_hashes=None,
+        *,
+        prompt_is_prefilled=False,
+    ):
         request = DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=torch.tensor(prompt),
@@ -174,6 +189,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
         request.add_event_add_engine()
         self.requests[request_id] = request
         self.precomputed_hashes[request_id] = precomputed_block_hashes
+        self.prefilled_prompts[request_id] = prompt_is_prefilled
         self.waiting_request_ids.append(request_id)
         return self._loop.create_future()
 
@@ -314,8 +330,12 @@ def test_completed_exact_ssm_handoff_enters_decode_without_waiting_queue(handoff
     )
     request.add_event_add_engine()
 
-    def add_request(request_id, prompt, sampling_params, precomputed_block_hashes=None):
+    def add_request(
+        request_id, prompt, sampling_params, precomputed_block_hashes=None, *, prompt_is_prefilled
+    ):
         assert request_id == request.request_id
+        # The imported KV covers the prompt, so admission must skip the prefill budget.
+        assert prompt_is_prefilled is True
         engine.requests[request_id] = request
         engine.waiting_request_ids.append(request_id)
         return request_future
@@ -768,7 +788,10 @@ def test_handoff_finishes_without_an_extra_decode_step(
         )
         InferenceStateHandoffMixin._complete_handoff_request_without_forward(engine, request_id)
 
-    def add_request(request_id, _prompt, _sampling_params, precomputed_block_hashes=None):
+    def add_request(
+        request_id, _prompt, _sampling_params, precomputed_block_hashes=None, *, prompt_is_prefilled
+    ):
+        assert prompt_is_prefilled is True
         engine.requests[request_id] = request
         engine.waiting_request_ids.append(request_id)
         return request_future
@@ -1019,12 +1042,71 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     ) as admit:
         engine._finalize_kv_handoff_import(pending)
     assert engine.precomputed_hashes[5] == hashes
+    assert engine.prefilled_prompts[5] is True
     assert engine.context.kv_block_allocator.registered_parent_hashes == [hashes[1]]
     assert engine.get_request(5).generated_tokens == [99]
     assert 5 not in engine.waiting_request_ids
     admit.assert_called_once_with(
         engine.context, engine.get_request(5), [10, 11, 12], [13], [99], ssm_state_idx=None
     )
+
+
+def _admission_engine(loop, *, pool_size=64):
+    engine = object.__new__(DynamicInferenceEngine)
+    engine._loop = loop
+    engine.requests = {}
+    engine._generation_epoch = None
+    engine.rank = 1
+    engine.enable_chunked_prefill = False
+    engine.materialize_only_last_token_logits = True
+    engine.controller = SimpleNamespace(tokenizer=SimpleNamespace(eod=0))
+    engine.context = SimpleNamespace(
+        max_sequence_length=32,
+        max_tokens=8,
+        block_size_tokens=4,
+        num_speculative_tokens=0,
+        kv_block_allocator=SimpleNamespace(pool_size=pool_size),
+    )
+    engine.waiting_request_ids = deque()
+    engine._handle_failed_request = mock.Mock()
+    return engine
+
+
+@pytest.mark.parametrize(
+    ("prompt_length", "pool_size", "prompt_is_prefilled", "expected_errors"),
+    [
+        (12, 64, True, []),
+        (12, 64, False, [TokenOverflowError]),
+        (40, 64, True, [MaxSequenceLengthOverflowError]),
+        (12, 4, True, [BlockOverflowError]),
+    ],
+)
+def test_prefilled_prompt_skips_only_the_prefill_token_budget(
+    handoff_loop, prompt_length, pool_size, prompt_is_prefilled, expected_errors
+):
+    engine = _admission_engine(handoff_loop, pool_size=pool_size)
+    request = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.arange(1, prompt_length + 1),
+        sampling_params=SamplingParams(num_tokens_to_generate=2),
+    )
+
+    engine._add_request(request, prompt_is_prefilled=prompt_is_prefilled)
+
+    errors = [
+        type(event.payload)
+        for event in request.events
+        if event.type == DynamicInferenceEventType.ERROR_NONTRANSIENT
+    ]
+    assert errors == expected_errors
+    if expected_errors:
+        assert request.status == Status.FAILED
+        assert list(engine.waiting_request_ids) == []
+        engine._handle_failed_request.assert_called_once_with(1)
+    else:
+        assert request.status == Status.ACTIVE_AND_GENERATING_TOKENS
+        assert list(engine.waiting_request_ids) == [1]
+        engine._handle_failed_request.assert_not_called()
 
 
 def test_decode_handoff_defers_until_kv_capacity_is_available(handoff_loop):

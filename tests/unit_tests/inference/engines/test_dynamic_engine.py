@@ -1781,7 +1781,7 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
     engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
     engine._notify_cond_for_new_request = mock.Mock(return_value=None)
 
-    def register(request, *, is_resume=False):
+    def register(request, *, is_resume=False, prompt_is_prefilled=False):
         if not is_resume:
             engine.requests[request.request_id] = types.SimpleNamespace(
                 record=DynamicInferenceRequestRecord.from_request(request)
@@ -1889,6 +1889,27 @@ def test_add_request_defaults_sampling_params():
     assert isinstance(first_request.sampling_params, SamplingParams)
     assert first_request.sampling_params is not second_request.sampling_params
     assert first_request.sampling_params.add_BOS is False
+
+
+@pytest.mark.parametrize("prompt_is_prefilled", [False, True])
+def test_add_request_forwards_prompt_is_prefilled(prompt_is_prefilled):
+    """The prefilled-prompt flag reaches admission, where it gates the prefill token budget."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.requests = {}
+    engine.context = types.SimpleNamespace(block_size_tokens=4, enable_prefix_caching=False)
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(validate_input_modalities=mock.Mock())
+    )
+    engine._add_request = mock.Mock()
+    tokens = torch.tensor([1, 2], dtype=torch.int64)
+
+    with mock.patch(
+        "megatron.core.inference.engines.dynamic_engine.torch.tensor", return_value=tokens
+    ):
+        engine.add_request(3, [1, 2], prompt_is_prefilled=prompt_is_prefilled)
+
+    engine._add_request.assert_called_once()
+    assert engine._add_request.call_args.kwargs == {"prompt_is_prefilled": prompt_is_prefilled}
 
 
 def test_add_request_rejects_duplicate_id_before_mutation():
