@@ -4,8 +4,10 @@
 Unit tests for identity hyper-connections (iHC).
 
 iHC keeps the mHC H_pre / H_post mappings but fixes the residual mixing matrix
-H_res to the identity: nothing is projected for it and the Sinkhorn-Knopp step
-is skipped, while the downstream H_res / H_post / BDA kernels are unchanged.
+H_res to the identity: no H_res parameters are learned and the Sinkhorn-Knopp
+step is skipped, while the downstream H_res / H_post / BDA kernels are unchanged.
+With use_fused_mhc the projection still runs through the fused kernel, fed zero
+H_res rows.
 Numerical references use full FP32 matmul precision so identity mixing preserves
 the residual even on devices where TF32 is selected for the native batched matmul.
 """
@@ -283,35 +285,84 @@ class TestIdentityHyperConnectionModule:
         torch.testing.assert_close(grad_ckpt, grad_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(wgrad_ckpt, wgrad_ref, atol=1e-5, rtol=1e-5)
 
-    def test_use_fused_mhc_keeps_native_projection(self):
-        """use_fused_mhc still fuses aggregate / H_post_bda; the projection stays native."""
+    def test_fused_mapping_params_pad_h_res_rows(self):
+        """The fused projection is fed the mHC layout: real rows first, zero H_res rows."""
+        n, C = 4, 64
+        ihc = self._make_module(identity=True, num_streams=n, hidden_size=C, use_fused_mhc=True)
+        weight, alpha_res, bias = ihc._fused_mapping_params()
+        assert weight.shape == (n * n + 2 * n, n * C)
+        assert bias.shape == (n * n + 2 * n,)
+        torch.testing.assert_close(weight[: 2 * n], ihc.mapping_proj.weight, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(bias[: 2 * n], ihc.bias, atol=0.0, rtol=0.0)
+        assert torch.count_nonzero(weight[2 * n :]) == 0
+        assert torch.count_nonzero(bias[2 * n :]) == 0
+        assert alpha_res.shape == (1,) and not alpha_res.requires_grad
+        assert torch.count_nonzero(alpha_res) == 0
+
+        mhc = self._make_module(identity=False, num_streams=n, hidden_size=C, use_fused_mhc=True)
+        weight, alpha_res, bias = mhc._fused_mapping_params()
+        assert weight is mhc.mapping_proj.weight
+        assert alpha_res is mhc.alpha_res
+        assert bias is mhc.bias
+
+    def test_use_fused_mhc_matches_native_projection(self):
+        """use_fused_mhc routes the iHC projection through the fused kernel, matching native."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
+
         s, b, n, C = 8, 2, 4, 64
-        module = self._make_module(num_streams=n, hidden_size=C, use_fused_mhc=True)
-        assert module._proj_rms_compute_h_op is None
-        assert module._sinkhorn_op is None
+        fused = self._make_module(num_streams=n, hidden_size=C, use_fused_mhc=True)
+        native = self._make_module(num_streams=n, hidden_size=C)
+        native.load_state_dict(fused.state_dict())
+        assert fused._proj_rms_compute_h_op is fused_proj_rms_compute_h
+        assert fused._sinkhorn_op is None
+        assert fused.alpha_res is None
 
-        hidden_states = torch.randn(
-            s, b, n * C, device="cuda", dtype=torch.bfloat16, requires_grad=True
-        )
-        aggregated, h_res, h_post, residual = module(hidden_states)
-        torch.testing.assert_close(
-            h_res, _identity_h_res(s, b, n, torch.bfloat16), atol=0.0, rtol=0.0
-        )
-        output = module.fused_h_res_h_post_bda(
-            h_res,
-            residual,
-            h_post,
-            (aggregated, None),
-            dropout_prob=0.0,
-            training=True,
-            fused=False,
-        )
-        output.sum().backward()
+        hidden_states = torch.randn(s, b, n * C, device="cuda", dtype=torch.bfloat16)
+        layer_output = torch.randn(s, b, C, device="cuda", dtype=torch.bfloat16)
 
-        assert hidden_states.grad is not None
-        assert module.mapping_proj.weight.grad is not None
-        assert module.alpha_pre.grad is not None
-        assert module.alpha_post.grad is not None
+        def run(module):
+            module.zero_grad(set_to_none=True)
+            hs = hidden_states.clone().requires_grad_(True)
+            aggregated, h_res, h_post, residual = module(hs)
+            torch.testing.assert_close(
+                h_res, _identity_h_res(s, b, n, torch.bfloat16), atol=0.0, rtol=0.0
+            )
+            output = module.fused_h_res_h_post_bda(
+                h_res,
+                residual,
+                h_post,
+                (aggregated + layer_output, None),
+                dropout_prob=0.0,
+                training=True,
+                fused=False,
+            )
+            output.float().sum().backward()
+            grads = {name: p.grad.clone() for name, p in module.named_parameters()}
+            return (
+                h_post.detach().float(),
+                aggregated.detach().float(),
+                output.detach().float(),
+                hs.grad.float(),
+                grads,
+            )
+
+        post_f, agg_f, out_f, gx_f, grads_f = run(fused)
+        post_n, agg_n, out_n, gx_n, grads_n = run(native)
+
+        # Same tolerances as the fused-kernel tests: the cuTile backend accumulates
+        # in mixed precision.
+        fwd_tol = dict(atol=2e-2, rtol=2e-2)
+        bwd_tol = dict(atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(post_f, post_n, **fwd_tol)
+        torch.testing.assert_close(agg_f, agg_n, **fwd_tol)
+        torch.testing.assert_close(out_f, out_n, **fwd_tol)
+        torch.testing.assert_close(gx_f, gx_n, **bwd_tol)
+        assert grads_f.keys() == grads_n.keys()
+        assert set(grads_n) == {"mapping_proj.weight", "alpha_pre", "alpha_post", "bias"}
+        assert grads_f["mapping_proj.weight"].shape == (2 * n, n * C)
+        assert grads_f["bias"].shape == (2 * n,)
+        for name in grads_n:
+            torch.testing.assert_close(grads_f[name], grads_n[name], msg=name, **bwd_tol)
 
 
 class TestIdentityHyperConnectionTransformerLayer:
