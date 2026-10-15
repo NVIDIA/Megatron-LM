@@ -833,7 +833,8 @@ class HyperConnectionModule(MegatronModule):
                     h_res,
                     streams,
                     h_post,
-                    x,
+                    # Bias gradients reduce across tokens; retain FP32 partials.
+                    x if bias is None else x.float(),
                     None if bias is None else bias.float(),
                     output_dtype=x.dtype,
                 ).flatten(-2)
