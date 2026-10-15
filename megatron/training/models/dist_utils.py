@@ -363,9 +363,14 @@ def _ddp_wrap(
         ddp_stream.wait_stream(current_stream)
 
     with torch.cuda.stream(ddp_stream):
-        dp_init_kwargs = {}
-        if not use_torch_fsdp2:
-            dp_init_kwargs["pg_collection"] = pg_collection
+        if use_torch_fsdp2:
+            # TorchFSDP takes the one group it shards over: DP x CP, including the GTP-remat
+            # axis when the collection has one.
+            dp_init_kwargs = {
+                "process_group": pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+            }
+        else:
+            dp_init_kwargs = {"pg_collection": pg_collection}
 
         # MFSDP v2 rejects ``disable_bucketing=True`` (see
         # FullyShardedDataParallelV2._validate_config) and does not use the classic
