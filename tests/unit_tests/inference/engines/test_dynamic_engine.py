@@ -2698,6 +2698,54 @@ def test_schedule_requests_drops_malformed_submit_request(malformed, caplog):
     assert msgpack.unpackb(broadcast[1], raw=False) == [len(malformed), len(good)]
 
 
+def test_schedule_requests_fails_a_rejected_kv_handoff_and_continues():
+    """A SUBMIT_REQUEST_WITH_KV that the handoff rejects fails its request with a reply.
+
+    Every MP rank receives the same broadcast message and raises the same
+    validation error, so failing the submission keeps their request state
+    mirrored instead of taking the engine loop down, and the batch continues.
+    """
+    params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
+    kv_meta = {"resume_tokens": [9]}
+    handoff = [
+        msgpack.packb(
+            [Headers.SUBMIT_REQUEST_WITH_KV.value, 41, params.serialize(), kv_meta],
+            use_bin_type=True,
+        ),
+        msgpack.packb("hello", use_bin_type=True),
+        msgpack.packb([7, 8], use_bin_type=True),
+    ]
+    good = _submit_request_message(42, params.serialize(), [3, 4], None)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = None
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    engine.requests, engine.failed_request_ids = {}, []
+    rejection = RuntimeError("KV handoff received without a transfer backend")
+    engine.add_request_with_kv_handoff = mock.Mock(side_effect=rejection)
+    engine.add_request = mock.Mock()
+    engine._fail_submission = mock.Mock()
+    socket = engine.socket_for_receiving_requests = mock.Mock()
+    socket.recv_multipart.side_effect = [handoff, good, dynamic_engine.zmq.Again]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
+    engine.local_metadata_ledger_enabled = False
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine._collect_failed_requests = mock.Mock(return_value=[])
+
+    assert engine.schedule_requests() == 2
+
+    engine.add_request_with_kv_handoff.assert_called_once()
+    args = engine.add_request_with_kv_handoff.call_args.args
+    assert args[0] == 41 and args[1] == "hello"
+    assert args[3] == kv_meta and args[4] == [7, 8]
+    engine._fail_submission.assert_called_once()
+    failed_id, failed_params, error = engine._fail_submission.call_args.args
+    assert failed_id == 41 and error is rejection
+    assert failed_params.num_tokens_to_generate == 1
+    # The next message in the batch is still admitted.
+    engine.add_request.assert_called_once()
+    assert engine.add_request.call_args.args[:2] == (42, [3, 4])
+
+
 def test_handle_failed_request_releases_vlm_request_data():
     """Media registered before admission is dropped when the request fails."""
     request = DynamicInferenceRequest(

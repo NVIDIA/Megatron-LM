@@ -654,7 +654,7 @@ class InferenceStateHandoffMixin:
     def add_request_with_kv_handoff(
         self,
         request_id: int,
-        prompt: list,
+        prompt: str | list[int],
         sampling_params: "SamplingParams",
         kv_meta: dict,
         src_block_ids: list,
@@ -663,6 +663,11 @@ class InferenceStateHandoffMixin:
 
         Side: decode engine; pull and push transport paths. A pull backend starts
         the read here, while a push backend posts the matching receive.
+
+        A string prompt is tokenized once here, as ``add_request`` tokenizes one, so
+        block hashing, the transfer size check and admission all use the same token
+        IDs. Validation errors raise before any cache state is reserved; the engine's
+        SUBMIT_REQUEST_WITH_KV handler turns them into a failed reply.
         """
         allocator = self.context.kv_block_allocator
         if not allocator.enable_prefix_caching:
@@ -710,6 +715,13 @@ class InferenceStateHandoffMixin:
                 "Decode-only handoff does not yet transfer prompt or first-token log probabilities"
             )
 
+        if isinstance(prompt, str):
+            # Normalize before hashing so the deferred and pending import records,
+            # and the finalizer's add_request(), carry token IDs. add_request() then
+            # takes its token-list path and does not add a second BOS.
+            prompt = self.controller.tokenize_prompt(
+                self.controller.tokenizer, prompt, sampling_params.add_BOS
+            )
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
         hashes = compute_block_hashes_batched(prompt_tensor, self.context.block_size_tokens)
         num_blocks = transfer_block_count(kv_meta, src_block_ids)

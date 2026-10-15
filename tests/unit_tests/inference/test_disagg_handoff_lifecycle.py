@@ -1051,6 +1051,48 @@ def test_decode_handoff_defers_until_kv_capacity_is_available(handoff_loop):
     assert engine._kv_transfer_agent.calls == [(kv_meta, [100, 101], [10, 11])]
 
 
+def test_string_handoff_prompt_is_tokenized_once_before_import(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    engine.context.kv_block_allocator.capacity_available = False
+    prompt_tokens = [7, 1, 2, 3, 4, 5, 6, 8]
+    tokenizer = object()
+    engine.controller = SimpleNamespace(
+        tokenizer=tokenizer, tokenize_prompt=mock.Mock(return_value=prompt_tokens)
+    )
+    sampling_params = SamplingParams(num_tokens_to_generate=2, add_BOS=True)
+    kv_meta = {"request_id": 6, "resume_tokens": [99]}
+    hashes = compute_block_hashes_batched(
+        torch.tensor(prompt_tokens), engine.context.block_size_tokens
+    )
+
+    future = engine.add_request_with_kv_handoff(
+        6, "hello world", sampling_params, kv_meta, [100, 101]
+    )
+
+    # The block-count check and the capacity-deferred record use the token IDs.
+    engine.controller.tokenize_prompt.assert_called_once_with(tokenizer, "hello world", True)
+    (deferred,) = engine._deferred_kv_handoffs
+    assert deferred.prompt == prompt_tokens
+    assert deferred.hashes == hashes
+    assert not future.done()
+
+    engine.context.kv_block_allocator.capacity_available = True
+    engine._poll_pending_kv_imports()
+    _drain_loop(handoff_loop)
+    (pending,) = engine._pending_kv_imports
+    assert pending.prompt == prompt_tokens
+    assert engine._kv_transfer_agent.calls == [(kv_meta, [100, 101], [10, 11])]
+
+    with mock.patch(
+        "megatron.core.inference.disaggregation.inference_state_handoff.admit_prefilled_decode"
+    ):
+        engine._finalize_kv_handoff_import(pending)
+
+    # Admission receives the same token IDs, and nothing tokenizes the prompt again.
+    engine.controller.tokenize_prompt.assert_called_once()
+    assert engine.get_request(6).prompt_tokens.tolist() == prompt_tokens
+
+
 def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine._kv_transfer_agent.begin_pull_blocks = mock.Mock(

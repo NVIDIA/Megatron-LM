@@ -1830,6 +1830,9 @@ class DynamicInferenceEngine(AbstractEngine):
         add_request raises. Registering a placeholder record with
         Status.FAILED lets ``_handle_failed_request`` publish the ENGINE_REPLY
         without leaving the client hanging or killing the engine loop.
+
+        The SUBMIT_REQUEST_WITH_KV handler calls it too, when
+        ``add_request_with_kv_handoff`` rejects a handoff before reserving cache state.
         """
         if self.rank == 0:
             warnings.warn(
@@ -4594,9 +4597,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 src_block_ids = msgpack.unpackb(message[2], raw=False)
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request_with_kv_handoff")
-                self.add_request_with_kv_handoff(
-                    request_id, prompt, sampling_params, kv_meta, src_block_ids
-                )
+                # As on the plain path, a rejected handoff must still reply. Every MP
+                # rank receives the same message and raises the same validation error,
+                # so failing it here keeps the ranks' request state mirrored.
+                try:
+                    self.add_request_with_kv_handoff(
+                        request_id, prompt, sampling_params, kv_meta, src_block_ids
+                    )
+                except Exception as error:  # pylint: disable=broad-except
+                    self._fail_submission(request_id, sampling_params, error)
                 nvtx_range_pop("add_request_with_kv_handoff")
             elif header == Headers.RELEASE_KV:
                 # Coordinator-broadcast release. Unknown request ids are no-ops.
