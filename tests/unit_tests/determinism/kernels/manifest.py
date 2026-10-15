@@ -189,7 +189,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="torch.compile",
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "
-        "standalone replay is in test_fused_activations. The DSv4 module tests cover static-spec "
+        "standalone replay and grad/no-grad forward parity are in test_fused_activations. "
+        "The DSv4 module tests cover static-spec "
         "construction and optional latent norms around the registered TE / RoPE / CSA kernels.",
     ),
     # ---------------------------------------------------------------- Megatron Triton fusions
