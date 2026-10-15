@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from megatron.core.utils import accepts_parameter, get_model_config
+from megatron.core.utils import accepts_parameter, get_model_config, unwrap_model
 
 try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
@@ -57,6 +57,24 @@ def get_language_model(model: torch.nn.Module) -> torch.nn.Module:
     """
     language_model = getattr(model, "language_model", None)
     return model if language_model is None else language_model
+
+
+def resolve_logits_dtype(model: torch.nn.Module, params_dtype: torch.dtype) -> torch.dtype:
+    """Return the dtype the LM head actually emits its logits in."""
+    # Deferred to avoid a circular import.
+    from megatron.core.transformer.module import Float16Module
+
+    logit_dtype = getattr(get_language_model(unwrap_model(model)), "logit_dtype", None)
+    if logit_dtype is not None:
+        return logit_dtype
+
+    module = model
+    while module is not None:
+        if isinstance(module, Float16Module):
+            return torch.float16 if module.fp16 else torch.bfloat16
+        module = getattr(module, "module", None)
+
+    return params_dtype
 
 
 def model_eos_token_ids(tokenizer: Any) -> frozenset:

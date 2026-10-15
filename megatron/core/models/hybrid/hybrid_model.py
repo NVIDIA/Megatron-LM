@@ -840,10 +840,49 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
-        logits = self._scale_logits(logits)
+        logits_buffer = getattr(inference_context, "logits_output_buffer", None)
+        multicast_handle = getattr(inference_context, "logits_buffer_multicast_handle", None)
+        if multicast_handle is not None:
+            from megatron.core.inference.communication.torch_symm_triton import multimem_all_gather
+
+            # TP > 1 on NVLS: each rank stores its vocab shard into its column block of every
+            # rank's buffer rows (gather and transpose fused); the barrier before the store
+            # orders it after every peer's reads of the previous step's logits.
+            shard, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=False
+            )
+            shard = self._scale_logits(shard).squeeze(1).contiguous()
+            buffer_rows = logits_buffer[0, : shard.shape[0]]
+            multimem_all_gather(
+                buffer_rows,
+                shard,
+                multicast_handle,
+                barrier_before=True,
+                last_dim_width=shard.shape[1],
+            )
+            logits = buffer_rows.unsqueeze(1)
+        elif logits_buffer is not None and inference_context.logits_output_in_place:
+            # TP 1 with a head that takes a preallocated output: write directly into the buffer.
+            buffer_rows = logits_buffer[0, : hidden_states.shape[0]]
+            logits, _ = self.output_layer(
+                hidden_states,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                out=buffer_rows.unsqueeze(1),
+            )
+            if self.config.use_mup and self.config.mup_output_mult != 1.0:
+                logits.mul_(self.config.mup_output_mult)
+        else:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+            logits = self._scale_logits(logits)
+            if logits_buffer is not None:
+                # Dynamic inference under CUDA graphs: write the logits into the controller's
+                # persistent buffer and return a view of it, so no graph pins its own copy.
+                buffer_rows = logits_buffer[0, : logits.shape[0]]
+                buffer_rows.copy_(logits.squeeze(1))
+                logits = buffer_rows.unsqueeze(1)
         gather_output = (
             self.output_layer.gather_output
             if runtime_gather_output is None
