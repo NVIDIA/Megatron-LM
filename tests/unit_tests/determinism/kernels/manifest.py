@@ -475,7 +475,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
-        notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
+        notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
+        "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
+        "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
+        "test_ssm_kernels.py.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -611,6 +614,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/communication/torch_symm_triton/barrier.py",
             "megatron/core/inference/communication/torch_symm_triton/collectives.py",
             "megatron/core/inference/communication/torch_symm_triton/fused_collectives.py",
+            "megatron/core/inference/communication/torch_symm_triton/kernel_config.py",
             "megatron/core/inference/communication/torch_symm_triton/multimem_asm.py",
             "megatron/core/inference/communication/torch_symm_triton/utils.py",
             "megatron/core/inference/communication/torch_symm_triton/variable_collectives.py",
@@ -680,8 +684,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
-        "test_fused_triton_kernels.py) and TE fused RoPE (test_te_wrappers.py). The TE "
-        "FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not replayed.",
+        "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
+        "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
+        "test_te_wrappers.py. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not "
+        "replayed.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
@@ -858,6 +864,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Numerical CP parity and strict attention/indexer replay are covered by "
         "test_dsv4_packed_cp.py; see the separate packed deterministic dispatch entry.",
     ),
+    KernelEntry(
+        name="dsa_dispatch",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="dispatch",
+        notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
+        "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
+    ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
         name="dsa_tilelang_kernels",
@@ -878,6 +892,28 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="Experimental DeepSeek sparse attention kernels (indexer / sparse MLA backward accumulate with "
         "atomics). Bit-exact replay is tracked as a follow-up; parity tests live in "
         "tests/unit_tests/transformer/experimental_attention_variant/.",
+    ),
+    # ---------------------------------------------------------------- DSA min-memory backends
+    KernelEntry(
+        name="dsa_min_memory_triton",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_min_memory_triton.py",
+        ),
+        tests=("tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",),
+        kind="triton",
+        notes="Streaming top-k routing, selected-score forward/backward, scatter of the selected "
+        "gradient and the normalized weight gradient. The tests assert torch.equal against the "
+        "torch reference on the rows top-k orders stably.",
+    ),
+    KernelEntry(
+        name="dsa_min_memory_torch",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_min_memory.py",),
+        tests=("tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",),
+        kind="torch-op",
+        notes="index_add_ accumulates the key, value and indexer-K gradients where top-k selects "
+        "one key more than once, so the sum order follows kernel scheduling. The accumulation runs "
+        "in FP32 regardless of the parameter dtype, which "
+        "test_sparse_attention_backward_torch_accumulates_repeated_keys_in_fp32 pins.",
     ),
 )
 
