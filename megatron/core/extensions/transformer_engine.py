@@ -1224,6 +1224,8 @@ class TENorm:
             **_get_extra_te_kwargs(config),
         )
 
+        if config.normalization == "RMSNorm":
+            instance.weight.is_rmsnorm_weight = True
         instance.returns_residual = use_fused_residual
         return cast(LayerNormInterface, instance)
 
@@ -1662,6 +1664,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                 **extra_kwargs,
             )
+
+        if self.config.normalization == "RMSNorm":
+            self.layer_norm_weight.is_rmsnorm_weight = True
 
         # Set proper partition_stride
         setattr(self.weight, 'partition_stride', stride)
