@@ -330,6 +330,76 @@ def test_deterministic_sparse_bwd_workspace_rejects_mixed_graph_modes(
         assert _retired_ptrs() == []
 
 
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_sparse_bwd_kwargs_reject_missing_kernel_and_unsupported_devices(monkeypatch):
+    """Deterministic mode never degrades silently: an old frontend, a non-SM100 GPU or a shape
+    cuDNN rejects all raise. A device without an index resolves to the current device."""
+    _reset_workspace_cache(monkeypatch)
+    device = torch.device("cuda", torch.cuda.current_device())
+    args = _sparse_attn_sample(device)
+    # ``torch.device("cuda")`` (no index) is keyed under the current device.
+    unindexed = types.SimpleNamespace(device=torch.device("cuda"))
+    workspace = dk._get_deterministic_sparse_attention_workspace(
+        unindexed, None, None, None, None, None, None, 0.5
+    )
+    assert workspace.numel() == 4096 and _workspace_entry(device).buffer.numel() == 4096
+    with patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)):
+        with pytest.raises(RuntimeError, match="SM100"):
+            dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+    with patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)):
+        monkeypatch.setattr(_FakeBackwardApi, "check_support", lambda self: False)
+        with pytest.raises(RuntimeError, match="cuDNN rejected"):
+            dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+        # A frontend whose wrapper has no inspectable signature / no deterministic kwargs.
+        monkeypatch.setattr(dk._DSA, "sparse_attention_backward_wrapper", object())
+        with pytest.raises(RuntimeError, match="nvidia-cudnn-frontend"):
+            dk._deterministic_sparse_bwd_kwargs(*args, None, 0.5, requested=True)
+
+
+def test_override_indexer_grads_replaces_only_the_deterministic_parts():
+    ig = {
+        "d_index_q": torch.zeros(2, 3),
+        "d_weights": torch.zeros(2, 2, dtype=torch.bfloat16),
+        "d_index_k": torch.zeros(4, dtype=torch.bfloat16),
+        "unrelated": object(),
+    }
+    det_k = torch.arange(4.0).reshape(2, 2)  # fp32 and a different shape, same numel
+    out = dk._override_indexer_grads(ig, None, det_k)
+    assert out["d_index_k"].dtype == torch.bfloat16 and out["d_index_k"].shape == (4,)
+    assert torch.equal(out["d_index_k"].float(), torch.arange(4.0))
+    assert out["d_weights"] is ig["d_weights"] and out["d_index_q"] is ig["d_index_q"]
+    assert "unrelated" not in out
+    out = dk._override_indexer_grads(ig, torch.ones(4), det_k)
+    assert out["d_weights"].dtype == torch.bfloat16 and out["d_weights"].shape == (2, 2)
+    assert torch.equal(out["d_weights"].float(), torch.ones(2, 2))
+
+
+def test_deterministic_indexer_grads_are_zero_without_selected_keys():
+    q = torch.randn(1, 2, 2, 3)
+    w = torch.randn(1, 2, 2)
+    k = torch.randn(1, 4, 3)
+    empty = torch.zeros(1, 2, 0)
+    kwargs = dict(loss_coeff=1.0, grad_loss=torch.ones(()), sm_scale=1.0)
+    grad_w, grad_k = dk._deterministic_sparse_indexer_grads_wk(
+        q, w, k, empty, empty, empty.to(torch.int32), compute_grad_w=True, **kwargs
+    )
+    assert torch.equal(grad_k, torch.zeros_like(k)) and torch.equal(grad_w, torch.zeros_like(w))
+    grad_w, grad_k = dk._deterministic_sparse_indexer_grads_wk(
+        q, w, k, empty, empty, empty.to(torch.int32), compute_grad_w=False, **kwargs
+    )
+    assert grad_w is None and torch.equal(grad_k, torch.zeros_like(k))
+
+
+def test_native_deterministic_indexer_grad_w_only_on_sm90():
+    assert dk._requires_native_deterministic_indexer_grad_w(torch.zeros(1)) is False
+    if torch.cuda.is_available():
+        expected = torch.cuda.get_device_capability() == (9, 0)
+        assert dk._requires_native_deterministic_indexer_grad_w(torch.zeros(1, device="cuda")) is (
+            expected
+        )
+
+
 def _spin_cycles(milliseconds=100):
     """Cycles for ``torch.cuda._sleep`` lasting about ``milliseconds`` on this GPU (measured)."""
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)

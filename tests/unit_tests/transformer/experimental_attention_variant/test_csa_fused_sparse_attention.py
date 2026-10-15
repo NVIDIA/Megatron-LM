@@ -2347,6 +2347,60 @@ class TestFusedIndexerSparseAttn:
         assert compact_call.kwargs['deterministic'] is True
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_sparse_loss_deterministic_replaces_indexer_dk_when_query_requires_grad(
+        self, reset_lazy_kernel_state, monkeypatch
+    ):
+        """With deterministic mode and a differentiable query, the forward precomputes the
+        atomic-free indexer dK and swaps it into cuDNN's gradient dict (dW stays cuDNN's on
+        SM100). The loss itself is unchanged."""
+        s = self.SHAPES
+        topk = 2
+        inputs = self._make_inputs(requires_grad=True)
+        fake_dsa, _ = _install_full_dsa_mock(
+            b=s['b'],
+            sq=s['sq'],
+            np_=s['np_'],
+            d=s['d'],
+            n_comp=s['n_comp'],
+            idx_nh=s['idx_nh'],
+            target_fn=lambda B, S, K, dev: _peaked_dist(B, S, K, dev, peak_idx=0),
+        )
+
+        def fake_compact(q_bshd, k_bshd, w_bsh, top_k, **kwargs):
+            indices = torch.arange(top_k, dtype=torch.int32, device=q_bshd.device)
+            indices = indices.view(1, 1, top_k).expand(s['b'], s['sq'], top_k).contiguous()
+            predict = torch.tensor([0.25, 0.75], dtype=torch.float32, device=q_bshd.device)
+            predict = predict.view(1, 1, top_k).expand(s['b'], s['sq'], top_k).contiguous()
+            return {'indices': indices, 'logits': predict.log(), 'softmax': predict}
+
+        fake_dsa.indexer_forward_top_k_wrapper = MagicMock(side_effect=fake_compact)
+        override = MagicMock(wraps=dk._override_indexer_grads)
+        monkeypatch.setattr(dk, '_override_indexer_grads', override)
+        with patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)):
+            _, indexer_loss = fused_csa_indexer_sparse_attn(
+                **inputs,
+                indexer_topk=topk,
+                ratio=4,
+                softmax_scale=0.5,
+                loss_coeff=1.0,
+                sparse_loss=True,
+                kv_offset=s['skv'] - s['n_comp'],
+                deterministic=True,
+            )
+
+        assert torch.allclose(
+            indexer_loss, torch.tensor(math.log(4), device='cuda'), rtol=1e-5, atol=1e-5
+        )
+        fake_dsa.indexer_backward_wrapper.assert_called_once()
+        override.assert_called_once()
+        _, det_w, det_k = override.call_args.args
+        assert det_w is None  # SM100: cuDNN's dW is already atomic-free
+        assert det_k.shape == (s['b'], s['n_comp'], s['idx_hd'])
+        # Only keys 0 and 1 are selected, so the deterministic dK is zero elsewhere, unlike the
+        # constant-filled cuDNN stub it replaces.
+        assert torch.all(det_k[:, topk:] == 0) and torch.any(det_k[:, :topk] != 0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_disabled_loss_uses_compact_without_softmax(self, reset_lazy_kernel_state):
         """A disabled dense loss must not force dense-score materialization."""
         s = self.SHAPES
@@ -2903,6 +2957,72 @@ class TestFusedIndexerSparseAttnFromTopk:
         torch.testing.assert_close(
             seen['topk_length'], torch.tensor([2, 1, 2, 2], dtype=torch.int32)
         )
+
+    def test_deterministic_mode_replaces_indexer_dk_before_cudnn_grads(self, monkeypatch):
+        """The caller-supplied-top-k path precomputes the atomic-free indexer dK in the forward
+        when deterministic mode is on and the query requires grad (dW stays cuDNN's off SM90)."""
+        inputs = self._inputs()
+        inputs['query'].requires_grad_()
+        total_q, num_heads, _ = inputs['query'].shape
+        total_comp, idx_dim = inputs['k_indexer'].shape
+        lse = torch.zeros(total_q, num_heads)
+
+        def fake_flash(query, kv_full, topk_idxs, softmax_scale, **kwargs):
+            del kv_full, topk_idxs, softmax_scale, kwargs
+            return torch.zeros_like(query), lse, lse
+
+        class FakeDSA:
+            @staticmethod
+            def sparse_indexer_score_recompute_wrapper(q, k, w, topk, **kwargs):
+                del q, k, w, kwargs
+                return {'predict': torch.full_like(topk, 0.5, dtype=torch.float32)}
+
+            @staticmethod
+            def sparse_attn_score_recompute_wrapper(q, k, lse, topk, scale, **kwargs):
+                del q, k, lse, scale, kwargs
+                return {'target': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def indexer_backward_wrapper(q, w, k, *args, **kwargs):
+                del args, kwargs
+                return {
+                    'd_index_q': torch.zeros_like(q),
+                    'd_weights': torch.zeros_like(w),
+                    'd_index_k': torch.zeros_like(k),
+                }
+
+        monkeypatch.setattr(dk, '_ensure_dsa_namespace', lambda: None)
+        monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
+        monkeypatch.setattr(dk, '_DSA', FakeDSA)
+        override = MagicMock(wraps=dk._override_indexer_grads)
+        monkeypatch.setattr(dk, '_override_indexer_grads', override)
+
+        FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+            *inputs.values(),
+            1.0,
+            1.0,
+            1.0,
+            float(total_q),
+            True,
+            2,
+            total_q,
+            (
+                torch.tensor([0, total_q], dtype=torch.int32),
+                torch.tensor([0, total_comp], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+            ),
+            *([None] * 5),  # q_padding_mask .. cp_group
+            0,
+            *([None] * 6),  # indexer_rank_map .. out_rope
+            True,  # deterministic
+        )
+
+        override.assert_called_once()
+        _, det_w, det_k = override.call_args.args
+        assert det_w is None
+        assert det_k.shape == (1, total_comp, idx_dim)
+        # target 1 vs predict 0.5 gives a non-zero clipped-KL gradient on every selected key.
+        assert torch.all(det_k.reshape(total_comp, idx_dim).abs().sum(dim=-1) > 0)
 
     def test_dense_loss_passes_recomputed_full_teacher_lse(self, monkeypatch):
         inputs = self._inputs()
