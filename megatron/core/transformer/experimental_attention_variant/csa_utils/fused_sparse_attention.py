@@ -22,6 +22,7 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import logging
 import math
@@ -781,6 +782,37 @@ def _csa_fwd_flash_mla(
     return out, lse, None
 
 
+def _out_rope_saved_tensors(
+    out_rope: Optional[OutputRopeParams],
+) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+    """Per-pack ``out_rope`` tensors that backward must read through ``saved_tensors``.
+
+    CUDA-graph slot memory only protects tensors saved for backward until the backward
+    replay; tensors kept on ``ctx`` may be overwritten by another graph in between.
+    """
+    if out_rope is None:
+        return None, None
+    return out_rope.cu_seqlens_q, out_rope.position_ids
+
+
+def _out_rope_without_saved_tensors(
+    out_rope: Optional[OutputRopeParams],
+) -> Optional[OutputRopeParams]:
+    """The ``out_rope`` fields kept on ``ctx``: everything except the saved tensors."""
+    if out_rope is None:
+        return None
+    return dataclasses.replace(out_rope, cu_seqlens_q=None, position_ids=None)
+
+
+def _restore_out_rope(
+    out_rope: Optional[OutputRopeParams],
+    cu_seqlens_q: Optional[Tensor],
+    position_ids: Optional[Tensor],
+) -> Optional[OutputRopeParams]:
+    """Rebuild the forward ``out_rope`` from ``ctx`` and its saved tensors."""
+    if out_rope is None:
+        return None
+    return dataclasses.replace(out_rope, cu_seqlens_q=cu_seqlens_q, position_ids=position_ids)
 def _ensure_dsa_namespace():
     """Lazily import the cudnn-frontend DSA namespace."""
     global _DSA
@@ -1824,12 +1856,29 @@ class CSASparseAttnFunc(torch.autograd.Function):
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
         if ctx.reconstruct_kv_for_backward:
             _validate_kv_reconstruction_parts(kv, kv_reconstruction_parts)
-            ctx.save_for_backward(q, *kv_reconstruction_parts, attn_sink, saved_topk_idxs, out, lse)
+            ctx.save_for_backward(
+                q,
+                *kv_reconstruction_parts,
+                attn_sink,
+                saved_topk_idxs,
+                out,
+                lse,
+                None if hca_cp_rank is not None else topk_length,
+                *_out_rope_saved_tensors(out_rope),
+            )
         else:
-            ctx.save_for_backward(q, kv, attn_sink, saved_topk_idxs, out, lse)
+            ctx.save_for_backward(
+                q,
+                kv,
+                attn_sink,
+                saved_topk_idxs,
+                out,
+                lse,
+                None if hca_cp_rank is not None else topk_length,
+                *_out_rope_saved_tensors(out_rope),
+            )
         ctx.softmax_scale = softmax_scale
-        ctx.topk_length = None if hca_cp_rank is not None else topk_length
-        ctx.out_rope = out_rope
+        ctx.out_rope = _out_rope_without_saved_tensors(out_rope)
         ctx.deterministic = deterministic
         ctx.cuda_graph = cuda_graph
         ctx.hca_cp_rank = hca_cp_rank
@@ -1842,14 +1891,36 @@ class CSASparseAttnFunc(torch.autograd.Function):
         _ensure_dsa_namespace()
 
         if ctx.reconstruct_kv_for_backward:
-            q, boundary_kv, local_kv, compressed_kv, attn_sink, topk_idxs, out, lse = (
-                ctx.saved_tensors
-            )
+            (
+                q,
+                boundary_kv,
+                local_kv,
+                compressed_kv,
+                attn_sink,
+                topk_idxs,
+                out,
+                lse,
+                topk_length,
+                rope_cu_seqlens_q,
+                rope_position_ids,
+            ) = ctx.saved_tensors
             kv = torch.cat((boundary_kv, local_kv, compressed_kv), dim=0)
         else:
-            q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
+            (
+                q,
+                kv,
+                attn_sink,
+                topk_idxs,
+                out,
+                lse,
+                topk_length,
+                rope_cu_seqlens_q,
+                rope_position_ids,
+            ) = ctx.saved_tensors
 
-        out, dO = undo_output_rope_for_backward(ctx.out_rope, out, dO)
+        out, dO = undo_output_rope_for_backward(
+            _restore_out_rope(ctx.out_rope, rope_cu_seqlens_q, rope_position_ids), out, dO
+        )
 
         if ctx.hca_cp_rank is not None:
             result = aligned_hca_backward(
@@ -1874,7 +1945,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
                 attn_sink,
                 topk_idxs,
                 softmax_scale=ctx.softmax_scale,
-                topk_length=ctx.topk_length,
+                topk_length=topk_length,
                 **_deterministic_sparse_bwd_kwargs(
                     q,
                     kv,
@@ -1882,7 +1953,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
                     lse,
                     attn_sink,
                     topk_idxs,
-                    ctx.topk_length,
+                    topk_length,
                     ctx.softmax_scale,
                     requested=getattr(ctx, "deterministic", False),
                     cuda_graph=getattr(ctx, "cuda_graph", False),
@@ -3616,15 +3687,16 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_q_indexer,
             precomputed_grad_k_indexer,
             precomputed_grad_weights,
+            padding_row_mask,
+            *_out_rope_saved_tensors(out_rope),
         )
         ctx.softmax_scale = softmax_scale
         ctx.deterministic = deterministic
         ctx.cuda_graph = cuda_graph
         ctx.is_thd = is_thd
-        ctx.padding_row_mask = padding_row_mask
         ctx.np_ = np_
         ctx.d = d
-        ctx.out_rope = out_rope
+        ctx.out_rope = _out_rope_without_saved_tensors(out_rope)
         if is_thd:
             ctx.total_q = total_q
         else:
@@ -3654,6 +3726,9 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_q_indexer,
             precomputed_grad_k_indexer,
             precomputed_grad_weights,
+            padding_row_mask,
+            rope_cu_seqlens_q,
+            rope_position_ids,
         ) = ctx.saved_tensors
 
         is_thd = ctx.is_thd
@@ -3667,11 +3742,13 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             sq, b, skv = ctx.sq, ctx.b, ctx.skv
             dO_flat = grad_output.reshape(sq * b, np_, d_v)
 
-        if ctx.padding_row_mask is not None:
-            dO_flat = dO_flat.masked_fill(ctx.padding_row_mask[:, None, None], 0)
-            lse = lse.masked_fill(ctx.padding_row_mask[:, None], 0)
+        if padding_row_mask is not None:
+            dO_flat = dO_flat.masked_fill(padding_row_mask[:, None, None], 0)
+            lse = lse.masked_fill(padding_row_mask[:, None], 0)
 
-        out_flat, dO_flat = undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
+        out_flat, dO_flat = undo_output_rope_for_backward(
+            _restore_out_rope(ctx.out_rope, rope_cu_seqlens_q, rope_position_ids), out_flat, dO_flat
+        )
 
         dq, dkv, d_sink = _csa_sparse_attention_backward(
             q_flat,
@@ -4048,6 +4125,8 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 saved_grad_k_indexer,
                 saved_grad_weights,
                 indexer_rank_map,
+                q_padding_mask,
+                *_out_rope_saved_tensors(out_rope),
             )
         else:
             ctx.save_for_backward(
@@ -4062,10 +4141,11 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 saved_grad_k_indexer,
                 saved_grad_weights,
                 indexer_rank_map,
+                q_padding_mask,
+                *_out_rope_saved_tensors(out_rope),
             )
         ctx.softmax_scale = softmax_scale
-        ctx.q_padding_mask = q_padding_mask
-        ctx.out_rope = out_rope
+        ctx.out_rope = _out_rope_without_saved_tensors(out_rope)
         ctx.deterministic = deterministic
         ctx.cuda_graph = cuda_graph
 
@@ -4090,6 +4170,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 saved_grad_k_indexer,
                 saved_grad_weights,
                 indexer_rank_map,
+                q_padding_mask,
+                rope_cu_seqlens_q,
+                rope_position_ids,
             ) = ctx.saved_tensors
             kv_full = torch.cat((boundary_kv, local_kv, compressed_kv), dim=0)
         else:
@@ -4105,6 +4188,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 saved_grad_k_indexer,
                 saved_grad_weights,
                 indexer_rank_map,
+                q_padding_mask,
+                rope_cu_seqlens_q,
+                rope_position_ids,
             ) = ctx.saved_tensors
 
         cp_group = ctx.cp_group
@@ -4126,11 +4212,13 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 grad_k_indexer_rank_major = grad_k_indexer
 
         dO_flat = grad_output.reshape(query.shape[0], query.shape[1], out_flat.shape[-1])
-        if ctx.q_padding_mask is not None:
-            dO_flat = dO_flat.masked_fill(ctx.q_padding_mask[:, None, None], 0)
-            lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
+        if q_padding_mask is not None:
+            dO_flat = dO_flat.masked_fill(q_padding_mask[:, None, None], 0)
+            lse = lse.masked_fill(q_padding_mask[:, None], 0)
 
-        out_flat, dO_flat = undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
+        out_flat, dO_flat = undo_output_rope_for_backward(
+            _restore_out_rope(ctx.out_rope, rope_cu_seqlens_q, rope_position_ids), out_flat, dO_flat
+        )
 
         nvtx_range_push("dsv4_cp_sparse_attention_backward")
         dq, dkv, d_sink = _csa_sparse_attention_backward(
