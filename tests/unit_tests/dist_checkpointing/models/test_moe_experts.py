@@ -392,7 +392,6 @@ class TestExpertLayerReconfiguration:
         with (
             TempNamedDir(tmp_path_dist_ckpt / 'test_grouped_mlp_extra_state_model_A') as ckpt_dir_A,
             TempNamedDir(tmp_path_dist_ckpt / 'test_grouped_mlp_extra_state_model_B') as ckpt_dir_B,
-            fp8_autocast(),
         ):
             tokens_per_expert = torch.tensor([16] * (8 // src_exp))
             input_tensor = torch.randn(tokens_per_expert.sum(), 16, device="cuda")
@@ -402,8 +401,9 @@ class TestExpertLayerReconfiguration:
             layer_prefix = f'{parallel_state.get_pipeline_model_parallel_rank()}.'
             model_A = initialize_expert_layer(1, use_glu, expert_type=src_module, fp8=True)
             model_A = model_A.cuda()
-            # fp8 meta is initialized at the first step
-            model_A(input_tensor, tokens_per_expert, probs)
+            # Finish FP8 reductions before destroying the process groups below.
+            with fp8_autocast():
+                model_A(input_tensor, tokens_per_expert, probs)
             sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
             save_strategy = TorchDistSaveShardedStrategy()

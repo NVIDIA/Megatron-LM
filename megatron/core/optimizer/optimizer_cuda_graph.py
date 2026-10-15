@@ -7,6 +7,7 @@ import logging
 import torch
 
 from megatron.core.full_cuda_graph import get_graph_pool, get_shared_capture_stream
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +62,16 @@ class OptimizerCudaGraphWrapper:
 
     def __del__(self):
         logger.info(f"Destructor called for {type(self.optimizer_step_func).__name__} optimizer!!!")
-        if OptimizerCudaGraphWrapper.cuda_graph is not None:
-            del OptimizerCudaGraphWrapper.cuda_graph
-            OptimizerCudaGraphWrapper.cuda_graph = None
-        if OptimizerCudaGraphWrapper.result is not None:
-            OptimizerCudaGraphWrapper.result = None
+        self.reset_cuda_graph()
+
+    @classmethod
+    def reset_cuda_graph(cls) -> None:
+        """Release the captured graph and reset the optimizer capture lifetime."""
+        cls.cuda_graph = None
+        cls.result = None
+        cls.curr_iteration = 0
+
+
+register_model_parallel_teardown(
+    TeardownStage.RELEASE_CUDA_GRAPHS, OptimizerCudaGraphWrapper.reset_cuda_graph
+)

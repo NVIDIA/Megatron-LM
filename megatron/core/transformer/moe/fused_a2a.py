@@ -6,6 +6,7 @@
 import inspect
 from typing import Callable, Optional
 
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.utils import internal_api
 
 try:
@@ -607,6 +608,18 @@ def reset_hybrid_ep_buffer():
     _hybrid_ep_buffer = None
 
 
+def reset_fused_a2a_buffers() -> None:
+    """Drop every module-global buffer bound to a process group (DeepEP and HybridEP).
+
+    Destructors can synchronize CUDA work and rendezvous with expert-parallel peers.
+    All participating ranks must finish their communication and release the buffers
+    together. Aborting torch process groups does not abort these libraries' transports.
+    """
+    global _buffer
+    _buffer = None
+    reset_hybrid_ep_buffer()
+
+
 class HybridEPDispatch(torch.autograd.Function):
     '''
     Fused dispatch operation for permute + dispatch a2a + permute using the HybridEP backend
@@ -649,7 +662,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
-        if _hybrid_ep_buffer is None:
+        if _hybrid_ep_buffer is None or _hybrid_ep_buffer.group != group:
             num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
@@ -954,6 +967,12 @@ def nccl_ep_finalize():
     """
     if HAVE_TE_EP:
         te_ep.ep_finalize()
+
+
+# Teardown runs these in reverse order: finalize NCCL EP, then drop the DeepEP and
+# HybridEP buffers.
+register_model_parallel_teardown(TeardownStage.RELEASE_COMMUNICATION, reset_fused_a2a_buffers)
+register_model_parallel_teardown(TeardownStage.RELEASE_COMMUNICATION, nccl_ep_finalize)
 
 
 if HAVE_TE_EP:

@@ -21,7 +21,6 @@ from tests.unit_tests.a2a_overlap.utils import (
     get_valid_dispatcher_configs,
     get_valid_fp8_flags,
 )
-from tests.unit_tests.test_utilities import Utils
 
 
 def build_model(config, use_padding_mask=False):
@@ -72,16 +71,24 @@ class TestA2AOverlap:
     produces the same results as the reference implementation.
     """
 
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
+    @pytest.fixture
+    def tp_size(self):
+        """Tensor-parallel size of the model-parallel layout.
+
+        A test that parametrizes ``tp_size`` overrides this default, so model_parallel
+        initializes that test's layout before the test runs.
+        """
+        return 1
+
+    @pytest.fixture(autouse=True)
+    def model_parallel(self, shared_model_parallel, tp_size):
+        shared_model_parallel(
+            tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=4,
+            expert_tensor_parallel_size=1,
         )
         set_streams()
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("mtp_layers", [0, 1])
@@ -193,16 +200,7 @@ class TestA2AOverlap:
         Verifies all-to-all overlap optimization with padding_mask produces
         the same results as the reference implementation with various TP/EP/CP combinations.
         """
-        # Re-initialize model parallel with the specified configuration
-        Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp_size,
-            pipeline_model_parallel_size=1,
-            expert_model_parallel_size=4,
-            expert_tensor_parallel_size=1,
-        )
-        set_streams()
-
+        # The model_parallel fixture initialized model parallelism with this tp_size.
         microbatches = 1
 
         gpt_models = []
