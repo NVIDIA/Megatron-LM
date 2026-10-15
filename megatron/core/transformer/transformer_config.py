@@ -4630,6 +4630,24 @@ class TransformerConfig(ModelParallelConfig):
                 "sequence_packing_scheduler, or use thd_tail_padding_policy='append_dummy_seq'."
             )
 
+        if self.dynamic_context_parallel and self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl != "transformer_engine":
+                raise ValueError("Dynamic CP supports only layer-wise TE CUDA graphs.")
+            if not self.cuda_graph_dynamic_microbatches:
+                raise ValueError("Dynamic CP CUDA graphs require dynamic microbatch slots.")
+            if self.delay_wgrad_compute or self.overlap_moe_expert_parallel_comm:
+                raise ValueError("Dynamic CP graphs do not support delayed wgrad or EP overlap.")
+            if self.moe_paged_stash:
+                raise ValueError(
+                    "Dynamic CP graphs do not support moe_paged_stash: its capture bookkeeping "
+                    "does not cover the per-CP-size graph banks."
+                )
+            if self.cuda_graph_modules and CudaGraphModule.mamba in self.cuda_graph_modules:
+                raise ValueError(
+                    "Dynamic CP graphs capture TransformerLayer scopes only; remove 'mamba' from "
+                    "cuda_graph_modules."
+                )
+
         if self.sequence_packing_scheduler is not None:
             # Check TE version.
             if not HAVE_PACKAGING:

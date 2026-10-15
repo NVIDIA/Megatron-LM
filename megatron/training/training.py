@@ -6042,6 +6042,12 @@ def train(
             optimizers=[optimizer],
             pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
+            dynamic_cp_group_getter=(
+                get_dynamic_data_context_parallel_groups if args.dynamic_context_parallel else None
+            ),
+            thd_max_subsamples_per_item=(
+                1 if args.use_varlen_dataset else args.thd_max_packed_sequences
+            ),
         )
 
     # OTel: everything above in train() (the preamble: weight-hash check, sniff
@@ -6560,7 +6566,7 @@ def train(
         )
 
     # Destroy CUDA Graphs.
-    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
@@ -6726,8 +6732,14 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
+                    # Evaluation runs eagerly, outside the captured training graph schedule.
                     packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
-                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                        wrap_data_iterator(
+                            data_iterator,
+                            config,
+                            eval_num_microbatches,
+                            validate_cuda_graph_limits=False,
+                        )
                     )
                 except StopIteration:
                     # Validation data iterator exhausted, stop evaluation early.

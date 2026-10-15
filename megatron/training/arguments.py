@@ -1606,9 +1606,11 @@ def validate_args(args, defaults={}):
         ), 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
     if args.dynamic_context_parallel:
-        assert (
-            not args.enable_cuda_graph
-        ), 'Dynamic context parallelism not supported with CUDA Graph'
+        # --enable-cuda-graph was migrated to cuda_graph_impl='local' above.
+        assert args.cuda_graph_impl in (
+            'none',
+            'transformer_engine',
+        ), 'Dynamic context parallelism supports only --cuda-graph-impl transformer_engine'
         assert (
             not args.use_megatron_fsdp
         ), 'Dynamic context parallelism not supported with Megatron FSDP'
@@ -1631,6 +1633,18 @@ def validate_args(args, defaults={}):
             f'min_dynamic_context_parallel_size ({args.min_dynamic_context_parallel_size}) '
             f'must be <= dp_size * cp_size ({dp_cp_size})'
         )
+        if args.cuda_graph_impl == 'transformer_engine':
+            if args.step_batch_size_schedule is not None:
+                raise ValueError('Dynamic CP CUDA graphs do not support step_batch_size_schedule.')
+            # One graph bank is captured per power-of-two CP size between these bounds.
+            for name, size in (
+                ('dp_size * cp_size', dp_cp_size),
+                ('min_dynamic_context_parallel_size', args.min_dynamic_context_parallel_size),
+            ):
+                if size < 1 or size & (size - 1):
+                    raise ValueError(
+                        f'Dynamic CP CUDA graphs require {name} ({size}) to be a power of two.'
+                    )
 
         import warnings
 

@@ -397,14 +397,8 @@ def _resolve_thd_padding_lengths(
         global_target_len = local_target_len * cp_size
         return local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device
 
-    # Metadata-only path: resolve the global padded endpoint first.
-    global_target_len = (
-        int(target_len) * cp_size
-        if target_len is not None
-        else _round_up_to_alignment(global_actual_T, alignment)
-    )
-
-    # Under CP, ask TE which packed rows this rank would receive.
+    # Metadata-only path: first recover the already-sliced local length. Padding
+    # targets and alignment are CP-local, just as they are in the tensor path.
     if cp_size > 1:
         from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 
@@ -419,16 +413,16 @@ def _resolve_thd_padding_lengths(
                 partition_cu_seqlens, global_actual_T, cp_size, cp_rank
             ).numel()
         )
-        # Do the same for the padded endpoint; THD CP is not simple equal split.
-        local_target_len = int(
-            get_thd_partitioned_indices(
-                partition_cu_seqlens, global_target_len, cp_size, cp_rank
-            ).numel()
-        )
     else:
         # Without CP, local and global metadata lengths are identical.
         local_actual_T = global_actual_T
-        local_target_len = global_target_len
+
+    local_target_len = (
+        int(target_len)
+        if target_len is not None
+        else _round_up_to_alignment(local_actual_T, alignment)
+    )
+    global_target_len = local_target_len * cp_size
 
     return local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device
 
@@ -579,13 +573,24 @@ def pad_sequence_for_thd(
         )
     )
 
-    # Reject individual packed sequences that cannot fit the resolved target.
-    if packed_seq_params.cu_seqlens_q is not None:
-        _cu = packed_seq_params.cu_seqlens_q
-        _individual_lens = _cu[1:] - _cu[:-1]
-        _max_individual = int(_individual_lens.max().item()) if _individual_lens.numel() > 0 else 0
-        assert _max_individual <= global_target_len, (
-            f"Individual request length ({_max_individual}) exceeds the global max sequence length "
+    # Keep the real length before adding a synthetic padding sequence. This host-only
+    # validation value is deliberately not a dataclass field or a graph/TE input.
+    max_seqlen_unpadded = getattr(packed_seq_params, '_max_seqlen_unpadded', None)
+    if max_seqlen_unpadded is None:
+        boundaries = {
+            id(cu): cu
+            for cu in (packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv)
+            if cu is not None
+        }
+        if boundaries:
+            max_seqlen_unpadded = max(
+                int((cu[1:] - cu[:-1]).max().item()) if cu.numel() > 1 else 0
+                for cu in boundaries.values()
+            )
+    if max_seqlen_unpadded is not None:
+        assert max_seqlen_unpadded <= global_target_len, (
+            f"Individual request length ({max_seqlen_unpadded}) exceeds the global max "
+            f"sequence length "
             f"({global_target_len}). Increase --max-seqlen-per-dp-cp-rank / alignment, "
             f"or filter out overlong requests."
         )
@@ -742,6 +747,8 @@ def pad_sequence_for_thd(
             )
         ),
     )
+
+    padded_params._max_seqlen_unpadded = max_seqlen_unpadded
 
     # True marks padded local token slots for routing/loss paths.
     tail_padding_mask = (

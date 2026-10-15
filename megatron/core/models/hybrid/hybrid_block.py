@@ -201,6 +201,13 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
         if self._uses_mhc_recompute_attn_cuda_graph_split():
             return static_inputs
+        group_tail = self._get_te_cuda_graph_group_tail()
+        if group_tail is not None:
+            tail_inputs = group_tail.inner_layer.get_layer_static_inputs(
+                seq_length, micro_batch_size
+            )
+            if "input_ids" in tail_inputs:
+                static_inputs["input_ids"] = tail_inputs["input_ids"]
         hs = static_inputs["hidden_states"]
         n = self.config.num_residual_streams
         static_inputs["hidden_states"] = torch.ones(
@@ -249,7 +256,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         """Reconstruct THD PackedSeqParams from tensor kwargs in the graph capture path."""
         if 'cu_seqlens_q' not in kwargs:
             return
-        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        capture_cp_size, capture_cp_group = self._get_thd_cuda_graph_capture_cp()
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * capture_cp_size
         from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
         graph_dynamic_plan = cp_balanced_indexer.pop_graph_dynamic_plan_from_kwargs(
@@ -264,6 +272,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            local_cp_size=(capture_cp_size if self.config.dynamic_context_parallel else None),
+            cp_group=(capture_cp_group if self.config.dynamic_context_parallel else None),
             # This Python flag is baked into the captured graph and cannot vary
             # between replay batches. Use the conservative THD-safe branch.
             pad_between_seqs=True,
@@ -428,6 +438,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         CUDA-graph output).
         """
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+        # The body calls the inner layer's capture implementation, which skips the inner
+        # TransformerLayer's own fallback, so a router-only capture needs it here.
+        self._set_dynamic_cp_capture_packed_seq_params(kwargs)
 
         # The Hybrid wrapper, not its inner TransformerLayer(s), is the TE graph
         # callable. Place the offload events at this outer boundary so every D2H/H2D
@@ -513,6 +526,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         change, so this wrapper must not enter or flush that queue around replay.
         """
         try:
+            # Select the CP graph bank before packed metadata is decomposed;
+            # both the split attention path and the wrapper graph replay it.
+            self._activate_dynamic_cp_cuda_graph(kwargs.get('packed_seq_params'))
             self._decompose_packed_seq_params_to_kwargs(kwargs)
             return self._te_cuda_graph_replay_impl(args, kwargs)
         finally:
