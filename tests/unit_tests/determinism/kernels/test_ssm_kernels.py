@@ -23,6 +23,7 @@ import torch
 
 from megatron.core.ssm import mamba_mixer as mamba_mixer_module
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.tuning import autotune_configs, choice_log
 from megatron.core.tuning import policy as tuning_policy
 from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
@@ -86,6 +87,40 @@ def _assert_pinned(*tuners):
 
 
 # --- Mamba2 --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mixer_type", ["mamba", "gdp"])
+def test_mixer_rmsnorm_gamma_replays(mixer_type):
+    """Actual mixer constructors mark gamma without changing gated norm forward/backward."""
+    if mamba_mixer_module.mamba_chunk_scan_combined is None:
+        pytest.skip("needs mamba_ssm")
+    if mixer_type == "gdp":
+        from tests.unit_tests.ssm.test_gated_delta_product import HAVE_GDP_DEPS
+        from tests.unit_tests.ssm.test_gated_delta_product import _build_mixer as build_gdp
+        from tests.unit_tests.ssm.test_gated_delta_product import _make_config
+
+        if not HAVE_GDP_DEPS:
+            pytest.skip("needs GDP dependencies")
+
+    seeded()
+    try:
+        if mixer_type == "mamba":
+            mixer = _build_mixer(deterministic_mode=False)
+        else:
+            Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+            model_parallel_cuda_manual_seed(123)
+            mixer = build_gdp(_make_config([]))
+        norm = mixer.norm
+        assert norm.weight.is_rmsnorm_weight
+        x = torch.randn(
+            4096, 2, norm.weight.numel(), device="cuda", dtype=norm.weight.dtype, requires_grad=True
+        )
+        gate = torch.randn_like(x, requires_grad=True)
+        assert_module_replays_bit_exact(
+            norm, (x, gate), replays=3, contention=True, what=f"{mixer_type} RMSNorm gamma"
+        )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_mamba_chunk_scan_combined_varlen_replays():

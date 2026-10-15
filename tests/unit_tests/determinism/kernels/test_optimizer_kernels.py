@@ -9,8 +9,14 @@ whole trajectory even when the model kernels are deterministic.
 import pytest
 import torch
 
-from megatron.core.optimizer import Adam
+from megatron.core.optimizer import (
+    Adam,
+    OptimizerConfig,
+    _get_param_groups,
+    get_standard_config_overrides,
+)
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
@@ -101,30 +107,61 @@ def test_tensor_metric_l2_replays(monkeypatch, dtype):
     )
 
 
-def test_fused_adam_step_replays():
-    """Mixed weight-decay groups produce identical updated params and moments on replay."""
+@pytest.mark.parametrize("rmsnorm_weight_decay_mult", [None, 0.0, 0.5, 1.0])
+def test_fused_adam_step_replays(monkeypatch, rmsnorm_weight_decay_mult):
+    """Replay params and moments with actual RMSNorm grouping and scheduled weight decay."""
     seeded()
-    shapes = [(4096, 4096), (16384, 2048), (2048,), (65536,)]
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda **_: 1)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, keys, **_: output.__setitem__(0, keys),
+    )
+    shapes = [(4096, 4096), (16384, 2048), (2048,), (65536,), (2048,)]
     params0 = [torch.randn(*s, device="cuda", dtype=torch.float32) for s in shapes]
     grads = [torch.randn(*s, device="cuda", dtype=torch.float32) for s in shapes]
+    config = OptimizerConfig(
+        lr=1e-3, min_lr=0.0, weight_decay=0.1, rmsnorm_weight_decay_mult=rmsnorm_weight_decay_mult
+    )
 
     def run_step():
         params = [torch.nn.Parameter(p.clone()) for p in params0]
         for p, g in zip(params, grads):
             p.grad = g.clone()
-        # Retention routing places a 1-D controller in a decayed group while ordinary
-        # vector parameters remain in a zero-WD group. Exercise both kernel paths together.
+        model = torch.nn.Module()
+        for name, param in zip(("matrix0", "matrix1", "retention", "vector", "gamma"), params):
+            model.register_parameter(name, param)
+        model.retention.is_wide_residual_retention_parameter = True
+        model.gamma.is_rmsnorm_weight = True
+        groups = _get_param_groups([model], config, get_standard_config_overrides(config))
         opt = Adam(
-            [
-                {"params": params[:3], "weight_decay": 0.1},
-                {"params": params[3:], "weight_decay": 0.0},
-            ],
-            lr=1e-3,
-            betas=(0.9, 0.95),
-            eps=1e-8,
+            groups, lr=config.lr, weight_decay=config.weight_decay, betas=(0.9, 0.95), eps=1e-8
         )
+        scheduler = OptimizerParamScheduler(
+            optimizer=opt,
+            init_lr=config.lr,
+            max_lr=config.lr,
+            min_lr=config.min_lr,
+            lr_warmup_steps=0,
+            lr_decay_steps=2,
+            lr_decay_style="constant",
+            start_wd=config.weight_decay,
+            end_wd=2 * config.weight_decay,
+            wd_incr_steps=2,
+            wd_incr_style="linear",
+        )
+        expected_gamma_mult = rmsnorm_weight_decay_mult or 0.0
+        for group in groups:
+            for param in group["params"]:
+                if param is model.gamma:
+                    assert group["weight_decay"] == pytest.approx(0.1 * expected_gamma_mult)
+                elif param is model.vector:
+                    assert group["weight_decay"] == 0.0
+                else:
+                    assert group["weight_decay"] == 0.1
         with RacingStreams():
             opt.step()
+            scheduler.step(1)
             opt.step()
         torch.cuda.synchronize()
         out = [p.detach().clone() for p in params]
