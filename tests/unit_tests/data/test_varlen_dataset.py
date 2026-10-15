@@ -751,6 +751,7 @@ def test_low_level_hub_loads_all_configs_and_thematic_splits(monkeypatch):
     calls = []
 
     monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["cfg-a", "cfg-b"])
+    monkeypatch.setattr(datasets, "get_dataset_default_config_name", lambda path: None)
     monkeypatch.setattr(
         datasets,
         "get_dataset_split_names",
@@ -777,6 +778,30 @@ def test_low_level_hub_loads_all_configs_and_thematic_splits(monkeypatch):
         low_level[3]
 
 
+def test_low_level_hub_loads_only_the_declared_default_config(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    calls = []
+
+    # fineweb-edu layout: ``default`` holds every row, the others are subsets of it.
+    monkeypatch.setattr(
+        datasets,
+        "get_dataset_config_names",
+        lambda path: ["default", "sample-10BT", "CC-MAIN-2024-10"],
+    )
+    monkeypatch.setattr(datasets, "get_dataset_default_config_name", lambda path: "default")
+    monkeypatch.setattr(datasets, "get_dataset_split_names", lambda path, config: ["train"])
+
+    def fake_load_dataset(path, name, split):
+        calls.append((path, name, split))
+        return _FakeHubDataset([{"text": f"{name}/{split}"}])
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+    low_level = VarlenLowLevelDataset("HuggingFaceFW/fineweb-edu")
+
+    assert calls == [("HuggingFaceFW/fineweb-edu", "default", "train")]
+    assert len(low_level) == 1
+
+
 def test_low_level_hub_falls_back_to_raw_json_payload(monkeypatch, tmp_path):
     datasets = pytest.importorskip("datasets")
     from datasets.exceptions import DatasetGenerationError
@@ -794,6 +819,7 @@ def test_low_level_hub_falls_back_to_raw_json_payload(monkeypatch, tmp_path):
         ],
     )
     monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["default"])
+    monkeypatch.setattr(datasets, "get_dataset_default_config_name", lambda path: "default")
     monkeypatch.setattr(datasets, "get_dataset_split_names", lambda path, config: ["train"])
     monkeypatch.setattr(
         datasets,

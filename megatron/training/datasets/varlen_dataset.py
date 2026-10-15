@@ -464,8 +464,10 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
     Dataset path interpretation:
 
       * HF Hub repo id (e.g. ``nvidia/Nemotron-SFT-Math-v4``) — contains ``/``
-        and does not exist locally. By default, all configs are considered;
-        each uses ``train`` when available, otherwise all thematic splits.
+        and does not exist locally. The repo's default config is used when it
+        declares one (its only config, or the one named or marked default);
+        otherwise all configs are combined. Each config uses ``train`` when
+        available, otherwise all thematic splits.
       * Local ``.parquet`` — loaded via
         ``datasets.load_dataset("parquet", data_files=path, split="all")``;
         parquet's footer schema makes chunked loading safe.
@@ -490,6 +492,7 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
                 Features,
                 Value,
                 get_dataset_config_names,
+                get_dataset_default_config_name,
                 get_dataset_split_names,
                 load_dataset,
                 load_dataset_builder,
@@ -522,8 +525,17 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
             self._cumulative_sizes.append(previous_size + len(dataset))
 
         if _looks_like_hf_id(dataset_path):
+            # A declared default config (the only config, or the one named or marked
+            # default) holds the repo's data; the other configs of such repos are
+            # usually subsets of it (e.g. fineweb-edu samples and dumps). Combine
+            # all configs only when no default is declared.
+            default_config = get_dataset_default_config_name(dataset_path)
+            if default_config is not None:
+                selected_configs = [default_config]
+            else:
+                selected_configs = get_dataset_config_names(dataset_path)
             selected_sources: List[Tuple[str, str]] = []
-            for selected_config in get_dataset_config_names(dataset_path):
+            for selected_config in selected_configs:
                 available_splits = get_dataset_split_names(dataset_path, selected_config)
                 selected_splits = ["train"] if "train" in available_splits else available_splits
                 selected_sources.extend(
