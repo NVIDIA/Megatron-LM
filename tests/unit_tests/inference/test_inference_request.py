@@ -460,7 +460,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert (finished.num_evictions, finished.num_tokens_to_generate) == (1, 8)
     assert finished.finish_reason == "length"
     # A live snapshot is the merged payload and record, keyed like a completion.
-    snapshot = LiveRequestSnapshot.from_record(rec, finished=False)
+    snapshot = LiveRequestSnapshot.from_record(rec)
     assert (snapshot.uid, snapshot.request_id, snapshot.record) == (a.uid, 3, finished)
     payload = snapshot.payload
     assert (payload.prompt_token_ids, payload.generated_token_ids) == ([1, 2, 3], [10, 11, 12])
@@ -881,7 +881,7 @@ def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
     record.checkpoint()
     # A live snapshot keeps the admission budget and offload params but drops the media; the
     # record keeps its continuation budget and its media.
-    snapshot = LiveRequestSnapshot.from_record(record, finished=False)
+    snapshot = LiveRequestSnapshot.from_record(record)
     assert (snapshot.uid, snapshot.offload_params) == ("chatcmpl-fixed", {"ng_capture": admission})
     assert (snapshot.record.num_tokens_to_generate, snapshot.payload.media_tensors) == (5, None)
     assert record.requests[-1].sampling_params.num_tokens_to_generate == 4
@@ -989,9 +989,9 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         ({**_WIRE, "token_ids": [1, 2.0]}, "holds non-integer tokens"),
         ({**_WIRE, "num_tokens_to_generate": -1}, "has a malformed budget"),
         ({**_WIRE, "num_evictions": -1}, "has a malformed eviction count"),
-        ({**_WIRE, "finished": 1}, "has a malformed finished flag"),
         ({**_WIRE, "token_ids": [1, 2, 3]}, "holds 3 tokens over a budget of 2"),
         ({**_WIRE, "num_tokens_to_generate": 1}, "filled its budget of 1 without finishing"),
+        ({**_WIRE, "finish_reason": "length"}, "ended by length short of its budget of 2"),
         (
             {**_WIRE, "log_probs": [-0.1, -0.2]},
             "has log probs and tokens of different lengths, 2 and 1",
@@ -1014,9 +1014,8 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         ({**_WIRE, "acceptance_step_lengths": [0, 1]}, "has malformed acceptance step lengths"),
         ({**_WIRE, "acceptance_step_lengths": [2]}, "has malformed acceptance step lengths"),
         ({**_WIRE, "finish_reason": "eos"}, "has a malformed finish reason"),
-        ({**_WIRE, "finish_reason": "stop"}, "has a finish reason without finishing"),
         (
-            {**_WIRE, "finished": True, "routing_indices": serialize_ndarray(np.zeros((1, 1)))},
+            {**_WIRE, "routing_indices": serialize_ndarray(np.zeros((1, 1)))},
             "has malformed routing indices",
         ),
         (
@@ -1027,15 +1026,15 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         ({**_WIRE, "token_ids": 1}, "wire is malformed: TypeError: .*"),
         ({**_WIRE, "policy_epoch": [3]}, "wire is malformed: TypeError: .*"),
         ({**_WIRE, "acceptance_step_lengths": None}, "wire is malformed: TypeError: .*"),
-        ({**_WIRE, "finished": True, "routing_indices": [1]}, "wire is malformed: TypeError: .*"),
+        ({**_WIRE, "routing_indices": [1]}, "wire is malformed: TypeError: .*"),
     ],
     ids=[
         "non-int-tokens",
         "negative-budget",
         "negative-evictions",
-        "non-bool-finished",
         "tokens-over-budget",
         "budget-filled-unfinished",
+        "length-short-of-budget",
         "misaligned-log-probs",
         "malformed-policy-epoch",
         "empty-kv-cache-epoch",
@@ -1046,7 +1045,6 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         "zero-step-length",
         "step-lengths-over-tokens",
         "unknown-finish-reason",
-        "finish-reason-unfinished",
         "flat-routing",
         "missing-field",
         "not-a-mapping",
@@ -1061,6 +1059,42 @@ def test_reject_malformed_resumed_generation(wire, reason):
     reason as it is rebuilt, whether a field is inconsistent or the wire itself is unreadable."""
     with pytest.raises(ValueError, match=f"^resumed generation {reason}$"):
         ResumedGeneration.from_wire(wire)
+
+
+def test_served_resume_reproduces_its_snapshot():
+    """A snapshot of a request that has ended, resumed through the wire, is served as the very
+    payload and record its engine held: every field crosses, so one added to either without a
+    carrier fails here rather than in review."""
+    params = SamplingParams(
+        num_tokens_to_generate=4, termination_id=-1, return_log_probs=True, top_n_logprobs=1
+    )
+    request = _make_dynamic_request(
+        prompt_tokens=torch.tensor([1, 2, 3]), sampling_params=params, generated_tokens=[10, 11]
+    )
+    request.generated_log_probs, request.prompt_log_probs = [-0.1, -0.2], [-1.0, -1.1]
+    request.generated_top_n_logprobs = [{"10": -0.1}, {"11": -0.2}]
+    request.prompt_top_n_logprobs = [{"2": -1.0}, {"3": -1.1}]
+    request.acceptance_step_lengths = [2]
+    request.policy_epoch, request.kv_cache_epoch = [(0, 6), (3, 7)], [(0, 6)]
+    request.finish_reason = "stop"  # detected; completion has still to run
+    request.add_event_evict()
+    rows = np.arange(4 * 2, dtype=np.int32).reshape(4, 1, 2)  # four of five tokens ran forward
+    snapshot = LiveRequestSnapshot.from_record(
+        DynamicInferenceRequestRecord.from_request(request), routing_indices=rows
+    )
+
+    wire = ResumedGeneration.from_snapshot(snapshot).to_wire()
+    served = DynamicInferenceRequestRecord.from_resumed_generation(
+        _make_dynamic_request(prompt_tokens=torch.tensor([1, 2, 3]), sampling_params=params),
+        ResumedGeneration.from_wire(wire),
+        generation_epoch=9,
+    ).merge()
+
+    assert served.status is Status.COMPLETED
+    assert FinishedRequestRecord.from_request(served) == snapshot.record
+    payload, expected = vars(OffloadedRequestPayload.from_request(served)), vars(snapshot.payload)
+    assert payload.pop("routing_indices").tolist() == expected.pop("routing_indices").tolist()
+    assert payload == expected
 
 
 @pytest.mark.parametrize("new_epoch", [7, 8], ids=["same-epoch", "new-epoch"])
@@ -1128,7 +1162,7 @@ def test_resumed_record_merge(new_epoch):
     generate(first, *part_one, scores)
     record = DynamicInferenceRequestRecord.from_request(first)
     # Run B's copy, taken here, with the routing the blocks hold for the six tokens so far.
-    snapshot = LiveRequestSnapshot.from_record(record, finished=False, routing_indices=rows[:5])
+    snapshot = LiveRequestSnapshot.from_record(record, routing_indices=rows[:5])
     record.checkpoint()
     record[-1].add_event_evict()
     generate(schedule(record[-1], new_epoch), *part_two, [-9.0])
@@ -1142,7 +1176,7 @@ def test_resumed_record_merge(new_epoch):
     )
     assert len(record.requests) == 2 and record[-1].kv_cache_epoch is None
     generate(schedule(record[-1], new_epoch), *part_two, [-9.0])
-    whole = LiveRequestSnapshot.from_record(record, finished=False)
+    whole = LiveRequestSnapshot.from_record(record)
     assert (whole.payload.generated_token_ids, whole.record.num_tokens_to_generate) == (
         [*part_one[0], *part_two[0]],
         10,
@@ -1150,7 +1184,7 @@ def test_resumed_record_merge(new_epoch):
     # Without the blocks' rows the carried prefix is incomplete; with them, the prefix's own
     # rows win over the re-prefill's and the continuation supplies the rest.
     assert whole.payload.routing_indices is None
-    again = LiveRequestSnapshot.from_record(record, finished=False, routing_indices=recomputed)
+    again = LiveRequestSnapshot.from_record(record, routing_indices=recomputed)
     assert again.payload.routing_indices.tolist() == rows.tolist()
     payload, telemetry = finish(record, recomputed)
 
