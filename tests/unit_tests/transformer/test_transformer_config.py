@@ -1,10 +1,34 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
+
 import pytest
 
 from megatron.core.activations import squared_relu
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
+
+
+@pytest.mark.parametrize(
+    "size_gib, offload, error",
+    [(size, True, None) for size in (0, 0.5, 8, 3, 152)]
+    + [
+        (size, True, "Pinned offload buffer")
+        for size in (-1, float("nan"), float("inf"), 0.1, 1000 / 2**30, 2**-24)
+    ]
+    + [(0, False, None), (1.5, False, "requires fine_grained_activation_offloading")],
+)
+def test_pinned_offload_buffer_config(size_gib, offload, error):
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=8,
+            fine_grained_activation_offloading=offload,
+            offload_modules=["moe_act"],
+            fine_grained_offloading_buffer_size_gib=size_gib,
+        )
+        assert config.fine_grained_offloading_buffer_size_gib == size_gib
 
 
 def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
