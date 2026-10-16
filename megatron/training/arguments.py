@@ -1088,14 +1088,17 @@ def validate_args(args, defaults={}):
             args.check_for_nan_in_loss_and_grad = False
             warn_rank_0('Setting args.check_for_nan_in_loss_and_grad to False since '
                         'dynamic loss scaling is being used')
+    # main_grads_dtype is still the CLI string here; it is mapped to a torch.dtype later, in
+    # OptimizerConfig.finalize_optimizer_config.
+    main_grads_is_fp32 = args.main_grads_dtype in ('fp32', torch.float32)
     if args.bf16:
         if args.accumulate_allreduce_grads_in_fp32:
-            assert args.main_grads_dtype == torch.float32, \
+            assert main_grads_is_fp32, \
                 "--main-grads-dtype can only be fp32 when --accumulate-allreduce-grads-in-fp32 is set"
 
         if args.grad_reduce_in_bf16:
             args.accumulate_allreduce_grads_in_fp32 = False
-        elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
+        elif not args.accumulate_allreduce_grads_in_fp32 and main_grads_is_fp32:
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
 

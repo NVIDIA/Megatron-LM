@@ -2696,7 +2696,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # is on, or for non-zero pipeline-parallel ranks.
         pp_rank = get_pg_rank(pg_collection.pp)
         per_chunk_disable_bucketing = [
-            (chunk_idx > 0) or cfg.overlap_param_gather_with_optimizer_step
+            (chunk_idx > 0) or cfg.optimizer.overlap_param_gather_with_optimizer_step
             for chunk_idx in range(len(model))
         ]
         per_chunk_bucket_sizes = [
@@ -2750,54 +2750,55 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
     args = get_args()
+    cfg = get_run_config()
 
     # Iteration-based training.
     if args.train_iters:
-        if cfg.optimizer.lr_decay_iters is None:
-            cfg.optimizer.lr_decay_iters = args.train_iters
-        lr_decay_steps = cfg.optimizer.lr_decay_iters * args.global_batch_size
+        if cfg.scheduler.lr_decay_iters is None:
+            cfg.scheduler.lr_decay_iters = args.train_iters
+        lr_decay_steps = cfg.scheduler.lr_decay_iters * args.global_batch_size
         wd_incr_steps = args.train_iters * args.global_batch_size
         wsd_decay_steps = None
-        if cfg.optimizer.lr_wsd_decay_iters is not None:
-            wsd_decay_steps = cfg.optimizer.lr_wsd_decay_iters * args.global_batch_size
-        if cfg.optimizer.lr_warmup_fraction is not None:
-            lr_warmup_steps = cfg.optimizer.lr_warmup_fraction * lr_decay_steps
+        if cfg.scheduler.lr_wsd_decay_iters is not None:
+            wsd_decay_steps = cfg.scheduler.lr_wsd_decay_iters * args.global_batch_size
+        if cfg.scheduler.lr_warmup_fraction is not None:
+            lr_warmup_steps = cfg.scheduler.lr_warmup_fraction * lr_decay_steps
         else:
-            lr_warmup_steps = cfg.optimizer.lr_warmup_iters * args.global_batch_size
+            lr_warmup_steps = cfg.scheduler.lr_warmup_iters * args.global_batch_size
     # Sample-based training.
     elif args.train_samples:
         # We need to set training iters for later use. Technically
         # we need to adjust the training samples too (due to last
         # batch being incomplete) but we leave it as is for now.
         update_train_iters(args)
-        if cfg.optimizer.lr_decay_samples is None:
-            cfg.optimizer.lr_decay_samples = args.train_samples
-        lr_decay_steps = cfg.optimizer.lr_decay_samples
+        if cfg.scheduler.lr_decay_samples is None:
+            cfg.scheduler.lr_decay_samples = args.train_samples
+        lr_decay_steps = cfg.scheduler.lr_decay_samples
         wd_incr_steps = args.train_samples
-        wsd_decay_steps = cfg.optimizer.lr_wsd_decay_samples
-        if cfg.optimizer.lr_warmup_fraction is not None:
-            lr_warmup_steps = cfg.optimizer.lr_warmup_fraction * lr_decay_steps
+        wsd_decay_steps = cfg.scheduler.lr_wsd_decay_samples
+        if cfg.scheduler.lr_warmup_fraction is not None:
+            lr_warmup_steps = cfg.scheduler.lr_warmup_fraction * lr_decay_steps
         else:
-            lr_warmup_steps = cfg.optimizer.lr_warmup_samples
+            lr_warmup_steps = cfg.scheduler.lr_warmup_samples
     else:
         raise Exception('either train-iters or train-samples should be provided.')
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
-        init_lr=cfg.optimizer.lr_warmup_init,
+        init_lr=cfg.scheduler.lr_warmup_init,
         max_lr=cfg.optimizer.lr,
         min_lr=cfg.optimizer.min_lr,
         lr_warmup_steps=lr_warmup_steps,
         lr_decay_steps=lr_decay_steps,
-        lr_decay_style=cfg.optimizer.lr_decay_style,
+        lr_decay_style=cfg.scheduler.lr_decay_style,
         start_wd=args.start_weight_decay,
         end_wd=args.end_weight_decay,
         wd_incr_steps=wd_incr_steps,
-        wd_incr_style=cfg.optimizer.weight_decay_incr_style,
+        wd_incr_style=cfg.scheduler.weight_decay_incr_style,
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
-        lr_wsd_decay_style=cfg.optimizer.lr_wsd_decay_style,
+        lr_wsd_decay_style=cfg.scheduler.lr_wsd_decay_style,
     )
 
     return opt_param_scheduler
@@ -3298,6 +3299,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         preserves the default behavior.
     """
     args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
 
     # OTel: set up per-step sub-span support.
@@ -3515,7 +3517,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if cfg.overlap_param_gather:
+    if cfg.optimizer.overlap_param_gather:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
         )
@@ -4828,7 +4830,7 @@ def train(
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
-    if cfg.overlap_param_gather and args.align_param_gather:
+    if cfg.optimizer.overlap_param_gather and args.align_param_gather:
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
@@ -4909,7 +4911,7 @@ def train(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.overlap_param_gather
+        copy_main_params = cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
@@ -5631,6 +5633,7 @@ def evaluate(
     """Evaluation."""
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
     train_state = get_train_state()
 
@@ -5675,7 +5678,7 @@ def evaluate(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.overlap_param_gather
+        copy_main_params = cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
@@ -6215,5 +6218,5 @@ def should_disable_forward_pre_hook(args):
             cfg.optimizer.use_distributed_optimizer
             or getattr(args, 'use_layer_wise_distributed_optimizer', False)
         )
-        and cfg.overlap_param_gather
+        and cfg.optimizer.overlap_param_gather
     )
