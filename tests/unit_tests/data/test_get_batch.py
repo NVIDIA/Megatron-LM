@@ -728,6 +728,9 @@ def test_get_batch_on_this_cp_rank_contiguous_keeps_attention_mask_zigzag(cp_siz
         'labels': tokens + 1,
         'loss_mask': torch.ones(micro_batch_size, seq_length),
         'position_ids': torch.arange(seq_length, dtype=torch.int64).repeat(micro_batch_size, 1),
+        "decoder_input": torch.stack((tokens, tokens + 100), dim=-1),
+        "mtp_input_mask": tokens.remainder(2).to(dtype=torch.bool),
+        "padding_mask": tokens.remainder(3) == 0,
     }
     attention_mask = torch.arange(micro_batch_size * seq_length, dtype=torch.int64).view(
         micro_batch_size, 1, seq_length, 1
@@ -792,6 +795,7 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     loss_mask = torch.tensor([[1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]])
     decoder_input = torch.stack((tokens, tokens + 20), dim=-1)
     mtp_input_mask = tokens.remainder(2).to(dtype=torch.bool)
+    padding_mask = loss_mask == 0
     cu_seqlens = torch.tensor([[0, 3, 13]], dtype=torch.int32)
     cu_seqlens_padded = torch.tensor([[0, 4, 16]], dtype=torch.int32)
     batch = {
@@ -801,6 +805,7 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
         "position_ids": tokens - 1,
         "decoder_input": decoder_input,
         "mtp_input_mask": mtp_input_mask,
+        "padding_mask": padding_mask,
         "cu_seqlens": cu_seqlens,
         "cu_seqlens_padded": cu_seqlens_padded,
         "max_seqlen": torch.tensor([12], dtype=torch.int32),
@@ -855,10 +860,14 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     expected_mtp_input_mask = mtp_input_mask.index_select(1, gathered_indices).masked_fill(
         padding.view(1, -1), 0
     )
+    expected_padding_mask = padding_mask.index_select(1, gathered_indices).masked_fill(
+        padding.view(1, -1), True
+    )
     torch.testing.assert_close(result["tokens"], expected_tokens)
     torch.testing.assert_close(result["loss_mask"], expected_loss_mask)
     torch.testing.assert_close(result["decoder_input"], expected_decoder_input)
     torch.testing.assert_close(result["mtp_input_mask"], expected_mtp_input_mask)
+    torch.testing.assert_close(result["padding_mask"], expected_padding_mask)
     torch.testing.assert_close(
         result["cu_seqlens_padded"], torch.tensor([[0, 8, 32]], dtype=torch.int32)
     )
