@@ -496,6 +496,12 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k scores before weighting."""
 
+    dsa_indexer_hf_scoring: bool = False
+    """Use GLM5Next HF KPool scoring order: upcast projected head weights before
+    scaling, scale FP32 q@k before ReLU, and reduce heads with FP32 matmul.
+    Compression rounding and score-input quantization remain independent options.
+    """
+
     dsa_indexer_qk_proj_use_quantization: bool = True
     """Whether indexer query/key projections use the enclosing FP8/FP4 context.
     When disabled, these projections use the configured unquantized dtype (e.g. BF16).
@@ -578,6 +584,13 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_kpool_use_quantization: bool = False
     """Quantize KPool scoring inputs to E4M3 with power-of-two scales after Hadamard
     rotation. This does not change projection parameter or GEMM precision.
+    """
+
+    dsa_indexer_kpool_key_dtype_compression: bool = False
+    """Cast pool probabilities to the key dtype before multiplication and reduction.
+    This matches the official GLM5Next HF compression arithmetic. False preserves
+    FP32 weighted reduction from the upstream KPool implementation. Score-input
+    quantization is independent of this compression precision choice.
     """
 
     dsa_indexer_kpool_always_select_tail: bool = True
@@ -2773,6 +2786,15 @@ class TransformerConfig(ModelParallelConfig):
             if self.dsa_indexer_kpool < 1:
                 raise ValueError(
                     f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
+                )
+            if self.dsa_indexer_hf_scoring and (
+                self.dsa_indexer_kpool <= 1
+                or self.dsa_indexer_weights_proj_output_dtype != "bf16"
+                or not self.dsa_indexer_scoring_relu
+            ):
+                raise ValueError(
+                    "dsa_indexer_hf_scoring requires KPool > 1, BF16 projection output "
+                    "and ReLU scoring."
                 )
             if self.dsa_indexer_kpool > 1:
                 if self.dsa_indexer_topk is None:
