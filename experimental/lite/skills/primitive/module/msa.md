@@ -27,13 +27,16 @@ def msa(task, implementation, config, reference, budget):
         "invariants": [
             "selection is per query TOKEN (not per query block); block ids compared as sets",
             "seq_len <= topk * block_size  =>  output == dense causal attention",
-            "indexer is a pure selector: no gradient path, no auxiliary loss (frozen, requires_grad=False)",
+            "default: indexer is a pure selector (frozen, requires_grad=False, no KL loss); indexer_trainable=True"
+            " trains it only via Magi's KL loss on a detached input (MiniMax recipe, ImplConfig.msa_indexer_kl_loss_coeff)",
             "attention TP=1; shapes fixed by msa_v1 (64/4/4 heads, D=128, block 128, top-16)",
         ],
         "reference": reference or "HF MiniMaxM3VLForCausalLM (bf16, same weights) and fp32 masked-dense torch indexer + attention",
     }
     implementation_contract = {
-        "details": ["MSAIndexer = index-Q/index-K projections + Gemma-norm + partial RoPE (no_grad); scoring/top-k run in Magi",
+        "details": ["MSAIndexer = index-Q/index-K projections + Gemma-norm + partial RoPE; scoring/top-k run in Magi",
+                    "MiniMax-forward bitwise parity needs protocol.MINIMAX_TRAINING_IMPL (TE fused RoPE, index input = fused qkv-norm output,"
+                    " KL on => msa_v1 return_temperature_lse, fa4_varlen dense, no permute fusion)",
                     "MSAttention = GQAttention projections/QK-norm/RoPE + MagiCoreAttention (core_attn) calling Magi calc_msa"
                     " (kernels/magi_msa.py: MagiAttention MSA extension + MM-Sparse-Attention msa_v1 kernels)"],
         "state": ["index_n_heads == num_key_value_heads", "index_head_dim", "block_size", "topk_blocks", "local_blocks",

@@ -10,9 +10,10 @@ Ownership split
   indexer + sparse-attention kernels (MSA layers) and the varlen-causal attention of the
   dense layers (native ``calc_attn`` on the same dispatched layout).
 
-Indexer freezing: the indexer projections run under ``torch.no_grad()`` and their parameters
+Indexer freezing (default): the indexer projections run under ``torch.no_grad()`` and their parameters
 carry ``requires_grad=False``; ``kl_loss_coeff=0`` only disables Magi's KL loss, it is *not*
 a freeze mechanism (zero grads would still drift under decoupled weight decay).
+``kl_loss_coeff > 0`` trains the indexer through Magi's KL backward (MiniMax training recipe).
 """
 
 from __future__ import annotations
@@ -84,6 +85,8 @@ class MagiMsaSettings:
     high_precision_reduce: bool = False  # FP32 required-dK group-reduce in backward
     dense_kernel_backend: str = "fa4"  # dense layers: fa4 | sdpa_ol (Magi calc_attn) | fa4_varlen (cp=1)
     deterministic: bool = False  # ordered msa_v1 backward (bitwise-reproducible, slower)
+    kl_loss_coeff: float = 0.0  # indexer KL loss (mcore sparse_kl_loss_coeff); 0 = frozen indexer
+    kl_temperature: float = 1.0  # mcore sparse_kl_temperature
 
 
 def validate_kernel_shapes(
@@ -130,8 +133,16 @@ def validate_device() -> None:
         raise RuntimeError("MiniMax-M3 MSA requires an SM100-family GPU (B200/GB300)")
 
 
-def build_msa_config(settings: MagiMsaSettings, *, head_dim: int = HEAD_DIM, index_head_dim: int = INDEX_HEAD_DIM) -> Any:
-    """``MsaConfig`` for the MSAV1 backend. KL/LSE coefficients are 0: the indexer is frozen (decision A)."""
+def build_msa_config(
+    settings: MagiMsaSettings,
+    *,
+    head_dim: int = HEAD_DIM,
+    index_head_dim: int = INDEX_HEAD_DIM,
+    cp_size: int = 1,
+) -> Any:
+    """``MsaConfig`` for the MSAV1 backend; KL coefficient scaled as mcore ``magi_msa._make_msa_config``."""
+    if settings.kl_loss_coeff < 0 or settings.kl_temperature <= 0:
+        raise ValueError("kl_loss_coeff must be >= 0 and kl_temperature > 0")
     m = _ensure_magi()
     return m.msa.MsaConfig(
         kernel_backend=m.msa.MsaKernelBackend.MSAV1,
@@ -140,7 +151,8 @@ def build_msa_config(settings: MagiMsaSettings, *, head_dim: int = HEAD_DIM, ind
         init_blocks=INIT_BLOCKS,
         local_blocks=LOCAL_BLOCKS,
         topk_blocks=TOPK,
-        kl_loss_coeff=0.0,
+        kl_loss_coeff=settings.kl_loss_coeff * settings.kl_temperature**2 * cp_size,
+        kl_temperature=settings.kl_temperature,
         lse_loss_coeff=0.0,
         score_in_fp32=True,
         deterministic=settings.deterministic,

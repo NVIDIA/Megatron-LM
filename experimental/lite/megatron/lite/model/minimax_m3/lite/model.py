@@ -146,6 +146,9 @@ class MiniMaxM3Layer(nn.Module):
         moe_hybridep_fused_permute: bool = False,
         moe_act_recompute: bool = False,
         moe_permute_fusion: bool = True,
+        rope_fusion: bool = False,
+        msa_index_input_norm: str = "recompute",
+        msa_indexer_trainable: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -157,6 +160,7 @@ class MiniMaxM3Layer(nn.Module):
             rotary_percent=config.partial_rotary_factor,
             zero_centered_gamma=True,
             qkv_layout="flat",
+            rope_fusion=rope_fusion,
         )
         if self.is_sparse_attention:
             self.attn: nn.Module = MSAttention(
@@ -170,6 +174,8 @@ class MiniMaxM3Layer(nn.Module):
                 block_size=config.index_block_size,
                 topk_blocks=config.index_topk_blocks,
                 local_blocks=config.index_local_blocks,
+                index_input_norm=msa_index_input_norm,
+                indexer_trainable=msa_indexer_trainable,
                 **attn_kwargs,
             )
         else:
@@ -261,6 +267,9 @@ class MiniMaxM3Model(nn.Module):
                     moe_hybridep_fused_permute=train_config.moe_hybridep_fused_permute,
                     moe_act_recompute=moe_act_recompute,
                     moe_permute_fusion=getattr(train_config, "moe_permute_fusion", True),
+                    rope_fusion=getattr(train_config, "rope_fusion", False),
+                    msa_index_input_norm=getattr(train_config, "msa_index_input_norm", "recompute"),
+                    msa_indexer_trainable=getattr(train_config, "msa_indexer_trainable", False),
                 )
                 for idx in self.layer_indices
             ]

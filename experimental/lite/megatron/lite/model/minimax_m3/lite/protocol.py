@@ -35,6 +35,7 @@ from megatron.lite.runtime.contracts.data import PackedBatch
 __all__ = [
     "EXPERT_CLASSIFIER",
     "ImplConfig",
+    "MINIMAX_TRAINING_IMPL",
     "PLACEMENT_FN",
     "build_model",
     "build_model_config",
@@ -72,6 +73,21 @@ class ImplConfig:
     magi_chunk_size: int = 2048
     magi_high_precision_reduce: bool = False
     magi_dense_kernel_backend: str = "fa4"
+    rope_fusion: bool = False  # TE fused RoPE (mcore apply_rope_fusion) instead of the torch rotate-half
+    msa_index_input_norm: str = "recompute"  # recompute | fused (reuse the qkv LayerNormLinear norm output)
+    msa_indexer_kl_loss_coeff: float = 0.0  # >0 trains the indexer with Magi's KL loss; 0 freezes it
+    msa_indexer_kl_temperature: float = 1.0
+
+
+# MiniMax's training recipe (mm_megatron_forward / mcore M3 config); fa4_varlen requires cp=1.
+MINIMAX_TRAINING_IMPL = dict(
+    rope_fusion=True,
+    msa_index_input_norm="fused",
+    msa_indexer_kl_loss_coeff=0.01,
+    msa_indexer_kl_temperature=2.0,
+    magi_dense_kernel_backend="fa4_varlen",
+    moe_permute_fusion=False,
+)
 
 
 def _maybe(module_name: str) -> Callable[[nn.Module], nn.Module | None]:
@@ -262,11 +278,14 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         high_precision_reduce=impl_cfg.magi_high_precision_reduce,
         dense_kernel_backend=impl_cfg.magi_dense_kernel_backend,
         deterministic=impl_cfg.deterministic,
+        kl_loss_coeff=impl_cfg.msa_indexer_kl_loss_coeff,
+        kl_temperature=impl_cfg.msa_indexer_kl_temperature,
     )
     magi_msa_config = magi_msa.build_msa_config(
         magi_settings,
         head_dim=model_cfg.head_dim,
         index_head_dim=model_cfg.index_head_dim,
+        cp_size=p.cp,
     )
     import os
 
@@ -297,6 +316,9 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         moe_hybridep_num_sms=impl_cfg.moe_hybridep_num_sms,
         moe_hybridep_fused_permute=impl_cfg.moe_hybridep_fused_permute,
         moe_permute_fusion=impl_cfg.moe_permute_fusion,
+        rope_fusion=impl_cfg.rope_fusion,
+        msa_index_input_norm=impl_cfg.msa_index_input_norm,
+        msa_indexer_trainable=impl_cfg.msa_indexer_kl_loss_coeff > 0,
         fp8=False,
         recompute_modules=recompute_spec,
         deterministic=impl_cfg.deterministic,

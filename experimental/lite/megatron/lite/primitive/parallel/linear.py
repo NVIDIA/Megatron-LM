@@ -152,11 +152,15 @@ class VanillaColumnParallelLinear(nn.Module):
     def weight(self) -> torch.nn.Parameter:
         return self.linear.weight
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
+        """Returns ``out``, or ``(out, norm_out)`` with ``return_layernorm_output``."""
         out = self.linear(x)
+        norm_out = None
+        if self.return_layernorm_output:
+            out, norm_out = out
         if self.gather_output and self.tp_size > 1:
             out = _AllGatherLastDim.apply(out, self.tp_size, self.tp_group)
-        return out
+        return out if norm_out is None else (out, norm_out)
 
 
 class ColumnParallelLinear(nn.Module):
@@ -173,12 +177,16 @@ class ColumnParallelLinear(nn.Module):
         eps: float = 1e-6,
         zero_centered_gamma: bool = False,
         sequence_parallel: bool | None = None,
+        return_layernorm_output: bool = False,
     ):
         super().__init__()
         self.tp_size = ps.tp_size
         self.tp_rank = ps.tp_rank
         self.tp_group = ps.tp_group
         self.local_out = ensure_divisible(out_features, ps.tp_size)
+        if return_layernorm_output and normalization is None:
+            raise ValueError("return_layernorm_output requires normalization")
+        self.return_layernorm_output = return_layernorm_output
         self.use_sp = (
             ps.tp_size > 1 and not gather_output if sequence_parallel is None else sequence_parallel
         )
@@ -190,6 +198,7 @@ class ColumnParallelLinear(nn.Module):
                 normalization=normalization,
                 eps=eps,
                 zero_centered_gamma=zero_centered_gamma,
+                return_layernorm_output=return_layernorm_output,
                 params_dtype=torch.bfloat16,
                 parallel_mode="column",
                 sequence_parallel=self.use_sp,
