@@ -1304,6 +1304,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         ), "flashinfer-python is required to resolve FlashInfer activation type."
         func = self.config.activation_func
         if func == F.silu:
+            # Gated experts reach FlashInfer only with inference_moe_nvfp4_recipe: config
+            # validation rejects them for the BF16 and MXFP8 FlashInfer paths.
             return ActivationType.Swiglu if self.config.gated_linear_unit else ActivationType.Silu
         elif func == F.gelu:
             return ActivationType.Gelu
@@ -1575,6 +1577,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 local_expert_offset=self.ep_group.rank() * self.num_local_experts,
                 activation_type=self._flashinfer_activation_type.value,
                 out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
+                token_capacity=self._flashinfer_mxfp8_token_capacity,
+                use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
             )
             return output, None
         output = fused_moe.cutlass_fused_moe(

@@ -970,6 +970,7 @@ class TestNVLSAllGatherVDispatcher:
         )
         return get_inference_optimized_moe_spec()(config=config).cuda().eval()
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("activation", _NVFP4_ACTIVATIONS)
     def test_cuda_graph_batch_invariant_nvfp4_moe_layer_uses_ordered_rsv(
         self, monkeypatch, activation
@@ -1045,6 +1046,7 @@ class TestNVLSAllGatherVDispatcher:
         assert ordered_calls["value"] > 0
         torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("activation", _NVFP4_ACTIVATIONS)
     def test_batch_invariant_nvfp4_moe_matches_training(self, monkeypatch, activation):
         """Per-token NVFP4 generation against TE row-scaled NVFP4 training.

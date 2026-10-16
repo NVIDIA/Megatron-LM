@@ -1451,7 +1451,8 @@ class TransformerConfig(ModelParallelConfig):
     True to disable fusion and use separate kernel launches (useful for debugging)."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
-    """Optional fixed token-row capacity for FlashInfer routed MXFP8 MoE.
+    """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
+    NVFP4 MoE (inference_moe_nvfp4_recipe).
 
     Decode-only dynamic-inference graphs use this fixed prefix when their
     host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
@@ -2192,14 +2193,14 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 if (
                     self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
-                    or not mxfp8_enabled
+                    or not (mxfp8_enabled or self.inference_moe_nvfp4_recipe is not None)
                     or self.inference_moe_token_dispatcher_type != "nvls"
                     or self.expert_model_parallel_size <= 1
                 ):
                     raise ValueError(
                         "inference_flashinfer_mxfp8_token_capacity requires "
                         "inference_grouped_gemm_backend='flashinfer', FP8 enabled with "
-                        "fp8_recipe='mxfp8', "
+                        "fp8_recipe='mxfp8' or inference_moe_nvfp4_recipe, "
                         "inference_moe_token_dispatcher_type='nvls' and "
                         "expert_model_parallel_size > 1"
                     )

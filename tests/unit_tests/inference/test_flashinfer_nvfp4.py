@@ -69,6 +69,31 @@ def test_flashinfer_nvfp4_batch_invariant_mode_requires_nvls_with_ep():
         _make_nvfp4_config(**_BATCH_INVARIANT_OVERRIDES, inference_moe_token_dispatcher_type="nccl")
 
 
+_BOUNDED_OVERRIDES = dict(
+    inference_flashinfer_mxfp8_token_capacity=64,
+    inference_moe_token_dispatcher_type="nvls",
+    expert_model_parallel_size=2,
+    expert_tensor_parallel_size=1,
+)
+
+
+def test_flashinfer_nvfp4_config_accepts_token_capacity():
+    config = _make_nvfp4_config(**_BOUNDED_OVERRIDES)
+    assert config.inference_flashinfer_mxfp8_token_capacity == 64
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"inference_moe_token_dispatcher_type": "nccl"}, "requires.*nvls"),
+        ({"expert_model_parallel_size": 1}, "requires.*expert_model_parallel_size > 1"),
+    ],
+)
+def test_flashinfer_nvfp4_token_capacity_rejects_invalid_configuration(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        _make_nvfp4_config(**{**_BOUNDED_OVERRIDES, **overrides})
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
@@ -164,9 +189,11 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
         _activation_clamp_scale=None,
         _flashinfer_activation_type=SimpleNamespace(value=7),
         _nvls_dispatcher=None,
+        _flashinfer_mxfp8_token_capacity=64,
         num_local_experts=2,
         ep_group=SimpleNamespace(size=lambda: 4, rank=lambda: 3),
     )
+    monkeypatch.setattr(experts.InferenceMode, "_use_bounded_mxfp8_rows", True)
 
     output, bias = experts.InferenceGroupedMLP._flashinfer_forward(
         grouped_mlp,
@@ -182,6 +209,36 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
     assert captured["local_expert_offset"] == 6
     assert captured["activation_type"] == 7
     assert captured["out"] is None
+    assert captured["token_capacity"] == 64
+    assert captured["use_bounded_rows"] is True
+
+
+@pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
+def test_refit_rejects_built_nvfp4_expert_weights(monkeypatch, built):
+    """A refit after the NVFP4 copy is built would leave generation on the old weights.
+
+    Before the first forward there is no copy yet; it is built from the refit weights.
+    """
+    from megatron.core.resharding import refit
+
+    experts_module = torch.nn.Module()
+    experts_module._nvfp4_weights = object() if built else None
+    target = torch.nn.Sequential(experts_module)
+    executed = []
+    monkeypatch.setattr(refit, "_unwrap_model_cores", lambda src, tgt: (None, tgt, 2))
+    monkeypatch.setattr(refit, "_build_or_get_plan", lambda *args, **kwargs: "plan")
+    monkeypatch.setattr(refit, "_harmonize_buffer_dtypes", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        refit, "execute_reshard_plan", lambda plan, *args, **kwargs: executed.append(plan)
+    )
+    service = SimpleNamespace(set_model_roles=lambda **kwargs: None)
+
+    if built:
+        with pytest.raises(NotImplementedError, match="per-token NVFP4"):
+            refit.reshard_model_weights(None, target, service)
+    else:
+        refit.reshard_model_weights(None, target, service)
+    assert executed == ["plan"], "the plan must run on every rank before raising"
 
 
 def test_gated_fc1_is_padded_per_half_and_interleaved_up_gate():
@@ -325,6 +382,7 @@ def _unpack_e2m1(packed):
     return torch.stack((lookup[packed & 0xF], lookup[packed >> 4]), dim=-1).flatten(-2)
 
 
+@pytest.mark.launch_on_gb200
 @requires_blackwell
 @requires_flashinfer_nvfp4
 @pytest.mark.parametrize("tokens", [1, 37, 256])
@@ -353,6 +411,7 @@ def test_per_token_nvfp4_quantize_matches_reference(monkeypatch, tokens, hidden_
     assert torch.equal(_unpack_e2m1(data).reshape(tokens, hidden_size), values)
 
 
+@pytest.mark.launch_on_gb200
 @requires_blackwell
 @requires_flashinfer_nvfp4
 @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
@@ -423,6 +482,7 @@ def test_flashinfer_routed_nvfp4_moe_matches_bf16_reference(hidden_size, interme
         )
 
 
+@pytest.mark.launch_on_gb200
 @requires_blackwell
 @requires_flashinfer_nvfp4
 @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
@@ -494,6 +554,61 @@ def test_flashinfer_routed_nvfp4_is_batch_invariant(local_expert_offset, mode, g
         assert torch.count_nonzero(output_alone).item() == 0
 
 
+@pytest.mark.launch_on_gb200
+@requires_blackwell
+@requires_flashinfer_nvfp4
+@pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+def test_flashinfer_routed_nvfp4_bounded_rows_match_full_buffer(gated):
+    """A bounded decode prefix gives the full buffer's rows and leaves the rest of out alone."""
+    from megatron.core.inference.moe.flashinfer_nvfp4 import (
+        flashinfer_routed_nvfp4_moe,
+        prepare_routed_nvfp4_weights,
+    )
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    torch.manual_seed(1235)
+    num_experts, hidden_size, intermediate_size = 4, 512, 512
+    full_rows, capacity, active_tokens, topk = 512, 64, 40, 2
+    fc1_rows = 2 * intermediate_size if gated else intermediate_size
+    weights = prepare_routed_nvfp4_weights(
+        (torch.randn(num_experts, fc1_rows, hidden_size, device="cuda") * 0.05).bfloat16(),
+        (torch.randn(num_experts, hidden_size, intermediate_size, device="cuda") * 0.05).bfloat16(),
+    )
+    hidden = torch.randn(full_rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    # The dispatcher marks rows without a token -1, inside and past the prefix.
+    routing_map = torch.full((full_rows, topk), -1, device="cuda", dtype=torch.int32)
+    routing_map[:active_tokens] = torch.randint(
+        num_experts, (active_tokens, topk), device="cuda", dtype=torch.int32
+    )
+    probs = torch.rand(full_rows, topk, device="cuda", dtype=torch.float32)
+
+    def _run(**bounds):
+        out = torch.full((full_rows, hidden_size), 7.0, device="cuda", dtype=torch.bfloat16)
+        flashinfer_routed_nvfp4_moe(
+            hidden,
+            routing_map,
+            probs,
+            weights,
+            num_experts=num_experts,
+            local_expert_offset=0,
+            activation_type=_activation_type(gated),
+            out=out,
+            **bounds,
+        )
+        return out
+
+    with torch.no_grad(), set_batch_invariant_mode(True):
+        full = _run()
+        bounded = _run(token_capacity=capacity, use_bounded_rows=True)
+        unbounded = _run(token_capacity=capacity, use_bounded_rows=False)
+
+    assert torch.equal(bounded[:capacity], full[:capacity])
+    assert torch.all(bounded[capacity:] == 7.0), "rows past the prefix were written"
+    assert torch.equal(unbounded, full), "use_bounded_rows=False must process the full buffer"
+
+
 # ──────────────────────────────────────────────────────────────────────
 # MoE layer level: InferenceGroupedMLP + inference dispatchers + refresh
 # ──────────────────────────────────────────────────────────────────────
@@ -536,6 +651,7 @@ def _make_nvfp4_layer_config(**overrides):
 
 
 @pytest.mark.internal
+@pytest.mark.launch_on_gb200
 @requires_blackwell
 @requires_flashinfer_nvfp4
 class TestNVFP4MoELayer:
