@@ -3,6 +3,7 @@
 """Iteration demand recording, strict replay, and weak module ownership."""
 
 import gc
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 from weakref import ref
@@ -20,8 +21,12 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionOrder,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration import (
     IterationOrder,
+    StaticOrder,
     iteration,
 )
 
@@ -94,6 +99,38 @@ def test_record_and_replay_mixed_occurrences():
             _demand(order, module, phase)
 
 
+def test_static_orders_prefetch_without_iteration():
+    """Explicit F/B orders repeat independently, including forward-only passes."""
+    a, b = _Unit(), _Unit()
+    forward = StaticOrder(ExecutionOrder([a, b, a]))
+    backward = StaticOrder(ExecutionOrder([b, a]))
+    gathers = Mock()
+    gathers.attach_mock(a._unshard_parameter_groups, "a")
+    gathers.attach_mock(b._unshard_parameter_groups, "b")
+    for forward_only in (False, True, False):
+        gathers.reset_mock()
+        for module in (a, b, a):
+            assert forward.advance() is module
+            forward.prefetch(None)
+        assert [call[0] for call in gathers.mock_calls] == ["b", "a"]
+        if not forward_only:
+            gathers.reset_mock()
+            for module in (b, a):
+                assert backward.advance() is module
+                backward.prefetch(None)
+            assert [call[0] for call in gathers.mock_calls] == ["a"]
+    gathers.reset_mock()
+    assert forward.advance() is a
+    forward.prefetch(0)
+    assert not gathers.mock_calls
+    forward.prefetch(2)
+    assert [call[0] for call in gathers.mock_calls] == ["b", "a"]
+    for module in (b, a):
+        assert forward.advance() is module
+        forward.prefetch(None)
+    assert len(gathers.mock_calls) == 2
+
+
 def test_replay_rejects_changed_or_incomplete_iterations():
     """Divergence, missing/extra demand, and failed recordings invalidate the cache."""
     a, b = _Unit(), _Unit()
@@ -146,8 +183,9 @@ def test_iteration_does_not_retain_modules():
 
 
 @pytest.mark.parametrize("reentrant", [False, True])
-def test_checkpoint_demand_recording(distributed_setup, reentrant):
-    """Both checkpoint variants replay recomputation demands and preserve SGD."""
+@pytest.mark.parametrize("record_iteration", [False, True], ids=["static", "recorded"])
+def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iteration):
+    """Static and recorded prefetch preserve SGD with both checkpoint variants."""
 
     class Model(nn.Module):
         def __init__(self):
@@ -185,13 +223,17 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant):
             parameter.grad.div_(distributed_setup.world_size)
         ref_optimizer.step()
         optimizer.zero_grad()
-        with iteration(context):
+        with iteration(context) if record_iteration else nullcontext():
             actual = model(x.detach().requires_grad_()).square().mean()
             actual.backward()
         optimizer.step()
         torch.testing.assert_close(actual, expected)
-    _, phases = context.iteration_order._orders["default"]
-    assert "recompute" in phases
+    if record_iteration:
+        _, phases = context.iteration_order._orders["default"]
+        assert "recompute" in phases
+    else:
+        assert not context.iteration_order._orders
+        assert set(context._static_orders) == {"forward", "backward"}
     # Group-packed shards need the FSDP layout to reconstruct parameters;
     # DTensor.full_tensor() assumes ordinary per-tensor chunking instead.
     with iteration(context, key="parameter_check"):

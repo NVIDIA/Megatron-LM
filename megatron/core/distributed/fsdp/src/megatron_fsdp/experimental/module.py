@@ -295,6 +295,10 @@ class FsdpModule:
             expected, phase = order.advance()
             if expected is not self or phase != prefetch:
                 raise RuntimeError("FSDP module calls diverged from the recorded iteration order.")
+        elif prefetch in ("forward", "backward"):
+            static_order = self.context.static_order(prefetch)
+            if static_order.advance() is not self:
+                raise RuntimeError("FSDP module calls diverged from the static prefetch order.")
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
@@ -303,13 +307,16 @@ class FsdpModule:
             self.context.current_stream().wait_event(self._unshard_event)
 
             context = self.context
-            if scoped:
+            if scoped or prefetch in ("forward", "backward"):
                 budget = (
                     self._schedule_policy.forward_prefetch_size
                     if prefetch == "forward"
                     else self._schedule_policy.backward_prefetch_size
                 )
-                context.iteration_order.prefetch(0 if prefetch == "none" else budget)
+                if scoped:
+                    context.iteration_order.prefetch(0 if prefetch == "none" else budget)
+                else:
+                    static_order.prefetch(budget)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.

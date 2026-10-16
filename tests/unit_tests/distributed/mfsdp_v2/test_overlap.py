@@ -17,7 +17,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    iteration,
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
@@ -155,10 +154,9 @@ def test_overlaps_communication_and_compute(
     def train_one_step() -> None:
         """Run one optimizer step consuming two microbatches."""
         optimizer.zero_grad(set_to_none=True)
-        with iteration(context):
-            for microbatch_index in range(2):
-                with microbatch(context, is_last=microbatch_index == 1):
-                    model(x).sum().backward()
+        for microbatch_index in range(2):
+            with microbatch(context, is_last=microbatch_index == 1):
+                model(x).sum().backward()
         optimizer.step()
 
     train_one_step()
@@ -284,10 +282,9 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
 
     def train_one_step() -> None:
         optimizer.zero_grad(set_to_none=True)
-        with iteration(context):
-            for microbatch_index in range(2):
-                with microbatch(context, is_last=microbatch_index == 1):
-                    model(x).sum().backward()
+        for microbatch_index in range(2):
+            with microbatch(context, is_last=microbatch_index == 1):
+                model(x).sum().backward()
         optimizer.step()
 
     train_one_step()

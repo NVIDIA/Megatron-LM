@@ -60,6 +60,31 @@ with a record-and-replay mechanism.
 3. Different input sizes may require different runtime orders for efficiency. We could
    capture or compute multiple orders for the runtime to choose from.
 
+## MFSDP v2 static prefetch
+
+Ordinary forward/backward loops prefetch without an iteration scope or recording.
+Context finalization builds separate static `forward_order` and `backward_order`
+sequences from construction. Each has independent execution and prefetch cursors;
+execution starts another pass after consuming the complete sequence. Forward-only
+validation advances only the forward order, leaving backward progress unchanged.
+
+For a different fixed call order, replace the sequences after construction:
+
+```python
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionOrder,
+)
+
+# Example: two independent FSDP units, called a then b in each forward.
+context.forward_order = ExecutionOrder([a, b])
+context.backward_order = ExecutionOrder([b, a])
+```
+
+Each pass must match its supplied order, including repeated occurrences. A mismatch
+raises rather than searching for a module or silently repositioning the cursor.
+Recomputation gathers on demand without advancing either static order. Dynamic
+mixed F/B schedules such as VPP/combined 1F1B use the iteration scope below.
+
 ## MFSDP v2 iteration demand recording
 
 The experimental v2 runtime can record one complete iteration and prefetch from
@@ -70,8 +95,8 @@ and its targets do not depend on materialization state. Prefetch gathers are not
 The first successful iteration of each schedule gathers on demand; failed or
 incompletely replayed iterations invalidate that schedule's recording.
 
-Pipeline entry points use `with_mfsdp_iteration` to scope the complete local
-schedule, including all VPP chunks and combined 1F1B nodes. Nested combined
+VPP and combined 1F1B entry points use `with_mfsdp_iteration` to scope the complete
+local schedule, including all VPP chunks and combined 1F1B nodes. Nested combined
 calls join the existing scope. Root hooks do not reset cursors. Training and
 validation, microbatch counts, and VPP grouping select separate recordings.
 
@@ -102,9 +127,9 @@ The recorder neither reduces gradients nor infers completion from node counts.
 
 Iteration recording is disabled for CUDA graph schedules because Python hooks
 do not cover graph replay. CUDA graph lifecycle support and performance tuning
-are outside this change. Outside an iteration scope, parameters are gathered on
-demand. `ExecutionOrder` only holds weak occurrences: construction-order lookup,
-`_unique_index`, and the module argument to `advance()` are removed.
+are outside this change. Outside an iteration scope, static F/B prefetch remains
+available as described above. `ExecutionOrder` only holds weak occurrences:
+`_unique_index` and the module argument to `advance()` remain removed.
 
 # Alternatives considered
 

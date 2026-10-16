@@ -27,6 +27,49 @@ if TYPE_CHECKING:
 DemandPhase = Literal["forward", "backward", "recompute", "none"]
 
 
+class StaticOrder:
+    """Traverse an explicit F or B order repeatedly without iteration recording.
+
+    Execution and prefetch have independent cursors. Only completing the
+    execution traversal starts a new pass; lookahead never wraps into it.
+    """
+
+    def __init__(self, order: ExecutionOrder) -> None:
+        self.order = order
+        self._reset()
+
+    def _reset(self) -> None:
+        self._execution = iter(self.order)
+        self._unshard = iter(self.order)
+        self._execution_position = self._unshard_position = 0
+
+    def advance(self) -> "FsdpModule":
+        """Consume the next occurrence, restarting after a complete traversal."""
+        if self._execution_position == len(self.order):
+            self._reset()
+        try:
+            module = next(self._execution)
+        except StopIteration:
+            raise RuntimeError("The static FSDP execution order is empty.") from None
+        self._execution_position += 1
+        return module
+
+    def prefetch(self, budget: int | None) -> None:
+        """Gather upcoming occurrences without changing execution progress."""
+        if budget == 0:
+            return
+        while self._unshard_position < self._execution_position:
+            next(self._unshard)
+            self._unshard_position += 1
+        size = 0
+        for module in self._unshard:
+            self._unshard_position += 1
+            module._unshard_parameter_groups()
+            size += module.num_parameter_elements
+            if budget is None or size >= budget:
+                break
+
+
 class IterationOrder:
     """Own execution and prefetch iterators over one weak occurrence sequence.
 

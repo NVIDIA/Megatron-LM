@@ -41,8 +41,13 @@ class ExecutionOrder(Generic[T]):
 
     def __iter__(self) -> Iterator[T]:
         """Traverse occurrences strictly without consuming another iterator."""
-        for item_ref in self._items:
+
+        def dereference(item_ref: ref[T]) -> T:
             item = item_ref()
             if item is None:
-                raise RuntimeError("A module in the recorded FSDP execution order was destroyed.")
-            yield item
+                raise RuntimeError("A module in the FSDP execution order was destroyed.")
+            return item
+
+        # Unlike a generator with a local `item`, this iterator does not retain
+        # the last yielded module while suspended between demands.
+        return map(dereference, self._items)

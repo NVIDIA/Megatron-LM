@@ -51,3 +51,10 @@ def test_order_does_not_retain_modules_or_skip_dead_occurrences():
     assert next(execution) is a
     with pytest.raises(RuntimeError, match="destroyed"):
         next(execution)
+    # A cursor kept between static passes must not retain its last yielded owner.
+    a_ref = ref(a)
+    live_iterator = iter(order)
+    assert next(live_iterator) is a
+    del a
+    gc.collect()
+    assert a_ref() is None

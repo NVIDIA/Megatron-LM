@@ -722,7 +722,6 @@ def _reset_activation_offload(
     off_interface.reset(process_group=pg_collection.tp_dp_cp)
 
 
-@with_mfsdp_iteration
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -2176,7 +2175,6 @@ def _prepare_forward_data_iterator(data_iterator, p2p_communicator, *, is_multim
     return chain((batch,), data_iterator)
 
 
-@with_mfsdp_iteration
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,

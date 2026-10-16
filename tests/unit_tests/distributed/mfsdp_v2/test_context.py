@@ -21,6 +21,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     microbatch,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionOrder,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContext
 
 
@@ -177,6 +180,8 @@ def test_sibling_roots_share_context_and_names(distributed_setup):
     assert model.layers[1].is_root()
     assert context.module_name(model.layers[0]) == ""
     assert context.module_name(model.layers[1]) == ""
+    assert list(context.forward_order) == [model.layers[0], model.layers[1]]
+    assert list(context.backward_order) == [model.layers[1], model.layers[0]]
 
 
 def test_sibling_roots_enqueue_one_post_backward_wait(distributed_setup, monkeypatch):
@@ -252,6 +257,13 @@ def test_nested_and_sibling_roots_have_independent_names(distributed_setup):
     assert not model.left.inner.is_root()
     assert context.module_name(model.left) == context.module_name(model.right) == ""
     assert context.module_name(model.left.inner) == "inner"
+    assert list(context.forward_order) == [model.left, model.left.inner, model.right]
+    assert list(context.backward_order) == [model.right, model.left, model.left.inner]
+    replacement = ExecutionOrder([model.right, model.left, model.left.inner])
+    cursor = context.static_order("forward")
+    context.forward_order = replacement
+    assert context.static_order("forward") is not cursor
+    assert context.static_order("forward").advance() is model.right
 
 
 def test_fully_shard_requires_context(distributed_setup):

@@ -20,7 +20,8 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .iteration import IterationOrder
+from .execution_order import ExecutionOrder
+from .iteration import IterationOrder, StaticOrder
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -91,6 +92,9 @@ class FsdpContext:
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.iteration_order = IterationOrder()
+        self.forward_order: ExecutionOrder[nn.Module] = ExecutionOrder()
+        self.backward_order: ExecutionOrder[nn.Module] = ExecutionOrder()
+        self._static_orders: dict[str, StaticOrder] = {}
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
@@ -133,7 +137,7 @@ class FsdpContext:
         self._registered_modules.append(module)
 
     def finalize(self) -> None:
-        """Finalize root membership and module names."""
+        """Finalize roots, names, and default static forward/backward orders."""
         if self._is_finalized:
             raise RuntimeError("FSDP context is already finalized.")
 
@@ -152,10 +156,22 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
+                self.forward_order.append(module)
+
+        for root in reversed(list(self._roots)):
+            _collect_backward_order(root, registered_modules, self.backward_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
         self._is_finalized = True
+
+    def static_order(self, phase: str) -> StaticOrder:
+        """Bind cursors lazily, including after the user replaces an explicit order."""
+        order = self.forward_order if phase == "forward" else self.backward_order
+        cursor = self._static_orders.get(phase)
+        if cursor is None or cursor.order is not order:
+            cursor = self._static_orders[phase] = StaticOrder(order)
+        return cursor
 
     def is_root(self, module: nn.Module) -> bool:
         """Return whether ``module`` is an outermost FSDP module in this context."""
@@ -237,6 +253,17 @@ def current_fully_shard_context() -> FsdpContext | None:
     second one.
     """
     return _FSDP_CONTEXT.get()
+
+
+def _collect_backward_order(
+    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[nn.Module]
+) -> None:
+    """Collect one root's static backward prefetch order."""
+    if module in registered_modules:
+        order.append(module)
+
+    for child in reversed(list(module.children())):
+        _collect_backward_order(child, registered_modules, order)
 
 
 def _collect_fsdp_children(
