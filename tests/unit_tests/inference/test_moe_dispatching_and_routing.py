@@ -423,7 +423,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=NANOV3_BASE["moe_router_topk"],
             hidden_size=NANOV3_BASE["hidden_size"],
-            ep_group=ep_group,
+            tp_ep_group=ep_group,
         )
 
         return NVLSAllGatherVDispatcher(
@@ -651,7 +651,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
-            ep_group=ep_group,
+            tp_ep_group=ep_group,
         )
 
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
@@ -845,7 +845,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
-            ep_group=get_expert_model_parallel_group(),
+            tp_ep_group=get_expert_model_parallel_group(),
         )
 
         if mxfp8_swiglu:
