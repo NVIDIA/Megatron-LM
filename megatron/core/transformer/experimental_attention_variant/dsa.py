@@ -2502,8 +2502,13 @@ class _DSAIndexSharingPayload:
     replay can compute the sparse indexer loss without rerunning the dense indexer. Any
     other publication of a layer's indices drops its score entries. Without the indexer
     loss (a frozen indexer) that replay stores and needs no scores: it reuses the layer's
-    own ``topk_by_layer`` and ``topk_length_by_layer`` entries, which the checkpoint
-    snapshot taken after the first call already holds.
+    own ``topk_by_layer``, ``topk_length_by_layer`` and ``topk_rows_nonempty_by_layer``
+    entries, which the checkpoint snapshot taken after the first call already holds.
+
+    ``topk_rows_nonempty_by_layer`` holds the publishing call's host-side certificate that
+    every row of its top-k selects at least one key (``can_prove_all_topk_rows_nonempty``).
+    Every publication writes it, False included, so it never outlives the indices it
+    describes; consumers treat a missing entry as False.
 
     ``frozen_topk_key_len_by_layer`` holds the key length of a frozen indexer's published
     indices. Every publication without the indexer loss writes it next to the indices, and
@@ -2514,6 +2519,7 @@ class _DSAIndexSharingPayload:
     topk_length_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
     topk_scores_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
     topk_key_len_by_layer: dict[int, int] = field(default_factory=dict)
+    topk_rows_nonempty_by_layer: dict[int, bool] = field(default_factory=dict)
     frozen_topk_key_len_by_layer: dict[int, int] = field(default_factory=dict)
 
     def __copy__(self):
@@ -2522,6 +2528,7 @@ class _DSAIndexSharingPayload:
             dict(self.topk_length_by_layer),
             dict(self.topk_scores_by_layer),
             dict(self.topk_key_len_by_layer),
+            dict(self.topk_rows_nonempty_by_layer),
             dict(self.frozen_topk_key_len_by_layer),
         )
 
@@ -2550,15 +2557,21 @@ class _DSAMTPRepeatedSharingPayload:
     Separate from ordinary IndexShare. Source calls replace only their layer's
     entries; consumers use MTP's explicit source/consumer flag. The enclosing
     forward owns tensor cleanup, while snapshots retain independent dictionaries.
+    ``topk_rows_nonempty_by_layer`` is the source's non-empty top-k row certificate,
+    published and cleared together with its indices; a missing entry means False.
     """
 
     topk_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
     topk_length_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
     latent_kv_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
+    topk_rows_nonempty_by_layer: dict[int, bool] = field(default_factory=dict)
 
     def __copy__(self):
         return type(self)(
-            dict(self.topk_by_layer), dict(self.topk_length_by_layer), dict(self.latent_kv_by_layer)
+            dict(self.topk_by_layer),
+            dict(self.topk_length_by_layer),
+            dict(self.latent_kv_by_layer),
+            dict(self.topk_rows_nonempty_by_layer),
         )
 
 
@@ -2717,6 +2730,7 @@ class DSAttention(MegatronModule):
             payload = state.get_or_create(_DSAMTPRepeatedSharingPayload)
             payload.topk_by_layer.pop(self.layer_number, None)
             payload.topk_length_by_layer.pop(self.layer_number, None)
+            payload.topk_rows_nonempty_by_layer.pop(self.layer_number, None)
             payload.latent_kv_by_layer.pop(self.layer_number, None)
         else:
             payload = self._require_mtp_sharing_payload(packed_seq_params, attention_mask)
@@ -2761,7 +2775,13 @@ class DSAttention(MegatronModule):
         packed_seq_params: PackedSeqParams | None,
         attention_mask: torch.Tensor | None,
     ) -> None:
-        """Bind graph-connected checkpoint outputs or detached replay inputs."""
+        """Bind graph-connected checkpoint outputs or detached replay inputs.
+
+        The host-side top-k row certificate is not a tensor and stays in the payload. It
+        remains valid because every binding passes the values that this payload's own
+        source call published: the source's checkpoint outputs, a consumer's inputs taken
+        from them, or those inputs replayed against the snapshot that saved them.
+        """
         state = self._get_forward_sharing_state(packed_seq_params, attention_mask)
         payload = state.get_or_create(_DSAMTPRepeatedSharingPayload)
         expected = int(self.mtp_latent_kv_share) + 2 * int(self.mtp_sparse_attention_index_share)
@@ -3312,10 +3332,14 @@ class DSAttention(MegatronModule):
             local_packed_cp_query_start = sequence_parallel_tp_row_start
             local_packed_cp_query_len = sequence_parallel_tp_full_rows
 
+        shared_topk_rows_nonempty = False
         if reuse_sparse_attention_index:
             assert mtp_payload is not None
             topk_indices = mtp_payload.topk_by_layer[self.layer_number]
             topk_length = mtp_payload.topk_length_by_layer.get(self.layer_number)
+            shared_topk_rows_nonempty = mtp_payload.topk_rows_nonempty_by_layer.get(
+                self.layer_number, False
+            )
         elif self.skip_topk:
             assert index_payload is not None
             if self.source_layer not in index_payload.topk_by_layer:
@@ -3331,10 +3355,16 @@ class DSAttention(MegatronModule):
                 )
             topk_indices = index_payload.topk_by_layer[self.source_layer]
             topk_length = index_payload.topk_length_by_layer.get(self.source_layer)
+            shared_topk_rows_nonempty = index_payload.topk_rows_nonempty_by_layer.get(
+                self.source_layer, False
+            )
         elif reuse_checkpoint_indices:
             assert index_payload is not None
             topk_indices = index_payload.topk_by_layer[self.layer_number]
             topk_length = index_payload.topk_length_by_layer.get(self.layer_number)
+            shared_topk_rows_nonempty = index_payload.topk_rows_nonempty_by_layer.get(
+                self.layer_number, False
+            )
         else:
             assert self.indexer is not None
             with torch.enable_grad() if use_indexer_loss else torch.no_grad():
@@ -3676,13 +3706,41 @@ class DSAttention(MegatronModule):
                     del index_scores
             slice_topk_to_local_sequence_parallel_rows()
 
+        # Host-side certificate that every top-k row selects a key, which lets the sparse
+        # attention backend skip its empty-row masking. A computing layer proves it from its
+        # layout. Index-sharing and repeated-MTP consumers reuse the producer's exact top-k
+        # tensors, from which alone the backend finds empty rows, so they inherit the
+        # producer's published certificate; their own layout must still pass the same checks.
+        # The helper's computes_topk gate thus also admits a certified producer's top-k.
+        # KPool selection without its tail leaves the rows before a query's first complete
+        # pool without a key, so such a producer certifies (and publishes) nothing.
+        kpool_may_leave_rows_empty = _is_kpool and not self.indexer.index_kpool_always_select_tail
+        topk_has_certified_source = (
+            computes_topk and not kpool_may_leave_rows_empty
+        ) or shared_topk_rows_nonempty
+        all_topk_rows_nonempty = dsa_masking.can_prove_all_topk_rows_nonempty(
+            computes_topk=topk_has_certified_source,
+            indexer_topk=self.index_topk,
+            kv_sequence_length=skv,
+            attention_mask=float_mask,
+            query_valid_rows=query_valid_rows,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            use_local_indexer_varlen=use_local_indexer_varlen,
+            varlen_starts=varlen_starts,
+            varlen_ends=varlen_ends,
+            key_positions=key_positions,
+        )
+
         publish_ordinary_topk = self.index_share and computes_topk
         publish_mtp_topk = bool(
             self.mtp_sparse_attention_index_share and mtp_payload is not None and is_mtp_source
         )
+        # Every publication writes the certificate, False included, so a stale True can
+        # never describe newer indices.
         if publish_ordinary_topk:
             assert index_payload is not None and topk_indices is not None
             index_payload.topk_by_layer[self.layer_number] = topk_indices
+            index_payload.topk_rows_nonempty_by_layer[self.layer_number] = all_topk_rows_nonempty
             if topk_length is None:
                 index_payload.topk_length_by_layer.pop(self.layer_number, None)
             else:
@@ -3698,24 +3756,13 @@ class DSAttention(MegatronModule):
         if publish_mtp_topk:
             assert mtp_payload is not None and topk_indices is not None
             mtp_payload.topk_by_layer[self.layer_number] = topk_indices
+            mtp_payload.topk_rows_nonempty_by_layer[self.layer_number] = all_topk_rows_nonempty
             if topk_length is not None:
                 mtp_payload.topk_length_by_layer[self.layer_number] = topk_length
 
         # ===================================
         # Run sparse attention kernel
         # ===================================
-        all_topk_rows_nonempty = dsa_masking.can_prove_all_topk_rows_nonempty(
-            computes_topk=computes_topk,
-            indexer_topk=self.index_topk,
-            kv_sequence_length=skv,
-            attention_mask=float_mask,
-            query_valid_rows=query_valid_rows,
-            varlen_is_plain_causal=varlen_is_plain_causal,
-            use_local_indexer_varlen=use_local_indexer_varlen,
-            varlen_starts=varlen_starts,
-            varlen_ends=varlen_ends,
-            key_positions=key_positions,
-        )
         output = _run_sparse_attention(
             absorbed_mla=absorbed_mla,
             query=query,
