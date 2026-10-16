@@ -14,7 +14,9 @@ import atexit
 import hashlib
 import json
 import math
+import numbers
 import os
+import sys
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -97,11 +99,14 @@ def _parse_range_spec(spec: str, label: str) -> tuple[tuple[int, int], ...] | No
         item = item.strip()
         if not item:
             raise ValueError(f"{label} contains an empty item")
-        if "-" in item:
-            start_text, end_text = item.split("-", 1)
-            start, end = int(start_text), int(end_text)
-        else:
-            start = end = int(item)
+        try:
+            if "-" in item:
+                start_text, end_text = item.split("-", 1)
+                start, end = int(start_text), int(end_text)
+            else:
+                start = end = int(item)
+        except ValueError as exc:
+            raise ValueError(f"invalid {label} range: {item!r}") from exc
         if start < 0 or end < start:
             raise ValueError(f"invalid {label} range: {item!r}")
         ranges.append((start, end))
@@ -369,13 +374,15 @@ class RankLocalTrace:
                 return
             record["metadata"] = _json_copy(dict(metadata or {}), "metadata")
             capture_mode = self.config.mode if mode is None else DigestMode(mode)
+            if capture_mode != DigestMode.METADATA:
+                self._require_value_iteration(iteration)
             pending = _capture_tensor(tensor, capture_mode, self.config.sample_count)
             self._enqueue(record, pending)
 
     def record_scalar(
         self,
         name: str,
-        value: bool | int | float | torch.Tensor | None,
+        value: numbers.Real | torch.Tensor | None,
         *,
         iteration: int | None,
         microbatch: int | None = None,
@@ -401,18 +408,32 @@ class RankLocalTrace:
             )
             return
 
-        if value is not None and type(value) not in (bool, int, float):
+        if isinstance(value, bool):
+            scalar_value: bool | int | float | None = value
+        elif isinstance(value, numbers.Integral):
+            scalar_value = int(value)
+        elif isinstance(value, numbers.Real):
+            scalar_value = float(value)
+        elif value is None:
+            scalar_value = None
+        else:
             raise TypeError("record_scalar requires a number, boolean, tensor, or None")
-        scalar_fields: dict[str, Any] = {"value": value}
-        if isinstance(value, float) and not math.isfinite(value):
+        scalar_fields: dict[str, Any] = {"value": scalar_value}
+        if isinstance(scalar_value, float) and not math.isfinite(scalar_value):
             scalar_fields = {
                 "finite": False,
-                "nonfinite": "nan" if math.isnan(value) else ("+inf" if value > 0 else "-inf"),
+                "nonfinite": (
+                    "nan" if math.isnan(scalar_value) else ("+inf" if scalar_value > 0 else "-inf")
+                ),
                 "value": None,
             }
-        self.record_event(
-            name, iteration=iteration, microbatch=microbatch, phase=phase, fields=scalar_fields
-        )
+        with self._lock:
+            record = self._new_record("event", name, iteration, microbatch, phase)
+            if record is None:
+                return
+            self._require_value_iteration(iteration)
+            record["fields"] = scalar_fields
+            self._enqueue(record, None)
 
     def flush(self) -> None:
         """Resolve buffered tensor evidence and append complete JSONL records."""
@@ -482,6 +503,12 @@ class RankLocalTrace:
         }
         return record
 
+    def _require_value_iteration(self, iteration: int | None) -> None:
+        if iteration is None and self._iteration_ranges is not None:
+            raise ValueError(
+                "iteration is required for value-bearing captures when iteration_spec is restricted"
+            )
+
     def _enqueue(self, record: dict[str, Any], pending: _PendingTensor | None) -> None:
         occurrence_key = tuple(
             record[field] for field in ("event", "name", "iteration", "microbatch", "phase")
@@ -516,6 +543,23 @@ _ACTIVE_TRACE_LOCK = threading.Lock()
 _ATEXIT_REGISTERED = False
 
 
+def _close_determinism_trace_at_exit() -> None:
+    try:
+        close_determinism_trace()
+    except RuntimeError as exc:
+        if "CUDA-graph-capture safe" not in str(exc):
+            raise
+        stream = getattr(sys, "stderr", None)
+        if stream is not None:
+            try:
+                stream.write(
+                    "determinism trace incomplete: pending CUDA values could not be flushed "
+                    "during CUDA graph capture\n"
+                )
+            except (AttributeError, OSError):
+                pass
+
+
 def initialize_determinism_trace(config: TraceConfig) -> RankLocalTrace | None:
     """Initialize the process-local tracer, returning None on unselected ranks."""
     global _ACTIVE_TRACE, _ATEXIT_REGISTERED
@@ -528,7 +572,7 @@ def initialize_determinism_trace(config: TraceConfig) -> RankLocalTrace | None:
             return None
         _ACTIVE_TRACE = trace
         if not _ATEXIT_REGISTERED:
-            atexit.register(close_determinism_trace)
+            atexit.register(_close_determinism_trace_at_exit)
             _ATEXIT_REGISTERED = True
         return trace
 

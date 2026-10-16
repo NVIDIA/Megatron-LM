@@ -10,7 +10,10 @@ import json
 import sys
 from pathlib import Path
 
-from trace_comparison import TraceValidationError, compare_traces
+if __package__:
+    from .trace_comparison import TraceValidationError, compare_traces
+else:
+    from trace_comparison import TraceValidationError, compare_traces
 
 
 def parse_args() -> argparse.Namespace:

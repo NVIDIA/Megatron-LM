@@ -7,9 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
+from megatron.core.determinism import trace as trace_module
 from megatron.core.determinism.trace import DigestMode, RankLocalTrace, TraceConfig
 from tools.determinism.trace_comparison import TraceValidationError, compare_traces, load_trace
 
@@ -49,6 +51,12 @@ def test_config_rejects_invalid_values(tmp_path, kwargs):
         TraceConfig(output_dir=tmp_path, **kwargs)
 
 
+@pytest.mark.parametrize("spec", ["4-", "-4", "word", "1-2-3"])
+def test_range_specs_report_labeled_errors(tmp_path, spec):
+    with pytest.raises(ValueError, match=rf"invalid iteration_spec range: {spec!r}"):
+        TraceConfig(output_dir=tmp_path, rank=0, iteration_spec=spec)
+
+
 def test_rank_and_iteration_selection(tmp_path):
     disabled = RankLocalTrace(
         TraceConfig(output_dir=tmp_path / "disabled", rank=3, rank_spec="0-2", append=False)
@@ -70,6 +78,22 @@ def test_rank_and_iteration_selection(tmp_path):
         trace.record_event("kept", iteration=2)
 
     assert [record["name"] for record in _records(trace)] == ["kept"]
+
+
+def test_restricted_iteration_selection_requires_value_capture_iteration(tmp_path):
+    with RankLocalTrace(
+        TraceConfig(output_dir=tmp_path, rank=0, mode="full", iteration_spec="2-4")
+    ) as trace:
+        trace.record_event("lifecycle", iteration=None)
+        trace.record_tensor("metadata", torch.ones(1), iteration=None, mode="metadata")
+        with pytest.raises(ValueError, match="iteration is required for value-bearing captures"):
+            trace.record_tensor("value", torch.ones(1), iteration=None)
+        with pytest.raises(ValueError, match="iteration is required for value-bearing captures"):
+            trace.record_scalar("python_scalar", 1.0, iteration=None)
+        with pytest.raises(ValueError, match="iteration is required for value-bearing captures"):
+            trace.record_scalar("tensor_scalar", torch.tensor(1.0), iteration=None)
+
+    assert [record["name"] for record in _records(trace)] == ["lifecycle", "metadata"]
 
 
 def test_metadata_mode_does_not_observe_values(tmp_path):
@@ -104,6 +128,19 @@ def test_summary_mode_handles_empty_and_nonfinite_tensors(tmp_path):
     assert nonfinite["all_finite"] is False
     assert nonfinite["maximum"] is None
     assert nonfinite["mean"] is None
+
+
+def test_complex_summary_uses_element_magnitudes(tmp_path):
+    with RankLocalTrace(
+        TraceConfig(output_dir=tmp_path, rank=0, mode="summary", append=False)
+    ) as trace:
+        trace.record_tensor("complex", torch.tensor([3 + 4j, 0 + 2j]), iteration=1)
+
+    summary = _records(trace)[0]["tensor"]["summary"]
+    assert summary["minimum"] == 2.0
+    assert summary["maximum"] == 5.0
+    assert summary["mean"] == 3.5
+    assert summary["l2_norm"] == pytest.approx(29**0.5)
 
 
 def test_sampled_mode_uses_stable_indices_and_digest(tmp_path):
@@ -150,6 +187,16 @@ def test_scalars_and_occurrences_are_json_safe(tmp_path):
     assert [record["occurrence"] for record in records[:2]] == [0, 1]
     assert records[0]["fields"] == {"finite": False, "nonfinite": "nan", "value": None}
     assert records[2]["tensor"]["exact_value_certificate"] is True
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(np.int64(3), 3), (np.float32(1.25), 1.25), (np.float64(2.5), 2.5)]
+)
+def test_numpy_scalars_are_normalized_to_json_numbers(tmp_path, value, expected):
+    with RankLocalTrace(TraceConfig(output_dir=tmp_path, rank=0, append=False)) as trace:
+        trace.record_scalar("metric", value, iteration=1)
+
+    assert _records(trace)[0]["fields"] == {"value": expected}
 
 
 def test_create_only_and_append_continuation(tmp_path):
@@ -305,6 +352,34 @@ def test_comparison_cli_exit_codes_and_report(tmp_path):
     assert completed.returncode == 0
     assert json.loads(completed.stdout)["status"] == "match"
     assert json.loads(report_path.read_text(encoding="utf-8"))["match"] is True
+
+    module_completed = subprocess.run(
+        [sys.executable, "-m", "tools.determinism.compare_traces", str(left), str(right)],
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert module_completed.returncode == 0, module_completed.stderr
+    assert json.loads(module_completed.stdout)["status"] == "match"
+
+
+def test_atexit_cuda_graph_flush_failure_emits_incomplete_note(monkeypatch, capsys):
+    def fail_during_capture():
+        raise RuntimeError("flush of value-bearing traces is not CUDA-graph-capture safe")
+
+    monkeypatch.setattr(trace_module, "close_determinism_trace", fail_during_capture)
+    trace_module._close_determinism_trace_at_exit()
+    assert "determinism trace incomplete" in capsys.readouterr().err
+
+
+def test_atexit_does_not_hide_unrelated_runtime_errors(monkeypatch):
+    def fail_for_other_reason():
+        raise RuntimeError("unrelated failure")
+
+    monkeypatch.setattr(trace_module, "close_determinism_trace", fail_for_other_reason)
+    with pytest.raises(RuntimeError, match="unrelated failure"):
+        trace_module._close_determinism_trace_at_exit()
 
 
 @pytest.mark.parametrize("mode", ["summary", "sampled", "full"])

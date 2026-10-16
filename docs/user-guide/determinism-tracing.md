@@ -38,6 +38,12 @@ matching user-visible training iteration numbers. Rank and iteration selectors
 accept comma-separated values and inclusive ranges, such as
 `0,4-7` and `20,24-28`.
 
+With a restricted iteration selector, summary, sampled, full, and scalar
+captures must provide `iteration`; omitting it raises an error instead of
+silently capturing values outside the selected window. Events and metadata-only
+tensor records may use `iteration=None` to represent iteration-independent
+structure and are intentionally not filtered by the iteration selector.
+
 Each rank creates `rank_XXXXXX.jsonl`. Existing files cause the run to fail
 rather than overwrite evidence. Use `--determinism-trace-append` only to
 continue an intentionally preserved stream; the tracer validates existing
@@ -61,6 +67,10 @@ The configured mode applies to `record_tensor` calls without a mode override:
 to establish equality or locate divergence without duplicating model-sized
 data. A matching sampled or summary record is diagnostic evidence, not proof
 that the full tensors are equal.
+
+For complex tensors, summary statistics are computed over element magnitudes.
+Consequently, minimum, maximum, and mean describe absolute values rather than
+the real or imaginary components.
 
 `record_scalar` is an explicit exception: scalar tensors always use `full`,
 including the training loop's scalar losses. Therefore a training run configured
