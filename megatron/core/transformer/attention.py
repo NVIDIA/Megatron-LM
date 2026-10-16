@@ -142,12 +142,14 @@ class QKVLayout:
     ``projection_split_shapes`` describes the projection slices repeated in every group.
     ``per_head_split_shapes`` describes the independently orthogonalizable head slices in the
     same group. Standard fused QKV has one group per query group, while MLA up-projections have
-    one group per attention head.
+    one group per attention head. ``per_head_adamw`` optionally marks output/control
+    slices for elementwise AdamW when semantic per-head routing is enabled.
     """
 
     num_groups: int
     projection_split_shapes: tuple[int, ...]
     per_head_split_shapes: tuple[int, ...]
+    per_head_adamw: tuple[bool, ...] = ()
 
     @classmethod
     def from_transformer_config(cls, config: TransformerConfig) -> 'QKVLayout':
@@ -157,15 +159,19 @@ class QKVLayout:
         num_query_heads_per_group = config.num_attention_heads // config.num_query_groups
         projection_split_shapes = [num_query_heads_per_group * config.kv_channels]
         per_head_split_shapes = [config.kv_channels] * num_query_heads_per_group
+        per_head_adamw = [False] * num_query_heads_per_group
         if config.attention_output_gate:
             projection_split_shapes.append(num_query_heads_per_group * config.kv_channels)
             per_head_split_shapes += [config.kv_channels] * num_query_heads_per_group
+            per_head_adamw += [True] * num_query_heads_per_group
         projection_split_shapes += [config.kv_channels, config.kv_channels]
         per_head_split_shapes += [config.kv_channels, config.kv_channels]
+        per_head_adamw += [False, False]
         return cls(
             num_groups=config.num_query_groups,
             projection_split_shapes=tuple(projection_split_shapes),
             per_head_split_shapes=tuple(per_head_split_shapes),
+            per_head_adamw=tuple(per_head_adamw),
         )
 
     @classmethod
