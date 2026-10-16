@@ -820,6 +820,22 @@ def test_load_checkpoint(
             assert new_opt_param_scheduler.state_dict() == {"opt_param_scheduler": "dummy2"}
 
 
+def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_args):
+    """The streaming dequantize load is weights-only (inference): the loaded state dict holds
+    the re-quantized params, so `load_checkpoint` must refuse any optimizer up front, before
+    anything is read."""
+    args = create_ckpt_load_args
+    args.load = "/nonexistent"
+    args.no_load_optim = True
+    args.stream_ckpt_dequant = True
+    set_args(args)
+
+    with pytest.raises(ValueError, match="inference-only"):
+        load_checkpoint(
+            [MockModel(TransformerConfig(num_layers=1, kv_channels=1))], MockState({}), None
+        )
+
+
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 def test_load_checkpoint_override_opt_param_scheduler(
     init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
@@ -1017,6 +1033,8 @@ def test_checkpoint_load_without_microbatch_calculator(
         )
 
         def build_model():
+            # CPU-initialized DP replicas must match the weights saved by rank 0.
+            torch.manual_seed(123)
             return (
                 GPTModel(
                     config=config,
@@ -1028,6 +1046,7 @@ def test_checkpoint_load_without_microbatch_calculator(
                 .eval()
             )
 
+        torch.manual_seed(123)
         model = build_model()
         save_checkpoint(123, [model], None, None, 456)
         saved_rng = torch.get_rng_state().clone()
