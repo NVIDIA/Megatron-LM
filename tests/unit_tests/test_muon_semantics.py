@@ -102,15 +102,22 @@ class TestMuonSemantics(unittest.TestCase):
         return p, opt
 
     def test_config_rejects_incompatible_per_head_modes(self):
+        """Use the explicit validation boundary, including edits after construction."""
         with self.assertRaisesRegex(ValueError, "requires muon_split_qkv"):
-            OptimizerConfig(muon_split_qkv_per_head=True, muon_split_qkv=False)
+            OptimizerConfig(muon_split_qkv_per_head=True, muon_split_qkv=False).validate()
         with self.assertRaisesRegex(ValueError, "layer_sharded"):
             OptimizerConfig(
                 optimizer="muon",
                 muon_split_qkv_per_head=True,
                 muon_tp_mode="layer_sharded",
                 use_layer_wise_distributed_optimizer=True,
-            )
+            ).validate()
+
+        config = OptimizerConfig(optimizer="muon", muon_split_qkv_per_head=True)
+        config.validate()
+        config.muon_split_qkv = False
+        with self.assertRaisesRegex(ValueError, "requires muon_split_qkv"):
+            config.validate()
 
     def test_layer_sharded_registry_omits_per_head_only_kwargs(self):
         import inspect
