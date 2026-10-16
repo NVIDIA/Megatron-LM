@@ -12,22 +12,22 @@ throughput, gradient norm) that export to any OTLP-compatible backend.
 
 ```
 megatron/core/telemetry/
-├── span_groups.py       — MegatronSpanGroup: Megatron-specific span groups.
+├── telemetry.py         — Megatron's nemo-lens shim and span registry.
+├── resource_attrs.py    — Megatron-owned trainer Resource mapping.
 ├── training_metrics.py  — OTel instruments for the training loop.
-├── fallbacks.py         — No-op shims for when nemo-lens is not installed.
 └── __init__.py
 ```
 
-Resource detection and the instrumentation primitives themselves live in
-`nemo-lens`. This module is a thin integration layer.
+Use the Nemo Lens API for Resource parsing, composition, detection, and
+instrumentation. Keep Megatron-specific Resource and signal mappings in
+`megatron/core/telemetry/`.
 
 ## Optional dependencies
 
 Nothing here requires `nemo-lens` or `opentelemetry` to import. Both are
-optional: when neither is installed, `fallbacks` supplies no-op decorators and
-context managers, `span_groups` falls back to a local `SpanGroup` stub, and
-`record_training_metrics()` returns immediately. Call sites can therefore import
-from this module unconditionally.
+optional: when neither is installed, `telemetry.py` exposes no-op decorators and
+context managers. Metric recorders also become no-ops without OpenTelemetry.
+Call sites can therefore import from this module unconditionally.
 
 Install the real implementations with the `otel` extra:
 
