@@ -30,7 +30,38 @@ from megatron.core.utils import deprecate_inference_params, internal_api
 logger = logging.getLogger(__name__)
 
 
-__all__ = ['RotaryEmbedding', 'MultimodalRotaryEmbedding']
+__all__ = ['RotaryEmbedding', 'MultimodalRotaryEmbedding', 'maybe_share_rotary_pos_emb']
+
+
+def maybe_share_rotary_pos_emb(
+    config: TransformerConfig, cache_key: tuple, rotary_pos_emb: nn.Module
+) -> nn.Module:
+    """Share a rotary embedding across identically configured layers, or return it unchanged.
+
+    The rotary cos/sin buffers depend only on the configuration, not on any layer weights, so
+    attention layers with the same rotary configuration build identical modules and can share a
+    single instance. When ``config.share_rotary_pos_emb`` is set, the first module built for a
+    given ``cache_key`` is cached on ``config`` and reused by later callers with an equal key, so
+    sharing is scoped to a single model; otherwise ``rotary_pos_emb`` is returned unchanged. The
+    cos/sin buffers are allocated lazily on first use, so the extra modules that are built but not
+    kept never allocate them; this removes the per-layer rotary buffer duplication (several GiB per
+    rank at long sequence lengths) with no change to the numerics.
+
+    Args:
+        config: Transformer config; ``config.share_rotary_pos_emb`` toggles sharing.
+        cache_key: A hashable key that uniquely identifies the rotary configuration.
+        rotary_pos_emb: The rotary embedding module built by the caller for this layer.
+
+    Returns:
+        The shared instance for ``cache_key`` when sharing is enabled, else ``rotary_pos_emb``.
+    """
+    if not getattr(config, 'share_rotary_pos_emb', False):
+        return rotary_pos_emb
+    cache = getattr(config, '_shared_rotary_pos_emb_cache', None)
+    if cache is None:
+        cache = {}
+        setattr(config, '_shared_rotary_pos_emb_cache', cache)
+    return cache.setdefault(cache_key, rotary_pos_emb)
 
 
 class RotaryEmbedding(nn.Module):
