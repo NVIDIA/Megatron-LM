@@ -11,7 +11,9 @@ class KDALayerConfig(GDNLayerConfig):
     """Configuration for a KDA (Kimi Delta Attention) layer in a hybrid stack.
 
     KDA is a channel-wise Gated DeltaNet variant, so this config extends the GDN layer view
-    with KDA-only settings.
+    with the KDA settings and the KDA validation. TransformerConfig declares the same four
+    KDA fields, so the CLI and model-wide settings reach the per-layer copies made by
+    ``from_config``.
     """
 
     linear_num_value_heads: Optional[int] = 16

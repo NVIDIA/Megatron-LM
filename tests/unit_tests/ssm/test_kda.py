@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -12,6 +12,9 @@ from megatron.core.fp8_utils import get_fp8_context, is_float8tensor
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_gated_delta_net_module_spec,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.layers.utils import Symbols, create_layer_config
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -21,6 +24,7 @@ from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import Float16Module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
@@ -134,6 +138,12 @@ def test_kda_config_rejects_nonpositive_conv_padding_alignment(alignment):
 def test_kda_config_rejects_invalid_safe_gate_lower_bound(lower_bound):
     with pytest.raises(ValueError, match="kda_lower_bound"):
         _make_config(kda_safe_gate=True, kda_lower_bound=lower_bound)
+
+
+def test_kda_two_stage_defaults_preserve_direct_gates():
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    assert config.kda_two_stage_gates is False
+    assert config.kda_disable_fp8 is False
 
 
 @pytest.mark.internal
@@ -471,13 +481,11 @@ def test_kda_layer_config_preserves_settings(explicit_settings):
 
     assert type(layer_config) is KDALayerConfig
     assert layer_config is not config
-    # dev keeps kda_safe_gate/kda_lower_bound on TransformerConfig for the
-    # --kda-safe-gate/--kda-lower-bound CLI flags (#6556); the other KDA-only
-    # settings must stay off the stack config.
-    dev_stack_fields = {"kda_safe_gate", "kda_lower_bound"}
-    transformer_fields = {field.name for field in fields(TransformerConfig)}
-    assert dev_stack_fields <= transformer_fields
-    assert (set(expected) - dev_stack_fields).isdisjoint(transformer_fields)
+    # All four KDA settings are TransformerConfig fields: dev keeps kda_safe_gate and
+    # kda_lower_bound there for the --kda-safe-gate/--kda-lower-bound CLI flags (#6556), and
+    # this stack adds kda_disable_fp8 and kda_two_stage_gates for --kda-disable-fp8,
+    # --kda-two-stage-gates and the FLOPs estimate. KDALayerConfig redeclares all four.
+    assert set(expected) <= {field.name for field in fields(TransformerConfig)}
     assert set(expected) <= {field.name for field in fields(KDALayerConfig)}
     for name, value in expected.items():
         assert getattr(layer_config, name) == value
@@ -492,6 +500,73 @@ def test_kda_fp8_opt_out_is_scoped_to_kda_config():
 
     assert _kda_fp8_disabled(kda_config)
     assert not _kda_fp8_disabled(gdn_config)
+
+
+@pytest.mark.parametrize("variant", ["kda", "gdn", "gdn2"])
+def test_kda_fp8_opt_out_covers_gpt_kda_config(variant):
+    """Dev's GPT KDA spec builds KDA from the decoder config, not from a KDALayerConfig."""
+
+    def gpt_config(kda_disable_fp8):
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            experimental_attention_variant=variant,
+            linear_attention_freq=1,
+            kda_disable_fp8=kda_disable_fp8,
+        )
+
+    config = gpt_config(kda_disable_fp8=True)
+    assert _kda_fp8_disabled(config) == (variant == "kda")
+    assert not _kda_fp8_disabled(gpt_config(kda_disable_fp8=False))
+    # Per-layer copies keep the type-based scope even when the variant is "kda".
+    assert _kda_fp8_disabled(create_layer_config(config, Symbols.KDA))
+    assert not _kda_fp8_disabled(create_layer_config(config, Symbols.GDN))
+
+
+_GATE_PROJECTIONS = ("f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj")
+
+
+@pytest.mark.parametrize("missing", [_GATE_PROJECTIONS, ("f_a_proj",), ("g_b_proj",)])
+def test_kda_two_stage_gates_require_gate_projections(monkeypatch, missing):
+    """Two-stage gates fail at construction when the spec has IdentityOp gate projections.
+
+    Dev's GPT KDA spec has no f/g projections, so --kda-two-stage-gates on a GPT KDA model
+    would otherwise build IdentityOp gates and fail only in forward.
+    """
+    import megatron.core.ssm.gated_delta_net.kda as kda_module
+
+    # The check runs before any FLA kernel, parameter or process group is needed.
+    monkeypatch.setattr(kda_module, "HAVE_FLA", True)
+    monkeypatch.setattr(kda_module, "HAVE_FLA_KDA", True)
+    if missing == _GATE_PROJECTIONS:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            experimental_attention_variant="kda",
+            linear_attention_freq=1,
+            kda_two_stage_gates=True,
+        )
+        submodules = get_gated_delta_net_module_spec(config).submodules
+    else:
+        config = _make_config(two_stage_gates=True)
+        submodules = replace(
+            hybrid_stack_spec.submodules.kda_layer.submodules.self_attention.submodules,
+            **{name: IdentityOp for name in missing},
+        )
+    with pytest.raises(ValueError, match=f"leaves {', '.join(missing)} as IdentityOp"):
+        KimiDeltaAttention(config, submodules=submodules, layer_number=1)
 
 
 def _make_fp8_stack_config(two_stage_gates, **overrides):
@@ -595,6 +670,34 @@ def test_kda_fp8_opt_out_preserves_gdn_alignment_check(two_stage_gates, gdn_vari
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_without_fp8_opt_out_keeps_alignment_check(two_stage_gates):
+    """Without kda_disable_fp8, a misaligned KDA in_proj still trips the FP8 assertion."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        stack_config = _make_fp8_stack_config(
+            two_stage_gates,
+            linear_key_head_dim=30,
+            linear_value_head_dim=30,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+        )
+        # The helper opts KDA out of FP8; this stack keeps KDA in FP8. (replace() would rerun
+        # __post_init__, which rejects the stack's already-resolved chunkwise CP layout.)
+        stack_config.kda_disable_fp8 = False
+        layer_config = create_layer_config(stack_config, Symbols.KDA)
+        assert type(layer_config) is KDALayerConfig
+        assert not _kda_fp8_disabled(layer_config)
+        with get_fp8_context(stack_config, is_init=True):
+            with pytest.raises(AssertionError, match="input projection output tensor"):
+                _build_kda(layer_config)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("two_stage_gates", [False, True])
 @pytest.mark.parametrize(
     ("sequence_packing", "tp", "sp", "cp", "linear_cp_mode"),
@@ -634,6 +737,40 @@ def test_parallel_kda_correctness(
         micro_batch_size=3 if linear_cp_mode == "chunkwise" else 2,
         sequence_packing=sequence_packing,
         cp_partition_mode=layout,
+    )
+
+
+@pytest.mark.parametrize(("tp", "sp", "cp"), [(1, False, 2), (2, True, 2)])
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.skipif(Utils.world_size < 4, reason="Requires four GPUs for TP2+CP2.")
+def test_parallel_kda_chunkwise_zigzag_input_correctness(
+    tmp_path_dist_ckpt, tp, sp, cp, run_config
+):
+    """Dev's default chunkwise CP path with two-stage gates: KDA converts zigzag inputs itself."""
+    # linear_cp_layout stays unset (dev default; an explicit zigzag is rejected for chunkwise)
+    # and the helper feeds zigzag CP inputs, so KimiDeltaAttention runs its module-local
+    # zigzag-to-contiguous conversion. test_parallel_kda_correctness above feeds its chunkwise
+    # rows contiguous inputs; the direct-gate zigzag chunkwise rows are in
+    # gated_delta_net/test_kda.py::test_parallel_kda_correctness.
+    config = _make_config(two_stage_gates=True, linear_cp_mode="chunkwise")
+    _test_parallel_attention_correctness(
+        transformer_config=config,
+        transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+        atol=1e-2,
+        rtol=1e-2,
+        # Parallel projection/reduction order can move individual BF16 values by
+        # one observed bin; the dedicated padded-CP test above also bounds relative L2.
+        input_grad_atol=_KDA_INPUT_GRAD_ATOL,
+        input_grad_rtol=1e-2,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=42,
+        sequence_length=128,
+        micro_batch_size=2,
+        sequence_packing=True,
+        cp_partition_mode="zigzag",
     )
 
 
