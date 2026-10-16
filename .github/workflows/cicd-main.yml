@@ -1321,6 +1321,7 @@ jobs:
   notify-nightly-failure:
     name: Notify nightly testing failure
     runs-on: ubuntu-latest
+    environment: main
     needs: [cicd-unit-tests-latest, cicd-unit-tests-latest-gb200, cicd-integration-tests-latest-h100, cicd-integration-tests-latest-gb200]
     permissions: {}
     # Report test failures, not failed ancestors or build-cache population.
