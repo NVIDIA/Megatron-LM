@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from functools import cached_property
 from typing import List, Optional
 
@@ -443,6 +444,18 @@ if HAVE_TRANSFORMERS:
     class _GigatokenTokenizer(PreTrainedTokenizerFast):
         """Keep HF rendering, metadata and decoding while accelerating text encoding."""
 
+        # Gigatoken's ICU 2.2 uses Unicode 17; HF tokenizers 0.22 uses Unicode 16.
+        # These ranges cover all differences in letter case, marks, numbers and whitespace.
+        _unicode_fallback_re = re.compile(
+            r'[\u0295\u088f\u0c5c\u0cdc\u1acf-\u1add\u1ae0-\u1aeb\ua7ce-\ua7cf\ua7d2\ua7d4'
+            r'\ua7f1\U00010940-\U00010959\U00010ec5-\U00010ec7\U00010efa-\U00010efb'
+            r'\U00011b60-\U00011b67\U00011db0-\U00011ddb\U00011de0-\U00011de9'
+            r'\U00016ea0-\U00016eb8\U00016ebb-\U00016ed3\U00016ff2-\U00016ff6'
+            r'\U000187f8-\U000187ff\U00018d09-\U00018d1e\U00018d80-\U00018df2'
+            r'\U0001e6c0-\U0001e6de\U0001e6e0-\U0001e6f5\U0001e6fe-\U0001e6ff'
+            r'\U0002b73a-\U0002b73f\U0002cea2-\U0002cead\U000323b0-\U00033479]'
+        )
+
         def __init__(self, tokenizer):
             from megatron.core.tokenizers.utils import init_gigatoken_from_hf
 
@@ -498,6 +511,11 @@ if HAVE_TRANSFORMERS:
                 or kwargs.get('max_length') is not None
                 or set(self.model_input_names) - {'input_ids', 'attention_mask'}
             ):
+                return super().__call__(text, text_pair, *args, **kwargs)
+
+            # Keep ASCII cheap; fall back for the whole input to preserve BPE boundaries.
+            texts = (text,) if isinstance(text, str) else text
+            if any(not t.isascii() and self._unicode_fallback_re.search(t) for t in texts):
                 return super().__call__(text, text_pair, *args, **kwargs)
 
             tokenizer = (

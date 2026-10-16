@@ -207,6 +207,73 @@ def test_gigatoken_user_text_and_special_filtering(gigatoken_hf_pair):
         assert encode.call_count > 0
 
 
+@pytest.mark.parametrize(
+    'character',
+    ['\u0295', '\ua7cf', '\u1acf', '\U00011de0', '\U00016ff4', '\U0002b73a', '\U00033479'],
+)
+def test_gigatoken_unicode_fallback(gigatoken_hf_pair, character):
+    hf, native = gigatoken_hf_pair
+    with (
+        patch.object(native.tokenizer, '_gigatoken') as encode,
+        patch.object(native.tokenizer, '_split_special_tokenizer') as split_encode,
+    ):
+        for include in (False, True):
+            hf.include_special_tokens = native.include_special_tokens = include
+            for offset in (0, 15, 16, 31, 32, 63, 64):
+                text = 'x' * offset + f'aa{character}bb 12345{character}6789 <extra><ordinary>'
+                assert native.text_to_ids(text) == hf.text_to_ids(text)
+                assert (
+                    native.tokenizer(
+                        text,
+                        add_special_tokens=native.include_special_tokens,
+                        split_special_tokens=True,
+                    ).input_ids
+                    == hf.tokenizer(
+                        text,
+                        add_special_tokens=hf.include_special_tokens,
+                        split_special_tokens=True,
+                    ).input_ids
+                )
+        encode.assert_not_called()
+        split_encode.assert_not_called()
+
+
+@pytest.mark.parametrize('split_special_tokens', [False, True])
+def test_gigatoken_unicode_batch_fallback(gigatoken_hf_pair, split_special_tokens):
+    hf, native = gigatoken_hf_pair
+    batch = ['Invoice 1234567 café 中文', '12345\U00011de06789 <extra><ordinary>']
+    name = '_split_special_tokenizer' if split_special_tokens else '_gigatoken'
+    with patch.object(native.tokenizer, name) as encode:
+        for values in (batch, tuple(batch)):
+            kwargs = dict(add_special_tokens=False, split_special_tokens=split_special_tokens)
+            assert native.tokenizer(values, **kwargs) == hf.tokenizer(values, **kwargs)
+        encode.assert_not_called()
+
+
+def test_gigatoken_unicode_chat_fallback(gigatoken_hf_pair):
+    hf, native = gigatoken_hf_pair
+    conversation = [{'role': 'user', 'content': 'Invoice 1234567'}]
+    # The rendered template can introduce an affected character absent from messages.
+    template = '\U00011de0' + hf.tokenizer.chat_template
+    with patch.object(native.tokenizer, '_gigatoken') as encode:
+        assert native.apply_chat_template(
+            conversation, chat_template=template, return_dict=False
+        ) == hf.apply_chat_template(conversation, chat_template=template, return_dict=False)
+        encode.assert_not_called()
+
+
+@pytest.mark.parametrize('text', ['Invoice 1234567', 'café e\u0301 中文 ١٢٣٤٥٦٧ １２３４５ 😀'])
+def test_gigatoken_compatible_unicode_stays_native(gigatoken_hf_pair, text):
+    hf, native = gigatoken_hf_pair
+    for split in (False, True):
+        name = '_split_special_tokenizer' if split else '_gigatoken'
+        with patch.object(native.tokenizer, name, wraps=getattr(native.tokenizer, name)) as encode:
+            assert native.tokenizer(text, split_special_tokens=split) == hf.tokenizer(
+                text, split_special_tokens=split
+            )
+            encode.assert_called_once()
+
+
 @pytest.mark.parametrize('batched', [False, True])
 @pytest.mark.parametrize('return_dict', [False, True, None])
 @pytest.mark.parametrize('tensor_type', [None, 'np', 'pt'])
