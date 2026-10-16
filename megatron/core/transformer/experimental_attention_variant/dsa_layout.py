@@ -3,7 +3,7 @@
 """Layout helpers for DeepSeek sparse attention."""
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -21,6 +21,7 @@ __all__ = [
     "extract_query_positions_from_position_ids",
     "get_cp_positions_from_layout",
     "get_packed_qk_cu_seqlens",
+    "invert_permutation",
     "normalize_cp_comm_type",
     "build_packed_allgather_cp_local_positions_from_host",
     "build_packed_allgather_cp_query_positions_and_key_reorder_from_host",
@@ -164,10 +165,53 @@ def build_zigzag_cp_local_positions(
     )
 
 
+def invert_permutation(perm: torch.Tensor) -> torch.Tensor:
+    """Return ``inv`` with ``inv[perm[i]] == i`` for a 1-D ``int64`` permutation ``perm``.
+
+    ``x.index_select(0, perm)`` is then undone exactly by ``y.index_select(0, inv)``,
+    which is what lets the CP key reorder use a plain gather as its backward instead
+    of autograd's zero fill plus atomic ``index_add_``. That is only valid when
+    ``perm`` is a bijection of ``[0, n)``. Host (CPU) inputs are checked here, where
+    reading the values needs no device synchronization, and a host ``perm`` that is
+    not a permutation raises ``ValueError``: it is a hard error, not a fallback to
+    ``index_add_``, because such a table would already be wrong in the forward.
+    Device inputs are deliberately not checked, since reading them back would add a
+    synchronization: callers must pass a permutation by construction, such as an
+    ``argsort`` output. The device scatter has a static output shape, so it is safe
+    to issue while a CUDA graph is being captured.
+    """
+    if perm.dim() != 1 or perm.dtype != torch.int64:
+        raise ValueError(
+            "invert_permutation expects a 1-D int64 tensor, got "
+            f"shape={tuple(perm.shape)}, dtype={perm.dtype}"
+        )
+    n = perm.numel()
+    positions = torch.arange(n, dtype=torch.int64, device=perm.device)
+    if perm.device.type != "cpu":
+        return torch.empty(n, dtype=torch.int64, device=perm.device).scatter_(0, perm, positions)
+    if n > 0 and (int(perm.min()) < 0 or int(perm.max()) >= n):
+        raise ValueError(
+            f"Expected a permutation of [0, {n}), got values in "
+            f"[{int(perm.min())}, {int(perm.max())}]"
+        )
+    inv = torch.full((n,), -1, dtype=torch.int64)
+    inv[perm] = positions
+    # n in-range entries: a repeated entry necessarily leaves another slot unwritten.
+    if bool((inv < 0).any()):
+        raise ValueError(f"Expected a permutation of [0, {n}), got repeated entries")
+    return inv
+
+
 def build_zigzag_allgather_cp_key_reorder(
-    sq: int, cp_size: int, device: torch.device
-) -> torch.Tensor:
-    """Build gathered-KV reorder index for non-packed zigzag allgather CP."""
+    sq: int, cp_size: int, device: torch.device, *, return_inverse_key_reorder: bool = False
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Build gathered-KV reorder index for non-packed zigzag allgather CP.
+
+    With ``return_inverse_key_reorder`` the inverse permutation is returned as well,
+    as ``(reorder, inverse)``. The ranks' front/back chunks tile ``[0, sq * cp_size)``
+    exactly once, so the gathered key positions are a permutation, the reorder is
+    their ``argsort``, and the positions themselves are its inverse: no extra kernel.
+    """
     global_seq_len = sq * cp_size
     gathered_key_positions = torch.cat(
         [
@@ -176,7 +220,10 @@ def build_zigzag_allgather_cp_key_reorder(
         ],
         dim=0,
     )
-    return torch.argsort(gathered_key_positions)
+    key_reorder_idx = torch.argsort(gathered_key_positions)
+    if return_inverse_key_reorder:
+        return key_reorder_idx, gathered_key_positions
+    return key_reorder_idx
 
 
 def get_cp_positions_from_layout(
@@ -415,7 +462,8 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     *,
     query_cu_seqlens_cover_output: bool = False,
     key_cu_seqlens_cover_output: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_inverse_key_reorder: bool = False,
+) -> Tuple[torch.Tensor, ...]:
     """Build packed-query positions and gathered-KV reorder index for allgather CP.
 
     Queries stay in the local zigzag THD order for ``cp_rank``. Keys/values are
@@ -423,6 +471,13 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     rank0-local-packed, rank1-local-packed, ..., rank{cp_size-1}-local-packed.
     This helper returns the permutation that restores those gathered KV tensors
     to global packed order, matching the Slime GLM5 implementation semantics.
+
+    With ``return_inverse_key_reorder`` a third tensor, the inverse permutation
+    (see :func:`invert_permutation`), is returned as well. The reorder is an
+    ``argsort`` output and therefore always a permutation of ``[0, n)``, so the
+    inverse is scattered on the reorder's device without a host readback, and
+    without a bijection check by design. DSAttention requests the triple, so a
+    replacement of this builder inside ``dsa.py`` must forward that keyword.
     """
     query_positions = build_packed_allgather_cp_local_positions(
         cu_seqlens_q,
@@ -449,6 +504,8 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
             f"Packed DSA CP key reorder length mismatch: got {key_reorder_idx.numel()}, "
             f"expected {global_output_size}"
         )
+    if return_inverse_key_reorder:
+        return query_positions, key_reorder_idx, invert_permutation(key_reorder_idx)
     return query_positions, key_reorder_idx
 
 
@@ -541,7 +598,8 @@ def build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
     *,
     query_cu_seqlens_cover_output: bool = False,
     key_cu_seqlens_cover_output: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_inverse_key_reorder: bool = False,
+) -> Tuple[torch.Tensor, ...]:
     """Host-side equivalent of the query-positions + key-reorder wrapper.
 
     Besides removing the device builders' synchronizations, this replaces the
@@ -552,6 +610,13 @@ def build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
     and the padding pseudo-positions ``total + r * output_size + j`` are unique
     and already ascending in ``(rank, j)`` order. Both facts are pinned by the
     bit-equality tests against the device path.
+
+    With ``return_inverse_key_reorder`` the inverse permutation is returned as a
+    third tensor. It is built on the host before either copy, which is also where
+    the reorder table is checked to be a bijection (see :func:`invert_permutation`):
+    a table that is not one raises ``ValueError`` instead of being copied. DSAttention
+    requests the triple, so a replacement of this builder inside ``dsa.py`` must
+    forward that keyword.
     """
     query_positions = build_packed_allgather_cp_local_positions_from_host(
         host_cu_seqlens_q,
@@ -564,13 +629,22 @@ def build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
     if key_local_output_size is None:
         key_local_output_size = local_output_size
 
+    def _finish(key_reorder_idx: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        if not return_inverse_key_reorder:
+            return query_positions, move_host_tensor_to_device(key_reorder_idx, device)
+        # Invert (and so validate) before either copy is issued.
+        key_reorder_inv = invert_permutation(key_reorder_idx)
+        return (
+            query_positions,
+            move_host_tensor_to_device(key_reorder_idx, device),
+            move_host_tensor_to_device(key_reorder_inv, device),
+        )
+
     kv_total = host_cu_seqlens_kv[-1]
     if cp_size <= 1:
         # Identity layout: the gathered order is already the global order.
         out = key_local_output_size if key_local_output_size is not None else kv_total
-        return query_positions, move_host_tensor_to_device(
-            torch.arange(out, dtype=torch.int64), device
-        )
+        return _finish(torch.arange(out, dtype=torch.int64))
     spans_by_rank = [
         _host_packed_cp_spans(host_cu_seqlens_kv, cp_size, rank) for rank in range(cp_size)
     ]
@@ -599,7 +673,7 @@ def build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
             key_reorder_idx[kv_total + rank * pad : kv_total + (rank + 1) * pad] = torch.arange(
                 rank * out + local, rank * out + out
             )
-    return query_positions, move_host_tensor_to_device(key_reorder_idx, device)
+    return _finish(key_reorder_idx)
 
 
 def extract_query_positions_from_position_ids(
