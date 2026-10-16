@@ -1079,11 +1079,7 @@ class TestMegatronFSDPE2E:
             pretrain_cfg_container_from_args,
         )
         from megatron.training.arguments import add_megatron_arguments, validate_args
-        from megatron.training.global_vars import (
-            set_args,
-            set_run_config,
-            unset_global_variables,
-        )
+        from megatron.training.global_vars import set_args, set_run_config, unset_global_variables
 
         # Because we are using pretrain() to test, destroy the entire global state
         # before calling pretrain() for the next test case.
