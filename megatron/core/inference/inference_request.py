@@ -455,6 +455,8 @@ def _merge_routing(parts: List[np.ndarray], total_rows: int) -> Optional[np.ndar
             covered = len(part)
     if not merged or covered != total_rows:
         return None
+    if any(part.shape[1:] != merged[0].shape[1:] for part in merged[1:]):
+        return None  # ensure sure we can't record segments with different topk
     return np.concatenate(merged)
 
 
@@ -1394,6 +1396,14 @@ class DynamicInferenceRequestRecord:
         # Preserve KV handoff metadata when merging request segments.
         disaggregated_params = self.requests[-1].disaggregated_params
 
+        # Need to account for the case where an earlier segment holds the stop but the
+        # final segment lost it: checkpoint() does not carry finish_reason, so an evict
+        # or suspend checkpoint buries a stop detected one step before completion.
+        finish_reason = next(
+            (r.finish_reason for r in reversed(self.requests) if r.finish_reason is not None),
+            None,
+        )
+
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
@@ -1416,7 +1426,7 @@ class DynamicInferenceRequestRecord:
             ttft=ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
-            finish_reason=self.requests[-1].finish_reason,
+            finish_reason=finish_reason,
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
@@ -1433,7 +1443,7 @@ class DynamicInferenceRequestRecord:
 
 @dataclass
 class FinishedRequestRecord:
-    """Per-request metadata, outside of the RESTful reply, to be used by the stager."""
+    """Per-request metadata, outside of the RESTful reply, used by the stager and snapshots."""
 
     policy_epoch: Optional[list[tuple[int, int]]]
     kv_cache_epoch: Optional[list[tuple[int, int]]]
@@ -1555,7 +1565,10 @@ class RequestPayloadStager(Protocol):
 
 @dataclass(frozen=True)
 class LiveRequestSnapshot:
-    """Snapshot of a live request, allowing for its later resumption."""
+    """Snapshot of a live request, allowing for its later resumption.
+
+    A snapshot carries no media; resuming a multimodal request requires resubmitting the
+    same media so the expanded prompt the boundaries were counted on is reproduced."""
 
     uid: str
     request_id: int
@@ -1632,10 +1645,6 @@ class ResumedGeneration:
             raise ValueError(
                 f"resumed generation holds {len(tokens)} tokens over a budget of {budget}"
             )
-        if len(tokens) == budget and self.finish_reason is None:
-            raise ValueError(f"resumed generation filled its budget of {budget} without finishing")
-        if len(tokens) < budget and self.finish_reason == "length":
-            raise ValueError(f"resumed generation ended by length short of its budget of {budget}")
         if self.log_probs is not None and len(self.log_probs) != len(tokens):
             raise ValueError(
                 "resumed generation has log probs and tokens of different lengths, "
