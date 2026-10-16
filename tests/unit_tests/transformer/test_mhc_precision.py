@@ -3,7 +3,10 @@
 import pytest
 import torch
 
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    native_h_aggregate_into,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -71,6 +74,30 @@ def test_mhc_precision(fp32_mixing, input_scale):
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
 
 
+@pytest.mark.parametrize("fp32_mappings", [False, True])
+def test_mhc_caller_owned_aggregation_matches_regular_path(fp32_mappings):
+    """The graph-input buffer must preserve FP32 mixing before the BF16 cast."""
+    torch.manual_seed(43)
+    x = torch.randn(8, 2, 4, 4096, device="cuda", dtype=torch.bfloat16)
+    mapping_dtype = torch.float32 if fp32_mappings else torch.bfloat16
+    weights = torch.randn(8, 2, 4, device="cuda", dtype=mapping_dtype)
+    actual_input, reference_input = (x.clone().requires_grad_() for _ in range(2))
+    actual_weights, reference_weights = (weights.clone().requires_grad_() for _ in range(2))
+    out = torch.empty(8, 2, 4096, device="cuda", dtype=x.dtype)
+    actual = native_h_aggregate_into(actual_input, actual_weights, out)
+    expected = (reference_input * reference_weights.unsqueeze(-1)).sum(2).to(x.dtype)
+    assert actual.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    grad = torch.randn_like(actual)
+    actual.backward(grad)
+    expected.backward(grad)
+    torch.testing.assert_close(actual_input.grad, reference_input.grad)
+    # The explicit-buffer custom op accumulates weight gradients in FP32.
+    torch.testing.assert_close(
+        actual_weights.grad, (grad.float().unsqueeze(2) * x.float()).sum(-1).to(mapping_dtype)
+    )
+
+
 def test_mhc_fused_rejects_unsupported_precision():
     config = TransformerConfig(
         num_layers=1,
@@ -78,7 +105,21 @@ def test_mhc_fused_rejects_unsupported_precision():
         num_attention_heads=4,
         enable_hyper_connections=True,
         use_fused_mhc=True,
-        mhc_keep_mappings_in_fp32=True,
     )
+    # Set the flag after __post_init__ so the module guard, not the config guard, is exercised.
+    config.mhc_keep_mappings_in_fp32 = True
     with pytest.raises(ValueError, match="Fused mHC does not support"):
         HyperConnectionModule(config, layer_number=1)
+
+
+@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
+def test_mhc_fused_config_rejects_unsupported_precision(flag):
+    with pytest.raises(ValueError, match="use_fused_mhc does not implement"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            enable_hyper_connections=True,
+            use_fused_mhc=True,
+            **{flag: True},
+        )

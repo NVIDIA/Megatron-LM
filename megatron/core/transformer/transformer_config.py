@@ -3046,6 +3046,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
+            if self.mhc_norm_eps_inside_sqrt or self.mhc_keep_mappings_in_fp32:
+                raise ValueError(
+                    "use_fused_mhc does not implement mhc_norm_eps_inside_sqrt or "
+                    "mhc_keep_mappings_in_fp32. "
+                    "Use the reference mHC path."
+                )
 
         if self.enable_hyper_connections:
             # Reject degenerate Sinkhorn-Knopp settings: the doubly stochastic projection needs

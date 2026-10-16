@@ -102,7 +102,12 @@ class NativeHAggregateInto(torch.autograd.Function):
             raise ValueError("H-aggregate caller-owned output must be a detached tensor")
 
         ctx.mark_dirty(out)
-        torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+        if x.dtype == h_pre.dtype:
+            torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+        else:
+            # A BF16 output buffer must not round FP32 mapping coefficients
+            # before reducing. Preserve FP32 mixing, then copy the final cast.
+            out.copy_((x * h_pre.unsqueeze(-1)).sum(dim=2))
         ctx.save_for_backward(x, h_pre)
         return out
 
@@ -298,9 +303,10 @@ class HyperConnectionModule(MegatronModule):
         # The fused path computes the projection and compute_h in one op, so
         # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
         # reached on the unfused path.
-        self._proj_rms_op = partial(
-            native_proj_rms, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt
-        )
+        # A full checkpoint first runs under no_grad, then replays under enable_grad.
+        # Use the same projection/RMS arithmetic in both passes: dispatching only the
+        # no-grad pass through torch.compile can change reduction/fusion rounding.
+        self._proj_rms_op = partial(_proj_rms_impl, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt)
 
         if config.use_fused_mhc:
             if config.mhc_norm_eps_inside_sqrt or config.mhc_keep_mappings_in_fp32:
@@ -360,9 +366,13 @@ class HyperConnectionModule(MegatronModule):
         x_2d = x.reshape(s * b, nC)
         weight = self.mapping_proj.weight
         if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
-            proj_rms = partial(_proj_rms_impl, eps_inside_sqrt=self.config.mhc_norm_eps_inside_sqrt)
             proj, r = checkpoint(
-                proj_rms, x_2d, weight, self.norm_eps, use_reentrant=False, preserve_rng_state=False
+                self._proj_rms_op,
+                x_2d,
+                weight,
+                self.norm_eps,
+                use_reentrant=False,
+                preserve_rng_state=False,
             )
         else:
             proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)

@@ -2647,7 +2647,8 @@ class TestMHCMTPIntegration:
         MTPLossLoggingHelper.tracker = {}
 
     @pytest.mark.parametrize('tp', [1, 2])
-    def test_mtp_constructor_with_mhc(self, tp):
+    @pytest.mark.parametrize('learned_output_contract', [False, True])
+    def test_mtp_constructor_with_mhc(self, tp, learned_output_contract):
         """MTP layers have e_proj/h_proj (not eh_proj) and learned contraction params."""
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
@@ -2658,6 +2659,7 @@ class TestMHCMTPIntegration:
             num_attention_heads=8,
             num_residual_streams=4,
             enable_hyper_connections=True,
+            mhc_learned_output_contract=learned_output_contract,
             use_cpu_initialization=True,
             tensor_model_parallel_size=tp,
             sequence_parallel=True if tp > 1 else False,
@@ -2675,11 +2677,41 @@ class TestMHCMTPIntegration:
             assert layer.eh_proj is None
             assert layer.e_proj.weight.shape == (h // tp, h)
             assert layer.h_proj.weight.shape == (h // tp, h)
-            assert layer.hc_head_fn.shape == (n, n * h)
-            assert layer.hc_head_base.shape == (n,)
-            assert layer.hc_head_scale.shape == (1,)
-            if tp > 1:
-                assert getattr(layer.hc_head_fn, 'sequence_parallel', False)
+            for name in ('hc_head_fn', 'hc_head_base', 'hc_head_scale'):
+                assert hasattr(layer, name) is learned_output_contract
+                assert (name in layer.state_dict()) is learned_output_contract
+            if learned_output_contract:
+                assert layer.hc_head_fn.shape == (n, n * h)
+                assert layer.hc_head_base.shape == (n,)
+                assert layer.hc_head_scale.shape == (1,)
+                if tp > 1:
+                    assert getattr(layer.hc_head_fn, 'sequence_parallel', False)
+
+    def test_mtp_mean_contraction_before_final_norm(self):
+        """GLM MTP contracts each stream mean exactly once before final norm."""
+        Utils.initialize_model_parallel(1, 1)
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=8,
+            num_residual_streams=4,
+            enable_hyper_connections=True,
+            mhc_learned_output_contract=False,
+            use_cpu_initialization=True,
+        )
+        spec = get_gpt_layer_local_spec(enable_hyper_connection=True)
+        mtp_spec = get_gpt_mtp_block_spec(config=config, spec=spec, use_transformer_engine=False)
+        layer = MultiTokenPredictionBlock(config=config, spec=mtp_spec).cuda().layers[0]
+        hidden = torch.randn(8, 2, 256, device='cuda')
+        actual_input, reference_input = (hidden.clone().requires_grad_() for _ in range(2))
+        actual = layer._postprocess(actual_input)
+        expected = layer.final_layernorm(reference_input.unflatten(-1, (4, 64)).mean(-2))
+        torch.testing.assert_close(actual, expected)
+        grad = torch.randn_like(actual)
+        actual.backward(grad)
+        expected.backward(grad)
+        torch.testing.assert_close(actual_input.grad, reference_input.grad)
 
     def test_transformer_block_returns_tuple(self):
         """With mHC+MTP the block returns (contracted, multistream); without MTP just a tensor."""
