@@ -866,7 +866,29 @@ def next_hdp_group_packing_aware(
         sample_ids_per_gpu[rank].append(sample_id)
 
     leftovers: List[Tuple[int, int]] = []
-    for sample_id, seq_len in sample_seqlens[1:]:
+    # Exact early exit. A sample is placed either by adding it to a group it still fits in
+    # or by forming a new group on free ranks. Samples are sorted longest first, so once no
+    # rank is free and the shortest sample fits no group, no later sample can be placed and
+    # the rest become leftovers in order, as the full scan would make them. The state only
+    # changes on a placement, so the check only reruns after one. Non-positive lengths keep
+    # the full scan so that cp_min_fn still rejects them.
+    shortest_seq_len = sample_seqlens[-1][1]
+    placed = True
+    for index in range(1, len(sample_seqlens)):
+        if (
+            placed
+            and shortest_seq_len > 0
+            and None not in gpu_group_id
+            and all(
+                packing_sequence_len[group_id] + shortest_seq_len / size > max_seq_len_per_rank
+                for group_id, size in group_size.items()
+            )
+        ):
+            leftovers.extend((sample_id, seq_len) for sample_id, seq_len in sample_seqlens[index:])
+            break
+        placed = False
+
+        sample_id, seq_len = sample_seqlens[index]
         min_needed = cp_min_fn(seq_len)
         best = None
 
@@ -909,6 +931,7 @@ def next_hdp_group_packing_aware(
             leftovers.append((sample_id, seq_len))
             continue
 
+        placed = True
         _, selected_cp_size, action, group_id, chosen_members = best
         per_gpu_cost = workload(seq_len, selected_cp_size)
         if action == "add":
