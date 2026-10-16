@@ -7,7 +7,9 @@ from unittest.mock import patch
 import pytest
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    MTPSplit,
     ParsedHybridPattern,
+    PipelineSplit,
     Symbols,
     get_hybrid_layer_counts,
     get_hybrid_total_layer_count,
@@ -46,6 +48,13 @@ _EXPECTED_LAYER_CONFIG_CLASSES = {
 }
 
 _DSV4_COMPRESS_RATIOS = {Symbols.CSA: 4, Symbols.HCA: 128, Symbols.WINDOW: 0}
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("sentinel", [PipelineSplit, MTPSplit])
+def test_split_sentinels_cannot_be_instantiated(sentinel):
+    with pytest.raises(TypeError, match=f"Use the bare {sentinel.__name__} class instead"):
+        sentinel()
 
 
 def _make_transformer_config() -> TransformerConfig:
