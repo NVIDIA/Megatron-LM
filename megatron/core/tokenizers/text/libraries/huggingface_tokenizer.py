@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from functools import cached_property
-from typing import List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
 
 try:
     from transformers import AutoTokenizer, BatchEncoding, PreTrainedTokenizerFast
@@ -17,6 +17,12 @@ except ModuleNotFoundError:
 from megatron.core.utils import log_single_rank
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
+
+if TYPE_CHECKING:
+    from gigatoken import HFCompat
+    from numpy.typing import NDArray
+    from torch import Tensor
+
 
 logger = logging.getLogger(__name__)
 
@@ -456,7 +462,7 @@ if HAVE_TRANSFORMERS:
             r'\U0002b73a-\U0002b73f\U0002cea2-\U0002cead\U000323b0-\U00033479]'
         )
 
-        def __init__(self, tokenizer):
+        def __init__(self, tokenizer: PreTrainedTokenizerFast) -> None:
             from megatron.core.tokenizers.utils import init_gigatoken_from_hf
 
             # Preserve the loaded HF configuration and native decoder for DecodeStream.
@@ -465,7 +471,11 @@ if HAVE_TRANSFORMERS:
             self._gigatoken = init_gigatoken_from_hf(tokenizer, tokenizer.name_or_path)
             self.tokenizer = self._gigatoken.tokenizer
 
-        def __reduce__(self):
+        def __reduce__(
+            self,
+        ) -> tuple[
+            Callable[..., "_GigatokenTokenizer"], tuple[PreTrainedTokenizerFast], dict[str, Any]
+        ]:
             # Spawned serving workers rebuild native encoders from the retained HF tokenizer.
             state = self.__dict__.copy()
             for name in ('tokenizer', '_gigatoken', '_split_special_tokenizer'):
@@ -473,7 +483,7 @@ if HAVE_TRANSFORMERS:
             return type(self), (self._hf_tokenizer,), state
 
         @cached_property
-        def _split_special_tokenizer(self):
+        def _split_special_tokenizer(self) -> "HFCompat":
             import gigatoken as gt
 
             # Gigatoken's matcher is immutable. Ordinary text needs a separate matcher
@@ -484,7 +494,9 @@ if HAVE_TRANSFORMERS:
             ]
             return gt.Tokenizer.from_json(json.dumps(config)).as_hf()
 
-        def __call__(self, text=None, text_pair=None, *args, **kwargs):
+        def __call__(
+            self, text: Any = None, text_pair: Any = None, *args: Any, **kwargs: Any
+        ) -> BatchEncoding:
             supported = {
                 'add_special_tokens',
                 'split_special_tokens',
@@ -536,7 +548,12 @@ if HAVE_TRANSFORMERS:
                 prepend_batch_axis=isinstance(text, str),
             )
 
-        def apply_chat_template(self, *args, **kwargs):
+        def apply_chat_template(
+            self, *args: Any, **kwargs: Any
+        ) -> Union[
+            str, List[str], List[int], List[List[int]], BatchEncoding, "Tensor", "NDArray[Any]"
+        ]:
+            """Preserve HF's character-to-token alignment when returning assistant masks."""
             if kwargs.get('return_assistant_tokens_mask'):
                 # Assistant masks require HF's character-to-token alignment data.
                 return self._hf_tokenizer.apply_chat_template(*args, **kwargs)
