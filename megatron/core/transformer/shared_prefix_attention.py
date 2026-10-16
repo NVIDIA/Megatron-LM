@@ -213,6 +213,15 @@ class _ComposedForestAttn(torch.autograd.Function):
         q, k, v, o_merged = ctx.saved_tensors
         lse_final = ctx.lse_final
         do = do.contiguous()
+        # The flash backward kernel needs a head dim divisible by 8. flash_attn_varlen_func
+        # zero-pads Q/K/V internally in the forward; pad every backward input the same way and
+        # slice the gradients back. Zero columns change neither the scores nor rowsum(dout * out).
+        hn = q.shape[-1]
+        pad = -hn % 8
+        if pad:
+            q, k, v, o_merged, do = (
+                torch.nn.functional.pad(tensor, (0, pad)) for tensor in (q, k, v, o_merged, do)
+            )
         deterministic = torch.are_deterministic_algorithms_enabled()
         dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
         dk = torch.zeros(k.shape, device=k.device, dtype=torch.float32)
@@ -256,6 +265,7 @@ class _ComposedForestAttn(torch.autograd.Function):
             else:
                 dk.index_add_(0, k_idx, dkx.float())
                 dv.index_add_(0, k_idx, dvx.float())
+        dq, dk, dv = (gradient[..., :hn] for gradient in (dq, dk, dv))
         return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None
 
 
