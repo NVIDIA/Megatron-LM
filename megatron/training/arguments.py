@@ -1780,11 +1780,11 @@ def validate_args(args, defaults={}):
             )
 
     # The PG-distribution cache stores one file per parallelization group, keyed by
-    # that group's minimum global rank, and each file holds both the save and the
-    # load distribution. If save and load used different parallelization groups,
-    # two distinct groups could map to the same file (they can share a minimum
-    # global rank), so one side would silently read a distribution computed for the
-    # other group's layout. Require both sides to use the same group.
+    # that group's ordered global ranks, and each file holds both the save and the
+    # load distribution derived from one gather over that group. A single create
+    # run (even one that only loads) therefore covers later saves only when save
+    # and load use the same group; otherwise a read run finds no cache file for the
+    # other side's group. Require both sides to use the same group.
     if args.ckpt_pg_tensors_cache_path is not None:
         assert (
             args.ckpt_fully_parallel_save_process_group
@@ -1794,8 +1794,8 @@ def validate_args(args, defaults={}):
             "--ckpt-fully-parallel-load-process-group to be identical, but got "
             f"save='{args.ckpt_fully_parallel_save_process_group}' and "
             f"load='{args.ckpt_fully_parallel_load_process_group}'. The cache is keyed by the "
-            "parallelization group, so mixing groups can read a distribution computed for a "
-            "different layout."
+            "parallelization group, so with mixed groups a run that creates the cache for one "
+            "side leaves the other side without a cache file."
         )
 
     if args.load_main_params_from_ckpt:
