@@ -46,6 +46,8 @@ def can_prove_all_topk_rows_nonempty(
     varlen_starts: Optional[torch.Tensor],
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
+    kpool_size: int = 1,
+    kpool_always_select_tail: bool = True,
 ) -> bool:
     """Return a host-side certificate that every query row has a selected key.
 
@@ -57,6 +59,9 @@ def can_prove_all_topk_rows_nonempty(
 
     Backend callers may pass their normalized plain-causal layout as
     ``varlen_is_plain_causal=True`` after dropping the equivalent explicit bounds.
+
+    KPool selects only complete pools. Without its causal tail, the first
+    ``kpool_size - 1`` rows of every sequence have no selectable key.
     """
     if (
         not computes_topk
@@ -64,6 +69,7 @@ def can_prove_all_topk_rows_nonempty(
         or kv_sequence_length <= 0
         or attention_mask is not None
         or query_valid_rows is not None
+        or (kpool_size > 1 and not kpool_always_select_tail)
     ):
         return False
     return varlen_is_plain_causal or (

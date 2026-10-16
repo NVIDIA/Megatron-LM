@@ -594,9 +594,12 @@ def test_dsa_all_topk_rows_nonempty_certificate():
         {"varlen_is_plain_causal": False},
         {**packed_local, "key_positions": torch.arange(4)},
         {**packed_local, "varlen_ends": None},
+        {"kpool_size": 4, "kpool_always_select_tail": False},
     ]
     for override in unsupported:
         assert not can_prove_all_topk_rows_nonempty(**{**common, **override})
+    assert can_prove_all_topk_rows_nonempty(**common, kpool_size=4, kpool_always_select_tail=True)
+    assert can_prove_all_topk_rows_nonempty(**common, kpool_size=1, kpool_always_select_tail=False)
 
 
 def test_dsa_packed_cp_padding_preserves_nonempty_local_varlen_rows():
