@@ -54,6 +54,8 @@ logger = logging.getLogger(__name__)
 # ".dev0" so pre-release builds of that line are accepted too, matching how the TE minimums
 # elsewhere in the tree are written.
 _SYRK_MIN_EO_VERSION = "0.4.0.dev0"
+# newton_schulz() accepts batched (3-D) input from this release onward.
+_BATCHED_NS_MIN_EO_VERSION = "0.3.0"
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -159,32 +161,23 @@ def _get_qkv_split_shapes(model_cfg, split_qkv_per_head: bool = False) -> list[i
 
     Args:
         model_cfg: Transformer config or an owning attention layer's ``QKVLayout`` metadata.
-        split_qkv_per_head: Return one split size per physical attention head. When false,
-            return the per-query-group Q, gate (if present), K, and V projection widths.
+        split_qkv_per_head: Repeat each group's per-head/component boundaries independently.
+            For standard QKV this yields the physical Q, gate (if present), K, and V heads;
+            for MLA it yields each content/positional component of every attention head. When
+            false, return the projection components that Muon aggregates across all groups.
     """
-    if hasattr(model_cfg, 'projection_split_shapes'):
-        if split_qkv_per_head:
-            return list(model_cfg.per_head_split_shapes) * model_cfg.num_groups
-        return list(model_cfg.projection_split_shapes)
+    # Keep attention imports out of optimizer module initialization: optimizer is itself imported
+    # while megatron.core is being initialized, whereas this helper runs after model construction.
+    from megatron.core.transformer.attention import QKVLayout
 
-    query_projection_size = (
-        model_cfg.num_attention_heads // model_cfg.num_query_groups * model_cfg.kv_channels
+    layout = (
+        model_cfg
+        if isinstance(model_cfg, QKVLayout)
+        else QKVLayout.from_transformer_config(model_cfg)
     )
     if split_qkv_per_head:
-        num_query_heads_per_group = model_cfg.num_attention_heads // model_cfg.num_query_groups
-        per_group_shapes = [model_cfg.kv_channels] * num_query_heads_per_group
-        if getattr(model_cfg, 'attention_output_gate', False):
-            per_group_shapes += [model_cfg.kv_channels] * num_query_heads_per_group
-        per_group_shapes += [model_cfg.kv_channels, model_cfg.kv_channels]
-        return per_group_shapes * model_cfg.num_query_groups
-    if getattr(model_cfg, 'attention_output_gate', False):
-        return [
-            query_projection_size,
-            query_projection_size,
-            model_cfg.kv_channels,
-            model_cfg.kv_channels,
-        ]
-    return [query_projection_size, model_cfg.kv_channels, model_cfg.kv_channels]
+        return list(layout.per_head_split_shapes) * layout.num_groups
+    return list(layout.projection_split_shapes)
 
 
 def _localize_qkv_split_shapes(
@@ -535,6 +528,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 )
             if len(set(split_shapes)) == 1:
                 # A 3D input selects Emerging-Optimizers' batched Newton-Schulz path.
+                if not is_emerging_optimizers_min_version(_BATCHED_NS_MIN_EO_VERSION):
+                    raise ValueError(
+                        "Muon batched per-head Newton-Schulz requires emerging-optimizers >= "
+                        f"{_BATCHED_NS_MIN_EO_VERSION}, but "
+                        f"{get_emerging_optimizers_version()} is installed. Upgrade "
+                        "emerging-optimizers or disable --muon-split-qkv-per-head."
+                    )
                 head_rows = split_shapes[0]
                 return orthogonalize_fn(grad.view(len(split_shapes), head_rows, -1)).view_as(grad)
             return torch.cat(

@@ -139,10 +139,14 @@ except ImportError:
 class QKVLayout:
     """Logical row layout for a packed attention projection weight.
 
-    ``projection_split_shapes`` describes the projection slices repeated in every group.
-    ``per_head_split_shapes`` describes the independently orthogonalizable head slices in the
-    same group. Standard fused QKV has one group per query group, while MLA up-projections have
-    one group per attention head.
+    Both split-shape tuples describe boundaries within one logical group. Standard fused QKV
+    uses one group per query group; MLA up-projections use one group per attention head.
+
+    Projection-level Muon combines the same entry of ``projection_split_shapes`` across all
+    groups into one Newton-Schulz matrix. Per-head Muon instead repeats
+    ``per_head_split_shapes`` for every group and processes every resulting slice independently.
+    For example, two MLA heads with content/positional widths ``(2, 2)`` produce two 4-row
+    projection-level matrices, but four independent 2-row per-head matrices.
     """
 
     num_groups: int
@@ -169,12 +173,19 @@ class QKVLayout:
         )
 
     @classmethod
-    def from_splits(cls, num_groups: int, split_shapes: tuple[int, ...]) -> 'QKVLayout':
-        """Build a layout whose projection slices are repeated once per attention head."""
+    def from_mla_head_components(
+        cls, num_heads: int, component_widths: tuple[int, ...]
+    ) -> 'QKVLayout':
+        """Build an MLA up-projection layout from one head's component widths.
+
+        Each group is one attention head. Projection-level Muon aggregates each component
+        across all heads, whereas per-head Muon processes each component of each head
+        independently.
+        """
         return cls(
-            num_groups=num_groups,
-            projection_split_shapes=split_shapes,
-            per_head_split_shapes=split_shapes,
+            num_groups=num_heads,
+            projection_split_shapes=component_widths,
+            per_head_split_shapes=component_widths,
         )
 
 

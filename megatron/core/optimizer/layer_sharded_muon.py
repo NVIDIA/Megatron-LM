@@ -405,7 +405,7 @@ class LayerShardedMuon(TensorParallelMuon):
                 "active in this class; tp_mode selects the mode for the delegated "
                 "(fallback/degenerate) paths only."
             )
-        if split_qkv:
+        if split_qkv or split_qkv_per_head:
             # The layer-sharded exchange routes whole matrices to their NS homes
             # and never goes through TensorParallelMuon.orthogonalize, where
             # split-QKV is implemented — only the fallback and degenerate paths
@@ -413,8 +413,9 @@ class LayerShardedMuon(TensorParallelMuon):
             # depend on whether param_ns_homes happens to be set; reject it at
             # the class level rather than relying on validate_args alone.
             raise ValueError(
-                "LayerShardedMuon does not implement split-QKV Newton-Schulz on the "
-                "layer-sharded path; pass split_qkv=False (--muon-no-split-qkv)."
+                "LayerShardedMuon does not implement split-QKV or per-head QKV "
+                "Newton-Schulz on the layer-sharded path; pass split_qkv=False and "
+                "split_qkv_per_head=False (--muon-no-split-qkv)."
             )
         # Fail loudly on a Newton-Schulz configuration this stack cannot run (batched NS
         # floor, Triton/SM, batched SYRK kernel) before the parent's emerging-optimizers

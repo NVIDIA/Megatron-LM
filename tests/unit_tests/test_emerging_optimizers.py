@@ -222,7 +222,7 @@ def test_muon_qkv_split_shapes():
     assert _get_qkv_split_shapes(config, split_qkv_per_head=True) == [64] * 32
     assert _get_qkv_split_shapes(gated_config, split_qkv_per_head=True) == [64] * 48
 
-    mla_layout = QKVLayout.from_splits(4, (128, 64))
+    mla_layout = QKVLayout.from_mla_head_components(4, (128, 64))
     assert _get_qkv_split_shapes(mla_layout) == [128, 64]
     assert _get_qkv_split_shapes(mla_layout, split_qkv_per_head=True) == [128, 64] * 4
 
@@ -1683,6 +1683,29 @@ def test_muon_optimizer_uniform_per_head_splits_use_batched_ns():
     torch.testing.assert_close(actual, expected)
 
 
+def test_muon_optimizer_batched_per_head_ns_rejects_old_emerging_optimizers(monkeypatch):
+    """The 3-D NS path reports the installed and required Emerging-Optimizers versions."""
+    grad = torch.zeros(4, 4, dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.is_qkv = True
+    param.qkv_split_shapes = [2, 2]
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[2, 2],
+        pg_collection=None,
+    )
+    monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda _version: False)
+    monkeypatch.setattr(eo_mod, "get_emerging_optimizers_version", lambda: "0.2.0")
+
+    with pytest.raises(
+        ValueError, match="requires emerging-optimizers >= 0.3.0, but 0.2.0 is installed"
+    ):
+        optimizer.orthogonalize(param, grad)
+
+
 def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
     """The pinned Emerging-Optimizers 3D Newton-Schulz path matches 2D head calls."""
     torch.manual_seed(42)
@@ -1717,7 +1740,7 @@ def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
 
 
-def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns():
+def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns(monkeypatch):
     """Nonuniform per-head splits keep using individual Newton-Schulz calls."""
     grad = torch.arange(12, dtype=torch.float32, device='cuda').view(3, 4)
     param = torch.nn.Parameter(torch.zeros_like(grad))
@@ -1737,6 +1760,11 @@ def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns():
         call_shapes.append(tuple(x.shape))
         return x - x.mean(dim=-2, keepdim=True)
 
+    monkeypatch.setattr(
+        eo_mod,
+        "is_emerging_optimizers_min_version",
+        lambda _version: pytest.fail("nonuniform splits must not select batched NS"),
+    )
     optimizer.scaled_orthogonalize_fn = center_rows
     actual = optimizer.orthogonalize(param, grad)
     assert call_shapes == [(2, 4), (1, 4)]
