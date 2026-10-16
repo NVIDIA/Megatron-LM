@@ -38,11 +38,11 @@ def test_prefetch_replays_occurrences(budget, expected):
     # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
     for _ in range(2):
         order.reset()
-        for module, targets, successor in zip(sequence, expected, sequence[1:] + [None]):
+        for module, targets in zip(sequence, expected):
             prefetched.clear()
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
-            assert order.next_item() is successor
+            assert list(order.prefetch(budget)) == prefetched
 
 
 def test_explicit_reset_and_exhaustion():
@@ -52,16 +52,16 @@ def test_explicit_reset_and_exhaustion():
     for _ in range(2):
         order.reset()
         assert order.advance() is a
-        assert order.next_item() is b
-        assert order.next_item() is b
+        assert list(order.prefetch()) == [b]
+        assert list(order.prefetch()) == [b]
         assert list(order) == [a, b, a]
         assert order.advance() is b
         assert order.advance() is a
-        assert order.next_item() is None
+        assert list(order.prefetch()) == []
         with pytest.raises(RuntimeError, match='exceeded'):
             order.advance()
     empty = ExecutionOrder()
-    assert empty.next_item() is None
+    assert list(empty.prefetch()) == []
     with pytest.raises(RuntimeError, match='exceeded'):
         empty.advance()
 
@@ -78,7 +78,7 @@ def test_iteration_and_weak_references():
     assert second_ref() is None
     assert list(order) == [first, first]
     assert order.advance() is first
-    assert order.next_item() is None
+    assert list(order.prefetch()) == []
     # Traversal skips dead references, but the demand cursor must not skip a call.
     with pytest.raises(RuntimeError, match='destroyed'):
         order.advance()
