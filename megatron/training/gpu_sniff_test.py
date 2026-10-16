@@ -23,8 +23,11 @@ Can be run in two ways:
 
 import argparse
 import logging
+import math
 import os
 import sys
+from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 import torch
@@ -46,6 +49,25 @@ MSG_BYTES_SMALL = 1 * 1024 * 1024    # 1 MiB.
 MSG_SIZES = [MSG_BYTES_LARGE, MSG_BYTES_SMALL]
 
 OUTLIER_MIN_DEVIATION_FRAC = 0.10  # Only flag if deviation from mean exceeds 10% of mean.
+
+
+@dataclass(frozen=True)
+class GpuSniffResult:
+    """One local benchmark result with structured workload identity."""
+
+    log_name: str
+    benchmark: str
+    value: float | None
+    unit: str
+    gemm_m: int | None = None
+    gemm_n: int | None = None
+    gemm_k: int | None = None
+    gemm_dtype: str | None = None
+    gemm_label: str | None = None
+    message_size: int | None = None
+    group_size: int | None = None
+    peer_stride: int | None = None
+    peer_rank: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +168,19 @@ def bench_gemms(extra_shapes=None):
         if label:
             name += f", {label}"
         name += ") [TFLOP/s/GPU]"
-        results.append((name, tflops))
+        results.append(
+            GpuSniffResult(
+                log_name=name,
+                benchmark="gemm",
+                value=float(tflops),
+                unit="TFLOP/s",
+                gemm_m=M,
+                gemm_n=N,
+                gemm_k=K,
+                gemm_dtype="bf16",
+                gemm_label=label,
+            )
+        )
         del A, B
     return results
 
@@ -177,7 +211,16 @@ def bench_all_reduce(group):
         avg = _time_cuda_op(_run, WARMUP_ITERS, BENCH_ITERS)
         nbytes = numel * 2
         busbw = 2 * nbytes * (group_size - 1) / group_size / avg / 1e9
-        results.append((f"All-reduce busbw (global PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]", busbw))
+        results.append(
+            GpuSniffResult(
+                log_name=f"All-reduce busbw (global PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]",
+                benchmark="all_reduce",
+                value=float(busbw),
+                unit="GB/s",
+                message_size=nbytes,
+                group_size=group_size,
+            )
+        )
         del buf
     return results
 
@@ -210,7 +253,16 @@ def bench_reduce_scatter(group):
         avg = _time_cuda_op(_run, WARMUP_ITERS, BENCH_ITERS)
         nbytes = numel * 2
         busbw = nbytes * (group_size - 1) / group_size / avg / 1e9
-        results.append((f"Reduce-scatter busbw (TP PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]", busbw))
+        results.append(
+            GpuSniffResult(
+                log_name=f"Reduce-scatter busbw (TP PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]",
+                benchmark="reduce_scatter",
+                value=float(busbw),
+                unit="GB/s",
+                message_size=nbytes,
+                group_size=group_size,
+            )
+        )
         del sendbuf, recvbuf
     return results
 
@@ -243,7 +295,16 @@ def bench_all_to_all(group):
         avg = _time_cuda_op(_run, WARMUP_ITERS, BENCH_ITERS)
         nbytes = numel * 2
         busbw = nbytes * (group_size - 1) / group_size / avg / 1e9
-        results.append((f"All-to-all busbw (EP PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]", busbw))
+        results.append(
+            GpuSniffResult(
+                log_name=f"All-to-all busbw (EP PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]",
+                benchmark="all_to_all",
+                value=float(busbw),
+                unit="GB/s",
+                message_size=nbytes,
+                group_size=group_size,
+            )
+        )
         del sendbuf, recvbuf
     return results
 
@@ -307,13 +368,38 @@ def bench_sendrecv(group):
                 avg = _time_cuda_op(_run, WARMUP_ITERS, BENCH_ITERS)
                 busbw = msg_bytes / avg / 1e9
             else:
-                busbw = float('nan')
+                busbw = None
 
             rank0_partner = global_ranks[stride] if stride < group_size else -1
-            results.append((
-                f"Send/recv busbw (DP PG, {msg_bytes / 1e6:.0f} MB, e.g., rank {global_ranks[0]} <-> rank {rank0_partner}) [GB/s]",
-                busbw,
-            ))
+            log_name = (
+                f"Send/recv busbw (DP PG, {msg_bytes / 1e6:.0f} MB, "
+                f"e.g., rank {global_ranks[0]} <-> rank {rank0_partner}) [GB/s]"
+            )
+            if have_partner:
+                results.append(
+                    GpuSniffResult(
+                        log_name=log_name,
+                        benchmark="send_recv",
+                        value=float(busbw),
+                        unit="GB/s",
+                        message_size=msg_bytes,
+                        group_size=group_size,
+                        peer_stride=stride,
+                        peer_rank=partner_global,
+                    )
+                )
+            else:
+                results.append(
+                    GpuSniffResult(
+                        log_name=log_name,
+                        benchmark="send_recv",
+                        value=None,
+                        unit="GB/s",
+                        message_size=msg_bytes,
+                        group_size=group_size,
+                        peer_stride=stride,
+                    )
+                )
 
         del sendbuf, recvbuf
     return results
@@ -326,6 +412,7 @@ def bench_sendrecv(group):
 def run_sniff_tests(
     ep_group, dp_group, ar_group=None, tp_group=None,
     extra_gemm_shapes=None, tag="",
+    measurement_sink: Callable[[GpuSniffResult], None] | None = None,
 ):
     """Run all sniff tests and report.
 
@@ -336,6 +423,8 @@ def run_sniff_tests(
         tp_group: ProcessGroup for reduce-scatter (or None to skip).
         extra_gemm_shapes: optional list of (M, N, K, label) for additional GEMMs.
         tag: string included in the header (e.g. iteration number).
+        measurement_sink: optional callback invoked for each finite local result
+            before the existing outlier gather.
     """
     rank = dist.get_rank()
     hostnames = _gather_hostnames()
@@ -345,25 +434,27 @@ def run_sniff_tests(
         logger.info(f"{'=' * 60}")
 
     any_outliers = False
-    for name, value in bench_gemms(extra_shapes=extra_gemm_shapes):
-        if _gather_and_check(name, value, hostnames):
-            any_outliers = True
 
-    for name, value in bench_all_reduce(ar_group):
-        if _gather_and_check(name, value, hostnames):
-            any_outliers = True
+    def report_results(results):
+        nonlocal any_outliers
+        for result in results:
+            if (
+                result.value is not None
+                and math.isfinite(result.value)
+                and measurement_sink is not None
+            ):
+                measurement_sink(result)
+            gather_value = result.value if result.value is not None else float('nan')
+            if _gather_and_check(result.log_name, gather_value, hostnames):
+                any_outliers = True
 
-    for name, value in bench_reduce_scatter(tp_group):
-        if _gather_and_check(name, value, hostnames):
-            any_outliers = True
-
-    for name, value in bench_all_to_all(ep_group):
-        if _gather_and_check(name, value, hostnames):
-            any_outliers = True
-
-    for name, value in bench_sendrecv(dp_group):
-        if _gather_and_check(name, value, hostnames):
-            any_outliers = True
+    # Finish each family's reporting before starting the next benchmark. This
+    # preserves collective ordering and completed results if a later family fails.
+    report_results(bench_gemms(extra_shapes=extra_gemm_shapes))
+    report_results(bench_all_reduce(ar_group))
+    report_results(bench_reduce_scatter(tp_group))
+    report_results(bench_all_to_all(ep_group))
+    report_results(bench_sendrecv(dp_group))
 
     if rank == 0:
         status = "OUTLIERS DETECTED" if any_outliers else "ALL RANKS OK"
@@ -410,12 +501,13 @@ def _get_ffn_gemm_shapes():
     ]
 
 
-def run_gpu_sniff_test(tag="", pg_collection=None):
+def run_gpu_sniff_test(tag="", pg_collection=None, measurement_sink=None):
     """Called from the Megatron training loop.
 
     Args:
         tag: string included in the header (e.g. "iteration 100").
         pg_collection: a ProcessGroupCollection. If None, one is built from mpu.
+        measurement_sink: optional finite-result callback used by integrated telemetry.
     """
     if pg_collection is None:
         from megatron.core.process_groups_config import ProcessGroupCollection
@@ -433,6 +525,7 @@ def run_gpu_sniff_test(tag="", pg_collection=None):
         tp_group=pg_collection.tp,
         extra_gemm_shapes=ffn_shapes,
         tag=tag,
+        measurement_sink=measurement_sink,
     )
 
 
