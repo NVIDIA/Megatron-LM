@@ -2750,13 +2750,6 @@ def _add_regularization_args(parser):
     group.add_argument('--lion-beta2', type=float, default=0.98,
                        help='Second beta coefficient for Lion optimizer '
                        '(used in momentum EMA update). Default: 0.98.')
-
-    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
-                       help='Type of no weight decay condition. Choices: '
-                       'None (default): apply weight decay to 1D weights and biases.'
-                       '"apply_wd_to_qk_layernorm": additionally apply weight decay to '
-                       'qk layernorm as a special case.'
-                       'DEPRECATED. Please use --apply-wd-to-qk-layernorm instead. ')
     return parser
 
 
@@ -2903,7 +2896,7 @@ def _add_initialization_args(parser):
 def _add_learning_rate_args(parser):
     from megatron.training.config import SchedulerConfig
 
-    sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=["no_weight_decay_cond_type"])
+    sched_factory = ArgumentGroupFactory(SchedulerConfig)
     group = sched_factory.build_group(parser, title="learning rate and weight decay")
 
     group.add_argument('--lr', type=float, default=None,

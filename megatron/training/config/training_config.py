@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import os
 import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
@@ -244,7 +243,6 @@ class SchedulerConfig:
         weight_decay: float | None,
     ) -> None:
         """Check this section against the rest of the run it belongs to."""
-        from megatron.training.utils import print_rank_0
 
         if train_iters and not skip_train:
             # If we use iteration-based training, make sure the
@@ -274,12 +272,9 @@ class SchedulerConfig:
                     'can only specify one of lr-warmup-fraction ' \
                     'and lr-warmup-samples'
 
-        if self.weight_decay_incr_style == 'constant':
-            assert self.start_weight_decay is None
-            assert self.end_weight_decay is None
-        else:
-            assert self.start_weight_decay is not None
-            assert self.end_weight_decay is not None
+        if self.weight_decay_incr_style == "constant":
+            for v in (self.start_weight_decay, self.end_weight_decay):
+                assert v is None or v == weight_decay
 
     def finalize_scheduler_config(self, weight_decay: float | None) -> None:
         """Finalize the scheduler configuration after validation and before training starts."""
