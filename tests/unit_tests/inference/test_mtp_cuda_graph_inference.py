@@ -33,16 +33,27 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
+    MultiTokenPredictionLayer,
+    MultiTokenPredictionLayerSubmodules,
+)
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
 

@@ -320,7 +320,9 @@ def test_shortcut_router_receives_runtime_cp():
         ),
     )
     ShortcutMoEBlock._moe_router_preprocess(block, hidden, padding_mask, packed)
-    mlp.route.assert_called_once_with(hidden, padding_mask, packed_seq_params=packed)
+    mlp.route.assert_called_once_with(
+        hidden, padding_mask, input_ids=None, packed_seq_params=packed
+    )
 
 
 def test_token_count_reduction_keeps_local_count_with_in_place_reduce(monkeypatch):

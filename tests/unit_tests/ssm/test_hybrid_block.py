@@ -936,6 +936,7 @@ class TestHybridBlock:
             layer_pattern,
             stack_spec=stack_spec,
             experimental_attention_variant="gdn2",
+            linear_attention_freq=1,
             linear_conv_kernel_dim=4,
             linear_key_head_dim=64,
             linear_value_head_dim=64,

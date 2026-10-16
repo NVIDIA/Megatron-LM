@@ -80,6 +80,8 @@ def _build_stack(
         fp32_residual_connection=fp32_residual,
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
+        # Explicitly exercise stack-owned CP layout handling in this parity test.
+        linear_cp_layout="zigzag",
         sequence_parallel=tp_size > 1,
         expert_model_parallel_size=2,
         expert_tensor_parallel_size=1,

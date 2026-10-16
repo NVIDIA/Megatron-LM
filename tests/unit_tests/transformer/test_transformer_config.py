@@ -513,6 +513,23 @@ def test_sequence_packing_moe_hybridep_with_uneven_input_padding_passes():
     )
 
     assert config.variable_seq_lengths is True
+    assert config.moe_hybridep_pad_variable_tokens is True
+    assert config.moe_hybridep_pad_uneven_dispatch_inputs is True
+
+
+@pytest.mark.parametrize(
+    "dev_flag,main_flag", [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_hybridep_padding_flag_spellings_share_one_setting(dev_flag, main_flag):
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        moe_hybridep_pad_variable_tokens=dev_flag,
+        moe_hybridep_pad_uneven_dispatch_inputs=main_flag,
+    )
+    assert config.moe_hybridep_pad_variable_tokens == (dev_flag or main_flag)
+    assert config.moe_hybridep_pad_uneven_dispatch_inputs == (dev_flag or main_flag)
 
 
 def test_sequence_packing_rejects_unknown_scheduler():

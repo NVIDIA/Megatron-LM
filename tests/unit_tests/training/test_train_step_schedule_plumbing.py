@@ -536,6 +536,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         ),
         dist=SimpleNamespace(use_megatron_fsdp=False, use_torch_fsdp2=False),
         rng=SimpleNamespace(data_parallel_random_init=False),
+        rl=SimpleNamespace(perform_rl_step=False),
     )
     pg_collection = mock.Mock()
 

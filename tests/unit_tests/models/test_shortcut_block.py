@@ -254,7 +254,14 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         assert kwargs == expected_layer_kwargs
         return hidden_states
 
-    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
+    def route(
+        shortcut_hidden,
+        padding_mask=None,
+        packed_seq_params=None,
+        input_ids=None,
+        recompute_context=None,
+    ):
+        assert input_ids is None
         assert recompute_context is attn_context
         observed["route_packed"] = packed_seq_params
         return shortcut_hidden, shortcut_hidden
@@ -340,7 +347,14 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     def two_stage(*_args, **_kwargs):
         raise AssertionError("inference must not use the two-stage training path")
 
-    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
+    def route(
+        shortcut_hidden,
+        padding_mask=None,
+        packed_seq_params=None,
+        input_ids=None,
+        recompute_context=None,
+    ):
+        assert input_ids is None
         observed["route_input"] = shortcut_hidden
         return shortcut_hidden, shortcut_hidden
 
@@ -545,8 +559,14 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.mlp = FakeMLP()
 
         def shortcut_route_preprocess(
-            self, shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None
+            self,
+            shortcut_hidden,
+            padding_mask=None,
+            packed_seq_params=None,
+            input_ids=None,
+            recompute_context=None,
         ):
+            assert input_ids is None
             assert recompute_context is None
             assert_quant_layer(1)
             return shortcut_hidden * self.route_scale, shortcut_hidden * self.prob_scale
@@ -680,10 +700,12 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
 
     moe_layer = _FakeMoE(config)
     mlp = moe_layer.mlp
-    mlp.route = lambda hidden_states, padding_mask=None, packed_seq_params=None: (
-        torch.ones_like(hidden_states),
-        torch.ones_like(hidden_states, dtype=torch.bool),
-    )
+
+    def route(hidden_states, padding_mask=None, input_ids=None, packed_seq_params=None):
+        assert input_ids is None
+        return torch.ones_like(hidden_states), torch.ones_like(hidden_states, dtype=torch.bool)
+
+    mlp.route = route
     mlp.preprocess = lambda hidden_states, probs, routing_map, padding_mask=None: (
         hidden_states,
         probs,

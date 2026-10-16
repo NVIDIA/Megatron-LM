@@ -82,6 +82,8 @@ def test_grouped_mtp_loss_rolls_preserve_conditioning_gradients(
     )
     seq_len = 5
     hidden = torch.ones(3 * seq_len, 1, 1, requires_grad=True)
+    # GPU training tests may have installed a CUDA scale in this process-global slot.
+    monkeypatch.setattr(mtp.MTPLossAutoScaler, "main_loss_backward_scale", hidden.new_tensor(1.0))
     tokens = torch.arange(seq_len).unsqueeze(0)
     validity = torch.tensor([[True, False, True, True, True]]) if with_input_mask else None
     calls = []

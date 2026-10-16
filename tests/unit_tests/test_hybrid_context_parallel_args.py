@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""validate_args must reject CUDA graphs with hybrid (dynamic) context parallelism.
+"""Retained dev THD graph paths require fixed padded token capacity.
 
-A captured graph bakes in static communicators, so it cannot follow the per-microbatch
-context-parallel group that hybrid context parallelism selects at runtime.
+Main's blanket hybrid-CP rejection does not apply to the dev implementation. Keep
+dev's local-graph rejection, static-metadata prerequisites and legacy normalization.
 """
 
 import sys
@@ -12,7 +12,8 @@ import pytest
 
 from megatron.training.arguments import parse_args, validate_args
 
-_GUARD = "Hybrid context parallelism not supported with CUDA Graph"
+_GUARD = "THD CUDA Graph requires --pad-packed-seq-alignment"
+_LOCAL_GUARD = "Dynamic context parallelism not supported with local CUDA Graph"
 
 
 def _hybrid_cp_args(monkeypatch, **overrides):
@@ -44,26 +45,59 @@ def _hybrid_cp_args(monkeypatch, **overrides):
 @pytest.mark.parametrize(
     "cuda_graph_impl, prerequisites",
     [
-        ("local", {}),
         ("transformer_engine", {}),
-        # full_iteration has its own prerequisite, checked before the hybrid-CP guard.
+        # full_iteration also requires NaN checking to be disabled during capture.
         ("full_iteration", {"check_for_nan_in_loss_and_grad": False}),
     ],
 )
-def test_hybrid_context_parallel_rejects_cuda_graph_impl(
+def test_hybrid_context_parallel_cuda_graph_requires_static_padding(
     monkeypatch, cuda_graph_impl, prerequisites
 ):
     args = _hybrid_cp_args(monkeypatch, cuda_graph_impl=cuda_graph_impl, **prerequisites)
-    with pytest.raises(AssertionError, match=_GUARD):
+    with pytest.raises(ValueError, match=_GUARD):
         validate_args(args)
 
 
 @pytest.mark.parametrize("deprecated_flag", ["enable_cuda_graph", "external_cuda_graph"])
-def test_hybrid_context_parallel_rejects_deprecated_cuda_graph_flags(monkeypatch, deprecated_flag):
+def test_hybrid_context_parallel_legacy_cuda_graph_flags_use_canonical_guards(
+    monkeypatch, deprecated_flag
+):
     # validate_args translates these into cuda_graph_impl and deletes them before the
     # hybrid-CP checks run, so the guard must read cuda_graph_impl.
     args = _hybrid_cp_args(monkeypatch, **{deprecated_flag: True})
-    with pytest.raises(AssertionError, match=_GUARD):
+    error = AssertionError if deprecated_flag == "enable_cuda_graph" else ValueError
+    message = _LOCAL_GUARD if deprecated_flag == "enable_cuda_graph" else _GUARD
+    with pytest.raises(error, match=message):
+        validate_args(args)
+
+
+@pytest.mark.parametrize("alignment", [None, "max"])
+def test_hybrid_context_parallel_rejects_local_graphs(monkeypatch, alignment):
+    args = _hybrid_cp_args(monkeypatch, cuda_graph_impl="local", pad_packed_seq_alignment=alignment)
+    with pytest.raises(AssertionError, match=_LOCAL_GUARD):
+        validate_args(args)
+
+
+@pytest.mark.parametrize("alignment", ["max", 1024])
+@pytest.mark.parametrize("cuda_graph_impl", ["transformer_engine", "full_iteration"])
+def test_hybrid_context_parallel_fixed_padding_validates(monkeypatch, cuda_graph_impl, alignment):
+    args = _hybrid_cp_args(
+        monkeypatch,
+        cuda_graph_impl=cuda_graph_impl,
+        pad_packed_seq_alignment=alignment,
+        check_for_nan_in_loss_and_grad=False,
+    )
+    validate_args(args)
+    assert args.cuda_graph_impl == cuda_graph_impl
+    assert args.dynamic_context_parallel is True
+
+
+@pytest.mark.parametrize("alignment", [128, 512])
+def test_hybrid_context_parallel_cuda_graph_rejects_nonstatic_padding(monkeypatch, alignment):
+    args = _hybrid_cp_args(
+        monkeypatch, cuda_graph_impl="transformer_engine", pad_packed_seq_alignment=alignment
+    )
+    with pytest.raises(ValueError, match=_GUARD):
         validate_args(args)
 
 

@@ -128,16 +128,15 @@ def checkpointed_forward(
                         if padding_mask_by_layout is not None
                         else padding_mask
                     ),
-                    input_ids=(
-                        input_ids_by_layout[cp_layout_state.manager.layer_layouts[index]]
-                        if input_ids_by_layout is not None
-                        else input_ids
-                    ),
                 )
                 inner_layer = getattr(layer, "inner_layer", layer)
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
                 if input_ids is not None and getattr(router, "is_hash_layer", False):
-                    layer_kwargs["input_ids"] = input_ids
+                    layer_kwargs["input_ids"] = (
+                        input_ids_by_layout[cp_layout_state.manager.layer_layouts[index]]
+                        if input_ids_by_layout is not None
+                        else input_ids
+                    )
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)

@@ -3,6 +3,10 @@
 import pytest
 import torch
 
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -14,7 +18,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
@@ -112,13 +116,33 @@ def _get_stack(
     )
 
 
-def test_mhc_mtp_requires_hybrid_contract():
-    config = _get_config(num_layers=1, mtp_num_layers=1)
-
-    with pytest.raises(ValueError, match="requires the HybridModel MTP contract"):
-        MultiTokenPredictionLayer(
-            config=config, submodules=object(), layer_number=1, pg_collection=None
+def test_mhc_mtp_supports_gpt_contract():
+    """The retained GPT MTP path uses separate projections and learned contraction."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = _get_config(num_layers=1, mtp_num_layers=1)
+        spec = get_gpt_mtp_block_spec(
+            config=config,
+            spec=get_gpt_layer_local_spec(enable_hyper_connection=True),
+            use_transformer_engine=False,
         )
+        mtp = MultiTokenPredictionBlock(
+            config=config, spec=spec, pg_collection=_get_pg_collection()
+        )
+        assert len(mtp.layers) == 1
+        layer = mtp.layers[0]
+        assert layer.mtp_layer_pattern is None
+        assert isinstance(layer.mtp_model_layer, TransformerLayer)
+        assert layer.mhc_enabled
+        assert layer.eh_proj is None
+        assert layer.e_proj.weight.shape == (config.hidden_size, config.hidden_size)
+        assert layer.h_proj.weight.shape == (config.hidden_size, config.hidden_size)
+        streams = config.mhc_num_residual_streams
+        assert layer.hc_head_fn.shape == (streams, streams * config.hidden_size)
+        assert layer.hc_head_base.shape == (streams,)
+        assert layer.hc_head_scale.shape == (1,)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.internal

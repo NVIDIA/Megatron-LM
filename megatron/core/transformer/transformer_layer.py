@@ -1865,24 +1865,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # Add input_ids for hash-based MoE routing under CUDA graphs.
         # Only add for layers that actually use hash routing,
         # since other layers (e.g. on later PP stages) receive input_ids=None.
-        if (
-            self.is_moe_layer
-            and self.config.moe_n_hash_layers > 0
-            and getattr(self.mlp.router, 'is_hash_layer', False)
-        ):
+        if self.is_moe_layer and getattr(self.mlp.router, 'is_hash_layer', False):
             input_ids_shape = (
                 (1, self.config.max_seqlen_per_dp_cp_rank)
                 if self._is_thd_cuda_graph()
-                else (micro_batch_size, seq_length)
+                else (micro_batch_size, static_inputs["hidden_states"].shape[0])
             )
             static_inputs["input_ids"] = torch.zeros(
                 input_ids_shape, dtype=torch.long, device=torch.cuda.current_device()
-            )
-        if self.is_moe_layer and getattr(self.mlp.router, 'is_hash_layer', False):
-            static_inputs["input_ids"] = torch.zeros(
-                (micro_batch_size, static_inputs["hidden_states"].shape[0]),
-                dtype=torch.long,
-                device=torch.cuda.current_device(),
             )
 
         # Reserve a padding_mask graph input when the eager warmup steps before capture gave this

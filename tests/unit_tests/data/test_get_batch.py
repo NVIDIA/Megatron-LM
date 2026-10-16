@@ -1671,18 +1671,9 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
 
     cp_batch = get_batch(data_iterator)
     batch = cp_batch.get_batch()
-    (
-        attention_mask,
-        cu_seqlens,
-        cu_seqlens_padded,
-        hybrid_cp_group,
-        labels,
-        local_cp_size,
-        loss_mask,
-        max_seqlen,
-        position_ids,
-        tokens,
-    ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
+    attention_mask, labels, loss_mask, position_ids, tokens = [
+        batch[key] for key in ("attention_mask", "labels", "loss_mask", "position_ids", "tokens")
+    ]
     padding_mask = batch.get("padding_mask")
     packed_seq_params = cp_batch.get_packed_seq_params()
 
@@ -1695,11 +1686,11 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert loss_mask is not None
     assert position_ids is not None
     assert attention_mask is None
-    assert cu_seqlens is None
-    assert cu_seqlens_padded is None
-    assert hybrid_cp_group is None
-    assert max_seqlen is None
-    assert local_cp_size is None
+    # ContextParallelBatch moves packing/CP metadata into PackedSeqParams.
+    assert (
+        not {"cu_seqlens", "cu_seqlens_padded", "hybrid_cp_group", "max_seqlen", "local_cp_size"}
+        & batch.keys()
+    )
 
     # Data iterator parameters (must match create_hybrid_cp_data_iterator)
     n_seqs = max(2, 2 * cp_size)

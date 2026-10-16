@@ -897,7 +897,15 @@ def _roll_tensors_packed_seq(
             positions = torch.arange(reference_tensor.size(dims), device=reference_tensor.device)
             doc_idx = torch.searchsorted(cu_seqlens, positions, right=True) - 1
             doc_idx = doc_idx.clamp(min=0, max=cu_seqlens.numel() - 2)
-            valid_ends = cu_seqlens[:-1] + (valid_cu_seqlens[1:] - valid_cu_seqlens[:-1])
+            valid_lengths = valid_cu_seqlens[1:] - valid_cu_seqlens[:-1]
+            # Static THD metadata can append empty/dummy physical sequences
+            # without adding logical documents. Their valid lengths are zero.
+            extra_sequences = cu_seqlens.numel() - valid_cu_seqlens.numel()
+            if extra_sequences < 0:
+                raise ValueError("Packed physical boundaries must cover every logical sequence.")
+            if extra_sequences:
+                valid_lengths = torch.nn.functional.pad(valid_lengths, (0, extra_sequences))
+            valid_ends = cu_seqlens[:-1] + valid_lengths
             valid_end_mask = positions + 1 >= valid_ends[doc_idx]
         rolled = [
             _roll_tensor_packed_seq_cp1(

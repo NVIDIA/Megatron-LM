@@ -597,6 +597,8 @@ class TestSerialization:
                 'prefix_key_to_remove',
             }
 
+            # Finish every rank's read before rank 0 rewrites the shared metadata.
+            torch.distributed.barrier()
             if torch.distributed.get_rank() == 0:
                 remove_sharded_tensors(ckpt_dir, key_prefix=prefix_name)
             torch.distributed.barrier()

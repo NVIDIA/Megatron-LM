@@ -182,6 +182,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
+        # Direct library callers need not set the training frontend's is_hybrid_model flag.
+        if (
+            config.enable_mhc_connections
+            and config.pipeline_model_parallel_size > 1
+            and config.overlap_moe_expert_parallel_comm
+        ):
+            raise NotImplementedError(
+                "mHC HybridModel pipeline parallelism does not support "
+                "overlap_moe_expert_parallel_comm. "
+                "Use the ordinary pipeline schedule for multi-stream residuals."
+            )
         super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):

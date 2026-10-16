@@ -21,6 +21,7 @@ import torch
 # today; switch to a public per-rank ownership helper once one is exported again.
 from megatron.core.context_parallel_layout.routes import _build_thd_layout_segments
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
     _ZZ_PACK_OK,
     _ensure_pack_zigzag_ok,
@@ -1704,7 +1705,7 @@ def test_balanced_ratio4_layer_rejects_custom_spec_without_indexer(monkeypatch):
         layer_number=1,
         attn_mask_type=AttnMaskType.causal,
         attention_type="self",
-        pg_collection=object(),
+        pg_collection=ProcessGroupCollection(tp=_StubGroup(1, 0), cp=_StubGroup(4, 0)),
         rotary_pos_emb=None,
     )
     with pytest.raises(ValueError, match="selected module spec provides none"):
@@ -1760,6 +1761,11 @@ def test_zigzag_scoring_matches_reference():
     class _StubIndexer:
         def __init__(self):
             self._w = torch.randint(-2, 3, (heads * dim, q_lora), device=dev).to(torch.bfloat16)
+            # A constant non-RoPE head contributes a small positive, distinct
+            # key signature. Otherwise ReLU can tie many keys at zero exactly
+            # at top-k's boundary, whose membership is unspecified across batches.
+            self._w[:dim].zero_()
+            self._w[0, 0] = 1
             self.rotary_pos_emb = _StubRotary(
                 torch.randn(msq, 1, 1, pos_dim, dtype=torch.float32, device=dev)
             )
@@ -1770,11 +1776,19 @@ def test_zigzag_scoring_matches_reference():
 
     stub = _StubIndexer()
     qr = torch.randint(-2, 3, (cap, 1, q_lora), device=dev).to(torch.bfloat16)
+    qr[..., 0] = 1
     w = (torch.rand(cap, heads, dtype=torch.float32, device=dev) + 0.5).to(torch.bfloat16)
     cu = torch.tensor(cu_list, dtype=torch.int32, device=dev)
     cu_comp = _comp_cu(cu.cpu()).to(dev)
     comp = int(cu_comp[-1])
-    k = torch.randn(comp, dim, dtype=torch.bfloat16, device=dev)
+    # Hadamard maps the anchor head to a constant vector. Paired noise has
+    # zero sum, leaving an exactly representable positive per-key signature;
+    # the other three heads still exercise the random projection and RoPE.
+    noise = torch.randn(comp, (dim - 2) // 2, dtype=torch.bfloat16, device=dev)
+    key_ids = torch.arange(comp, device=dev)
+    high = (1 + key_ids // 128).to(torch.bfloat16).unsqueeze(-1)
+    low = (key_ids % 128).to(torch.bfloat16).unsqueeze(-1) / 128
+    k = torch.cat((high, low, noise, -noise), dim=-1)
     scale = dim**-0.5
 
     def _layout_topk(q, w_rows, k_pass, layout3):
@@ -1805,7 +1819,13 @@ def test_zigzag_scoring_matches_reference():
         )
         scores = scores.masked_fill(~valid, float("-inf"))
         width = min(topk, k_pass.shape[0])
-        values, sel = torch.topk(scores, width, dim=-1)
+        values, sel = torch.topk(scores, min(width + 1, k_pass.shape[0]), dim=-1)
+        if width < k_pass.shape[0]:
+            tied_cutoff = torch.isfinite(values[:, width]) & (
+                values[:, width - 1] == values[:, width]
+            )
+            assert not tied_cutoff.any(), "fixture must have a unique top-k boundary"
+        values, sel = values[:, :width], sel[:, :width]
         out = torch.full((rows, topk), -1, dtype=torch.int32, device=q.device)
         out[:, :width] = torch.where(torch.isfinite(values), k_pos[sel].to(torch.int32), -1)
         return out
@@ -1854,6 +1874,9 @@ def test_zigzag_scoring_matches_reference():
             (slice(half, None), "tail_layout", "pos_tail"),
         ):
             q_c = _project_rope(rows_q[sl], plan[pos], plan[lay])
+            torch.testing.assert_close(
+                q_c, q_ref.index_select(0, plan["gather_idx"][sl]), rtol=0, atol=0
+            )
             parts.append(_layout_topk(q_c, rows_w[sl], k, plan[lay]))
         Z[r * l_local : (r + 1) * l_local] = torch.cat(parts)
     for r in range(cp_size):

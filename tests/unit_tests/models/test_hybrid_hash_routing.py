@@ -159,7 +159,9 @@ class PassthroughHyperConnection(torch.nn.Module):
 def wrap_with_passthrough_mhc(inner_layer):
     wrapper = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
     torch.nn.Module.__init__(wrapper)
-    wrapper.config = SimpleNamespace(fp32_residual_connection=False, params_dtype=None)
+    wrapper.config = SimpleNamespace(
+        fp32_residual_connection=False, params_dtype=None, cuda_graph_impl="none"
+    )
     wrapper.inner_layer = inner_layer
     wrapper.layer_number = inner_layer.layer_number
     wrapper.hyper_connection = PassthroughHyperConnection()
@@ -245,6 +247,46 @@ def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature
     assert transformer_layer.calls[0]['input_ids'] is input_ids
     assert 'input_ids' not in learned_transformer_layer.calls[0]
     assert non_transformer_layer.num_calls == 1
+
+
+@pytest.mark.parametrize("full_recompute", [False, True])
+def test_hybrid_stack_forwards_layout_specific_ids_only_to_hash_layers(monkeypatch, full_recompute):
+    monkeypatch.setattr(
+        recompute_module.tensor_parallel,
+        "checkpoint",
+        lambda function, _distribute_saved_activations, *args: function(*args),
+    )
+    first_hash = RecordingTransformerLayer()
+    second_hash = RecordingTransformerLayer(layer_number=2)
+    learned = RecordingTransformerLayer(layer_number=3, is_hash_layer=False)
+    stack = make_stack(
+        [first_hash, second_hash, learned],
+        recompute_granularity="full" if full_recompute else None,
+        recompute_method="uniform" if full_recompute else None,
+        recompute_num_layers=3 if full_recompute else None,
+    )
+    input_ids = torch.arange(8).reshape(2, 4)
+    converted_ids = {"zigzag": input_ids + 100, "contiguous": input_ids + 200}
+    manager = SimpleNamespace(layer_layouts=("zigzag", "contiguous", "zigzag"))
+
+    def convert_metadata(value, layout):
+        assert value is input_ids
+        return converted_ids[layout]
+
+    state = SimpleNamespace(
+        manager=manager,
+        convert_sequence_metadata=convert_metadata,
+        prepare_layer=lambda _index, hidden: (hidden, None),
+        finalize_layer=lambda _index, hidden: hidden,
+    )
+    manager.build_forward_state = lambda *_args, **_kwargs: state
+    stack._cp_layout_manager = manager
+
+    run_stack(stack, input_ids)
+
+    assert first_hash.calls[0]["input_ids"] is converted_ids["zigzag"]
+    assert second_hash.calls[0]["input_ids"] is converted_ids["contiguous"]
+    assert "input_ids" not in learned.calls[0]
 
 
 def test_hybrid_mhc_wrapper_passes_ids_and_recompute_manager_to_mlp_branch():
@@ -397,6 +439,7 @@ def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
             mlp_chunks_for_training=2,
             transformer_impl="local",
             inference_fuse_tp_communication=False,
+            sequence_parallel=False,
         ),
         training=True,
         mlp=moe,

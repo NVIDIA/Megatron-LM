@@ -709,14 +709,20 @@ def test_indexer_metrics_average_only_ratio4_layers(monkeypatch: pytest.MonkeyPa
     DSAIndexerLossLoggingHelper.tracker = {
         "values": torch.tensor([0.0, 3.0, 0.0, 0.0, 0.0], device="cuda")
     }
-    monkeypatch.setattr(DSAIndexerLossLoggingHelper, "reduce_loss_in_tracker", lambda **_: None)
+    groups = ProcessGroupCollection(pp=object(), dp=object())
+
+    def reduce_loss(**kwargs):
+        assert kwargs["pp_group"] is groups.pp
+        assert kwargs["dp_group"] is groups.dp
+
+    monkeypatch.setattr(DSAIndexerLossLoggingHelper, "reduce_loss_in_tracker", reduce_loss)
     total_loss_dict = {}
     try:
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=0.5,
             iteration=1,
             writer=None,
-            pg_collection=object(),
+            pg_collection=groups,
             total_loss_dict=total_loss_dict,
             num_layers=5,
             num_indexer_layers=1,

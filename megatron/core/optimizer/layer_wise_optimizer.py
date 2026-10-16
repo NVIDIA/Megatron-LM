@@ -688,10 +688,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # launch it: a full layout uses the fixed-size parameter buffer, while the variable-size
         # path without a full layout uses grad_data. False means the optimizer calls
         # allgather_params() synchronously after its step, using temporary flatten/receive buffers.
-        self.layerwise_param_sync_via_bucket_group = (
-            self.ddp_config.param_sync_via_bucket_group
+        reuse_grad_buf_for_param_sync = (
+            self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
             if self.ddp_config is not None
-            else self.overlap_param_gather or config.reuse_grad_buf_for_mxfp8_param_ag
+            else config.reuse_grad_buf_for_mxfp8_param_ag
+        )
+        # The model-level DistOpt flag can belong only to sibling AdamW buffers:
+        # compact LayerWise buffers override it to False. Select our own gather path
+        # from the LayerWise layout, while retaining DDP-owned overlap/reuse policies.
+        self.layerwise_param_sync_via_bucket_group = (
+            self.use_buffer_param_sync or self.overlap_param_gather or reuse_grad_buf_for_param_sync
         )
 
         needs_variable_size_bucket_metadata = (

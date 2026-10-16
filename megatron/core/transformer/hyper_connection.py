@@ -111,6 +111,12 @@ def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
+@torch.compile
+def _native_h_aggregate_into_forward(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
+    """Fuse the same multiply/reduction as native_h_aggregate into caller-owned storage."""
+    return torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+
+
 class NativeHAggregateInto(torch.autograd.Function):
     """Native H-aggregate whose result is produced in caller-owned storage.
 
@@ -140,7 +146,10 @@ class NativeHAggregateInto(torch.autograd.Function):
             raise ValueError("H-aggregate caller-owned output must be a detached tensor")
 
         ctx.mark_dirty(out)
-        torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+        # An eager multiply materializes a rounded intermediate;
+        # the allocating path fuses it with the reduction. Keep both paths fused
+        # without allocating an aggregate and copying it into the graph's slot.
+        _native_h_aggregate_into_forward(x, h_pre, out)
         ctx.save_for_backward(x, h_pre)
         return out
 

@@ -65,6 +65,19 @@ def patch_hadamard_if_needed():
         yield
 
 
+@pytest.fixture
+def deterministic_csa_reference(monkeypatch):
+    """Isolate deferred wgrads from the reference gather's BF16 atomic backward."""
+    previous_mode = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous_mode, warn_only=previous_warn_only)
+
+
 # ---------------------------------------------------------------------------
 # Config / build helpers
 # ---------------------------------------------------------------------------
@@ -294,6 +307,7 @@ class TestDSv4HybridCSADelayedWgradFlush:
         yield
         Utils.destroy_model_parallel()
 
+    @pytest.mark.usefixtures("deterministic_csa_reference")
     def test_csa_deferred_wgrads_flushed_through_core_attention(self):
         seq_len = 256
         batch_size = 2

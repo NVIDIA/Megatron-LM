@@ -43,7 +43,7 @@ from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module, MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -460,8 +460,11 @@ class TestHybridModel:
         seen_bda_managers = []
         seen_inner_managers = []
 
-        def fake_hyper_connection_forward(hidden_states, mhc_recompute_manager=None):
+        def fake_hyper_connection_forward(
+            hidden_states, mhc_recompute_manager=None, return_residual=False
+        ):
             assert mhc_recompute_manager is manager
+            assert return_residual is True
             s, b, _ = hidden_states.shape
             n = model_config.num_residual_streams
             c = model_config.hidden_size
@@ -837,15 +840,16 @@ class TestHybridModel:
             decoder.config.recompute_num_layers = 2
         if convert_cp_layout:
             # Exercise both layout boundaries without requiring a multi-rank CP group.
+            layout_manager = SimpleNamespace(
+                layer_layouts=(decoder.config.attention_cp_layout,) * len(decoder.layers)
+            )
             layout_state = SimpleNamespace(
+                manager=layout_manager,
                 prepare_layer=lambda index, tensor: (tensor.roll(1, dims=0), None),
                 finalize_layer=lambda index, tensor: tensor.roll(-1, dims=0),
             )
-            monkeypatch.setattr(
-                decoder,
-                "_cp_layout_manager",
-                SimpleNamespace(build_forward_state=lambda *args, **kwargs: layout_state),
-            )
+            layout_manager.build_forward_state = lambda *args, **kwargs: layout_state
+            monkeypatch.setattr(decoder, "_cp_layout_manager", layout_manager)
 
         expected_residuals = {}
 
@@ -1677,35 +1681,44 @@ class TestMLADownProjFusion:
 
         return copy.deepcopy(hybrid_stack_spec.submodules)
 
-    def _call_fuse(self, submodules, *, mla_down_proj_fusion):
-        """Invoke `_fuse_mla_down_proj` as an unbound method with a minimal
-        stub for `self`. The method only reads `self.config`, so we can avoid
-        constructing a full `HybridStack`.
-        """
-        from megatron.core.models.hybrid.hybrid_block import HybridStack
+    def _build_with_specs(
+        self, submodules, *, mla_down_proj_fusion, pattern="M+-", **config_overrides
+    ):
+        """Record the specs selected by the real stack while constructing its layers."""
+        with patch(
+            "megatron.core.models.hybrid.hybrid_block.build_module", wraps=build_module
+        ) as build:
+            model = self._build_model(
+                pattern=pattern,
+                spec=ModuleSpec(module=HybridStack, submodules=submodules),
+                mla_down_proj_fusion=mla_down_proj_fusion,
+                **config_overrides,
+            )
+        selected_specs = [
+            call.args[0] for call in build.call_args_list if "layer_number" in call.kwargs
+        ]
+        assert len(selected_specs) == len(model.decoder.layers)
+        return model, selected_specs
 
-        stub = SimpleNamespace(config=SimpleNamespace(mla_down_proj_fusion=mla_down_proj_fusion))
-        # Mimic the call-site check in `HybridStack.__init__`.
-        if getattr(stub.config, "mla_down_proj_fusion", False):
-            submodules = HybridStack._fuse_mla_down_proj(stub, submodules)
-        return submodules
-
-    def test_disabled_returns_spec_unchanged(self):
-        """Flag off: method returns the same object, no copying or rewriting."""
+    def test_disabled_selects_unfused_spec_without_mutation(self):
+        """Flag off: construction selects the original unfused spec without rewriting it."""
         submodules = self._fresh_submodules()
-        result = self._call_fuse(submodules, mla_down_proj_fusion=False)
-        assert result is submodules
+        baseline = self._fresh_submodules()
+        _, selected_specs = self._build_with_specs(submodules, mla_down_proj_fusion=False)
+        assert selected_specs[1] is submodules.mla_layer
+        _assert_equal_with_partial_contents(submodules, baseline)
 
-    def test_enabled_rewrites_mla_spec(self):
-        """Flag on: MLA spec is swapped to the fused module and fused linear."""
+    def test_enabled_selects_prebuilt_fused_spec(self):
+        """Flag on: construction selects the pre-built fused module and fused linear."""
         from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
         from megatron.core.transformer.identity_op import IdentityOp
         from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 
         submodules = self._fresh_submodules()
-        result = self._call_fuse(submodules, mla_down_proj_fusion=True)
+        _, selected_specs = self._build_with_specs(submodules, mla_down_proj_fusion=True)
 
-        mla_spec = result.mla_layer
+        mla_spec = selected_specs[1]
+        assert mla_spec is submodules.mla_fused_down_proj_layer
         assert mla_spec.submodules.input_layernorm is IdentityOp
         assert mla_spec.submodules.self_attention.module is FusedMLASelfAttention
 
@@ -1714,23 +1727,22 @@ class TestMLADownProjFusion:
         assert attn_submodules.linear_q_down_proj is None
         assert attn_submodules.linear_kv_down_proj is None
 
-    def test_enabled_deep_copies_input_submodules(self):
-        """The caller's submodules object must not be mutated – the method
-        deep-copies before rewriting, so callers can safely reuse their spec.
-        """
+    def test_enabled_does_not_mutate_input_submodules(self):
+        """Selecting the fused variant must leave both input specs reusable."""
         from megatron.core.transformer.multi_latent_attention import (
             FusedMLASelfAttention,
             MLASelfAttention,
         )
 
         submodules = self._fresh_submodules()
+        baseline = self._fresh_submodules()
         original_mla_module = submodules.mla_layer.submodules.self_attention.module
         original_q_down_proj = (
             submodules.mla_layer.submodules.self_attention.submodules.linear_q_down_proj
         )
         assert original_mla_module is MLASelfAttention  # sanity check of baseline
 
-        result = self._call_fuse(submodules, mla_down_proj_fusion=True)
+        model, selected_specs = self._build_with_specs(submodules, mla_down_proj_fusion=True)
 
         # Original is unchanged.
         assert submodules.mla_layer.submodules.self_attention.module is original_mla_module
@@ -1738,11 +1750,10 @@ class TestMLADownProjFusion:
             submodules.mla_layer.submodules.self_attention.submodules.linear_q_down_proj
             is original_q_down_proj
         )
-        # And result is a different object than the input.
-        assert result is not submodules
-        assert result.mla_layer is not submodules.mla_layer
-        # Plus the fused module only shows up on the returned copy.
-        assert result.mla_layer.submodules.self_attention.module is FusedMLASelfAttention
+        _assert_equal_with_partial_contents(submodules, baseline)
+        assert selected_specs[1] is not submodules.mla_layer
+        assert selected_specs[1] is submodules.mla_fused_down_proj_layer
+        assert isinstance(self._get_layer_with_mla(model).self_attention, FusedMLASelfAttention)
 
     def test_enabled_leaves_dsa_layer_alone(self):
         """MLA fusion must not rewrite the absorbed DSA attention specification."""
@@ -1752,27 +1763,44 @@ class TestMLADownProjFusion:
         from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 
         submodules = self._fresh_submodules()
-        result = self._call_fuse(submodules, mla_down_proj_fusion=True)
+        baseline = self._fresh_submodules()
+        model, selected_specs = self._build_with_specs(
+            submodules,
+            mla_down_proj_fusion=True,
+            pattern=f"M{Symbols.DS_ATTENTION}-",
+            experimental_attention_variant="dsa",
+            add_bias_linear=False,
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+        )
 
-        assert result.dsa_layer.submodules.self_attention.module is AbsorbedMLASelfAttention
-        assert result.dsa_layer.submodules.self_attention.module is not FusedMLASelfAttention
+        assert selected_specs[1] is submodules.dsa_layer
+        assert isinstance(model.decoder.layers[1].self_attention, AbsorbedMLASelfAttention)
+        assert not isinstance(model.decoder.layers[1].self_attention, FusedMLASelfAttention)
         # DSA's down projections must remain non-`None` (they're still used
         # via the unfused path).
-        assert result.dsa_layer.submodules.self_attention.submodules.linear_q_down_proj is not None
-        assert result.dsa_layer.submodules.self_attention.submodules.linear_kv_down_proj is not None
+        assert (
+            submodules.dsa_layer.submodules.self_attention.submodules.linear_q_down_proj is not None
+        )
+        assert (
+            submodules.dsa_layer.submodules.self_attention.submodules.linear_kv_down_proj
+            is not None
+        )
+        _assert_equal_with_partial_contents(submodules, baseline)
 
     def test_enabled_leaves_non_mla_layers_alone(self):
         """Unrelated layer specs (mamba, attention, mlp) must survive unchanged."""
         submodules = self._fresh_submodules()
-        original_mamba = submodules.mamba_layer
-        original_attention = submodules.attention_layer
-        original_mlp = submodules.mlp_layer
+        baseline = self._fresh_submodules()
+        _, selected_specs = self._build_with_specs(
+            submodules, mla_down_proj_fusion=True, pattern="M*-"
+        )
 
-        result = self._call_fuse(submodules, mla_down_proj_fusion=True)
-
-        _assert_equal_with_partial_contents(result.mamba_layer, original_mamba)
-        _assert_equal_with_partial_contents(result.attention_layer, original_attention)
-        _assert_equal_with_partial_contents(result.mlp_layer, original_mlp)
+        assert selected_specs[0] is submodules.mamba_layer
+        assert selected_specs[1] is submodules.attention_layer
+        assert selected_specs[2] is submodules.mlp_layer
+        _assert_equal_with_partial_contents(submodules, baseline)
 
 
 class TestHybridWithDynamicInference:

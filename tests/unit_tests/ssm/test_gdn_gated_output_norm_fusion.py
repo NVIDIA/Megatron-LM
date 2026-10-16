@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._inductor import config as inductor_config
 
 from megatron.core import parallel_state
 from megatron.core.fusions import fused_gated_norm as gated_norm
@@ -19,6 +20,15 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.ssm.gdn_test_matrix import POST_FUSION_DISTRIBUTED_CASES
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.fixture(scope="module", autouse=True)
+def synchronous_inductor_compilation():
+    """Keep compilation in-process for this distributed shape matrix."""
+    # Late shapes can start per-rank compiler worker pools while peers enter
+    # collectives. Bound that fan-out without disabling compilation or kernels.
+    with inductor_config.patch(compile_threads=1):
+        yield
 
 
 def _config(**overrides):

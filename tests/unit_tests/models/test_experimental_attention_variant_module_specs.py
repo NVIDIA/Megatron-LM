@@ -606,7 +606,7 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
             num_moe_experts=8,
             moe_layer_freq=2,
             normalization="RMSNorm",
-            enable_hyper_connections=True,
+            enable_mhc_connections=True,
         )
         backend = _make_backend()
         attn_spec = self._make_attention_spec(fuse_input_layernorm=False)

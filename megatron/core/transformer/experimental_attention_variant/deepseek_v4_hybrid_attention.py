@@ -133,6 +133,13 @@ class DSv4HybridAttention(Attention):
         if compress_ratio is None:
             compress_ratio = getattr(self.config, "compress_ratio", None)
         if compress_ratio is None:
+            if _ratio_idx >= len(self.config.csa_compress_ratios):
+                layer_kind = "MTP" if is_mtp_layer else "decoder"
+                raise ValueError(
+                    "csa_compress_ratios does not contain an entry for "
+                    f"{layer_kind} layer {layer_number}: index {_ratio_idx} requires at least "
+                    f"{_ratio_idx + 1} entries, got {len(self.config.csa_compress_ratios)}."
+                )
             compress_ratio = self.config.csa_compress_ratios[_ratio_idx]
         # compress_ratio == 0 is a sliding-window-only layer (the 'W' symbol): no compressor /
         # no top-k indexer (see CompressedSparseAttention) AND standard (non-YARN) rope.

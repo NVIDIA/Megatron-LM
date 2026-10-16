@@ -1198,6 +1198,9 @@ class TransformerConfig(ModelParallelConfig):
     upstream and leave this option disabled.
     """
 
+    moe_hybridep_pad_uneven_dispatch_inputs: bool = False
+    """Main-branch spelling of moe_hybridep_pad_variable_tokens; either enables the same padding."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -1928,6 +1931,10 @@ class TransformerConfig(ModelParallelConfig):
 
     def _normalize_sync_compatibility_fields(self) -> None:
         """Normalize branch-compatible names before validating the shared configuration."""
+        self.moe_hybridep_pad_variable_tokens = (
+            self.moe_hybridep_pad_variable_tokens or self.moe_hybridep_pad_uneven_dispatch_inputs
+        )
+        self.moe_hybridep_pad_uneven_dispatch_inputs = self.moe_hybridep_pad_variable_tokens
         if self.experimental_attention_variant == "dsv4_hybrid":
             if self.cp_partition_mode == "contiguous":
                 self.attention_cp_layout = "contiguous"
@@ -3638,9 +3645,17 @@ class TransformerConfig(ModelParallelConfig):
                 "that path expects a single residual stream."
             )
         if self.enable_mhc_connections:
-            if self.pipeline_model_parallel_size > 1 and self.overlap_moe_expert_parallel_comm:
+            # Dev's GPT combined-1F1B schedule carries mHC streams through VPP
+            # and runs mHC post-processing on the compute stream. Main's HybridModel
+            # has no equivalent overlap schedule, so keep its restriction scoped.
+            if (
+                self.is_hybrid_model
+                and self.pipeline_model_parallel_size > 1
+                and self.overlap_moe_expert_parallel_comm
+            ):
                 raise NotImplementedError(
-                    "mHC pipeline parallelism does not support overlap_moe_expert_parallel_comm. "
+                    "mHC HybridModel pipeline parallelism does not support "
+                    "overlap_moe_expert_parallel_comm. "
                     "Use the ordinary pipeline schedule for multi-stream residuals."
                 )
             if self.fp32_residual_connection:

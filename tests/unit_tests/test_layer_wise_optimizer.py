@@ -89,7 +89,9 @@ def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeyp
         FakeWrappedOptimizer,
     )
     monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
-    config = SimpleNamespace(
+    config = OptimizerConfig(
+        optimizer="muon",
+        use_layer_wise_distributed_optimizer=True,
         bf16=True,
         chunked_optimizer_state_offload=True,
         optimizer_state_offload_fraction=0.0,
@@ -130,7 +132,9 @@ def test_layerwise_offload_rejects_multiple_nonempty_muon_children(monkeypatch):
         FakeWrappedOptimizer,
     )
     monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
-    config = SimpleNamespace(
+    config = OptimizerConfig(
+        optimizer="muon",
+        use_layer_wise_distributed_optimizer=True,
         bf16=True,
         chunked_optimizer_state_offload=True,
         optimizer_state_offload_fraction=1.0,
@@ -499,6 +503,26 @@ class TestLayerWiseOptimizer:
         assert layer_wise_optimizer.grad_stats_parallel_group is pg_collection.intra_dist_opt
         for sub_optimizer in layer_wise_optimizer.chained_optimizers:
             assert sub_optimizer.grad_stats_parallel_group is pg_collection.intra_dist_opt
+
+        if use_param_layout:
+            # AdamW siblings use DistOpt, but compact Muon buffers do not. The model's
+            # flag must not send LayerWise params through those sibling bucket gathers.
+            assert model.ddp_config.use_distributed_optimizer
+            layerwise_groups = [
+                group
+                for group in model.bucket_groups + model.expert_parallel_bucket_groups
+                if any(
+                    getattr(param, "is_managed_by_layer_wise_optimizer", False)
+                    for bucket in group.buckets
+                    for param in bucket.params_list
+                )
+            ]
+            assert layerwise_groups
+            assert all(
+                not group.ddp_config.param_sync_via_bucket_group for group in layerwise_groups
+            )
+            assert not layer_wise_optimizer.use_buffer_param_sync
+            assert not layer_wise_optimizer.layerwise_param_sync_via_bucket_group
 
         reference_model = self.create_reference_model(model)
 

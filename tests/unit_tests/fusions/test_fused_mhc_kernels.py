@@ -217,6 +217,21 @@ class TestFusedSinkhorn:
 class TestNativeHAggregate:
     """Tests for native_h_aggregate."""
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("grad_enabled", [False, True])
+    def test_caller_owned_forward_matches_allocating_path(self, dtype, grad_enabled):
+        """A fixed graph input must receive the same aggregate without intermediate rounding."""
+        torch.manual_seed(1234)
+        x = torch.randn(8, 1, 2, 64, device=DEVICE, dtype=dtype, requires_grad=True)
+        h_pre = torch.randn(8, 1, 2, device=DEVICE, dtype=dtype, requires_grad=True)
+        out = torch.full((8, 1, 64), float("nan"), device=DEVICE, dtype=dtype)
+        pointer = out.data_ptr()
+        with torch.set_grad_enabled(grad_enabled):
+            expected = native_h_aggregate(x, h_pre)
+            actual = native_h_aggregate_into(x, h_pre, out)
+        assert actual.data_ptr() == pointer
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, C):
         _info()

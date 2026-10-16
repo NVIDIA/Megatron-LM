@@ -104,6 +104,14 @@ C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="mtp_packed_cp1_roll",
+        sources=("megatron/core/transformer/multi_token_prediction.py",),
+        tests=(K + "test_dev_sync_kernels.py",),
+        kind="torch-op",
+        notes="CP1 packed roll forward/backward with repeated static metadata boundaries "
+        "and physical padding not represented by logical documents.",
+    ),
+    KernelEntry(
         name="dev_csa_packed_compaction_and_routing",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_layout_kernels.py",

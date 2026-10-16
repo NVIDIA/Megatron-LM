@@ -175,8 +175,9 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch):
             moe_paged_stash=False,
             sequence_parallel=True,
             multi_latent_attention=False,
-            moe_n_hash_layers=0,
+            moe_num_hash_layers=0,
             mtp_num_layers=None,
+            freeze_base_model_for_mtp=False,
         ),
         pre_process=True,
         post_process=False,
@@ -1334,20 +1335,27 @@ class TestStaticInputs:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_thd_hash_router_input_ids_use_per_rank_capacity(self):
-        """Hash routing input IDs must use the fixed [1, local_tokens] THD shape."""
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("micro_batch_size", [1, 2])
+    def test_hash_router_input_ids_follow_static_token_layout(self, packed, micro_batch_size):
+        """THD flattens batches; SBHD retains the static batch and local sequence axes."""
         layer = _build_layer(256, 4, 4, 1024, 128, 8)
         layer.config.context_parallel_size = 2
-        layer.config.sequence_packing_scheduler = "dp_balanced"
+        layer.config.sequence_packing_scheduler = "dp_balanced" if packed else None
         layer.config.cuda_graph_impl = "transformer_engine"
-        layer.config.moe_n_hash_layers = 1
+        layer.config.moe_num_hash_layers = 1
         layer.is_moe_layer = True
         layer.mlp.router = torch.nn.Identity()
         layer.mlp.router.is_hash_layer = True
 
-        static_inputs = layer.get_layer_static_inputs(seq_length=256, micro_batch_size=2)
+        static_inputs = layer.get_layer_static_inputs(
+            seq_length=256, micro_batch_size=micro_batch_size
+        )
 
-        assert static_inputs["input_ids"].shape == (1, 128)
+        expected = (
+            (1, 128) if packed else (micro_batch_size, static_inputs["hidden_states"].shape[0])
+        )
+        assert static_inputs["input_ids"].shape == expected
 
 
 @pytest.mark.internal

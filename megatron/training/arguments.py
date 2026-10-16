@@ -1551,9 +1551,11 @@ def validate_args(args, defaults={}):
         ), 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
     if args.dynamic_context_parallel:
+        # The deprecated --enable-cuda-graph flag is already normalized/deleted.
+        # Keep dev's local-graph restriction without rejecting its TE graph path.
         assert (
-            not args.enable_cuda_graph
-        ), 'Dynamic context parallelism not supported with CUDA Graph'
+            args.cuda_graph_impl != 'local'
+        ), 'Dynamic context parallelism not supported with local CUDA Graph'
         assert (
             not args.use_megatron_fsdp
         ), 'Dynamic context parallelism not supported with Megatron FSDP'

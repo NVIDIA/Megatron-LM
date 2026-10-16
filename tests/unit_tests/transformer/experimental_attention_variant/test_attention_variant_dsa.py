@@ -396,6 +396,7 @@ def test_absorbed_mla_qkv_rope_uses_microbatch_cp_group(
             rope_type="rope",
             context_parallel_size=cp_size,
             dynamic_context_parallel=dynamic,
+            max_seqlen_per_dp_cp_rank=sum(sequence_lengths) if dynamic else None,
             cp_comm_type="all_gather",
             apply_rope_fusion=False,
             use_cpu_initialization=True,

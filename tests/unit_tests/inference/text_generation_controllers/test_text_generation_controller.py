@@ -8,7 +8,7 @@ import string
 import time
 from collections import OrderedDict, defaultdict
 from types import SimpleNamespace
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from unittest import mock
 
 import pytest

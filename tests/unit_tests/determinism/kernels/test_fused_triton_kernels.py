@@ -32,6 +32,7 @@ from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
+from megatron.core.transformer.hyper_connection import native_h_aggregate_into
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
@@ -437,6 +438,25 @@ def test_mhc_h_aggregate_replays_fwd_bwd(backend):
         (x, h_pre),
         replays=3,
         what=f"mhc h_aggregate[{backend}]",
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_native_mhc_aggregate_into_replays_fwd_bwd(dtype):
+    """Replay the real direct-write kernel at one fixed address, including both gradients."""
+    seeded()
+    x = _mhc_rand(8, 1, 2, 64, dtype=dtype)
+    h_pre = _mhc_rand(8, 1, 2, dtype=dtype)
+    out = torch.empty(8, 1, 64, device="cuda", dtype=dtype)
+    pointer = out.data_ptr()
+
+    def run(value, weights):
+        result = native_h_aggregate_into(value, weights, out.detach())
+        assert result.data_ptr() == pointer
+        return result
+
+    assert_replays_bit_exact(
+        run, (x, h_pre), replays=3, contention=True, what="native mHC caller-owned aggregate"
     )
 
 

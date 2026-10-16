@@ -3037,12 +3037,18 @@ class TestMultiTokenPrediction:
         assert torch.equal(rolled_input_ids, torch.tensor([[20, 30, 0]]))
         assert torch.equal(rolled_padding_mask, torch.tensor([[False, False, True]]))
 
-    def test_roll_tensor_packed_cp1_vectorizes_sequence_boundaries(self, monkeypatch):
+    @pytest.mark.parametrize("physical_tail", [0, 2])
+    def test_roll_tensor_packed_cp1_vectorizes_sequence_boundaries(
+        self, monkeypatch, physical_tail
+    ):
         """Packed CP1 uses one full-buffer roll per field, including duplicate boundaries."""
-        input_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
-        padding_mask = torch.zeros(5, dtype=torch.bool)
+        original_ids = torch.tensor([1, 2, 3, 4, 5] + [0] * physical_tail, dtype=torch.long)
+        input_ids = original_ids.clone()
+        padding_mask = torch.zeros(5 + physical_tail, dtype=torch.bool)
         cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
-        cu_seqlens_padded = torch.tensor([0, 3, 5, 5, 5], dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor(
+            [0, 3, 5, 5 + physical_tail, 5 + physical_tail], dtype=torch.int32
+        )
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
@@ -3069,10 +3075,13 @@ class TestMultiTokenPrediction:
         # The number of roll kernels depends on the field count, not the number
         # of packed sequences. Repeated static-padding endpoints are harmless.
         assert roll_calls == 2
-        assert torch.equal(rolled_input_ids, torch.tensor([2, 3, 0, 5, 0]))
-        assert torch.equal(rolled_padding_mask, torch.tensor([False, False, True, False, True]))
-        assert torch.equal(input_ids, torch.tensor([1, 2, 3, 4, 5]))
-        assert torch.equal(padding_mask, torch.zeros(5, dtype=torch.bool))
+        assert torch.equal(rolled_input_ids, torch.tensor([2, 3, 0, 5, 0] + [0] * physical_tail))
+        assert torch.equal(
+            rolled_padding_mask,
+            torch.tensor([False, False, True, False, True] + [True] * physical_tail),
+        )
+        assert torch.equal(input_ids, original_ids)
+        assert torch.equal(padding_mask, torch.zeros(5 + physical_tail, dtype=torch.bool))
 
     def test_roll_tensor_packed_cp1_fills_implicit_tail_end(self):
         """A physical tail beyond the last packed boundary cannot wrap to token zero."""
@@ -4801,8 +4810,8 @@ class TestMultiTokenPredictionHybrid:
     @pytest.mark.parametrize("with_mask", [False, True])
     def test_forward_uses_mtp_cp_layout_inputs(self, monkeypatch, with_mask):
         model, hidden_states, call_counts, metric_avg_group = self._make_forward_stub()
-        contiguous_packed_seq_params = object()
-        zigzag_packed_seq_params = object()
+        contiguous_packed_seq_params = PackedSeqParams(cp_partition_mode="contiguous")
+        zigzag_packed_seq_params = PackedSeqParams(cp_partition_mode="zigzag")
         zigzag_hidden_states = hidden_states + 10.0
         padding_mask = torch.tensor([[False, True]]) if with_mask else None
         zigzag_padding_mask = torch.tensor([[True, False]]) if with_mask else None
@@ -4846,8 +4855,10 @@ class TestMultiTokenPredictionHybrid:
             assert passed_tp_cp_group is tp_cp_group
             assert thd_plan is cp_layout_plan
             if layer_hidden_states.dtype == torch.bool:
-                torch.testing.assert_close(layer_hidden_states, (~padding_mask).transpose(0, 1))
-                return (~zigzag_padding_mask).transpose(0, 1).contiguous()
+                torch.testing.assert_close(
+                    layer_hidden_states, (~padding_mask).transpose(0, 1).unsqueeze(-1)
+                )
+                return (~zigzag_padding_mask).transpose(0, 1).unsqueeze(-1).contiguous()
             assert layer_hidden_states is hidden_states
             return zigzag_hidden_states
 
@@ -4929,6 +4940,7 @@ class TestMultiTokenPredictionHybrid:
         assert captured["mtp_loss"]["labels"] is zigzag_labels
         assert captured["mtp_loss"]["loss_mask"] is zigzag_loss_mask
         assert captured["mtp_loss"]["input_ids"] is zigzag_input_ids
+        assert captured["mtp_loss"]["cp_group"] is cp_group
         assert captured["mtp_loss"]["main_hidden_states"] is hidden_states
         torch.testing.assert_close(output, labels.to(dtype=hidden_states.dtype) + 1000.0)
 

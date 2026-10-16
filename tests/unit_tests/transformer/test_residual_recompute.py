@@ -862,6 +862,8 @@ class TestResidualStreamRecomputeIntegration:
         cp_layout_state = _RecordingCPLayoutState()
 
         class _RecordingCPLayoutManager:
+            layer_layouts = (config.linear_cp_layout,)
+
             def build_forward_state(
                 self, packed_seq_params, packed_seq_params_by_layout=None, thd_plan=None
             ):
@@ -869,6 +871,7 @@ class TestResidualStreamRecomputeIntegration:
                 assert packed_seq_params_by_layout is None
                 assert thd_plan is None
                 events.append("cp_build")
+                cp_layout_state.manager = self
                 return cp_layout_state
 
         stack._cp_layout_manager = _RecordingCPLayoutManager()

@@ -114,9 +114,7 @@ class TestHyperConnectionCheckpoint:
         # Forward without checkpoint (reference)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(
-            hidden_states, return_residual=True
-        )
+        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(hidden_states)
         mixed_ref = module.apply_h_res(h_res_ref, residual)
         loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
@@ -128,7 +126,7 @@ class TestHyperConnectionCheckpoint:
         torch.cuda.manual_seed(42)
         manager = MHCCheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = (
-            module._forward_with_checkpoint(hidden_states_ckpt, manager, return_residual=True)
+            module._forward_with_checkpoint(hidden_states_ckpt, manager)
         )
         mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
         # Calculate loss before discarding outputs
@@ -817,21 +815,30 @@ class TestTransformerConfigRecomputeMhc:
                 fp32_residual_connection=True,
             )
 
+    def test_config_accepts_full_activation_recompute(self):
+        """Retained dev checkpointed_forward supports full mHC layer recomputation."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        )
+        assert config.enable_mhc_connections
+        assert config.recompute_granularity == "full"
+        assert config.recompute_method == "uniform"
+        assert config.recompute_num_layers == 1
+
     @pytest.mark.parametrize(
         "extra_kwargs, error_type, match",
         [
             (
-                # recompute_num_layers is required for non-selective granularity, and that
-                # check runs first — supply it so the mHC guard is what actually fires.
-                {
-                    "recompute_granularity": "full",
-                    "recompute_method": "uniform",
-                    "recompute_num_layers": 1,
-                },
+                {"inference_fuse_tp_communication": True},
                 NotImplementedError,
-                "full activation recompute",
+                "inference_fuse_tp_communication",
             ),
-            ({"inference_fuse_tp_communication": True}, NotImplementedError, "single-stream"),
             ({"mhc_sinkhorn_iterations": 0}, ValueError, "mhc_sinkhorn_iterations"),
             ({"mhc_init_gating_factor": -0.1}, ValueError, "mhc_init_gating_factor"),
         ],
@@ -1101,9 +1108,7 @@ class TestHyperConnectionModuleCheckpoint:
         # Forward without checkpoint (reference)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(
-            hidden_states, return_residual=True
-        )
+        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(hidden_states)
         mixed_ref = module.apply_h_res(h_res_ref, residual)
         loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
@@ -1115,7 +1120,7 @@ class TestHyperConnectionModuleCheckpoint:
         torch.cuda.manual_seed(42)
         manager = CheckpointWithoutOutputManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = (
-            module._forward_with_checkpoint(hidden_states_ckpt, manager, return_residual=True)
+            module._forward_with_checkpoint(hidden_states_ckpt, manager)
         )
         mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
         # Calculate loss before discarding outputs

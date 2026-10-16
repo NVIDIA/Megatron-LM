@@ -150,6 +150,7 @@ class TestParallelTransformerLayer:
             use_cpu_initialization=True,
             context_parallel_size=1,
             dynamic_context_parallel=True,
+            max_seqlen_per_dp_cp_rank=128,
             cp_comm_type=cp_comm_type,
         )
 
@@ -269,12 +270,14 @@ class TestParallelTransformerLayer:
         layer.is_moe_layer = False
 
         seen_managers = []
+        retained_inputs = []
         discarded_outputs = []
 
         class RecordingCheckpoint:
-            def __init__(self, fp8=False, ckpt_manager=None):
+            def __init__(self, fp8=False, ckpt_manager=None, retain_input_tensors=False):
                 del fp8
                 seen_managers.append(ckpt_manager)
+                retained_inputs.append(retain_input_tensors)
 
             def checkpoint(self, function, *args):
                 return function(*args)
@@ -303,6 +306,7 @@ class TestParallelTransformerLayer:
         )
 
         assert seen_managers == [manager, manager]
+        assert retained_inputs == [False, False]
         assert len(discarded_outputs) == 1
         assert discarded_outputs[0] is attention_output[0]
         assert mlp_output[0].shape == hidden_states.shape
@@ -2156,8 +2160,8 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         "cuda_graph_module",
         [CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
     )
-    def test_moe_layer_rejects_partial_cuda_graphs(self, cuda_graph_module):
-        """Partial MoE graphs must not drop the hyper-connection state."""
+    def test_moe_layer_rejects_local_partial_cuda_graphs(self, cuda_graph_module):
+        """Enable the local graph path whose partial MoE scopes cannot carry mHC state."""
         config = _make_mhc_config(
             hidden_size=32,
             num_streams=4,
@@ -2169,6 +2173,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             moe_router_load_balancing_type="none",
             moe_token_dispatcher_type="allgather",
         )
+        config.cuda_graph_impl = "local"
         config.cuda_graph_modules = [cuda_graph_module]
 
         with pytest.raises(NotImplementedError, match="MoE CUDA graph"):

@@ -9,7 +9,8 @@ and none of its hooks apply here.  The hooks and fixtures the CI runner
 (``tests/unit_tests/run_ci_test.sh``) depends on are reproduced below:
 
 * ``pytest_configure`` — the NCCL unit-test defaults moved out of the shell
-  runner into the main conftest; this independent bucket needs them too;
+  runner into the main conftest; this independent bucket needs them too, plus
+  nonblocking communicators for graceful CP ring shutdown in the CI container;
 * ``--experimental`` — the runner invokes pytest a second time with this
   flag, which would otherwise be rejected as an unknown option;
 * ``pytest_sessionfinish`` — that second invocation collects nothing in
@@ -64,9 +65,15 @@ def _report_stderr(message):
 
 
 def pytest_configure(config):
-    """Match the main unit suite's NCCL defaults before any group is created."""
+    """Set the suite's NCCL defaults before any process group is created."""
     os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+    # CP ring traffic creates several peer communicators in a process group.
+    # Nonblocking finalization lets all peers start shutting down before waiting;
+    # blocking finalization can hang when ranks visit those peers in different orders.
+    # The CI image explicitly sets this to 0, so setdefault would leave the hang.
+    # Pin only this test suite's mode; keep the normal destroy_process_group path.
+    os.environ["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "1"
 
 
 def pytest_addoption(parser):

@@ -63,6 +63,16 @@ except ImportError:
 SIMILARITY_THRESHOLD = 0.999
 
 
+@pytest.fixture(autouse=True)
+def nonblocking_cp_communicators(monkeypatch):
+    """Allow every CP peer communicator to finalize before waiting for its peers."""
+    # These eager CP comparisons create multiple peer communicators per group;
+    # blocking finalization can visit them in different orders and hang at exit.
+    # Scope this to these tests: globally enabling nonblocking NCCL also affects
+    # CUDA Graph capture and stalls the partial-attention graph regression.
+    monkeypatch.setenv("TORCH_NCCL_USE_COMM_NONBLOCKING", "1")
+
+
 # =============================================================================
 # Test Cases
 # =============================================================================

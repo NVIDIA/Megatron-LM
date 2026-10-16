@@ -836,7 +836,7 @@ class HybridStack(MegatronModule):
                                         else padding_mask
                                     ),
                                 )
-                                if input_ids is not None:
+                                if input_ids is not None and self._uses_hash_routing(layer):
                                     layer_kwargs["input_ids"] = (
                                         input_ids_by_layout[
                                             cp_layout_state.manager.layer_layouts[

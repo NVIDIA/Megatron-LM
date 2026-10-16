@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import megatron.core.optimizer as optimizer_module
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
@@ -148,10 +149,8 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model = torch.nn.Module()
         model.config = SimpleNamespace(num_attention_heads=1, num_query_groups=1, kv_channels=4)
-        model.ddp_config = SimpleNamespace(
-            use_distributed_optimizer=False,
-            overlap_param_gather=False,
-            param_sync_via_bucket_group=False,
+        model.ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=False, overlap_param_gather=False
         )
         model.weights = torch.nn.ParameterList(
             [_parameter(device='cuda') for _ in range(2 * torch.distributed.get_world_size())]

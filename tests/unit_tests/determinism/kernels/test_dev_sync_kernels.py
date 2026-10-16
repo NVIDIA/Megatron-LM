@@ -75,6 +75,29 @@ def test_fused_mrope_replays():
     )
 
 
+def test_mtp_packed_cp1_roll_replays():
+    """Replay physical THD padding with fewer logical than padded boundaries."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+    logical = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+    physical = torch.tensor([0, 3, 5, 7, 7], dtype=torch.int32, device="cuda")
+    packed = PackedSeqParams(
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        qkv_format="thd",
+    )
+    value = torch.arange(1, 8, dtype=torch.float32, device="cuda", requires_grad=True)
+
+    def roll(x):
+        return roll_tensor(x, packed_seq_params=packed, return_sum=False)[0]
+
+    assert torch.equal(roll(value), value.new_tensor([2, 3, 0, 5, 0, 0, 0]))
+    assert_replays_bit_exact(roll, (value,), contention=True, what="MTP packed CP1 roll")
+
+
 def test_mtp_prefix_replays():
     """Include an exact-zero acceptance in the fused prefix-product backward."""
     from megatron.core.fusions.fused_mtp_prefix import (

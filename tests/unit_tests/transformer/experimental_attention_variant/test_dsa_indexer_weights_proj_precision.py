@@ -126,7 +126,8 @@ def test_fp32_weights_projection_ensures_weight_ready_before_direct_gemm(monkeyp
     assert events == ["ready", "gemm"]
 
 
-def test_absorbed_mla_backward_dw_flushes_owned_dsa_indexer_in_order():
+@pytest.mark.parametrize("with_gate", [False, True])
+def test_absorbed_mla_backward_dw_flushes_owned_dsa_indexer_in_order(with_gate):
     events = []
 
     def deferred_linear(name):
@@ -142,6 +143,7 @@ def test_absorbed_mla_backward_dw_flushes_owned_dsa_indexer_in_order():
     core_attention.backward_dw = lambda: DSAttention.backward_dw(core_attention)
     owner = SimpleNamespace(
         core_attention=core_attention,
+        linear_gate=deferred_linear("gate") if with_gate else None,
         _backward_kv_proj=lambda: events.append("kv"),
         _backward_q_proj=lambda: events.append("q"),
         _backward_output_proj=lambda: events.append("output"),
@@ -149,13 +151,18 @@ def test_absorbed_mla_backward_dw_flushes_owned_dsa_indexer_in_order():
 
     AbsorbedMLASelfAttention.backward_dw(owner)
 
-    assert events == ["kv", "q", "indexer_wq_b", "indexer_wk", "indexer_weights_proj", "output"]
+    expected = ["kv", "q"] + (["gate"] if with_gate else [])
+    assert events == expected + ["indexer_wq_b", "indexer_wk", "indexer_weights_proj", "output"]
 
 
-def test_absorbed_mla_backward_dw_allows_core_without_deferred_wgrad():
+@pytest.mark.parametrize("with_gate", [False, True])
+def test_absorbed_mla_backward_dw_allows_core_without_deferred_wgrad(with_gate):
     events = []
     owner = SimpleNamespace(
         core_attention=object(),
+        linear_gate=(
+            SimpleNamespace(backward_dw=lambda: events.append("gate")) if with_gate else None
+        ),
         _backward_kv_proj=lambda: events.append("kv"),
         _backward_q_proj=lambda: events.append("q"),
         _backward_output_proj=lambda: events.append("output"),
@@ -163,7 +170,7 @@ def test_absorbed_mla_backward_dw_allows_core_without_deferred_wgrad():
 
     AbsorbedMLASelfAttention.backward_dw(owner)
 
-    assert events == ["kv", "q", "output"]
+    assert events == ["kv", "q"] + (["gate"] if with_gate else []) + ["output"]
 
 
 @pytest.fixture(autouse=True)

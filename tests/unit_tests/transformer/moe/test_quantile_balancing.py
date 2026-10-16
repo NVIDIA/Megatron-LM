@@ -88,9 +88,24 @@ def test_qb_cli_exposes_global_batch_scope_and_histogram_bins():
     assert args.moe_router_qb_num_bins == 257
 
 
-def test_qb_dev_rejects_micro_batch_scope():
-    with pytest.raises(ValueError, match="dev supports only"):
-        _config(moe_router_quantile_balancing_estimation_scope="micro_batch")
+def test_qb_accepts_upstream_micro_batch_scope():
+    config = _config(moe_router_quantile_balancing_estimation_scope="micro_batch")
+    assert config.moe_router_quantile_balancing_estimation_scope == "micro_batch"
+
+
+@pytest.mark.parametrize(
+    "overrides, error_match",
+    [
+        ({"moe_router_fusion": True}, "requires native routing"),
+        (
+            {"dynamic_context_parallel": True, "max_seqlen_per_dp_cp_rank": 128},
+            "requires static TP/CP groups",
+        ),
+    ],
+)
+def test_qb_micro_batch_rejects_unsupported_paths(overrides, error_match):
+    with pytest.raises(ValueError, match=error_match):
+        _config(moe_router_quantile_balancing_estimation_scope="micro_batch", **overrides)
 
 
 def test_qb_rejects_nonzero_aux_loss():

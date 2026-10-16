@@ -11,6 +11,7 @@ import json
 import logging
 import os
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import pytest
 
@@ -347,6 +348,31 @@ def test_packaged_entries_name_live_candidates():
             assert f"{selection.kernel_module(tuner)}.{selection.kernel_name(tuner)}" == kernel
             for key in entries:
                 assert table.lookup(kernel, key, tuner.configs) is not None, (arch, kernel, key)
+
+            if name == "_mla_rope_bwd_kernel":
+                # DO_IN/DO_OUT add one tensor dtype to the old in-place signature.
+                # Check real call keys so stale entries cannot hide behind "*".
+                bf16 = SimpleNamespace(dtype="torch.bfloat16")
+                cu_seqlens = SimpleNamespace(dtype="torch.int32")
+                for heads, packed, block_h in (
+                    (1, False, 8),
+                    (1, True, 1),
+                    (16, False, 16),
+                    (16, True, 16),
+                ):
+                    named = dict(
+                        DO_IN=bf16,
+                        DO_OUT=bf16,
+                        COS=bf16,
+                        SIN=bf16,
+                        emb_dim=64,
+                        head_num=heads,
+                        cu_seqlens_q=cu_seqlens if packed else None,
+                    )
+                    args = tuple(named.get(arg) for arg in tuner.arg_names)
+                    key = selection.tuning_key(tuner, args, {})
+                    assert key in entries, (arch, kernel, key)
+                    assert table.lookup(kernel, key, tuner.configs).kwargs["BLOCK_H"] == block_h
 
 
 def test_verify_cadence_requires_the_interception():

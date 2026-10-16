@@ -205,7 +205,7 @@ class TestTraining:
         destroy_global_vars()
 
 
-def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatch):
+def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatch, run_config):
     """The second per-step log must not include the first step's loss."""
     args = SimpleNamespace(
         consumed_train_samples=0,
@@ -228,8 +228,10 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
         skipped_train_samples=0,
         timing_log_level=0,
         train_iters=2,
+        train_samples=None,
         world_size=1,
     )
+    run_config.logger = args
     timers = mock.MagicMock()
     timers.return_value.elapsed.return_value = 1.0
     log_lines = []
@@ -297,7 +299,7 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
     assert " alignment loss: 4.000000E+00 |" not in log_lines[-1]
 
 
-def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatch):
+def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatch, run_config):
     """DSA metrics use the stable parent and actual indexer-execution divisor."""
     parent_dp_cp_group = object()
     pp_group = object()
@@ -315,6 +317,7 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
         consumed_train_samples=0,
         context_parallel_size=4,
         csa_compress_ratios=None,
+        csa_dense_mode=False,
         cuda_graph_impl="none",
         data_parallel_size=2,
         dsa_indexer_loss_coeff=0.1,
@@ -336,6 +339,7 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
         timing_log_level=0,
         world_size=8,
     )
+    run_config.logger = args
 
     monkeypatch.setattr(training_module, "get_args", lambda: args)
     monkeypatch.setattr(training_module, "get_timers", mock.MagicMock)

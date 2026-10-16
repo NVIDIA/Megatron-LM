@@ -71,20 +71,50 @@ def test_mhc_pipeline_tensor_shapes(enabled, streams, pp_size, tp_size, cp_size,
     assert shape == ([()] if variable else [(32 // tp_size // cp_size, 2, width)])
 
 
-def test_mhc_pipeline_rejects_ep_overlap():
+def _mhc_ep_overlap_config(**overrides):
+    kwargs = dict(
+        num_layers=4,
+        hidden_size=64,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.bfloat16,
+        bf16=True,
+        enable_mhc_connections=True,
+        num_moe_experts=2,
+        expert_model_parallel_size=2,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+@pytest.mark.parametrize("is_hybrid_model", [False, True])
+@pytest.mark.parametrize("vp_size", [None, 2])
+def test_mhc_pipeline_ep_overlap_follows_model_schedule(is_hybrid_model, vp_size):
+    kwargs = dict(is_hybrid_model=is_hybrid_model, virtual_pipeline_model_parallel_size=vp_size)
+    if is_hybrid_model:
+        with pytest.raises(NotImplementedError, match="overlap_moe_expert_parallel_comm"):
+            _mhc_ep_overlap_config(**kwargs)
+    elif vp_size is None:
+        with pytest.raises(AssertionError, match="virtual_pipeline_model_parallel_size"):
+            _mhc_ep_overlap_config(**kwargs)
+    else:
+        config = _mhc_ep_overlap_config(**kwargs)
+        assert config.enable_mhc_connections and config.overlap_moe_expert_parallel_comm
+        assert config.virtual_pipeline_model_parallel_size == vp_size
+
+
+def test_mhc_hybrid_constructor_rejects_ep_overlap_without_frontend_flag():
+    config = _mhc_ep_overlap_config(virtual_pipeline_model_parallel_size=2)
+    assert not config.is_hybrid_model
     with pytest.raises(NotImplementedError, match="overlap_moe_expert_parallel_comm"):
-        TransformerConfig(
-            num_layers=4,
-            hidden_size=64,
-            num_attention_heads=4,
-            pipeline_model_parallel_size=2,
-            pipeline_dtype=torch.bfloat16,
-            bf16=True,
-            enable_mhc_connections=True,
-            num_moe_experts=2,
-            expert_model_parallel_size=2,
-            moe_token_dispatcher_type="alltoall",
-            overlap_moe_expert_parallel_comm=True,
+        HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=64,
+            max_sequence_length=32,
+            hybrid_layer_pattern="*-*-",
         )
 
 

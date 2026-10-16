@@ -1956,6 +1956,7 @@ class TestHybridTECudaGraphDiscovery:
         from megatron.core.transformer.identity_op import IdentityOp
 
         class Config:
+            context_parallel_size = 1
             recompute_granularity = None
             recompute_modules = []
             fp8 = False
@@ -1974,6 +1975,7 @@ class TestHybridTECudaGraphDiscovery:
 
         tail = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
         torch.nn.Module.__init__(tail)
+        tail.config = Config()
         tail.capture_weight = torch.nn.Parameter(torch.ones(1))
         object.__setattr__(tail, '_inner_is_partial_moe_capture', lambda: True)
         object.__setattr__(tail, '_get_submodules_under_cudagraphs', lambda: [tail])
@@ -1996,6 +1998,7 @@ class TestHybridTECudaGraphDiscovery:
         from megatron.core.transformer.identity_op import IdentityOp
 
         class Config:
+            context_parallel_size = 1
             recompute_granularity = None
             recompute_modules = []
             fp8 = True
@@ -2018,6 +2021,7 @@ class TestHybridTECudaGraphDiscovery:
 
         tail = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
         torch.nn.Module.__init__(tail)
+        tail.config = Config()
         object.__setattr__(tail, '_inner_is_partial_moe_capture', lambda: True)
 
         head.layer_number, tail.layer_number = 1, 2
