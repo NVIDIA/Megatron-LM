@@ -245,7 +245,9 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
-    is quick_gelu or SwiGLU, including weighted SwiGLU (MoE only)."""
+    is quick_gelu or SwiGLU, including weighted SwiGLU (MoE only). For SwiGLU,
+    use_te_activation_func must be False, and the TE op-fuser dense MLP (TEFusedMLP) rejects the
+    clamp."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -3441,10 +3443,6 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError(
                     "activation_func_clamp_value for SwiGLU must be finite and greater than zero."
-                )
-            if self.num_moe_experts is None:
-                raise ValueError(
-                    "activation_func_clamp_value for SwiGLU is only supported with MoE."
                 )
             if self.glu_linear_offset != 0.0:
                 raise ValueError(

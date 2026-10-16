@@ -25,6 +25,11 @@ def test_clamped_swiglu_config_accepts_positive_moe_clamp():
     assert _clamped_swiglu_config().activation_func_clamp_value == 10.0
 
 
+def test_clamped_swiglu_config_accepts_dense_clamp():
+    """MLP applies the SwiGLU clamp in its fused and unfused activation paths."""
+    assert _clamped_swiglu_config(num_moe_experts=None).activation_func_clamp_value == 10.0
+
+
 @pytest.mark.parametrize("clamp_value", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
 def test_clamped_swiglu_config_requires_positive_clamp(clamp_value):
     with pytest.raises(ValueError, match="greater than zero"):
@@ -38,10 +43,7 @@ def test_clamped_swiglu_config_rejects_linear_offset():
 
 @pytest.mark.parametrize(
     ("kwargs", "match"),
-    [
-        ({"num_moe_experts": None}, "only supported with MoE"),
-        ({"use_te_activation_func": True}, "use_te_activation_func must be False"),
-    ],
+    [({"use_te_activation_func": True}, "use_te_activation_func must be False")],
 )
 def test_clamped_swiglu_config_rejects_unsupported_paths(kwargs, match):
     with pytest.raises(ValueError, match=match):

@@ -3198,6 +3198,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            if self.config.activation_func_clamp_value is not None:
+                # The TE activation ops built by _make_fused_impl do not clamp.
+                raise ValueError(
+                    f"{self.__class__.__name__} does not support activation_func_clamp_value: "
+                    "its Transformer Engine activation op does not clamp. Build the MLP "
+                    "without use_transformer_engine_op_fuser."
+                )
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module matching MLP."""
