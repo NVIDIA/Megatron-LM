@@ -93,6 +93,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
+    "dsa_compact_indexer_workspace_sharing": True,
     "dsa_cp_balance_indexer": False,
     "dsa_indexer_head_dim": None,
     "dsa_indexer_k_norm_epsilon": None,
