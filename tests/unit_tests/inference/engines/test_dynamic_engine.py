@@ -2173,7 +2173,7 @@ def test_snapshot_live_requests(replay):
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._loop, other_loop = asyncio.new_event_loop(), asyncio.new_event_loop()
     active = Status.ACTIVE_AND_GENERATING_TOKENS
-    live, stop_hit, stop_masked, failed, waiting = (
+    live, stop_hit, stop_masked, failed, waiting, requeued = (
         _make_request_entry(engine._loop, request_id, status, resolve=False)
         for request_id, status in (
             (1, active),
@@ -2181,9 +2181,10 @@ def test_snapshot_live_requests(replay):
             (3, active),
             (4, Status.FAILED),
             (5, active),
+            (6, active),
         )
     )
-    engine.requests = {1: live, 2: stop_hit, 3: stop_masked, 4: failed, 5: waiting}
+    engine.requests = {1: live, 2: stop_hit, 3: stop_masked, 4: failed, 5: waiting, 6: requeued}
     # The engine records a stop's reason when it detects it, a step before completion.
     stop_hit.record[-1].finish_reason = stop_masked.record[-1].finish_reason = "stop"
     # Routing replay keeps each token's expert choices in the blocks a request owns and reads them
@@ -2191,8 +2192,11 @@ def test_snapshot_live_requests(replay):
     # token's apart.
     live.record[-1].generated_tokens, stop_hit.record[-1].generated_tokens = [9], [5, 6]
     stop_masked.record[-1].generated_tokens = [8]  # the waiting entry has generated nothing yet
+    # Evicted and re-queued: tokens banked, but no context row — its routing is recomputed.
+    requeued.record[-1].generated_tokens = [7]
     live.record[-1].sampling_params.num_tokens_to_generate = 4
     stop_hit.record[-1].sampling_params.num_tokens_to_generate = 2
+    requeued.record[-1].sampling_params.num_tokens_to_generate = 3
     routing = {
         20: np.full((3, 1, 2), 2),
         30: np.full((2, 1, 2), 3),
@@ -2206,18 +2210,19 @@ def test_snapshot_live_requests(replay):
         return routing[block_ids[0]]
 
     engine.context = types.SimpleNamespace(
+        request_ids=object(),  # resident: the bookkeeping tensors exist (not suspended)
         kv_block_allocator=types.SimpleNamespace(
             block_routing=routing if replay else {}, reconstruct_routing_from_blocks=reconstruct
         ),
-        get_index_of_request={1: 2, 2: 0, 3: 1, 5: 3}.__getitem__,
+        get_index_of_request={1: 2, 2: 0, 3: 1, 5: 3, 6: -1}.__getitem__,
         get_committed_kv_block_ids=[[20, 21], [30], [40], [50]].__getitem__,
     )
     expected = [
         LiveRequestSnapshot.from_record(entry.record)
-        for entry in (live, stop_hit, stop_masked, waiting)
+        for entry in (live, stop_hit, stop_masked, waiting, requeued)
     ]
-    assert [s.record.finish_reason for s in expected] == [None, "stop", "stop", None]
-    routed = [routing[40], routing[20], routing[30], None] if replay else [None] * 4
+    assert [s.record.finish_reason for s in expected] == [None, "stop", "stop", None, None]
+    routed = [routing[40], routing[20], routing[30], None, None] if replay else [None] * 5
 
     def listed(arrays):
         return [None if array is None else array.tolist() for array in arrays]
@@ -2248,6 +2253,7 @@ def test_snapshot_live_requests(replay):
     finally:
         engine._loop.call_soon_threadsafe(engine._loop.stop)
         thread.join(timeout=5)
+        engine._loop.close()
         other_loop.close()
 
 
@@ -2923,12 +2929,13 @@ _FILLED = ResumedGeneration(
     [7, 8, 9, 10, 11, 12],
     6,
     log_probs=[-0.1] * 6,
-    prompt_log_probs=[-1.0, -1.1, -1.2],
+    # A prompt of P tokens scores P - 1 positions (the first has no predecessor).
+    prompt_log_probs=[-1.0, -1.1],
     policy_epoch=[(0, 7)],
     kv_cache_epoch=[(0, 6)],
     num_evictions=2,
     finish_reason="length",
-    prompt_top_n_logprobs=[{"p": -1.0}, {"p": -1.1}, {"p": -1.2}],
+    prompt_top_n_logprobs=[{"p": -1.0}, {"p": -1.1}],
     generated_top_n_logprobs=[{str(t): -0.1} for t in range(7, 13)],
     acceptance_step_lengths=[1, 3, 2],
 )
@@ -3092,6 +3099,7 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
         assert admitted.sampling_params.num_tokens_to_generate == resumed.num_tokens_to_generate
         assert (admitted.policy_epoch, admitted.kv_cache_epoch) == ([(0, 9)], [(0, 9)])
         assert FinishedRequestRecord.from_request(admitted).num_evictions == 0
+        engine._loop.close()
         return
     if outcome:
         failed = future.result()
@@ -3110,6 +3118,7 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
             assert reason == f"resumed generation {outcome}"
             assert failed.generated_tokens == []
             assert failed.sampling_params.num_tokens_to_generate == 6
+        engine._loop.close()
         return
     if resumed.finish_reason is not None:
         completed = future.result()
@@ -3144,6 +3153,7 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
             resumed.num_tokens_to_generate,
             reason,
         )
+        engine._loop.close()
         return
     record = engine.requests[1].record
     continuation = record[-1]
@@ -3197,6 +3207,8 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
     assert not routed or np.array_equal(
         again.requests[1].record[0].routing_indices, resumed.routing_indices
     )
+    engine._loop.close()
+    again._loop.close()
 
 
 def test_engine_defers_expanded_multimodal_stitching_past_prompt_preparer():
@@ -3262,8 +3274,12 @@ def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_resul
 
     class _Preparer:
         def prepare_prompt(self, prompt, *, offload_params=None):
+            params = dict(bad_result.get("offload_params", offload_params or {}))
+            # The failing preparer also hands back a resume; the rebuilt error
+            # frame must not carry it.
+            params[RESUMED_GENERATION_FIELD] = ResumedGeneration([7], 2).to_wire()
             return RequestPromptPreparationResult(
-                **{"prompt": prompt, "offload_params": offload_params, **bad_result}
+                prompt=bad_result.get("prompt", prompt), offload_params=params
             )
 
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
