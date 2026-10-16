@@ -13,7 +13,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.enums import ModelType
-from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
+from megatron.core.fp8_utils import dequantize_fp8_tensor, is_float8tensor, is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -241,6 +241,104 @@ class TestFP8Param:
 
         return eval_loss.item()
 
+    def assert_precision_aware_optimizer_state(self, args, optimizer):
+        """Check the precision-aware Adam layout used with a non-delayed FP8 recipe.
+
+        With fp32 main params and a non-delayed FP8 recipe (with or without FP8 primary
+        weights), MCore keeps the fp32 master shards, from which FP8 primary weights are
+        re-quantized, and TE FusedAdam stores only the two moments, which must be held in
+        exactly the requested dtypes.
+        """
+        expected_dtypes = {"exp_avg": args.exp_avg_dtype, "exp_avg_sq": args.exp_avg_sq_dtype}
+        num_checked = 0
+        for optim_instance in optimizer.chained_optimizers:
+            assert isinstance(optim_instance, DistributedOptimizer)
+            assert optim_instance.config.use_precision_aware_optimizer
+            assert not optim_instance.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            for main_param, state in optim_instance.optimizer.state.items():
+                assert main_param.dtype == args.main_params_dtype
+                assert "master_param" not in state
+                for state_name, dtype in expected_dtypes.items():
+                    assert state[state_name].dtype == dtype, (state_name, state[state_name].dtype)
+                    num_checked += 1
+        assert num_checked > 0
+
+    @staticmethod
+    def dequantize_fp8_params(model_chunk):
+        """Return an fp32 copy of every FP8 primary weight of a model chunk, keyed by name."""
+        with torch.no_grad():
+            return {
+                name: dequantize_fp8_tensor(param).float()
+                for name, param in model_chunk.named_parameters()
+                if is_float8tensor(param)
+            }
+
+    @staticmethod
+    def assert_fp8_params_gathered(model_chunk, pg_collection, initial_values):
+        """Check the gathered FP8 primary weights exactly; call right after a forward pass.
+
+        By the end of a forward pass every bucket's param all-gather has completed: without
+        overlap it runs synchronously in optimizer.step(), and with overlap the forward
+        pre-hooks wait for it. Each rank re-quantizes only its own fp32 master shard. The
+        per-block scales come from an amax that is all-reduced over the bucket's
+        data-parallel group, and the other shards arrive by all-gather. The checks are:
+
+        * Every replica of a weight in its data-parallel group (expt_dp for routed experts,
+          dp_cp for dense weights) holds bitwise-identical dequantized values. If the gather
+          of any bucket were skipped, stale or misplaced, each rank would hold its freshly
+          re-quantized shard next to older values of the other shards, and the replicas
+          would differ.
+        * With 2-D block scaling, the columnwise copy (used for dgrad on Hopper) is exactly
+          the transpose of the rowwise data and scales. A columnwise copy that was not
+          rebuilt after the gather fails this.
+        * Every weight differs from its value at the first forward pass. Otherwise the
+          replica agreement could just be the trivial agreement of untouched initial
+          weights.
+
+        The verdict is all-reduced over all ranks before asserting, so a failure in one
+        expert-DP group cannot leave the other ranks waiting in a collective.
+        """
+        failures = []
+        with torch.no_grad():
+            for name, param in model_chunk.named_parameters():
+                if not is_float8tensor(param):
+                    continue
+                is_expert = not getattr(param, 'allreduce', True)
+                group = pg_collection.expt_dp if is_expert else pg_collection.dp_cp
+                value = dequantize_fp8_tensor(param).float()
+                lowest = value.clone()
+                highest = value.clone()
+                torch.distributed.all_reduce(lowest, op=torch.distributed.ReduceOp.MIN, group=group)
+                torch.distributed.all_reduce(
+                    highest, op=torch.distributed.ReduceOp.MAX, group=group
+                )
+                if not torch.equal(lowest, highest):
+                    failures.append(f"{name}: data-parallel replicas differ after the gather")
+                if torch.equal(value, initial_values[name]):
+                    failures.append(f"{name}: FP8 values never changed during training")
+
+                data = param.data
+                if getattr(data, '_is_2D_scaled', False) and data._columnwise_data is not None:
+                    # Same region that TE's _create_columnwise copies: the unpadded
+                    # (column tiles, row tiles) part of the columnwise scale_inv.
+                    rowwise_scale_inv_t = data._rowwise_scale_inv.t()
+                    columnwise_scale_inv = data._columnwise_scale_inv
+                    tiles = (
+                        min(columnwise_scale_inv.shape[0], rowwise_scale_inv_t.shape[0]),
+                        min(columnwise_scale_inv.shape[1], rowwise_scale_inv_t.shape[1]),
+                    )
+                    if not (
+                        torch.equal(data._columnwise_data, data._rowwise_data.t())
+                        and torch.equal(
+                            columnwise_scale_inv[: tiles[0], : tiles[1]],
+                            rowwise_scale_inv_t[: tiles[0], : tiles[1]],
+                        )
+                    ):
+                        failures.append(f"{name}: columnwise copy is not the rowwise transpose")
+            num_failures = torch.tensor([len(failures)], dtype=torch.int64, device='cuda')
+            torch.distributed.all_reduce(num_failures, op=torch.distributed.ReduceOp.MAX)
+        assert num_failures.item() == 0, failures
+
     def _run_test_helper(
         self,
         tp_size,
@@ -256,6 +354,14 @@ class TestFP8Param:
         # Test-only knob: not a model arg, so pop before create_test_args (which asserts every
         # kwarg is a real arg attribute).
         save_at_steps_kw = kwargs.pop("save_at_steps", ())
+        check_precision_aware_optimizer_state = kwargs.pop(
+            "check_precision_aware_optimizer_state", False
+        )
+        # Test-only knob, too. It applies to the FP8-param run only, because the BF16-param
+        # reference holds no FP8 weights (asserted below).
+        check_fp8_param_replicas = (
+            kwargs.pop("check_fp8_param_replicas", False) and fp8_param_gather
+        )
         args = self.create_test_args(
             tp_size,
             recipe,
@@ -361,17 +467,42 @@ class TestFP8Param:
         if kwargs.get("first_last_layers_bf16", False):
             fp8_layers -= kwargs["num_layers_at_start_in_bf16"]
             fp8_layers -= kwargs["num_layers_at_end_in_bf16"]
-        if fp8_param_gather and fp8_layers > 0:
+        if not fp8_param_gather:
+            # Negative control for the loss-parity reference: it must keep BF16 primary
+            # weights, or parity would compare the FP8-param configuration with itself.
+            assert num_fp8_params == 0
+        elif fp8_layers > 0:
             if args.num_experts is None:
                 # Each dense layer has 4 GEMM weights: qkv, proj, fc1, fc2.
                 assert num_fp8_params == 4 * fp8_layers
             else:
-                assert num_fp8_params > 0
+                # Each MoE layer has qkv and proj, the shared expert's fc1 and fc2 (all in the
+                # dense DP buffers), and one fc1 and one fc2 weight per local expert in the
+                # grouped GEMMs (in the expert-DP buffers). The router weight stays BF16.
+                num_shared_expert_weights = 2 if args.moe_shared_expert_intermediate_size else 0
+                num_local_experts = args.num_experts // args.expert_model_parallel_size
+                assert num_fp8_params == fp8_layers * (
+                    2 + num_shared_expert_weights + 2 * num_local_experts
+                ), num_fp8_params
                 assert any(
                     not getattr(param, 'allreduce', True) for param in gpt_model[0].parameters()
                 )
+                # Routed-expert GEMM weights (allreduce=False) live in the expert-DP buffers;
+                # they must be FP8 primary weights too, so the expert-DP all-gather moves
+                # quantized data rather than only the dense attention weights doing so.
+                expert_weights = [
+                    param
+                    for param in gpt_model[0].parameters()
+                    if not getattr(param, 'allreduce', True) and param.dim() == 2
+                ]
+                assert expert_weights
+                assert all(is_float8tensor(param) for param in expert_weights)
                 if not inference:
                     assert len(optimizer.chained_optimizers) >= 2
+        if check_fp8_param_replicas:
+            # The check compares the first and last forward passes of a training run.
+            assert not inference and num_steps > 1 and num_fp8_params > 0
+        initial_fp8_values = None
 
         # Verify that bf16 params (embedding, LN, etc.) in the MXFP8 model are mapped
         # to the param buffer (shared with grad buffer) rather than allocated separately.
@@ -484,6 +615,14 @@ class TestFP8Param:
             if inference:
                 continue
 
+            # After a forward pass no param all-gather is in flight (see
+            # assert_fp8_params_gathered), and the grad reduce-scatter has not started yet.
+            if check_fp8_param_replicas:
+                if i == 0:
+                    initial_fp8_values = self.dequantize_fp8_params(gpt_model[0])
+                elif i == num_steps - 1:
+                    self.assert_fp8_params_gathered(gpt_model[0], pg_collection, initial_fp8_values)
+
             # Verify gradients
             loss = output.mean()
             loss.backward()
@@ -545,6 +684,10 @@ class TestFP8Param:
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
             self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
+
+        if check_precision_aware_optimizer_state:
+            assert not inference
+            self.assert_precision_aware_optimizer_state(args, optimizer)
 
         if eval_transition:
             return torch.tensor(loss_list), torch.tensor(eval_loss_list)
@@ -697,10 +840,13 @@ class TestFP8Param:
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.4.0.dev0"), reason="TE 2.4.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
-    @pytest.mark.parametrize("dp_overlap", [(True, True)])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (True, True)])
     def test_blockwise_scaling(self, tp_size, dp_overlap):
+        """
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
-        self.run_test(tp_size=tp_size, recipe="blockwise")
+        self.run_test(tp_size=tp_size, recipe="blockwise", **kwargs)
 
     @pytest.mark.skipif(
         get_device_arch_version() != 9, reason="blockwise is only supported on Hopper architecture"
@@ -1093,3 +1239,98 @@ class TestFP8Param:
         if mismatches:
             print(f"[rank {Utils.rank}] " + "\n".join(mismatches), flush=True)
         assert not mismatches, "\n".join(mismatches)
+
+    @staticmethod
+    def blockwise_moe_kwargs(dp_overlap):
+        """MoE settings for the blockwise FP8 param-gather tests.
+
+        Mirrors test_mxfp8_moe (EP2, grouped GEMM, AllToAll, no aux loss), but with four
+        experts and top-2 routing. Each EP rank then has two local experts, so its fc1 and
+        fc2 grouped GEMMs each hold two FP8 expert weights in the expert-DP buffers, and
+        AllToAll sends each token to two experts. A shared expert adds FP8 weights to the
+        dense DP buffers.
+
+        The GLM-5.3 MoE settings (SwiGLU clamped at 10.0, FP32 routing) are compatibility
+        coverage only: TransformerConfig accepts them under FP8 and they run. Both arms of
+        run_test use them, so loss parity cannot detect errors in them. At this scale the
+        clamp never binds either: fc1 pre-activations have a std of about
+        0.02 * sqrt(128) ~= 0.23. moe_apply_probs_after_fc2=False is the default and only
+        pins the standard probability placement. The rejection of True under fp8/fp8_param
+        is tested in transformer/test_glm53_config.py and
+        transformer/moe/test_moe_probs_after_fc2.py, not here.
+
+        check_fp8_param_replicas is a test-only knob that runs assert_fp8_params_gathered
+        in the FP8-param run.
+        """
+        return {
+            "overlap_param_gather": dp_overlap[0],
+            "overlap_grad_reduce": dp_overlap[1],
+            "expert_model_parallel_size": 2,
+            "num_experts": 4,
+            "moe_grouped_gemm": True,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_router_topk": 2,
+            "moe_router_pre_softmax": True,
+            "moe_router_load_balancing_type": "none",
+            "moe_aux_loss_coeff": 0.0,
+            "moe_ffn_hidden_size": 128,
+            "moe_shared_expert_intermediate_size": 128,
+            "moe_router_dtype": "fp32",
+            "activation_func_clamp_value": 10.0,
+            "moe_apply_probs_after_fc2": False,
+            "check_fp8_param_replicas": True,
+        }
+
+    @pytest.mark.skipif(
+        get_device_arch_version() != 9, reason="blockwise is only supported on Hopper architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.4.0.dev0"), reason="TE 2.4.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [1])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (True, True)])
+    def test_blockwise_moe(self, tp_size, dp_overlap):
+        """Blockwise FP8 param gather for routed-expert (expert-DP) and dense (DP) weights.
+
+        This test checks four things:
+
+        * The FP8 primary-weight layout: the exact count, and every routed-expert weight
+          is FP8.
+        * After the param all-gather, with and without overlap, every FP8 weight is
+          bitwise identical across its data-parallel replicas, and its columnwise copy is
+          rebuilt from the gathered rowwise data.
+        * Loss parity with the BF16-param reference.
+        * The BF16-param reference holds no FP8 weights.
+
+        Every rank sees the same batch, so this does not check that the gradient
+        reduce-scatter or the EP token routing is correct. Both arms also share those paths.
+
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        self.run_test(tp_size=tp_size, recipe="blockwise", **self.blockwise_moe_kwargs(dp_overlap))
+
+    @pytest.mark.skipif(
+        get_device_arch_version() != 9, reason="blockwise is only supported on Hopper architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.4.0.dev0"), reason="TE 2.4.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [1])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (True, True)])
+    def test_blockwise_moe_precision_aware_optimizer(self, tp_size, dp_overlap):
+        """Blockwise FP8 MoE param gather with the precision-aware optimizer (BF16 moments).
+
+        Runs the same checks as test_blockwise_moe, plus the optimizer-state layout. The
+        FP8-param run and its BF16-param reference share this optimizer configuration, so
+        run_test's loss-parity tolerance applies unchanged.
+
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        kwargs = self.blockwise_moe_kwargs(dp_overlap)
+        kwargs.update(
+            use_precision_aware_optimizer=True,
+            main_params_dtype="fp32",
+            main_grads_dtype="fp32",
+            exp_avg_dtype="bf16",
+            exp_avg_sq_dtype="bf16",
+            check_precision_aware_optimizer_state=True,
+        )
+        self.run_test(tp_size=tp_size, recipe="blockwise", **kwargs)
