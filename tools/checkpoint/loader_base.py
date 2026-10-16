@@ -122,7 +122,6 @@ class MegatronCheckpointLoaderBase:
         self.check_for_arg('iteration')
         self.check_for_arg('bert_binary_head')
         self.check_for_arg('disable_bias_linear', False)
-        self.check_for_arg('params_dtype')
         self.check_for_arg('swiglu', False)
 
         self._maybe_ensure_additional_required_arguments()
@@ -141,6 +140,9 @@ class MegatronCheckpointLoaderBase:
             sys.exit(1)
 
         cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        # Derives optimizer.params_dtype from --fp16/--bf16; not run by set_global_variables.
+        cfg.optimizer.finalize_optimizer_config()
+        self.cfg = cfg
         set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
@@ -444,7 +446,7 @@ class MegatronCheckpointLoaderBase:
         md.max_position_embeddings = self.margs.max_position_embeddings
         md.tokenizer_type = self.margs.tokenizer_type
         md.iteration = self.margs.iteration
-        md.params_dtype = self.margs.params_dtype
+        md.params_dtype = self.cfg.optimizer.params_dtype
         md.bert_binary_head = self.margs.bert_binary_head
         md.output_layer = self.margs.untie_embeddings_and_output_weights
         md.position_embedding_type = self.margs.position_embedding_type
