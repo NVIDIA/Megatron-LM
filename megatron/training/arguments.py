@@ -1128,8 +1128,6 @@ def validate_args(args, defaults={}):
             'inference_dynamic_batching_num_cuda_graphs should be a positive integer or -1' \
             '-1 means that we will automatically determine the number of CUDA graphs to capture based on the `max_requests` value.'
 
-    print_rank_0('using {} for parameters ...'.format(args.params_dtype))
-
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 

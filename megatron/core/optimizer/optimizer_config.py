@@ -9,8 +9,6 @@ import torch
 
 from ..utils import is_te_min_version, warn_rank_0
 
-from megatron.core.distributed import DistributedDataParallelConfig
-
 
 @dataclass(frozen=True)
 class ParamPredicate:
@@ -535,7 +533,8 @@ class OptimizerConfig:
     def validate_run(
         self,
         *,
-        ddp_config: Optional[DistributedDataParallelConfig] = None,
+        ddp_config: Optional["DistributedDataParallelConfig"] = None,
+        use_torch_fsdp2: bool,
         moe_single_grouped_weight: bool,
         virtual_pipeline_model_parallel_size: int | None,
         use_dist_ckpt: bool,
@@ -549,7 +548,7 @@ class OptimizerConfig:
                 "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
                 "as the hybrid device optimizer reuses the code path of this flag."
             )
-            assert not self.fp8_param_gather or self.fp8_recipe == "delayed", (
+            assert not ddp_config.fp8_param_gather or self.fp8_recipe == "delayed", (
                 "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
                 "must be used in conjunction with `--fp8-recipe delayed`."
             )
@@ -587,7 +586,7 @@ class OptimizerConfig:
             )
 
         if self.use_distributed_optimizer:
-            assert not ddp_config.use_torch_fsdp2, \
+            assert not use_torch_fsdp2, \
                 "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
 
         if self.overlap_param_gather_with_optimizer_step:
@@ -603,7 +602,7 @@ class OptimizerConfig:
                 '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 
         if self.fp16:
-            assert not ddp_config.use_torch_fsdp2, \
+            assert not use_torch_fsdp2, \
                 '--use-torch-fsdp2 not supported with fp16 yet'
 
     def finalize_optimizer_config(self) -> None:

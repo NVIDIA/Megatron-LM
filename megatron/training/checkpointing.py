@@ -2030,7 +2030,7 @@ def _gtp_pad_for_alignment_from_args(args):
     """GTP dim-0 alignment implied by the precision recipe recorded in args."""
     return resolve_gtp_pad_for_alignment(
         fp4=getattr(args, 'fp4', None) is not None,
-        fp8_recipe=getattr(cfg.optimizer, 'fp8_recipe', None),
+        fp8_recipe=getattr(args, 'fp8_recipe', None),
         fp8=getattr(args, 'fp8', None) is not None,
     )
 
