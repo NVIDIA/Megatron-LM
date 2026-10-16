@@ -411,11 +411,17 @@ class _GTPTEWeightBridge:
 
     def _on_te_wgrad_ready(self, fc_layer: int, wgrads):
         """TE API: finalize_group_grads starts FC2's VE reduction; GTP finalizes after it."""
-        expected = [w.main_grad for w in self.runtime_weights[fc_layer]]
-        if self._ptrs("grad", wgrads) != self._ptrs("grad", expected):
-            raise RuntimeError(
-                "TE must write virtual-expert wgrads into DistributedWeight buffers."
-            )
+        expected = [w.grad_buffer() for w in self.runtime_weights[fc_layer]]
+        wgrads = _as_tuple(wgrads)
+        if len(wgrads) != len(expected) or any(
+            grad.shape != target.shape for grad, target in zip(wgrads, expected)
+        ):
+            raise RuntimeError("TE virtual-expert wgrads must match the supplied buffer shapes.")
+        # Some TE paths return scratch instead of writing into grad_buffer(). Copy before
+        # VE reduction reads these buffers; GTP's own copy fallback runs after that reduction.
+        for grad, target in zip(wgrads, expected):
+            if grad.data_ptr() != target.data_ptr():
+                target.copy_(grad)
         if fc_layer == 1 and self._start_grad_reduce is not None:
             self._start_grad_reduce()(fc_layer)
         return (None,) * len(expected)
