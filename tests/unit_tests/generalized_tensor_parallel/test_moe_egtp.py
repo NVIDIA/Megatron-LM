@@ -487,6 +487,20 @@ def _mxfp8_override_recipe(pattern):
     )
 
 
+def _te_fused_grouped_mlp_quantizes_gathered_bf16() -> bool:
+    """Whether TE's fused grouped MLP quantizes a distributed weight it re-gathers as BF16.
+
+    A capability probe rather than a version check: the fix landed with the helper below and is
+    not tied to a TE release yet. Without it, EGTP_remat-sharded experts under a quantized
+    override raise AttributeError on ``_columnwise_data`` in the fused backward.
+    """
+    try:
+        from transformer_engine.pytorch.ops.fused import grouped_mlp
+    except ImportError:
+        return False
+    return hasattr(grouped_mlp, "_quantize_unquantized_weights")
+
+
 def _worker_egtp_quantized_precision_override_backward(rank, world_size, port, egtp_remat_size):
     """EGTP_remat experts kept *fused* by an MXFP8 override under a global NVFP4 recipe.
 
@@ -658,5 +672,11 @@ class TestMoEEGTPPrecisionOverride:
             available, reason = probe(return_reason=True)
             if not available:
                 pytest.skip(reason)
+        if egtp_remat_size > 1 and not _te_fused_grouped_mlp_quantizes_gathered_bf16():
+            pytest.skip(
+                "Sharded experts under a quantized override need a TE whose fused grouped MLP "
+                "quantizes re-gathered BF16 weights (ops/fused/grouped_mlp.py "
+                "_quantize_unquantized_weights)"
+            )
         monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
         _run_distributed(_worker_egtp_quantized_precision_override_backward, 4, egtp_remat_size)
