@@ -5000,6 +5000,14 @@ def _add_moe_args(parser):
 def _add_mla_args(parser):
     group = parser.add_argument_group(title="mla")
     group.add_argument(
+        '--no-mla-proj-use-quantization',
+        '--disable-mla-proj-use-quantization',
+        action='store_false',
+        dest='mla_proj_use_quantization',
+        default=True,
+        help="Keep MLA projection initialization and GEMMs outside FP8/FP4 quantization.",
+    )
+    group.add_argument(
         '--q-lora-rank',
         type=int,
         default=None,
