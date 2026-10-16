@@ -633,9 +633,9 @@ class OptimizerConfig:
         self.exp_avg_sq_dtype = map_dtype(self.exp_avg_sq_dtype)
 
         # emerging optimizer check
-        if args.optimizer not in ('sgd', 'adam'):
-            if args.optimizer == 'dist_muon':
-                args.optimizer = 'muon'
+        if self.optimizer not in ('sgd', 'adam'):
+            if self.optimizer == 'dist_muon':
+                self.optimizer = 'muon'
                 self.use_layer_wise_distributed_optimizer = True
 
             if self.use_distributed_optimizer:
