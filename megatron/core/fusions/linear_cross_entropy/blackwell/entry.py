@@ -20,7 +20,7 @@ try:
         bwd_partial_dlogits as bwd_partial_dlogits,
     )
     from megatron.core.fusions.linear_cross_entropy.blackwell import fwd_mainloop as fwd_mainloop
-    from megatron.core.fusions.linear_cross_entropy.blackwell import triton as triton_kernels
+    from megatron.core.fusions.linear_cross_entropy.triton import kernels as triton_kernels
 
     @dataclass
     class FwdConfig:
