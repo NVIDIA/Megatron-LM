@@ -20,6 +20,7 @@ from megatron.training.models.dist_utils import (
     prepare_existing_model_chunks_for_distributed_training,
 )
 from megatron.training.utils import print_rank_0
+from megatron.training.global_vars import get_run_config
 
 # Preserve the previous example-local import path.
 _EncoderFloat16Module = MimoEncoderFloat16Module
@@ -37,15 +38,16 @@ def configure_module_rng(
     so disjoint modules (and stages) get independent RNG state. Caller invokes once per active
     module on this rank.
     """
+    cfg = get_run_config()
     for _required in ("pp", "dp", "tp", "ep", "expt_tp", "gtp_remat", "expt_gtp_remat"):
         assert (
             getattr(pg_collection, _required, None) is not None
         ), f"pg_collection passed to configure_module_rng must define {_required}"
     _set_random_seed(
-        args.seed + role_seed_offset,
+        cfg.rng.seed + role_seed_offset,
         data_parallel_random_init,
-        te_rng_tracker=getattr(args, "te_rng_tracker", False),
-        inference_rng_tracker=getattr(args, "inference_rng_tracker", False),
+        te_rng_tracker=cfg.rng.te_rng_tracker,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
         use_cudagraphable_rng=getattr(args, "cuda_graph_impl", "none") != "none",
         pp_group=pg_collection.pp,
         dp_group=pg_collection.dp,

@@ -54,8 +54,13 @@ def _config(*, sequence_parallel: bool) -> TransformerConfig:
 @pytest.mark.parametrize(("sequence_parallel", "expected_value"), [(False, 1.5), (True, 3.0)])
 def test_streamwise_control_gradients_use_correct_tp_reduction(sequence_parallel, expected_value):
     config = _config(sequence_parallel=sequence_parallel)
-    connection = StreamwiseSigmoidWideResidualConnection(
-        config=config, layer_number=1, branch_name="test", pg_collection=None
+    connection = torch.nn.ModuleList(
+        [
+            StreamwiseSigmoidWideResidualConnection(
+                config=config, layer_number=1, branch_name="test", operation=operation
+            )
+            for operation in ("read", "write")
+        ]
     ).cuda()
     connection.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
 
@@ -122,7 +127,10 @@ def test_wide_residual_mtp_runs_with_tensor_parallelism_and_matching_controller_
 
     mtp_stack = model.mtp.layers[0].mtp_model_layer
     assert type(mtp_stack.layers[0]) is TransformerLayer
-    assert mtp_stack.layers[0]._get_self_attention_residual_connection() is None
+    for operation in ("read", "write"):
+        assert (
+            mtp_stack.layers[0]._get_self_attention_residual_connection(operation=operation) is None
+        )
     assert not mtp_stack.uses_wide_residual_stream
     assert model.mtp.layers[0].eh_proj.weight.grad is not None
     assert all(torch.equal(grad, gathered_grads[0]) for grad in gathered_grads[1:])
