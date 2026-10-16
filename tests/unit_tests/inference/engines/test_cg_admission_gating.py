@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-""" Unit tests for CUDA-graph-aware admission gating. """
+"""Unit tests for CUDA-graph-aware admission gating."""
 
 import logging
 import types
@@ -30,6 +30,9 @@ def _create_engine(
         engine
     )
     engine._find_cg_chunk_size = DynamicInferenceEngine._find_cg_chunk_size.__get__(engine)
+    engine._cg_chunked_prefill_chunk_size = (
+        DynamicInferenceEngine._cg_chunked_prefill_chunk_size.__get__(engine)
+    )
     engine._matches_cg_admission = DynamicInferenceEngine._matches_cg_admission.__get__(engine)
     engine._cg_admission_check = DynamicInferenceEngine._cg_admission_check.__get__(engine)
     engine._register_cg_wait = DynamicInferenceEngine._register_cg_wait.__get__(engine)
@@ -548,3 +551,96 @@ class TestChunkedPrefillCgGating:
         assert snapped is not None  # hit
         req.cg_wait_iters = 0  # as the engine does on a hit
         assert req.cg_wait_iters == 0
+
+
+class TestChunkedPrefillCgChunkSize:
+    """`_cg_chunked_prefill_chunk_size` admits fitting requests whole and splits the rest."""
+
+    def test_fitting_request_is_admitted_whole(self):
+        # 100 tokens fit and pad up to the 128-token prefill graph; no split at 64.
+        engine = _create_engine(SAMPLE_CG_LIST)
+        assert engine._cg_chunked_prefill_chunk_size(computed_len=100, computed_budget=100) == 100
+
+    def test_fitting_request_packs_behind_active_prefill(self):
+        # One 100-token prefill is active; another 100 tokens fit and pad to 256.
+        engine = _create_engine(SAMPLE_CG_LIST, active_tok=100, num_prefill=1)
+        assert engine._cg_chunked_prefill_chunk_size(computed_len=100, computed_budget=156) == 100
+
+    def test_request_over_budget_is_split_at_largest_graph(self):
+        # 500 tokens do not fit a 300-token budget: split to land on the 256 graph.
+        engine = _create_engine(SAMPLE_CG_LIST)
+        assert engine._cg_chunked_prefill_chunk_size(computed_len=500, computed_budget=300) == 256
+
+    def test_split_fills_remaining_budget_to_graph_boundary(self):
+        # 210 active tokens: the split fills exactly to the 256 graph.
+        engine = _create_engine(SAMPLE_CG_LIST, active_tok=210, num_prefill=3)
+        assert engine._cg_chunked_prefill_chunk_size(computed_len=70, computed_budget=46) == 46
+
+    def test_no_graph_match_falls_back_to_eager_budget(self):
+        # Strict (hybrid) matching: 5 prefills + 252 decodes fit no captured graph.
+        engine = _create_engine(
+            SAMPLE_CG_LIST, active_tok=200, num_prefill=4, num_decode=252, is_hybrid=True
+        )
+        assert engine._cg_chunked_prefill_chunk_size(computed_len=50, computed_budget=50) == 50
+
+    @staticmethod
+    def _simulate_steps(engine, prompt_len, num_requests, max_tokens, num_steps, chunk_fn):
+        """Mirror schedule_chunked_prefill admission: whole admits keep packing, a partial
+        admit ends the step, and the next step first finishes the partial request.
+
+        Returns the (token_count, prefill_request_count) of each simulated step.
+        """
+        remaining = [prompt_len] * num_requests
+        continuing = False
+        steps = []
+        for _ in range(num_steps):
+            engine.context.active_token_count = 0
+            engine.context.num_prefill_requests = 0
+            while remaining:
+                budget = max_tokens - engine.context.active_token_count
+                if budget <= 0:
+                    break
+                computed_budget = min(remaining[0], budget)
+                if continuing:
+                    chunk = computed_budget
+                else:
+                    chunk = chunk_fn(engine, remaining[0], computed_budget)
+                engine.context.active_token_count += chunk
+                engine.context.num_prefill_requests += 1
+                if chunk >= remaining[0]:
+                    remaining.pop(0)
+                    continuing = False
+                else:
+                    remaining[0] -= chunk
+                    continuing = True
+                    break
+            steps.append((engine.context.active_token_count, engine.context.num_prefill_requests))
+        return steps
+
+    def test_steps_pack_to_largest_graph(self):
+        # 70-token prompts, 256-token budget: each step packs three whole requests plus a
+        # split one to fill the 256 graph, instead of one 64-token split per step.
+        engine = _create_engine(SAMPLE_CG_LIST)
+        packed = self._simulate_steps(
+            engine,
+            prompt_len=70,
+            num_requests=20,
+            max_tokens=256,
+            num_steps=3,
+            chunk_fn=lambda eng, length, budget: eng._cg_chunked_prefill_chunk_size(length, budget),
+        )
+        assert [tokens for tokens, _ in packed] == [256, 256, 256]
+        assert all(prefills >= 4 for _, prefills in packed)
+
+        # The previous rule (snap every new request) splits each one and stalls the loop.
+        engine = _create_engine(SAMPLE_CG_LIST)
+        snapped = self._simulate_steps(
+            engine,
+            prompt_len=70,
+            num_requests=20,
+            max_tokens=256,
+            num_steps=3,
+            chunk_fn=lambda eng, length, budget: eng._find_cg_chunk_size(budget) or budget,
+        )
+        assert snapped[0] == (64, 1)
+        assert all(prefills <= 2 for _, prefills in snapped)

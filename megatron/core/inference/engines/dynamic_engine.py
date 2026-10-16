@@ -3607,6 +3607,37 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return None
 
+    def _cg_chunked_prefill_chunk_size(self, computed_len: int, computed_budget: int) -> int:
+        """Return how many tokens of a newly admitted chunked-prefill request to compute.
+
+        A request whose remaining prompt fits in the step budget is admitted whole when the
+        resulting batch still matches a captured graph (padding up to the graph's token count),
+        so the scheduler keeps packing further requests into the step. Only a request that does
+        not fit is split, at the largest captured-graph boundary within budget, which ends the
+        step on a graph-sized token count. Snapping every request to a boundary instead would
+        split each one that fits, and since a partial admit ends the scheduling loop, every step
+        would carry just one new request.
+
+        Args:
+            computed_len (int): Remaining prompt tokens the request needs to compute.
+            computed_budget (int): Tokens the request may compute this step
+                (`min(computed_len, step budget)`).
+
+        Returns:
+            int: Tokens to compute this step; falls back to `computed_budget` (eager) when no
+            captured graph covers any chunk in budget.
+        """
+        if computed_len <= computed_budget:
+            candidate = InferenceBatchDimensions(
+                token_count=self.context.active_token_count + computed_len,
+                prefill_req_count=self.context.num_prefill_requests + 1,
+                decode_req_count=self.context.num_decode_requests,
+            )
+            if self._matches_cg_admission(candidate):
+                return computed_len
+        snapped_chunk = self._find_cg_chunk_size(computed_budget)
+        return snapped_chunk if snapped_chunk is not None else computed_budget
+
     def _register_cg_wait(self, req) -> None:
         """Track a deferred admission attempt and throw a starvation warning at the threshold.
 
@@ -3737,11 +3768,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip CG gating for the continuation of an in-flight chunked prefill:
                 # the request is already mid-flight, deferring it would deadlock progress.
                 if self._cg_admission_gating_active() and not is_continuing_chunked_prefill:
-                    # Snap the COMPUTED chunk size to the largest captured-CG boundary
-                    # within budget (skipped tokens don't affect the CG batch shape).
-                    # Fall back to eager (computed_budget) if no CG shape covers it.
-                    snapped_chunk = self._find_cg_chunk_size(computed_budget)
-                    computed_chunk = snapped_chunk if snapped_chunk is not None else computed_budget
+                    # Admit the whole COMPUTED remainder when it fits and still matches a
+                    # captured graph; otherwise snap it to the largest captured-CG boundary
+                    # within budget (skipped tokens don't affect the CG batch shape), falling
+                    # back to eager (computed_budget) if no CG shape covers it.
+                    computed_chunk = self._cg_chunked_prefill_chunk_size(
+                        remaining_len - prefix_skip, computed_budget
+                    )
                     req.cg_wait_iters = 0
                 else:
                     computed_chunk = computed_budget
