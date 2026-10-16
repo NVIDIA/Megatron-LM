@@ -19,6 +19,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
@@ -112,7 +113,12 @@ def torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 def _kda_fp8_disabled(config: TransformerConfig) -> bool:
     # Copied GDN layer configs can carry KDA settings from the stack config too.
-    return isinstance(config, KDALayerConfig) and config.kda_disable_fp8
+    # Dev's GPT KDA spec builds KDA from the plain decoder config, whose GDN-family
+    # variant is "kda"; per-layer copies are still told apart by their type.
+    is_kda_config = isinstance(config, KDALayerConfig) or (
+        not isinstance(config, GDNLayerConfig) and config.experimental_attention_variant == "kda"
+    )
+    return is_kda_config and config.kda_disable_fp8
 
 
 def _build_with_kda_fp8_disabled(fp8_config, module_spec, *args, **kwargs):
