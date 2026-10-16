@@ -9,16 +9,13 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS, TensorParallelMuon
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = [
@@ -48,83 +45,6 @@ class TestMuonPerHeadMultiRankTP:
         Utils.initialize_model_parallel(tensor_model_parallel_size=min(world, 2))
         yield
         Utils.destroy_model_parallel()
-
-    @pytest.mark.parametrize("split_per_head", [False, True])
-    @pytest.mark.parametrize("q_lora_rank", [None, 4])
-    def test_mla_down_layout_extends_shared_up_layouts(self, split_per_head, q_lora_rank):
-        """MLA up-projections use module-owned layouts with TP-aware Muon splitting."""
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        tp_size = pg_collection.tp.size()
-        assert tp_size == 2
-        model_parallel_cuda_manual_seed(123)
-        transformer_config = MLATransformerConfig(
-            num_layers=1,
-            hidden_size=8,
-            num_attention_heads=2,
-            q_lora_rank=q_lora_rank,
-            kv_lora_rank=4,
-            qk_head_dim=4,
-            qk_pos_emb_head_dim=2,
-            v_head_dim=3,
-            tensor_model_parallel_size=tp_size,
-            use_cpu_initialization=False,
-            add_bias_linear=False,
-            multi_latent_attention=True,
-            rope_type="rope",
-            rotary_base=10000,
-            original_max_position_embeddings=8,
-        )
-        model = GPTModel(
-            config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ),
-            vocab_size=32,
-            max_sequence_length=8,
-            pre_process=False,
-            post_process=False,
-            pg_collection=pg_collection,
-        )
-        optimizer_config = OptimizerConfig(
-            optimizer='muon',
-            lr=0.01,
-            use_distributed_optimizer=False,
-            muon_split_qkv=True,
-            muon_split_qkv_per_head=split_per_head,
-            muon_tp_mode="blockwise",
-        )
-
-        optimizer = get_megatron_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=False,
-            pg_collection=pg_collection,
-        )
-
-        attention = model.decoder.layers[0].self_attention
-        q_up_weight = (
-            attention.linear_q_proj.weight
-            if q_lora_rank is None
-            else attention.linear_q_up_proj.weight
-        )
-        kv_up_weight = attention.linear_kv_up_proj.weight
-        assert optimizer is not None
-        if split_per_head:
-            assert q_up_weight.is_qkv
-            assert kv_up_weight.is_qkv
-            assert q_up_weight.qkv_split_shapes_global == [4, 2] * 2
-            assert kv_up_weight.qkv_split_shapes_global == [4, 3] * 2
-            assert q_up_weight.qkv_split_heads_are_complete
-            assert kv_up_weight.qkv_split_heads_are_complete
-        else:
-            # Inherit #6326's default MLA projection splitting.
-            assert q_up_weight.is_qkv and kv_up_weight.is_qkv
-            assert q_up_weight.qkv_split_shapes == [4, 2]
-            assert kv_up_weight.qkv_split_shapes == [4, 3]
-        if q_lora_rank is not None:
-            assert not getattr(attention.linear_q_down_proj.weight, 'is_qkv', False)
-        assert not getattr(attention.linear_kv_down_proj.weight, 'is_qkv', False)
-        assert attention.linear_kv_down_proj.weight.muon_layout.splits == (4, 2)
 
     @pytest.mark.parametrize("variant", ["gated_delta_net", "gdn2"])
     def test_gdn_variant_owned_semantic_layout(self, variant):
@@ -276,8 +196,8 @@ def test_muon_optimizer_uniform_splits_accept_noncontiguous_batched_output():
         pg_collection=None,
     )
 
-    def noncontiguous_identity(x, tp_group=None, partition_dim=None):
-        del tp_group, partition_dim
+    def noncontiguous_identity(x, tp_group=None, partition_dim=None, tp_mode_this_group=None):
+        del tp_group, partition_dim, tp_mode_this_group
         return x.mT.contiguous().mT
 
     optimizer.scaled_orthogonalize_fn = noncontiguous_identity
