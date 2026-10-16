@@ -759,8 +759,10 @@ def test_handoff_finishes_without_an_extra_decode_step(
     request.stop_word_ids = stop_word_ids
     engine.stop_word_being_finished_ids = set()
     engine.finished_request_count = 0
+    engine.context.remove_vlm_request_data = lambda request_id: None
     engine._set_finish_reason = DynamicInferenceEngine._set_finish_reason.__get__(engine)
-    engine._complete_request = DynamicInferenceEngine._complete_request
+    engine._finalize_request = DynamicInferenceEngine._finalize_request.__get__(engine)
+    engine._complete_request = DynamicInferenceEngine._complete_request.__get__(engine)
 
     def complete_request(request_id):
         engine.requests[request_id] = RequestEntry(
@@ -827,14 +829,8 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     engine.finished_request_count = 0
     engine.use_coordinator = False
     engine.is_mp_coordinator = False
+    engine.context = mock.Mock()
     tokenizer = SimpleNamespace(eod=None, detokenize=mock.Mock(return_value="answer"))
-
-    def complete_request(request_entry):
-        finished_request = request_entry.record.merge()
-        request_entry.future.set_result(finished_request)
-        return finished_request
-
-    engine._complete_request = complete_request
 
     InferenceStateHandoffMixin._complete_handoff_request_without_forward(engine, 7)
 

@@ -446,6 +446,20 @@ def deserialize_ndarray(obj: dict) -> np.ndarray:
     return np.array(obj["data"], dtype=np.dtype(obj["dtype"]))
 
 
+def _merge_routing(parts: List[np.ndarray], total_rows: int) -> Optional[np.ndarray]:
+    """Combine the routing of a sequence's segments, each recorded from the sequence's first row."""
+    merged, covered = [], 0
+    for part in parts:
+        if len(part) > covered:
+            merged.append(part[covered:])
+            covered = len(part)
+    if not merged or covered != total_rows:
+        return None
+    if any(part.shape[1:] != merged[0].shape[1:] for part in merged[1:]):
+        return None  # ensure sure we can't record segments with different topk
+    return np.concatenate(merged)
+
+
 def unwrap_serialized_tensors(serialized_request: dict) -> dict:
     """Unwrap serialized tensor tuples produced by serialize() into plain lists.
 
@@ -1148,6 +1162,78 @@ class DynamicInferenceRequestRecord:
         record.requests.append(request)
         return record
 
+    @classmethod
+    def from_resumed_generation(
+        cls,
+        first: DynamicInferenceRequest,
+        resumed: "ResumedGeneration",
+        *,
+        generation_epoch: Optional[int],
+    ) -> "DynamicInferenceRequestRecord":
+        """Build the record the engine admits for a request that resumes a generation."""
+        if resumed.log_probs is None and first.sampling_params.return_log_probs:
+            raise ValueError(
+                "resumed generation carries no log probs for a request that returns them"
+            )
+        if resumed.generated_top_n_logprobs is None and first.sampling_params.top_n_logprobs > 0:
+            raise ValueError(
+                "resumed generation carries no top-N log probs for a request that returns them"
+            )
+        if resumed.policy_epoch is None and generation_epoch is not None:
+            raise ValueError(
+                "resumed generation carries no policy epoch for an engine that stamps one"
+            )
+        prompt_length = len(first.prompt_tokens)  # expanded: the prompt the stamps were made on
+        tokens = resumed.token_ids
+        for name, boundaries in (
+            ("policy_epoch", resumed.policy_epoch),
+            ("kv_cache_epoch", resumed.kv_cache_epoch),
+        ):
+            # A stamp sits on an existing token:
+            # at the earliest, the prompt's last, before any generation;
+            # at the latest, the last generated token.
+            if boundaries is not None and any(
+                not prompt_length - 1 <= position <= prompt_length + len(tokens) - 1
+                for position, _ in boundaries[1:]
+            ):
+                raise ValueError(
+                    f"resumed generation has {name} boundaries outside the sequence it resumes"
+                )
+        routing, total_tokens = resumed.routing_indices, prompt_length + len(tokens)
+        # The last token never ran forward: a sequence of T tokens routes T - 1 of them.
+        if routing is not None and routing.shape[0] != total_tokens - 1:
+            raise ValueError(
+                f"resumed generation has routing indices for {routing.shape[0]} tokens of a "
+                f"sequence of {total_tokens}"
+            )
+        first.sampling_params.num_tokens_to_generate = resumed.num_tokens_to_generate
+        first.sampling_params.num_tokens_total = None
+        first.generated_tokens = tokens
+        first.generated_length = len(tokens)
+        first.generated_log_probs = resumed.log_probs
+        first.prompt_log_probs = resumed.prompt_log_probs
+        first.generated_top_n_logprobs = resumed.generated_top_n_logprobs
+        first.prompt_top_n_logprobs = resumed.prompt_top_n_logprobs
+        first.acceptance_step_lengths = list(resumed.acceptance_step_lengths)
+        first.finish_reason = resumed.finish_reason
+        first.routing_indices = routing
+        first.policy_epoch = None if resumed.policy_epoch is None else list(resumed.policy_epoch)
+        first.kv_cache_epoch = (
+            None if resumed.kv_cache_epoch is None else list(resumed.kv_cache_epoch)
+        )
+        for _ in range(resumed.num_evictions):
+            first.add_event_evict()
+        record = cls.from_request(first)
+        if resumed.finish_reason is not None:  # ended on its first engine: served as it stands
+            first.status = Status.COMPLETED
+            return record
+        first.add_event_evict()
+        record.checkpoint()
+        continuation = record[-1]
+        if generation_epoch is not None and continuation.policy_epoch[-1][1] != generation_epoch:
+            continuation.policy_epoch.append((prompt_length + len(tokens) - 1, generation_epoch))
+        return record
+
     def __getitem__(self, idx: int) -> DynamicInferenceRequest:
         """Get request by index.
 
@@ -1285,11 +1371,15 @@ class DynamicInferenceRequestRecord:
         first_request = self.requests[0]
         prompt_tokens = first_request.prompt_tokens
         prompt_text = self.requests[0].prompt
+        generated_tokens = merge_lists("generated_tokens")
+        # A resumed request (checkpointing) grabs routing indices from its history.
+        # A recomputed request recomputes routing indices.
         routing_indices = None
         routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
         if routing_parts:
-            routing_indices = np.concatenate(routing_parts)
-        generated_tokens = merge_lists("generated_tokens")
+            routing_indices = _merge_routing(
+                routing_parts, len(prompt_tokens) + len(generated_tokens) - 1
+            )
 
         # Detach the merged result's outer epoch lists under the engine's append-only
         # mutation pattern described in checkpoint().
@@ -1305,6 +1395,14 @@ class DynamicInferenceRequestRecord:
         ttft = next((request.ttft for request in self.requests if request.ttft is not None), None)
         # Preserve KV handoff metadata when merging request segments.
         disaggregated_params = self.requests[-1].disaggregated_params
+
+        # Need to account for the case where an earlier segment holds the stop but the
+        # final segment lost it: checkpoint() does not carry finish_reason, so an evict
+        # or suspend checkpoint buries a stop detected one step before completion.
+        finish_reason = next(
+            (r.finish_reason for r in reversed(self.requests) if r.finish_reason is not None),
+            None,
+        )
 
         # Merged request.
         request = DynamicInferenceRequest(
@@ -1328,7 +1426,7 @@ class DynamicInferenceRequestRecord:
             ttft=ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
-            finish_reason=self.requests[-1].finish_reason,
+            finish_reason=finish_reason,
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
@@ -1345,15 +1443,18 @@ class DynamicInferenceRequestRecord:
 
 @dataclass
 class FinishedRequestRecord:
-    """Stores per-request metadata that is not meant to be passed through the RESTful server."""
+    """Per-request metadata, outside of the RESTful reply, used by the stager and snapshots."""
 
     policy_epoch: Optional[list[tuple[int, int]]]
     kv_cache_epoch: Optional[list[tuple[int, int]]]
     num_evictions: int
+    num_tokens_to_generate: Optional[int] = None
+    finish_reason: Optional[str] = None
 
     @classmethod
     def from_request(cls, request: "DynamicInferenceRequest") -> "FinishedRequestRecord":
         """Build the request's non-RESTful metadata from a finished request."""
+        params = request.sampling_params
         # Epoch stamps exist only while the engine has a generation epoch set.
         record = cls(
             policy_epoch=(
@@ -1367,6 +1468,8 @@ class FinishedRequestRecord:
             num_evictions=sum(
                 1 for event in request.events if event.type is DynamicInferenceEventType.EVICT
             ),
+            num_tokens_to_generate=None if params is None else params.num_tokens_to_generate,
+            finish_reason=request.finish_reason,
         )
         return record
 
@@ -1376,7 +1479,8 @@ class OffloadedRequestPayload:
     """A finished request's per-token payload, kept off the RESTful reply by payload offload.
 
     Self-contained: a consumer can rebuild the served sequence from it alone,
-    keyed by the request uid (the OpenAI response id).
+    keyed by the request uid (the OpenAI response id). The top-N scores and the
+    per-step token counts also stay on the reply; they ride here for a resume.
 
     ``prompt_token_ids`` is the prompt the model ran on. For a VLM request that is the
     *expanded* sequence (one media token per projected embedding), which is what a
@@ -1393,6 +1497,9 @@ class OffloadedRequestPayload:
     prompt_log_probs: Optional[list[float]]
     routing_indices: Optional[np.ndarray]
     media_tensors: Optional[Dict[str, torch.Tensor]] = None
+    prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
+    generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
+    acceptance_step_lengths: List[int] = field(default_factory=list)
 
     @classmethod
     def from_request(cls, request: "DynamicInferenceRequest") -> "OffloadedRequestPayload":
@@ -1428,6 +1535,9 @@ class OffloadedRequestPayload:
                     if tensor is not None
                 }
             ),
+            prompt_top_n_logprobs=to_plain_list(request.prompt_top_n_logprobs),
+            generated_top_n_logprobs=to_plain_list(request.generated_top_n_logprobs),
+            acceptance_step_lengths=list(request.acceptance_step_lengths),
         )
 
 
@@ -1453,6 +1563,42 @@ class RequestPayloadStager(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class LiveRequestSnapshot:
+    """Snapshot of a live request, allowing for its later resumption.
+
+    A snapshot carries no media; resuming a multimodal request requires resubmitting the
+    same media so the expanded prompt the boundaries were counted on is reproduced."""
+
+    uid: str
+    request_id: int
+    offload_params: Optional[Dict[str, Any]]
+    payload: OffloadedRequestPayload
+    record: FinishedRequestRecord
+
+    @classmethod
+    def from_record(
+        cls,
+        record: "DynamicInferenceRequestRecord",
+        *,
+        routing_indices: Optional[np.ndarray] = None,
+    ) -> "LiveRequestSnapshot":
+        """Copy a live record's merged state; the record itself is left untouched."""
+        merged = record.merge()
+        merged.media_tensors = None
+        if routing_indices is not None:
+            carried = [r.routing_indices for r in record.requests if r.routing_indices is not None]
+            total_rows = len(merged.prompt_tokens) + len(merged.generated_tokens) - 1
+            merged.routing_indices = _merge_routing([*carried, routing_indices], total_rows)
+        return cls(
+            uid=merged.uid,
+            request_id=merged.request_id,
+            offload_params=merged.offload_params,
+            payload=OffloadedRequestPayload.from_request(merged),
+            record=FinishedRequestRecord.from_request(merged),
+        )
+
+
 # Request-metadata keys written by the chat endpoint when it defers prompt-prefix
 # replacement. A RequestPromptPreparer may consume them before admission; the
 # multimodal path also uses them to locate the splice after media expansion.
@@ -1464,6 +1610,170 @@ PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
 # before adding these reserved keys, so clients cannot forge them.
 PREFIX_EXPANDED_TOKEN_COUNT_FIELD = "_prefix_expanded_token_count"
 PREFIX_MEDIA_COUNT_FIELD = "_prefix_media_count"
+
+# Reserved field a RequestPromptPreparer writes, as ``ResumedGeneration.to_wire()``,
+# to resume a generation at admission; the engine pops it before the request keeps its params.
+RESUMED_GENERATION_FIELD = "_resumed_generation"
+
+
+@dataclass
+class ResumedGeneration:
+    """Generated tokens a request already holds when it is admitted."""
+
+    token_ids: List[int]
+    num_tokens_to_generate: int
+    log_probs: Optional[List[float]] = None
+    prompt_log_probs: Optional[List[float]] = None
+    policy_epoch: Optional[List[Tuple[int, int]]] = None
+    kv_cache_epoch: Optional[List[Tuple[int, int]]] = None
+    num_evictions: int = 0
+    finish_reason: Optional[str] = None
+    prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
+    generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
+    acceptance_step_lengths: List[int] = field(default_factory=list)
+    routing_indices: Optional[np.ndarray] = None
+
+    def __post_init__(self):
+        tokens, budget = self.token_ids, self.num_tokens_to_generate
+        if not all(type(t) is int for t in tokens):
+            raise ValueError("resumed generation holds non-integer tokens")
+        if type(budget) is not int or budget < 0:
+            raise ValueError("resumed generation has a malformed budget")
+        if type(self.num_evictions) is not int or self.num_evictions < 0:
+            raise ValueError("resumed generation has a malformed eviction count")
+        if len(tokens) > budget:
+            raise ValueError(
+                f"resumed generation holds {len(tokens)} tokens over a budget of {budget}"
+            )
+        if self.log_probs is not None and len(self.log_probs) != len(tokens):
+            raise ValueError(
+                "resumed generation has log probs and tokens of different lengths, "
+                f"{len(self.log_probs)} and {len(tokens)}"
+            )
+        if self.finish_reason not in (None, "stop", "length"):
+            raise ValueError("resumed generation has a malformed finish reason")
+        for name, scores in (
+            ("prompt", self.prompt_top_n_logprobs),
+            ("generated", self.generated_top_n_logprobs),
+        ):
+            if scores is not None and not all(isinstance(entry, dict) for entry in scores):
+                raise ValueError(f"resumed generation has malformed {name} top-N log probs")
+        top_n = self.generated_top_n_logprobs
+        if top_n is not None and len(top_n) != len(tokens):
+            raise ValueError(
+                "resumed generation has top-N log probs and tokens of different lengths, "
+                f"{len(top_n)} and {len(tokens)}"
+            )
+        steps = self.acceptance_step_lengths
+        if not all(type(s) is int and s > 0 for s in steps) or sum(steps) > len(tokens):
+            raise ValueError("resumed generation has malformed acceptance step lengths")
+        routing = self.routing_indices
+        if routing is not None and not (isinstance(routing, np.ndarray) and routing.ndim == 3):
+            raise ValueError("resumed generation has malformed routing indices")
+        for name, boundaries in (
+            ("policy_epoch", self.policy_epoch),
+            ("kv_cache_epoch", self.kv_cache_epoch),
+        ):
+            if boundaries is None:
+                continue
+            if not (
+                boundaries
+                and all(len(b) == 2 and all(type(v) is int for v in b) for b in boundaries)
+            ):
+                raise ValueError(f"resumed generation has malformed {name} boundaries")
+            if boundaries[0][0] != 0:
+                raise ValueError(
+                    f"resumed generation has {name} boundaries that do not start at admission"
+                )
+            positions = [position for position, _ in boundaries[1:]]
+            if positions != sorted(positions):
+                raise ValueError(f"resumed generation has {name} boundaries out of order")
+
+    @classmethod
+    def from_snapshot(cls, snapshot: "LiveRequestSnapshot") -> "ResumedGeneration":
+        """The resume of a live request from the engine's snapshot of it."""
+        payload, record = snapshot.payload, snapshot.record
+
+        def as_list(values):
+            return None if values is None else list(values)
+
+        return cls(
+            token_ids=[int(t) for t in payload.generated_token_ids],
+            num_tokens_to_generate=record.num_tokens_to_generate,
+            log_probs=as_list(payload.generated_log_probs),
+            prompt_log_probs=as_list(payload.prompt_log_probs),
+            policy_epoch=as_list(record.policy_epoch),
+            kv_cache_epoch=as_list(record.kv_cache_epoch),
+            num_evictions=record.num_evictions,
+            finish_reason=record.finish_reason,
+            prompt_top_n_logprobs=as_list(payload.prompt_top_n_logprobs),
+            generated_top_n_logprobs=as_list(payload.generated_top_n_logprobs),
+            acceptance_step_lengths=list(payload.acceptance_step_lengths),
+            routing_indices=payload.routing_indices,
+        )
+
+    def to_wire(self) -> Dict[str, Any]:
+        """The msgpack form MP rank zero broadcasts."""
+
+        def top_n(scores):
+            if scores is None:
+                return None
+            return [{token: float(score) for token, score in entry.items()} for entry in scores]
+
+        return {
+            "token_ids": list(self.token_ids),
+            "num_tokens_to_generate": self.num_tokens_to_generate,
+            "log_probs": None if self.log_probs is None else [float(v) for v in self.log_probs],
+            "prompt_log_probs": (
+                None if self.prompt_log_probs is None else [float(v) for v in self.prompt_log_probs]
+            ),
+            "policy_epoch": (
+                None if self.policy_epoch is None else [list(b) for b in self.policy_epoch]
+            ),
+            "kv_cache_epoch": (
+                None if self.kv_cache_epoch is None else [list(b) for b in self.kv_cache_epoch]
+            ),
+            "num_evictions": self.num_evictions,
+            "finish_reason": self.finish_reason,
+            "prompt_top_n_logprobs": top_n(self.prompt_top_n_logprobs),
+            "generated_top_n_logprobs": top_n(self.generated_top_n_logprobs),
+            "acceptance_step_lengths": list(self.acceptance_step_lengths),
+            "routing_indices": (
+                None if self.routing_indices is None else serialize_ndarray(self.routing_indices)
+            ),
+        }
+
+    @classmethod
+    def from_wire(cls, obj: Dict[str, Any]) -> "ResumedGeneration":
+        """Rebuild the broadcast form."""
+
+        def boundaries(name):
+            value = obj[name]
+            return None if value is None else [tuple(boundary) for boundary in value]
+
+        try:
+            return cls(
+                token_ids=list(obj["token_ids"]),
+                num_tokens_to_generate=obj["num_tokens_to_generate"],
+                log_probs=obj["log_probs"],
+                prompt_log_probs=obj["prompt_log_probs"],
+                policy_epoch=boundaries("policy_epoch"),
+                kv_cache_epoch=boundaries("kv_cache_epoch"),
+                num_evictions=obj["num_evictions"],
+                finish_reason=obj["finish_reason"],
+                prompt_top_n_logprobs=obj["prompt_top_n_logprobs"],
+                generated_top_n_logprobs=obj["generated_top_n_logprobs"],
+                acceptance_step_lengths=list(obj["acceptance_step_lengths"]),
+                routing_indices=(
+                    None
+                    if obj["routing_indices"] is None
+                    else deserialize_ndarray(obj["routing_indices"])
+                ),
+            )
+        except (KeyError, TypeError) as unreadable:
+            raise ValueError(
+                f"resumed generation wire is malformed: {type(unreadable).__name__}: {unreadable}"
+            ) from unreadable
 
 
 @dataclass(frozen=True)
@@ -1488,7 +1798,9 @@ class RequestPromptPreparer(Protocol):
     prompt_token_ids`` plus ``generated_token_ids``) the same way for text and
     multimodal requests. When ``PREFIX_MEDIA_COUNT_FIELD`` is present, they must also
     return the length of that exact prefix as ``PREFIX_EXPANDED_TOKEN_COUNT_FIELD`` so
-    the engine expands only the tokens after it.
+    the engine expands only the tokens after it. A preparer that resumes a generation
+    puts ``ResumedGeneration.to_wire()`` under ``RESUMED_GENERATION_FIELD``; its epoch
+    boundaries are the engine's own, counted on the expanded prompt the engine ran.
     """
 
     def prepare_prompt(

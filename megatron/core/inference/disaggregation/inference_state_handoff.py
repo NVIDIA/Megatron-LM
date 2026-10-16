@@ -1062,12 +1062,9 @@ class InferenceStateHandoffMixin:
         self._set_finish_reason(request)
         request.generated_length = len(request.generated_tokens)
         request.status = Status.COMPLETED
-        request.add_event_finish()
-        self.finished_request_count += 1
-        finished_request = self._complete_request(request_entry)
+        self._complete_request(request_entry, reply_now=True)
 
         if self.use_coordinator and self.is_mp_coordinator:
-            self._send_requests_to_coordinator([finished_request])
             self._partial_emit_lengths.pop(request_id, None)
 
     def _release_pending_kv_import(self, pending: PendingKvImport) -> None:
