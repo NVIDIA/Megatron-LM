@@ -169,7 +169,8 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
     with torch.no_grad():
-        model(torch.ones(2, 4, device=device))
+        for _ in range(3):
+            model(torch.ones(2, 4, device=device))
 
     context = model.layers[0].context
     assert model.layers[1].context is context

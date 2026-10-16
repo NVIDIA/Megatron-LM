@@ -20,7 +20,8 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .indexed_order import IndexedOrder
+from .execution_order import ExecutionOrder
+from .iteration import IterationOrder
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -45,10 +46,10 @@ class FsdpContext:
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
-    forward_order: IndexedOrder[nn.Module]
-    backward_order: IndexedOrder[nn.Module]
+    forward_order: ExecutionOrder[nn.Module]
+    backward_order: ExecutionOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
-    _roots: IndexedOrder[nn.Module]
+    _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
     _module_names: WeakKeyDictionary[nn.Module, str]
     # The optimizer runs on the current stream and must wait for reductions on
@@ -95,12 +96,13 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
-        self.forward_order = IndexedOrder()
-        self.backward_order = IndexedOrder()
+        self.iteration_order = IterationOrder()
+        self.forward_order = ExecutionOrder()
+        self.backward_order = ExecutionOrder()
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
-        self._roots = IndexedOrder()
+        self._roots = WeakKeyDictionary()
         self._module_names = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
@@ -153,14 +155,14 @@ class FsdpContext:
         for root in self._registered_modules:
             if root in children:
                 continue
-            self._roots.append(root)
+            self._roots[root] = None
             for name, module in root.named_modules():
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
                 self.forward_order.append(module)
 
-        for root in reversed(self._roots):
+        for root in reversed(list(self._roots)):
             _collect_backward_order(root, registered_modules, self.backward_order)
 
         self._registered_modules.clear()
@@ -250,7 +252,7 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: IndexedOrder[nn.Module]
+    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[nn.Module]
 ) -> None:
     """Collect one root's static backward prefetch order."""
     if module in registered_modules:
