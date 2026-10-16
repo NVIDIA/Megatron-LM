@@ -97,8 +97,8 @@ def fully_shard(
         schedule_policy: Communication scheduling policy for this FSDP module.
         register_hooks: Whether to register the automatic forward and backward execution
             hooks on ``module``. Disable this when an external scheduler invokes the
-            corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
-            is registered independently.
+            corresponding FSDP lifecycle methods explicitly. State-dict hooks are
+            registered independently.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")

@@ -43,9 +43,14 @@ from torch.distributed.tensor import DTensor
 
 from .dbuffer import DBuffer
 from .layout import non_leading_numel
-from .module import FsdpModule
+from .parameter_group import get_containing_parameter_group
 
-__all__ = ["attach_uneven_dtensor_metadata", "chunk_metadata_by_fqn"]
+__all__ = [
+    "attach_uneven_dtensor_metadata",
+    "chunk_metadata_by_fqn",
+    "preprocess_model_state_dict",
+    "preprocess_optimizer_state_dict",
+]
 
 # Key of the per-parameter optimizer state in a torch DCP optimizer state dict.
 _OPTIMIZER_STATE_KEY = "state"
@@ -98,21 +103,26 @@ def chunk_metadata_by_fqn(model: nn.Module) -> dict[str, ChunkStorageMetadata]:
         Tied parameters appear once per FQN, all sharing the one chunk of the buffer entry that
         backs them.
     """
-    # Keyed by tensor, which hashes and compares by identity, as torch.optim keys its state.
+    return _chunk_metadata_by_key(dict(model.named_parameters(remove_duplicate=False)))
+
+
+def _chunk_metadata_by_key(parameters: dict[Any, nn.Parameter]) -> dict[Any, ChunkStorageMetadata]:
+    """Resolve FQNs or optimizer parameter IDs through the same FSDP buffer layouts."""
     metadata_by_parameter: dict[torch.Tensor, ChunkStorageMetadata] = {}
-    for module in model.modules():
-        if not isinstance(module, FsdpModule):
+    for parameter in parameters.values():
+        if parameter in metadata_by_parameter:
             continue
-        for parameter_group in module.parameter_groups:
-            for index, fsdp_parameter in enumerate(parameter_group.fsdp_parameters):
-                metadata_by_parameter[fsdp_parameter.sharded] = _dbuffer_chunk_metadata(
-                    parameter_group.main_weight, index
-                )
-    # Tied parameters share one nn.Parameter under several FQNs, and the state dict carries an
-    # entry for each of them, so iterate without deduplicating.
+        group = get_containing_parameter_group(parameter)
+        if group is None:
+            continue
+        for index, fsdp_parameter in enumerate(group.fsdp_parameters):
+            metadata_by_parameter[fsdp_parameter.sharded] = _dbuffer_chunk_metadata(
+                group.main_weight, index
+            )
+    # Preserve every key for tied parameters while computing their metadata once.
     return {
-        fqn: metadata_by_parameter[parameter]
-        for fqn, parameter in model.named_parameters(remove_duplicate=False)
+        key: metadata_by_parameter[parameter]
+        for key, parameter in parameters.items()
         if parameter in metadata_by_parameter
     }
 
@@ -135,6 +145,29 @@ def attach_uneven_dtensor_metadata(
     metadata_by_fqn = chunk_metadata_by_fqn(model)
     _attach_by_fqn(model_state_dict, metadata_by_fqn)
     _attach_by_fqn(optimizer_state_dict[_OPTIMIZER_STATE_KEY], metadata_by_fqn)
+
+
+def preprocess_model_state_dict(
+    module: nn.Module, state_dict: dict[str, Any], prefix: str = ""
+) -> None:
+    """Prepare this module's state entries for DCP using its local buffer layout."""
+    for fqn, chunk in chunk_metadata_by_fqn(module).items():
+        tensor = state_dict.get(prefix + fqn)
+        if isinstance(tensor, DTensor):
+            _attach_dcp_hooks(tensor, chunk)
+
+
+def preprocess_optimizer_state_dict(
+    optimizer: torch.optim.Optimizer, state_dict: dict[str, Any]
+) -> None:
+    """Prepare optimizer state for DCP using each parameter's local buffer layout."""
+    parameters: dict[int, nn.Parameter] = {}
+    for group, saved_group in zip(optimizer.param_groups, state_dict["param_groups"]):
+        parameters.update(zip(saved_group["params"], group["params"]))
+    for parameter_id, chunk in _chunk_metadata_by_key(parameters).items():
+        for tensor in state_dict["state"].get(parameter_id, {}).values():
+            if isinstance(tensor, DTensor):
+                _attach_dcp_hooks(tensor, chunk)
 
 
 def _build_chunk_metadata(row_offset: int, rows: int, shape: torch.Size) -> ChunkStorageMetadata:
