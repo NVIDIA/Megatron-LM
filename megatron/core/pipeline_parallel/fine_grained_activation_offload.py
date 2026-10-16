@@ -12,11 +12,6 @@ from torch.autograd.graph import saved_tensors_hooks
 DEBUG = False
 DEBUG_RANK = 0
 
-try:
-    from nemo.lens.helpers import trace_fn as _otel_trace_fn
-except ImportError:
-    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
-
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
@@ -891,7 +886,6 @@ class ChunkOffloadHandler:
     # view spans most of the storage.
     BASE_OFFLOAD_MIN_COVERAGE = 0.5
 
-    @_otel_trace_fn('activation_offload', 'megatron.activation.offload')
     def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True):
         """Offload.
 
@@ -933,7 +927,6 @@ class ChunkOffloadHandler:
         state = (src_tensor.device, cpu_backup, use_cpu_pool, view_meta)
         return state
 
-    @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
     def reload(self, state, non_blocking=None):
         """Reload."""
         debug_rank("------reload")
