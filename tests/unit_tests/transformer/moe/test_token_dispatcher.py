@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +27,7 @@ from megatron.core.transformer.moe.fused_a2a import (
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity, pad_routing_map
 from megatron.core.transformer.moe.token_dispatcher import (
+    MoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
     _DeepepManager,
     _HybridEPManager,
@@ -761,6 +763,37 @@ def test_moe_layer_preprocess_forwards_padding_mask_only_to_flex_dispatcher(flex
         assert len(calls) == 1 and calls[0] is padding_mask
     else:
         assert calls == ["no-mask"]
+
+
+def test_alltoall_combine_postprocess_releases_router_probs():
+    """combine_postprocess drops the dispatcher's reference to the router probs, so their
+    autograd graph is not kept alive until the next forward (under full recompute, through
+    the rest of backward). The combined output is unchanged."""
+    dispatcher = object.__new__(MoEAlltoAllTokenDispatcher)
+    dispatcher.config = SimpleNamespace(moe_permute_fusion=False)
+    dispatcher.drop_and_pad = False
+    dispatcher.batch_invariant_inverse_permutation_mapping = None
+    dispatcher.shared_experts = None
+    num_tokens, hidden, topk, num_experts = 3, 4, 2, 2
+    dispatcher.hidden_shape = torch.Size([num_tokens, 1, hidden])
+    dispatcher.hidden_shape_before_permute = torch.Size([num_tokens, hidden])
+    dispatcher.routing_map = torch.ones(num_tokens, num_experts, dtype=torch.bool)
+    # Permuted rows are grouped by expert: expert 0 gets tokens [0, 1, 2], then expert 1.
+    dispatcher.reversed_local_input_permutation_mapping = torch.tensor([0, 1, 2, 0, 1, 2])
+
+    logits = torch.randn(num_tokens, num_experts, requires_grad=True)
+    probs = torch.softmax(logits, dim=-1)  # non-leaf, carries the router's grad_fn
+    probs_ref = weakref.ref(probs)
+    dispatcher.probs = probs
+    del probs
+
+    permuted = torch.arange(num_tokens * topk * hidden, dtype=torch.float32).view(-1, hidden)
+    output = dispatcher.combine_postprocess(permuted)
+
+    expected = (permuted[:num_tokens] + permuted[num_tokens:]).view(num_tokens, 1, hidden)
+    torch.testing.assert_close(output, expected)
+    assert dispatcher.probs is None
+    assert probs_ref() is None, "the router probs (and their graph) are still referenced"
 
 
 def test_hybridep_dropless_excludes_padding_rows(monkeypatch):
