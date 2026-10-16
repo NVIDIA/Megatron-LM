@@ -434,6 +434,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="apex FastLayerNormFN / FusedLayerNormAffineFunction; dgamma/dbeta cross-row reduction.",
     ),
     KernelEntry(
+        name="glm5_next_rms_norm",
+        sources=("megatron/core/transformer/glm5_next_norm.py",),
+        tests=(K + "test_glm5_next_norm.py",),
+        kind="torch.compile",
+        notes="GLM5Next RMSNorm (rmsnorm_cast_before_weight): eager passes and, with "
+        "rmsnorm_cast_before_weight_compiled, Inductor kernels with emulate_precision_casts; "
+        "mean-square and gamma-gradient reductions.",
+    ),
+    KernelEntry(
         name="fused_scale_mask_softmax",
         sources=(
             "megatron/core/fusions/fused_softmax.py",

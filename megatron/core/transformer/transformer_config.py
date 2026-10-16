@@ -969,6 +969,23 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    mtp_enable_hyper_connections: Optional[bool] = None
+    """Override the MTP residual-stream architecture; None inherits the main decoder."""
+
+    rmsnorm_cast_before_weight: bool = False
+    """Round the normalized activation before applying RMSNorm gamma, matching HF GLM5Next.
+    This is an explicit numerical path, not a change to Transformer Engine's default.
+    """
+
+    rmsnorm_cast_before_weight_compiled: bool = False
+    """Run the rmsnorm_cast_before_weight RMSNorm as Inductor-compiled kernels.
+
+    Keeps the rounding contract of rmsnorm_cast_before_weight in both passes (Inductor's
+    emulate_precision_casts keeps every dtype cast), but sums the mean square and the gamma
+    gradient in Inductor's reduction order, so results can differ from the eager operation
+    order in the last bit. Requires rmsnorm_cast_before_weight.
+    """
+
     kda_f_lora_rank: Optional[int] = None
     """Rank of KDA's bias-free low-rank F-decay projection; None keeps it full-rank."""
 
@@ -978,11 +995,39 @@ class TransformerConfig(ModelParallelConfig):
     When both KDA ranks are None, KDA uses its legacy fused input projection.
     """
 
+    kda_disable_fp8: bool = False
+    """Force KDA projections to BF16 even under FP8 training,
+    (KDA projections are BF16 in the checkpoint)."""
+
+    kda_beta_sigmoid_in_projection_dtype: bool = False
+    """Apply the KDA beta sigmoid in the projection dtype and only then promote beta to FP32,
+    as official GLM5Next does, for direct and two-stage gates alike.
+    False keeps the FP32-first sigmoid (beta.float().sigmoid()).
+    """
+
+    kda_conv_in_fp32: bool = False
+    """Retain KDA convolution weights in FP32, as official GLM5Next loading requires.
+    Convolution and SiLU accumulate before casting back to the activation dtype.
+    False preserves the existing projection-dtype convolution parameter contract.
+    """
+
+    kda_core_in_fp32: bool = False
+    """Run the GLM two-stage KDA core with FP32 Q/K/V/decay/beta storage.
+    Q/K normalization is external FP32 HF-style math when enabled; the FLA core
+    output is restored to activation dtype before gated output normalization.
+    This changes all recurrent-core intermediate dtypes, not only Q/K norms.
+    It does not select IEEE GEMMs or change global precision. Initial scope is
+    CP=1; False preserves the existing FLA dtype/normalization contract.
+    """
+
     kda_safe_gate: bool = False
     """Whether the KDA kernel should use bounded gate values."""
 
     kda_lower_bound: Optional[float] = None
     """Optional lower bound for KDA's bounded gate values."""
+
+    kda_two_stage_gates: bool = False
+    """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection."""
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use streamed Triton pre-GDR preprocessing for GDN-family attention."""
@@ -1715,6 +1760,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    moe_apply_probs_after_fc2: bool = False
+    """Apply FP32 routing probabilities after the expert output projection, then restore
+    its activation dtype. Matches the probability placement in HF GLM5Next routed experts.
+    Initially limited to bias-free BF16/FP32 TEGroupedMLP, TP/ETP1 and AllToAll dispatch.
+    The default retains probability weighting between the activation and FC2.
+    """
+
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
@@ -2000,8 +2052,29 @@ class TransformerConfig(ModelParallelConfig):
     mhc_norm_eps_inside_sqrt: bool = False
     """Use rsqrt(mean(x**2) + layernorm_epsilon) for the mHC mapping norm."""
 
+    mhc_normalize_before_projection: bool = False
+    """Feed the RMS-normalized residual to the FP32 mHC mapping projection, as HF GLM5Next
+    does, instead of scaling the projection by the norm afterwards. The norm is the one
+    mhc_norm_eps_inside_sqrt selects. Incompatible with use_fused_mhc. False preserves the
+    projection-before-normalization path.
+    """
+
     mhc_keep_mappings_in_fp32: bool = False
     """Keep mHC coefficients and stream mixing in FP32 until the output cast."""
+
+    mhc_keep_pre_in_fp32: bool = False
+    """Keep input-aggregation coefficients in FP32 independently of residual mixing.
+    Official GLM5Next uses FP32 pre coefficients but activation-dtype post/residual
+    coefficients. Keeping all mappings in FP32 also keeps pre in FP32.
+    """
+
+    mhc_preserve_activation_dtype_rounding: bool = False
+    """Preserve eager activation-dtype intermediate rounding in compiled mHC residual updates.
+    Uses the opt-in Inductor emulate_precision_casts option for the native no-dropout
+    post-multiply/residual-add operator, including backward and checkpoint replay.
+    Requires compiler support and is incompatible with use_fused_mhc. False preserves
+    the existing compiler precision policy; this does not change global matmul precision.
+    """
 
     mhc_learned_output_contract: bool = True
     """Contract residual streams to the ordinary hidden width using token-dependent gating;
@@ -2865,14 +2938,82 @@ class TransformerConfig(ModelParallelConfig):
                 "enable_attention_residuals is not yet supported with: " + "; ".join(unsupported)
             )
 
+    def _validate_moe_probs_after_fc2(self) -> None:
+        """Reject expert paths that do not implement the opt-in output-weighting contract."""
+        if not isinstance(self.moe_apply_probs_after_fc2, bool):
+            raise ValueError("moe_apply_probs_after_fc2 must be a bool.")
+        if not self.moe_apply_probs_after_fc2:
+            return
+        if (
+            self.transformer_impl != "transformer_engine"
+            or not self.moe_grouped_gemm
+            or not self.num_moe_experts
+            or not is_te_min_version("1.9.0.dev0")
+        ):
+            raise ValueError("moe_apply_probs_after_fc2 requires TEGroupedMLP and TE>=1.9.0.dev0.")
+        if (
+            self.fp16
+            or self.params_dtype not in (torch.bfloat16, torch.float32)
+            or self.fp8
+            or self.fp4
+            or self.fp8_param
+            or self.fp4_param
+            or self.activation_func_fp8_input_store
+            or self.quant_recipe is not None
+        ):
+            raise ValueError("moe_apply_probs_after_fc2 supports non-quantized BF16/FP32 only.")
+        if (
+            self.tensor_model_parallel_size != 1
+            or self.expert_tensor_parallel_size != 1
+            or self.sequence_parallel
+            or self.moe_token_dispatcher_type != "alltoall"
+            or self.moe_router_dtype != "fp32"
+        ):
+            raise ValueError(
+                "moe_apply_probs_after_fc2 requires TP/ETP1, no SP, AllToAll and FP32 routing."
+            )
+        if (
+            self.add_bias_linear
+            or not self.gated_linear_unit
+            or self.activation_func is not F.silu
+            or self.use_te_activation_func
+            or self.moe_mlp_glu_interleave_size is not None
+            or self.glu_linear_offset != 0
+            or self.moe_latent_size is not None
+            or self.activation_func_tanh_clamp_scale is not None
+            or self.activation_func_tanh_clamp_scale_linear is not None
+        ):
+            raise ValueError("moe_apply_probs_after_fc2 requires bias-free standard SwiGLU.")
+        if (
+            self.moe_apply_probs_on_input
+            or self.use_transformer_engine_op_fuser
+            or self.moe_use_grouped_tensor
+            or self.moe_single_grouped_weight
+            or self.moe_single_grouped_bias
+            or self.moe_megakernel_backend is not None
+        ):
+            raise ValueError(
+                "moe_apply_probs_after_fc2 does not support fused/packed experts "
+                "or input weighting."
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+        self._validate_moe_probs_after_fc2()
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
+
+        if not isinstance(self.kda_core_in_fp32, bool):
+            raise ValueError("kda_core_in_fp32 must be a bool.")
+        if self.kda_core_in_fp32:
+            if not self.kda_two_stage_gates:
+                raise ValueError("kda_core_in_fp32 requires kda_two_stage_gates=True.")
+            if self.context_parallel_size != 1:
+                raise ValueError("kda_core_in_fp32 currently supports CP=1 only.")
 
         # Imported lazily because the module-spec module imports TransformerConfig.
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -5156,14 +5297,27 @@ class TransformerConfig(ModelParallelConfig):
                 "recompute_modules with selective recompute to reduce activation memory."
             )
 
+        if self.rmsnorm_cast_before_weight_compiled and not self.rmsnorm_cast_before_weight:
+            raise ValueError(
+                "rmsnorm_cast_before_weight_compiled requires rmsnorm_cast_before_weight=True."
+            )
+
         # Validation for use_fused_mhc
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
-            if self.mhc_norm_eps_inside_sqrt or self.mhc_keep_mappings_in_fp32:
+            if (
+                self.mhc_norm_eps_inside_sqrt
+                or self.mhc_normalize_before_projection
+                or self.mhc_keep_mappings_in_fp32
+                or self.mhc_keep_pre_in_fp32
+                or self.mhc_preserve_activation_dtype_rounding
+            ):
                 raise ValueError(
-                    "use_fused_mhc does not support mhc_norm_eps_inside_sqrt or "
-                    "mhc_keep_mappings_in_fp32; use the unfused mHC path."
+                    "use_fused_mhc does not support mhc_norm_eps_inside_sqrt, "
+                    "mhc_normalize_before_projection, mhc_keep_mappings_in_fp32, "
+                    "mhc_keep_pre_in_fp32 or mhc_preserve_activation_dtype_rounding; "
+                    "use the unfused mHC path."
                 )
 
         valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")
