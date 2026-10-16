@@ -365,6 +365,8 @@ async def openai_stream(
             final=None,
             role_sent=False,
             echo_sent=False,
+            # Logprobs of tokens whose text the chat parser has not emitted yet.
+            pending_logprobs=None,
             parser=chat_parsers[index] if chat_parsers is not None else None,
             echo_prompt=echo_prompts[index] if echo_prompts is not None else None,
             prompt_token_ids=prompt_token_ids[index] if prompt_token_ids is not None else [],
@@ -484,20 +486,23 @@ async def openai_stream(
 
             parser = state["parser"]
             if parser is not None:
+                # The parser may hold text back for later frames, so keep its tokens'
+                # logprobs until the next textual delta carries them.
+                if logprobs is not None:
+                    if state["pending_logprobs"] is None:
+                        state["pending_logprobs"] = logprobs
+                    else:
+                        for key, entries in logprobs.items():
+                            state["pending_logprobs"][key].extend(entries)
                 parsed_deltas = parser.parse(state["detokenizer"].text, finished=is_final)
-                logprobs_attached = False
                 for parsed_delta in parsed_deltas:
                     parsed_logprobs = None
-                    if (
-                        not logprobs_attached
-                        and logprobs is not None
-                        and (
-                            parsed_delta.get("content") is not None
-                            or parsed_delta.get("reasoning_content") is not None
-                        )
+                    if state["pending_logprobs"] is not None and (
+                        parsed_delta.get("content") is not None
+                        or parsed_delta.get("reasoning_content") is not None
                     ):
-                        parsed_logprobs = logprobs
-                        logprobs_attached = True
+                        parsed_logprobs = state["pending_logprobs"]
+                        state["pending_logprobs"] = None
                     yield sse(
                         [
                             {

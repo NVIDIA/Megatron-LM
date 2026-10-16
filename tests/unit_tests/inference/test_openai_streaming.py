@@ -288,6 +288,75 @@ async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
     assert records[-1] == "data: [DONE]\n\n"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final_tokens", [[1, 2], [1, 2, 3]], ids=["held-back-tokens", "held-back-and-final-tokens"]
+)
+async def test_openai_stream_keeps_logprobs_of_parser_held_back_text(final_tokens):
+    log_probs = [-0.1, NEG_INF, -0.3]
+    top_log_probs = [{"a": NEG_INF}, {"b": -0.2}, {"c": -0.3}]
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    for token in (1, 2):
+        stream.put(
+            {
+                "partial": {
+                    "request_id": 1,
+                    "new_tokens": [token],
+                    "new_log_probs": [log_probs[token - 1]],
+                    "new_top_n_logprobs": [top_log_probs[token - 1]],
+                }
+            }
+        )
+    stream.put(
+        {
+            "final": {
+                "prompt_tokens": [9],
+                "generated_tokens": final_tokens,
+                "generated_log_probs": log_probs[: len(final_tokens)],
+                "generated_top_n_logprobs": top_log_probs[: len(final_tokens)],
+                "sampling_params": {"num_tokens_to_generate": 8},
+            }
+        }
+    )
+    stream.finish()
+
+    def parse(text, finished=False):
+        return NemotronV3ReasoningParser.parse(
+            text, chat_template_kwargs={"enable_thinking": False}
+        )
+
+    records = [
+        record
+        async for record in openai_stream(
+            [stream],
+            _Tokenizer(),
+            [_IncrementalDetokenizer()],
+            chat=True,
+            return_log_probs=True,
+            chat_parsers=[StreamingChatParser(parse)],
+        )
+    ]
+    payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
+
+    # The forced-content parser holds the partial frames' text back until the final frame.
+    role, content, finished = payloads
+    assert role["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+    expected_text = "abc"[: len(final_tokens)]
+    assert content["choices"][0]["delta"] == {"content": expected_text}
+    # Delaying the text must not drop its logprobs: every token keeps exactly one entry.
+    entries = content["choices"][0]["logprobs"]["content"]
+    assert [entry["token"] for entry in entries] == list(expected_text)
+    assert [entry["logprob"] for entry in entries] == [-0.1, JSON_SAFE_LOGPROB_FLOOR, -0.3][
+        : len(final_tokens)
+    ]
+    assert entries[0]["top_logprobs"] == [
+        {"token": "a", "logprob": JSON_SAFE_LOGPROB_FLOOR, "bytes": [97]}
+    ]
+    assert finished["choices"][0]["logprobs"] is None
+    assert finished["choices"][0]["finish_reason"] == "stop"
+    assert records[-1] == "data: [DONE]\n\n"
+
+
 def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
     tools = [
         {
