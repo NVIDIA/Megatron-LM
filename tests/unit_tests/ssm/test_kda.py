@@ -144,6 +144,86 @@ def test_kda_two_stage_defaults_preserve_direct_gates():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
     assert config.kda_two_stage_gates is False
     assert config.kda_disable_fp8 is False
+    assert config.kda_conv_in_fp32 is False
+    assert config.kda_beta_sigmoid_in_projection_dtype is False
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("conv_in_fp32", [False, True])
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_convolution_precision_survives_bf16_model_construction(conv_in_fp32, two_stage_gates):
+    """HF keeps convolution parameters FP32; the opt-out retains dev BF16 defaults."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(322)
+        config = replace(
+            _make_config(two_stage_gates=two_stage_gates), kda_conv_in_fp32=conv_in_fp32
+        )
+        layer = _build_kda(config)
+        expected_dtype = torch.float32 if conv_in_fp32 else torch.bfloat16
+        assert layer.conv1d.weight.dtype == expected_dtype
+        original = layer.conv1d.weight.detach().clone()
+        Float16Module(config, layer)
+        assert layer.in_proj.weight.dtype == torch.bfloat16
+        assert layer.conv1d.weight.dtype == expected_dtype
+        assert getattr(layer.conv1d.weight, "keep_in_fp32", False) is conv_in_fp32
+        torch.testing.assert_close(layer.conv1d.weight, original, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("sigmoid_in_projection_dtype", [False, True])
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_beta_sigmoid_order_reaches_kernel(
+    two_stage_gates, sigmoid_in_projection_dtype, monkeypatch
+):
+    """Both gate modes give the recurrent kernel the beta order the switch selects.
+
+    The direct-gate path runs through the compiled input preparation, so this also checks
+    that the projection-dtype rounding survives torch.compile there.
+    """
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(321)
+        config = _make_config(
+            two_stage_gates=two_stage_gates,
+            kda_beta_sigmoid_in_projection_dtype=sigmoid_in_projection_dtype,
+        )
+        layer = _build_kda(config)
+        assert layer.beta_sigmoid_in_projection_dtype is sigmoid_in_projection_dtype
+        projected, kernel_betas = [], []
+
+        def record_projection(module, inputs, output):
+            projected.append((output[0] if isinstance(output, tuple) else output).detach())
+
+        gated_delta_rule = layer.gated_delta_rule
+
+        def record_kernel(*args, **kwargs):
+            kernel_betas.append(kwargs["beta"].detach())
+            return gated_delta_rule(*args, **kwargs)
+
+        monkeypatch.setattr(layer, "gated_delta_rule", record_kernel)
+        handle = layer.beta_proj.register_forward_hook(record_projection)
+        hidden = torch.randn(32, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        try:
+            with torch.no_grad():
+                layer(hidden, None)
+        finally:
+            handle.remove()
+        assert len(projected) == len(kernel_betas) == 1
+        raw = projected[0].transpose(0, 1)  # beta_proj's [s, b, h] in the kernel's [b, s, h]
+        assert raw.dtype == torch.bfloat16
+        official, legacy = raw.sigmoid().float(), raw.float().sigmoid()
+        assert (official - legacy).abs().max() > 1e-4, "Fixture must distinguish the orders."
+        assert kernel_betas[0].dtype == torch.float32
+        # A compiled FP32 sigmoid may differ from eager by an ulp; BF16 rounding is far larger.
+        expected = official if sigmoid_in_projection_dtype else legacy
+        torch.testing.assert_close(kernel_betas[0], expected, rtol=0, atol=1e-6)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.internal

@@ -43,6 +43,13 @@ class KDALayerConfig(GDNLayerConfig):
 
     def validate_kda(self) -> None:
         """Validate KDA-specific dimensions, including configs copied with from_config."""
+        if not isinstance(self.kda_core_in_fp32, bool):
+            raise ValueError("kda_core_in_fp32 must be a bool.")
+        if self.kda_core_in_fp32:
+            if not self.kda_two_stage_gates:
+                raise ValueError("kda_core_in_fp32 requires kda_two_stage_gates=True.")
+            if self.context_parallel_size != 1:
+                raise ValueError("kda_core_in_fp32 currently supports CP=1 only.")
         if self.gdn_conv_pad_alignment is not None and self.gdn_conv_pad_alignment <= 0:
             raise ValueError(
                 "gdn_conv_pad_alignment must be positive when set for KDA, got "
