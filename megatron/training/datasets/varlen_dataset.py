@@ -495,9 +495,8 @@ class MockVarlenDataset(MockSFTDataset):
         eod = tokenizer.eod
         pad = tokenizer.pad if tokenizer.pad is not None else eod
 
-        # MockSFTLowLevelDataset returns ``length - 1`` token ids; append EOD
-        # to make the conversation end on a stop token, mirroring the real
-        # VarlenDataset path.
+        # The low-level dataset returns ``length`` content tokens. Appending
+        # EOD provides the extra target so the next-token shift preserves length.
         raw = self.dataset[int(self.indices[idx % len(self.indices)])]
         tokens_list = raw.tolist()
         tokens_list.append(eod)
@@ -509,8 +508,8 @@ class MockVarlenDataset(MockSFTDataset):
         # --mock-data in validate_args).
         # THD mode: unpacked single sample, pad to pad_granularity only.
         if len(tokens_list) > max_len + 1:
-            tokens_list = tokens_list[: max_len - 1] + [eod]
-            targets_list = targets_list[: max_len - 1] + [eod]
+            tokens_list = tokens_list[:max_len] + [eod]
+            targets_list = targets_list[:max_len] + [eod]
         original_seq_len = len(tokens_list) - 1
 
         pad_granularity = self._calculate_padding_divisor()
