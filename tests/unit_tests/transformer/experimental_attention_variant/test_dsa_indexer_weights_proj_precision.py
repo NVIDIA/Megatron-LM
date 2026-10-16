@@ -192,9 +192,14 @@ def test_weights_projection_precision_contract(
 
 
 @pytest.mark.internal
-def test_precision_config_defaults_and_invalid_combinations():
+@pytest.mark.parametrize("dsa_kernel_backend", ["none", "cudnn"])
+def test_precision_config_defaults_and_invalid_combinations(monkeypatch, dsa_kernel_backend):
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_config." "_validate_dsa_kernel_backend_dependencies",
+        lambda _backend: None,
+    )
     default_config = _make_config(
-        use_sparse_loss=True, calculate_per_token_loss=False, dsa_kernel_backend="none"
+        use_sparse_loss=True, calculate_per_token_loss=False, dsa_kernel_backend=dsa_kernel_backend
     )
     assert default_config.dsa_indexer_weights_proj_use_quantization is True
     assert default_config.dsa_indexer_weights_proj_output_dtype == "bf16"
@@ -209,13 +214,14 @@ def test_precision_config_defaults_and_invalid_combinations():
             dsa_indexer_weights_proj_output_dtype="fp32",
         )
 
-    with pytest.raises(ValueError, match="not supported.*cudnn"):
-        dataclasses.replace(
-            default_config,
-            dsa_kernel_backend="cudnn",
-            dsa_indexer_weights_proj_use_quantization=False,
-            dsa_indexer_weights_proj_output_dtype="fp32",
-        )
+    fp32_config = dataclasses.replace(
+        default_config,
+        dsa_indexer_weights_proj_use_quantization=False,
+        dsa_indexer_weights_proj_output_dtype="fp32",
+    )
+    assert fp32_config.params_dtype == torch.bfloat16
+    assert fp32_config.dsa_indexer_weights_proj_output_dtype == "fp32"
+    assert fp32_config.dsa_indexer_weights_proj_use_quantization is False
 
 
 @pytest.mark.internal
@@ -720,8 +726,9 @@ def test_unquantized_fp32_tilelang_dsa_matches_native():
 
 
 @pytest.mark.internal
-def test_unquantized_bf16_cudnn_dsa_matches_native():
-    """cuDNN must retain its BF16 weights-tensor contract when quantization is bypassed."""
+@pytest.mark.parametrize("weights_proj_output_dtype", ["bf16", "fp32"])
+def test_unquantized_cudnn_dsa_matches_native(weights_proj_output_dtype):
+    """Compare both forward precisions, retaining cuDNN's BF16 indexer backward."""
     run_absorbed_mla_dsa_parity(
         kernel_backend="cudnn",
         seqlen=1024,
@@ -730,5 +737,5 @@ def test_unquantized_bf16_cudnn_dsa_matches_native():
         use_sparse_loss=True,
         num_iterations=1,
         dsa_indexer_weights_proj_use_quantization=False,
-        dsa_indexer_weights_proj_output_dtype="bf16",
+        dsa_indexer_weights_proj_output_dtype=weights_proj_output_dtype,
     )
