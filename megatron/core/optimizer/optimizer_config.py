@@ -530,6 +530,118 @@ class OptimizerConfig:
                 self.exp_avg_sq_dtype == torch.float32
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
 
+    def validate_run(
+        self,
+        *,
+        use_megatron_fsdp: bool,
+        overlap_grad_reduce: bool,
+        use_torch_fsdp2: bool,
+        moe_single_grouped_weight: bool,
+        virtual_pipeline_model_parallel_size: int | None,
+        use_dist_ckpt: bool,
+    ) -> None:
+        if self.lr is not None:
+            assert self.min_lr <= self.lr
+
+        # Optimizer CPU offload check
+        if self.optimizer_cpu_offload:
+            assert self.use_precision_aware_optimizer, (
+                "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
+                "as the hybrid device optimizer reuses the code path of this flag."
+            )
+            assert not self.fp8_param_gather or self.fp8_recipe == "delayed", (
+                "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
+                "must be used in conjunction with `--fp8-recipe delayed`."
+            )
+
+        if self.overlap_param_gather:
+            assert self.use_distributed_optimizer or use_megatron_fsdp \
+                or self.optimizer == 'dist_muon', \
+                '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
+            assert overlap_grad_reduce, \
+                'Must use --overlap-param-gather with --overlap-grad-reduce'
+        
+        if self.optimizer not in ('sgd', 'adam'):
+            if self.optimizer == 'dist_muon':
+                warn_rank_0(
+                    "optimizer='dist_muon' is deprecated. "
+                    "Use --optimizer muon --use-distributed-optimizer instead."
+                )
+
+        assert not (
+            self.use_layer_wise_distributed_optimizer and moe_single_grouped_weight
+        ), (
+            "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
+            "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
+            "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
+        )
+
+        # Checked OUTSIDE the emerging-optimizer block below: with --optimizer
+        # sgd/adam that block is skipped entirely, which would silently ignore the
+        # mode — the one case where the loud failure matters most.
+        if self.muon_tp_mode == 'layer_sharded':
+            assert self.optimizer in ('muon', 'dist_muon'), (
+                f"--muon-tp-mode layer_sharded is only supported with --optimizer muon "
+                f"(got --optimizer {self.optimizer}). Other optimizers, including "
+                "adaptive_muon, do not implement layer sharding."
+            )
+
+        if self.use_distributed_optimizer:
+            assert not use_torch_fsdp2, \
+                "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
+
+        if self.overlap_param_gather_with_optimizer_step:
+            assert self.use_distributed_optimizer, \
+                '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
+            assert self.overlap_param_gather, \
+                'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
+
+        if self.overlap_param_gather_with_optimizer_step:
+            assert virtual_pipeline_model_parallel_size is not None, \
+                '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
+            assert not use_dist_ckpt, \
+                '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
+
+        if self.fp16:
+            assert not use_torch_fsdp2, \
+                '--use-torch-fsdp2 not supported with fp16 yet'
+
+    def finalize_optimizer_config(self) -> None:
+        # Parameters dtype.
+        if self.fp16:
+            assert not self.bf16
+            self.params_dtype = torch.half
+
+        if self.bf16:
+            assert not self.fp16
+            self.params_dtype = torch.bfloat16
+
+        # Map string data-type to torch.dtype.
+        dtype_map = {
+            'fp32': torch.float32,
+            'bf16': torch.bfloat16,
+            'fp16': torch.float16,
+            'fp8': torch.uint8,
+            'auto': None,
+            None: None,
+        }
+        map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
+
+        self.main_grads_dtype = map_dtype(self.main_grads_dtype)
+        self.main_params_dtype = map_dtype(self.main_params_dtype)
+        self.exp_avg_dtype = map_dtype(self.exp_avg_dtype)
+        self.exp_avg_sq_dtype = map_dtype(self.exp_avg_sq_dtype)
+
+        # emerging optimizer check
+        if args.optimizer not in ('sgd', 'adam'):
+            if args.optimizer == 'dist_muon':
+                args.optimizer = 'muon'
+                self.use_layer_wise_distributed_optimizer = True
+
+            if self.use_distributed_optimizer:
+                self.use_layer_wise_distributed_optimizer = True
+                self.use_distributed_optimizer = False
+
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).
 AdamOptimizerConfig = OptimizerConfig

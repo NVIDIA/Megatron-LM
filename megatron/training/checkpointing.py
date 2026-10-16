@@ -611,7 +611,7 @@ def _build_sharded_state_dict_metadata(
     # same sharding-type metadata even though the parser flips
     # ``use_distributed_optimizer`` off in that mode.
     has_distributed_optimizer = cfg.optimizer.use_distributed_optimizer or getattr(
-        args, 'use_layer_wise_distributed_optimizer', False
+        cfg.optimizer, 'use_layer_wise_distributed_optimizer', False
     )
 
     if has_distributed_optimizer and args.ckpt_format == 'fsdp_dtensor':
@@ -817,7 +817,7 @@ def save_checkpoint(
             optimizer.save_parameter_state(optim_checkpoint_name)
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(args, 'use_layer_wise_distributed_optimizer', False) and args.ckpt_format == 'torch':
+    if getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False) and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(
             os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
@@ -2088,7 +2088,7 @@ def _gtp_pad_for_alignment_from_args(args):
     """GTP dim-0 alignment implied by the precision recipe recorded in args."""
     return resolve_gtp_pad_for_alignment(
         fp4=getattr(args, 'fp4', None) is not None,
-        fp8_recipe=getattr(args, 'fp8_recipe', None),
+        fp8_recipe=getattr(cfg.optimizer, 'fp8_recipe', None),
         fp8=getattr(args, 'fp8', None) is not None,
     )
 
@@ -3267,7 +3267,7 @@ def load_checkpoint(
         try:
             # Load state dict.
             if (
-                getattr(args, 'use_layer_wise_distributed_optimizer', False)
+                getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False)
                 and args.ckpt_format == 'torch'
             ):
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
@@ -3329,8 +3329,8 @@ def load_checkpoint(
                 else:
                     for param_group in optimizer.param_groups:
                         if param_group.get("is_decoupled_lr", False):
-                            max_lr = getattr(args, "decoupled_lr", None)
-                            min_lr = getattr(args, "decoupled_min_lr", None)
+                            max_lr = getattr(cfg.optimizer, "decoupled_lr", None)
+                            min_lr = getattr(cfg.optimizer, "decoupled_min_lr", None)
                         else:
                             max_lr = cfg.optimizer.lr
                             min_lr = cfg.optimizer.min_lr
