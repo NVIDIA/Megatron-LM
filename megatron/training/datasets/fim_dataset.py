@@ -221,7 +221,8 @@ class GPTFIMDataset(GPTDataset):
                 permuted = self._fim_permute_sequence(
                     sequence[curr_start_position:loc], self.fragment_fim_rate
                 )
-                new_samples += [permuted, [self.fim_split_sample]]
+                new_samples.append(permuted)
+            new_samples.append([self.fim_split_sample])
             curr_start_position = loc + 1  # Jump over the split token
         # Permute the segment after the last split token
         permuted = self._fim_permute_sequence(
