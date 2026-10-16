@@ -94,6 +94,24 @@ def test_attention_latent_norm_epsilon_argument():
 
 
 @pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        ([], True),
+        (["--no-mla-proj-use-quantization"], False),
+        (["--disable-mla-proj-use-quantization"], False),
+    ],
+)
+def test_mla_proj_use_quantization_argument(argv, expected):
+    parser = ArgumentParser()
+    _add_mla_args(parser)
+
+    args = parser.parse_args(argv)
+
+    assert args.mla_proj_use_quantization is expected
+    assert MLATransformerConfig.mla_proj_use_quantization is True
+
+
+@pytest.mark.parametrize(
     ("q_lora_rank", "q_projection"), [(None, "linear_q_proj"), (32, "linear_q_up_proj")]
 )
 def test_fused_norm_projections_carry_attention_latent_epsilon(q_lora_rank, q_projection):
