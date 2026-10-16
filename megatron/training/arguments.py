@@ -1241,8 +1241,9 @@ def validate_args(args, defaults={}):
         args.use_custom_fsdp = True
 
         if args.megatron_fsdp_version == 2:
-            assert not args.use_distributed_optimizer, \
-                '--megatron-fsdp-version 2 is not compatible with --use-distributed-optimizer'
+            assert (
+                not args.use_distributed_optimizer
+            ), '--megatron-fsdp-version 2 is not compatible with --use-distributed-optimizer'
         else:
             # Megatron-FSDP v1 requires the DistributedOptimizer.
             if not args.use_distributed_optimizer:
@@ -3646,8 +3647,7 @@ def _add_regularization_args(parser):
     group.add_argument(
         '--muon-use-syrk',
         action='store_true',
-        help='Use the Triton SYRK kernel for the Gram matrix '
-        'in Newton-Schulz iteration.',
+        help='Use the Triton SYRK kernel for the Gram matrix ' 'in Newton-Schulz iteration.',
     )
     group.add_argument(
         '--muon-extra-scale-factor',
