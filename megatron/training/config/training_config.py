@@ -107,6 +107,27 @@ class TrainingConfig:
     iterations_to_skip: list[int] = field(default_factory=list)
     """List of 1-indexed iterations to skip during training, empty by default."""
 
+    determinism_trace_dir: str | None = None
+    """Write rank-local determinism records to this directory. Disabled by default."""
+
+    determinism_trace_mode: Literal["metadata", "summary", "sampled", "full"] = "metadata"
+    """Tensor evidence captured by the determinism tracer. Stronger modes cost more."""
+
+    determinism_trace_sample_count: int = 256
+    """Maximum evenly spaced tensor elements captured in sampled mode."""
+
+    determinism_trace_flush_every: int = 0
+    """Flush after this many buffered records. Zero flushes at iteration boundaries."""
+
+    determinism_trace_append: bool = False
+    """Append to an existing per-rank trace instead of failing on collision."""
+
+    determinism_trace_ranks: str = "all"
+    """Comma-separated global ranks or inclusive ranges to trace, or all."""
+
+    determinism_trace_iterations: str = "all"
+    """Comma-separated 1-indexed iterations or inclusive ranges to trace, or all."""
+
 
 @dataclass(kw_only=True)
 class ValidationConfig:
