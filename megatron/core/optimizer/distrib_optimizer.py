@@ -3349,14 +3349,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
     def start_param_sync_for_bucket_group_subset(self) -> None:
-        """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
+        """Trigger ``start_param_sync`` on this optimizer's bucket groups only.
 
         Walks each model chunk's DDP bucket groups and skips those tagged
         ``is_managed_by_layer_wise_optimizer=True`` (so a sibling
         :class:`LayerWiseDistributedOptimizer` does not double-sync the same
-        buckets). When no LayerWise tagging is present every bucket group is
-        included — matching the previous ``model_chunk.start_param_sync()``
-        behaviour. Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
+        buckets). Dense and expert DistributedOptimizers can share a model chunk,
+        so also restrict synchronization to buckets in this optimizer's buffers.
+        Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
         so FP8 post-all-gather processing (and MXFP8 copy) still runs.
         """
         # Deferred import: layer_wise_optimizer's compute_full_param_layout
@@ -3364,6 +3364,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # module load here would create a cycle.
         from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
 
+        if self.is_stub_optimizer:
+            return
+
+        owned_bucket_ids = {id(bucket) for buffer in self.buffers for bucket in buffer.buckets}
         for model_chunk in self.model_chunks:
             for bucket_group in (
                 model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
@@ -3374,6 +3378,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     bucket_group.buckets[0], default_for_untagged=False
                 ):
                     continue
+                if not any(id(bucket) in owned_bucket_ids for bucket in bucket_group.buckets):
+                    continue
+                assert all(id(bucket) in owned_bucket_ids for bucket in bucket_group.buckets), (
+                    "A parameter sync bucket group must not mix optimizer-owned buckets "
+                    "with buckets owned by another optimizer."
+                )
                 model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 
     @torch.no_grad()
