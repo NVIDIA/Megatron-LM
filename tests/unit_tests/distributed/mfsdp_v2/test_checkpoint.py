@@ -2,8 +2,8 @@
 
 """DCP save/load roundtrip tests for Megatron-FSDP v2.
 
-Covers the standalone checkpoint helpers and MCore expert-parallel save/load by
-comparing resumed losses with uninterrupted training.
+Covers the standalone checkpoint helpers, standard PyTorch loading hooks, and MCore
+expert-parallel save/load by comparing resumed losses with uninterrupted training.
 """
 
 import math
@@ -23,12 +23,12 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
-    fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
     load_checkpoint,
     save_checkpoint,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtensor import (
     attach_uneven_dtensor_metadata,
 )
@@ -42,7 +42,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import unwrap_model
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
@@ -353,6 +355,39 @@ def test_checkpoint_roundtrip_default_placements(
     assert any(nonempty_flags), "All ranks had empty local shards."
 
 
+def test_load_state_dict_restores_compute_weights(
+    distributed_setup, tmp_path_dist_ckpt: Path
+) -> None:
+    """Plain state dicts work with DCP and refresh BF16 compute weights automatically."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    source = _TinyModel().to(device=device, dtype=torch.bfloat16)
+    destination = _TinyModel().to(device=device, dtype=torch.bfloat16)
+    for parameter in destination.parameters():
+        nn.init.zeros_(parameter)
+    for model in (source, destination):
+        with fully_shard_context(device=device):
+            fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
+            # The root owns fc2; both units must refresh their compute weights after loading.
+            fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    inputs = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = source(inputs)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "load_state_dict", sync=True) as checkpoint_dir:
+        state = source.state_dict()
+        dcp.save({"model": state}, checkpoint_id=checkpoint_dir)
+
+        state = destination.state_dict()
+        dcp.load({"model": state}, checkpoint_id=checkpoint_dir)
+        destination.load_state_dict(state)
+
+    with torch.no_grad():
+        actual = destination(inputs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_saved_chunks_match_the_stable_path(distributed_setup, tmp_path_dist_ckpt: Path) -> None:
     """The checkpoint describes the same chunks Megatron-FSDP's stable helper would describe.
 
@@ -461,7 +496,7 @@ def test_metadata_attach_issues_no_collectives(
 
     Dropping the stable helper's per-DTensor ``all_gather_object`` is the point of this path, and
     a saved checkpoint cannot show its absence -- :func:`dcp.save` issues collectives of its own --
-    so this asserts it at the one call the save path makes.
+    so check both the automatic state-dict hooks and the explicit metadata helper.
     """
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -470,8 +505,6 @@ def test_metadata_attach_issues_no_collectives(
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
-    model_state_dict = get_model_state_dict(model)
-    optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
 
     def _fail(*args, **kwargs):
         raise AssertionError("Attaching chunk metadata must not issue a collective.")
@@ -480,6 +513,8 @@ def test_metadata_attach_issues_no_collectives(
     # shard's offset with one all_gather_object per DTensor; this path derives it from the layout.
     for name in ("all_gather", "all_gather_object", "all_gather_into_tensor", "all_reduce"):
         monkeypatch.setattr(dist, name, _fail)
+    model_state_dict = get_model_state_dict(model)
+    optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
     attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
 
     assert model_state_dict.keys() == dict(model.named_parameters()).keys()
@@ -533,6 +568,7 @@ def test_ep_fsdp_checkpoint_roundtrip(tmp_path_dist_ckpt, ep_size):
                 hybrid_layer_pattern="*E",
                 pg_collection=groups,
             ).cuda()
+            model = Float16Module(config, model)
             model = FullyShardedDataParallel(
                 config=config,
                 ddp_config=DistributedDataParallelConfig(
@@ -604,7 +640,8 @@ def test_ep_fsdp_checkpoint_roundtrip(tmp_path_dist_ckpt, ep_size):
             raw_model_state = destination.state_dict_for_save_checkpoint()
             state = checkpoint_state(destination, destination_optimizer, is_loading=True)
             dcp.load(state, checkpoint_id=path)
-            destination.load_state_dict(raw_model_state)
+            # Loading the inner model must also refresh its BF16 compute weights.
+            unwrap_model(destination).load_state_dict(raw_model_state)
             destination_optimizer.load_state_dict(state["optimizer"])
 
         expected_losses = train(source, source_optimizer)

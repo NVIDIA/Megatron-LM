@@ -21,9 +21,9 @@ on the same device mesh. The standard DCP state-dict helpers
 :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`) expose those as FQN-keyed
 DTensors and initialize the (empty) optimizer state on load, so we do not reimplement that here.
 
-The one Megatron-FSDP-specific step is :func:`attach_uneven_dtensor_metadata`, which describes each
-parameter's true position inside its packed parameter-group buffer. Without it the default planner
-assumes canonical ``Shard(0)`` offsets and silently corrupts the checkpoint.
+State-dict hooks installed by :func:`fully_shard` and :func:`fully_shard_optimizer` describe each
+parameter's true position inside its packed parameter-group buffer. This lets standard DCP
+save and load the uneven shards without manual metadata preprocessing.
 """
 
 import os
@@ -38,8 +38,6 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from .optimizer import init_optimizer_state
-from .parameter_group import sync_model_weights_from_main_weights
-from .uneven_dtensor import attach_uneven_dtensor_metadata
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
 
@@ -56,7 +54,6 @@ def save_checkpoint(
     """
     model_state_dict = get_model_state_dict(model)
     optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
-    attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
     dcp.save(
         {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
     )
@@ -71,7 +68,8 @@ def load_checkpoint(
     module structure and mesh); DCP reshards the on-disk data to this rank's shards.
     :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict` initializes the
     (empty) optimizer state so DCP has DTensors to load into in place, and the ``set_*`` helpers
-    reinstall the loaded state. Compute weights are then refreshed from the loaded main weights.
+    reinstall the loaded state. Loading the model state also refreshes compute weights
+    through the post-load hooks installed by :func:`fully_shard`.
 
     Args:
         model: A module tree sharded with :func:`fully_shard`, whose weights receive the load.
@@ -81,10 +79,8 @@ def load_checkpoint(
     init_optimizer_state(optimizer)
     model_state_dict = get_model_state_dict(model)
     optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
-    attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
     dcp.load(
         {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
     )
     set_model_state_dict(model, model_state_dict)
     set_optimizer_state_dict(model, optimizer, optimizer_state_dict)
-    sync_model_weights_from_main_weights(model.parameters())

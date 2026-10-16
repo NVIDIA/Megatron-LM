@@ -43,6 +43,7 @@ from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_c
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -66,9 +67,6 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
         copy_parameter_attributes,
-    )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-        sync_model_weights_from_main_weights,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         all_sharding_strategies_in,
@@ -682,6 +680,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             schedule_policy=schedule_policy,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
+        # Float16Module delegates state-dict loading to its inner model, bypassing
+        # hooks on the wrapper. Keep FSDP ownership and load hooks on that model.
+        fsdp_root = module.module if isinstance(module, Float16Module) else module
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
@@ -715,8 +716,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             grad_divisor=config.expert_model_parallel_size,
                             **common_fully_shard_kwargs,
                         )
-            for submodule in reversed(list(module.modules())):
-                if submodule is module:
+            for submodule in reversed(list(fsdp_root.modules())):
+                if submodule is fsdp_root:
                     # The root is always sharded after selected child units so it is not
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
@@ -732,20 +733,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
-                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
+                fsdp_root, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
             )
         super().__init__(config=config, module=module)
+        self._fsdp_context = fsdp_root.context
 
         if config.overlap_moe_expert_parallel_comm:
-            register_combined_1f1b_hooks(self.module)
-
-    def load_state_dict(self, state_dict, strict=True):
-        """Load main weights and refresh the buffers used for forward compute."""
-        super().load_state_dict(state_dict, strict=strict)
-        # DCP writes into FP32 main-weight DTensors. BF16 and quantized compute
-        # buffers have separate storage and must be refreshed before the first
-        # resumed forward, just as they are after every optimizer step.
-        sync_model_weights_from_main_weights(self.module.parameters())
+            register_combined_1f1b_hooks(fsdp_root)
 
     @staticmethod
     def _validate_config(
@@ -892,7 +886,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         MCore's schedules wrap every microbatch but the last in ``no_sync_func``.
         """
-        with microbatch(self.module.context, is_last=False):
+        with microbatch(self._fsdp_context, is_last=False):
             yield
 
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
@@ -903,7 +897,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """Wait on all submitted reductions, including delayed weight gradients."""
-        self.module.context.finish_grad_sync()
+        self._fsdp_context.finish_grad_sync()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

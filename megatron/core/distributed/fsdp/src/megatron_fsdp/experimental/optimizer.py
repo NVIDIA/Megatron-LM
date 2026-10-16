@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from .parameter_group import get_containing_parameter_group, sync_model_weights_from_main_weights
+from .uneven_dtensor import preprocess_optimizer_state_dict
 
 __all__ = ["fully_shard_optimizer", "init_optimizer_state"]
 
@@ -57,12 +58,13 @@ def init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
 def fully_shard_optimizer(
     optimizer: torch.optim.Optimizer, *, precision_aware: bool = False
 ) -> None:
-    """Attach FSDP-aware step hooks to an optimizer instance.
+    """Attach FSDP step and checkpoint hooks to an optimizer instance.
 
     The adapted optimizer preserves its existing parameter groups, temporarily
     casts gradients around optimizer steps for FSDP sharded parameters whose
     data dtype differs from their grad dtype unless the optimizer is precision
-    aware, and refreshes compute weights after each optimizer step.
+    aware, and refreshes compute weights after each optimizer step. Its state-dict
+    hook describes the packed shards to DCP without manual preprocessing.
 
     Alternatives considered:
         - Monkey-patching optimizer methods directly on the instance. This is
@@ -145,5 +147,12 @@ def fully_shard_optimizer(
             chain.from_iterable(group["params"] for group in hooked_optimizer.param_groups)
         )
 
+    def state_dict_post_hook(
+        hooked_optimizer: torch.optim.Optimizer, state_dict: dict[str, Any]
+    ) -> None:
+        """Attach local shard metadata before returning the optimizer state dict."""
+        preprocess_optimizer_state_dict(hooked_optimizer, state_dict)
+
     optimizer.register_step_pre_hook(step_pre_hook)
     optimizer.register_step_post_hook(step_post_hook)
+    optimizer.register_state_dict_post_hook(state_dict_post_hook)

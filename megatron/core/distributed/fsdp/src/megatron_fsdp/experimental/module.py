@@ -37,6 +37,7 @@ from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
+from .uneven_dtensor import preprocess_model_state_dict
 
 
 def _is_in_backward() -> bool:
@@ -120,14 +121,15 @@ class FsdpModule:
                 if group.requires_grad
             )
         )
-        # The state-dict safety hook is registered unconditionally. It is still
-        # required to keep loading a state dict safe when ``register_hooks`` is
-        # False (i.e. execution hooks are disabled), so it must not be turned off
-        # together with the auto-execution hooks below.
-        self.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
+        # State-dict hooks remain necessary when an external scheduler disables
+        # the automatic forward/backward hooks with ``register_hooks=False``.
+        module = cast(nn.Module, self)
+        module.register_state_dict_post_hook(FsdpModule._post_state_dict)
+        module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
+        module.register_load_state_dict_post_hook(FsdpModule._post_load_state_dict)
         if register_hooks:
             self._register_hooks()
-        context.register_module(cast(nn.Module, self))
+        context.register_module(module)
 
     @property
     def context(self) -> FsdpContext:
@@ -250,6 +252,25 @@ class FsdpModule:
                 "load_state_dict(assign=True) is not supported after fully_shard(). "
                 "Load before fully_shard() or use an in-place load path with assign=False."
             )
+
+    @staticmethod
+    def _post_state_dict(
+        module: nn.Module,
+        state_dict: dict[str, object],
+        prefix: str,
+        _local_metadata: dict[str, object],
+    ) -> None:
+        """Attach local shard metadata before returning the state dict to DCP."""
+        preprocess_model_state_dict(module, state_dict, prefix)
+
+    @staticmethod
+    def _post_load_state_dict(module: nn.Module, _incompatible_keys: object) -> None:
+        """Refresh compute weights after loading this module and its children."""
+        # Resting parameters expose main weights. BF16 and quantized compute
+        # buffers have separate storage; refresh only the groups owned here,
+        # since nested FsdpModules run their own post-load hooks.
+        for group in cast(FsdpModule, module).parameter_groups:
+            group.sync_model_weight_from_main_weight()
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute and prefetch the next FsdpModule.
