@@ -140,6 +140,7 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
         mtp_num_layers=None,
         num_experts=None,
         perform_rl_step=False,
+        profile_ranks=[],
         record_memory_history=False,
         rl_profile=False,
         rl_use_sequence_packing=False,

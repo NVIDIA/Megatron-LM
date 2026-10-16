@@ -974,7 +974,7 @@ class IndexedDatasetBuilder(object):
         self.sequence_lengths.extend(lengths)
         self.document_indices.append(len(self.sequence_lengths))
         if self.multimodal:
-            self.sequence_modes.extend(modes if modes is not None else [0] * lengths)
+            self.sequence_modes.extend(modes if modes is not None else [0] * len(lengths))
 
     def end_document(self) -> None:
         """Finalize the document, for use with IndexedDatasetBuilder.add_item"""

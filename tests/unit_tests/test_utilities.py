@@ -46,6 +46,10 @@ class Utils:
     rank = int(os.environ.get('LOCAL_RANK', '0'))
     inited = False
     store = None
+    # Model-parallel process groups dropped by destroy_model_parallel(). The
+    # destroy_retired_process_groups fixture in conftest.py destroys them once the
+    # test finishes.
+    retired_process_groups = []
 
     @staticmethod
     def initialize_distributed():
@@ -114,9 +118,64 @@ class Utils:
         except Exception:
             Utils.inited = False
             return
+        # Drop module-level caches that hold model-parallel process groups before
+        # those groups are destroyed, so the next test cannot reuse an aborted
+        # communicator.
+        from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+
+        reset_hybrid_ep_buffer()
+        try:
+            from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+            FP8GlobalStateManager.reset()
+        except ImportError:
+            pass
+        # ps.destroy_model_parallel() only drops its references to the groups it
+        # created. Retire them so they are destroyed when the test finishes;
+        # otherwise every test leaks its NCCL communicators and their threads, and
+        # a long bucket exhausts the process's memory-map limit. They cannot be
+        # destroyed here: a test may re-initialize model parallelism and keep using
+        # a group it captured earlier, for example in a ProcessGroupCollection.
+        Utils.retired_process_groups.extend(
+            g for g in (ps._global_process_group_list or []) if g is not None
+        )
         ps.destroy_model_parallel()
         Utils.inited = False
         torch.cuda.memory.empty_cache()
+
+    @staticmethod
+    def destroy_retired_process_groups():
+        """Destroy the process groups retired by destroy_model_parallel()."""
+        groups, Utils.retired_process_groups = Utils.retired_process_groups, []
+        if not groups or not torch.distributed.is_initialized():
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        Utils.clear_dtensor_sharding_caches()
+        live_groups = torch.distributed.distributed_c10d._world.pg_map
+        for group in groups:
+            if group in live_groups:
+                torch.distributed.destroy_process_group(group)
+
+    @staticmethod
+    def clear_dtensor_sharding_caches():
+        """Drop DTensor's cached sharding propagation results.
+
+        DTensor caches output shardings keyed on value-equal DeviceMeshes, so a later
+        test that builds a mesh with the same layout can receive placements that still
+        reference an earlier test's mesh, and through it a destroyed process group.
+        Both the Python and the native caches are per thread; this clears the calling
+        thread's, which is where tests build and dispatch their DTensors.
+        """
+        try:
+            from torch.distributed.tensor import DTensor
+        except ImportError:
+            return
+        propagate = DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding
+        getattr(propagate, "cache", propagate).cache_clear()
+        clear_native_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
+        if clear_native_cache is not None:
+            clear_native_cache()
 
     @staticmethod
     def initialize_model_parallel(

@@ -83,8 +83,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             raise ValueError(
                 "MFSDP v2 does not currently support layer-wise distributed optimizer."
             )
-        if config.optimizer_cuda_graph:
-            raise ValueError("MFSDP v2 does not currently support optimizer CUDA graphs.")
 
     def state_dict(self):
         """Return optimizer state.

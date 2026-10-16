@@ -32,7 +32,10 @@ _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
 @contextmanager
 def fully_shard_context(
-    device: torch.device | None = None, *, use_symmetric_memory: bool = False
+    device: torch.device | None = None,
+    *,
+    use_symmetric_memory: bool = False,
+    unify_communication_stream: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -44,6 +47,9 @@ def fully_shard_context(
             the current CUDA device.
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
             NCCL symmetric-memory pool.
+        unify_communication_stream: Whether all-gathers and reduce-scatters share one
+            communication stream to reduce peak transient memory. See
+            https://github.com/NVIDIA/Megatron-LM/issues/6471.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -52,7 +58,11 @@ def fully_shard_context(
     if device.type != "cuda":
         raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
 
-    context = FsdpContext(device=device, use_symmetric_memory=use_symmetric_memory)
+    context = FsdpContext(
+        device=device,
+        use_symmetric_memory=use_symmetric_memory,
+        unify_communication_stream=unify_communication_stream,
+    )
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context

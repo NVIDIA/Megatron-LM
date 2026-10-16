@@ -71,3 +71,83 @@ def test_causal_conv1d_cp_matches_full_sequence():
         torch.testing.assert_close(bias_local.grad, bias_ref.grad, rtol=rtol, atol=atol)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not HAVE_CAUSAL_CONV1D, reason="causal_conv1d is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_causal_conv1d_channel_contiguous_matches_sequence_contiguous(dtype):
+    """Verify forward and backward equivalence across causal_conv1d layouts.
+
+    Both inputs have shape (batch, dim, seqlen) and identical values. Only
+    their strides differ: a unit dim stride selects the channel-last kernel,
+    while a unit seqlen stride selects the standard kernel.
+    """
+    torch.manual_seed(42)
+    batch, seq_len, dim, width = 2, 128, 64, 4
+    padding = 16
+    storage_dim = dim + 2 * padding
+
+    # Slice a larger allocation so the channel-last input is non-dense and
+    # has gaps between consecutive sequence elements.
+    channel_last_storage = torch.randn(batch, seq_len, storage_dim, device="cuda", dtype=dtype)
+    x_channel_contiguous = (
+        channel_last_storage[:, :, padding : padding + dim]
+        .transpose(1, 2)
+        .detach()
+        .requires_grad_()
+    )
+    x_sequence_contiguous = x_channel_contiguous.detach().contiguous().requires_grad_()
+
+    assert x_channel_contiguous.shape == x_sequence_contiguous.shape == (batch, dim, seq_len)
+    assert torch.equal(x_channel_contiguous, x_sequence_contiguous)
+    assert x_channel_contiguous.stride() == (seq_len * storage_dim, 1, storage_dim)
+    assert x_sequence_contiguous.stride() == (dim * seq_len, seq_len, 1)
+
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.float32, requires_grad=True)
+    bias = torch.randn(dim, device="cuda", dtype=torch.float32, requires_grad=True)
+
+    out_channel_contiguous = causal_conv1d_fn(x_channel_contiguous, weight, bias, activation="silu")
+    out_sequence_contiguous = causal_conv1d_fn(
+        x_sequence_contiguous, weight, bias, activation="silu"
+    )
+
+    assert out_channel_contiguous.stride() == (seq_len * dim, 1, dim)
+    assert out_sequence_contiguous.stride() == (dim * seq_len, seq_len, 1)
+
+    # The forward kernels should be bitwise identical.
+    assert torch.equal(out_channel_contiguous, out_sequence_contiguous)
+
+    grad_channel_contiguous = torch.randn_like(out_channel_contiguous)
+    grad_sequence_contiguous = grad_channel_contiguous.contiguous()
+    assert torch.equal(grad_channel_contiguous, grad_sequence_contiguous)
+    assert grad_channel_contiguous.stride() == (seq_len * dim, 1, dim)
+    assert grad_sequence_contiguous.stride() == (dim * seq_len, seq_len, 1)
+
+    dx_channel, dweight_channel, dbias_channel = torch.autograd.grad(
+        out_channel_contiguous,
+        (x_channel_contiguous, weight, bias),
+        grad_outputs=grad_channel_contiguous,
+    )
+    dx_sequence, dweight_sequence, dbias_sequence = torch.autograd.grad(
+        out_sequence_contiguous,
+        (x_sequence_contiguous, weight, bias),
+        grad_outputs=grad_sequence_contiguous,
+    )
+
+    assert dx_channel.stride() == (seq_len * dim, 1, dim)
+    assert dx_sequence.stride() == (dim * seq_len, seq_len, 1)
+
+    # dx is returned in the input dtype, so BF16 needs looser tolerances. Weight
+    # and bias gradients are accumulated in FP32; their small differences come
+    # from the kernels using different parallel reduction orders.
+    input_grad_rtol, input_grad_atol = (3e-4, 1e-3) if dtype == torch.float32 else (1e-2, 5e-2)
+    param_grad_rtol, param_grad_atol = 1e-3, 1e-3
+
+    torch.testing.assert_close(dx_channel, dx_sequence, rtol=input_grad_rtol, atol=input_grad_atol)
+    torch.testing.assert_close(
+        dweight_channel, dweight_sequence, rtol=param_grad_rtol, atol=param_grad_atol
+    )
+    torch.testing.assert_close(
+        dbias_channel, dbias_sequence, rtol=param_grad_rtol, atol=param_grad_atol
+    )

@@ -1722,10 +1722,10 @@ def _pin_mamba_autotuners():
 
     kernels = []
     try:
-        from megatron.core.ssm.ops import ssd_bmm as r_bmm
-        from megatron.core.ssm.ops import ssd_chunk_scan as r_scan
-        from megatron.core.ssm.ops import ssd_chunk_state as r_state
-        from megatron.core.ssm.ops import ssd_state_passing as r_pass
+        from megatron.core.ssm.ops.mamba2 import ssd_bmm as r_bmm
+        from megatron.core.ssm.ops.mamba2 import ssd_chunk_scan as r_scan
+        from megatron.core.ssm.ops.mamba2 import ssd_chunk_state as r_state
+        from megatron.core.ssm.ops.mamba2 import ssd_state_passing as r_pass
 
         kernels += [
             r_bmm._bmm_chunk_fwd_kernel,

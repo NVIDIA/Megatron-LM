@@ -135,6 +135,27 @@ def test_ssm_geometry_uses_conv_and_recurrent_state_names():
         )
 
 
+def test_ssm_geometry_uses_explicit_live_slot_axis():
+    layout = SSMShardLayout(
+        global_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        layer_start=0,
+        num_layers=3,
+        dims=SSMStateDims(nheads=2, headdim=4, d_state=5, ngroups=1, d_conv=3),
+    )
+    geometry = base.compute_buffer_geometry(
+        torch.zeros(3, 3, 2, 4, 5),
+        expected_num_blocks=3,
+        backend_name="test",
+        heads_per_partition=2,
+        ssm_layout=layout,
+        ssm_state_kind="recurrent",
+    )
+
+    assert geometry.blocks_axis == 1
+
+
 def test_nixl_direct_backend_exports_metadata_with_fake_agent(monkeypatch):
     from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
 

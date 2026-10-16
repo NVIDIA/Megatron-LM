@@ -573,30 +573,31 @@ class TEGroupedMLP(MegatronModule):
                 beta2=self.config.situ_glu_beta2,
             )
         elif self.config.activation_func == F.silu and self.config.gated_linear_unit:
-            clamp = self.config.activation_func_clamp_value
-            if clamp is not None:
-                qgeglu_kwargs = {
+            clamp_value = self.config.activation_func_clamp_value
+            if clamp_value is not None:
+                clamped_glu_kwargs = {
                     "glu_interleave_size": glu_interleave,
                     "alpha": 1.0,
-                    "limit": clamp,
+                    "limit": clamp_value,
                     "glu_linear_offset": 0.0,
                 }
                 if (
                     "activation_recompute_in_mlp"
                     in inspect.signature(te.pytorch.ops.ScaledClampedQGeGLU).parameters
                 ):
-                    qgeglu_kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
-                op = te.pytorch.ops.ScaledClampedQGeGLU(**qgeglu_kwargs)
-            elif (
-                "activation_recompute_in_mlp"
-                in inspect.signature(te.pytorch.ops.ScaledSwiGLU).parameters
-            ):
-                op = te.pytorch.ops.ScaledSwiGLU(
-                    glu_interleave_size=glu_interleave,
-                    activation_recompute_in_mlp=activation_recompute_in_mlp,
-                )
+                    clamped_glu_kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
+                op = te.pytorch.ops.ScaledClampedQGeGLU(**clamped_glu_kwargs)
             else:
-                op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
+                if (
+                    "activation_recompute_in_mlp"
+                    in inspect.signature(te.pytorch.ops.ScaledSwiGLU).parameters
+                ):
+                    op = te.pytorch.ops.ScaledSwiGLU(
+                        glu_interleave_size=glu_interleave,
+                        activation_recompute_in_mlp=activation_recompute_in_mlp,
+                    )
+                else:
+                    op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
         elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
             clamp = self.config.activation_func_clamp_value
             if clamp is not None:

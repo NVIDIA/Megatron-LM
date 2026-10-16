@@ -14,6 +14,8 @@
 
 """Distributed tensor buffers for Megatron-FSDP."""
 
+import contextlib
+import contextvars
 import dataclasses
 from collections.abc import Iterable
 
@@ -33,6 +35,29 @@ class _OwnedRange:
     numel: int
     tensor_relative_offset: int
     buffer_relative_offset: int
+
+
+# True while DBuffers are allocated from the NCCL symmetric-memory pool; see
+# symmetric_memory_allocation.
+_ALLOCATING_FROM_SYMM_MEM: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "megatron_fsdp_allocating_from_symm_mem", default=False
+)
+
+
+@contextlib.contextmanager
+def symmetric_memory_allocation(pool: torch.cuda.MemPool):
+    """Allocate DBuffers created in this scope from the symmetric-memory ``pool``.
+
+    DBuffers constructed inside the scope record ``allocated_from_symm_mem``, so
+    ``DBuffer.is_symmetric_memory`` still recognizes them, and their collectives still
+    rendezvous, on PyTorch builds without ``symm_mem.is_symm_mem_tensor``.
+    """
+    token = _ALLOCATING_FROM_SYMM_MEM.set(True)
+    try:
+        with torch.cuda.use_mem_pool(pool):
+            yield
+    finally:
+        _ALLOCATING_FROM_SYMM_MEM.reset(token)
 
 
 def _validate_placements(placements: Iterable[Placement]) -> None:
@@ -67,7 +92,11 @@ class DBuffer:
     layout: GlobalLayout
     offset: int
     local_buffer: torch.Tensor
-    # Set by owners that allocate ``local_buffer`` from the NCCL symmetric-memory pool. Only
+    # Record the allocation stream so DBuffer users can check that uses are joined back to it
+    # before deleting the buffer. See https://github.com/NVIDIA/Megatron-LM/pull/6187 and
+    # https://docs.pytorch.org/docs/2.13/generated/torch.Tensor.record_stream.html.
+    allocation_stream: torch.cuda.Stream | None
+    # Whether ``local_buffer`` was allocated inside ``symmetric_memory_allocation``. Only
     # consulted on PyTorch builds without ``symm_mem.is_symm_mem_tensor``.
     allocated_from_symm_mem: bool = False
 
@@ -103,6 +132,12 @@ class DBuffer:
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
+        self.allocated_from_symm_mem = _ALLOCATING_FROM_SYMM_MEM.get()
+        self.allocation_stream = (
+            torch.cuda.current_stream(self.local_buffer.device)
+            if self.local_buffer.is_cuda
+            else None
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -113,6 +148,16 @@ class DBuffer:
     def device(self) -> torch.device:
         """Device of the local buffer."""
         return self.local_buffer.device
+
+    @property
+    def is_symmetric_memory(self) -> bool:
+        """Whether the local buffer is allocated from symmetric memory."""
+        # PyTorch builds that predate symm_mem.is_symm_mem_tensor (such as dev's 2.12
+        # pre-release) cannot report whether the buffer is symmetric, so fall back to the
+        # allocation-time flag. Ordinary buffers leave it False and keep the plain path.
+        if hasattr(symm_mem, "is_symm_mem_tensor"):
+            return symm_mem.is_symm_mem_tensor(self.local_buffer)
+        return self.allocated_from_symm_mem
 
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""
@@ -158,6 +203,8 @@ class DBuffer:
         mesh: DeviceMesh,
         placements: Iterable[Placement],
         tensor_shapes: Iterable[Shape],
+        *,
+        allocation_stream: torch.cuda.Stream | None,
     ) -> "DBuffer":
         """Create a DBuffer from an existing local buffer.
 
@@ -168,6 +215,7 @@ class DBuffer:
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
             tensor_shapes: Global shapes for each logical tensor in this buffer.
+            allocation_stream: CUDA stream that allocated ``local_buffer``, or ``None`` for CPU.
 
         Returns:
             A DBuffer that reuses ``local_buffer`` without allocating storage.
@@ -198,6 +246,7 @@ class DBuffer:
         buffer.layout = layout
         buffer.offset = offset
         buffer.local_buffer = local_buffer
+        buffer.allocation_stream = allocation_stream
         return buffer
 
     @classmethod
@@ -343,7 +392,11 @@ class DBuffer:
                     "Replicate -> Partial redistribute does not support an out buffer."
                 )
             return DBuffer.from_local(
-                self.local_buffer, self.mesh, new_placements, self.layout.tensor_shapes
+                self.local_buffer,
+                self.mesh,
+                new_placements,
+                self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
             )
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
@@ -361,6 +414,10 @@ class DBuffer:
         placements[mesh_axis] = Replicate()
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
+        # Symmetric-memory registration is scoped to the collective's process
+        # group, so rendezvous the output on the same mesh axis as the all-gather.
+        if out.is_symmetric_memory:
+            out.rendezvous(mesh_axis)
         dist.all_gather_into_tensor(
             output_tensor=out.local_buffer,
             input_tensor=self.local_buffer,
@@ -400,14 +457,9 @@ class DBuffer:
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
         reduce_op = partial_placement.reduce_op
-        # PyTorch builds that predate symm_mem.is_symm_mem_tensor (such as dev's 2.12
-        # pre-release) cannot report whether the buffer is symmetric, so fall back to the
-        # allocation-time flag. Ordinary buffers leave it False and keep the plain path.
-        if hasattr(symm_mem, "is_symm_mem_tensor"):
-            is_symm_mem = symm_mem.is_symm_mem_tensor(self.local_buffer)
-        else:
-            is_symm_mem = self.allocated_from_symm_mem
-        if is_symm_mem:
+        # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
+        # reductions remain supported on older PyTorch versions that lack it.
+        if self.is_symmetric_memory:
             self.rendezvous(axis)
             # NCCL symmetric-memory reduce-scatter selects its symmetric kernel
             # for SUM. Preserve the placement's AVG semantics by scaling the
@@ -420,7 +472,7 @@ class DBuffer:
             op=reduce_op,
             group=self.mesh.get_group(axis),
         )
-        if is_symm_mem and partial_placement.reduce_op == dist.ReduceOp.AVG:
+        if self.is_symmetric_memory and partial_placement.reduce_op == dist.ReduceOp.AVG:
             out.local_buffer.div_(self.mesh.size(axis))
         return out
 
@@ -455,7 +507,13 @@ class DBuffer:
             raise RuntimeError("scatter() destination is not contained in the source local buffer.")
         local_slice = self.local_buffer.narrow(0, local_buffer_offset, destination_numel)
         if out is None:
-            return DBuffer.from_local(local_slice, self.mesh, placements, self.layout.tensor_shapes)
+            return DBuffer.from_local(
+                local_slice,
+                self.mesh,
+                placements,
+                self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
+            )
 
         out.local_buffer.copy_(local_slice)
         return out

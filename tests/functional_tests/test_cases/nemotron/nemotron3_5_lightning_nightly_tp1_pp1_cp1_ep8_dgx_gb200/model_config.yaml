@@ -1,0 +1,163 @@
+ENV_VARS:
+  NCCL_GRAPH_REGISTER: 0
+  NCCL_NVLS_ENABLE: 0
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCH_NCCL_AVOID_RECORD_STREAMS: 1
+  TORCH_NCCL_HIGH_PRIORITY: 1
+  CUDA_DEVICE_MAX_CONNECTIONS: 32
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 8
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: 128
+  NVLINK_DOMAIN_SIZE: 72
+  USE_MNNVL: 1
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 20
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 20
+  NVTE_NORM_BWD_USE_CUDNN: 1
+  NVTE_NORM_FWD_USE_CUDNN: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NON_DETERMINSTIC_RESULTS: 1
+
+TEST_TYPE: regular
+
+MODEL_ARGS:
+  # Distributed topology: 2 nodes x 4 GB200 GPUs.
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --context-parallel-size: 1
+  --expert-model-parallel-size: 8
+  --expert-tensor-parallel-size: 1
+  --data-parallel-sharding-strategy: optim_grads_params
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --check-for-large-grads: true
+
+  # Functional-test training budget. Keep the full Bridge LR schedule.
+  --micro-batch-size: 2
+  --global-batch-size: 512
+  --train-iters: 20
+  --manual-gc: true
+  --manual-gc-interval: 100
+  --cross-entropy-loss-fusion: true
+  # Bridge uses TE here, but current MCore rejects TE cross-entropy fusion.
+  --cross-entropy-fusion-impl: native
+  --attention-backend: fused
+  --te-rng-tracker: true
+
+  # Nemotron 3 Nano / Nemotron 3.5 Lightning architecture.
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
+  --hybrid-layer-pattern: MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME/*E/*E
+  --num-layers: 52
+  --hidden-size: 2688
+  --ffn-hidden-size: 1856
+  --moe-ffn-hidden-size: 1856
+  --num-attention-heads: 32
+  --group-query-attention: true
+  --num-query-groups: 2
+  --kv-channels: 128
+  --mamba-num-heads: 64
+  --mamba-head-dim: 64
+  --mamba-state-dim: 128
+  --mamba-num-groups: 8
+  --position-embedding-type: none
+  --normalization: RMSNorm
+  --norm-epsilon: 1.0e-5
+  --untie-embeddings-and-output-weights: true
+  --disable-bias-linear: true
+  --squared-relu: true
+  --use-fused-weighted-squared-relu: true
+  --init-method-std: 0.0173
+  --make-vocab-size-divisible-by: 128
+  --first-last-layers-bf16: true
+  --transformer-impl: transformer_engine
+
+  # Mixture of experts and HybridEP.
+  --num-experts: 128
+  --moe-router-topk: 6
+  --moe-router-topk-scaling-factor: 2.5
+  --moe-router-num-groups: 1
+  --moe-router-group-topk: 1
+  --moe-router-score-function: sigmoid
+  --moe-router-enable-expert-bias: true
+  --moe-router-dtype: fp32
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-aux-loss-coeff: 1.0e-4
+  --moe-shared-expert-intermediate-size: 3712
+  --moe-token-dispatcher-type: flex
+  --moe-flex-dispatcher-backend: hybridep
+  --moe-flex-dispatcher-num-sms: 16
+  --moe-grouped-gemm: true
+  --moe-permute-fusion: true
+
+  # Lightning multi-token prediction. The unified pattern above carries both depths.
+  --mtp-num-layers: 2
+  --mtp-use-repeated-layer: true
+  --mtp-loss-scaling-factor: 0.3
+
+  # Use the staged corpus shared by the other GB200 functional tests instead of
+  # the node-local RP2 mount.
+  --seq-length: 8192
+  --max-position-embeddings: 8192
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --split: 949,50,1
+  --dataloader-type: single
+  --num-workers: 8
+  --no-create-attention-mask-in-dataloader: true
+
+  # BF16 compute and BF16 gradient reduction with FP32 optimizer state.
+  --bf16: true
+  --grad-reduce-in-bf16: true
+  --main-grads-dtype: fp32
+  --main-params-dtype: fp32
+  --exp-avg-dtype: fp32
+  --exp-avg-sq-dtype: fp32
+
+  # Adam and cosine schedule inherited from Bridge.
+  --optimizer: adam
+  --lr: 1.6e-3
+  --min-lr: 1.6e-5
+  --lr-decay-style: cosine
+  --lr-decay-iters: 39735
+  --lr-warmup-iters: 333
+  --lr-warmup-init: 0.0
+  --lr-wsd-decay-style: minus_sqrt
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  --adam-eps: 1.0e-8
+  --weight-decay: 0.1
+  --clip-grad: 1.0
+  --override-opt-param-scheduler: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+
+  # Synchronous distributed checkpointing; 20 test steps do not reach the save interval.
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 50
+  --ckpt-format: torch_dist
+  --ckpt-assume-constant-structure: true
+  --dist-ckpt-strictness: log_all
+
+  # Validation and functional metrics.
+  --eval-interval: 500
+  --eval-iters: 32
+  --log-interval: 1
+  --log-num-zeros-in-grad: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --timing-log-level: 0
+  --seed: 1234
+
+METRICS:
+  - iteration-time
+  - lm loss
+  - mtp_1 loss
+  - mtp_2 loss
+  - num-zeros
+  - mem-allocated-bytes
+  - mem-max-allocated-bytes
+
+LAUNCHER: ft_launcher

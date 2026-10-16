@@ -50,6 +50,7 @@ def weighted_swiglu(y, weights):
 
 @jit_fuser
 def clamped_swiglu(y, clamp_value):
+    """Perform SwiGLU after clamping both halves of the input."""
     dtype = y.dtype
     y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
     y_1 = y_1.clamp(min=None, max=clamp_value)
@@ -60,12 +61,13 @@ def clamped_swiglu(y, clamp_value):
 
 @jit_fuser
 def bias_clamped_swiglu(y, bias, clamp_value):
-    """SwiGLU with clamping after bias addition."""
+    """Perform clamped SwiGLU after bias addition."""
     return clamped_swiglu(y + bias, clamp_value)
 
 
 @jit_fuser
 def clamped_weighted_swiglu(y, weights, clamp_value):
+    """Perform token-weighted clamped SwiGLU."""
     dtype = y.dtype
     res = clamped_swiglu(y, clamp_value) * weights
     return res.to(dtype)
@@ -122,6 +124,7 @@ def weighted_swiglu_back(g, y, weights):
 
 @jit_fuser
 def clamped_swiglu_back(g, y, clamp_value):
+    """Compute the input gradient for clamped SwiGLU."""
     dtype = y.dtype
     y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
     y_1c = y_1.clamp(min=None, max=clamp_value)
@@ -142,12 +145,13 @@ def clamped_swiglu_back(g, y, clamp_value):
 
 @jit_fuser
 def bias_clamped_swiglu_back(g, y, bias, clamp_value):
-    """Backward of SwiGLU with clamping after bias addition."""
+    """Compute the input gradient for clamped SwiGLU with bias."""
     return clamped_swiglu_back(g, y + bias, clamp_value)
 
 
 @jit_fuser
 def clamped_weighted_swiglu_back(g, y, weights, clamp_value):
+    """Compute input and weight gradients for token-weighted clamped SwiGLU."""
     input_dtype = y.dtype
     w_dtype = weights.dtype
     input_grad = clamped_swiglu_back(g * weights, y, clamp_value)
@@ -280,10 +284,8 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         ctx.fp8_input_store = fp8_input_store
         ctx.clamp_value = clamp_value
         if clamp_value is not None and clamp_value > 0:
-            res = clamped_weighted_swiglu(input, weights, clamp_value)
-        else:
-            res = weighted_swiglu(input, weights)
-        return res
+            return clamped_weighted_swiglu(input, weights, clamp_value)
+        return weighted_swiglu(input, weights)
 
     @staticmethod
     def backward(ctx, grad_output):

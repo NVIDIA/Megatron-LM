@@ -199,6 +199,10 @@ class MultiModulePipelineCommunicator:
                     return True
         return False
 
+    def is_module_pp_first_stage(self, module_name: str) -> bool:
+        """Return True if the current rank is the module's first PP stage."""
+        return self.rank_module_map[module_name].pp_rank == 0
+
     @property
     def is_pp_last_stage(self):
         """Return True if the current rank has the absolute last stage in the overall model.

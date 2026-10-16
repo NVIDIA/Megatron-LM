@@ -11,6 +11,7 @@ modules:
     reconcile_proposal: true
     team_key: MCORE
     project_template: "MCore CI Testing"
+    linear_issue_status: "Need Triage"
     enable_linear_open: true
     enable_linear_modify: true
     enable_linear_close: true
