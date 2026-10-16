@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import random
+import threading
 import types
 from collections import OrderedDict, deque
 from contextlib import nullcontext
@@ -53,6 +54,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
+    OffloadedRequestPayload,
     RequestPayloadStageResult,
     RequestPromptPreparationResult,
     Status,
@@ -1982,22 +1984,32 @@ def test_drained_reset_rejects_suspended_state_before_context_mutation():
     engine.controller._async_sched_forward.clear.assert_not_called()
 
 
-def test_drained_reset_rejects_outstanding_requests_before_mutation():
-    """Reset rejects a nonempty request table before clearing engine state."""
+@pytest.mark.parametrize(
+    ("requests", "staging_tasks", "match"),
+    [
+        ({7: object()}, set(), "must drain all requests before reset"),
+        # A staged reply outlives its request, so an empty request table is not enough.
+        ({}, {object()}, "must drain all payload staging before reset"),
+    ],
+    ids=["outstanding-requests", "in-flight-staging"],
+)
+def test_drained_reset_rejects_undrained_work_before_mutation(requests, staging_tasks, match):
+    """Reset rejects outstanding requests or payload staging before clearing engine state."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._state_events = {}
     engine.state = EngineState.RUNNING
-    requests = {7: object()}
     engine.requests = requests
+    engine._staging_tasks = staging_tasks
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
         _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
 
-    with pytest.raises(RuntimeError, match="must drain all requests before reset"):
+    with pytest.raises(RuntimeError, match=match):
         engine.reset()
 
     assert engine.requests is requests
+    assert engine._staging_tasks is staging_tasks
     engine.context.reset.assert_not_called()
     engine.controller._async_sched_forward.clear.assert_not_called()
 
@@ -2386,16 +2398,21 @@ def test_streaming_partials_are_sent():
 
 
 class _RecordingStager:
-    """RequestPayloadStager test double: keeps every staged (uid, payload)."""
+    """RequestPayloadStager test double: keeps every staged (uid, payload) and returns
+    ``response_metadata``, or raises ``error`` without staging anything."""
 
-    def __init__(self):
+    def __init__(self, error=None, response_metadata=None):
         self.staged = []
+        self.error = error
+        self.response_metadata = response_metadata or {}
 
     def stage(self, uid, payload, *, finished_metadata, offload_params=None):
+        if self.error is not None:
+            raise self.error
         self.staged.append((uid, payload))
         self.finished_metadata = finished_metadata
         self.offload_params = offload_params
-        return RequestPayloadStageResult()
+        return RequestPayloadStageResult(response_metadata=self.response_metadata)
 
 
 def _reply_request(uid, status, log_probs, *, streaming=False, return_prompt_tokens=False):
@@ -2417,26 +2434,61 @@ def _reply_request(uid, status, log_probs, *, streaming=False, return_prompt_tok
     return request
 
 
+def _sent_replies(engine):
+    """Decode every ENGINE_REPLY the engine sent, in send order."""
+    replies = []
+    for call in engine.socket_for_receiving_requests.send_multipart.call_args_list:
+        frames = call.args[0]
+        header, _ = msgpack.unpackb(frames[0], raw=False)
+        assert header == Headers.ENGINE_REPLY.value
+        replies.extend(msgpack.unpackb(frame, raw=False) for frame in frames[1:])
+    return replies
+
+
+def _reply_engine(stager):
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.local_metadata_ledger_enabled = False
+    engine.local_metadata_ledger = {}
+    engine.payload_stager = stager
+    engine._staging_tasks = set()
+    engine.socket_for_receiving_requests = mock.Mock()
+    return engine
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("with_stager", "streaming", "expected_offloaded"),
-    [(False, False, False), (True, False, True), (True, True, False)],
+    ("stager", "streaming", "expected_offloaded"),
+    [
+        (None, False, False),
+        ("records", False, True),
+        ("records", True, False),
+        ("raises", False, False),
+        # Metadata that cannot be serialized breaks the reply after a successful write.
+        ("unsendable", False, "failed_reply"),
+        # A reply that cannot be built even without the metadata.
+        ("unserializable", False, "exit"),
+    ],
 )
-def test_payload_offload_stages_only_eligible_completed_replies(
-    with_stager, streaming, expected_offloaded
+async def test_payload_offload_stages_only_eligible_completed_replies(
+    stager, streaming, expected_offloaded
 ):
     """A stager offloads completed non-streaming replies only.
 
     Failed and streaming requests are neither staged nor stripped, and replies are untouched
-    without a stager. An offloaded reply never carries the prompt tensors, even when the
-    request opted into return_prompt_tokens (the stager holds the prompt ids); a reply that
-    is not offloaded still honours the opt-in. The ledger is a separate mechanism and stays
-    off here.
+    without a stager or when its write raises. A staged reply that cannot be sent is
+    replaced by a FAILED reply, or exits the process if even that fails, so the client is
+    never left waiting. An offloaded reply never carries the prompt
+    tensors, even when the request opted into return_prompt_tokens (the stager holds the
+    prompt ids); a reply that is not offloaded still honours the opt-in. The ledger is a
+    separate mechanism and stays off here.
     """
-    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.local_metadata_ledger_enabled = False
-    engine.local_metadata_ledger = {}
-    engine.payload_stager = _RecordingStager() if with_stager else None
-    engine.socket_for_receiving_requests = mock.Mock()
+    stager_kind = stager
+    if stager is not None:
+        stager = _RecordingStager(
+            error=RuntimeError("write failed") if stager == "raises" else None,
+            response_metadata={"coords": object()} if stager == "unsendable" else None,
+        )
+    engine = _reply_engine(stager)
     completed = _reply_request(
         "chatcmpl-ok",
         Status.COMPLETED,
@@ -2446,14 +2498,27 @@ def test_payload_offload_stages_only_eligible_completed_replies(
     )
     failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
 
-    engine._send_requests_to_coordinator([completed, failed])
+    if stager_kind == "unserializable":
+        engine._serialize_finished_request = mock.Mock(side_effect=RuntimeError("bad request"))
 
-    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
-    frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
-    header, _ = msgpack.unpackb(frames[0], raw=False)
-    ok_wire, failed_wire = [msgpack.unpackb(frame, raw=False) for frame in frames[1:]]
-    assert header == Headers.ENGINE_REPLY.value
-    assert failed_wire["payload_offloaded"] is False
+    with mock.patch("megatron.core.utils.sys.exit") as exit_process:
+        engine._send_requests_to_coordinator([completed, failed])
+        await engine._drain_staging_tasks()
+
+    wires = {wire["uid"]: wire for wire in _sent_replies(engine)}
+    assert wires["chatcmpl-failed"]["payload_offloaded"] is False
+    if expected_offloaded == "exit":
+        exit_process.assert_called_once_with(1)
+        assert "chatcmpl-ok" not in wires
+        return
+    exit_process.assert_not_called()
+    if expected_offloaded == "failed_reply":
+        ok_wire = wires["chatcmpl-ok"]
+        assert ok_wire["status"] == Status.FAILED.name
+        assert ok_wire["payload_offloaded"] is False
+        assert ok_wire["payload_stage_metadata"] == {}
+        return
+    ok_wire = wires["chatcmpl-ok"]
     assert engine.local_metadata_ledger == {}
     assert ok_wire["payload_offloaded"] is expected_offloaded
     if expected_offloaded:
@@ -2478,16 +2543,16 @@ def test_payload_offload_stages_only_eligible_completed_replies(
     assert ok_wire["generated_tokens"] == [10, 11]
     assert completed.generated_log_probs == [-0.5, -0.25]
     assert completed.prompt_tokens.tolist() == [1, 2, 3]
+    if stager is None:
+        assert engine._staging_log_suffix() == ""
 
 
-def test_finished_request_record_is_built_once_for_ledger_and_stager():
+@pytest.mark.asyncio
+async def test_finished_request_record_is_built_once_for_ledger_and_stager():
     """With both the ledger and a stager on, one FinishedRequestRecord per completed request
     is shared by both; failed requests build none."""
-    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine = _reply_engine(_RecordingStager())
     engine.local_metadata_ledger_enabled = True
-    engine.local_metadata_ledger = {}
-    engine.payload_stager = _RecordingStager()
-    engine.socket_for_receiving_requests = mock.Mock()
     completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])
     failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
 
@@ -2495,6 +2560,7 @@ def test_finished_request_record_is_built_once_for_ledger_and_stager():
         FinishedRequestRecord, "from_request", wraps=FinishedRequestRecord.from_request
     ) as from_request:
         engine._send_requests_to_coordinator([completed, failed])
+        await engine._drain_staging_tasks()
 
     from_request.assert_called_once_with(completed)
     record = engine.local_metadata_ledger["chatcmpl-ok"]
@@ -2502,6 +2568,82 @@ def test_finished_request_record_is_built_once_for_ledger_and_stager():
     assert record.num_evictions == 0
     ((uid, _),) = engine.payload_stager.staged
     assert uid == "chatcmpl-ok"
+
+
+class _BlockingStager:
+    """RequestPayloadStager test double whose write sets ``started``, then blocks until
+    ``release`` is set."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.threads = []
+
+    def stage(self, uid, payload, *, finished_metadata, offload_params=None):
+        self.threads.append(threading.current_thread())
+        self.started.set()
+        assert self.release.wait(timeout=10)
+        return RequestPayloadStageResult(response_metadata={"ng_commit_coords": {"uid": uid}})
+
+
+@pytest.mark.asyncio
+async def test_slow_stager_does_not_block_the_engine_loop(caplog):
+    """stage() runs off the engine loop.
+
+    _send_requests_to_coordinator returns while the writes are still running and other
+    replies go out at once. The step log reports the backlog and its peak since the last
+    log line. Shutdown waits for in-flight writes, logs how many it waited for (and is
+    silent when there are none), and each staged reply carries the stager's metadata.
+    """
+    stager = _BlockingStager()
+    engine = _reply_engine(stager)
+    drain_logger = "megatron.core.inference.engines.dynamic_engine"
+
+    def drain_messages():
+        return [
+            r.getMessage() for r in caplog.records if "in-flight payload staging" in r.getMessage()
+        ]
+
+    with caplog.at_level(logging.INFO, logger=drain_logger):
+        await engine._drain_staging_tasks()
+    assert drain_messages() == []
+
+    with mock.patch.object(
+        OffloadedRequestPayload, "from_request", wraps=OffloadedRequestPayload.from_request
+    ) as from_request:
+        engine._send_requests_to_coordinator(
+            [
+                _reply_request("chatcmpl-a", Status.COMPLETED, [-0.5, -0.25]),
+                _reply_request("chatcmpl-failed", Status.FAILED, None),
+                _reply_request("chatcmpl-b", Status.COMPLETED, [-0.5, -0.25]),
+            ]
+        )
+        # Payloads are copied to host during bookkeeping, before any staging task runs.
+        assert from_request.call_count == 2
+    assert await asyncio.to_thread(stager.started.wait, 10)
+
+    # A write is still blocked, yet the engine already moved on.
+    assert [wire["uid"] for wire in _sent_replies(engine)] == ["chatcmpl-failed"]
+    assert stager.threads[0] is not threading.current_thread()
+    assert engine._staging_log_suffix() == " ... payload staging: in-flight 2, peak 2"
+
+    # Release only once draining is underway, so the drain has to wait for both writes.
+    asyncio.get_running_loop().call_soon(stager.release.set)
+    with caplog.at_level(logging.INFO, logger=drain_logger):
+        await engine._drain_staging_tasks()
+
+    (message,) = drain_messages()
+    assert message.startswith("Waiting for 2 in-flight payload staging task(s) before shutdown")
+    assert not engine._staging_tasks
+    staged = {wire["uid"]: wire for wire in _sent_replies(engine)[1:]}
+    assert sorted(staged) == ["chatcmpl-a", "chatcmpl-b"]
+    for uid, wire in staged.items():
+        assert wire["payload_offloaded"] is True
+        assert wire["generated_log_probs"] is None
+        assert wire["payload_stage_metadata"] == {"ng_commit_coords": {"uid": uid}}
+    # The peak resets at each log line, to the backlog at that moment.
+    assert engine._staging_log_suffix() == " ... payload staging: in-flight 0, peak 2"
+    assert engine._staging_log_suffix() == " ... payload staging: in-flight 0, peak 0"
 
 
 def _submit_request_message(request_id, sampling_params, prompt, offload_params):
@@ -5772,6 +5914,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         finished_requests = []
         while engine.has_unfinished_requests():
             finished_requests.extend(engine.step_modern()["finished_requests"])
+        # Staging runs in a task off the engine loop; step_modern() only runs the loop
+        # during a step, so wait for the staged reply as shutdown() would.
+        engine._run_coroutine_sync(engine._drain_staging_tasks())
         finished = finished_requests[0]
 
         # The staged payload is the exact per-token data of the request, keyed by its uid.
