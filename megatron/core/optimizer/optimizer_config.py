@@ -539,7 +539,7 @@ class OptimizerConfig:
         virtual_pipeline_model_parallel_size: int | None,
         ckpt_format: str | None,
     ) -> None:
-        if self.lr is not None:
+        if self.lr is not None and self.min_lr is not None:
             assert self.min_lr <= self.lr
 
         # Optimizer CPU offload check
