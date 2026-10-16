@@ -11,6 +11,11 @@ from torch import Tensor
 
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.residual_recompute_plan import (
+    build_recompute_block_end_plan,
+    build_recompute_layer_managers,
+    finalize_recompute_block,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
@@ -22,28 +27,11 @@ def build_mhc_recompute_layer_plan(
     num_layers: int, mhc_recompute_layer_num: Optional[int], use_mhc_recompute: bool
 ) -> Tuple[list[Optional[CheckpointWithoutOutputManager]], list[bool]]:
     """Build per-layer mHC recompute managers and recompute-block end markers."""
-    layer_managers: list[Optional[CheckpointWithoutOutputManager]] = [None] * num_layers
-    is_recompute_block_end = [False] * num_layers
-
     if not use_mhc_recompute or num_layers == 0:
-        return layer_managers, is_recompute_block_end
+        return [None] * num_layers, [False] * num_layers
 
-    mhc_manager = CheckpointWithoutOutputManager()
-    for layer_index in range(num_layers):
-        is_last_in_transformer_block = layer_index == num_layers - 1
-        is_last_in_recompute_block = is_last_in_transformer_block
-        if mhc_recompute_layer_num is not None:
-            is_last_in_recompute_block = is_last_in_transformer_block or (
-                (layer_index + 1) % mhc_recompute_layer_num == 0
-            )
-
-        layer_managers[layer_index] = mhc_manager
-        is_recompute_block_end[layer_index] = is_last_in_recompute_block
-
-        if is_last_in_recompute_block and not is_last_in_transformer_block:
-            mhc_manager = CheckpointWithoutOutputManager()
-
-    return layer_managers, is_recompute_block_end
+    block_ends = build_recompute_block_end_plan(num_layers, mhc_recompute_layer_num)
+    return build_recompute_layer_managers(block_ends), list(block_ends)
 
 
 def finalize_mhc_recompute_layer(
@@ -52,8 +40,7 @@ def finalize_mhc_recompute_layer(
     is_last_in_recompute_block: bool,
 ) -> None:
     """Finalize mHC recompute state when the current recompute block ends."""
-    if mhc_manager is not None and is_last_in_recompute_block:
-        mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+    finalize_recompute_block(mhc_manager, hidden_states, is_last_in_recompute_block)
 
 
 @torch.compile

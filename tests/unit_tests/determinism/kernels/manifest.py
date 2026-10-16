@@ -534,10 +534,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             C + "test_gpt_model.py",
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
+            "tests/unit_tests/rl/test_rl_utils.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
-        "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay.",
+        "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
+        "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration.",
     ),
     KernelEntry(
         name="nccl_allocator",
@@ -645,7 +647,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_mamba_mixer",
         sources=("megatron/core/ssm/mamba_mixer.py",),
-        tests=(C + "test_ssm_conv1d.py", K + "test_ssm_kernels.py"),
+        tests=(
+            C + "test_ssm_conv1d.py",
+            K + "test_ssm_kernels.py",
+            "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
+        ),
         kind="dispatch",
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "

@@ -1242,10 +1242,8 @@ def save_checkpoint(
                 )
 
                 if save_retain_interval is not None:
-                    if (
-                        prev_iteration > 0
-                        and prev_iteration != iteration
-                        and prev_iteration % save_retain_interval != 0
+                    if _should_delete_previous_checkpoint(
+                        prev_iteration, iteration, save_retain_interval
                     ):
                         checkpoint_name = get_checkpoint_name(
                             args.save, iteration=prev_iteration, return_base_dir=True
@@ -1541,6 +1539,19 @@ def save_tokenizer_assets(
             logger.error(traceback.format_exc())
         if raise_on_error:
             raise
+
+
+def _should_delete_previous_checkpoint(
+    prev_iteration: int, iteration: int, save_retain_interval: int
+) -> bool:
+    """Return whether checkpoint `prev_iteration` should be deleted after saving checkpoint `iteration`.
+
+    The previous checkpoint is deleted only if it is older than `iteration` and is not
+    kept by `save_retain_interval`. A run restarted from an earlier iteration, or from
+    scratch, can find a newer iteration in the tracker file; such newer checkpoints should
+    not be deleted.
+    """
+    return 0 < prev_iteration < iteration and prev_iteration % save_retain_interval != 0
 
 
 @_disable_gc()
@@ -2121,7 +2132,10 @@ def _load_global_dist_base_checkpoint(
         )
 
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
-    load_strategy = TorchDistLoadShardedStrategy(cache_metadata=args.ckpt_assume_constant_structure)
+    load_strategy = TorchDistLoadShardedStrategy(
+        cache_metadata=args.ckpt_assume_constant_structure,
+        stream_ckpt_dequant=getattr(args, 'stream_ckpt_dequant', False),
+    )
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
@@ -2713,6 +2727,12 @@ def load_checkpoint(
     args = get_args()
     load_dir = getattr(args, load_arg)
     loading_pretrained_checkpoint = False
+
+    if getattr(args, 'stream_ckpt_dequant', False) and optimizer is not None:
+        raise ValueError(
+            '--stream-ckpt-dequant is an inference-only (weights-only) load path: it cannot be '
+            'used to load a checkpoint together with an optimizer.'
+        )
 
     # --freeze-all-layers: nothing trains, so load the model in --load weights-only (finetune-style)
     # and auto-resume the data position by feeding this run's own progress tracker -- written to
