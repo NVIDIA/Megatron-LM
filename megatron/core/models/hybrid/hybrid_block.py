@@ -1313,7 +1313,8 @@ class HybridStack(MegatronModule):
         Returns:
             Tensor in the common case. A 2-tuple ``(hidden_states, mhc_multistream)`` ONLY when
             ``enable_hyper_connections and post_process and mtp_num_layers > 0 and not
-            is_mtp_layer`` — the extra element is the pre-contraction multi-stream tensor that
+            is_mtp_layer`` and MTP hyper-connections are not explicitly disabled — the extra
+            element is the pre-contraction multi-stream tensor that
             MTP's ``_concat_embeddings`` consumes. Callers (e.g. ``HybridModel.forward``) must
             handle both; pipeline send/recv only ever transfers the contracted ``hidden_states``.
         """
@@ -1483,7 +1484,9 @@ class HybridStack(MegatronModule):
         # final_layernorm itself, so doing it here would double-collapse the multi-stream tensor.
         mhc_multistream = None
         if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
-            if (self.config.mtp_num_layers or 0) > 0:
+            if (
+                self.config.mtp_num_layers or 0
+            ) > 0 and self.config.mtp_enable_hyper_connections is not False:
                 mhc_multistream = hidden_states
             if self.config.mhc_learned_output_contract:
                 hidden_states = learned_output_contract(

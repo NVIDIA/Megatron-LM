@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import warnings
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
@@ -2109,7 +2110,17 @@ class MultiTokenPredictionLayer(MegatronModule):
                     f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
                 )
 
-        self.mhc_enabled = self.config.enable_hyper_connections
+        self.mhc_enabled = (
+            self.config.enable_hyper_connections
+            and self.config.mtp_enable_hyper_connections is not False
+        )
+        # A released checkpoint can use a multistream decoder and an ordinary
+        # single-stream MTP block. Do not mutate the shared decoder config or
+        # construct randomly initialized inner mHC parameters for that checkpoint.
+        inner_config = self.config
+        if self.config.enable_hyper_connections and not self.mhc_enabled:
+            inner_config = copy(self.config)
+            inner_config.enable_hyper_connections = False
 
         self.enorm = self.submodules.enorm(
             config=self.config,
@@ -2194,7 +2205,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 
             self.mtp_model_layer = HybridStack(
-                config=self.config,
+                config=inner_config,
                 submodules=hybrid_submodules,
                 layer_type_list=validate_segment_layers(mtp_layer_pattern),
                 pp_layer_offset=0,
@@ -2214,7 +2225,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # Mamba path and ensures proper aux loss tracking in router.py.
             self.mtp_model_layer = build_module(
                 self.submodules.mtp_model_layer,
-                config=self.config,
+                config=inner_config,
                 vp_stage=self.vp_stage,
                 layer_number=self.layer_number,
                 is_mtp_layer=True,
@@ -3129,6 +3140,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 Contracted decoder hidden states [s, b, h] when mHC is enabled.
             mhc_multistream (Tensor, optional): When mHC is enabled, the pre-contraction
                 multi-stream decoder output [s, b, n*h] used as input to MTP depths.
+                Must be omitted when mtp_enable_hyper_connections is False.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
             padding_mask (Tensor, optional): Padding mask for MoE routing (True = padded).
@@ -3141,6 +3153,14 @@ class MultiTokenPredictionBlock(MegatronModule):
             (Tensor): The mtp loss tensor of shape [b, s].
         """
         # get hidden states from previous mtp stages
+        mtp_hc_enabled = (
+            self.config.enable_hyper_connections
+            and self.config.mtp_enable_hyper_connections is not False
+        )
+        if mhc_multistream is not None and not mtp_hc_enabled:
+            raise ValueError(
+                "mhc_multistream must be None when MTP hyper-connections are disabled."
+            )
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         if mhc_multistream is not None:

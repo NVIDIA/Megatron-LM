@@ -12,10 +12,12 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 def _plain_proj_rms(x, weight, eps, eps_inside_sqrt):
     x = x.reshape(x.shape[0] * x.shape[1], -1).to(torch.float32)
     weight = weight.to(torch.float32)
-    proj = torch.matmul(x, weight.t())
     if eps_inside_sqrt:
+        # GLM normalizes the FP32 input before its projection.
         r = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+        proj = torch.matmul(x * r, weight.t())
     else:
+        proj = torch.matmul(x, weight.t())
         r = (x.norm(dim=-1, keepdim=True) / (x.shape[-1] ** 0.5) + eps).reciprocal()
     return proj, r
 
@@ -103,10 +105,11 @@ def test_mhc_projection_stays_fp32_under_autocast(eps_inside_sqrt):
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
         with torch.autocast(device_type="cpu", enabled=False):
-            expected_proj = torch.matmul(x.float(), weight.float().t())
             if eps_inside_sqrt:
                 expected_norm = torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
+                expected_proj = torch.matmul(x.float() * expected_norm, weight.float().t())
             else:
+                expected_proj = torch.matmul(x.float(), weight.float().t())
                 expected_norm = 1.0 / (x.float().norm(dim=-1, keepdim=True) / math.sqrt(32) + eps)
 
     assert actual_proj.dtype == torch.float32
