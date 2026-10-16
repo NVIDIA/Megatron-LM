@@ -47,6 +47,7 @@ HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
 
+from megatron.core.muon_layout import MuonProjectionLayout
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
     ParamGroupOverride,
@@ -840,12 +841,34 @@ def _get_megatron_emerging_optimizer(
 
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
     for model_chunk in model_chunks:
+        if config.muon_split_qkv_per_head and getattr(model_chunk.config, "use_kitchen", False):
+            raise ValueError(
+                "Per-head Muon does not support Kitchen projection layouts. "
+                "Disable Kitchen or muon_split_qkv_per_head."
+            )
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
             qkv_layout = getattr(param, 'qkv_layout', None)
+            if (
+                config.muon_split_qkv_per_head
+                and qkv_layout is None
+                and 'linear_qkv.weight' in name
+                and param.ndim == 2
+            ):
+                # Compatibility for custom modules without owning-layer metadata.
+                from megatron.core.transformer.attention import QKVLayout
+
+                qkv_layout = QKVLayout.from_transformer_config(model_chunk.config)
+                param.qkv_layout = qkv_layout
+            if (
+                config.muon_split_qkv_per_head
+                and qkv_layout is not None
+                and any(qkv_layout.per_head_adamw)
+            ):
+                param.muon_layout = MuonProjectionLayout.from_qkv_layout(qkv_layout)
             if (qkv_layout is not None or 'linear_qkv.weight' in name) and len(param.shape) == 2:
                 if qkv_layout is not None:
                     qkv_split_shapes = _get_qkv_split_shapes(
