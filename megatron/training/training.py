@@ -869,6 +869,44 @@ def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_to
     return attended / (mean_seqlen / 2)
 
 
+def _dsa_kpool_pair_scales(
+    total_real_tokens, seqlen_squared_sum, topk, pool_size, always_select_tail=True
+):
+    """Return sparse-attention and pooled-indexer pair scales relative to L^2/2.
+
+    Complete pools are causal only after their last token. At query position
+    ``j`` (one based), scoring visits ``j // pool_size`` pools and attention
+    visits ``min(j // pool_size, topk // pool_size)`` complete pools, plus
+    ``j % pool_size`` tail tokens when enabled. The closed sums are exact for
+    equal-length BSHD samples, including sequences shorter than one pool.
+
+    Only sum(L) and sum(L^2) are available for ragged THD, so evaluate the sums
+    at floor(sum(L^2)/sum(L)), as a length-weighted approximation. Do not infer
+    exact per-document pool boundaries from those insufficient statistics.
+    Pool size one deliberately retains the existing DSA estimate unchanged.
+    """
+    if pool_size < 1:
+        raise ValueError("dsa_indexer_kpool must be positive for FLOPs accounting.")
+    if pool_size == 1:
+        return _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, topk), 1.0
+    if topk is None or topk <= 0 or topk % pool_size:
+        raise ValueError("KPool FLOPs require a positive top-k divisible by the pool size.")
+    if total_real_tokens <= 0 or seqlen_squared_sum <= 0:
+        return 0.0, 0.0
+    length = max(math.floor(seqlen_squared_sum / total_real_tokens), 1)
+    pools, remainder = divmod(length, pool_size)
+    score_pairs = pool_size * pools * (pools - 1) / 2 + pools * (remainder + 1)
+    selected_pools = min(pools, topk // pool_size)
+    selected_pool_pairs = pool_size * selected_pools * (selected_pools - 1) / 2 + selected_pools * (
+        length - pool_size * selected_pools + 1
+    )
+    attention_pairs = pool_size * selected_pool_pairs
+    if always_select_tail:
+        attention_pairs += pools * pool_size * (pool_size - 1) / 2 + remainder * (remainder + 1) / 2
+    dense_pair_estimate = length * length / 2
+    return attention_pairs / dense_pair_estimate, score_pairs / dense_pair_estimate
+
+
 def _logit_flops_per_token(hidden_size, vocab_size, mtp_num_layers=0, mtp_detach_heads=False):
     """Return training FLOPs per token for the final and MTP logit projections.
 
@@ -903,6 +941,8 @@ def _dsa_indexer_flops(
     dsa_indexer_loss_enabled: bool,
     dsa_indexer_use_sparse_loss=False,
     sparse_core_scale=1.0,
+    kpool_size=1,
+    kpool_score_scale=1.0,
 ):
     """DSA lightning-indexer FLOPs coefficients, fwd/bwd expansion included.
 
@@ -958,6 +998,8 @@ def _dsa_indexer_flops(
     Multiply ``token_linear`` by the real token count and ``core`` by
     ``sum_i(L_i ** 2)``.
     """
+    if kpool_size > 1 and dsa_indexer_loss_enabled:
+        raise ValueError("DSA indexer loss is not supported with KPool FLOPs accounting.")
     if num_indexer_layers <= 0:
         return 0, 0
     if q_lora_rank is None:
@@ -969,8 +1011,13 @@ def _dsa_indexer_flops(
         + hidden_size * head_dim  # wk
         + hidden_size * n_heads  # weights_proj
     )
+    if kpool_size > 1:
+        # Frozen H -> index_head_dim pool-compression gate; pooling softmax,
+        # reductions and top-k sorting are omitted like other elementwise work.
+        token_linear += num_indexer_layers * hidden_size * head_dim
     # Scoring each query against every past token under a causal mask (/2).
-    core = num_indexer_layers * index_dim / 2
+    # KPool instead scores complete causal pools; the caller supplies its ratio.
+    core = num_indexer_layers * index_dim / 2 * kpool_score_scale
     fma_expansion_factor = 2
     if not dsa_indexer_loss_enabled:
         token_expansion, core_expansion = 1, 1
@@ -1653,6 +1700,8 @@ def num_floating_point_operations(
         v_head_dim,
         attention_output_gate=False,
         gated_attention_proj_granularity="elementwise",
+        absorbed=False,
+        sparse_core_scale=1.0,
     ):
         """Calculate FLOPs for a Multi-Latent Attention (MLA) layer.
 
@@ -1692,8 +1741,12 @@ def num_floating_point_operations(
             + hidden_size * gate_projection_size
         )
         # Core attention (L^2) part: QK^T and (softmax(QK^T))V. /2 (causal) cancels *2 (FMA).
-        core = fma * (
-            num_heads * (qk_head_dim + qk_pos_emb_head_dim) / 2 + num_heads * v_head_dim / 2
+        core_qk_dim = kv_lora_rank if absorbed else qk_head_dim
+        core_v_dim = kv_lora_rank if absorbed else v_head_dim
+        core = (
+            fma
+            * (num_heads * (core_qk_dim + qk_pos_emb_head_dim) / 2 + num_heads * core_v_dim / 2)
+            * sparse_core_scale
         )
         return token_linear * total_tokens + core * seqlen_squared_sum
 
@@ -1790,8 +1843,9 @@ def num_floating_point_operations(
         num_qk_heads=16,
         num_v_heads=16,
         conv_kernel_dim=4,
+        two_stage_gates=False,
     ):
-        """Calculate FLOPs for a direct-projection Kimi Delta Attention layer."""
+        """Calculate FLOPs for direct or GLM two-stage Kimi Delta Attention."""
         if num_qk_heads != num_v_heads or qk_head_dim != v_head_dim:
             raise ValueError(
                 "KDA FLOPs require the equal K/V head layout enforced by KimiDeltaAttention."
@@ -1799,11 +1853,19 @@ def num_floating_point_operations(
         qk_dim = qk_head_dim * num_qk_heads
         v_dim = v_head_dim * num_v_heads
         in_proj_dim = 3 * qk_dim + 2 * v_dim
+        gate_projection_term = 0
+        if two_stage_gates:
+            # Q/K/V only in in_proj; f and g each use H -> head_dim -> head_count*head_dim.
+            in_proj_dim = 2 * qk_dim + v_dim
+            gate_projection_term = (
+                hidden_size * (qk_head_dim + v_head_dim) + qk_head_dim * qk_dim + v_head_dim * v_dim
+            )
         non_core_flops = (
             2
             * total_tokens
             * (
                 hidden_size * (in_proj_dim + num_qk_heads)
+                + gate_projection_term
                 + conv_kernel_dim * (2 * qk_dim + v_dim)
                 + hidden_size * v_dim
             )
@@ -1823,6 +1885,7 @@ def num_floating_point_operations(
         num_mlp_layers,
         num_moe_layers,
         gdp_num_householder,
+        num_dsa_layers=0,
         num_gdn_layers=0,
         mamba_state_dim=128,
         mamba_head_dim=64,
@@ -1850,6 +1913,7 @@ def num_floating_point_operations(
         kda_num_qk_heads=16,
         kda_num_v_heads=16,
         kda_conv_kernel_dim=4,
+        kda_two_stage_gates=False,
         vocab_size=256000,
         mtp_num_layers=0,
         mtp_loss_type="cross_entropy",
@@ -1872,6 +1936,11 @@ def num_floating_point_operations(
         dsa_indexer_n_heads=None,
         dsa_indexer_head_dim=None,
         dsa_indexer_topk=None,
+        num_dsa_indexer_layers=0,
+        dsa_indexer_loss_coeff=None,
+        dsa_indexer_use_sparse_loss=False,
+        dsa_indexer_kpool=1,
+        dsa_indexer_kpool_always_select_tail=True,
     ):
         """Calculate total FLOPs for the hybrid model."""
         # Self-attention (already summed over all attention layers, fwd-equivalent
@@ -1928,6 +1997,48 @@ def num_floating_point_operations(
                     gated_attention_proj_granularity,
                 )
 
+        dsa_indexer_flops_total = 0
+        if num_dsa_layers:
+            sparse_scale, score_scale = _dsa_kpool_pair_scales(
+                total_tokens,
+                seqlen_squared_sum,
+                dsa_indexer_topk,
+                dsa_indexer_kpool,
+                dsa_indexer_kpool_always_select_tail,
+            )
+            attn_flops_total += num_dsa_layers * mla_attn_layer_flops(
+                total_tokens,
+                seqlen_squared_sum,
+                hidden_size,
+                num_attn_heads,
+                q_lora_rank,
+                kv_lora_rank,
+                qk_head_dim,
+                qk_pos_emb_head_dim,
+                v_head_dim,
+                attention_output_gate,
+                gated_attention_proj_granularity,
+                absorbed=True,
+                sparse_core_scale=sparse_scale,
+            )
+            indexer_token, indexer_core = _dsa_indexer_flops(
+                hidden_size=hidden_size,
+                q_lora_rank=q_lora_rank,
+                n_heads=dsa_indexer_n_heads,
+                head_dim=dsa_indexer_head_dim,
+                num_indexer_layers=num_dsa_indexer_layers,
+                dsa_indexer_loss_enabled=(dsa_indexer_loss_coeff or 0.0) > 0,
+                dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+                sparse_core_scale=sparse_scale,
+                kpool_size=dsa_indexer_kpool,
+                kpool_score_scale=score_scale,
+            )
+            # Already includes its own fwd/bwd factor. In particular, frozen
+            # KPool selection is forward-only and must not get the global x3.
+            dsa_indexer_flops_total = (
+                indexer_token * total_tokens + indexer_core * seqlen_squared_sum
+            )
+
         kda_flops_total = 0
         if num_kda_layers:
             kda_flops_total = num_kda_layers * kda_layer_flops(
@@ -1938,6 +2049,7 @@ def num_floating_point_operations(
                 kda_num_qk_heads,
                 kda_num_v_heads,
                 kda_conv_kernel_dim,
+                kda_two_stage_gates,
             )
 
         mamba_flops = (
@@ -2003,7 +2115,9 @@ def num_floating_point_operations(
         e2e_tv_target_projection_flops = (
             2 * total_tokens * hidden_size * vocab_size if mtp_loss_type == "e2e_tv" else 0
         )
-        return flops_fwd * 3 + logit_flops + e2e_tv_target_projection_flops
+        return (
+            flops_fwd * 3 + dsa_indexer_flops_total + logit_flops + e2e_tv_target_projection_flops
+        )
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -2233,6 +2347,7 @@ def num_floating_point_operations(
                     num_qk_heads=args.linear_num_key_heads,
                     num_v_heads=args.linear_num_value_heads,
                     conv_kernel_dim=args.linear_conv_kernel_dim,
+                    two_stage_gates=getattr(args, "kda_two_stage_gates", False),
                 )
             elif is_gated_delta_net_variant(args.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
@@ -2337,8 +2452,12 @@ def num_floating_point_operations(
             linear_self_attn_term = 0
             num_standard_attention_layers = num_layers
 
-            dsa_sparse_core_scale = _dsa_sparse_core_scale(
-                total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
+            dsa_sparse_core_scale, kpool_score_scale = _dsa_kpool_pair_scales(
+                total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch,
+                args.dsa_indexer_topk,
+                getattr(args, "dsa_indexer_kpool", 1),
+                getattr(args, "dsa_indexer_kpool_always_select_tail", True),
             )
             standard_self_attn_core_term = (
                 forward_backward_expansion_factor
@@ -2364,6 +2483,8 @@ def num_floating_point_operations(
                 dsa_indexer_loss_enabled=(args.dsa_indexer_loss_coeff or 0.0) > 0,
                 dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
                 sparse_core_scale=dsa_sparse_core_scale,
+                kpool_size=getattr(args, "dsa_indexer_kpool", 1),
+                kpool_score_scale=kpool_score_scale,
             )
         else:
             num_linear_attention_layers = 0
@@ -2486,9 +2607,10 @@ def num_floating_point_operations(
 
         # DSv4 D/C/H/W layers are MLA variants, but their
         # sparse attention FLOPs are handled by the DSv4 branch.
-        dsv4_mla_symbols = Symbols.MLA_ATTENTION - {Symbols.MLA}
+        dsv4_mla_symbols = Symbols.MLA_ATTENTION - {Symbols.MLA, Symbols.DS_ATTENTION}
         dsv4_mla_layers = sum(layer_counts[symbol] for symbol in dsv4_mla_symbols)
         num_mla_layers = layer_counts[Symbols.MLA]
+        num_dsa_layers = layer_counts[Symbols.DS_ATTENTION]
         if args.experimental_attention_variant == "dsv4_hybrid":
             num_attn_layers = layer_counts[Symbols.ATTENTION] + dsv4_mla_layers
         else:
@@ -2506,24 +2628,14 @@ def num_floating_point_operations(
                 f"{dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128} are W/C/H."
             )
 
-        # DSA accounting (top-k sparse core attention + indexer) is only
-        # implemented on the standard-model path in ``transformer_flops``. A
-        # 'D' pattern here would silently fall through to the dense full-MLA
-        # estimate below -- overcounting core attention at long context and
-        # dropping the indexer entirely -- so fail loud instead. Key off the
-        # layer pattern itself, not just ``args.experimental_attention_variant``:
-        # on the hybrid path a 'D' pattern sets the variant only in the config
-        # kwargs (``arguments.py``/``argument_utils.py`` write it into
-        # ``kw_args``, never back onto ``args``), so the attribute alone misses
-        # exactly the runs this guard exists for.
-        assert (
-            args.experimental_attention_variant != "dsa" and layer_counts[Symbols.DS_ATTENTION] == 0
-        ), (
-            "num_floating_point_operations does not support DSA "
-            "('D' layers / experimental_attention_variant='dsa') on the "
-            "hybrid-model path (--hybrid-layer-pattern); express the model "
-            "without a layer pattern."
+        # Only explicit D symbols establish a DSA module binding. A model-wide
+        # variant with implicit '*'/'+' attention is ambiguous and remains rejected.
+        assert args.experimental_attention_variant != "dsa" or num_dsa_layers > 0, (
+            "DSA FLOPs on the hybrid-model path require explicit 'D' layers; "
+            "implicit attention bindings with experimental_attention_variant='dsa' are unsupported."
         )
+        if num_dsa_layers and args.experimental_attention_variant not in (None, "dsa"):
+            raise ValueError("Explicit hybrid DSA FLOPs require a None or 'dsa' attention variant.")
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
@@ -2536,6 +2648,7 @@ def num_floating_point_operations(
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
             num_mla_layers=num_mla_layers,
+            num_dsa_layers=num_dsa_layers,
             num_kda_layers=num_kda_layers,
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
@@ -2576,6 +2689,7 @@ def num_floating_point_operations(
             kda_num_qk_heads=args.linear_num_key_heads or 16,
             kda_num_v_heads=args.linear_num_value_heads or 16,
             kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
+            kda_two_stage_gates=getattr(args, "kda_two_stage_gates", False),
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
             mtp_loss_type=getattr(args, "mtp_loss_type", "cross_entropy"),
@@ -2600,6 +2714,22 @@ def num_floating_point_operations(
             dsa_indexer_n_heads=getattr(args, "dsa_indexer_n_heads", None),
             dsa_indexer_head_dim=getattr(args, "dsa_indexer_head_dim", None),
             dsa_indexer_topk=getattr(args, "dsa_indexer_topk", None),
+            num_dsa_indexer_layers=(
+                _num_hybrid_dsa_indexer_layers(
+                    args.hybrid_layer_pattern,
+                    args.num_layers,
+                    getattr(args, "dsa_indexer_skip_topk_offset", 0),
+                    getattr(args, "dsa_indexer_topk_freq", 1),
+                )
+                if num_dsa_layers
+                else 0
+            ),
+            dsa_indexer_loss_coeff=getattr(args, "dsa_indexer_loss_coeff", None),
+            dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+            dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+            dsa_indexer_kpool_always_select_tail=getattr(
+                args, "dsa_indexer_kpool_always_select_tail", True
+            ),
         )
     else:
         # Compute standard Transformer model FLOPs.

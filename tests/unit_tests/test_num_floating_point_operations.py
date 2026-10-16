@@ -2130,12 +2130,10 @@ class TestDSAHelperEdgeCases:
         assert _dsa_sparse_core_scale(0, 0, 2048) == 1.0
         assert _dsa_sparse_core_scale(512, 512 * 4096, None) == 1.0
 
-    def test_hybrid_dsa_rejected(self):
-        """A hybrid layer pattern with DSA must fail loud, not fall through
-        to the dense full-MLA estimate (which overcounts core attention and
-        drops the indexer)."""
+    def test_hybrid_implicit_dsa_rejected(self):
+        """A global variant alone does not prove the hybrid attention binding."""
         args = _make_dsa_args()
-        args.hybrid_layer_pattern = "D-D-"
+        args.hybrid_layer_pattern = "+-+-"
         args.mamba_state_dim = 128
         args.mamba_head_dim = 64
         args.mamba_num_groups = 8
@@ -2144,19 +2142,231 @@ class TestDSAHelperEdgeCases:
         with pytest.raises(AssertionError, match="hybrid-model path"):
             num_floating_point_operations(args, 2)
 
-    def test_hybrid_dsa_rejected_without_variant_attribute(self):
-        """The guard must key off the 'D' symbols in the layer pattern, not
-        just ``args.experimental_attention_variant``: on the hybrid path a
-        'D' pattern sets the variant only in the config kwargs (never back
-        onto ``args``), so a real ``--hybrid-layer-pattern "D..."`` launch
-        reaches this code with the attribute still ``None``."""
+    def test_hybrid_dsa_conflicting_variant_rejected(self):
+        """Explicit D must not be silently attributed to a conflicting variant."""
         args = _make_dsa_args()
-        args.experimental_attention_variant = None
+        args.experimental_attention_variant = "gdn"
         args.hybrid_layer_pattern = "D-D-"
         args.mamba_state_dim = 128
         args.mamba_head_dim = 64
         args.mamba_num_groups = 8
         args.mamba_num_heads = 128
 
-        with pytest.raises(AssertionError, match="hybrid-model path"):
+        with pytest.raises(ValueError, match="Explicit hybrid DSA"):
             num_floating_point_operations(args, 2)
+
+
+def _as_dsa_hybrid(args, pattern):
+    hybrid = SimpleNamespace(**vars(args))
+    hybrid.hybrid_layer_pattern = pattern
+    hybrid.num_layers = len(pattern.split('/')[0].replace('|', ''))
+    hybrid.mamba_state_dim = 128
+    hybrid.mamba_head_dim = 64
+    hybrid.mamba_num_groups = 8
+    hybrid.mamba_num_heads = 128
+    hybrid.gdp_num_householder = 3
+    return hybrid
+
+
+def _glm53_flops_golden(args, batch_size):
+    """Independent per-query/per-module calculator, not production helpers."""
+    pattern = args.hybrid_layer_pattern.replace('|', '')
+    depths = len(pattern.split('/')) - 1
+    counts = {symbol: pattern.count(symbol) for symbol in 'KD-E'}
+    h, n, s = args.hidden_size, args.num_attention_heads, args.seq_length
+    t = batch_size * s
+    pool, budget = args.dsa_indexer_kpool, args.dsa_indexer_topk
+    tail = getattr(args, 'dsa_indexer_kpool_always_select_tail', True)
+    # Enumerate complete causal pools and each query's own incomplete tail.
+    score_pairs = batch_size * sum(j // pool for j in range(1, s + 1))
+    attention_pairs = batch_size * sum(
+        pool * min(j // pool, budget // pool) + (j % pool if tail else 0) for j in range(1, s + 1)
+    )
+    r, q, d, v, rope = (
+        args.kv_lora_rank,
+        args.q_lora_rank,
+        args.qk_head_dim,
+        args.v_head_dim,
+        args.qk_pos_emb_head_dim,
+    )
+    mla_projection = q * (h + n * (d + rope) + 1)
+    mla_projection += r * (h + n * (d + v) + 1) + h * rope + n * v * h
+    dsa = counts['D'] * (6 * t * mla_projection + 6 * n * (2 * r + rope) * attention_pairs)
+    ih, idim = args.dsa_indexer_n_heads, args.dsa_indexer_head_dim
+    indexer = (
+        counts['D']
+        * 2
+        * (t * (q * ih * idim + h * idim + h * ih + h * idim) + ih * idim * score_pairs)
+    )
+    kd, kh = args.linear_key_head_dim, args.linear_num_key_heads
+    channels = kd * kh
+    kda = (
+        counts['K']
+        * 6
+        * t
+        * (
+            h * (3 * channels + kh)
+            + 2 * h * kd
+            + 2 * kd * channels
+            + args.linear_conv_kernel_dim * 3 * channels
+            + h * channels
+            + kh * (kd * kd + 3 * kd * kd)
+        )
+    )
+    ffn = (
+        6
+        * t
+        * h
+        * 3
+        * (
+            counts['-'] * args.ffn_hidden_size
+            + counts['E']
+            * (
+                args.moe_router_topk * args.moe_ffn_hidden_size
+                + args.moe_shared_expert_intermediate_size
+            )
+        )
+    )
+    mtp = 6 * t * depths * (3 * h + 2 * h * h)
+    logits = 6 * t * h * args.padded_vocab_size * (1 + depths)
+    return dsa + indexer + kda + ffn + mtp + logits
+
+
+class TestHybridDSAAndGLM53Flops:
+    @pytest.mark.parametrize('tail', (False, True))
+    def test_standard_and_hybrid_kpool_match(self, tail):
+        args = _make_dsa_args(0.0)
+        args.dsa_indexer_kpool = 4
+        args.dsa_indexer_kpool_always_select_tail = tail
+        hybrid = _as_dsa_hybrid(args, 'D-' * args.num_layers)
+        assert num_floating_point_operations(hybrid, 2) == num_floating_point_operations(args, 2)
+
+    def test_ragged_pool_scales_are_length_weighted_not_exact_document_counts(self):
+        # Lengths 3 and 17 yield weighted mean 298/20=14.9, floored to 14.
+        # The available aggregates cannot recover individual pool boundaries.
+        actual = training_module._dsa_kpool_pair_scales(20, 298, 8, 4)
+        approximated = training_module._dsa_kpool_pair_scales(14, 14**2, 8, 4)
+        assert actual == approximated
+
+    @pytest.mark.parametrize('variant', (None, 'dsa'))
+    @pytest.mark.parametrize('loss', (0.0, 0.01))
+    @pytest.mark.parametrize('sparse_loss', (False, True))
+    def test_explicit_d_matches_standard_pool_one(self, variant, loss, sparse_loss):
+        standard = _make_dsa_args(loss, sparse_loss)
+        hybrid = _as_dsa_hybrid(standard, 'D-' * standard.num_layers)
+        hybrid.experimental_attention_variant = variant
+        assert num_floating_point_operations(hybrid, 2) == num_floating_point_operations(
+            standard, 2
+        )
+        stats = dict(total_real_tokens_in_batch=384, seqlen_squared_sum_in_batch=32768)
+        assert num_floating_point_operations(hybrid, 2, **stats) == num_floating_point_operations(
+            standard, 2, **stats
+        )
+
+    @pytest.mark.parametrize('length', (1, 3, 4, 9, 17, 128))
+    @pytest.mark.parametrize('pool', (2, 4, 8))
+    @pytest.mark.parametrize('tail', (False, True))
+    def test_kpool_pair_closed_sums(self, length, pool, tail):
+        sparse, score = training_module._dsa_kpool_pair_scales(length, length**2, 8, pool, tail)
+        expected_score = sum(j // pool for j in range(1, length + 1))
+        expected_sparse = sum(
+            pool * min(j // pool, 8 // pool) + (j % pool if tail else 0)
+            for j in range(1, length + 1)
+        )
+        assert score * length**2 / 2 == pytest.approx(expected_score)
+        assert sparse * length**2 / 2 == pytest.approx(expected_sparse)
+
+    @pytest.mark.parametrize('full_model', (False, True))
+    @pytest.mark.parametrize('tail', (False, True))
+    @pytest.mark.parametrize('length', (3, 17, 512, 4099))
+    def test_glm53_independent_golden(self, full_model, tail, length):
+        pattern = 'K-KEKEDE/DE'
+        if full_model:
+            pattern = 'K-' * 3 + ('DE' + 'KE' * 3) * 10 + 'DEKE/DE'
+        args = _as_dsa_hybrid(_make_dsa_args(0.0), pattern)
+        args.seq_length = length
+        args.hidden_size = 4096 if full_model else 1024
+        args.num_attention_heads = 64 if full_model else 8
+        args.q_lora_rank = 1536 if full_model else 512
+        args.kv_lora_rank = 512
+        args.qk_head_dim = args.v_head_dim = args.kv_channels = 256
+        args.qk_pos_emb_head_dim = 0
+        args.ffn_hidden_size = 12288 if full_model else 3072
+        args.moe_ffn_hidden_size = args.moe_shared_expert_intermediate_size = (
+            2048 if full_model else 512
+        )
+        args.num_experts = 288 if full_model else 32
+        args.moe_router_topk = 8 if full_model else 4
+        args.padded_vocab_size = 154880 if full_model else 4096
+        args.linear_key_head_dim = args.linear_value_head_dim = 128
+        args.linear_num_key_heads = args.linear_num_value_heads = 64 if full_model else 8
+        args.linear_conv_kernel_dim = 4
+        args.kda_two_stage_gates = True
+        args.dsa_indexer_kpool = 4
+        args.dsa_indexer_topk = 2048 if full_model else 128
+        args.dsa_indexer_kpool_always_select_tail = tail
+        args.dsa_indexer_n_heads = 32 if full_model else 8
+        args.dsa_indexer_head_dim = 128
+        args.mtp_num_layers = 1
+        if full_model:
+            main = pattern.split('/')[0]
+            assert (
+                len(main),
+                main.count('K'),
+                main.count('D'),
+                main.count('-'),
+                main.count('E'),
+            ) == (90, 34, 11, 3, 42)
+        batch_size = 2 if full_model else 8
+        assert num_floating_point_operations(args, batch_size) == pytest.approx(
+            _glm53_flops_golden(args, batch_size), rel=1e-12, abs=0
+        )
+        # Packed aggregates deliberately retain the documented length-weighted
+        # approximation; they are not claimed to identify exact document pools.
+        assert num_floating_point_operations(
+            args,
+            batch_size,
+            total_real_tokens_in_batch=batch_size * length,
+            seqlen_squared_sum_in_batch=batch_size * length**2,
+        ) == num_floating_point_operations(args, batch_size)
+
+    def test_indexer_uses_physical_main_and_mtp_layer_numbers(self, monkeypatch):
+        args = _as_dsa_hybrid(_make_dsa_args(0.0), 'K-DE|DE/DE/DE')
+        args.dsa_indexer_topk_freq = 4
+        args.mtp_num_layers = 2
+        counts = []
+        original = training_module._dsa_indexer_flops
+
+        def capture(**kwargs):
+            counts.append(kwargs['num_indexer_layers'])
+            return original(**kwargs)
+
+        monkeypatch.setattr(training_module, '_dsa_indexer_flops', capture)
+        # D positions 3, 5, 7, 7; frequency four executes only position 5.
+        # Wrong inner-MTP numbering would execute positions 1,1 and give 3.
+        num_floating_point_operations(args, 2)
+        assert counts == [1]
+
+    @pytest.mark.parametrize('pool,topk,loss', ((0, 8, 0.0), (4, 6, 0.0), (4, 8, 0.1)))
+    def test_invalid_kpool_is_not_silently_estimated(self, pool, topk, loss):
+        args = _as_dsa_hybrid(_make_dsa_args(loss), 'D-')
+        args.dsa_indexer_kpool = pool
+        args.dsa_indexer_topk = topk
+        with pytest.raises(ValueError):
+            num_floating_point_operations(args, 2)
+
+    @pytest.mark.parametrize('hybrid', (False, True))
+    def test_two_stage_kda_projection_delta(self, hybrid):
+        args = _make_kda_hybrid_args()
+        if not hybrid:
+            args.hybrid_layer_pattern = None
+            args.num_layers = 1
+            args.experimental_attention_variant = 'kda'
+            args.linear_attention_freq = [1]
+        direct = num_floating_point_operations(args, 2)
+        args.kda_two_stage_gates = True
+        two_stage = num_floating_point_operations(args, 2)
+        h, d, heads = args.hidden_size, args.linear_key_head_dim, args.linear_num_key_heads
+        channels = d * heads
+        projection_delta = 2 * h * d + 2 * d * channels - 2 * h * channels
+        assert two_stage - direct == 6 * (2 * args.seq_length) * projection_delta
