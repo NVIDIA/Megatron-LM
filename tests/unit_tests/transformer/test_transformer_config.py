@@ -53,6 +53,33 @@ def test_mhc_fused_backend_defaults_to_auto():
     assert config.mhc_fused_backend == "auto"
 
 
+def _make_dsa_kpool_config(**overrides) -> TransformerConfig:
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        experimental_attention_variant="dsa",
+        add_bias_linear=False,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("kpool", [0, -1])
+def test_dsa_kpool_requires_positive_pool_size(kpool):
+    with pytest.raises(ValueError, match="dsa_indexer_kpool must be positive"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=kpool)
+
+
+def test_dsa_kpool_requires_divisible_topk():
+    with pytest.raises(ValueError, match="dsa_indexer_topk must be divisible"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=4, dsa_indexer_topk=6)
+
+
+def test_dsa_kpool_requires_topk():
+    with pytest.raises(ValueError, match="dsa_indexer_topk must be set"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=4)
+
+
 @pytest.mark.parametrize("backend", ["native", "triton", "cutile"])
 def test_mhc_fused_backend_accepts_explicit_policy(backend: str):
     config = TransformerConfig(
@@ -190,8 +217,8 @@ def test_attn_logit_softcapping_rejects_invalid_values(softcap):
         pytest.param(
             {"num_moe_experts": 2, "moe_shortcut_connection": True, "cuda_graph_impl": "local"},
             AssertionError,
-            "CUDA graphs are not supported",
-            id="cuda-graphs",
+            "supports CUDA graphs only",
+            id="cuda-graphs-layer-scope",
         ),
     ],
 )
@@ -205,6 +232,22 @@ def test_shortcut_rejects_incompatible_configurations(overrides, error, message)
             moe_router_pre_softmax=True,
             **overrides,
         )
+
+
+def test_shortcut_accepts_local_block_cuda_graphs():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_shortcut_connection=True,
+        cuda_graph_impl="local",
+        inference_cuda_graph_scope="block",
+    )
+    assert config.cuda_graph_impl == "local"
+    assert config.inference_cuda_graph_scope.name == "block"
 
 
 def _make_shortcut_memory_config(**overrides):
