@@ -483,10 +483,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:
-                assert not self.enable_prefix_caching, (
-                    "batch_invariant_mode does not support Mamba prefix caching; "
-                    "set enable_prefix_caching=False."
-                )
+                if self.enable_prefix_caching:
+                    assert inference_config.block_size_tokens % self.ssm_chunk_alignment == 0, (
+                        "batch-invariant Mamba prefix caching requires block_size_tokens "
+                        "to be a multiple of ssm_chunk_alignment so restored states "
+                        "start at the same scan boundary as uncached prefill."
+                    )
                 assert self.num_speculative_tokens == 0, (
                     "batch_invariant_mode for Mamba dynamic inference only supports "
                     "one-token decode; set num_speculative_tokens=0."

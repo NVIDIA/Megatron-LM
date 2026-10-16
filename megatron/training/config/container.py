@@ -43,19 +43,39 @@ class ConfigContainerBase:
     """
     Configuration container base class for Megatron configurations.
 
-    Provides sub-config validation and YAML/Dict serialization and deserialization.
+    Provides validation, runtime finalization, and YAML/Dict serialization.
     """
 
+    _finalized: bool = field(default=False, init=False, repr=False, compare=False)
+
     def validate(self) -> None:
-        """Run each sub-config's explicit validation before runtime initialization."""
-        rng = getattr(self, "rng", None)
-        if rng is not None:
-            rng.finalize_model_config(getattr(self, "model", None))
+        """Check sub-configs without mutation; callers may validate repeatedly."""
         for config_field in dataclass_fields(self):
             config = getattr(self, config_field.name)
             validate = getattr(config, "validate", None)
             if callable(validate):
                 validate()
+
+    def finalize(self) -> None:
+        """Validate and apply runtime derivations once, before runtime initialization.
+
+        Called by ``initialize_megatron``, not by configuration-editing code.
+        Re-entering initialization (e.g. an in-process restart) does not apply the
+        derivations again. After finalization, treat layout and RNG policy as fixed;
+        create a new container for a differently configured run. The lifecycle flag
+        is private and is not saved in YAML/checkpoint configuration metadata.
+        """
+        if self._finalized:
+            return
+        self.validate()
+        self._finalize()
+        self._finalized = True
+
+    def _finalize(self) -> None:
+        """Apply shared runtime derivations after all validation has succeeded."""
+        rng = getattr(self, "rng", None)
+        if rng is not None:
+            rng.finalize_model_config(getattr(self, "model", None))
     
     @classmethod
     def from_dict(
@@ -273,6 +293,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
+        self.rl.validate_ddp_config(self.ddp)
         super().validate()
         transformer = getattr(self.model, "transformer", None)
         cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
@@ -285,6 +306,11 @@ class PretrainConfigContainer(ConfigContainerBase):
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
         )
+
+    def _finalize(self) -> None:
+        super()._finalize()
+        if self.rl.perform_rl_step:
+            self.rl.finalize_ddp_config(self.ddp)
 
 
 @dataclass(kw_only=True)

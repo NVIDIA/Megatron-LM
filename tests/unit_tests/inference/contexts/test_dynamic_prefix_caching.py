@@ -1175,32 +1175,38 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert _m2.effective_prefill_chunk_length == len(p2)
 
     @pytest.mark.internal
+    def test_batch_invariant_mamba_prefix_cache_alignment(self):
+        ctx = self._mctx(batch_invariant_mode=True)
+        assert ctx.enable_prefix_caching
+        assert ctx.mamba_slot_allocator is not None
+        with pytest.raises(AssertionError, match="multiple of ssm_chunk_alignment"):
+            self._mctx(batch_invariant_mode=True, block_size_tokens=32)
+
+    @pytest.mark.internal
+    def test_batch_invariant_mamba_cached_suffix_uses_compute_budget(self):
+        ctx = self._mctx(batch_invariant_mode=True, enable_chunked_prefill=True)
+        engine = _StubEngine(ctx, enable_chunked_prefill=True)
+        # A warm 512-token prefix of a 600-token prompt leaves only 88 tokens to
+        # compute. The old scheduler rounded the full 600 down against the 88-token
+        # budget to zero and could never admit the request.
+        assert engine._mamba_batch_invariant_prefill_chunk_length(600 - 512, 88) == 88
+        assert engine._mamba_batch_invariant_prefill_chunk_length(1025 - 512, 512) == 384
+        assert engine._mamba_batch_invariant_prefill_chunk_length(1025 - 512, 100) == 0
+
+    @pytest.mark.internal
     def test_batch_invariant_mamba_chunked_prefill_scheduler_alignment(self):
         ctx = self._mctx(
             block_size_tokens=32, batch_invariant_mode=True, enable_prefix_caching=False
         )
         engine = _StubEngine(ctx, enable_chunked_prefill=True)
-        req = self._req(ctx, self._prompt(500), enable_prefix_caching=False)
+        chunk = ctx.mamba_chunk_size
 
-        assert engine._mamba_batch_invariant_prefill_chunk_length(req, 300) == 256
-        assert engine._mamba_batch_invariant_prefill_chunk_length(req, 100) == 0
-
-        short_req = self._req(ctx, self._prompt(200), request_id=2, enable_prefix_caching=False)
-        assert engine._mamba_batch_invariant_prefill_chunk_length(short_req, 300) == 200
-
-        one_left_req = self._req(
-            ctx, self._prompt(ctx.mamba_chunk_size + 1), request_id=3, enable_prefix_caching=False
-        )
-        assert (
-            engine._mamba_batch_invariant_prefill_chunk_length(one_left_req, ctx.mamba_chunk_size)
-            == 0
-        )
-        assert (
-            engine._mamba_batch_invariant_prefill_chunk_length(
-                one_left_req, ctx.mamba_chunk_size + 1
-            )
-            == ctx.mamba_chunk_size + 1
-        )
+        assert engine._mamba_batch_invariant_prefill_chunk_length(500, 300) == 256
+        assert engine._mamba_batch_invariant_prefill_chunk_length(500, 100) == 0
+        assert engine._mamba_batch_invariant_prefill_chunk_length(200, 300) == 200
+        # Never leave a single prompt token for the final call.
+        assert engine._mamba_batch_invariant_prefill_chunk_length(chunk + 1, chunk) == 0
+        assert engine._mamba_batch_invariant_prefill_chunk_length(chunk + 1, chunk + 1) == chunk + 1
 
         with pytest.raises(AssertionError, match="max_tokens > ssm_chunk_alignment"):
             self._mctx(
@@ -1210,9 +1216,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
                 max_tokens=ctx.mamba_chunk_size,
                 max_requests=64,
             )
-
-        with pytest.raises(AssertionError, match="does not support Mamba prefix caching"):
-            self._mctx(batch_invariant_mode=True)
 
     @pytest.mark.internal
     def test_mamba_intermediate_offsets(self):

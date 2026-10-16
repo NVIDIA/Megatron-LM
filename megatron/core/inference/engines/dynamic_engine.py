@@ -425,6 +425,29 @@ def _cuda_graph_mempool_bytes() -> Tuple[int, int]:
     return reserved, allocated
 
 
+def _slice_merged_segments(segments, attr: str, start: int, end: int) -> list:
+    """Slice `attr` over the concatenation of request checkpoint segments.
+
+    Equivalent to `merged[start:end]` where `merged` is the per-attribute
+    concatenation produced by `DynamicInferenceRequestRecord.merge()`, without
+    materializing the full merged list.
+    """
+    if len(segments) == 1:
+        return list((getattr(segments[0], attr, None) or [])[start:end])
+    out = []
+    offset = 0
+    for segment in segments:
+        values = getattr(segment, attr, None) or []
+        seg_start = max(start - offset, 0)
+        seg_end = min(end - offset, len(values))
+        if seg_start < seg_end:
+            out.extend(values[seg_start:seg_end])
+        offset += len(values)
+        if offset >= end:
+            break
+    return out
+
+
 @dataclass(kw_only=True)
 class RequestEntry:
     """Entry in the engine's `self.requests` dict."""
@@ -3396,15 +3419,14 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
-    def _mamba_batch_invariant_prefill_chunk_length(
-        self, req: DynamicInferenceRequest, capacity: int
-    ) -> int:
-        """Raw prefill length that computes an aligned chunk within `capacity`.
+    def _mamba_batch_invariant_prefill_chunk_length(self, remaining: int, capacity: int) -> int:
+        """Number of prompt tokens to compute this step, at most `capacity`.
 
-        Non-final calls must start and end at SSM chunk boundaries. The final
-        prompt call may be shorter because it seeds the decode replay tail.
+        `remaining` counts the prompt tokens still to compute (excluding any
+        cached prefix). Non-final calls must start and end at SSM chunk
+        boundaries. The final prompt call may be shorter because it seeds the
+        decode replay tail.
         """
-        remaining = len(req.remaining_prompt_tokens)
         if capacity >= remaining:
             return remaining
 
@@ -3725,14 +3747,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     computed_chunk = computed_budget
 
                 if batch_invariant_mamba_prefill:
-                    prefill_chunk_length = self._mamba_batch_invariant_prefill_chunk_length(
-                        req, computed_chunk
+                    computed_chunk = self._mamba_batch_invariant_prefill_chunk_length(
+                        remaining_len - prefix_skip, computed_chunk
                     )
-                    if prefill_chunk_length == 0:
+                    if computed_chunk == 0:
                         can_schedule = False
                         break
-                else:
-                    prefill_chunk_length = prefix_skip + computed_chunk
+                prefill_chunk_length = prefix_skip + computed_chunk
 
                 # Mamba prefix caching: keep chunk boundaries block-aligned.
                 # compute_and_store_offsets() records a recurrent-state snapshot at a
@@ -3927,15 +3948,25 @@ class DynamicInferenceEngine(AbstractEngine):
         return result, context_state, step_time
 
     def _try_send_streaming_partials(self) -> None:
-        """Send pending token deltas to the inference coordinator."""
+        """Send pending token deltas to the inference coordinator.
+
+        Stream offsets (`_partial_emit_lengths`) are indexed in the coordinates
+        of `record.merge()`, i.e. across all checkpoint segments of a request.
+        When a request is evicted or recomputed after a suspend,
+        `DynamicInferenceRequestRecord.checkpoint()` appends a new segment whose
+        prompt includes the earlier generations and whose `generated_tokens`
+        restart at 0, so the latest segment alone cannot be indexed by the
+        stream offset.
+        """
         partials: list = []
         emit_lengths: Dict[int, int] = {}
         for rid, entry in self.requests.items():
-            request = entry.record[-1]
+            segments = list(entry.record)
+            request = segments[-1]
             if not getattr(request.sampling_params, "streaming", False):
                 continue
             already = self._partial_emit_lengths.get(rid, 0)
-            total = len(request.generated_tokens)
+            total = sum(len(segment.generated_tokens) for segment in segments)
             stop_word_ids = getattr(request, "stop_word_ids", None)
             holdback = 0
             if stop_word_ids and not getattr(
@@ -3945,21 +3976,24 @@ class DynamicInferenceEngine(AbstractEngine):
             emit_end = max(already, total - holdback)
             streaming_interval = getattr(request.sampling_params, "streaming_interval", 1)
             if emit_end - already >= streaming_interval:
-                new_tokens = list(request.generated_tokens[already:emit_end])
+                new_tokens = _slice_merged_segments(segments, "generated_tokens", already, emit_end)
                 partial = {"request_id": rid, "new_tokens": new_tokens}
                 if request.sampling_params.return_log_probs:
-                    partial["new_log_probs"] = list(
-                        (request.generated_log_probs or [])[already:emit_end]
+                    partial["new_log_probs"] = _slice_merged_segments(
+                        segments, "generated_log_probs", already, emit_end
                     )
-                    partial["new_top_n_logprobs"] = list(
-                        (getattr(request, "generated_top_n_logprobs", None) or [])[already:]
+                    partial["new_top_n_logprobs"] = _slice_merged_segments(
+                        segments, "generated_top_n_logprobs", already, emit_end
                     )
                     if already == 0 and not request.sampling_params.skip_prompt_log_probs:
+                        # Prompt log probs belong to the original prompt (first
+                        # segment), matching `record.merge()`.
+                        first_request = segments[0]
                         partial["prompt_log_probs"] = list(
-                            getattr(request, "prompt_log_probs", None) or []
+                            getattr(first_request, "prompt_log_probs", None) or []
                         )
                         partial["prompt_top_n_logprobs"] = list(
-                            getattr(request, "prompt_top_n_logprobs", None) or []
+                            getattr(first_request, "prompt_top_n_logprobs", None) or []
                         )
                 partials.append(partial)
                 emit_lengths[rid] = emit_end

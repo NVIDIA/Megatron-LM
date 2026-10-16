@@ -582,6 +582,9 @@ def _log_softmax_batch_invariant(input, dim, _half_to_float):
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
     """Batch-invariant replacement for `aten::mean.dim` over one or more dimensions."""
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
+    # A full reduction (`x.mean()`, `torch.mean(x)`) arrives with an empty dim list.
+    if dim is None or len(dim) == 0:
+        dim = list(range(input.ndim))
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
     else:

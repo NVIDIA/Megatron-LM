@@ -42,7 +42,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
-from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
@@ -2746,6 +2746,89 @@ def test_streaming_partials_buffer_until_token_interval():
     assert engine._partial_emit_lengths == {7: 3}
 
 
+def _collect_streamed_partials(engine, streamed):
+    """Run `_try_send_streaming_partials` and accumulate its frames per request id."""
+    engine.socket_for_receiving_requests.send_multipart.reset_mock()
+    engine._try_send_streaming_partials()
+    for call in engine.socket_for_receiving_requests.send_multipart.call_args_list:
+        for frame in call.args[0][1:]:
+            partial = msgpack.unpackb(frame, raw=False)
+            out = streamed.setdefault(
+                partial["request_id"], {"tokens": [], "log_probs": [], "top_n": []}
+            )
+            out["tokens"].extend(partial["new_tokens"])
+            out["log_probs"].extend(partial.get("new_log_probs", []))
+            out["top_n"].extend(partial.get("new_top_n_logprobs", []))
+
+
+@pytest.mark.parametrize("streaming_interval", [1, 3])
+@pytest.mark.parametrize("stop_word_holdback", [False, True])
+def test_streaming_partials_continue_across_checkpoint(streaming_interval, stop_word_holdback):
+    """Streaming must stay aligned with `record.merge()` across an eviction checkpoint.
+
+    Eviction (and recompute on suspend) calls `record.checkpoint()`, which appends
+    a new segment whose prompt absorbs the earlier generations and whose
+    `generated_tokens` restart at 0. The stream offset is tracked over the whole
+    record, so indexing only the latest segment with it skips the first
+    `already` tokens generated after the resume.
+    """
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._partial_emit_lengths = {}
+    engine.socket_for_receiving_requests = mock.Mock()
+
+    request = DynamicInferenceRequest(
+        request_id=7,
+        prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=21,
+            termination_id=-1,
+            streaming=True,
+            streaming_interval=streaming_interval,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+        ),
+        stop_word_ids=[[900, 901, 902]] if stop_word_holdback else None,
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    engine.requests = {7: RequestEntry(record=record, future=None)}
+
+    def generate(token):
+        segment = record[-1]
+        segment.generated_tokens.append(token)
+        if segment.generated_log_probs is None:
+            segment.generated_log_probs = []
+            segment.generated_top_n_logprobs = []
+        segment.generated_log_probs.append(-token / 100.0)
+        segment.generated_top_n_logprobs.append({str(token): -token / 100.0})
+
+    streamed = {}
+    next_token = 100
+    # Two evictions: 5 tokens, then 4 (fewer than already streamed), then 12.
+    segment_lengths = (5, 4, 12)
+    for segment_length in segment_lengths:
+        for _ in range(segment_length):
+            generate(next_token)
+            next_token += 1
+            _collect_streamed_partials(engine, streamed)
+        if segment_length != segment_lengths[-1]:
+            record.checkpoint()
+            # Nothing new to send right after a checkpoint.
+            _collect_streamed_partials(engine, streamed)
+
+    merged = record.merge()
+    assert len(record.requests) == 3
+    assert merged.generated_tokens == list(range(100, 121))
+    out = streamed[7]
+    sent = len(out["tokens"])
+    assert out["tokens"] == merged.generated_tokens[:sent]
+    # Holdback / interval may keep a tail unsent; the final reply carries it.
+    holdback = 2 if stop_word_holdback else 0
+    assert sent >= len(merged.generated_tokens) - holdback - (streaming_interval - 1)
+    assert sent == engine._partial_emit_lengths[7]
+    assert out["log_probs"] == merged.generated_log_probs[:sent]
+    assert out["top_n"] == merged.generated_top_n_logprobs[:sent]
+
+
 def _generated_event_tokens(request):
     return [
         event.payload["token_id"]
@@ -3346,6 +3429,102 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert allocator.pool_avail == allocator.pool_size - 1
         assert context.total_request_count == 0
         assert context.paused_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_streaming_partials_match_merged_record_after_eviction(self) -> None:
+        """Streamed token/logprob deltas equal `record.merge()` for evicted requests.
+
+        A KV pool too small for all requests with no paused-block budget forces
+        evictions. An evicted request resumes as a new record segment whose
+        `generated_tokens` restart at 0, while its stream offset is already
+        non-zero; the stream must continue from the merged position instead of
+        skipping (or stalling on) tokens generated after the resume.
+        """
+        num_requests = 8
+        prompt_length = 256
+        num_tokens_to_generate = 48
+        block_size_tokens = 256
+        pool_block_count = 6
+
+        probe_env = self._build_test_env(DynamicEngineTestConfig())
+        block_size_bytes = probe_env.engine.context.block_size_bytes
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=num_requests,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=num_tokens_to_generate,
+            context_block_size_tokens=block_size_tokens,
+            context_buffer_size_gb=(pool_block_count * block_size_bytes + 1) / 1024**3,
+            context_paused_buffer_size_gb=0.0,
+            context_max_requests=num_requests,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        context = engine.context
+        vocab_size = test_config.vocab_size
+
+        # Deterministic, position-dependent tokens (next = input + 1) so a skipped
+        # or repeated token changes the streamed sequence, not just its length.
+        def mock_increment_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            logits = torch.zeros(
+                *tokens.shape, vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            next_tokens = (tokens + 1) % (vocab_size - 1)
+            logits.scatter_(-1, next_tokens.unsqueeze(-1), 100.0)
+            if test_config.materialize_only_last_token_logits:
+                logits = context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        engine.controller.inference_wrapped_model.model.forward = mock_increment_forward
+
+        for request in env.requests:
+            request.sampling_params.termination_id = -1
+            request.sampling_params.streaming = True
+            engine._add_request(request)
+
+        # Mirror the coordinator branch of `async_bookkeep`: drop finished
+        # requests' offsets, then stream deltas for the remaining requests.
+        engine._partial_emit_lengths = {}
+        engine.socket_for_receiving_requests = mock.Mock()
+        streamed = {}
+        segments_seen = {}
+        finished_requests = []
+        for _ in range(4000):
+            if not engine.has_unfinished_requests():
+                break
+            step_finished = engine.step_modern()["finished_requests"]
+            finished_requests.extend(step_finished)
+            for request in step_finished:
+                engine._partial_emit_lengths.pop(request.request_id, None)
+            for rid, entry in engine.requests.items():
+                segments_seen[rid] = max(segments_seen.get(rid, 1), len(entry.record.requests))
+            _collect_streamed_partials(engine, streamed)
+
+        assert not engine.has_unfinished_requests()
+        assert engine.evicted_request_count > 0, "no request was evicted"
+        assert len(finished_requests) == num_requests
+
+        resumed_and_streamed = 0
+        for request in finished_requests:
+            assert len(request.generated_tokens) == num_tokens_to_generate
+            out = streamed.get(request.request_id, {"tokens": [], "log_probs": []})
+            sent = len(out["tokens"])
+            assert out["tokens"] == request.generated_tokens[:sent], request.request_id
+            assert out["log_probs"] == request.generated_log_probs[:sent], request.request_id
+            # Only the final step's token(s) may be left to the final reply.
+            assert sent >= num_tokens_to_generate - 1, (request.request_id, sent)
+            if segments_seen.get(request.request_id, 1) > 1:
+                resumed_and_streamed += 1
+        assert resumed_and_streamed > 0, "no evicted request streamed after resuming"
         assert context.active_token_count == 0
 
     @pytest.mark.internal
