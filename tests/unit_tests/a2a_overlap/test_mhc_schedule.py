@@ -17,6 +17,7 @@ from megatron.core.tensor_parallel.random import (
     MHCCheckpointManager,
     initialize_rng_tracker,
 )
+from megatron.core.transformer.cuda_graphs import set_current_microbatch
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -579,7 +580,6 @@ class TestMhcA2AOverlapNumerics:
                 layer.config.cuda_graph_impl = "transformer_engine"
                 layer.config.cuda_graph_modules = [CudaGraphModule.attn]
                 layer.config.mhc_recompute_attn_cuda_graph_split = split_switch
-                layer.set_te_cuda_graph_backward_dw_wrapper = lambda: None
 
                 def _record(*args, **kwargs):
                     recorded.append(kwargs)
@@ -590,10 +590,18 @@ class TestMhcA2AOverlapNumerics:
             padding_mask = torch.ones_like(data["input_ids"], dtype=torch.bool)
             padding_mask[:, -4:] = False
             plan = model.build_schedule_plan(**data, padding_mask=padding_mask)
+            # Direct schedule execution bypasses the pipeline forward step, which
+            # normally initializes the microbatch used by the graphed DW callback.
+            set_current_microbatch(model, 0)
             with pytest.raises(_StopAfterRecord):
                 TransformerModelChunkSchedulePlan.run(plan, None)
 
         assert recorded, "the CUDA-graph replay entry point was never reached"
+        replay_layer = model.decoder.layers[0]
+        replay_dw = replay_layer.backward_dw_wrapper.graphed_backward_dw_callable
+        assert replay_dw is not None
+        assert replay_dw.func == replay_layer._te_cuda_graph_backward_dw_graph
+        assert replay_dw.args == (0,)
         assert "padding_mask" in recorded[0], (
             "the schedule must forward padding_mask to the attention-only CUDA-graph "
             "replay; without it the graphed routing tail silently drifts from eager "
