@@ -63,7 +63,7 @@ from megatron.training.global_vars import get_run_config, get_tokenizer, get_tra
 from megatron.training.utils.checkpoint_utils import get_checkpoint_train_state_filename
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
-from . import ft_integration, wandb_utils
+from . import ft_integration
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
@@ -1248,22 +1248,6 @@ def save_checkpoint(
             async_save_request.add_finalize_fn(onelogger_finalize_fn)
         else:
             onelogger_finalize_fn()
-
-    # Additional callback for wandb (last rank)
-    if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized() or is_last_rank()
-    ):
-
-        def wandb_finalize_fn():
-            wandb_utils.on_save_checkpoint_success(
-                checkpoint_name, get_checkpoint_tracker_filename(save_dir), save_dir, iteration
-            )
-
-        if args.async_save:
-            assert async_save_request is not None
-            async_save_request.add_finalize_fn(wandb_finalize_fn)
-        else:
-            wandb_finalize_fn()
 
     # Conversion tools register an inference container, which has no RL section.
     rl_config = getattr(get_run_config(), "rl", None)
@@ -3463,10 +3447,6 @@ def load_checkpoint(
         f'p {_pp_r + 1}/{_pp_w} ] '
         f'at iteration {iteration}'
     )
-
-    # Additional callback for wandb (last rank)
-    if not torch.distributed.is_initialized() or is_last_rank():
-        wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
 
     torch.cuda.empty_cache()
 
