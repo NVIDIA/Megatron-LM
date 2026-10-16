@@ -310,6 +310,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             train_iters=self.train.train_iters,
             train_samples=self.train.train_samples,
             skip_train=self.validation.skip_train,
+            weight_decay=self.optimizer.weight_decay,
         )
 
     def _finalize(self) -> None:

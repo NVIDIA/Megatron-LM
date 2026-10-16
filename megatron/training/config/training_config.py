@@ -1,9 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+import os
 import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
-
-from megatron.training.utils import print_rank_0
 
 
 @dataclass(kw_only=True)
@@ -229,12 +229,6 @@ class SchedulerConfig:
     weight_decay_incr_style: Literal["constant", "linear", "cosine"] = "constant"
     """Weight decay increment function."""
 
-    no_weight_decay_cond_type: Literal["qwen3_next"] | None = None
-    """Type of no weight decay condition. Choices:
-    None (default): param no weight decay if and only if it is 1D; or it is bias;
-    or it is embedding and embedding_init_method_std is not None.
-    "qwen3_next": In addition to the default rules, apply weight decay to qk layernorm as a special case."""
-
     wd_incr_steps: int | None = field(init=False, default=None)
     """Number of samples to increment weight decay over. Calculated at runtime."""
 
@@ -247,8 +241,11 @@ class SchedulerConfig:
         train_iters: int | None,
         train_samples: int | None,
         skip_train: bool,
+        weight_decay: float | None,
     ) -> None:
         """Check this section against the rest of the run it belongs to."""
+        from megatron.training.utils import print_rank_0
+
         if train_iters and not skip_train:
             # If we use iteration-based training, make sure the
             # sample-based options are off.
@@ -277,22 +274,11 @@ class SchedulerConfig:
                     'can only specify one of lr-warmup-fraction ' \
                     'and lr-warmup-samples'
 
-        if self.no_weight_decay_cond_type is not None:
-            print_rank_0(
-                'WARNING: --no-weight-decay-cond-type is deprecated. Please use --apply-wd-to-qk-layernorm instead.',
-                args.rank,
-            )
-            if self.no_weight_decay_cond_type == "apply_wd_to_qk_layernorm":
-                self.apply_wd_to_qk_layernorm = True
-            else:
-                raise ValueError(f"Invalid no_weight_decay_cond_type: {self.no_weight_decay_cond_type}")
-            self.no_weight_decay_cond_type = None
-
         if self.weight_decay_incr_style == 'constant':
             assert self.start_weight_decay is None
             assert self.end_weight_decay is None
-            self.start_weight_decay = self.weight_decay
-            self.end_weight_decay = self.weight_decay
+            self.start_weight_decay = weight_decay
+            self.end_weight_decay = weight_decay
         else:
             assert self.start_weight_decay is not None
             assert self.end_weight_decay is not None
