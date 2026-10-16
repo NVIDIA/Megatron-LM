@@ -302,7 +302,7 @@ class _GDNBase(MegatronModule):
             groups=self.conv_dim_local_tp,
             padding=self.conv_kernel_dim - 1,
             device=torch.cuda.current_device(),
-            dtype=config.params_dtype,
+            dtype=(torch.float32 if getattr(self, "conv_in_fp32", False) else config.params_dtype),
         )
         setattr(self.conv1d.weight, "tensor_model_parallel", True)
         setattr(self.conv1d.weight, "partition_dim", 0)

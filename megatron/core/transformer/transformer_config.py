@@ -564,6 +564,21 @@ class TransformerConfig(ModelParallelConfig):
     """Force KDA projections to BF16 even under FP8 training,
     (KDA projections are BF16 in the checkpoint)."""
 
+    kda_conv_in_fp32: bool = False
+    """Retain KDA convolution weights in FP32, as official GLM5Next loading requires.
+    Convolution and SiLU accumulate before casting back to the activation dtype.
+    False preserves the existing projection-dtype convolution parameter contract.
+    """
+
+    kda_core_in_fp32: bool = False
+    """Run the GLM two-stage KDA core with FP32 Q/K/V/decay/beta storage.
+    Q/K normalization is external FP32 HF-style math when enabled; the FLA core
+    output is restored to activation dtype before gated output normalization.
+    This changes all recurrent-core intermediate dtypes, not only Q/K norms.
+    It does not select IEEE GEMMs or change global precision. Initial scope is
+    CP=1; False preserves the existing FLA dtype/normalization contract.
+    """
+
     kda_safe_gate: bool = False
     """Whether the KDA kernel should use bounded gate values."""
 
@@ -1740,6 +1755,14 @@ class TransformerConfig(ModelParallelConfig):
         super().__post_init__()
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
+
+        if not isinstance(self.kda_core_in_fp32, bool):
+            raise ValueError("kda_core_in_fp32 must be a bool.")
+        if self.kda_core_in_fp32:
+            if not self.kda_two_stage_gates:
+                raise ValueError("kda_core_in_fp32 requires kda_two_stage_gates=True.")
+            if self.context_parallel_size != 1:
+                raise ValueError("kda_core_in_fp32 currently supports CP=1 only.")
 
         # Imported lazily because the module-spec module imports TransformerConfig.
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -4747,6 +4770,13 @@ class TransformerConfig(ModelParallelConfig):
 
     def validate_kda(self) -> None:
         """Validate KDA-specific dimensions, including configs copied with from_config."""
+        if not isinstance(self.kda_core_in_fp32, bool):
+            raise ValueError("kda_core_in_fp32 must be a bool.")
+        if self.kda_core_in_fp32:
+            if not self.kda_two_stage_gates:
+                raise ValueError("kda_core_in_fp32 requires kda_two_stage_gates=True.")
+            if self.context_parallel_size != 1:
+                raise ValueError("kda_core_in_fp32 currently supports CP=1 only.")
         if self.gdn_conv_pad_alignment is not None and self.gdn_conv_pad_alignment <= 0:
             raise ValueError(
                 "gdn_conv_pad_alignment must be positive when set for KDA, got "

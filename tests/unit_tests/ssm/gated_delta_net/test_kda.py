@@ -195,6 +195,32 @@ def test_kda_two_stage_defaults_preserve_direct_gates():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
     assert config.kda_two_stage_gates is False
     assert config.kda_disable_fp8 is False
+    assert config.kda_conv_in_fp32 is False
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("conv_in_fp32", [False, True])
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_convolution_precision_survives_bf16_model_construction(conv_in_fp32, two_stage_gates):
+    """HF keeps convolution parameters FP32; the opt-out retains dev BF16 defaults."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(322)
+        config = replace(
+            _make_config(two_stage_gates=two_stage_gates), kda_conv_in_fp32=conv_in_fp32
+        )
+        layer = _build_kda(config)
+        expected_dtype = torch.float32 if conv_in_fp32 else torch.bfloat16
+        assert layer.conv1d.weight.dtype == expected_dtype
+        original = layer.conv1d.weight.detach().clone()
+        Float16Module(config, layer)
+        assert layer.in_proj.weight.dtype == torch.bfloat16
+        assert layer.conv1d.weight.dtype == expected_dtype
+        assert getattr(layer.conv1d.weight, "keep_in_fp32", False) is conv_in_fp32
+        torch.testing.assert_close(layer.conv1d.weight, original, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.internal
