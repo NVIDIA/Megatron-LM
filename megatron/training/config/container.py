@@ -285,6 +285,12 @@ class PretrainConfigContainer(ConfigContainerBase):
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
         )
+        self.optimizer.validate_run(
+            ddp_config=self.ddp,
+            moe_single_grouped_weight=self.model.moe_single_grouped_weight,
+            virtual_pipeline_model_parallel_size=self.model.virtual_pipeline_model_parallel_size,
+            use_dist_ckpt=self.checkpoint.use_dist_ckpt,
+        )
 
 
 @dataclass(kw_only=True)

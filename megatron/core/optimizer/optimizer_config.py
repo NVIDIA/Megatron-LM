@@ -7,7 +7,9 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 
-from ..utils import is_te_min_version
+from ..utils import is_te_min_version, warn_rank_0
+
+from megatron.core.distributed import DistributedDataParallelConfig
 
 
 @dataclass(frozen=True)
@@ -533,9 +535,7 @@ class OptimizerConfig:
     def validate_run(
         self,
         *,
-        use_megatron_fsdp: bool,
-        overlap_grad_reduce: bool,
-        use_torch_fsdp2: bool,
+        ddp_config: Optional[DistributedDataParallelConfig] = None,
         moe_single_grouped_weight: bool,
         virtual_pipeline_model_parallel_size: int | None,
         use_dist_ckpt: bool,
@@ -555,10 +555,10 @@ class OptimizerConfig:
             )
 
         if self.overlap_param_gather:
-            assert self.use_distributed_optimizer or use_megatron_fsdp \
+            assert self.use_distributed_optimizer or ddp_config.use_megatron_fsdp \
                 or self.optimizer == 'dist_muon', \
                 '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
-            assert overlap_grad_reduce, \
+            assert ddp_config.overlap_grad_reduce, \
                 'Must use --overlap-param-gather with --overlap-grad-reduce'
         
         if self.optimizer not in ('sgd', 'adam'):
@@ -587,7 +587,7 @@ class OptimizerConfig:
             )
 
         if self.use_distributed_optimizer:
-            assert not use_torch_fsdp2, \
+            assert not ddp_config.use_torch_fsdp2, \
                 "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
 
         if self.overlap_param_gather_with_optimizer_step:
@@ -603,7 +603,7 @@ class OptimizerConfig:
                 '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 
         if self.fp16:
-            assert not use_torch_fsdp2, \
+            assert not ddp_config.use_torch_fsdp2, \
                 '--use-torch-fsdp2 not supported with fp16 yet'
 
     def finalize_optimizer_config(self) -> None:
