@@ -480,6 +480,23 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
+    dsa_indexer_reuse_checkpoint_topk: bool = False
+    """Whether a recomputed DSA layer reuses the top-k selected by its checkpoint's first call.
+
+    The first call of a checkpointed top-k-computing layer runs without grad and skips the
+    indexer loss, so its replay reruns the dense indexer and top-k only to recover the
+    selected scores for that loss. When enabled, the first call also keeps the selected fp32
+    scores, ``[batch, sequence, dsa_indexer_topk]`` per computing layer per in-flight
+    microbatch, and the replay computes the sparse indexer loss from them. With a frozen
+    indexer (``dsa_indexer_loss_coeff`` <= 0 or unset) the replay needs no scores and none
+    are kept: it reuses the top-k selection that the first call published for cross-layer
+    sharing, and skips the indexer projections, the dense scoring and the top-k. Requires
+    ``dsa_kernel_backend='cudnn'``, the fused DSA kernels and cross-layer top-k sharing
+    (``dsa_indexer_topk_freq > 1``), plus the sparse indexer loss when the indexer loss is
+    on. Not supported with KPool selection (``dsa_indexer_kpool > 1``), nor for a frozen
+    indexer whose projections are quantized with ``fp8_recipe`` 'delayed' or 'custom' or
+    ``fp4_recipe`` 'custom'. Has no effect without full or ``core_attn`` recompute."""
+
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
     """Precision used only by the fused compact DSA indexer forward and Top-K."""
 
@@ -2715,6 +2732,73 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+            if self.dsa_indexer_reuse_checkpoint_topk:
+                from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                    use_fused_dsa_kernels,
+                )
+
+                if self.dsa_kernel_backend != "cudnn":
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk requires dsa_kernel_backend='cudnn', "
+                        f"got {self.dsa_kernel_backend!r}."
+                    )
+                if not use_fused_dsa_kernels(self):
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk requires the fused DSA kernels "
+                        "(attention_backend != unfused); otherwise the replay always reruns the "
+                        "dense indexer."
+                    )
+                if self.overlap_moe_expert_parallel_comm and self.recompute_granularity == "full":
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk does not support full recompute with "
+                        "overlap_moe_expert_parallel_comm: that schedule replays layers without "
+                        "the forward-sharing checkpoint wrapper, so no top-k can be reused."
+                    )
+                indexer_loss_on = (self.dsa_indexer_loss_coeff or 0.0) > 0
+                if indexer_loss_on and not self.dsa_indexer_use_sparse_loss:
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk with the indexer loss on "
+                        "(dsa_indexer_loss_coeff > 0) requires the sparse indexer loss: set "
+                        "dsa_indexer_use_sparse_loss=True, or dsa_indexer_loss_coeff=0 for a "
+                        "frozen indexer."
+                    )
+                # With the loss on, KPool is rejected below together with the indexer loss.
+                if not indexer_loss_on and self.dsa_indexer_kpool > 1:
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk does not support KPool selection "
+                        f"(dsa_indexer_kpool > 1), got dsa_indexer_kpool={self.dsa_indexer_kpool}."
+                    )
+                # TE keeps a per-module recompute stash for delayed scaling, which a custom
+                # recipe (FP8 or FP4) can also carry.
+                stateful_recipe = None
+                if self.fp8 and self.fp8_recipe in ("delayed", "custom"):
+                    stateful_recipe = f"fp8_recipe='{Fp8Recipe(self.fp8_recipe).value}'"
+                elif self.fp4 and self.fp4_recipe == "custom":
+                    stateful_recipe = "fp4_recipe='custom'"
+                if (
+                    not indexer_loss_on
+                    and stateful_recipe is not None
+                    and (
+                        self.dsa_indexer_qk_proj_use_quantization
+                        or self.dsa_indexer_weights_proj_use_quantization
+                    )
+                ):
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk with a frozen indexer "
+                        "(dsa_indexer_loss_coeff <= 0) does not support quantized indexer "
+                        f"projections with {stateful_recipe}: the replay skips those "
+                        "projections, so Transformer Engine's delayed-scaling recompute stash "
+                        "of their first call is never consumed. Use a recipe without delayed "
+                        "scaling (e.g. mxfp8), or disable "
+                        "dsa_indexer_qk_proj_use_quantization and "
+                        "dsa_indexer_weights_proj_use_quantization."
+                    )
+                if self.dsa_indexer_topk_freq <= 1:
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk reuses top-k through cross-layer "
+                        "sharing and requires dsa_indexer_topk_freq > 1, got "
+                        f"{self.dsa_indexer_topk_freq}."
+                    )
             if has_context_parallelism:
                 cp_comm_types = (
                     self.cp_comm_type

@@ -2254,6 +2254,175 @@ def run_fused_qk_topk_with_loss(
     )
 
 
+def _sparse_indexer_loss_layout_supported(
+    q: Tensor, query: Optional[Tensor], key: Optional[Tensor], config
+) -> bool:
+    """Whether ``run_sparse_indexer_loss_from_topk`` can consume this attention layout."""
+    if query is None or key is None or query.ndim != 4 or key.ndim != 4 or key.size(2) != 1:
+        return False
+    if query.size(0) != q.size(0) or query.size(1) != q.size(1) or key.size(1) != q.size(1):
+        return False
+    if query.size(3) != key.size(3):
+        return False
+    latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
+    return (
+        latent_v_channels > 0
+        and _supports_flash_mla_value_layout(key.size(-1), latent_v_channels)
+        and _flash_mla_supports_head_count(query)
+    )
+
+
+def run_fused_qk_topk_with_scores(
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    index_topk: int,
+    starts: Tensor,
+    ends: Tensor,
+    block_size: int,
+    use_relu: bool = True,
+    use_local_indexer_varlen: bool = False,
+    single_packed_thd_sequence: bool = False,
+    local_packed_cp_rank: int = 0,
+    local_packed_cp_query_start: int = 0,
+    local_packed_cp_query_len: Optional[int] = None,
+    packed_seq_params: Optional["PackedSeqParams"] = None,
+    cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
+    packed_thd_causal_identity_layout: Optional[bool] = None,
+    packed_thd_single_sequence: Optional[bool] = None,
+    deterministic: bool = False,
+    query: Optional[Tensor] = None,
+    key: Optional[Tensor] = None,
+    config: Optional["TransformerConfig"] = None,
+) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+    """Run the cuDNN fused indexer and return index-sorted top-k plus aligned scores.
+
+    The indices and lengths have the same index-sorted prefix layout as
+    ``run_fused_qk_topk``. The fp32 scores are the selected indexer logits in the same
+    slots, which ``run_sparse_indexer_loss_from_topk`` consumes in a checkpoint replay.
+    Declines when that replay could not consume the attention ``query``/``key`` layout,
+    so no scores are kept for nothing.
+    """
+    if not _sparse_indexer_loss_layout_supported(q, query, key, config):
+        return None
+    use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        packed_thd_causal_identity_layout=packed_thd_causal_identity_layout,
+        packed_thd_single_sequence=packed_thd_single_sequence,
+    )
+    _assert_supported_indexer_scoring(use_relu)
+    del block_size
+    if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
+        return None
+    if q.size(0) != weights.size(0) or q.size(1) != k.size(1) or q.size(1) != weights.size(1):
+        return None
+    if q.size(2) != weights.size(2) or q.size(3) != k.size(2):
+        return None
+    if starts is None or ends is None:
+        return None
+
+    packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q, packed_max_seqlen_k = (
+        _get_packed_thd_metadata(use_local_indexer_varlen, packed_seq_params)
+    )
+    q_bshd, k_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q, k, weights)
+    topk_indices, topk_length, topk_scores = _indexer_topk_bshd(
+        q_bshd,
+        k_bsd,
+        w_bsh,
+        index_topk,
+        varlen_starts=starts,
+        varlen_ends=ends,
+        key_positions=None,
+        return_scores=False,
+        return_topk_scores=True,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        local_packed_cp_rank=local_packed_cp_rank,
+        local_packed_cp_query_start=local_packed_cp_query_start,
+        local_packed_cp_query_len=local_packed_cp_query_len,
+        packed_cu_seqlens_q=packed_cu_seqlens_q,
+        packed_cu_seqlens_k=packed_cu_seqlens_k,
+        packed_max_seqlen_q=packed_max_seqlen_q,
+        packed_max_seqlen_k=packed_max_seqlen_k,
+        packed_cp_size=cp_size,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+        deterministic=deterministic,
+    )
+    if topk_scores is None:
+        return None
+    topk_indices, topk_scores = _sort_valid_topk_indices_and_scores_by_index(
+        topk_indices, topk_scores, topk_length, k_bsd.size(1)
+    )
+    return topk_indices.int().contiguous(), topk_length, topk_scores.contiguous()
+
+
+def run_sparse_indexer_loss_from_topk(
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    topk_indices: Tensor,
+    topk_length: Tensor,
+    topk_scores: Tensor,
+    query: Tensor,
+    key: Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    pg_collection: "ProcessGroupCollection",
+    query_valid_rows: Optional[Tensor] = None,
+    calculate_per_token_loss: bool = False,
+    config: Optional["TransformerConfig"] = None,
+    deterministic: bool = False,
+) -> Optional[Tensor]:
+    """Run the cuDNN sparse indexer loss for top-k selected by an earlier call.
+
+    ``topk_indices``/``topk_length``/``topk_scores`` must come from
+    ``run_fused_qk_topk_with_scores`` on the same layer inputs.
+    """
+    tp_group = getattr(pg_collection, "tp", None)
+    if loss_coeff <= 0:
+        return None
+    if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
+        return None
+    if q.size(0) != weights.size(0) or q.size(1) != k.size(1) or q.size(1) != weights.size(1):
+        return None
+    if q.size(2) != weights.size(2) or q.size(3) != k.size(2):
+        return None
+    if not _sparse_indexer_loss_layout_supported(q, query, key, config):
+        return None
+    batch, rows = q.size(1), q.size(0)
+    if topk_indices.ndim != 3 or tuple(topk_indices.shape[:2]) != (batch, rows):
+        return None
+    if topk_scores.shape != topk_indices.shape or topk_scores.dtype != torch.float32:
+        return None
+    if tuple(topk_length.shape) != (batch, rows):
+        return None
+
+    latent_v_channels = int(config.kv_lora_rank)
+    return SparseIndexerLossFromTopKFunc.apply(
+        q.contiguous(),
+        k.contiguous(),
+        weights.contiguous(),
+        query.contiguous(),
+        key.squeeze(2).contiguous(),
+        topk_indices,
+        topk_length,
+        topk_scores,
+        softmax_scale,
+        loss_coeff,
+        calculate_per_token_loss,
+        latent_v_channels,
+        query_valid_rows,
+        tp_group,
+        bool(
+            deterministic
+            or getattr(config, "deterministic_mode", False)
+            or torch.are_deterministic_algorithms_enabled()
+        ),
+    )
+
+
 def _all_reduce_tp_target(target: Tensor, tp_group) -> Tensor:
     """Sum a local attention target across TP ranks when TP is enabled."""
     if get_pg_size(tp_group) > 1:
@@ -2890,6 +3059,54 @@ def _compute_sparse_indexer_loss_and_grads(
     )
 
 
+def _sparse_indexer_loss_and_grads_for_selected_topk(
+    *,
+    q_idx_bshd: Tensor,
+    k_idx_bsd: Tensor,
+    w_bsh: Tensor,
+    topk_indices_cmp: Tensor,
+    topk_length_cmp: Tensor,
+    topk_scores: Tensor,
+    topk_indices_attn: Tensor,
+    topk_length_attn: Tensor,
+    query: Tensor,
+    kv_full: Tensor,
+    softmax_scale: float,
+    d_v: int,
+    loss_coeff: float,
+    query_valid_rows: Optional[Tensor],
+    calculate_per_token_loss: bool,
+    tp_group,
+    deterministic: bool,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Sparse indexer loss and precomputed gradients for an already selected top-k set.
+
+    FlashMLA returns only the output and LSE, so the attention target needs one
+    sparse-attention forward over the attention-ordered indices for its LSE. The loss
+    then reads the indexer scores aligned with ``topk_indices_cmp``.
+    """
+    _out_flat, lse, *_ = _run_sparse_attention_forward(
+        query, kv_full, topk_indices_attn, softmax_scale, d_v, topk_length=topk_length_attn
+    )
+    return _compute_sparse_indexer_loss_and_grads(
+        q_idx_bshd=q_idx_bshd,
+        k_idx_bsd=k_idx_bsd,
+        w_bsh=w_bsh,
+        topk_indices_cmp=topk_indices_cmp,
+        topk_length_cmp=topk_length_cmp,
+        indexer_score_payload=topk_scores,
+        query=query,
+        kv_full=kv_full,
+        lse=lse,
+        softmax_scale=softmax_scale,
+        loss_coeff=loss_coeff,
+        query_valid_rows=query_valid_rows,
+        calculate_per_token_loss=calculate_per_token_loss,
+        tp_group=tp_group,
+        deterministic=deterministic,
+    )
+
+
 def _compute_dense_indexer_loss_and_grads(
     *,
     query: Tensor,
@@ -3491,25 +3708,24 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         topk_indices_attn, topk_length_attn = _prepare_attention_topk_indices(
             topk_indices_cmp, kv_full.size(0)
         )
-        _out_flat, lse, *_ = _run_sparse_attention_forward(
-            query, kv_full, topk_indices_attn, softmax_scale, d_v, topk_length=topk_length_attn
-        )
         (
             indexer_loss,
             precomputed_grad_q_indexer,
             precomputed_grad_k_indexer,
             precomputed_grad_weights,
-        ) = _compute_sparse_indexer_loss_and_grads(
+        ) = _sparse_indexer_loss_and_grads_for_selected_topk(
             q_idx_bshd=q_idx_bshd,
             k_idx_bsd=k_idx_bsd,
             w_bsh=w_bsh,
             topk_indices_cmp=topk_indices_cmp,
             topk_length_cmp=topk_length_cmp,
-            indexer_score_payload=indexer_score_payload,
+            topk_scores=indexer_score_payload,
+            topk_indices_attn=topk_indices_attn,
+            topk_length_attn=topk_length_attn,
             query=query,
             kv_full=kv_full,
-            lse=lse,
             softmax_scale=softmax_scale,
+            d_v=d_v,
             loss_coeff=loss_coeff,
             query_valid_rows=query_valid_rows,
             calculate_per_token_loss=calculate_per_token_loss,
@@ -3576,6 +3792,93 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             None,  # varlen_is_plain_causal
             None,  # deterministic
         )
+        return gradients[: ctx.num_inputs]
+
+
+class SparseIndexerLossFromTopKFunc(torch.autograd.Function):
+    """Sparse indexer-loss autograd for a top-k set selected by an earlier call.
+
+    ``FusedQKTopKWithSparseLossFunc`` without the dense indexer scoring and top-k: the
+    index-sorted indices and their aligned scores come from the checkpoint's first call.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q_indexer: Tensor,
+        k_indexer: Tensor,
+        weights: Tensor,
+        query: Tensor,
+        kv_full: Tensor,
+        topk_indices: Tensor,
+        topk_length: Tensor,
+        topk_scores: Tensor,
+        softmax_scale: float,
+        loss_coeff: float,
+        calculate_per_token_loss: bool,
+        d_v: int,
+        query_valid_rows: Optional[Tensor],
+        tp_group,
+        deterministic: bool = False,
+    ) -> Tensor:
+        """Compute the sparse indexer loss from stored top-k indices and scores."""
+        _ensure_dsa_namespace()
+
+        sq, b, _num_heads, _d = query.shape
+        query_valid_rows = dsa_masking.normalize_query_valid_rows(
+            query_valid_rows, b=b, sq=sq, device=query.device
+        )
+        q_idx_bshd, k_idx_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q_indexer, k_indexer, weights)
+        (
+            indexer_loss,
+            precomputed_grad_q_indexer,
+            precomputed_grad_k_indexer,
+            precomputed_grad_weights,
+        ) = _sparse_indexer_loss_and_grads_for_selected_topk(
+            q_idx_bshd=q_idx_bshd,
+            k_idx_bsd=k_idx_bsd,
+            w_bsh=w_bsh,
+            topk_indices_cmp=topk_indices,
+            topk_length_cmp=topk_length,
+            topk_scores=topk_scores,
+            topk_indices_attn=topk_indices,
+            topk_length_attn=topk_length,
+            query=query,
+            kv_full=kv_full,
+            softmax_scale=softmax_scale,
+            d_v=d_v,
+            loss_coeff=loss_coeff,
+            query_valid_rows=query_valid_rows,
+            calculate_per_token_loss=calculate_per_token_loss,
+            tp_group=tp_group,
+            deterministic=deterministic,
+        )
+
+        ctx.save_for_backward(
+            precomputed_grad_q_indexer, precomputed_grad_k_indexer, precomputed_grad_weights
+        )
+        ctx.num_inputs = len(ctx.needs_input_grad)
+        return indexer_loss
+
+    @staticmethod
+    def backward(ctx, grad_loss):
+        """Scale saved indexer-loss gradients for autograd."""
+        precomputed_grad_q_indexer, precomputed_grad_k_indexer, precomputed_grad_weights = (
+            ctx.saved_tensors
+        )
+        if grad_loss is not None:
+            grad_q_indexer = precomputed_grad_q_indexer * grad_loss
+            grad_k_indexer = precomputed_grad_k_indexer * grad_loss
+            grad_weights = precomputed_grad_weights * grad_loss
+        else:
+            grad_q_indexer = None
+            grad_k_indexer = None
+            grad_weights = None
+
+        # Grads: q_indexer, k_indexer, weights, then None for query, kv_full,
+        #   topk_indices, topk_length, topk_scores, softmax_scale, loss_coeff,
+        #   calculate_per_token_loss, d_v, query_valid_rows, tp_group, deterministic.
+        gradients = (grad_q_indexer, grad_k_indexer, grad_weights) + (None,) * 12
         return gradients[: ctx.num_inputs]
 
 
@@ -3774,4 +4077,6 @@ __all__ = [
     "run_fused_dsa_attention",
     "run_fused_qk_topk",
     "run_fused_qk_topk_with_loss",
+    "run_fused_qk_topk_with_scores",
+    "run_sparse_indexer_loss_from_topk",
 ]
