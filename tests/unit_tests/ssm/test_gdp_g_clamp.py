@@ -16,11 +16,12 @@ from megatron.training.arguments import _add_network_size_args
 from megatron.training.checkpointing import CheckpointType, load_args_from_checkpoint
 
 
-def _mixer(clamp_value, *, cutedsl=False, chunkwise_cp=True):
+def _mixer(clamp_value, *, backend="fla", chunkwise_cp=True):
     # Exercise gate math without constructing CUDA kernels or distributed layers.
     mixer = gdp.GatedDeltaProductMixer.__new__(gdp.GatedDeltaProductMixer)
     torch.nn.Module.__init__(mixer)
-    mixer.config = SimpleNamespace(gdp_g_clamp_value=clamp_value, gdp_cutedsl_kernel=cutedsl)
+    mixer.config = SimpleNamespace(gdp_g_clamp_value=clamp_value)
+    mixer.gdp_backend = backend
     mixer.nheads_local_cp = 2
     mixer.num_householder = 3
     mixer.chunkwise_context_parallel = chunkwise_cp
@@ -167,10 +168,10 @@ def test_prefill_forwards_bounded_g_to_chunked_scan(clamp_value):
 
 
 @pytest.mark.parametrize("clamp_value", [None, 50.0])
-@pytest.mark.parametrize("cutedsl", [False, True])
+@pytest.mark.parametrize("backend", ["fla", "cudnn"])
 @pytest.mark.parametrize("chunkwise_cp", [False, True])
-def test_gating_clamps_decay_with_correct_gradients(clamp_value, cutedsl, chunkwise_cp):
-    mixer = _mixer(clamp_value, cutedsl=cutedsl, chunkwise_cp=chunkwise_cp)
+def test_gating_clamps_decay_with_correct_gradients(clamp_value, backend, chunkwise_cp):
+    mixer = _mixer(clamp_value, backend=backend, chunkwise_cp=chunkwise_cp)
     ba = torch.tensor([[[0.0] * 6 + [10000.0, 0.0]]], requires_grad=True)
 
     beta, gate = mixer._compute_gating(ba, runtime_cp=mixer.runtime_cp)
@@ -178,7 +179,7 @@ def test_gating_clamps_decay_with_correct_gradients(clamp_value, cutedsl, chunkw
     raw = -F.softplus(ba.detach()[..., 6:])
     expected = raw if clamp_value is None else raw.clamp_min(-clamp_value)
     torch.testing.assert_close(gate, expected.reshape_as(gate), rtol=0, atol=0)
-    assert gate.shape == ((1, 2) if cutedsl else (1, 1, 2))
+    assert gate.shape == ((1, 2) if backend == "cudnn" else (1, 1, 2))
     assert gate.dtype == torch.float32
     torch.testing.assert_close(beta, torch.full_like(beta, 0.5), rtol=0, atol=0)
 

@@ -13,11 +13,16 @@ carries several draft tokens and the kernels snapshot the conv and recurrent sta
 each of them -- and the torch gated-delta-rule path that ``--deterministic-mode`` selects
 instead of FLA.
 
+The cuDNN GDP training dispatch is replayed with forward/backward for CP=1 and packed
+CP=4, including the CP adapter's summary preparation and saved-context reuse.
+
 Autotuning is the mechanism that can break replay here: ``megatron.core.tuning`` pins a
 single config, while ``ops/common/determinism.py`` selects a zero-initialised, ordered-sum
 workspace when the explicit deterministic policy (or ``torch.use_deterministic_algorithms``) is on.
 Each kernel is replayed in that mode, including with Triton's autotune cache enabled.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -596,6 +601,94 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
 
 
 # --- Gated Delta Product ----------------------------------------------------------------------
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("cp_size", [1, 4], ids=["non-cp", "packed-cp4"])
+def test_cudnn_gdp_forward_backward_replays(cp_size):
+    """Replay the real cuDNN dispatch with strided Q/K/V and all five input gradients."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("cuDNN GDP requires an SM100-class GPU")
+    if Utils.world_size < cp_size or Utils.world_size % cp_size:
+        pytest.skip(f"CP={cp_size} requires a world size divisible by {cp_size}")
+    pytest.importorskip("cudnn", minversion="1.33.0")
+
+    from megatron.core import parallel_state
+    from megatron.core.ssm import gated_delta_product as gdp
+    from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
+
+    if not gdp.HAVE_CUDNN_GDP or not gdp.HAVE_CUDNN_GDP_CP:
+        pytest.skip("cuDNN Frontend GDP training APIs are unavailable")
+
+    try:
+        Utils.initialize_model_parallel(context_parallel_size=cp_size)
+        cp_group = parallel_state.get_context_parallel_group()
+        seeded(1234 + cp_group.rank())
+        T, H, K, V, R = 4096 // cp_size, 8, 128, 64, 3
+
+        # At CP=4 the middle sequence spans ranks 0-2; rank 3 starts a new sequence.
+        seq_lens = torch.tensor([512, 2560, 1024], dtype=torch.int32, device="cuda")
+        seq_idx = torch.repeat_interleave(
+            torch.arange(3, dtype=torch.int32, device="cuda"), seq_lens
+        ).unsqueeze(0)
+        metadata = build_packed_sequence_cp_metadata(seq_idx, cp_group.rank(), cp_size)
+
+        # Match the noncontiguous views into the mixer's fused V/K/Q convolution output.
+        widths = [R * H * V, R * H * K, H * K]
+        vkq = torch.randn(1, T, sum(widths), device="cuda", dtype=torch.bfloat16)
+        v, k, q = vkq[0].split(widths, dim=-1)
+        inputs = {
+            "q": q.view(T, H, K).requires_grad_(),
+            "k": k.view(T, R, H, K).requires_grad_(),
+            "v": v.view(T, R, H, V).requires_grad_(),
+            "g": (-0.01 * torch.rand(T, H, device="cuda", dtype=torch.float32)).requires_grad_(),
+            "beta": torch.rand(T, R, H, device="cuda", dtype=torch.bfloat16).requires_grad_(),
+        }
+        mixer = gdp.GatedDeltaProductMixer.__new__(gdp.GatedDeltaProductMixer)
+        torch.nn.Module.__init__(mixer)
+        mixer.config = SimpleNamespace(gdp_checkpoint_every_n_tokens=192)
+        mixer.gdp_backend = "cudnn"
+        mixer.d_state, mixer.num_householder = K, R
+        mixer.chunkwise_cp_backend = (
+            gdp.CuDNNGatedDeltaProductCPBackend(
+                checkpoint_every_n_tokens=mixer.config.gdp_checkpoint_every_n_tokens
+            )
+            if cp_size > 1
+            else None
+        )
+        runtime_cp = gdp._GDPRuntimeCP(
+            group=cp_group, helper=None, chunkwise=cp_size > 1, d_inner=H * V, nheads=H, ngroups=H
+        )
+
+        def forward(q, k, v, g, beta):
+            output, _ = mixer._run_gdp_kernel(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                vkq,
+                output_final_state=False,
+                cu_seqlens=metadata.local_cu_seqlens,
+                preceding_rank_start=metadata.preceding_rank_start,
+                following_rank_stop=metadata.following_rank_stop,
+                runtime_cp=runtime_cp,
+            )
+            return output
+
+        output_grad = torch.randn(1, T, H, V, device="cuda", dtype=torch.bfloat16)
+        _, grads = assert_replays_bit_exact(
+            forward,
+            inputs,
+            replays=3,
+            backward=True,
+            grad_outputs={"out": output_grad},
+            contention=True,
+            what=f"cuDNN GDP CP={cp_size}",
+        )
+        assert set(grads) == {"in.q", "in.k", "in.v", "in.g", "in.beta"}
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def _gdp_case(M=2):

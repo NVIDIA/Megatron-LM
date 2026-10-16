@@ -11,8 +11,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.gated_delta_product import (
-    HAVE_CUTEDSL_GDP,
-    HAVE_CUTEDSL_GDP_CP,
+    HAVE_CUDNN_GDP_CP,
     HAVE_EINOPS,
     HAVE_FLA,
     HAVE_FLA_GDP_CP,
@@ -25,12 +24,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_causal_conv1d_min_version
 from tests.unit_tests.test_utilities import Utils
 
-HAVE_GDP_DEPS = (
-    HAVE_MAMBA_SSM
-    and HAVE_EINOPS
-    and (HAVE_FLA or HAVE_CUTEDSL_GDP)
-    and causal_conv1d_fn is not None
-)
+HAVE_GDP_DEPS = HAVE_MAMBA_SSM and HAVE_EINOPS and HAVE_FLA and causal_conv1d_fn is not None
 
 # The mixer places several divisibility constraints on these: d_inner = num_heads *
 # head_dim must divide evenly by the group count, and the in_proj output width
@@ -53,6 +47,7 @@ def _make_config(recompute_modules, fp8_recipe=None):
         mamba_head_dim=MAMBA_HEAD_DIM,
         mamba_num_groups=MAMBA_NUM_GROUPS,
         mamba_state_dim=MAMBA_STATE_DIM,
+        gdp_backend="fla",
         params_dtype=torch.bfloat16,
         bf16=True,
         recompute_granularity="selective" if recompute_modules else None,
@@ -115,7 +110,7 @@ def assert_in_proj_recompute_preserves_norm_gate_view(
     if effective_cp_size > 1:
         if not is_causal_conv1d_min_version("1.7.0"):
             pytest.skip("chunkwise CP requires causal-conv1d >= 1.7.0")
-        if not (HAVE_FLA_GDP_CP if HAVE_FLA else HAVE_CUTEDSL_GDP_CP):
+        if not (HAVE_FLA_GDP_CP if HAVE_FLA else HAVE_CUDNN_GDP_CP):
             pytest.skip("the selected GDP backend does not support chunkwise CP")
     if fp8_recipe == "mxfp8":
         te = pytest.importorskip("transformer_engine.pytorch")
@@ -139,7 +134,7 @@ def assert_in_proj_recompute_preserves_norm_gate_view(
         config.linear_cp_layout = "contiguous"
         if fp8_recipe:
             config.fp8 = "e4m3"
-        config.gdp_cutedsl_kernel = not HAVE_FLA
+        config.gdp_backend = "fla" if HAVE_FLA else "cudnn"
         # Eight heads align the projection's ba width to MXFP8's 32-element blocks.
         config.mamba_num_heads = 8
         baseline = _build_mixer(config)

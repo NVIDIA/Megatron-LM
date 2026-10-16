@@ -723,6 +723,7 @@ TWO_STAGE_ATTENTION_CASES = [
             "mamba_head_dim": 64,
             "mamba_num_groups": 4,
             "mamba_state_dim": 16,
+            "gdp_backend": "fla",
         },
         marks=pytest.mark.skipif(
             not (HAVE_GDP and HAVE_GDP_MAMBA), reason="GDP dependencies are not installed"

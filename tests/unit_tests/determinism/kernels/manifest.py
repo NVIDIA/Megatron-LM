@@ -867,16 +867,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_gated_delta_product",
-        sources=("megatron/core/ssm/gated_delta_product.py",),
+        sources=(
+            "megatron/core/ssm/gated_delta_product.py",
+            "megatron/core/ssm/context_parallel/gdp_cudnn.py",
+        ),
         tests=(K + "test_ssm_kernels.py", R + 'test_ssm_replay.py'),
         kind="dispatch",
-        notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
-        "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "
+        notes="Dispatches FLA chunk_gated_delta_product / l2_norm, causal_conv1d and the Megatron "
         "GDP forks (chunk_gated_delta_product_varlen, fused_recurrent_gated_delta_rule_update), all "
         "replayed in test_ssm_kernels.py. ssm_decode also drives the speculative-decoding path, "
         "where causal_conv1d_update and the fused recurrence take several draft tokens per step and "
         "fill the conv / SSM rollback snapshot buffers; both are replayed there with the snapshots "
-        "as outputs. Runtime chunkwise full-head gating and headwise helper convolution/collectives "
+        "as outputs. cuDNN GDP CP=1 and packed CP=4 replay the training output and all five input "
+        "gradients through the real dispatch, including CP summaries and saved-context reuse. "
+        "Runtime chunkwise full-head gating and headwise helper convolution/collectives "
         "are replayed in runtime/test_ssm_replay.py.",
     ),
     KernelEntry(
