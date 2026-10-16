@@ -1859,8 +1859,9 @@ def num_floating_point_operations(
         num_qk_heads=16,
         num_v_heads=16,
         conv_kernel_dim=4,
+        two_stage_gates=False,
     ):
-        """Calculate FLOPs for a direct-projection Kimi Delta Attention layer."""
+        """Calculate FLOPs for direct or GLM two-stage Kimi Delta Attention."""
         if num_qk_heads != num_v_heads or qk_head_dim != v_head_dim:
             raise ValueError(
                 "KDA FLOPs require the equal K/V head layout enforced by KimiDeltaAttention."
@@ -1868,11 +1869,19 @@ def num_floating_point_operations(
         qk_dim = qk_head_dim * num_qk_heads
         v_dim = v_head_dim * num_v_heads
         in_proj_dim = 3 * qk_dim + 2 * v_dim
+        gate_projection_term = 0
+        if two_stage_gates:
+            # Q/K/V only in in_proj; f and g each use H -> head_dim -> head_count*head_dim.
+            in_proj_dim = 2 * qk_dim + v_dim
+            gate_projection_term = (
+                hidden_size * (qk_head_dim + v_head_dim) + qk_head_dim * qk_dim + v_head_dim * v_dim
+            )
         non_core_flops = (
             2
             * total_tokens
             * (
                 hidden_size * (in_proj_dim + num_qk_heads)
+                + gate_projection_term
                 + conv_kernel_dim * (2 * qk_dim + v_dim)
                 + hidden_size * v_dim
             )
@@ -1920,6 +1929,7 @@ def num_floating_point_operations(
         kda_num_qk_heads=16,
         kda_num_v_heads=16,
         kda_conv_kernel_dim=4,
+        kda_two_stage_gates=False,
         vocab_size=256000,
         mtp_num_layers=0,
         mtp_loss_type="cross_entropy",
@@ -2067,6 +2077,7 @@ def num_floating_point_operations(
                 kda_num_qk_heads,
                 kda_num_v_heads,
                 kda_conv_kernel_dim,
+                kda_two_stage_gates,
             )
 
         mamba_flops = (
@@ -2373,6 +2384,7 @@ def num_floating_point_operations(
                     num_qk_heads=args.linear_num_key_heads,
                     num_v_heads=args.linear_num_value_heads,
                     conv_kernel_dim=args.linear_conv_kernel_dim,
+                    two_stage_gates=getattr(args, "kda_two_stage_gates", False),
                 )
             elif is_gated_delta_net_variant(args.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
@@ -2756,6 +2768,7 @@ def num_floating_point_operations(
             kda_num_v_heads=args.linear_num_value_heads or 16,
             kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
+            kda_two_stage_gates=getattr(args, "kda_two_stage_gates", False),
             vocab_size=cfg.tokenizer.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
             mtp_loss_type=getattr(args, "mtp_loss_type", "cross_entropy"),

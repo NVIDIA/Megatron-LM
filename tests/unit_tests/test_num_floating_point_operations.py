@@ -2775,3 +2775,164 @@ class TestHybridDSA:
         args.dsa_indexer_topk = topk
         with pytest.raises(ValueError, match=error):
             num_floating_point_operations(args, cfg, 2)
+
+
+def _glm53_flops_golden(args, cfg, batch_size):
+    """Independent per-query/per-module calculator, not production helpers.
+
+    Attention and indexer pairs are enumerated exactly per query, then put in
+    the FLOPs convention that counts dense causal attention as ``L^2 / 2``
+    pairs. The DSA helpers normalize pair counts by the discrete dense count
+    ``L (L + 1) / 2`` to keep that convention, so each pair weighs
+    ``L / (L + 1)``.
+    """
+    pattern = args.hybrid_layer_pattern.replace("|", "")
+    depths = len(pattern.split("/")) - 1
+    counts = {symbol: pattern.count(symbol) for symbol in "KD-E"}
+    h, n, s = args.hidden_size, args.num_attention_heads, args.seq_length
+    t = batch_size * s
+    pool, budget = args.dsa_indexer_kpool, args.dsa_indexer_topk
+    tail = getattr(args, "dsa_indexer_kpool_always_select_tail", True)
+    pair_weight = (s * s / 2) / (s * (s + 1) / 2)
+    # Enumerate complete causal pools and each query's own incomplete tail.
+    score_pairs = batch_size * sum(j // pool for j in range(1, s + 1))
+    attention_pairs = batch_size * sum(
+        pool * min(j // pool, budget // pool) + (j % pool if tail else 0) for j in range(1, s + 1)
+    )
+    # Keys that the frozen pool compression reduces: complete pools only.
+    pooled_keys = batch_size * pool * (s // pool)
+    r, q, d, v, rope = (
+        args.kv_lora_rank,
+        args.q_lora_rank,
+        args.qk_head_dim,
+        args.v_head_dim,
+        args.qk_pos_emb_head_dim,
+    )
+    mla_projection = q * (h + n * (d + rope) + 1)
+    mla_projection += r * (h + n * (d + v) + 1) + h * rope + n * v * h
+    dsa = counts["D"] * (
+        6 * t * mla_projection + 6 * n * (2 * r + rope) * attention_pairs * pair_weight
+    )
+    ih, idim = args.dsa_indexer_n_heads, args.dsa_indexer_head_dim
+    # Forward only (frozen selector): wq_b, wk, weights_proj and the compression
+    # gate per token, one FMA per pooled key component, and complete-pool scoring.
+    indexer = (
+        counts["D"]
+        * 2
+        * (
+            t * (q * ih * idim + h * idim + h * ih + h * idim)
+            + idim * pooled_keys
+            + ih * idim * score_pairs * pair_weight
+        )
+    )
+    kd, kh = args.linear_key_head_dim, args.linear_num_key_heads
+    channels = kd * kh
+    kda = (
+        counts["K"]
+        * 6
+        * t
+        * (
+            h * (3 * channels + kh)
+            + 2 * h * kd
+            + 2 * kd * channels
+            + args.linear_conv_kernel_dim * 3 * channels
+            + h * channels
+            + kh * (kd * kd + 3 * kd * kd)
+        )
+    )
+    ffn = (
+        6
+        * t
+        * h
+        * 3
+        * (
+            counts["-"] * args.ffn_hidden_size
+            + counts["E"]
+            * (
+                args.moe_router_topk * args.moe_ffn_hidden_size
+                + args.moe_shared_expert_intermediate_size
+            )
+        )
+    )
+    mtp = 6 * t * depths * (3 * h + 2 * h * h)
+    logits = 6 * t * h * cfg.tokenizer.padded_vocab_size * (1 + depths)
+    return dsa + indexer + kda + ffn + mtp + logits
+
+
+class TestGLM53Flops:
+    """GLM-5.3 hybrid FLOPs: two-stage KDA gates on top of the hybrid DSA terms."""
+
+    @pytest.mark.parametrize("full_model", [False, True])
+    @pytest.mark.parametrize("select_tail", [False, True])
+    @pytest.mark.parametrize("length", [3, 17, 512, 4099])
+    def test_glm53_independent_golden(self, full_model, select_tail, length):
+        pattern = "K-KEKEDE/DE"
+        if full_model:
+            pattern = "K-" * 3 + ("DE" + "KE" * 3) * 10 + "DEKE/DE"
+        args, cfg = _make_dsa_args(0.0)
+        args = _as_dsa_hybrid(args, pattern)
+        args.seq_length = length
+        args.hidden_size = 4096 if full_model else 1024
+        args.num_attention_heads = 64 if full_model else 8
+        args.q_lora_rank = 1536 if full_model else 512
+        args.kv_lora_rank = 512
+        args.qk_head_dim = args.v_head_dim = args.kv_channels = 256
+        args.qk_pos_emb_head_dim = 0
+        args.ffn_hidden_size = 12288 if full_model else 3072
+        args.moe_ffn_hidden_size = args.moe_shared_expert_intermediate_size = (
+            2048 if full_model else 512
+        )
+        args.num_experts = 288 if full_model else 32
+        args.moe_router_topk = 8 if full_model else 4
+        cfg.tokenizer.padded_vocab_size = 154880 if full_model else 4096
+        args.linear_key_head_dim = args.linear_value_head_dim = 128
+        args.linear_num_key_heads = args.linear_num_value_heads = 64 if full_model else 8
+        args.linear_conv_kernel_dim = 4
+        args.kda_two_stage_gates = True
+        args.dsa_indexer_kpool = 4
+        args.dsa_indexer_topk = 2048 if full_model else 128
+        args.dsa_indexer_kpool_always_select_tail = select_tail
+        args.dsa_indexer_n_heads = 32 if full_model else 8
+        args.dsa_indexer_head_dim = 128
+        args.mtp_num_layers = 1
+        if full_model:
+            main = pattern.split("/")[0]
+            assert (
+                len(main),
+                main.count("K"),
+                main.count("D"),
+                main.count("-"),
+                main.count("E"),
+            ) == (90, 34, 11, 3, 42)
+        batch_size = 2 if full_model else 8
+        # Fractional pair weights make the golden non-integral, while the
+        # production estimate is truncated to an int. pytest.approx takes the
+        # larger of rel=1e-12 (about 1e3 FLOPs for the full model) and abs=1.
+        assert num_floating_point_operations(args, cfg, batch_size) == pytest.approx(
+            _glm53_flops_golden(args, cfg, batch_size), rel=1e-12, abs=1
+        )
+        # Packed aggregates deliberately retain the documented length-weighted
+        # approximation; they are not claimed to identify exact document pools.
+        assert num_floating_point_operations(
+            args,
+            cfg,
+            batch_size,
+            total_real_tokens_in_batch=batch_size * length,
+            seqlen_squared_sum_in_batch=batch_size * length**2,
+        ) == num_floating_point_operations(args, cfg, batch_size)
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_two_stage_kda_projection_delta(self, hybrid):
+        args, cfg = _make_kda_hybrid_args()
+        if not hybrid:
+            args.hybrid_layer_pattern = None
+            args.num_layers = 1
+            args.experimental_attention_variant = "kda"
+            args.linear_attention_freq = [1]
+        direct = num_floating_point_operations(args, cfg, 2)
+        args.kda_two_stage_gates = True
+        two_stage = num_floating_point_operations(args, cfg, 2)
+        h, d, heads = args.hidden_size, args.linear_key_head_dim, args.linear_num_key_heads
+        channels = d * heads
+        projection_delta = 2 * h * d + 2 * d * channels - 2 * h * channels
+        assert two_stage - direct == 6 * (2 * args.seq_length) * projection_delta
