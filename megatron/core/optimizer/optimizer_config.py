@@ -537,7 +537,7 @@ class OptimizerConfig:
         use_torch_fsdp2: bool,
         moe_single_grouped_weight: bool,
         virtual_pipeline_model_parallel_size: int | None,
-        ckpt_format: bool,
+        ckpt_format: str | None,
     ) -> None:
         if self.lr is not None:
             assert self.min_lr <= self.lr
