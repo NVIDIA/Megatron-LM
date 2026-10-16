@@ -3435,8 +3435,11 @@ class DSAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
+        # KPool selection without its tail leaves the rows before a query's first complete
+        # pool without a key, which the layout checks cannot see, so it certifies nothing.
+        kpool_may_leave_rows_empty = _is_kpool and not self.indexer.index_kpool_always_select_tail
         all_topk_rows_nonempty = _can_prove_all_topk_rows_nonempty(
-            computes_topk=computes_topk,
+            computes_topk=computes_topk and not kpool_may_leave_rows_empty,
             indexer_topk=self.index_topk,
             kv_sequence_length=skv,
             attention_mask=attention_mask,
