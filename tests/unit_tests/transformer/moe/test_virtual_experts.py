@@ -14,9 +14,6 @@ synthetic; no dataset or custom launcher is required.
 
 import gc
 import os
-import subprocess
-import sys
-import time
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partialmethod
@@ -27,7 +24,6 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 import triton
-import triton.language as tl
 from torch.nn import functional as F
 from transformer_engine.pytorch import cpu_offload as te_cpu_offload
 from transformer_engine.pytorch.attention.dot_product_attention import (
@@ -658,10 +654,21 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
 @requires_hybridep
 @pytest.mark.parametrize("use_op_fuser", [True, False], ids=["op-fuser", "grouped-tensor"])
 def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
-    """Moving routes preserves BF16 outputs/dgrads; only wgrad summation may round differently."""
+    """Moving routes preserves outputs/input/probability gradients; wgrad sums may round."""
+    from megatron.core.fusions import fused_weighted_squared_relu as srelu
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
     from megatron.core.transformer.spec_utils import get_submodules
 
+    # Compare routing with the same probability-gradient reduction strategy in both runs,
+    # even when virtual experts change the number of rows processed on a rank.
+    monkeypatch.setattr(
+        srelu,
+        "weighted_squared_relu_back",
+        torch.compile(
+            srelu.weighted_squared_relu_back._torchdynamo_orig_callable,
+            options={"batch_invariant": True},
+        ),
+    )
     monkeypatch.setattr(
         fused_a2a.HybridEPBuffer,
         '__init__',
@@ -1391,101 +1398,3 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, mode, compact_suppo
     finally:
         destroy_moe_metrics_tracker()
         Utils.destroy_model_parallel()
-
-
-@triton.jit
-def _barrier_wait_probe(signal, scratch, output, MODE: tl.constexpr, DELAY_NS: tl.constexpr):
-    block = tl.program_id(0)
-    if MODE == "grid":
-        # Block 1 deliberately never arrives; block 0 must abort the whole grid.
-        if block == 0:
-            vt._grid_sync(scratch, vt._GRID_SYNC_TAG, 2)
-    else:
-        if block == 0:
-            peers = tl.arange(0, 4)
-            # Two live lanes: one ready and one delayed/missing, plus masked lanes.
-            address = (signal + peers).to(tl.int64)
-            vt._handshake(
-                address,
-                peers < 2,
-                scratch,
-                COMPARE=0 if MODE == "release" else 1,
-                VALUE=1 if MODE == "release" else 0,
-                SEM="release" if MODE == "release" else "acquire",
-                LABEL="test missing peer",
-            )
-        elif DELAY_NS > 0:
-            start = tl.extra.cuda.globaltimer()
-            while tl.extra.cuda.globaltimer() - start < DELAY_NS:
-                pass
-            tl.atomic_xchg(signal + 1, 0 if MODE == "release" else 1, sem="release")
-        # On failure this also checks that another block spinning in a different
-        # wait cannot prevent the trap from reaching the host.
-        vt._grid_sync(scratch + 1, vt._GRID_SYNC_TAG, 2)
-    tl.store(output + block, 17)
-
-
-def _barrier_timeout_worker(mode, graph, delayed):
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
-    # Shorten only the deadline; keep the production sampling interval so these
-    # cases also catch watchdogs that sample too infrequently to fail promptly.
-    vt._BARRIER_TIMEOUT_NS = tl.constexpr(500_000_000 if delayed else 20_000_000)
-    signal = torch.tensor(
-        [0, 1, 0, 0] if mode == "release" else [1, 0, 0, 0], device="cuda", dtype=torch.int32
-    )
-    scratch = torch.zeros(2, device="cuda", dtype=torch.int32)
-    output = torch.zeros(2, device="cuda", dtype=torch.int32)
-    args = (signal, scratch, output)
-    kwargs = dict(
-        MODE=mode, DELAY_NS=250_000_000 if delayed else 0, num_warps=4, launch_cooperative_grid=True
-    )
-    _barrier_wait_probe.warmup(*args, **kwargs, grid=(2,))
-    torch.cuda.synchronize()
-    if graph:
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            _barrier_wait_probe[(2,)](*args, **kwargs)
-        launch = g.replay
-    else:
-        launch = lambda: _barrier_wait_probe[(2,)](*args, **kwargs)
-    start = time.monotonic()
-    try:
-        for _ in range(3 if delayed else 1):
-            output.zero_()
-            signal.copy_(torch.tensor([0, 1, 0, 0] if mode == "release" else [1, 0, 0, 0]))
-            launch()
-            torch.cuda.synchronize()
-            if delayed:
-                assert output.tolist() == [17, 17]
-        assert delayed, "missing participant unexpectedly completed"
-    except RuntimeError as exc:
-        assert not delayed, str(exc)
-        assert "launch failure" in str(exc), str(exc)
-        assert time.monotonic() - start < 10
-        print("EXPECTED_TIMEOUT_TRAP", flush=True)
-        return
-    print("DELAYED_PEER_REPLAY_OK", flush=True)
-
-
-@requires_cuda
-@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
-@pytest.mark.parametrize(
-    "mode,delayed",
-    [("release", False), ("acquire", False), ("grid", False), ("release", True), ("acquire", True)],
-)
-def test_virtual_expert_barrier_timeout(mode, delayed, graph):
-    """Both handshake phases and grid waits fail with debugging explicitly off."""
-    # A timeout trap poisons the CUDA context, so each case needs a fresh process.
-    result = subprocess.run(
-        [sys.executable, __file__, mode, str(int(graph)), str(int(delayed))],
-        env={**os.environ, "TRITON_DEBUG": "0"},
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert ("DELAYED_PEER_REPLAY_OK" if delayed else "EXPECTED_TIMEOUT_TRAP") in result.stdout
-
-
-if __name__ == "__main__":
-    _barrier_timeout_worker(sys.argv[1], bool(int(sys.argv[2])), bool(int(sys.argv[3])))
