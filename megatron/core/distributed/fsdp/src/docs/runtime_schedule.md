@@ -62,35 +62,20 @@ with a record-and-replay mechanism.
 
 ## MFSDP v2 static prefetch
 
-Ordinary forward/backward loops prefetch without an iteration scope or recording.
-Context finalization builds separate static `forward_order` and `backward_order`
-sequences from construction. Each `ExecutionOrder` owns its execution and prefetch cursors;
-execution starts another pass after consuming the complete sequence. Forward-only
-validation advances only the forward order, leaving backward progress unchanged.
-
-For a different fixed call order, replace the sequences after construction:
-
-```python
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
-    ExecutionOrder,
-)
-
-# Example: two independent FSDP units, called a then b in each forward.
-context.forward_order = ExecutionOrder([a, b])
-context.backward_order = ExecutionOrder([b, a])
-```
-
-Each pass must match its supplied order, including repeated occurrences. A mismatch
-raises rather than searching for a module or silently repositioning the cursor.
-Recomputation gathers on demand without advancing either static order. Dynamic
-mixed F/B schedules such as VPP/combined 1F1B use the iteration scope below.
+Ordinary forward/backward loops retain the existing `ExecutionOrder` behavior
+and prefetch without an iteration scope or recording. Context finalization builds
+separate `forward_order` and `backward_order` sequences; users can supply explicit
+orders after construction. Unique modules select their position by identity,
+while repeated modules validate the next occurrence. Forward-only validation
+uses only the forward order. Recomputation gathers on demand without advancing
+the static orders.
 
 ## MFSDP v2 iteration demand recording
 
 The experimental v2 runtime can record one complete iteration and prefetch from
 that demand order on subsequent iterations. Forward, backward, recomputation,
 and repeated calls share one occurrence sequence. Independent execution and
-prefetch cursors in `ExecutionOrder` consume this sequence; prefetch never changes execution progress
+prefetch cursors in `IterationOrder` consume this sequence; prefetch never changes execution progress
 and its targets do not depend on materialization state. Prefetch gathers are not recorded.
 The first successful iteration of each schedule gathers on demand; failed or
 incompletely replayed iterations invalidate that schedule's recording.
@@ -128,8 +113,8 @@ The recorder neither reduces gradients nor infers completion from node counts.
 Iteration recording is disabled for CUDA graph schedules because Python hooks
 do not cover graph replay. CUDA graph lifecycle support and performance tuning
 are outside this change. Outside an iteration scope, static F/B prefetch remains
-available as described above. `ExecutionOrder` holds weak occurrences and both cursors:
-`_unique_index` and the module argument to `advance()` remain removed.
+available as described above. `ExecutionOrder` and its static prefetch API remain unchanged. The recorded
+sequence, phase metadata, and both replay cursors belong to `IterationOrder`.
 
 # Alternatives considered
 

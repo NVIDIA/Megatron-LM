@@ -12,69 +12,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A weak occurrence sequence with independent execution and prefetch cursors."""
+"""Weakly held construction or recorded module execution sequences."""
 
 from collections.abc import Iterable, Iterator
 from typing import Generic, TypeVar
-from weakref import ref
+from weakref import WeakKeyDictionary, ref
 
 T = TypeVar("T")
 
 
 class ExecutionOrder(Generic[T]):
-    """Track execution and prefetch independently without identity lookup.
+    """Look up unique modules and validate repeated module-call occurrences.
 
-    Execution starts a new pass after consuming the complete sequence; prefetch
-    never wraps into the next pass. Ordinary iteration does not move either
-    cursor. Missing owners are errors rather than skipped occurrences.
+    A module appearing once can unambiguously select its position, preserving
+    construction-order prefetch for reordered or repeated demand calls. Modules
+    appearing more than once must match the next occurrence at the cursor.
+    Prefetch lookahead never advances that cursor.
     """
 
     def __init__(self, items: Iterable[T] = ()) -> None:
-        self._items: list[ref[T]] = [ref(item) for item in items]
-        self.reset()
-
-    @property
-    def position(self) -> int:
-        """Number of execution occurrences consumed in the current pass."""
-        return self._execution_position
-
-    def reset(self) -> None:
-        """Start a fresh execution and prefetch traversal."""
-        self._execution_position = self._prefetch_position = 0
-
-    def advance(self) -> T:
-        """Consume the next execution occurrence, restarting completed passes."""
-        if not self._items:
-            raise RuntimeError("The FSDP execution order is empty.")
-        if self._execution_position == len(self):
-            self.reset()
-        item = self._dereference(self._items[self._execution_position])
-        self._execution_position += 1
-        return item
-
-    def next_prefetch(self) -> T | None:
-        """Consume one upcoming occurrence without advancing execution."""
-        self._prefetch_position = max(self._prefetch_position, self._execution_position)
-        if self._prefetch_position == len(self):
-            return None
-        item = self._dereference(self._items[self._prefetch_position])
-        self._prefetch_position += 1
-        return item
+        """Create a weak execution sequence, preserving repeated occurrences."""
+        self._items: list[ref[T]] = []
+        # An index identifies a unique item; None marks an ambiguous repeated item.
+        self._unique_index: WeakKeyDictionary[T, int | None] = WeakKeyDictionary()
+        self._position = 0
+        for item in items:
+            self.append(item)
 
     def append(self, item: T) -> None:
-        """Append one weakly held occurrence, preserving repetitions."""
+        """Append an occurrence and mark previously seen items as repeated."""
+        self._unique_index[item] = None if item in self._unique_index else len(self._items)
         self._items.append(ref(item))
 
-    def __len__(self) -> int:
-        return len(self._items)
-
-    @staticmethod
-    def _dereference(item_ref: ref[T]) -> T:
-        item = item_ref()
-        if item is None:
-            raise RuntimeError("A module in the FSDP execution order was destroyed.")
-        return item
-
     def __iter__(self) -> Iterator[T]:
-        """Traverse weak occurrences without moving or retaining cursor items."""
-        return map(self._dereference, self._items)
+        """Iterate over live occurrences in execution order."""
+        for item_ref in self._items:
+            item = item_ref()
+            if item is not None:
+                yield item
+
+    def advance(self, item: T) -> None:
+        """Locate a unique demand call or consume the next expected repeated call."""
+        index = self._unique_index.get(item)
+        if index is None:
+            if not self._items or self._items[self._position]() is not item:
+                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
+            index = self._position
+        self._position = (index + 1) % len(self._items)
+
+    def next_item(self, offset: int = 1) -> T | None:
+        """Look ahead from the last consumed occurrence without moving the cursor."""
+        if not self._items:
+            return None
+        index = (self._position - 1) % len(self._items)
+        next_index = index + offset
+        if next_index >= len(self._items):
+            return None
+        return self._items[next_index]()

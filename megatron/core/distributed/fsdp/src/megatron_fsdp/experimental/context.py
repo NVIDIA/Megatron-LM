@@ -43,6 +43,11 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
+    # Static orders used to drive all-gather prefetch. We may want to switch to
+    # capturing runtime order if static module order proves too fragile. Each
+    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
+    forward_order: ExecutionOrder[nn.Module]
+    backward_order: ExecutionOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -92,8 +97,8 @@ class FsdpContext:
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.iteration_order = IterationOrder()
-        self.forward_order: ExecutionOrder[nn.Module] = ExecutionOrder()
-        self.backward_order: ExecutionOrder[nn.Module] = ExecutionOrder()
+        self.forward_order = ExecutionOrder()
+        self.backward_order = ExecutionOrder()
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
@@ -136,7 +141,7 @@ class FsdpContext:
         self._registered_modules.append(module)
 
     def finalize(self) -> None:
-        """Finalize roots, names, and default static forward/backward orders."""
+        """Finalize roots, names, and cross-root prefetch orders."""
         if self._is_finalized:
             raise RuntimeError("FSDP context is already finalized.")
 

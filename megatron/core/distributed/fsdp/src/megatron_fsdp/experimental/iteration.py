@@ -17,8 +17,7 @@
 from collections.abc import Hashable, Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Literal
-
-from .execution_order import ExecutionOrder
+from weakref import ref
 
 if TYPE_CHECKING:
     from .context import FsdpContext
@@ -27,30 +26,19 @@ if TYPE_CHECKING:
 DemandPhase = Literal["forward", "backward", "recompute", "none"]
 
 
-def _prefetch_parameters(order: ExecutionOrder, budget: int | None) -> None:
-    """Gather upcoming owners up to the policy budget using the prefetch cursor."""
-    if budget == 0:
-        return
-    size = 0
-    while (module := order.next_prefetch()) is not None:
-        module._unshard_parameter_groups()
-        size += module.num_parameter_elements
-        if budget is None or size >= budget:
-            break
-
-
 class IterationOrder:
-    """Manage recording and strict replay over one execution order.
+    """Own recorded occurrences and independent execution/prefetch cursors.
 
     State lives on FsdpContext, not a ContextVar, since autograd hooks may run
     on another thread. One context cannot execute overlapping iteration scopes.
     """
 
     def __init__(self) -> None:
-        self._orders: dict[Hashable, tuple[ExecutionOrder, tuple[DemandPhase, ...]]] = {}
-        self._order: ExecutionOrder | None = None
+        self._orders: dict[Hashable, tuple[list[ref["FsdpModule"]], tuple[DemandPhase, ...]]] = {}
+        self._order: list[ref["FsdpModule"]] | None = None
         self._phases: list[DemandPhase] | tuple[DemandPhase, ...] = ()
         self._recording = False
+        self._execution_position = self._prefetch_position = 0
 
     @property
     def active(self) -> bool:
@@ -67,13 +55,13 @@ class IterationOrder:
             raise RuntimeError("FSDP iteration scopes cannot overlap on the same context.")
         self._recording = rerecord or key not in self._orders
         if self._recording:
-            self._order, self._phases = ExecutionOrder(), []
+            self._order, self._phases = [], []
         else:
             self._order, self._phases = self._orders[key]
-        self._order.reset()
+        self._execution_position = self._prefetch_position = 0
         try:
             yield
-            if self._order.position != len(self._order):
+            if self._execution_position != len(self._order):
                 raise RuntimeError(
                     "FSDP iteration ended before consuming its recorded demand order."
                 )
@@ -83,7 +71,7 @@ class IterationOrder:
             self._orders.pop(key, None)
             raise
         finally:
-            self._order.reset()
+            self._execution_position = self._prefetch_position = 0
             self._order = None
             self._phases = ()
             self._recording = False
@@ -92,19 +80,26 @@ class IterationOrder:
         """Observe a demand only during the initial recording iteration."""
         if not self._recording or self._order is None:
             raise RuntimeError("No FSDP iteration recording is active.")
-        self._order.append(module)
+        self._order.append(ref(module))
         self._phases.append(phase)
 
     def advance(self) -> tuple["FsdpModule", DemandPhase]:
         """Consume the next occurrence; the caller validates its observed demand."""
         if self._order is None:
             raise RuntimeError("No FSDP iteration is active.")
-        # Static execution may start another pass; iteration replay must never
-        # wrap, since extra demands indicate a schedule mismatch.
-        if self._order.position == len(self._order):
+        # A complete iteration never wraps; extra demands are mismatches.
+        if self._execution_position == len(self._order):
             raise RuntimeError("FSDP demand exceeded the recorded iteration order.")
-        phase = self._phases[self._order.position]
-        return self._order.advance(), phase
+        module = self._module_at(self._execution_position)
+        phase = self._phases[self._execution_position]
+        self._execution_position += 1
+        return module, phase
+
+    def _module_at(self, position: int) -> "FsdpModule":
+        module = self._order[position]()
+        if module is None:
+            raise RuntimeError("A module in the recorded FSDP iteration was destroyed.")
+        return module
 
     def prefetch(self, budget: int | None) -> None:
         """Advance a separate, monotonic cursor over upcoming demand occurrences.
@@ -115,7 +110,15 @@ class IterationOrder:
         """
         if not self.active or self._recording or budget == 0:
             return
-        _prefetch_parameters(self._order, budget)
+        self._prefetch_position = max(self._prefetch_position, self._execution_position)
+        size = 0
+        while self._prefetch_position < len(self._order):
+            module = self._module_at(self._prefetch_position)
+            self._prefetch_position += 1
+            module._unshard_parameter_groups()
+            size += module.num_parameter_elements
+            if budget is None or size >= budget:
+                break
 
 
 @contextmanager

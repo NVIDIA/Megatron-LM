@@ -21,12 +21,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
-    ExecutionOrder,
-)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration import (
     IterationOrder,
-    _prefetch_parameters,
     iteration,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -98,38 +94,6 @@ def test_record_and_replay_mixed_occurrences():
         assert b._unshard_parameter_groups.call_count == before + 1
         for module, phase in events[1:]:
             _demand(order, module, phase)
-
-
-def test_static_orders_prefetch_without_iteration():
-    """Explicit F/B orders repeat independently, including forward-only passes."""
-    a, b = _Unit(), _Unit()
-    forward = ExecutionOrder([a, b, a])
-    backward = ExecutionOrder([b, a])
-    gathers = Mock()
-    gathers.attach_mock(a._unshard_parameter_groups, "a")
-    gathers.attach_mock(b._unshard_parameter_groups, "b")
-    for forward_only in (False, True, False):
-        gathers.reset_mock()
-        for module in (a, b, a):
-            assert forward.advance() is module
-            _prefetch_parameters(forward, None)
-        assert [call[0] for call in gathers.mock_calls] == ["b", "a"]
-        if not forward_only:
-            gathers.reset_mock()
-            for module in (b, a):
-                assert backward.advance() is module
-                _prefetch_parameters(backward, None)
-            assert [call[0] for call in gathers.mock_calls] == ["a"]
-    gathers.reset_mock()
-    assert forward.advance() is a
-    _prefetch_parameters(forward, 0)
-    assert not gathers.mock_calls
-    _prefetch_parameters(forward, 2)
-    assert [call[0] for call in gathers.mock_calls] == ["b", "a"]
-    for module in (b, a):
-        assert forward.advance() is module
-        _prefetch_parameters(forward, None)
-    assert len(gathers.mock_calls) == 2
 
 
 def test_replay_rejects_changed_or_incomplete_iterations():
@@ -238,8 +202,6 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
         assert "recompute" in phases
     else:
         assert not context.iteration_order._orders
-        assert context.forward_order.position == len(context.forward_order)
-        assert context.backward_order.position == len(context.backward_order)
     # Group-packed shards need the FSDP layout to reconstruct parameters;
     # DTensor.full_tensor() assumes ordinary per-tensor chunking instead.
     with iteration(context, key="parameter_check"):

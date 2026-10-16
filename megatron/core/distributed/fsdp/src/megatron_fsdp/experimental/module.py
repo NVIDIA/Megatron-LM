@@ -32,7 +32,8 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .iteration import DemandPhase, _prefetch_parameters
+from .execution_order import ExecutionOrder
+from .iteration import DemandPhase
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
@@ -295,12 +296,6 @@ class FsdpModule:
             expected, phase = order.advance()
             if expected is not self or phase != prefetch:
                 raise RuntimeError("FSDP module calls diverged from the recorded iteration order.")
-        elif prefetch in ("forward", "backward"):
-            static_order = (
-                self.context.forward_order if prefetch == "forward" else self.context.backward_order
-            )
-            if static_order.advance() is not self:
-                raise RuntimeError("FSDP module calls diverged from the static prefetch order.")
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
@@ -309,16 +304,42 @@ class FsdpModule:
             self.context.current_stream().wait_event(self._unshard_event)
 
             context = self.context
-            if scoped or prefetch in ("forward", "backward"):
+            if scoped:
                 budget = (
                     self._schedule_policy.forward_prefetch_size
                     if prefetch == "forward"
                     else self._schedule_policy.backward_prefetch_size
                 )
-                if scoped:
-                    context.iteration_order.prefetch(0 if prefetch == "none" else budget)
-                else:
-                    _prefetch_parameters(static_order, budget)
+                context.iteration_order.prefetch(0 if prefetch == "none" else budget)
+            elif prefetch == "forward":
+                self._prefetch_parameter_groups(
+                    context.forward_order, self._schedule_policy.forward_prefetch_size
+                )
+            elif prefetch == "backward":
+                self._prefetch_parameter_groups(
+                    context.backward_order, self._schedule_policy.backward_prefetch_size
+                )
+
+    def _prefetch_parameter_groups(
+        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
+    ) -> None:
+        """Prefetch successors from ``order`` according to this module's budget."""
+        module = cast(nn.Module, self)
+        order.advance(module)
+        next_module = order.next_item()
+        if prefetch_size is None:
+            if next_module is not None:
+                cast(FsdpModule, next_module)._unshard_parameter_groups()
+            return
+
+        prefetched_size = 0
+        offset = 1
+        while next_module is not None and prefetched_size < prefetch_size:
+            fsdp_module = cast(FsdpModule, next_module)
+            fsdp_module._unshard_parameter_groups()
+            prefetched_size += fsdp_module.num_parameter_elements
+            offset += 1
+            next_module = order.next_item(offset)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
