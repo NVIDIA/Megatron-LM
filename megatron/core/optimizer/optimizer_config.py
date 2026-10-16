@@ -533,7 +533,7 @@ class OptimizerConfig:
     def validate_run(
         self,
         *,
-        ddp_config: Optional["DistributedDataParallelConfig"] = None,
+        ddp_config: "DistributedDataParallelConfig",
         use_torch_fsdp2: bool,
         moe_single_grouped_weight: bool,
         virtual_pipeline_model_parallel_size: int | None,
