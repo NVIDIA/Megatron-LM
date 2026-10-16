@@ -683,7 +683,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if checkpoint_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                        ckpt_manager=mhc_recompute_manager
+                        ckpt_manager=mhc_recompute_manager,
+                        retain_input_tensors=layer._pre_mlp_layernorm_returns_residual,
                     )
                     with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
@@ -698,13 +699,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 # When using fused residual norm (e.g. TEFusedResidualRMSNorm),
                 # the layernorm returns (normalized_output, residual). Unpack
                 # and use the fused residual for the downstream BDA connection.
-                if isinstance(pre_mlp_layernorm_output, tuple):
-                    if len(pre_mlp_layernorm_output) != 2:
-                        raise ValueError(
-                            f"When the output of pre_mlp_layernorm is a tuple, it is "
-                            f"expected to have 2 elements (output, residual), but "
-                            f"got {len(pre_mlp_layernorm_output)}"
-                        )
+                if layer._pre_mlp_layernorm_returns_residual:
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
                     if not is_mhc_layer:
                         residual = hidden_states

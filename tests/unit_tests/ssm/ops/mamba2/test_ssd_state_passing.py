@@ -5,7 +5,7 @@ import unittest
 import torch
 
 try:
-    from megatron.core.ssm.ops.ssd_state_passing import _state_passing_fwd
+    from megatron.core.ssm.ops.mamba2.ssd_state_passing import _state_passing_fwd
 
     HAVE_SSD_OPS = True
 except (ImportError, Exception):

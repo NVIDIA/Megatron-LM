@@ -307,6 +307,75 @@ class TestLayerNormLinearGTP:
 
 
 # ---------------------------------------------------------------------------
+# Megatron linear: the wgrad handed to the reduce-scatter carries main_grad's dtype
+# ---------------------------------------------------------------------------
+
+
+def _worker_wgrad_rs_dtype(rank, world_size, port):
+    """With an FP32 main_grad, the gtp_remat reduce-scatter must run in FP32, not the compute dtype.
+
+    Guards a SILENT failure: a bf16 wgrad makes the RS round at every rank, which leaves gradients
+    finite and merely less precise, so the value-based tests here pass either way.
+
+    Covers Megatron's linear (layers.py); TE types its wgrad from main_grad via grad_buffer().
+    """
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
+    from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
+    from megatron.core.tensor_parallel.layers import (
+        linear_with_grad_accumulation_and_async_allreduce,
+    )
+
+    torch.manual_seed(0)
+    batch, in_f, out_f = 16, 64, 128  # out_f % (16*world_size)==0 -> no padding
+    layer = nn.Linear(in_f, out_f, bias=False, dtype=torch.bfloat16, device="cuda")
+    wrap_module_params_gtp(layer, ["weight"], dist.new_group(list(range(world_size))))
+    layer.weight.main_grad = torch.zeros(layer.weight.shape, dtype=torch.float32, device="cuda")
+
+    seen = []
+    captured = []
+    original = GTPShardedParam.wgrad_reduce_scatter
+
+    def recording_rs(self, wgrad, nvtx_label=None):
+        seen.append(wgrad.dtype)
+        captured.append(wgrad.detach().float().clone())
+        return original(self, wgrad, nvtx_label=nvtx_label)
+
+    try:
+        GTPShardedParam.wgrad_reduce_scatter = recording_rs
+        inp = torch.randn(batch, in_f, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        linear_with_grad_accumulation_and_async_allreduce(
+            input=inp,
+            weight=layer.weight,
+            bias=None,
+            gradient_accumulation_fusion=True,
+            allreduce_dgrad=False,
+            sequence_parallel=False,
+            gtp_remat_size=world_size,
+        ).sum().backward()
+    finally:
+        GTPShardedParam.wgrad_reduce_scatter = original
+
+    # Every rank asserts: the tally is rank-local.
+    assert seen, "wgrad_reduce_scatter was never reached -- the weight is not GTP-sharded"
+    assert set(seen) == {torch.float32}, (
+        f"gtp_remat reduce-scatter ran in {set(seen)} with an FP32 main_grad. The wgrad must carry "
+        f"main_grad's dtype, or the cross-rank sum rounds before main_grad ever sees it."
+    )
+    # The widened branch is the only caller of _wgrad_gemm here, so pin the VALUE too: a wrong
+    # layout/operand order would still be FP32 and still reduce-scatter cleanly. grad_output is
+    # all ones (loss = .sum()), so every wgrad row is just the input column sum -- computed in
+    # FP32 without a GEMM, the reference carries no BF16 rounding and the tolerance stays tight.
+    expected = inp.detach().float().sum(dim=0).expand(out_f, in_f)
+    torch.testing.assert_close(captured[0], expected, rtol=1e-5, atol=1e-4)
+
+
+class TestGTPWgradRSDtype:
+    def test_wgrad_rs_follows_main_grad_dtype(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_wgrad_rs_dtype, 4)
+
+
+# ---------------------------------------------------------------------------
 # GroupedLinear forward/backward smoke test
 # ---------------------------------------------------------------------------
 
@@ -500,6 +569,42 @@ class TestGroupedExpertChainClassification:
         assert not gtp_module._chain_is_graphed("GTP_remat_grouped_fc1_ungraphed")
         assert not gtp_module._chain_is_graphed("GTP_ungraphed")
         assert gtp_module._chain_is_graphed("GTP_graphed")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GTPShardedParam requires CUDA")
+class TestLatentProjectionChainClassification:
+    """Classify opted-in latent projections through the public GTP chain API."""
+
+    FC1 = "decoder.layers.3.mlp.fc1_latent_proj.weight"
+    FC2 = "decoder.layers.3.mlp.fc2_latent_proj.weight"
+
+    def teardown_method(self, method):
+        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
+        gtp_module.reset_gtp_state()
+
+    def _chains(self, *, cuda_graph_modules=None, cuda_graph_impl="none"):
+        params = tuple(GTPShardedParam(torch.zeros(1, device="cuda")) for _ in range(2))
+        assert all(isinstance(param, GTPShardedParam) for param in params)
+
+        class _Model:
+            def named_parameters(_self):
+                return iter(zip((self.FC1, self.FC2), params))
+
+        gtp_module.classify_gtp_remat_chains(
+            _Model(), cuda_graph_modules=cuda_graph_modules, cuda_graph_impl=cuda_graph_impl
+        )
+        return tuple(param.chain_id for param in params)
+
+    def test_eager_latent_projections_are_ungraphed(self):
+        assert self._chains() == (GTPChain.UNGRAPHED.value, GTPChain.UNGRAPHED.value)
+
+    def test_local_router_captures_both_latent_projections(self):
+        chains = self._chains(cuda_graph_modules={"moe_router"}, cuda_graph_impl="local")
+        assert chains == (GTPChain.GRAPHED.value, GTPChain.GRAPHED.value)
+
+    def test_unrelated_local_scope_leaves_latent_projections_ungraphed(self):
+        chains = self._chains(cuda_graph_modules={"mamba", "attn"}, cuda_graph_impl="local")
+        assert chains == (GTPChain.UNGRAPHED.value, GTPChain.UNGRAPHED.value)
 
 
 class TestGroupedDoubleBuffer:
@@ -1439,3 +1544,50 @@ class TestGTPGraphWgradRing:
         assert rs_input is weights[1]._gtp_graph_wgrad_ring_slot.tensor
         torch.testing.assert_close(rs_input[:4], wgrad)
         assert torch.count_nonzero(rs_input[4:]) == 0
+
+
+class TestActivationRecomputePhaseFlag:
+    """GTP's forward-only readiness gate rests on TE's recompute flag being dtype-agnostic."""
+
+    def test_recompute_phase_flag_is_set_under_bf16(self):
+        """``in_activation_recompute_phase`` must be True for BF16 recompute, not just FP8.
+
+        GTP aliases TE's ``in_fp8_activation_recompute_phase`` under a name without ``fp8``
+        because TE assigns the underlying global unconditionally. ``_all_gather_weight`` uses it
+        to skip publishing during recompute (see
+        ``test_gtp_ddp_param_sync_race.py::test_recompute_forward_does_not_request_publication``).
+        If TE ever made it FP8-only, BF16 recompute would start asking DDP to publish inside
+        backward -- silently, since the failure is a wrong-buffer gather rather than an error.
+        """
+        _requires_multi_gpu(1)
+        import transformer_engine.pytorch as te
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        assert not FP8GlobalStateManager.is_fp8_enabled(), "must run outside fp8_autocast"
+
+        hidden, dtype = 128, torch.bfloat16
+        observed = []
+
+        class _Probe(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = te.Linear(hidden, hidden, bias=False, params_dtype=dtype, device="cuda")
+
+            def forward(self, x):
+                observed.append(gtp_module.in_activation_recompute_phase())
+                return self.lin(x)
+
+        x = torch.randn(8, hidden, dtype=dtype, device="cuda", requires_grad=True)
+        out = te.checkpoint(
+            _Probe(),
+            x,
+            distribute_saved_activations=False,
+            get_rng_state_tracker=None,
+            tp_group=None,
+        )
+        out.sum().backward()  # replays the forward -> second observation
+
+        assert observed == [False, True], (
+            f"expected [original fwd=False, recompute fwd=True], got {observed}: "
+            "in_activation_recompute_phase no longer tracks BF16 activation recompute"
+        )

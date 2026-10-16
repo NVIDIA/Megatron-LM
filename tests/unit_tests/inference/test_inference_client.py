@@ -118,3 +118,24 @@ async def test_inference_client_connect_handshake_rejects_unexpected_reply():
     fake_socket.recv.return_value = msgpack.packb([Headers.STOP.value], use_bin_type=True)
     with pytest.raises(AssertionError):
         client._connect_with_inference_coordinator()
+
+
+async def test_add_request_with_kv_handoff_returns_future():
+    """Non-streaming handoffs use the normal final-reply future path."""
+    client, _, fake_socket = _make_client()
+    params = SamplingParams(temperature=0.5)
+
+    future = client.add_request_with_kv_handoff([1, 2, 3], params, {"agent": "prefill"}, [10, 11])
+
+    assert isinstance(future, asyncio.Future)
+    assert params.streaming is False
+    assert client.completion_futures == {0: future}
+    assert client.streams == {}
+    payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    assert payload[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
+    assert payload[1] == 0
+    assert payload[2] == [1, 2, 3]
+    assert payload[3]["streaming"] is False
+    assert payload[4] == {"agent": "prefill"}
+    assert payload[5] == [10, 11]
+    future.cancel()

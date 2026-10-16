@@ -446,6 +446,15 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                 f"{self.__class__.__name__} requires Transformer Engine with "
                 "pytorch.ops.ScaledSiTUGLU for SiTU-GLU."
             )
+        if self.config.activation_func_clamp_value is not None and (
+            not is_te_min_version("2.17.0.dev0")
+            or not hasattr(te.pytorch.ops, "ScaledClampedQGeGLU")
+        ):
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires Transformer Engine >= 2.17.0.dev0 "
+                "with pytorch.ops.ScaledClampedQGeGLU when "
+                "activation_func_clamp_value is set."
+            )
         if self.config.moe_shared_expert_glu_interleave_size is None:
             raise ValueError(
                 f"{self.__class__.__name__} requires "
@@ -482,7 +491,7 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         return self._fused_grouped_swiglu_recipe
 
     def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
-        """Construct GroupedLinear(num_groups=1) -> ScaledSwiGLU -> GroupedLinear."""
+        """Construct the grouped-linear shared-expert MLP operations."""
         ops = te.pytorch.ops.Sequential()
         tp_world_size = get_pg_size(self.tp_group)
         rng_state_tracker_function = None
@@ -505,14 +514,22 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         op._glu_interleave_size = glu_interleave_size
         ops.append(op)
 
+        clamp_value = self.config.activation_func_clamp_value
         if self.config.activation_func is situlu:
             activation_op = te.pytorch.ops.ScaledSiTUGLU(
                 glu_interleave_size=glu_interleave_size,
                 beta1=self.config.situ_glu_beta1,
                 beta2=self.config.situ_glu_beta2,
             )
-        else:
+        elif clamp_value is None:
             activation_op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size)
+        else:
+            activation_op = te.pytorch.ops.ScaledClampedQGeGLU(
+                glu_interleave_size=glu_interleave_size,
+                alpha=1.0,
+                limit=clamp_value,
+                glu_linear_offset=0.0,
+            )
         # Shared experts are not router-gated. Mark this fused-op instance so
         # TE can omit the optional forward cuDNN probability tensor without
         # changing the semantics of routed single-group MLPs.

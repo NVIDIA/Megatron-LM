@@ -5,7 +5,7 @@ import unittest
 import torch
 
 try:
-    from megatron.core.ssm.ops.ssd_chunk_state import (
+    from megatron.core.ssm.ops.mamba2.ssd_chunk_state import (
         _chunk_cumsum_fwd,
         _chunk_state_fwd,
         chunk_state_varlen,

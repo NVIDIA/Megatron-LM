@@ -19,7 +19,10 @@ from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.data_parallel_inference_coordinator.handlers import handle_engine_reply
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
+    HANDLERS,
+    handle_engine_reply,
+)
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
@@ -48,6 +51,11 @@ except ImportError:
 NUM_REQUESTS = 10
 NUM_TOKENS = 2
 DEFAULT_PORT = 46581
+
+
+def test_coordinator_registers_client_kv_handoff_handlers():
+    assert Headers.SUBMIT_REQUEST_WITH_KV in HANDLERS
+    assert Headers.RELEASE_KV in HANDLERS
 
 
 class DummyTokenizer:

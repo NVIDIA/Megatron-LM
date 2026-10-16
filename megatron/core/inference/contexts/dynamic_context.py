@@ -894,8 +894,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and prefix_caching_mamba_gb is not None
                 and prefix_caching_mamba_gb > 0
             ):
+                assert self.mamba_slot_allocator is not None
                 prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
-                prefix_cache_slots = prefix_cache_bytes // mamba_bytes_per_req
+                # The allocator contains the PP-synchronized durable capacity.
+                prefix_cache_slots = self.mamba_slot_allocator.max_slots
                 log_lines += [
                     f"  Mamba prefix cache:",
                     f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
@@ -1754,6 +1756,24 @@ class DynamicInferenceContext(BaseInferenceContext):
         per_slot_bytes = self.num_mamba_layers * (conv_size + ssm_size)
         total_bytes = int(mamba_gb * 1024**3)
         max_slots = total_bytes // per_slot_bytes
+        local_max_slots = max_slots
+
+        # Prefix-cache state is replicated across pipeline stages. Use the
+        # smallest stage-local capacity so identical cache operations produce
+        # identical block-to-slot mappings on every stage. A recurrent prefix
+        # is executable only when all stages retain its state, so additional
+        # slots on an individual stage would not increase usable cache capacity.
+        if get_pg_size(self.pipeline_parallel_group) > 1:
+            max_slots_tensor = torch.tensor(
+                max_slots, dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(
+                max_slots_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.pipeline_parallel_group,
+            )
+            max_slots = int(max_slots_tensor.item())
+
         if max_slots < 1:
             logging.warning(
                 "Mamba cache budget (%.3f GB) too small for even 1 slot "
@@ -2396,6 +2416,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
         if real_bs < padded_bs:
             self._cpu_mha_block_table[real_bs:padded_bs] = self.kv_block_allocator.dummy_block_idx
+        # Real rows must avoid having a -1 sentinel in their trailing columns,
+        # because the kernel treats the -1 sentinel as a real value.
+        # We cannot avoid writing -1 into `request_to_kv_block_ids`; other logic needs it.
+        # The only option is to overwrite the -1 with a dummy block index via `masked_fill`.
+        if real_bs > 0:
+            _real_rows = self._cpu_mha_block_table[:real_bs]
+            # masked_fill_ over the pinned int32 view: no index_put/nonzero
+            # temporaries on the per-step CPU path.
+            _real_rows.masked_fill_(_real_rows < 0, self.kv_block_allocator.dummy_block_idx)
 
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
         if not self.using_cuda_graph_this_step() and real_bs > 0:
@@ -2929,10 +2958,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request
+        # because we allocate a single set of Mamba state tensors for each request.
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
+        # A handoff is the exception: it keeps its live recurrent-state slot after
+        # its request row is removed, so both capacities must be checked independently.
+        if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
+            request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
 
         matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)

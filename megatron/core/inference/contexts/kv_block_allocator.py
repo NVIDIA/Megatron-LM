@@ -46,6 +46,12 @@ class KVBlockAllocator:
         self.on_blocks_deregistered: Optional[Callable] = None
         self._blocks_deregistered_observers: list[BlocksDeregisteredObserver] = []
 
+        # Handoff blocks remain pinned until decode finishes pulling them.
+        # Pinning at request finish only happens on engines with KV transfer
+        # configured (setup_kv_transfer flips this on); other engines have no
+        # release path for the pins.
+        self.enable_handoff_pinning = False
+
         assert (
             0 <= paused_limit <= pool_size - 2
         ), "paused block limit must leave at least one usable block outside the limit"
@@ -250,6 +256,21 @@ class KVBlockAllocator:
             num_blocks = blocks.numel()
             self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = blocks
             self.pool_avail += num_blocks
+
+    def retain_memory_blocks(self, block_ids: list[int]) -> None:
+        """Add one prefix-cache reference to each block.
+
+        Args:
+            block_ids: Blocks retained by a new owner.
+        """
+        assert self.enable_prefix_caching, "retaining KV blocks requires prefix caching"
+        if block_ids:
+            blocks = torch.tensor(block_ids, dtype=torch.int32, device='cpu')
+            unique_blocks, retain_counts = torch.unique(blocks, return_counts=True)
+            self.block_ref_counts[unique_blocks] += retain_counts.to(
+                dtype=self.block_ref_counts.dtype
+            )
+            self.update_timestamps(unique_blocks)
 
     def reset(self) -> None:
         """Reset the allocator to initial state.

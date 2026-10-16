@@ -157,6 +157,7 @@ def create_args():
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
     args.verify_integrity = False
+    args.save_tokenizer_assets = False
 
     yield args
 

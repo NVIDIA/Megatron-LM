@@ -9,7 +9,7 @@ that loops over requests calling `causal_conv1d_fn` with `initial_states`.
 import pytest
 import torch
 
-from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
+from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
 try:
     from causal_conv1d import causal_conv1d_fn

@@ -5,7 +5,7 @@ import unittest
 import torch
 
 try:
-    from megatron.core.ssm.ops.ssd_chunk_scan import _chunk_scan_fwd
+    from megatron.core.ssm.ops.mamba2.ssd_chunk_scan import _chunk_scan_fwd
 
     HAVE_SSD_OPS = True
 except (ImportError, Exception):

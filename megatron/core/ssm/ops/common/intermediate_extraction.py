@@ -1,7 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Fused gather + conditional-scatter kernels for Mamba intermediate-state
+"""Fused gather + conditional-scatter kernels for SSM intermediate-state
 extraction used by prefix caching.
+
+Nothing here is specific to a recurrence: the kernels only index rows of a state
+tensor by slot, so they apply to Mamba2 and any other linear-attention / SSM
+mixer that caches per-chunk intermediate states.
 
 These replace the two-step ``states[indices]`` (dense gather) + ``.copy_()``
 (scratch write) pattern with a single kernel that:
