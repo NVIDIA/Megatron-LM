@@ -413,15 +413,23 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        expert_order: Optional[List[int]] = None,
     ) -> None:
         """
         Initialize the AlltoAll token dispatcher.
 
         Args:
             num_local_experts (int): Number of local experts on the current device.
-            local_expert_indices (List[int]): Indices of local experts on the current device.
+            local_expert_indices (List[int]): Global expert ids owned by the current device.
             config (TransformerConfig): Configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+            expert_order (List[int], optional): Global expert ids in rank-major slot order (the
+                custom expert placement). Reshaped to [ep_size, num_local_experts], row r holds
+                the experts owned by EP rank r. None (default) means the contiguous placement
+                range(num_experts). The routing map/probs columns are permuted by this order at
+                dispatch time so that the downstream contiguous split logic sends each token to
+                the EP rank that owns its expert; in this "slot space" every rank owns the
+                contiguous block [ep_rank * num_local_experts, (ep_rank + 1) * num_local_experts).
         """
         super().__init__(config=config, pg_collection=pg_collection)
         self.num_local_experts = num_local_experts
@@ -432,10 +440,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert (
             len(self.local_expert_indices) == self.num_local_experts
         ), "Invalid local expert indices"
-        for i in range(len(self.local_expert_indices) - 1):
-            assert (
-                self.local_expert_indices[i] == self.local_expert_indices[i + 1] - 1
-            ), "local_expert_indices must be continuous"
+        # Custom expert placement: the local expert ids need NOT be contiguous. The routing map is
+        # remapped into contiguous rank-major slot order at dispatch time (see set_expert_order).
+        self.set_expert_order(
+            expert_order if expert_order is not None else list(range(self.num_experts)),
+            self.local_expert_indices,
+        )
 
         # [ep_size]. Represents the number of tokens sent by the current rank to other
         # EP ranks.
@@ -516,6 +526,43 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.cudagraph_attrs.append('shared_experts.gate_score')
         self.cudagraph_attrs.append('shared_experts.cached_fc1_input')
 
+    def set_expert_order(self, expert_order: List[int], local_expert_indices: List[int]) -> None:
+        """(Re)configure the custom expert placement.
+
+        Called at construction and again from MoELayer.set_layer_number() once the (per-layer)
+        placement is known. Placement only permutes which global expert maps to each local slot;
+        all shapes and num_local_experts are unchanged, so this is a metadata-only update.
+
+        Args:
+            expert_order (List[int]): Global expert ids in rank-major slot order.
+            local_expert_indices (List[int]): Global expert ids owned by this rank.
+        """
+        assert (
+            len(expert_order) == self.num_experts
+        ), f"expert_order has {len(expert_order)} entries, expected {self.num_experts}."
+        self.expert_order = list(expert_order)
+        self.local_expert_indices = list(local_expert_indices)
+        # In "slot space" (after the column permutation below) this rank always owns the
+        # contiguous block [ep_rank * num_local_experts, (ep_rank + 1) * num_local_experts).
+        self.local_slot_start = self.ep_rank * self.num_local_experts
+        self.local_slot_end = self.local_slot_start + self.num_local_experts
+        # Default contiguous placement -> no column permutation (fast path). Otherwise the gather
+        # index tensor is created lazily on the routing map's device at first use (see
+        # _get_expert_order_index) to avoid assuming a CUDA context at construction time.
+        self.expert_order_is_identity = self.expert_order == list(range(self.num_experts))
+        self._expert_order_index_cache = None
+
+    def _get_expert_order_index(self, device):
+        """Lazily build/cache the column-permutation index tensor on the given device."""
+        if self.expert_order_is_identity:
+            return None
+        cache = self._expert_order_index_cache
+        if cache is None or cache.device != device:
+            self._expert_order_index_cache = torch.tensor(
+                self.expert_order, dtype=torch.long, device=device
+            )
+        return self._expert_order_index_cache
+
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
         Preprocesses the token routing map for All-to-All communication and token permutation.
@@ -593,8 +640,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 .transpose(0, 1)
             )
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
+            # In slot space (after the expert_order column permutation) this rank owns the
+            # contiguous block [local_slot_start, local_slot_end).
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
-                :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
+                :, :, self.local_slot_start : self.local_slot_end
             ].contiguous()
             # [tp_size, ep_size, num_local_experts] -> [tp_size, ep_size]
             num_global_tokens_per_rank = num_global_tokens_per_local_expert.sum(axis=2)
@@ -657,11 +706,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         # Preprocess: Get the metadata for communication, permutation and computation operations.
         self.hidden_shape = hidden_states.shape
-        self.probs = probs
-        self.routing_map = routing_map
         assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
+        # Custom expert placement: permute the expert (column) axis into rank-major slot order so
+        # the downstream contiguous split/permute logic routes each token to the EP rank that owns
+        # its expert. Identity (default contiguous) placement is a no-op fast path.
+        expert_order_index = self._get_expert_order_index(routing_map.device)
+        if expert_order_index is not None:
+            routing_map = routing_map.index_select(1, expert_order_index)
+            probs = probs.index_select(1, expert_order_index)
+        self.probs = probs
+        self.routing_map = routing_map
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         if self.config.moe_router_padding_for_quantization:
@@ -1018,6 +1074,10 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
     expert outputs for the same wire row are summed to one row before the combine
     all-to-all; the experts apply the routing weights as with the stock dispatcher.
 
+    Combined with a co-activation expert placement (``--moe-expert-placement``),
+    which co-locates experts that tend to fire together, the number of wire rows
+    per token drops further because more of a token's experts share a rank.
+
     The default dispatcher does not call this class, so enabling this
     optimization adds no branch or metadata work to the existing hot path.
     """
@@ -1028,17 +1088,15 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        expert_order: Optional[List[int]] = None,
     ) -> None:
         super().__init__(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
             config=config,
             pg_collection=pg_collection,
+            expert_order=expert_order,
         )
-        # This rank's experts form the contiguous block [local_slot_start, local_slot_end)
-        # of the expert axis (the base class asserts contiguity).
-        self.local_slot_start = self.local_expert_indices[0]
-        self.local_slot_end = self.local_expert_indices[-1] + 1
         if self.ep_size <= 1:
             raise ValueError("Token dedup requires expert parallel size greater than one.")
         if self.tp_size > 1:
@@ -1077,6 +1135,7 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         self._dedup_wire_tokens = None
         self._dedup_wire_to_expert_rows = None
         self._dedup_expert_wire_rows = None
+        self._dedup_num_tokens = 0
         self._dedup_topk = 0
 
     def _metadata_gather_launch(
@@ -1132,6 +1191,7 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
             self.ep_rank, self.num_experts : counts_width
         ].tolist()
         self.dedup_output_splits = gathered_cpu[:, self.num_experts + self.ep_rank].tolist()
+        self.num_global_tokens_per_local_expert_cpu = local_expert_counts_cpu
         self.cuda_sync_point = "no_sync"
         self.tokens_per_expert_gpu = gathered[:, self.local_slot_start : self.local_slot_end].sum(
             dim=0
@@ -1201,6 +1261,7 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
             torch.arange(num_wire_rows, device=indices.device),
         )
         token_wire_rows = token_wire_rows.view(num_tokens, topk)
+        self._dedup_num_tokens = num_tokens
         self._dedup_topk = topk
         self._dedup_token_wire_rows = token_wire_rows
         self._dedup_wire_tokens = wire_tokens
@@ -1281,6 +1342,13 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
+        # Custom expert placement: permute the expert (column) axis into rank-major slot order.
+        # The dedup hit map is built in slot space, so placements that co-locate co-activated
+        # experts on one rank directly increase dedup opportunities.
+        expert_order_index = self._get_expert_order_index(routing_map.device)
+        if expert_order_index is not None:
+            routing_map = routing_map.index_select(1, expert_order_index)
+            probs = probs.index_select(1, expert_order_index)
         self.probs = probs
         self.routing_map = routing_map
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
@@ -1345,6 +1413,7 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
             self.dedup_row_elems = dedup_payload_width(
                 hidden_size, topk, hidden_states.element_size()
             )
+            self._dedup_num_tokens = num_tokens
             self._dedup_topk = topk
             self._dedup_token_wire_rows = token_wire_rows
             self._dedup_wire_tokens = wire_tokens_full.narrow(0, 0, num_wire_rows)

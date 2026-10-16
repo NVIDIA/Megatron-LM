@@ -450,6 +450,20 @@ dispatcher hands the experts expanded expert-major rows and routing weights exac
 > **Requirements**: `--moe-token-dispatcher-type alltoall`, `expert_model_parallel_size > 1`,
 > `--expert-tensor-parallel-size 1`, dropless routing (no capacity factor).
 
+#### Co-activation Expert Placement (`--moe-expert-placement`)
+
+`--moe-expert-placement <json>` reorders which global expert lives on which EP rank (a global or per-layer permutation
+in rank-major slot order), so that experts often selected together for the same token share a rank and dedup reaches
+them with fewer All-to-All rows. Checkpoints stay keyed by global expert id, so any placement loads from any checkpoint
+(`--no-load-optim` if the optimizer state was saved under a different placement). The placement is built offline from
+a route capture:
+
+```bash
+MOE_ROUTE_CAPTURE=1 MOE_ROUTE_CAPTURE_DIR=/path/routes MOE_ROUTE_CAPTURE_START=<iter> MOE_ROUTE_CAPTURE_CONS_ITERS=8 <training command>   # capture routes
+python tools/build_expert_placement.py /path/routes --iters <a>-<b> --num-experts <N> --ep-size <EP> [--nodes <n>] --out placement.json
+<training command> --moe-token-dedup --moe-expert-placement placement.json
+```
+
 ### Compute Optimization
 
 Fine-grained MoE produces many small operations that can underutilize GPU resources. These optimizations reduce kernel launch overhead and improve GPU utilization.
@@ -569,6 +583,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-token-drop-policy | Drop policy: probs, position | probs |
 | --moe-permute-fusion | Fuse permutation ops | False |
 | --moe-token-dedup | One All-to-All row per unique (token, destination EP rank) with the alltoall dispatcher | False |
+| --moe-expert-placement | Path to a per-layer expert placement JSON (from `tools/build_expert_placement.py`) | None |
 
 ### Performance Optimization
 | Argument | Description | Default |

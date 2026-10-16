@@ -166,6 +166,47 @@ class RouterBuilder(Protocol):
     ) -> RouterInterface: ...
 
 
+def get_expert_placement_order(config: TransformerConfig, layer_number, ep_size):
+    """Resolve the global-expert-to-EP-rank placement for a single MoE layer.
+
+    Returns a list of length ``config.num_moe_experts`` giving global expert ids in rank-major
+    slot order: reshaped to [ep_size, num_moe_experts // ep_size], row r holds the experts owned
+    by EP rank r (in local-slot order). The default (contiguous) placement is
+    ``range(num_experts)``.
+
+    ``config.moe_expert_placement`` (parsed from --moe-expert-placement) may override this with a
+    per-layer permutation (keyed by ``layer_number``) or a global 'default' permutation.
+    """
+    num_experts = config.num_moe_experts
+    placement = getattr(config, "moe_expert_placement", None)
+    if placement is None:
+        return list(range(num_experts))
+
+    order = None
+    layers = placement.get("layers") or {}
+    if layer_number is not None and layer_number in layers:
+        order = layers[layer_number]
+    elif placement.get("default") is not None:
+        order = placement["default"]
+
+    if order is None:
+        # No entry for this layer -> fall back to the default contiguous placement.
+        return list(range(num_experts))
+
+    assert len(order) == num_experts, (
+        f"moe_expert_placement for layer {layer_number} has {len(order)} entries, "
+        f"expected {num_experts}."
+    )
+    assert (
+        num_experts % ep_size == 0
+    ), f"num_moe_experts ({num_experts}) must be divisible by expert parallel size ({ep_size})."
+    assert sorted(order) == list(range(num_experts)), (
+        f"moe_expert_placement for layer {layer_number} is not a permutation of "
+        f"0..{num_experts - 1}."
+    )
+    return list(order)
+
+
 @dataclass
 class MoESubmodules:
     """MoE Layer Submodule spec"""
@@ -202,14 +243,24 @@ class BaseMoELayer(MegatronModule, ABC):
 
         assert self.config.num_moe_experts % ep_size == 0
         self.num_local_experts = self.config.num_moe_experts // ep_size
-        local_expert_indices_offset = ep_rank * self.num_local_experts
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
 
-        self.local_expert_indices = [
-            local_expert_indices_offset + i for i in range(self.num_local_experts)
-        ]
+        # `expert_order` lists global expert ids in rank-major slot order: reshaped to
+        # [ep_size, num_local_experts], row r holds the experts owned by EP rank r. With the
+        # default (contiguous) placement this is simply range(num_moe_experts). A custom
+        # placement (config.moe_expert_placement) permutes it. `local_expert_indices` are the
+        # true global ids owned by this rank -- used both for the checkpoint expert axis and,
+        # via the dispatcher's column permutation, for routing.
+        #
+        # NOTE: the layer_number is not known at construction time (TransformerLayer calls
+        # set_layer_number() afterwards), so a per-layer placement is (re)applied there. Here we
+        # resolve with whatever layer_number is available, which yields the correct result for the
+        # default/global placement and is refined once the layer number is known.
+        self._compute_local_expert_indices()
         assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
         self.router: RouterInterface = None
         self.experts = None
@@ -217,15 +268,36 @@ class BaseMoELayer(MegatronModule, ABC):
         self.token_dispatcher: Optional[MoETokenDispatcher] = None
         self.layer_number = layer_number
 
+    def _compute_local_expert_indices(self):
+        """(Re)compute expert_order and the true global expert ids owned by this rank."""
+        self.expert_order = get_expert_placement_order(self.config, self.layer_number, self.ep_size)
+        offset = self.ep_rank * self.num_local_experts
+        self.local_expert_indices = [
+            self.expert_order[offset + i] for i in range(self.num_local_experts)
+        ]
+
     @abstractmethod
     def forward(self, hidden_states):
         """Forward method for the MoE layer."""
         pass
 
     def set_layer_number(self, layer_number: int):
-        """Set the layer number for the MoE layer."""
+        """Set the layer number for the MoE layer.
+
+        The layer number is only known after construction, so re-resolve a per-layer expert
+        placement here and propagate the updated global expert ids to the token dispatcher (used
+        for routing) and the experts module (used for checkpoint expert-axis offsets). Placement
+        only permutes which global id maps to each local slot; all shapes and num_local_experts
+        are unchanged, so this is a cheap metadata update with no reallocation.
+        """
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
+        self._compute_local_expert_indices()
+        assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
+        if self.token_dispatcher is not None and hasattr(self.token_dispatcher, "set_expert_order"):
+            self.token_dispatcher.set_expert_order(self.expert_order, self.local_expert_indices)
+        if self.experts is not None and hasattr(self.experts, "local_expert_indices"):
+            self.experts.local_expert_indices = self.local_expert_indices
 
 
 class MoELayer(BaseMoELayer):
@@ -369,6 +441,7 @@ class MoELayer(BaseMoELayer):
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
+                expert_order=self.expert_order,
             )
         elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
@@ -389,6 +462,10 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
+        # Custom expert placement: the experts module keys its checkpoint expert axis by the
+        # true global expert ids owned by this rank (refreshed in set_layer_number()).
+        if hasattr(self.experts, "local_expert_indices"):
+            self.experts.local_expert_indices = self.local_expert_indices
 
         # Initialize shared experts
         if self.use_shared_expert:

@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, Zyphra Technologies Inc. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
@@ -8,6 +9,7 @@ from typing import Optional, Sequence, Union
 
 import torch
 
+from megatron.core.capture import get_capturer
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -175,6 +177,18 @@ class Router(ABC, MegatronModule):
         self.layer_number = layer_number
         if getattr(self, "router_replay", None) is not None:
             self.router_replay.layer_number = layer_number
+
+    def _capture_layer_number(self) -> int:
+        """Layer key used by the expert-affinity route capture.
+
+        MTP routers reuse the decoder layer numbering, so they are offset past the
+        decoder layers (the same convention as the aux-loss tracker) to keep the
+        captured ``moe_layer_indices`` unique within a forward pass.
+        """
+        layer_number = self.layer_number if self.layer_number is not None else 0
+        if self.is_mtp_layer:
+            layer_number = layer_number + self.config.num_layers
+        return int(layer_number)
 
 
 class TopKRouter(Router):
@@ -1086,7 +1100,13 @@ class TopKRouter(Router):
                 if topk_indices_dtype is not None
                 else None
             )
-            probs, routing_map = topk_routing_with_score_function(
+            # Expert-affinity route capture (env-var gated; a no-op unless MOE_ROUTE_CAPTURE=1 and
+            # this forward falls inside the capture window). It needs the dense top-k
+            # selection, which only the unfused path exposes. The dense-index route buffer of
+            # the flex backends is left untouched, so those layouts are not captured.
+            capturer = get_capturer()
+            expose_topk = capturer.wants_router and topk_indices is None
+            routing_output = topk_routing_with_score_function(
                 logits,
                 self.topk,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -1098,7 +1118,21 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
                 topk_indices=topk_indices,
+                return_topk=expose_topk,
             )
+            if expose_topk:
+                probs, routing_map, top_indices, top_probs = routing_output
+                # top_indices / top_probs are [num_tokens, topk] over logits' flattened
+                # [s, b] token axis; the capture format is [b, s, topk]. Recorded here,
+                # before padding-masking and token dropping, so it reflects the router's
+                # own decision.
+                capturer.record_router(
+                    self._capture_layer_number(),
+                    top_indices.view(seq_length, bsz, self.topk).transpose(0, 1),
+                    top_probs.view(seq_length, bsz, self.topk).transpose(0, 1),
+                )
+            else:
+                probs, routing_map = routing_output
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:

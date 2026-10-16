@@ -655,6 +655,15 @@ class TestMoEModules:
             pytest.param("alltoall", 2, {"moe_permute_fusion": HAVE_TE_PERMUTE}, id="alltoall-ep2"),
             pytest.param("alltoall", 2, {"moe_token_dedup": True}, id="alltoall-dedup-ep2"),
             pytest.param(
+                "alltoall",
+                2,
+                {
+                    "moe_token_dedup": True,
+                    "moe_expert_placement": {"default": [3, 1, 0, 2, 7, 5, 4, 6], "layers": {}},
+                },
+                id="alltoall-dedup-placement-ep2",
+            ),
+            pytest.param(
                 "flex",
                 2,
                 {"moe_flex_dispatcher_backend": "deepep"},

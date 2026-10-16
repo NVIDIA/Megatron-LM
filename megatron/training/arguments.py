@@ -1566,7 +1566,7 @@ def validate_args(args, defaults={}):
         assert args.num_experts % args.expert_model_parallel_size == 0, \
             "Number of experts should be a multiple of expert model parallel_size."
 
-    # Token dedup (see validate_moe_args).
+    # Custom expert placement / token dedup (parses and validates --moe-expert-placement).
     validate_moe_args(args)
 
     # MoE router check
@@ -1997,11 +1997,69 @@ def validate_args(args, defaults={}):
     return args
 
 
-def validate_moe_args(args, defaults={}):
-    """Validate the token-dedup MoE options.
+def _validate_expert_placement_perm(perm, num_experts, ep_size, ctx):
+    """Validate a single placement array: it must be a permutation of range(num_experts)
+    that reshapes cleanly to [ep_size, num_experts // ep_size]."""
+    if not isinstance(perm, (list, tuple)):
+        raise ValueError(f"moe-expert-placement {ctx}: expected a list, got {type(perm)}.")
+    perm = [int(x) for x in perm]
+    if len(perm) != num_experts:
+        raise ValueError(
+            f"moe-expert-placement {ctx}: expected {num_experts} entries, got {len(perm)}.")
+    if sorted(perm) != list(range(num_experts)):
+        raise ValueError(
+            f"moe-expert-placement {ctx}: entries must be a permutation of 0..{num_experts - 1}.")
+    if num_experts % ep_size != 0:
+        raise ValueError(
+            f"moe-expert-placement {ctx}: num_experts ({num_experts}) must be divisible by "
+            f"expert-model-parallel-size ({ep_size}).")
+    return perm
 
-    Runs from validate_args once num_experts and expert_model_parallel_size are final.
+
+def _parse_moe_expert_placement(path, num_experts, ep_size):
+    """Load and validate the placement JSON. Returns a dict
+    {'default': list|None, 'layers': {int: list}} with validated permutations."""
+    if num_experts is None:
+        raise ValueError("--moe-expert-placement requires --num-experts to be set.")
+    with open(path, 'r') as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError("--moe-expert-placement JSON must be an object.")
+    if 'num_experts' in raw and int(raw['num_experts']) != num_experts:
+        raise ValueError(
+            f"--moe-expert-placement num_experts ({raw['num_experts']}) does not match "
+            f"--num-experts ({num_experts}).")
+    parsed = {'default': None, 'layers': {}}
+    if raw.get('default') is not None:
+        parsed['default'] = _validate_expert_placement_perm(
+            raw['default'], num_experts, ep_size, "'default'")
+    for layer_key, perm in (raw.get('layers') or {}).items():
+        layer_number = int(layer_key)
+        parsed['layers'][layer_number] = _validate_expert_placement_perm(
+            perm, num_experts, ep_size, f"layer {layer_number}")
+    if parsed['default'] is None and not parsed['layers']:
+        raise ValueError(
+            "--moe-expert-placement JSON must define at least a 'default' or 'layers' entry.")
+    return parsed
+
+
+def validate_moe_args(args, defaults={}):
+    """Validate the token-dedup / expert-placement MoE options and parse the placement file.
+
+    Runs from validate_args once num_experts and expert_model_parallel_size are final. The CLI
+    takes a JSON path (dest ``moe_expert_placement_path``); the parsed dict lands in
+    ``args.moe_expert_placement``, the TransformerConfig field.
     """
+    args.moe_expert_placement = None
+    path = getattr(args, 'moe_expert_placement_path', None)
+    if path is not None:
+        args.moe_expert_placement = _parse_moe_expert_placement(
+            path, args.num_experts, args.expert_model_parallel_size)
+        if args.moe_token_dispatcher_type != 'alltoall':
+            raise ValueError(
+                "--moe-expert-placement currently only supports "
+                "--moe-token-dispatcher-type alltoall, got "
+                f"'{args.moe_token_dispatcher_type}'.")
     if getattr(args, 'moe_token_dedup', False):
         if args.moe_token_dispatcher_type != 'alltoall':
             raise ValueError(
@@ -2374,6 +2432,7 @@ def _add_network_size_args(parser):
         "embedding_init_method",
         "activation_func",
         "experimental_attention_variant_loss_scale_func",
+        "moe_expert_placement",  # dict field; the CLI takes a JSON path (--moe-expert-placement)
         # types affect docstring
         "pipeline_model_parallel_layout",
         "window_size",
@@ -3474,7 +3533,24 @@ def _add_moe_args(parser):
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
     # NOTE: --moe-token-dedup is auto-generated from the TransformerConfig dataclass field by
-    # ArgumentGroupFactory (see _add_network_size_args).
+    # ArgumentGroupFactory (see _add_network_size_args). moe_expert_placement is a dict field,
+    # excluded from auto-generation; the CLI takes a JSON path here (dest
+    # moe_expert_placement_path) which validate_moe_args parses into args.moe_expert_placement.
+    group.add_argument('--moe-expert-placement', '--moe-expert-placement-path',
+                       type=str, default=None,
+                       dest='moe_expert_placement_path',
+                       help='Path to a JSON file describing a custom global-expert-to-EP-rank placement, '
+                       'replacing the default contiguous block placement. The JSON has the form '
+                       '{"num_experts": N, "default": [perm of 0..N-1], "layers": {"<layer_number>": [perm]}}. '
+                       'Each array lists global expert ids in rank-major slot order: reshaped to '
+                       '[expert_model_parallel_size, num_experts // ep_size], row r gives the experts owned by '
+                       'EP rank r (in local-slot order). "default" applies to every MoE layer; per-layer entries '
+                       'in "layers" (keyed by global layer number) override it. Each EP rank keeps the same number '
+                       'of experts. Because the placement names EP ranks, it is expert-parallel-size specific; '
+                       'checkpoints store weights/optimizer state by global expert id, so a run may load a '
+                       'checkpoint that was saved with a different placement (weights are reshuffled to the new '
+                       'owners automatically). Build it with tools/build_expert_placement.py from a route capture. '
+                       'Currently only supported with --moe-token-dispatcher-type alltoall.')
     # Router arguments
     group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
                        choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'quantile_balancing', 'none'],

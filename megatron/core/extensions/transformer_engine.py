@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, Zyphra Technologies Inc. All rights reserved.
 from __future__ import annotations
 
 import copy
@@ -3085,11 +3086,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 return grouped_splits[gemm_idx]
 
             num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
-            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
+            # Custom expert placement: local_expert_indices (set by TEGroupedMLP) gives the true
+            # global expert ids owned by this rank. None -> default contiguous block.
+            local_expert_indices = getattr(self, "local_expert_indices", None)
+            if local_expert_indices is None:
+                offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
+                global_expert_ids = [offset + g for g in range(self.num_gemms)]
+            else:
+                global_expert_ids = list(local_expert_indices)
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
             for gemm_idx in range(self.num_gemms):
-                global_expert_idx = local_expert_indices_offset + gemm_idx
+                global_expert_idx = global_expert_ids[gemm_idx]
                 state_dict = {
                     f"{gemm_idx}.weight": get_gemm_tensor("weight", gemm_idx),
                     f"{gemm_idx}._extra_state": extra_states[gemm_idx],
