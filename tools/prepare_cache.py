@@ -176,7 +176,7 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
         cfg.finalize_batch_sizes(get_batch_parallel_size(args))
         set_run_config(cfg)
         # Derive train_iters from --train-samples when needed (pretrain() does the same).
-        update_train_iters()
+        update_train_iters(cfg.train)
         train_valid_test_num_samples = get_train_valid_test_num_samples()
         _print_effective_configuration(args, train_valid_test_num_samples, ignored_flags)
 

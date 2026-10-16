@@ -156,7 +156,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
-from megatron.training.config import FaultInjectorConfig
+from megatron.training.config import FaultInjectorConfig, TrainingConfig
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -2302,29 +2302,28 @@ def pretrain(
     _end_otel_job_spans()
 
 
-def update_train_iters():
-    cfg = get_run_config()
-
+def update_train_iters(train: TrainingConfig) -> None:
+    """Resolve the sample-based training horizon on the supplied training config."""
     # For iteration-based training, we don't need to do anything
-    if cfg.train.train_iters:
+    if train.train_iters:
         return
 
-    if cfg.train.step_batch_size_schedule is not None:
+    if train.step_batch_size_schedule is not None:
         # Sample based training with step batch size schedule.
         iterations = 0
         consumed_samples = 0
-        while consumed_samples < cfg.train.train_samples:
+        while consumed_samples < train.train_samples:
             update_num_microbatches(consumed_samples, consistency_check=False)
             consumed_samples += get_current_global_batch_size()
             iterations += 1
         # Reset
         update_num_microbatches(0, consistency_check=False)
-        cfg.train.train_iters = iterations
+        train.train_iters = iterations
     else:
         # Constant batch size with sample-based training.
-        cfg.train.train_iters = cfg.train.train_samples // cfg.train.global_batch_size
+        train.train_iters = train.train_samples // train.global_batch_size
 
-    print_rank_0(f'setting training iterations to {cfg.train.train_iters}')
+    print_rank_0(f'setting training iterations to {train.train_iters}')
 
 
 def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_parameters):
@@ -2796,7 +2795,7 @@ def get_optimizer_param_scheduler(optimizer):
         # We need to set training iters for later use. Technically
         # we need to adjust the training samples too (due to last
         # batch being incomplete) but we leave it as is for now.
-        update_train_iters()
+        update_train_iters(cfg.train)
         if args.lr_decay_samples is None:
             args.lr_decay_samples = cfg.train.train_samples
         lr_decay_steps = args.lr_decay_samples
@@ -3027,7 +3026,7 @@ def setup_model_and_optimizer(
         optimizer, opt_param_scheduler = None, None
         # In RL inference-only mode, train_iters must still be set despite having no optimizer.
         if perform_rl_step:
-            update_train_iters()
+            update_train_iters(cfg.train)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers

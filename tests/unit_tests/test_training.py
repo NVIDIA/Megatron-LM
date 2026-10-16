@@ -259,13 +259,18 @@ class TestGetModelBucketSizingPgCollection:
 class TestPackedSampleAccounting:
     @pytest.mark.parametrize("schedule,expected_iters", [(None, 4), ("0:8 32:16", 6)])
     def test_sample_horizon_uses_config_and_resets_batch_schedule(
-        self, monkeypatch, run_config, schedule, expected_iters
+        self, monkeypatch, schedule, expected_iters
     ):
         from megatron.core import num_microbatches_calculator as calculator
-        from megatron.training.training import update_train_iters
+        from megatron.training import training
 
         monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
-        run_config.train = TrainingConfig(
+
+        def unexpected_global_config():
+            raise AssertionError("sample horizon must use the supplied TrainingConfig")
+
+        monkeypatch.setattr(training, "get_run_config", unexpected_global_config)
+        train = TrainingConfig(
             micro_batch_size=2,
             global_batch_size=16,
             train_samples=64,
@@ -278,8 +283,8 @@ class TestPackedSampleAccounting:
             data_parallel_size=1,
             step_batch_size_schedule=schedule,
         )
-        update_train_iters()
-        assert run_config.train.train_iters == expected_iters
+        training.update_train_iters(train)
+        assert train.train_iters == expected_iters
         assert calculator.get_current_global_batch_size() == (8 if schedule else 16)
 
     @pytest.mark.parametrize(
