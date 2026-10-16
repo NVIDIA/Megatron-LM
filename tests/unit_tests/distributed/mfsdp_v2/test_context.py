@@ -19,6 +19,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
+    iteration,
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContext
@@ -158,7 +159,7 @@ def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
 
 
 def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
-    """Independent roots should share streams and follow construction order."""
+    """Independent roots share topology and execute within one iteration scope."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -170,7 +171,8 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
 
     with torch.no_grad():
         for _ in range(3):
-            model(torch.ones(2, 4, device=device))
+            with iteration(model.layers[0].context):
+                model(torch.ones(2, 4, device=device))
 
     context = model.layers[0].context
     assert model.layers[1].context is context
@@ -193,7 +195,8 @@ def test_sibling_roots_enqueue_one_post_backward_wait(distributed_setup, monkeyp
     post_backward = Mock(wraps=context.post_backward)
     monkeypatch.setattr(context, "post_backward", post_backward)
 
-    model(torch.ones(2, 4, device=device)).sum().backward()
+    with iteration(context):
+        model(torch.ones(2, 4, device=device)).sum().backward()
 
     post_backward.assert_called_once_with()
 

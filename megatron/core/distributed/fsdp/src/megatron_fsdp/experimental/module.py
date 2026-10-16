@@ -274,13 +274,7 @@ class FsdpModule:
 
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
-            if (
-                not context.iteration_order.active
-                and not is_recomputing
-                and next(iter(context.forward_order), None) is self
-            ):
-                # A context can concatenate several static roots; reset only
-                # where the complete forward traversal begins.
+            if not context.iteration_order.active and not is_recomputing:
                 context.forward_order.reset()
 
         self.unshard(prefetch="forward" if not is_recomputing else "recompute")
@@ -409,10 +403,7 @@ class FsdpModule:
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            if (
-                not context.iteration_order.active
-                and next(iter(context.backward_order), None) is self
-            ):
+            if not context.iteration_order.active:
                 context.backward_order.reset()
             context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the
