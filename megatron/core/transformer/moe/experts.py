@@ -838,14 +838,20 @@ class TEGroupedMLP(MegatronModule):
                 if fine_grained_activation_offloading and output_buffer is None
                 else []
             )
-            # Deterministic mode: TE's fused grouped-MLP backward accumulates the routing-prob
-            # gradient (dprob) with atomics inside the fused dactivation kernel, so the router
+            # Deterministic mode: TE's op fuser builds its CuTe fused grouped MLP only for the
+            # MXFP8 / NVFP4 recipes, and that fused backward accumulates the routing-prob
+            # gradient (dprob) with atomics inside the cuDNN dactivation epilogue, so the router
             # gradient is not bit-reproducible (newer TE raises for this on the GLU path). Feed a
             # unit scale to the fused op and apply the probs on the FC2 output instead: without
             # an FC2 bias the two placements are the same function, and the prob gradient
-            # becomes an ordinary (deterministic) torch reduction.
+            # becomes an ordinary (deterministic) torch reduction. The BF16 op-fuser path runs
+            # the separate scaled-GLU op, whose scale gradient is already reproducible, so it is
+            # left untouched and its numerics do not change.
             post_probs = None
-            if getattr(self.config, "deterministic_mode", False):
+            fused_cute_grouped_mlp = (
+                self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.mxfp8
+            ) or (self.config.fp4 and self.config.fp4_recipe == Fp4Recipe.nvfp4)
+            if getattr(self.config, "deterministic_mode", False) and fused_cute_grouped_mlp:
                 if self.linear_fc2.use_bias:
                     raise RuntimeError(
                         "deterministic_mode with the Transformer Engine operation-fuser grouped "

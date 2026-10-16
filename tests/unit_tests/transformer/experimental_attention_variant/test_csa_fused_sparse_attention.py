@@ -2961,8 +2961,13 @@ class TestFusedIndexerSparseAttnFromTopk:
     def test_deterministic_mode_replaces_indexer_dk_before_cudnn_grads(self, monkeypatch):
         """The caller-supplied-top-k path precomputes the atomic-free indexer dK in the forward
         when deterministic mode is on and the query requires grad (dW stays cuDNN's off SM90)."""
+        torch.manual_seed(0)
         inputs = self._inputs()
         inputs['query'].requires_grad_()
+        # The indexer score is w * relu(q . k): keep q and k positive so every selected key
+        # receives a non-zero gradient regardless of the draw.
+        inputs['q_indexer'] = inputs['q_indexer'].abs() + 0.1
+        inputs['k_indexer'] = inputs['k_indexer'].abs() + 0.1
         total_q, num_heads, _ = inputs['query'].shape
         total_comp, idx_dim = inputs['k_indexer'].shape
         lse = torch.zeros(total_q, num_heads)
