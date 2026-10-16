@@ -20,7 +20,7 @@ from __future__ import annotations
 import enum
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Literal, cast
+from typing import cast
 from weakref import ref
 
 import torch
@@ -33,6 +33,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
 from .execution_order import ExecutionOrder
+from .iteration import DemandPhase
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
@@ -274,9 +275,9 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        self.unshard(prefetch="forward" if not is_recomputing else "none")
+        self.unshard(prefetch="forward" if not is_recomputing else "recompute")
 
-    def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
+    def unshard(self, prefetch: DemandPhase = "none") -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
         External schedulers invoking this directly (rather than through the
@@ -286,6 +287,10 @@ class FsdpModule:
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
         """
+        # Combined hooks may run forward recomputation inside backward.
+        if prefetch == "forward" and _is_in_backward():
+            prefetch = "recompute"
+        scoped = self.context.iteration_order.advance(self, prefetch)
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
@@ -294,7 +299,14 @@ class FsdpModule:
             self.context.current_stream().wait_event(self._unshard_event)
 
             context = self.context
-            if prefetch == "forward":
+            if scoped:
+                budget = (
+                    self._schedule_policy.forward_prefetch_size
+                    if prefetch == "forward"
+                    else self._schedule_policy.backward_prefetch_size
+                )
+                context.iteration_order.prefetch(0 if prefetch == "none" else budget)
+            elif prefetch == "forward":
                 self._prefetch_parameter_groups(
                     context.forward_order, self._schedule_policy.forward_prefetch_size
                 )

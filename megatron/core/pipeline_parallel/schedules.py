@@ -9,6 +9,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.models.common.mfsdp_iteration import with_mfsdp_iteration
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -721,6 +722,7 @@ def _reset_activation_offload(
     off_interface.reset(process_group=pg_collection.tp_dp_cp)
 
 
+@with_mfsdp_iteration
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -1017,6 +1019,7 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
     return schedule_table
 
 
+@with_mfsdp_iteration
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -2173,6 +2176,7 @@ def _prepare_forward_data_iterator(data_iterator, p2p_communicator, *, is_multim
     return chain((batch,), data_iterator)
 
 
+@with_mfsdp_iteration
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,

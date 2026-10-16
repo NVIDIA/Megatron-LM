@@ -60,6 +60,44 @@ with a record-and-replay mechanism.
 3. Different input sizes may require different runtime orders for efficiency. We could
    capture or compute multiple orders for the runtime to choose from.
 
+## MFSDP v2 iteration demand recording
+
+The experimental v2 runtime can record one complete iteration and prefetch from
+that demand order on subsequent iterations. Forward, backward, recomputation,
+and repeated calls share one occurrence cursor. Prefetch gathers are not recorded.
+The first successful iteration of each schedule gathers on demand; failed or
+incompletely replayed iterations invalidate that schedule's recording.
+
+Pipeline entry points use `with_mfsdp_iteration` to scope the complete local
+schedule, including all VPP chunks and combined 1F1B nodes. Nested combined
+calls join the existing scope. Root hooks do not reset cursors. Training and
+validation, microbatch counts, and VPP grouping select separate recordings.
+
+Custom schedules can use the scope directly:
+
+```python
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import iteration
+
+with iteration(context, key=("train", num_microbatches)):
+    run_all_local_model_chunks()
+context.finish_grad_sync()  # after all backward and delayed wgrad producers
+optimizer.step()
+```
+
+Use a new key or `rerecord=True` when changing the schedule. All DP peers must
+follow a compatible, stable schedule; a local mismatch exception is not a
+collective-safe recovery protocol. Discard failed computation before retrying.
+
+Demand hooks still wait for their own gather, including if an intervening
+reshard invalidated an earlier speculative prefetch. Existing release and
+parameter-completion hooks retain CUDA stream and gradient-readiness ownership.
+The recorder neither reduces gradients nor infers completion from node counts.
+
+CUDA graph schedules retain their prior behavior: Python-hook recording does
+not cover graph replay. CUDA graph lifecycle support and performance tuning
+are outside this change. The construction-order path remains available when
+no iteration scope is active.
+
 # Alternatives considered
 
 ## FSDP1
