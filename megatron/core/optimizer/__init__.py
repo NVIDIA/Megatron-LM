@@ -1163,16 +1163,17 @@ def get_megatron_optimizer(
                 param_groups = _get_param_groups(
                     model_chunk, config, config_overrides, param_group_process_group
                 )
+                # Empty local shards need no optimizer update. Excluding them also avoids
+                # gradient casts and optimizer bookkeeping that create temporary tensors.
+                for param_group in param_groups:
+                    param_group['params'] = [
+                        parameter
+                        for parameter in param_group['params']
+                        if parameter.to_local().numel() > 0
+                    ]
                 if not is_te_min_version("2.18.0"):
-                    # TE FusedAdam can skip pending updates when a group ends in an empty tensor:
+                    # Preserve the empty-group workaround for older TE FusedAdam:
                     # https://github.com/NVIDIA/TransformerEngine/issues/3207.
-                    # Empty local shards have no optimizer state or data to update, so omit them.
-                    for param_group in param_groups:
-                        param_group['params'] = [
-                            parameter
-                            for parameter in param_group['params']
-                            if parameter.to_local().numel() > 0
-                        ]
                     param_groups = [
                         param_group for param_group in param_groups if param_group['params']
                     ]

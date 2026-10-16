@@ -446,7 +446,8 @@ class TestMcoreAdapterDense:
         delayed_losses = train(delayed_layer, delayed_layer.backward_dw)
         torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
 
-    def test_build_train_and_step(self):
+    @pytest.mark.parametrize("use_precision_aware_optimizer", [False, True])
+    def test_build_train_and_step(self, use_precision_aware_optimizer):
         """Match eager training against an MFSDP v2 train-and-step sequence."""
         config = TransformerConfig(
             num_layers=2,
@@ -488,19 +489,26 @@ class TestMcoreAdapterDense:
             # clipping is fixed.
             clip_grad=0.0,
         )
+        moment_dtype = torch.bfloat16 if use_precision_aware_optimizer else torch.float32
         reference_optimizer = get_megatron_optimizer(reference_optimizer_config, [reference_model])
         optimizer = get_megatron_optimizer(
             replace(
                 reference_optimizer_config,
-                use_precision_aware_optimizer=True,
+                use_precision_aware_optimizer=use_precision_aware_optimizer,
                 # Exercise MFSDP v2's precision-aware optimizer with BF16 moment state.
-                exp_avg_dtype=torch.bfloat16,
-                exp_avg_sq_dtype=torch.bfloat16,
+                exp_avg_dtype=moment_dtype,
+                exp_avg_sq_dtype=moment_dtype,
             ),
             [model],
         )
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
+        empty_shards = torch.tensor(
+            sum(param.to_local().numel() == 0 for param in model.parameters()), device="cuda"
+        )
+        torch.distributed.all_reduce(empty_shards)
+        assert empty_shards.item() > 0, "The test must exercise empty local shards."
+        assert all(param.to_local().numel() > 0 for param in optimizer.get_parameters())
 
         steps = [
             [
@@ -522,6 +530,8 @@ class TestMcoreAdapterDense:
                     )
 
                 optimizer.zero_grad(set_to_none=True)
+                if isinstance(optimizer, FullyShardedOptimizer):
+                    assert all(param.grad is None for param in model.parameters())
                 microbatch_losses = run_forward_backward_on_microbatches(
                     model,
                     forward,
@@ -537,8 +547,8 @@ class TestMcoreAdapterDense:
         losses = run(model, optimizer)
 
         for state in optimizer.optimizer.state.values():
-            assert state["exp_avg"].dtype == torch.bfloat16
-            assert state["exp_avg_sq"].dtype == torch.bfloat16
+            assert state["exp_avg"].dtype == moment_dtype
+            assert state["exp_avg_sq"].dtype == moment_dtype
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
 
     def test_fused_sgd_casts_mismatched_grads(self):
