@@ -100,6 +100,11 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    mtp_repeated_layer_shared_components: Optional[List[str]] = None
+    """Components obtained by the first repeated MTP layer invocation and reused by later ones.
+    Currently supported components are "latent_kv" and "sparse_attention_index". None or an
+    empty list disables repeated-layer sharing."""
+
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
     This prevents MTP loss gradients from flowing back to the main model,
@@ -372,11 +377,12 @@ class TransformerConfig(ModelParallelConfig):
     """Number of top-k tokens to select in DSA indexer."""
 
     dsa_indexer_topk_freq: int = 1
-    """Frequency of DSA indexer top-k computation across layers.
-    A value greater than 1 enables cross-layer top-k sharing."""
+    """Frequency of DSA indexer top-k computation across globally numbered Transformer and MTP
+    layers. A value greater than 1 enables cross-layer top-k sharing. This does not control
+    sharing across repeated MTP layer invocations; use mtp_repeated_layer_shared_components."""
 
     dsa_indexer_skip_topk_offset: int = 0
-    """Layer offset for DSA cross-layer top-k sharing."""
+    """Global layer-number offset for DSA cross-layer top-k sharing."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
@@ -384,6 +390,17 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    dsa_indexer_reuse_checkpoint_topk: bool = False
+    """Whether a recomputed DSA layer reuses the top-k selected by its checkpoint's first call.
+
+    The first call of a checkpointed top-k-computing layer runs without grad and skips the
+    indexer loss, so its replay reruns the dense indexer and top-k only to recover the
+    selected scores for that loss. When enabled, the first call also keeps the selected fp32
+    scores, ``[batch, sequence, dsa_indexer_topk]`` per computing layer per in-flight
+    microbatch, and the replay computes the sparse indexer loss from them. Requires
+    ``dsa_kernel_backend='cudnn'``, the sparse indexer loss and cross-layer top-k sharing
+    (``dsa_indexer_topk_freq > 1``). Has no effect without full or ``core_attn`` recompute."""
 
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
     """Precision used only by the fused compact DSA indexer forward and Top-K."""
@@ -1255,6 +1272,18 @@ class TransformerConfig(ModelParallelConfig):
     and Dynamic CP for GDN2. GDN and KDA layers follow this field unchanged.
     """
 
+    #############################
+    # Pipeline Parallel Prewarm
+    #############################
+    pipeline_model_parallel_prewarm: bool = False
+    """Initialize lazy kernels concurrently across pipeline stages before training.
+
+    Each PP rank runs one synthetic eager forward/backward pass for every transformer layer in
+    its local PP/VPP model chunks. The passes do not use pipeline P2P communication, so pipeline
+    stages can initialize their local kernels concurrently. This does not capture or replay CUDA
+    Graphs and can be used independently of ``cuda_graph_impl``.
+    """
+
     ##################
     # Cuda Graphs
     ##################
@@ -1377,6 +1406,17 @@ class TransformerConfig(ModelParallelConfig):
     replay can cover iterations whose real packed microbatch count changes at a fixed source
     global batch size. Increasing the source global batch size with step_batch_size_schedule
     after capture is rejected rather than retaining an unbounded number of graph instances."""
+
+    cuda_graph_static_dynamic_cp: bool = False
+    """Allow dynamic CP with a full-iteration graph only through the static-certificate path.
+
+    This is an explicit fail-closed opt-in, not general dynamic-CP CUDA Graph support. The
+    dynamic scheduler still runs eagerly before every iteration, while each realized
+    microbatch slot must retain the captured microbatch count, effective CP size, process-group
+    identity and rank membership, partition mode, and (for CP>1) exact packed boundaries and
+    route-defining geometry. Any mismatch is rejected before replay. This option is only valid
+    for the full-iteration CUDA Graph implementation; layer/chunk implementations reject it.
+    """
 
     ####################
     # Hyper-Connection Configuration
@@ -1671,6 +1711,13 @@ class TransformerConfig(ModelParallelConfig):
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        # Full-iteration capture cannot include the per-step pipeline shape handshake. Enable
+        # the shared fixed-shape packed-P2P path before the base config validates its static
+        # token-capacity, padding, and sequence-parallel divisibility requirements.
+        if self.cuda_graph_impl == "full_iteration" and (
+            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
+        ):
+            self.pipeline_p2p_fixed_shape = True
         super().__post_init__()
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
@@ -1984,6 +2031,44 @@ class TransformerConfig(ModelParallelConfig):
                     f"csa_compress_ratios={self.csa_compress_ratios}). Without one the "
                     "flag would only add per-microbatch prebuild work."
                 )
+
+        shared_components = self.mtp_repeated_layer_shared_components
+        if shared_components is not None and not isinstance(shared_components, list):
+            raise ValueError("mtp_repeated_layer_shared_components must be a list or None.")
+        if shared_components is not None:
+            allowed_components = {"latent_kv", "sparse_attention_index"}
+            if any(not isinstance(component, str) for component in shared_components):
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components entries must be strings; supported "
+                    "components are 'latent_kv' and 'sparse_attention_index'."
+                )
+            if len(shared_components) != len(set(shared_components)):
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components must not contain duplicate components."
+                )
+            unknown_components = set(shared_components) - allowed_components
+            if unknown_components:
+                raise ValueError(
+                    "Unsupported mtp_repeated_layer_shared_components "
+                    f"{sorted(unknown_components)}; supported components are "
+                    f"{sorted(allowed_components)}."
+                )
+
+        if shared_components:
+            if self.experimental_attention_variant != "dsa":
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components currently requires "
+                    "experimental_attention_variant='dsa'."
+                )
+            if not self.mtp_use_repeated_layer:
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components requires mtp_use_repeated_layer=True."
+                )
+            if self.mtp_num_layers is None or self.mtp_num_layers <= 1:
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components requires mtp_num_layers > 1."
+                )
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
@@ -2092,6 +2177,41 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+            if self.dsa_indexer_reuse_checkpoint_topk:
+                from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                    use_fused_dsa_kernels,
+                )
+
+                if self.dsa_kernel_backend != "cudnn":
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk requires dsa_kernel_backend='cudnn', "
+                        f"got {self.dsa_kernel_backend!r}."
+                    )
+                if not use_fused_dsa_kernels(self):
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk requires the fused DSA kernels "
+                        "(attention_backend != unfused); otherwise the replay always reruns the "
+                        "dense indexer."
+                    )
+                if self.overlap_moe_expert_parallel_comm and self.recompute_granularity == "full":
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk does not support full recompute with "
+                        "overlap_moe_expert_parallel_comm: that schedule replays layers without "
+                        "the forward-sharing checkpoint wrapper, so no top-k can be reused."
+                    )
+                if not self.dsa_indexer_use_sparse_loss or not (
+                    (self.dsa_indexer_loss_coeff or 0.0) > 0
+                ):
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk requires the sparse indexer loss: "
+                        "set dsa_indexer_use_sparse_loss=True and dsa_indexer_loss_coeff > 0."
+                    )
+                if self.dsa_indexer_topk_freq <= 1:
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk reuses top-k through cross-layer "
+                        "sharing and requires dsa_indexer_topk_freq > 1, got "
+                        f"{self.dsa_indexer_topk_freq}."
+                    )
             if has_context_parallelism:
                 cp_comm_types = (
                     self.cp_comm_type
@@ -2785,6 +2905,15 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_modules = ["core_attn"]
 
         if self.recompute_granularity == "selective":
+            if (
+                "latent_kv" in (self.mtp_repeated_layer_shared_components or [])
+                and "core_attn" in self.recompute_modules
+            ):
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components containing latent_kv does not support "
+                    "selective core_attn recompute. Use full recompute, select mla_up_proj "
+                    "instead, or disable latent_kv sharing."
+                )
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
                     "core_attn",
@@ -3976,6 +4105,21 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
             )
+        if (
+            self.mtp_repeated_layer_shared_components
+            and graph_captures_attention
+            and self.cuda_graph_impl != "full_iteration"
+        ):
+            raise ValueError(
+                "mtp_repeated_layer_shared_components does not support per-layer CUDA graph "
+                "scopes that capture attention. Use a MoE-only scope or a full-iteration graph "
+                "that contains the complete MTP producer-consumer chain."
+            )
+
+        if self.pipeline_model_parallel_prewarm:
+            assert (
+                self.pipeline_model_parallel_size > 1
+            ), "pipeline_model_parallel_prewarm requires pipeline_model_parallel_size > 1."
 
         if self.cuda_graph_impl != "none":
 
@@ -4057,6 +4201,13 @@ class TransformerConfig(ModelParallelConfig):
                 assert self.cuda_graph_warmup_steps >= 2, (
                     "Transformer Engine whole-MoE CUDA graphs with paged stash require at least "
                     "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
+                )
+
+            if self.cuda_graph_impl == "full_iteration" and self.moe_paged_stash:
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Full-iteration CUDA graphs with paged stash require at least two eager "
+                    "warmup steps to discover the stash schedule and allocate its buffers "
+                    "before capture."
                 )
 
             if self.recompute_granularity:
@@ -4534,6 +4685,19 @@ class TransformerConfig(ModelParallelConfig):
                     "Disable MoE capacity/expert padding."
                 )
 
+        if self.cuda_graph_static_dynamic_cp:
+            assert self.cuda_graph_impl == "full_iteration", (
+                "--cuda-graph-static-dynamic-cp is only valid with "
+                "cuda_graph_impl='full_iteration'."
+            )
+            assert (
+                self.dynamic_context_parallel
+            ), "--cuda-graph-static-dynamic-cp requires --dynamic-context-parallel."
+            assert self.sequence_packing_scheduler == 'default_dynamic_cp', (
+                "--cuda-graph-static-dynamic-cp requires "
+                "sequence_packing_scheduler='default_dynamic_cp'."
+            )
+
         if self.cuda_graph_impl != "none" and (
             self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
         ):
@@ -4550,6 +4714,45 @@ class TransformerConfig(ModelParallelConfig):
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
             )
+            if self.cuda_graph_impl == "full_iteration":
+                # The full-iteration graph captures the whole forward_backward_func,
+                # so the entire batch path must satisfy the THD static-input
+                # contract: fixed per-rank token capacity, fixed cu_seqlens width,
+                # a fixed num_microbatches per step, and a static CP topology.
+                assert self.sequence_packing_scheduler is not None, (
+                    "THD full-iteration CUDA graph is only supported with a "
+                    "sequence packing scheduler."
+                )
+                if self.dynamic_context_parallel:
+                    assert self.cuda_graph_static_dynamic_cp, (
+                        "THD full-iteration CUDA graph with dynamic context parallelism "
+                        "requires --cuda-graph-static-dynamic-cp. This explicit opt-in "
+                        "enables per-slot realized-schedule certification; it does not "
+                        "permit the schedule topology to change after capture."
+                    )
+                assert self.max_seqlen_per_dp_cp_rank is not None, (
+                    "THD full-iteration CUDA graph requires --max-seqlen-per-dp-cp-rank "
+                    "to define the static per-rank token capacity."
+                )
+                assert (
+                    self.thd_max_packed_sequences is not None and self.thd_max_packed_sequences > 0
+                ), (
+                    "THD full-iteration CUDA graph requires a positive "
+                    "--thd-max-packed-sequences to define the static cu_seqlens width."
+                )
+                assert not self.mtp_standalone, (
+                    "THD full-iteration CUDA graph does not support standalone MTP: "
+                    "its PP shape handshake is not graph-capturable."
+                )
+                if self.context_parallel_size > 1 or self.dynamic_context_parallel:
+                    assert self.cuda_graph_warmup_steps > 0, (
+                        "THD full-iteration CUDA graph with context parallelism requires "
+                        "cuda_graph_warmup_steps > 0 so consumers can materialize "
+                        "host-derived device layout caches before graph capture."
+                    )
+                assert (
+                    self.pipeline_p2p_fixed_shape
+                ), "THD full-iteration CUDA graph requires fixed-shape pipeline communication."
 
         # 'extend_last' THD tail padding with context parallelism requires the
         # global metadata to be extended before CP slicing, which only the

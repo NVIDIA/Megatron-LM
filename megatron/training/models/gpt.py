@@ -4,14 +4,14 @@ import inspect
 import logging
 from typing import Any, Callable, ClassVar, Literal
 
-from typing_extensions import override
-
 import torch
+from typing_extensions import override
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
+    get_transformer_layer_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
@@ -460,6 +460,15 @@ def mtp_block_spec(
         if isinstance(transformer_layer_spec, TransformerBlockSubmodules):
             if transformer_layer_spec.layer_specs:
                 spec = transformer_layer_spec.layer_specs[-1]
+            elif transformer_cfg.experimental_attention_variant is not None:
+                # An MTP-only pipeline stage has no local decoder spec to copy. Preserve the
+                # global experimental-attention pattern instead of selecting standard attention.
+                experimental_layer_specs = (
+                    get_transformer_layer_with_experimental_attention_variant_spec(
+                        config=transformer_cfg
+                    )
+                )
+                spec = experimental_layer_specs[-1]
             else:
                 # A pipeline stage with no decoder layers still needs a decoder spec for MTP.
                 spec = _te_or_local_layer_spec(config, vp_stage)

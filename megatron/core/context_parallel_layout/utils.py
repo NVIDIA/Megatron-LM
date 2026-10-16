@@ -41,5 +41,6 @@ def finalize_packed_seq_params(
 
     cp_group = resolve_cp_group(get_context_parallel_group(), packed_seq_params)
     packed_seq_params.cp_group = cp_group
-    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    if not getattr(packed_seq_params, '_full_cuda_graph_cp_metadata_prebuilt', False):
+        prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
     return packed_seq_params
