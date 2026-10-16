@@ -224,7 +224,15 @@ def _chunk_scan_row_kernel(
             & (offs_n[None, :] < hdim),
             other=0.0,
         ).to(tl.float32)
-        acc += x_residual * D
+        if x_ptr.dtype.element_ty == tl.float32:
+            acc += x_residual * D
+        else:
+            # The training kernel converts 16-bit x to the MMA layout and its
+            # ``acc += x_residual * D`` compiles to fma.rn.f32. Whether this kernel's
+            # mul lands in the same layout as the add (and so fuses) is up to Triton's
+            # layout pass; with Triton 3.8 and per-hdim D it does not, so the fused
+            # form is written out.
+            acc = tl.fma(x_residual, D, acc)
 
     if HAS_Z:
         # As the training kernel's target-rows mode: z is the entry's one row.
