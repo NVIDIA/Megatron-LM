@@ -42,6 +42,9 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
 )
+from megatron.core.extensions.transformer_engine import (
+    add_ptq_calibration_metadata_to_state_dict,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
@@ -884,6 +887,18 @@ def save_checkpoint(
                 model_sd_kwargs=dict(metadata=sharded_sd_metadata),
                 rerun_state=rerun_state,
             )
+
+        # If exporting post-training quantization calibration metadata for inference,
+        # add the metadata to the checkpoint state dictionary.
+        if any(
+            getattr(
+                getattr(model_chunk, "config", None),
+                "ckpt_transformer_engine_calibration",
+                False,
+            )
+            for model_chunk in model
+        ):
+            add_ptq_calibration_metadata_to_state_dict(state_dict, model)
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':

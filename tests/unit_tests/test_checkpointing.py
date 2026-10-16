@@ -548,6 +548,7 @@ def create_args(run_config):
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
+    args.ckpt_transformer_engine_calibration = False
 
     yield args
 
@@ -658,8 +659,14 @@ def test_save_checkpoint(
 
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
+    # PTQ calibration export is controlled by the model config, not legacy global args.
+    args.ckpt_transformer_engine_calibration = False
 
-    config = TransformerConfig(num_layers=1, kv_channels=1)
+    config = TransformerConfig(
+        num_layers=1,
+        kv_channels=1,
+        ckpt_transformer_engine_calibration=ckpt_format == "torch",
+    )
     model = MockModel(config)
     optimizer = MockState({"optimizer": "optimizer_state"})
     if ckpt_format == "fsdp_dtensor":
@@ -681,10 +688,15 @@ def test_save_checkpoint(
 
         # Text-only checkpoint saves still bypass dataloader state, while passing CP through.
         cp_group = mock.sentinel.cp_group
-        with mock.patch(
-            "megatron.training.checkpointing.maybe_save_dataloader_state",
-            wraps=maybe_save_dataloader_state,
-        ) as save_dataloader_state:
+        with (
+            mock.patch(
+                "megatron.training.checkpointing.maybe_save_dataloader_state",
+                wraps=maybe_save_dataloader_state,
+            ) as save_dataloader_state,
+            mock.patch(
+                "megatron.training.checkpointing.add_ptq_calibration_metadata_to_state_dict"
+            ) as export_calibration_metadata,
+        ):
             save_checkpoint(
                 iteration,
                 [model],
@@ -694,6 +706,11 @@ def test_save_checkpoint(
                 cp_group=cp_group,
             )
         assert save_dataloader_state.call_args.kwargs["cp_group"] is cp_group
+        if config.ckpt_transformer_engine_calibration:
+            export_calibration_metadata.assert_called_once()
+            assert export_calibration_metadata.call_args.args[1] == [model]
+        else:
+            export_calibration_metadata.assert_not_called()
 
         with open(args.save / "latest_checkpointed_iteration.txt", "r") as f:
             assert iteration == int(f.read())
