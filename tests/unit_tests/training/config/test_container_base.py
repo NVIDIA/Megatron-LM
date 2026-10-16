@@ -4,7 +4,7 @@ import copy
 import functools
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -104,6 +104,93 @@ class CallableConfigContainer(ConfigContainerBase):
         """Initialize callable_data if not provided."""
         if self.callable_data is None:
             self.callable_data = CallableDataclass()
+
+
+def _config_snapshot(value):
+    """Copy all config fields, comparing partial callables by contents, not identity."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _config_snapshot(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, functools.partial):
+        return (
+            functools.partial,
+            _config_snapshot(value.func),
+            _config_snapshot(value.args),
+            _config_snapshot(value.keywords),
+            _config_snapshot(vars(value)),
+        )
+    if isinstance(value, dict):
+        return {key: _config_snapshot(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_config_snapshot(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_config_snapshot(item) for item in value)
+    return copy.deepcopy(value)
+
+
+@pytest.mark.parametrize(
+    "inference,model_kind,cuda_graphs",
+    [(False, "gpt", False), (False, "hybrid", True), (True, "gpt", True), (True, "hybrid", False)],
+)
+@pytest.mark.parametrize("outcome", ["valid", "invalid_seed", "invalid_logger"])
+def test_validation_preserves_config(run_config, inference, model_kind, cuda_graphs, outcome):
+    """Validation leaves every config field unchanged, including when it raises."""
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.config import (
+        CheckpointConfig,
+        InferenceConfigContainer,
+        InferenceSetupConfig,
+    )
+    from megatron.training.config.common_config import RNGConfig
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
+
+    transformer = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        use_te_rng_tracker=False,
+        inference_rng_tracker=not inference,
+    )
+    # Recipe edits may require tracker finalization, but validation must not apply it.
+    transformer.cuda_graph_impl = "transformer_engine" if cuda_graphs else "none"
+    model_cls = GPTModelConfig if model_kind == "gpt" else HybridModelConfig
+    model = model_cls(
+        transformer=transformer,
+        vocab_size=128,
+        seq_length=16,
+        extra_checkpoint_metadata={"nested": {"tags": ["validation", "unchanged"]}},
+    )
+    if inference:
+        cfg = InferenceConfigContainer(
+            model=model,
+            checkpoint=CheckpointConfig(),
+            inference=InferenceSetupConfig(cuda_graph_modules=["attention"]),
+        )
+    else:
+        cfg = run_config
+        cfg.model = model
+        cfg.train.iterations_to_skip = [2, 7]
+    cfg.rng = RNGConfig(
+        seed=0 if outcome == "invalid_seed" else 919,
+        te_rng_tracker=not cuda_graphs,
+        inference_rng_tracker=inference,
+    )
+    cfg.logger.log_interval = 2
+    cfg.logger.log_memory_interval = 3 if outcome == "invalid_logger" else 4
+    cfg.logger.memory_keys = {"allocated": "allocated_bytes.all.current"}
+    cfg.profiling.profile_ranks = [0, 1]
+    cfg.tokenizer.special_tokens = ["<extra>"]
+
+    # Include every field, even those serialization omits, and check snapshot stability first.
+    before = _config_snapshot(cfg)
+    assert _config_snapshot(cfg) == before
+    expected_error = {"invalid_seed": ValueError, "invalid_logger": AssertionError}.get(outcome)
+    for _ in range(2):
+        if expected_error is None:
+            cfg.validate()
+        else:
+            with pytest.raises(expected_error):
+                cfg.validate()
+        assert _config_snapshot(cfg) == before
 
 
 class TestConfigContainer_FromDict:

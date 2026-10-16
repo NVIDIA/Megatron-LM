@@ -24,6 +24,26 @@ def _args_without_rng():
     return args
 
 
+@pytest.fixture
+def initialization_mocks(monkeypatch):
+    args = _args_without_rng()
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    for name in (
+        "setup_logging",
+        "initialize_rerun_state_machine",
+        "_initialize_distributed",
+        "_init_autoresume",
+        "set_default_log_ranks",
+        "print_rank_0",
+    ):
+        monkeypatch.setattr(initialize, name, Mock())
+    monkeypatch.setattr(initialize.mpu, "set_tensor_model_parallel_world_size", Mock())
+    monkeypatch.setattr(initialize.mpu, "set_tensor_model_parallel_rank", Mock())
+    seed = Mock()
+    monkeypatch.setattr(initialize, "_set_random_seed", seed)
+    return args, seed
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_tracker_cli_flags_populate_rng_config(enabled):
     from megatron.training.argument_utils import _default_config_from_args
@@ -46,8 +66,14 @@ def test_tracker_cli_flags_populate_rng_config(enabled):
 @pytest.mark.parametrize("inference", [False, True])
 @pytest.mark.parametrize("te_tracker", [False, True])
 @pytest.mark.parametrize("inference_tracker", [False, True])
-def test_container_derives_tracker_fields_one_way(
-    run_config, model_kind, inference, te_tracker, inference_tracker
+def test_initialization_applies_tracker_policy(
+    monkeypatch,
+    run_config,
+    initialization_mocks,
+    model_kind,
+    inference,
+    te_tracker,
+    inference_tracker,
 ):
     from megatron.core.transformer import TransformerConfig
     from megatron.training.config import (
@@ -76,26 +102,69 @@ def test_container_derives_tracker_fields_one_way(
     cfg.model = model
     cfg.rng = RNGConfig(te_rng_tracker=te_tracker, inference_rng_tracker=inference_tracker)
     before = asdict(cfg.rng)
-    for _ in range(2):
-        cfg.validate()
-        assert transformer.use_te_rng_tracker is te_tracker
-        assert transformer.inference_rng_tracker is inference_tracker
-        assert asdict(cfg.rng) == before
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    initialize.initialize_megatron(
+        allow_no_cuda=True, skip_mpu_initialization=True, training=not inference
+    )
+    assert transformer.use_te_rng_tracker is te_tracker
+    assert transformer.inference_rng_tracker is inference_tracker
+    assert asdict(cfg.rng) == before
 
 
-def test_native_cuda_graph_requirement_is_resolved_before_seeding(run_config):
+@pytest.mark.parametrize("model_kind", ["gpt", "hybrid"])
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("skip_mpu", [False, True])
+@pytest.mark.parametrize("lazy", [False, True])
+def test_native_cuda_graph_requirement_is_resolved_before_seeding(
+    monkeypatch, run_config, initialization_mocks, model_kind, training, skip_mpu, lazy
+):
     from megatron.core.transformer import TransformerConfig
-    from megatron.training.models import GPTModelConfig
+    from megatron.training.config import (
+        CheckpointConfig,
+        InferenceConfigContainer,
+        InferenceSetupConfig,
+    )
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
 
+    args, seed = initialization_mocks
+    args.lazy_mpu_init = lazy
     transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
     transformer.cuda_graph_impl = "transformer_engine"
-    run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
-    run_config.rng = RNGConfig()
-    run_config.validate()
-    assert run_config.rng.te_rng_tracker is True
+    model_cls = GPTModelConfig if model_kind == "gpt" else HybridModelConfig
+    model = model_cls(transformer=transformer, vocab_size=128, seq_length=16)
+    cfg = (
+        run_config
+        if training
+        else InferenceConfigContainer(
+            model=model, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+        )
+    )
+    cfg.model = model
+    cfg.rng = RNGConfig(inference_rng_tracker=not training)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+
+    def check_seed(*seed_args, **seed_kwargs):
+        assert seed_args == (1234, False, True, not training)
+        assert transformer.use_te_rng_tracker is True
+        assert transformer.inference_rng_tracker is not training
+
+    seed.side_effect = check_seed
+    finish = initialize.initialize_megatron(
+        allow_no_cuda=True,
+        skip_mpu_initialization=skip_mpu,
+        skip_dependency_compilation=True,
+        training=training,
+    )
+    if lazy and not skip_mpu:
+        seed.assert_not_called()
+        assert cfg.rng.te_rng_tracker is True
+        assert transformer.use_te_rng_tracker is True
+        finish()
+    assert seed.call_count == (0 if skip_mpu else 1)
+    assert cfg.rng.te_rng_tracker is True
     assert transformer.use_te_rng_tracker is True
-    run_config.validate()
-    assert run_config.rng.te_rng_tracker is True
+    assert transformer.inference_rng_tracker is not training
+    assert not hasattr(args, "te_rng_tracker")
 
 
 @pytest.mark.parametrize("yaml", [False, True])
@@ -142,25 +211,12 @@ def test_shared_config_factories_use_run_rng_after_bootstrap(
 @pytest.mark.parametrize("inference_tracker", [False, True])
 @pytest.mark.parametrize("lazy", [False, True])
 @pytest.mark.parametrize("skip", [False, True])
+@pytest.mark.parametrize("training", [False, True])
 def test_initialization_uses_owner_and_preserves_deferred_seeding(
-    monkeypatch, lazy, skip, te_tracker, inference_tracker, run_config
+    lazy, skip, te_tracker, inference_tracker, run_config, initialization_mocks, training
 ):
-    args = _args_without_rng()
+    args, seed = initialization_mocks
     args.lazy_mpu_init = lazy
-    monkeypatch.setattr(initialize, "get_args", lambda: args)
-    for name in (
-        "setup_logging",
-        "initialize_rerun_state_machine",
-        "_initialize_distributed",
-        "_init_autoresume",
-        "set_default_log_ranks",
-        "print_rank_0",
-    ):
-        monkeypatch.setattr(initialize, name, Mock())
-    monkeypatch.setattr(initialize.mpu, "set_tensor_model_parallel_world_size", Mock())
-    monkeypatch.setattr(initialize.mpu, "set_tensor_model_parallel_rank", Mock())
-    seed = Mock()
-    monkeypatch.setattr(initialize, "_set_random_seed", seed)
     rng = RNGConfig(
         seed=919,
         data_parallel_random_init=True,
@@ -169,7 +225,10 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(
     )
     run_config.rng = rng
     finish = initialize.initialize_megatron(
-        allow_no_cuda=True, skip_random_seed=skip, skip_dependency_compilation=True
+        allow_no_cuda=True,
+        skip_random_seed=skip,
+        skip_dependency_compilation=True,
+        training=training,
     )
     if lazy:
         seed.assert_not_called()
