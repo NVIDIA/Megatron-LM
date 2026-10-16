@@ -454,13 +454,16 @@ class FsdpParameterGroup:
             and unsharded_model_weight.is_rowwise_allocated
         )
 
-    def _mxfp8_planes_to_unshard(self, phase: Phase | None) -> tuple[bool, bool]:
-        """Translate ``phase`` into the (rowwise, columnwise) planes not unsharded yet."""
-        unsharded_model_weight = self._unsharded_model_weight
-        # Forward GEMMs read rowwise planes; backward data-gradient GEMMs read columnwise planes.
+    def _needs_to_unshard_rowwise(self, phase: Phase | None) -> bool:
+        """Whether compute in ``phase`` needs MXFP8 rowwise planes not unsharded yet."""
+        # Forward GEMMs read rowwise planes.
+        return phase is not Phase.BACKWARD and not self._unsharded_model_weight.is_rowwise_allocated
+
+    def _needs_to_unshard_columnwise(self, phase: Phase | None) -> bool:
+        """Whether compute in ``phase`` needs MXFP8 columnwise planes not unsharded yet."""
+        # Backward data-gradient GEMMs read columnwise planes.
         return (
-            phase is not Phase.BACKWARD and not unsharded_model_weight.is_rowwise_allocated,
-            phase is not Phase.FORWARD and not unsharded_model_weight.is_columnwise_allocated,
+            phase is not Phase.FORWARD and not self._unsharded_model_weight.is_columnwise_allocated
         )
 
     def unshard_parameters(self, phase: Phase | None = None) -> set[Phase]:
@@ -485,14 +488,15 @@ class FsdpParameterGroup:
         elif isinstance(unsharded_model_weight, DBuffer):
             # Data that is already unsharded will not be gathered again.
             if not unsharded_model_weight.is_allocated:
-                self._install_unsharded_parameters(self._materialize_unsharded_model_weight())
+                self._materialize_unsharded_model_weight()
+                self._install_unsharded_parameters(unsharded_model_weight)
             ready_phases = {Phase.FORWARD, Phase.BACKWARD}
         else:
-            rowwise, columnwise = self._mxfp8_planes_to_unshard(phase)
+            rowwise = self._needs_to_unshard_rowwise(phase)
+            columnwise = self._needs_to_unshard_columnwise(phase)
+            self._materialize_unsharded_model_weight(rowwise=rowwise, columnwise=columnwise)
             self._install_unsharded_parameters(
-                self._materialize_unsharded_model_weight(rowwise=rowwise, columnwise=columnwise),
-                rowwise=rowwise,
-                columnwise=columnwise,
+                unsharded_model_weight, rowwise=rowwise, columnwise=columnwise
             )
             # Forward GEMMs read rowwise planes; backward dgrad GEMMs read columnwise planes.
             ready_phases = {
@@ -507,9 +511,17 @@ class FsdpParameterGroup:
         return ready_phases
 
     def _install_unsharded_parameters(
-        self, unsharded_model_weight: "DBuffer | QuantizedDBuffer", **mxfp8_planes: bool
+        self,
+        unsharded_model_weight: DBuffer | QuantizedDBuffer,
+        *,
+        rowwise: bool = True,
+        columnwise: bool = True,
     ) -> None:
-        """Point unsharded parameters' data at ``unsharded_model_weight``."""
+        """Point unsharded parameters' data at ``unsharded_model_weight``.
+
+        ``rowwise`` and ``columnwise`` select the newly gathered MXFP8 planes to
+        install. Regular compute weights ignore them.
+        """
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor_view = unsharded_model_weight.get_tensor_view(index)
             # TE saves an MXFP8 Parameter itself for backward and reads its planes when
@@ -518,21 +530,23 @@ class FsdpParameterGroup:
             if isinstance(unsharded_model_weight, DBuffer):
                 fsdp_parameter.unsharded.data = tensor_view
             else:
-                update_mxfp8_tensor(tensor_view, fsdp_parameter.unsharded, **mxfp8_planes)
+                update_mxfp8_tensor(
+                    tensor_view, fsdp_parameter.unsharded, rowwise=rowwise, columnwise=columnwise
+                )
 
     def _materialize_unsharded_model_weight(
-        self, **mxfp8_planes: bool
-    ) -> "DBuffer | QuantizedDBuffer":
-        """All-gather full compute weights into their unsharded buffer and return it.
+        self, *, rowwise: bool = True, columnwise: bool = True
+    ) -> None:
+        """All-gather full compute weights into their unsharded buffer.
 
-        ``mxfp8_planes`` holds the ``rowwise`` and ``columnwise`` plane selection for
-        MXFP8 groups. Regular groups pass nothing and gather their whole buffer.
+        ``rowwise`` and ``columnwise`` select the MXFP8 planes to gather. Regular
+        compute weights ignore them and gather their whole buffer.
         """
         unsharded_model_weight = self._unsharded_model_weight
         if isinstance(unsharded_model_weight, DBuffer):
             buffers = (unsharded_model_weight,)
         else:
-            buffers = unsharded_model_weight.planes_for(**mxfp8_planes)
+            buffers = unsharded_model_weight.planes_for(rowwise=rowwise, columnwise=columnwise)
         with self._symmetric_memory_context():
             for buffer in buffers:
                 buffer.reallocate_storage()
@@ -545,10 +559,17 @@ class FsdpParameterGroup:
         with torch.autograd._unsafe_preserve_version_counter(
             tuple(buffer.local_buffer for buffer in buffers)
         ):
-            self.model_weight.redistribute(
-                unsharded_model_weight.placements, out=unsharded_model_weight, **mxfp8_planes
-            )
-        return unsharded_model_weight
+            if isinstance(unsharded_model_weight, DBuffer):
+                self.model_weight.redistribute(
+                    unsharded_model_weight.placements, out=unsharded_model_weight
+                )
+            else:
+                self.model_weight.redistribute(
+                    unsharded_model_weight.placements,
+                    out=unsharded_model_weight,
+                    rowwise=rowwise,
+                    columnwise=columnwise,
+                )
 
     def reshard_parameters(self) -> None:
         """Install sharded DTensor parameters on the owning modules."""
