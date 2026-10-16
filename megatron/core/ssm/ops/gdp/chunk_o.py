@@ -4,7 +4,7 @@
 # Forked from `fla/ops/gated_delta_product/chunk_deltaproduct_o.py` in
 # flash-linear-attention v0.5.1 (https://github.com/fla-org/flash-linear-attention).
 #
-# Licensed under the MIT license; see the LICENSE file in this directory.
+# Licensed under the MIT license; see the LICENSE file in the repository root.
 
 """Intra-chunk output for the Gated Delta Product.
 
@@ -190,7 +190,9 @@ def chunk_gated_delta_product_fwd_o(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    o = v.new_empty(B, T, H, V).fill_(-float('inf'))
+    # Zeros, not a poison value: with a padded token dimension the tail belongs
+    # to no chunk program, and the padding contract requires it to read back zero.
+    o = v.new_zeros(B, T, H, V)
 
     def grid(meta):
         return (triton.cdiv(V, meta['BV']), NT, B * H)

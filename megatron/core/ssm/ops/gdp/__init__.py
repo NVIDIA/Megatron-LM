@@ -4,7 +4,7 @@
 # The modules in this package are forked from the Gated Delta Product kernels
 # in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention), licensed under the MIT
-# license. See the LICENSE file in this directory.
+# license. See the LICENSE file in the repository root.
 
 """Inference-only fork of the Gated Delta Product kernels from
 `flash-linear-attention <https://github.com/fla-org/flash-linear-attention>`_
@@ -22,5 +22,11 @@ Both entry points are forward-only.
 
 from .chunk import chunk_gated_delta_product_varlen
 from .fused_recurrent import fused_recurrent_gated_delta_rule_update
+from .metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
 
-__all__ = ["chunk_gated_delta_product_varlen", "fused_recurrent_gated_delta_rule_update"]
+__all__ = [
+    "chunk_gated_delta_product_varlen",
+    "fused_recurrent_gated_delta_rule_update",
+    "build_gdp_chunk_descriptors",
+    "max_gdp_chunk_counts",
+]

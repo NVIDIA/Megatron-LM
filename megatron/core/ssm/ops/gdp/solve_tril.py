@@ -4,7 +4,7 @@
 # Forked from `fla/ops/utils/solve_tril.py` in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention).
 #
-# Licensed under the MIT license; see the LICENSE file in this directory.
+# Licensed under the MIT license; see the LICENSE file in the repository root.
 
 """Inverse of `I + A` for a strictly lower-triangular, chunk-blocked `A`.
 

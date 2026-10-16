@@ -258,6 +258,20 @@ class TestRLUtils:
         )
         assert rl_utils.single_turn_termination_ok(rollout, traj, seq_len, eod) is ok
 
+    def test_single_turn_termination_without_generation_cap(self):
+        """Production rollouts that do not stamp a cap retain strict EOD validation."""
+        rollout = TokenRollout(
+            trajectory=[[1, 2, 3]],
+            generation_mask=[[False, True, True]],
+            reward=0.0,
+            env_id="uncapped-test",
+        )
+
+        assert rollout.generation_cap is None
+        assert not rl_utils.single_turn_termination_ok(
+            rollout, rollout.trajectory[-1], seq_len=16, eod=99
+        )
+
     def test_rl_granularity_defaults(self):
         args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
 
@@ -291,17 +305,23 @@ class TestRLUtils:
         agent = MagicMock()
 
         class FakePipeline:
-            def __init__(self, agent, request, parallel_generation_tasks):
+            def __init__(
+                self, agent, request, parallel_generation_tasks, bank=None, initial_batch_id=0
+            ):
                 captured["agent"] = agent
                 captured["request"] = request
                 captured["parallel_generation_tasks"] = parallel_generation_tasks
                 self.gate = SimpleNamespace(capacity=parallel_generation_tasks)
+                captured["bank"] = bank
+                captured["initial_batch_id"] = initial_batch_id
 
             def run(self):
                 return rollout_generator
 
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
         monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", None)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_AGENT", None)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", None)
         monkeypatch.setattr(rl_utils, "get_agent", lambda _env_config_path: agent)
         monkeypatch.setattr(rl_utils, "RolloutPipeline", FakePipeline)
 
@@ -316,6 +336,7 @@ class TestRLUtils:
             consumption_granularity="B",
             generation_lag=generation_lag,
             env_config_path="unused.yaml",
+            current_iteration=17,
         )
 
         assert result is rollout_generator
@@ -325,6 +346,7 @@ class TestRLUtils:
         # independent of submission granularity.
         assert captured["parallel_generation_tasks"] == generation_lag + 1
         assert captured["request"].submission_granularity == submission_granularity
+        assert captured["initial_batch_id"] == 17
 
     @pytest.mark.parametrize(
         "overrides, match",

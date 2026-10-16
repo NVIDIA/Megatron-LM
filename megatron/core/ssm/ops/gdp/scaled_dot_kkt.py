@@ -4,7 +4,7 @@
 # Forked from `fla/ops/common/chunk_scaled_dot_kkt.py` in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention).
 #
-# Licensed under the MIT license; see the LICENSE file in this directory.
+# Licensed under the MIT license; see the LICENSE file in the repository root.
 
 """Strictly-lower-triangular `beta * K K^T` per chunk.
 

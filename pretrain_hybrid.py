@@ -225,6 +225,7 @@ def get_batch(data_iterator, vp_stage=None):
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        use_contiguous_cp=(config.linear_cp_layout == "contiguous" and cp_size > 1),
     )
 
     # Return values in a fixed order so callers can unpack them even when
@@ -341,6 +342,9 @@ def forward_step(data_iterator, model: HybridModel):
         # attention only computes work for real tokens within each chunk.
         update_seqlen_stats_from_cu_seqlens(cu_seqlens)
         cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+        total_tokens = int(cu_seqlens_for_params[-1].item())
+        if args.linear_cp_layout == "contiguous" and args.context_parallel_size > 1:
+            cu_seqlens_for_params = cu_seqlens
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens_for_params,
@@ -351,7 +355,7 @@ def forward_step(data_iterator, model: HybridModel):
             max_seqlen_kv=int(max_seqlen.item()),
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
-            total_tokens=int(cu_seqlens_for_params[-1].item()),
+            total_tokens=total_tokens,
             tokens_per_sample=args.seq_length,
         )
         prepare_packed_seq_params(packed_seq_params, get_attr_wrapped_model(model, "config"))

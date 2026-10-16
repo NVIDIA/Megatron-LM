@@ -11,6 +11,8 @@ Tests cover:
 import pytest
 import torch
 
+from megatron.core.inference.quantization.mxfp8_tensor import HAVE_FLASHINFER, MXFP8Tensor
+
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.internal,
@@ -260,9 +262,166 @@ class TestMxfp8Quantize:
 
 class TestMXFP8Tensor:
 
+    def test_restore_uint8_scale_dtype_after_resharding(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import ensure_mxfp8_scale_dtype
+
+        scale_bytes = torch.arange(16, dtype=torch.uint8)
+        scale = ensure_mxfp8_scale_dtype(scale_bytes)
+
+        assert scale.dtype == torch.float8_e8m0fnu
+        torch.testing.assert_close(scale.view(torch.uint8), scale_bytes)
+
+    @pytest.mark.parametrize("backend", ["triton", "flashinfer"])
+    def test_copy_preserves_storage_and_logical_metadata(self, backend):
+        if backend == "flashinfer" and not HAVE_FLASHINFER:
+            pytest.skip("FlashInfer not available")
+
+        source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
+        tensor = MXFP8Tensor.from_bf16(source, backend=backend)
+        data_ptr = tensor.data.data_ptr()
+        scale_ptr = tensor.scale.data_ptr()
+
+        assert tensor.shape == source.shape
+        assert tensor.dtype == source.dtype
+        assert tensor.device == source.device
+
+        updated = torch.randn_like(source)
+        assert tensor.copy_(updated) is tensor
+        expected = MXFP8Tensor.from_bf16(updated, backend=backend)
+
+        assert tensor.data.data_ptr() == data_ptr
+        assert tensor.scale.data_ptr() == scale_ptr
+        assert torch.equal(tensor.data, expected.data)
+        assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+
+    def test_copy_rejects_shape_mismatch(self):
+        tensor = MXFP8Tensor.from_bf16(
+            torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+        with pytest.raises(ValueError, match="shape mismatch"):
+            tensor.copy_(torch.randn(32, 128, device="cuda", dtype=torch.bfloat16))
+
+    def test_copy_requires_backend(self):
+        source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
+        quantized = MXFP8Tensor.from_bf16(source, backend="triton")
+        backendless = MXFP8Tensor(data=quantized.data, scale=quantized.scale, dtype=source.dtype)
+        with pytest.raises(ValueError, match="without a quantization backend"):
+            backendless.copy_(source)
+
+    def test_copy_preserves_source_dtype_for_legacy_constructor(self):
+        initial = MXFP8Tensor.from_bf16(
+            torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+        tensor = MXFP8Tensor(initial.data.clone(), initial.scale.clone(), "triton")
+        source = torch.randn(16, 128, device="cuda", dtype=torch.float16)
+        expected = MXFP8Tensor.from_bf16(source, backend="triton")
+
+        assert tensor.dtype is None
+        tensor.copy_(source)
+        assert tensor.dtype == source.dtype
+        assert torch.equal(tensor.data, expected.data)
+        assert torch.equal(tensor.scale, expected.scale)
+
+    def test_failed_legacy_copy_keeps_dtype_unknown(self):
+        initial = MXFP8Tensor.from_bf16(
+            torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+        tensor = MXFP8Tensor(
+            initial.data.clone(), initial.scale.clone(), "unsupported"  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(ValueError, match="Unknown MXFP8 quantization backend"):
+            tensor.copy_(torch.randn(16, 128, device="cuda", dtype=torch.float16))
+        assert tensor.dtype is None
+
+    def test_copy_does_not_downcast_update_to_logical_dtype(self):
+        source = torch.randn(16, 128, device="cuda", dtype=torch.float16)
+        tensor = MXFP8Tensor.from_bf16(source, backend="triton")
+        update = torch.linspace(
+            -100_000, 100_000, steps=16 * 128, device="cuda", dtype=torch.float32
+        ).reshape(16, 128)
+        expected = MXFP8Tensor.from_bf16(update, backend="triton")
+
+        assert tensor.dtype == torch.float16
+        tensor.copy_(update)
+        assert tensor.dtype == torch.float16
+        assert torch.equal(tensor.data, expected.data)
+        assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+
+    def test_copy_normalizes_flashinfer_fp32_input_to_bf16(self, monkeypatch):
+        tensor = MXFP8Tensor(
+            data=torch.empty((16, 128), device="cuda", dtype=torch.float8_e4m3fn),
+            scale=torch.empty(512, device="cuda", dtype=torch.uint8),
+            backend="flashinfer",
+        )
+        update = torch.randn(16, 128, device="cuda", dtype=torch.float32)
+        expected_data = torch.zeros_like(tensor.data)
+        expected_scale = torch.zeros_like(tensor.scale)
+        quantizer_input = {}
+
+        def fake_from_bf16(cls, value, group_size=32, backend="flashinfer"):
+            quantizer_input["dtype"] = value.dtype
+            return cls(data=expected_data, scale=expected_scale, backend=backend, dtype=value.dtype)
+
+        monkeypatch.setattr(MXFP8Tensor, "from_bf16", classmethod(fake_from_bf16))
+
+        tensor.copy_(update)
+
+        assert quantizer_input["dtype"] == torch.bfloat16
+        assert tensor.dtype == torch.bfloat16
+        assert torch.equal(tensor.data, expected_data)
+        assert torch.equal(tensor.scale, expected_scale)
+
+    def test_copy_rejects_stacked_storage(self):
+        tensor = MXFP8Tensor.from_bf16(
+            torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+        stacked = MXFP8Tensor(
+            data=torch.stack([tensor.data, tensor.data]),
+            scale=torch.stack([tensor.scale, tensor.scale]),
+            dtype=tensor.dtype,
+            backend=tensor.backend,
+        )
+
+        with pytest.raises(ValueError, match="require 2D destination storage"):
+            stacked.copy_(torch.randn(2, 16, 128, device="cuda", dtype=torch.bfloat16))
+
+    def test_reject_invalid_scale_dtype(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import ensure_mxfp8_scale_dtype
+
+        with pytest.raises(TypeError, match="MXFP8 scales must use"):
+            ensure_mxfp8_scale_dtype(torch.ones(16, dtype=torch.bfloat16))
+
+    def test_validate_unswizzled_2d_scale_geometry(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import (
+            MXFP8Tensor,
+            validate_mxfp8_tensor,
+        )
+
+        data = torch.empty((64, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        scale = torch.empty((64, 4), dtype=torch.uint8, device="cuda")
+
+        validate_mxfp8_tensor(MXFP8Tensor(data, scale, dtype=torch.bfloat16, backend="flashinfer"))
+
+        invalid = MXFP8Tensor(data, scale[:63], dtype=torch.bfloat16, backend="flashinfer")
+        with pytest.raises(ValueError, match="2D scale has shape"):
+            validate_mxfp8_tensor(invalid)
+
+    def test_missing_backend_error_is_actionable(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import (
+            MXFP8Tensor,
+            validate_mxfp8_tensor,
+        )
+
+        data = torch.empty((128, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        scale = torch.empty(512, dtype=torch.uint8, device="cuda")
+
+        with pytest.raises(ValueError, match="backend= explicitly"):
+            validate_mxfp8_tensor(MXFP8Tensor(data, scale, dtype=torch.bfloat16))
+
     @pytest.mark.parametrize("M,K", [(16, 128), (64, 256), (128, 2688)])
     def test_from_bf16_triton(self, M, K):
-        """from_bf16 with triton backend produces correct data and scales."""
+        """The Triton backend produces correct data and scales."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
         torch.manual_seed(42)
@@ -411,9 +570,8 @@ class TestSquaredReluAndQuantizeMxfp8:
     """Compare fused squared_relu + mxfp8 quantize against PyTorch reference.
 
     Reference: torch.relu(x.float()).pow(2).to(bf16) -> ref_to_mxfp -> ref_swizzle.
-    The fused kernel computes squared ReLU in fp32 and quantizes to MXFP8 in one pass,
-    so the PyTorch fp32 reference is the correct baseline (not the unfused Triton path
-    which has an intermediate bf16 roundtrip).
+    The fused kernel matches the BF16 materialization used by training and the
+    unfused inference path before quantizing to MXFP8.
     """
 
     @pytest.mark.parametrize(
@@ -440,7 +598,7 @@ class TestSquaredReluAndQuantizeMxfp8:
         perm_map = _make_permutation_map(M, num_padding=0)
 
         # PyTorch reference: squared ReLU in fp32, then downcast to bf16, then quantize
-        activated_ref = torch.relu(x.float()).pow(2)
+        activated_ref = torch.relu(x.float()).pow(2).to(torch.bfloat16)
         _, ref_data = ref_to_mxfp(activated_ref)
 
         # Fused kernel
@@ -460,7 +618,7 @@ class TestSquaredReluAndQuantizeMxfp8:
         perm_map = _make_permutation_map(M, num_padding=0)
 
         # PyTorch reference
-        activated_ref = torch.relu(x.float()).pow(2)
+        activated_ref = torch.relu(x.float()).pow(2).to(torch.bfloat16)
         ref_scales_2d, _ = ref_to_mxfp(activated_ref)
         ref_swizzled = ref_swizzle(ref_scales_2d)
 
@@ -485,7 +643,7 @@ class TestSquaredReluAndQuantizeMxfp8:
 
         # PyTorch reference (only real rows)
         real_rows = M - num_padding
-        activated_ref = torch.relu(x[:real_rows].float()).pow(2)
+        activated_ref = torch.relu(x[:real_rows].float()).pow(2).to(torch.bfloat16)
         _, ref_data = ref_to_mxfp(activated_ref)
 
         # Fused kernel
@@ -633,6 +791,76 @@ class TestPermuteAndQuantizeMxfp8:
         assert isinstance(result, MXFP8Tensor)
         assert result.backend == "triton"
         assert result.data.dtype == torch.float8_e4m3fn
+
+    @pytest.mark.parametrize("alignment", [64, 128])
+    def test_fixed_buffer_rows_match_swizzled_scale_padding(self, alignment):
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        hidden, probs, routing_map = self._make_inputs(72, 2688, 6, 128)
+        result, _, _, _ = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, 64, _vt(72), alignment=alignment
+        )
+
+        unaligned_rows = 72 * 6 + alignment * 64
+        assert result.data.shape[0] == ceil_div(unaligned_rows, 128) * 128
+        assert result.scale_2d().shape[0] == result.data.shape[0]
+
+    def test_unfused_fixed_buffer_rows_match_swizzled_scale_padding(self):
+        """The disable-fused-quant route preserves the same MXFP8 row invariant."""
+        from megatron.core.inference.moe.permute import permute_tokens
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        hidden, probs, routing_map = self._make_inputs(72, 2688, 6, 128)
+        permuted, _, _, _ = permute_tokens(
+            hidden, probs, routing_map, 0, 64, _vt(72), alignment=128, row_alignment=128
+        )
+        result = MXFP8Tensor.from_bf16(permuted, backend="triton")
+
+        assert result.data.shape[0] == 8704
+        assert result.scale_2d().shape[0] == result.data.shape[0]
+
+    @pytest.mark.skipif(
+        torch.cuda.get_device_capability()[0] < 10,
+        reason="MXFP8 scaled_grouped_mm requires Blackwell (SM 100+)",
+    )
+    def test_unfused_moe_accepts_non_aligned_fixed_token_capacity(self):
+        """The separate-quantization route feeds matching rows to scaled_grouped_mm."""
+        from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        num_tokens, hidden_size, topk, num_experts = 72, 128, 2, 4
+        hidden, probs, routing_map = self._make_inputs(num_tokens, hidden_size, topk, num_experts)
+
+        def stack_weights() -> MXFP8Tensor:
+            per_expert = [
+                MXFP8Tensor.from_bf16(
+                    torch.randn(hidden_size, hidden_size, device="cuda", dtype=torch.bfloat16),
+                    backend="triton",
+                )
+                for _ in range(num_experts)
+            ]
+            return MXFP8Tensor(
+                data=torch.stack([weight.data for weight in per_expert]),
+                scale=torch.stack([weight.scale for weight in per_expert]),
+                dtype=torch.bfloat16,
+                backend="triton",
+            )
+
+        output = mcore_fused_moe(
+            hidden,
+            probs,
+            stack_weights(),
+            stack_weights(),
+            ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            _vt(num_tokens),
+            routing_map,
+            disable_fused_quant_kernels=True,
+        )
+
+        assert output.shape == hidden.shape
+        assert torch.isfinite(output).all()
 
     @pytest.mark.parametrize("alignment", [128])
     def test_offsets_aligned(self, alignment):

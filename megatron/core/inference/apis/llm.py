@@ -2,12 +2,18 @@
 
 """Sync high-level inference API for Megatron (``MegatronLLM``)."""
 
-from typing import List, Optional, Union
+from typing import List, Optional, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.serve_config import ServeConfig
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
+    AbstractModelInferenceWrapper,
+)
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 
 
@@ -39,7 +45,15 @@ class MegatronLLM(_MegatronLLMBase):
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
+        inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
     ) -> None:
+        # Resolve the default at call time so tests can monkey-patch
+        # ``GPTInferenceWrapper`` on this module. Binding it as the argument
+        # default would freeze the reference at import time and bypass the
+        # patch, which is why the previous ``= None`` version tripped
+        # ``None(model, context)``.
+        if inference_wrapper_cls is None:
+            inference_wrapper_cls = GPTInferenceWrapper
         super().__init__(
             model=model,
             tokenizer=tokenizer,
@@ -47,18 +61,33 @@ class MegatronLLM(_MegatronLLMBase):
             use_coordinator=use_coordinator,
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
+            inference_wrapper_cls=inference_wrapper_cls,
         )
 
     def generate(
         self,
         prompts: Union[str, List[int], List[str], List[List[int]]],
         sampling_params: Optional[SamplingParams] = None,
+        multi_modal_data=None,
     ) -> List["DynamicInferenceRequest"]:
         """Run inference for one prompt or a batch.
 
         Returns ``list[DynamicInferenceRequest]`` in input order. Single-prompt
         input returns a one-element list -- the always-list shape is the
         deliberate sync-vs-async asymmetry.
+
+        ``multi_modal_data`` follows vLLM's modality-dictionary shape. Batched
+        prompts take one modality dictionary per prompt.
+
+        Images:
+            ``"image"`` accepts raw image bytes, a list of raw image bytes, or
+            a preprocessed image tensor dictionary.
+        Video:
+            Video does not yet have any supported data preprocessing or
+            modeling formats.
+        Audio:
+            Audio does not yet have any supported data preprocessing or
+            modeling formats.
 
         No concurrency guard: sync is single-caller by Python's GIL. If you
         need to call ``generate`` concurrently from multiple threads, callers
@@ -71,13 +100,21 @@ class MegatronLLM(_MegatronLLMBase):
         if sampling_params is None:
             sampling_params = SamplingParams()
 
-        normalized, _is_batch = self._normalize_prompts(prompts)
+        normalized, is_batch = self._normalize_prompts(prompts)
         if not normalized:
             return []
 
+        per_prompt_multi_modal_data = self._normalize_multi_modal_data_list(
+            multi_modal_data, num_prompts=len(normalized), is_batch=is_batch
+        )
+
         if self._use_coordinator:
             assert self._loop_manager is not None
-            return self._loop_manager.run_sync(self._generate_impl(normalized, sampling_params))
+            return self._loop_manager.run_sync(
+                self._generate_impl(normalized, sampling_params, per_prompt_multi_modal_data)
+            )
+        if any(per_prompt_multi_modal_data):
+            raise ValueError("multi_modal_data is only supported with use_coordinator=True.")
         # Direct mode: bypass _generate_impl (which would use to_thread,
         # pointless for sync). Call the engine directly and merge.
         records = self._engine.generate(normalized, sampling_params)

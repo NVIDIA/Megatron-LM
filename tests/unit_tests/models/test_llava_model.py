@@ -144,16 +144,18 @@ class TestLLaVAModel:
         use_inference_kv_cache = False
         inference_context = None
 
-        embeddings, labels, loss_mask = self.model._preprocess_data(
-            image_embeddings,
-            language_embeddings,
-            input_ids,
-            loss_mask,
-            labels,
-            use_inference_kv_cache,
-            inference_context,
-            image_token_index,
-            num_image_tiles,
+        embeddings, labels, loss_mask, _combined_input_ids, _combined_position_ids = (
+            self.model._preprocess_data(
+                image_embeddings,
+                language_embeddings,
+                input_ids,
+                loss_mask,
+                labels,
+                use_inference_kv_cache,
+                inference_context,
+                image_token_index,
+                num_image_tiles,
+            )
         )
 
         img_seq_len = 577

@@ -228,11 +228,10 @@
         }
     },
     "iteration-time": {
-        "start_step": 1,
+        "start_step": 2,
         "end_step": 50,
         "step_interval": 1,
         "values": {
-            "1": "nan",
             "2": 7.85476,
             "3": 1.48469,
             "4": 1.45312,

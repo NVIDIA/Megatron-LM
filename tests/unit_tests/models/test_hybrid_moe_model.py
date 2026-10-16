@@ -46,11 +46,14 @@ GOLDEN_CONFIG: Dict[str, Any] = {
         "_sort_order_": 0,
         "_value_": 1,
     },
+    "attention_cp_layout": "zigzag",
     "attention_dropout": 0.0,
     "attention_output_gate": False,
     "attention_softmax_in_fp32": False,
     "autocast_dtype": "torch.bfloat16",
     "barrier_with_L1_time": True,
+    "batch_invariant_backend": "te_native",
+    "batch_invariant_collective": "ordered",
     "batch_invariant_mode": False,
     "batch_p2p_comm": True,
     "batch_p2p_sync": True,
@@ -182,6 +185,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "layernorm_epsilon": 1e-05,
     "layernorm_zero_centered_gamma": False,
     "linear_attention_freq": None,
+    "linear_cp_layout": "zigzag",
     "linear_conv_kernel_dim": 4,
     "linear_key_head_dim": 128,
     "linear_num_key_heads": 16,
@@ -210,6 +214,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_deepep_num_sms": None,
     "moe_enable_deepep": False,
     "moe_expert_capacity_factor": None,
+    "moe_combine_bwd_dtype": "bf16",
+    "moe_dispatch_fwd_dtype": "bf16",
     "moe_expert_rank_capacity_factor": None,
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
@@ -225,6 +231,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_input_jitter_eps": None,
     "moe_latent_size": None,
     "moe_latent_up_projection_rmsnorm": False,
+    "moe_use_norm_before_up_proj": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
     "moe_megakernel_backend": None,
@@ -254,6 +261,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_qb_num_bins": 1000,
     "moe_router_quantile_balancing_estimation_scope": "global_batch",
     "moe_router_score_function": "sigmoid",
+    "moe_router_skip_muon": True,
     "moe_router_topk": 6,
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
@@ -276,6 +284,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mup_output_mult": 1.0,
     "mup_width_mult": 1.0,
     "mtp_detach_heads": False,
+    "mtp_hsm": False,
     "mtp_hybrid_override_pattern": None,
     "mtp_loss_type": "cross_entropy",
     "mtp_loss_scaling_factor": 0.1,
@@ -542,6 +551,7 @@ class TestHybridMoEModel:
         args.moe_grouped_gemm = True
         args.moe_shared_expert_intermediate_size = 3712
         args.moe_router_score_function = "sigmoid"
+        args.moe_router_skip_muon = True
         args.moe_router_enable_expert_bias = True
         args.moe_router_topk_scaling_factor = 2.5
         args.mamba_state_dim = 128

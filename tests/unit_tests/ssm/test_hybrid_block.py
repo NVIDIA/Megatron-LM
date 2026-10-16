@@ -12,7 +12,10 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_inference_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import (
     HybridModel,
     _get_hash_moe_layer_threshold,
@@ -781,6 +784,12 @@ class TestHybridBlock:
         )
         assert isinstance(block.layers[0], TransformerLayer)
         assert isinstance(block.layers[0].self_attention, KimiDeltaAttention)
+
+    def test_gdn_inference_spec(self):
+        """The inference stack must materialize GDN rather than its IdentityOp default."""
+        gdn_spec = hybrid_inference_stack_spec.submodules.gdn_layer
+        assert gdn_spec.module is TransformerLayer
+        assert gdn_spec.submodules.self_attention.module is GatedDeltaNet
 
     def test_gdn_gpu_forward(self):
         """Test GPU forward pass with GDN, attention, and Mamba layers."""

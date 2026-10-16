@@ -17,6 +17,7 @@ execution.py        Submits send/recv ops to a CopyService, handles writebacks
     |
 copy_services/      Pluggable transport backends
     ├── nccl         GPU-to-GPU via torch.distributed P2P
+    ├── nccl_m2n     Hierarchical cross-group transfer via NCCL M2N
     ├── gloo         CPU-staged via Gloo process group
     └── nvshmem      NVSHMEM pipelined GPU-to-GPU (requires nvshmem library)
 
@@ -34,7 +35,9 @@ from megatron.core.resharding import swap_model_weights
 swap_model_weights(
     src_model=training_model,
     target_model=inference_model,
-    refit_method="nccl",  # or "gloo" or "nvshmem"
+    # Other collocated backends: "gloo", "nvshmem", or "nixl".
+    # "nccl_m2n" is supported only for non-collocated refits.
+    refit_method="nccl",
 )
 ```
 
@@ -78,13 +81,63 @@ swap_model_weights(None, None, "nccl",
 | Backend | Transport | Best for | Notes |
 |---------|-----------|----------|-------|
 | `nccl` | GPU P2P via `batch_isend_irecv` | Intra-node / single cluster | Lowest latency; default choice |
+| `nccl_m2n` | NCCL M2N copy/staging reshard | Large non-collocated source/destination groups | Requires `nccl-extensions` and NCCL 2.30.5+; source ranks must precede destination ranks; pair-size skew adds padding |
 | `gloo` | CPU-staged via Gloo PG | Cross-cluster / multi-node | Higher latency; works where NCCL cross-cluster doesn't |
 | `nvshmem` | Pipelined NVSHMEM puts | High-throughput intra-node | Requires NVSHMEM; uses double-buffered kernel pipeline |
 | `nixl` | GPU RDMA via NIXL (UCX), sender-initiated WRITE | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging) |
 
-All backends detect same-rank (local) transfers via `task_id` and
-short-circuit them into direct `tensor.copy_()` instead of going
-through the network stack.
+Backends that support collocated models detect same-rank (local) transfers via
+`task_id` and short-circuit them into direct `tensor.copy_()` instead of going
+through the network stack. NCCL M2N is the exception because its source and
+destination meshes must be disjoint.
+
+### NCCL M2N backend
+
+Build the current M2N library from
+[NVIDIA/nccl-extensions](https://github.com/NVIDIA/nccl-extensions), then install
+its Python package together with NCCL4Py. M2N v0.2 requires NCCL 2.30.5 or
+newer. For a source checkout, follow the upstream native build instructions,
+then install the bindings from outside the `python/` directory:
+
+```bash
+CUDA_HOME=/usr/local/cuda pip install -e /path/to/nccl-extensions/python
+```
+
+The package imports as `nccl.m2n` and uses `nccl.core` from NCCL4Py. A wheel
+may bundle `libnccl_m2n.so`; otherwise set the loader override explicitly:
+
+```bash
+export NCCL_M2N_LIBRARY=/path/to/libnccl_m2n.so
+```
+
+Select it with `refit_method="nccl_m2n"` or `--refit-method nccl_m2n`.
+The backend preserves the existing ReFIT planner and packs its operations into
+one logical `[source, destination, bytes]` tensor. Source ranks shard dimension
+0, destination ranks shard dimension 1, and one cross-dimension
+`nccl.m2n.reshard` call moves the entire batch through M2N's managed
+copy/staging transport. Before a plan's first call, ranks exchange byte counts,
+tensor counts, and an ordered layout digest for every source/destination pair;
+any sender/receiver disagreement fails before weight data moves. The result is
+cached with the immutable plan, so subsequent refits do not run that collective
+or repeat the peer/layout validation.
+
+This backend supports only non-collocated multi-rank layouts. The communication
+group must contain a contiguous source interval starting at group rank 0,
+immediately followed by a contiguous destination interval, with no overlapping
+or idle ranks, and `num_dst_pools > 1` is not supported. Use a process group
+scoped to exactly one source/destination pool when the application has extra
+ranks. The M2N API describes a regular tensor, so every pair uses the largest
+validated pair payload as its trailing extent; skewed pair sizes therefore add
+wire padding. The logical transfer size is
+`src_count * dst_count * max_pair_bytes`, and each rank temporarily stages
+`peer_count * max_pair_bytes`. The staging tensor is returned to PyTorch's
+caching allocator after each refit rather than retained by the service. Model
+parameter storage itself is not replaced. Supported mesh sizes are validated
+by `nccl-extensions`.
+
+The built-in RL loop currently creates its training and inference models on the
+same ranks, so it rejects `nccl_m2n`; non-collocated launchers can use the public
+API or the ReFIT benchmark.
 
 ## How the Reshard Plan Works
 
@@ -133,7 +186,7 @@ across refits.
 
 | Cache | Key | Contents | Why |
 |-------|-----|----------|-----|
-| `_service_cache` | Backend name | `CopyService` instance | Avoid re-creating CUDA streams / NVSHMEM buffers |
+| `_service_cache` | Backend name + process-group identity | `CopyService` instance | Avoid re-creating backend communicators and buffers |
 | `_plan_cache` | (rank, src_config, dst_config, num_experts) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits |
 
 Call `clear_all_caches()` before destroying distributed process groups
@@ -162,6 +215,7 @@ attribute with the following groups:
 | `transforms.py` | `ReshardTransform` base class, `MXFP8ReshardTransform` |
 | `utils.py` | `TransferOp`, `ReshardPlan`, `ParameterMetadata`, `ShardingDescriptor` |
 | `copy_services/nccl_copy_service.py` | NCCL backend |
+| `copy_services/nccl_m2n_copy_service.py` | Hierarchical NCCL M2N backend |
 | `copy_services/gloo_copy_service.py` | Gloo backend |
 | `copy_services/nixl_copy_service.py` | NIXL/UCX backend |
 | `copy_services/nvshmem_copy_service.py` | NVSHMEM backend (delegates to `nvshmem_copy_service/`) |

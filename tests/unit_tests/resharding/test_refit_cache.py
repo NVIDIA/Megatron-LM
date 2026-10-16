@@ -11,9 +11,12 @@ Covers:
   replaces a buffer).
 """
 
+import pytest
 import torch
 import torch.nn as nn
 
+import megatron.core.resharding.refit as refit
+from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.refit import _PlanCacheKey
 from megatron.core.resharding.utils import get_refit_tensor_dict, invalidate_refit_tensor_cache
 
@@ -142,6 +145,52 @@ class TestPlanCacheKeyNonCollocated:
             dst_rank_offset=8,
         )
         assert layout_a != layout_b
+
+
+def test_service_cache_distinguishes_process_groups(monkeypatch):
+    """A backend service must never reuse a communicator from another group."""
+
+    class StubService:
+        def __init__(self, group=None):
+            self.group = group
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(refit, "NCCLM2NCopyService", StubService)
+    monkeypatch.setattr(refit, "_service_cache", {})
+    first_group = object()
+    second_group = object()
+
+    first = refit.get_or_create_service("nccl_m2n", group=first_group)
+    first_again = refit.get_or_create_service("nccl_m2n", group=first_group)
+    second = refit.get_or_create_service("nccl_m2n", group=second_group)
+
+    assert first_again is first
+    assert second is not first
+    assert second.group is second_group
+
+
+def test_swap_rejects_multiple_pools_for_service_without_idle_ranks():
+    class NoIdleRanksService(CopyService):
+        supports_idle_ranks = False
+
+        def __init__(self):
+            pass
+
+        def submit_send(self, src_tensor, dest_rank, task_id=None):
+            pass
+
+        def submit_recv(self, dest_tensor, src_rank, task_id=None):
+            pass
+
+        def run(self):
+            pass
+
+    service = NoIdleRanksService()
+
+    with pytest.raises(ValueError, match="does not support num_dst_pools > 1"):
+        refit.swap_model_weights(None, None, refit_method=service, num_dst_pools=2)
 
 
 class TestNeedsMxfp8Conversion:

@@ -72,8 +72,9 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
       :data:`ACCEPTED_NCCL_ALGO_TOKENS`.
     * ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` / ``CUBLAS_WORKSPACE_CONFIG`` —
       if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
-    * ``MAMBA_DETERMINISTIC`` — if set (non-empty), must start with ``'1'``;
-      unset auto-follows :func:`torch.are_deterministic_algorithms_enabled`.
+    * ``MAMBA_DETERMINISTIC`` / ``CAUSAL_CONV1D_DETERMINISTIC`` — if set
+      (non-empty), must start with ``'1'``; unset auto-follows
+      :func:`torch.are_deterministic_algorithms_enabled`.
 
     After validation, ``setdefault`` fills every key in
     :data:`DETERMINISM_ENV_VAR_DEFAULTS` that has not been set — a value the
@@ -100,14 +101,15 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
             f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}."
         )
 
-    # Mamba SSM auto-follows torch when MAMBA_DETERMINISTIC is unset; only
-    # reject an explicit non-deterministic override.
-    mamba = env.get("MAMBA_DETERMINISTIC")
-    if mamba:
-        assert mamba[0] == "1", (
-            f"MAMBA_DETERMINISTIC={mamba!r} disables Mamba SSM determinism under "
-            "--deterministic-mode. Unset it or set to '1'."
-        )
+    # Mamba SSM and causal_conv1d auto-follow torch when unset; only reject an
+    # explicit non-deterministic override.
+    for name in ("MAMBA_DETERMINISTIC", "CAUSAL_CONV1D_DETERMINISTIC"):
+        value = env.get(name)
+        if value:
+            assert value[0] == "1", (
+                f"{name}={value!r} disables SSM determinism under "
+                "--deterministic-mode. Unset it or set to '1'."
+            )
 
     # setdefault preserves any launcher-set value that just passed validation.
     for k, v in DETERMINISM_ENV_VAR_DEFAULTS.items():
@@ -125,7 +127,8 @@ def apply_determinism_to_args(args) -> None:
     2. Calls :func:`apply_determinism_env` on ``os.environ`` — validates
        every determinism-relevant env var (``NCCL_ALGO``,
        ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``, ``CUBLAS_WORKSPACE_CONFIG``,
-       ``MAMBA_DETERMINISTIC``) and setdefaults the canonical values.
+       ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``) and
+       setdefaults the canonical values.
     3. Calls ``torch.use_deterministic_algorithms(True)``.
 
     Incompatible options are rejected with an explicit error rather than

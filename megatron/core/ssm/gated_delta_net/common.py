@@ -167,8 +167,9 @@ class _GDNBase(MegatronModule):
             cp_comm_type (Optional[str]): Accepted for TransformerLayer compatibility and
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
-            pp_layer_offset (Optional[int]): Pipeline layer offset forwarded by
-                TransformerLayer. Stored for MTP/TransformerLayer API compatibility.
+            pp_layer_offset (Optional[int]): Offset of this pipeline stage's first global layer,
+                forwarded by TransformerLayer/HybridStack. Used to index the dynamic-inference
+                state caches (``layer_number - pp_layer_offset``); ``None`` is treated as 0.
             is_mtp_layer (bool): Whether this module is inside an MTP prediction depth.
         """
         if not HAVE_FLA:
@@ -182,6 +183,7 @@ class _GDNBase(MegatronModule):
         # Attributes from arguments
         self.layer_number = layer_number
         self._pp_layer_offset = pp_layer_offset
+        self.pp_layer_offset = pp_layer_offset if pp_layer_offset is not None else 0
         self.is_mtp_layer = is_mtp_layer
         self.bias = bias
         self.conv_bias = conv_bias

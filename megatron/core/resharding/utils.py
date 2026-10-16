@@ -97,6 +97,40 @@ class ShardingDescriptor:
     dst_dim_ranks: list[int]
 
 
+@dataclass(frozen=True)
+class TensorReshardSpec:
+    """Backend-neutral description of one native mesh reshard.
+
+    The generic executor continues to consume ``send_ops``/``recv_ops``.  A
+    backend with a native reshard primitive can instead consume these specs
+    before the plan is lowered into point-to-point slices. Most parameters
+    produce one full-tensor spec. Packed parameters whose components are
+    independently TP-sharded produce one spec per contiguous component.
+    """
+
+    resolved_name: str
+    src_ranks: tuple[int, ...]
+    dst_ranks: tuple[int, ...]
+    global_shape: tuple[int, ...]
+    src_local_shape: tuple[int, ...]
+    dst_local_shape: tuple[int, ...]
+    dtype: torch.dtype
+    src_shard_dim: int | None
+    dst_shard_dim: int | None
+    # Raw module paths are rank-local when PP renumbers layers.  Only the
+    # member on the corresponding side has a name here.
+    src_param_name: str | None = None
+    dst_param_name: str | None = None
+    src_param_shape: tuple[int, ...] | None = None
+    dst_param_shape: tuple[int, ...] | None = None
+    # None selects the complete local parameter. Component specs select the
+    # corresponding contiguous logical tensor from the packed parameter.
+    src_slice: tuple[slice, ...] | None = None
+    dst_slice: tuple[slice, ...] | None = None
+    part_index: int = 0
+    part_count: int = 1
+
+
 @dataclass
 class ReshardPlan:
     """Reshard plan - operations for this rank."""
@@ -108,6 +142,11 @@ class ReshardPlan:
     # Populated by _harmonize_buffer_dtypes on first call; reused thereafter to
     # skip the all_gather_object + named_modules() walks on the hot path.
     buffer_dtypes: Optional[dict[str, torch.dtype]] = None
+    # Whole-tensor descriptions for transports with a native mesh-reshard
+    # primitive. None means this plan cannot be represented by that path; the
+    # accompanying error explains why.
+    tensor_reshard_specs: list[TensorReshardSpec] | None = None
+    tensor_reshard_error: str | None = None
 
     def __str__(self):
         return f"ReshardPlan(sends={len(self.send_ops)}, recvs={len(self.recv_ops)})"

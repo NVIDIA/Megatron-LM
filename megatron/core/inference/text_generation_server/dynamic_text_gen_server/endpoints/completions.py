@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import base64
 import logging
 import time
 
@@ -97,6 +98,25 @@ try:
 
             ignore_eos = bool(req.get("ignore_eos", False))
 
+            # Optional vLLM-style multimodal input. Image entries are
+            # base64-encoded bytes ordered to match prompt placeholders.
+            request_multi_modal_data = req.get("multi_modal_data") or {}
+            if not isinstance(request_multi_modal_data, dict):
+                raise ValueError("multi_modal_data must be a dictionary.")
+            unsupported_modalities = set(request_multi_modal_data) - {"image"}
+            if unsupported_modalities:
+                raise ValueError(
+                    "Unsupported multimodal modalities: "
+                    f"{sorted(unsupported_modalities)}; only 'image' is supported."
+                )
+            encoded_images = request_multi_modal_data.get("image") or []
+            if isinstance(encoded_images, str):
+                encoded_images = [encoded_images]
+            if not isinstance(encoded_images, list):
+                raise ValueError("multi_modal_data.image must be a string or list.")
+            image_bytes_list = [base64.b64decode(encoded_image) for encoded_image in encoded_images]
+            multi_modal_data = {"image": image_bytes_list} if image_bytes_list else None
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -143,9 +163,17 @@ try:
                 streaming_interval=sampling_params.streaming_interval,
             )
             if stream_requested:
-                tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
+                tasks.append(
+                    client.add_request_streaming(
+                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                    )
+                )
             else:
-                tasks.append(client.add_request(prompt_tokens, per_req_params))
+                tasks.append(
+                    client.add_request(
+                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                    )
+                )
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
