@@ -66,7 +66,6 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
-    _localize_qkv_split_shapes,
     _qkv_split_groups_are_complete,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
@@ -744,31 +743,25 @@ def check_config_overrides_consistency(
 
 
 def qkv_rows_after_gtp_gather(
-    param: torch.nn.Parameter,
-    qkv_split_shapes: List[int],
-    gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Tuple[int, int, bool]:
-    """Total rows of a fused QKV weight across its GTP shards, and whether [q|k|v] divides them.
+    param: torch.nn.Parameter, gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None
+) -> Tuple[int, int]:
+    """Return a fused QKV weight's logical TP-local rows and GTP shard count.
 
     Not ``param.shape[0]``: once the GTP degree stops dividing the query-group count, a
     shard-local test switches the split off on GTP ranks while TP1 keeps it, and one
     weight gets two different Muon rules.
 
-    The count is still TP-local. ``splittable`` therefore describes only the tensor after
-    its GTP gather; callers that support query groups fragmented across TP ranks must make
-    the final decision from the full layer layout and the combined TP/GTP row count.
+    The count is still TP-local; callers compare the combined TP/GTP row count against the
+    owning layer's full logical QKV layout.
 
     Args:
         param: Fused QKV weight; reads ``is_gtp_weight_remat`` and ``pad_length``.
-        qkv_split_shapes: Per-query-group rows, e.g. ``[q, k, v]``. Must be non-empty.
         gtp_remat_group: The group the optimizer gathers over -- ``param.group`` can name
             a different one under a ``MultiModuleProcessGroupCollection``.
 
     Returns:
-        ``(gathered_rows, gtp_size, splittable)``, padding already subtracted.
+        ``(gathered_rows, gtp_size)``, padding already subtracted.
     """
-    if not qkv_split_shapes:
-        raise ValueError("qkv_split_shapes must be non-empty to decide the QKV split")
     gtp_size = (
         get_pg_size(gtp_remat_group)
         if gtp_remat_group is not None and getattr(param, 'is_gtp_weight_remat', False)
@@ -777,7 +770,7 @@ def qkv_rows_after_gtp_gather(
     # Subtract the pad only when the rows were scaled up.
     alignment_pad_rows = getattr(param, 'pad_length', 0) if gtp_size > 1 else 0
     gathered_rows = param.shape[0] * gtp_size - alignment_pad_rows
-    return gathered_rows, gtp_size, gathered_rows % sum(qkv_split_shapes) == 0
+    return gathered_rows, gtp_size
 
 
 def _get_megatron_emerging_optimizer(
@@ -847,26 +840,14 @@ def _get_megatron_emerging_optimizer(
                 param.expert_tp = True
             qkv_layout = getattr(param, 'qkv_layout', None)
             if (qkv_layout is not None or 'linear_qkv.weight' in name) and len(param.shape) == 2:
-                if qkv_layout is not None:
-                    qkv_split_shapes = _get_qkv_split_shapes(
-                        qkv_layout, split_qkv_per_head=config.muon_split_qkv_per_head
-                    )
-                    logical_split_shapes = (
-                        qkv_split_shapes
-                        if config.muon_split_qkv_per_head
-                        else qkv_split_shapes * qkv_layout.num_groups
-                    )
-                else:
+                layout_or_config = qkv_layout
+                if layout_or_config is None:
                     # Backward compatibility for custom QKV modules that do not annotate
                     # their weight with the owning attention layer's logical layout.
-                    qkv_split_shapes = _get_qkv_split_shapes(
-                        model_chunk.config, split_qkv_per_head=config.muon_split_qkv_per_head
-                    )
-                    logical_split_shapes = (
-                        qkv_split_shapes
-                        if config.muon_split_qkv_per_head
-                        else qkv_split_shapes * model_chunk.config.num_query_groups
-                    )
+                    layout_or_config = model_chunk.config
+                qkv_split_shapes, logical_split_shapes = _get_qkv_split_shapes(
+                    layout_or_config, split_qkv_per_head=config.muon_split_qkv_per_head
+                )
 
                 tp_group = (
                     pg_collection.expt_tp
@@ -874,7 +855,6 @@ def _get_megatron_emerging_optimizer(
                     else pg_collection.tp
                 )
                 tp_size = get_pg_size(tp_group)
-                tp_rank = get_pg_rank(tp_group)
                 gtp_remat_group = (
                     resolve_gtp_remat_group(
                         pg_collection, is_expert=getattr(param, 'expert_tp', False)
@@ -882,10 +862,7 @@ def _get_megatron_emerging_optimizer(
                     if getattr(param, 'is_gtp_weight_remat', False)
                     else None
                 )
-                logical_tp_local_rows, gtp_size, _ = qkv_rows_after_gtp_gather(
-                    param, qkv_split_shapes, gtp_remat_group
-                )
-                gtp_rank = get_pg_rank(gtp_remat_group)
+                logical_tp_local_rows, gtp_size = qkv_rows_after_gtp_gather(param, gtp_remat_group)
 
                 qkv_gtp_pad_length = (
                     int(getattr(param, 'pad_length', 0))
@@ -915,26 +892,19 @@ def _get_megatron_emerging_optimizer(
                     param.qkv_split_shapes_global = None
                     param.qkv_gtp_pad_length = 0
                     param.qkv_split_groups_are_complete = False
-                    param.qkv_split_heads_are_complete = False
                     continue
 
                 param.is_qkv = True
                 param.qkv_split_shapes_global = logical_split_shapes
                 param.qkv_gtp_pad_length = qkv_gtp_pad_length
-                local_start = tp_rank * logical_tp_local_rows + gtp_rank * param.shape[0]
                 if config.muon_split_qkv_per_head:
-                    if qkv_gtp_pad_length > 0:
-                        # A padded GTP shard does not have a purely logical local layout.
-                        # Force the per-head path to use qkv_split_shapes_global instead.
-                        param.qkv_split_shapes = None
-                        param.qkv_split_heads_are_complete = False
-                    else:
-                        param.qkv_split_shapes, param.qkv_split_heads_are_complete = (
-                            _localize_qkv_split_shapes(
-                                qkv_split_shapes, local_start=local_start, local_rows=param.shape[0]
-                            )
-                        )
+                    # Per-head execution reconstructs row-sharded layouts before splitting;
+                    # no rank-local head-boundary metadata is needed.
+                    param.qkv_split_shapes = qkv_split_shapes
                 else:
+                    tp_rank = get_pg_rank(tp_group)
+                    gtp_rank = get_pg_rank(gtp_remat_group)
+                    local_start = tp_rank * logical_tp_local_rows + gtp_rank * param.shape[0]
                     param.qkv_split_shapes = qkv_split_shapes
                     param.qkv_split_groups_are_complete = (
                         qkv_gtp_pad_length == 0

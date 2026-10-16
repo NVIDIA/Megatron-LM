@@ -16,11 +16,7 @@ if not HAVE_GTP:
 from megatron.core import parallel_state as ps
 from megatron.core.optimizer import emerging_optimizers as _eo_module
 from megatron.core.optimizer import qkv_rows_after_gtp_gather
-from megatron.core.optimizer.emerging_optimizers import (
-    HAVE_EMERGING_OPTIMIZERS,
-    TensorParallelMuon,
-    _localize_qkv_split_shapes,
-)
+from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS, TensorParallelMuon
 
 if not HAVE_EMERGING_OPTIMIZERS:
     pytest.skip("emerging_optimizers not available", allow_module_level=True)
@@ -70,37 +66,35 @@ def _param(rows, pad=0, sharded=True):
     return param
 
 
-def _rows(param, split, gtp_size=None):
+def _rows(param, gtp_size=None):
     assert torch.distributed.is_initialized()
     group = _FakeGroup(gtp_size) if gtp_size else None
-    return qkv_rows_after_gtp_gather(param, split, group)
+    return qkv_rows_after_gtp_gather(param, group)
 
 
 class TestQKVRowCount:
     """QKV tagging must decide from rows across GTP shards, excluding padding."""
 
     @pytest.mark.parametrize("gtp_size", [1, 2, 4, 64])
-    def test_decision_is_layout_invariant(self, gtp_size):
+    def test_row_count_is_layout_invariant(self, gtp_size):
         assert _ROWS % gtp_size == 0
-        assert _rows(_param(_ROWS // gtp_size), _SPLIT, gtp_size) == (_ROWS, gtp_size, True)
+        assert _rows(_param(_ROWS // gtp_size), gtp_size) == (_ROWS, gtp_size)
 
     def test_local_shard_would_have_disabled(self):
         local_rows, gtp_size = 102, 64
-        split = [6144, 192, 192]
-        assert local_rows % sum(split) != 0
-        assert _rows(_param(local_rows), split, gtp_size) == (6528, 64, True)
+        assert local_rows % 6528 != 0
+        assert _rows(_param(local_rows), gtp_size) == (6528, 64)
 
     def test_padding_is_excluded(self):
-        rows, _, splittable = _rows(_param(25, pad=4), _SPLIT, 4)
-        assert (rows, splittable) == (_GROUP, True)
+        rows, gtp_size = _rows(_param(25, pad=4), 4)
+        assert (rows, gtp_size) == (_GROUP, 4)
         assert 100 % _GROUP != 0
 
-    def test_non_qkv_shape_is_rejected(self):
-        rows, _, splittable = _rows(_param(30), _SPLIT, 4)
-        assert (rows, splittable) == (120, False)
+    def test_arbitrary_rows_are_counted_without_layout_decisions(self):
+        assert _rows(_param(30), 4) == (120, 4)
 
     def test_unsharded_param_ignores_group_and_padding(self):
-        assert _rows(_param(_GROUP, pad=4, sharded=False), _SPLIT, 4) == (_GROUP, 1, True)
+        assert _rows(_param(_GROUP, pad=4, sharded=False), 4) == (_GROUP, 1)
 
 
 def _make_muon(
@@ -206,18 +200,14 @@ def _unequal_mla_local_shard(weight, pg_collection):
     assert gtp_size == _MLA_GTP_SIZE
     shard_rows = _MLA_ROWS // gtp_size
     local_start = gtp_rank * shard_rows
-    local_split_shapes, local_heads_are_complete = _localize_qkv_split_shapes(
-        _MLA_HEAD_SPLITS, local_start=local_start, local_rows=shard_rows
-    )
     shard = weight[local_start : local_start + shard_rows].clone()
     shard.is_qkv = True
     shard.is_gtp_weight_remat = True
-    shard.qkv_split_shapes = local_split_shapes
+    shard.qkv_split_shapes = _MLA_HEAD_SPLITS
     shard.qkv_split_shapes_global = _MLA_HEAD_SPLITS
-    shard.qkv_split_heads_are_complete = local_heads_are_complete
     shard.qkv_gtp_pad_length = 0
     shard.partition_dim = 0
-    return shard, gtp_rank, shard_rows, local_heads_are_complete
+    return shard, gtp_rank, shard_rows
 
 
 def _reference_per_head_orth(opt, weight, tp_group, split_shapes):
@@ -277,14 +267,11 @@ def _worker_unequal_mla_heads_gather_consistently(rank, world_size, port):
         opt = _make_muon(pg_collection, split_qkv_per_head=True, qkv_split_shapes=_MLA_HEAD_SPLITS)
         weight = _full_weight(_MLA_ROWS)
         expected = _reference_per_head_orth(opt, weight, pg_collection.tp, _MLA_HEAD_SPLITS)
-        local, gtp_rank, shard_rows, local_heads_are_complete = _unequal_mla_local_shard(
-            weight, pg_collection
-        )
+        local, gtp_rank, shard_rows = _unequal_mla_local_shard(weight, pg_collection)
 
-        # [192, 64, 192, 64] / GTP8 gives 64 rows per rank. Ranks 3 and 7
-        # contain a complete 64-row RoPE slice; the other ranks cut a 192-row
-        # content slice. This mixed local metadata must not control all-gather.
-        assert local_heads_are_complete == (gtp_rank in (3, 7))
+        # [192, 64, 192, 64] / GTP8 gives 64 rows per rank and cuts the unequal
+        # logical components differently. Row sharding alone forces every rank to
+        # reconstruct the global layout before splitting.
         actual = opt.orthogonalize(local, local.clone())
 
         expected_local = expected[gtp_rank * shard_rows : (gtp_rank + 1) * shard_rows]

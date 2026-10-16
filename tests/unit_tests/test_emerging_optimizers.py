@@ -27,7 +27,6 @@ from megatron.core.optimizer.emerging_optimizers import (
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
     _get_qkv_split_shapes,
-    _localize_qkv_split_shapes,
     _qkv_split_groups_are_complete,
     _select_tp_mode,
     get_supported_coefficient_types,
@@ -217,36 +216,17 @@ def test_muon_qkv_split_shapes():
         attention_output_gate=True,
     )
 
-    assert _get_qkv_split_shapes(config) == [128, 64, 64]
-    assert _get_qkv_split_shapes(gated_config) == [128, 128, 64, 64]
-    assert _get_qkv_split_shapes(config, split_qkv_per_head=True) == [64] * 32
-    assert _get_qkv_split_shapes(gated_config, split_qkv_per_head=True) == [64] * 48
+    assert _get_qkv_split_shapes(config) == ([128, 64, 64], [128, 64, 64] * 8)
+    assert _get_qkv_split_shapes(gated_config) == ([128, 128, 64, 64], [128, 128, 64, 64] * 8)
+    assert _get_qkv_split_shapes(config, split_qkv_per_head=True) == ([64] * 32, [64] * 32)
+    assert _get_qkv_split_shapes(gated_config, split_qkv_per_head=True) == ([64] * 48, [64] * 48)
 
     mla_layout = QKVLayout.from_mla_head_components(4, (128, 64))
-    assert _get_qkv_split_shapes(mla_layout) == [128, 64]
-    assert _get_qkv_split_shapes(mla_layout, split_qkv_per_head=True) == [128, 64] * 4
-
-
-def test_muon_local_qkv_head_split_shapes_can_differ_by_tp_rank():
-    """Rank-local per-head layouts report complete and fragmented heads."""
-    global_split_shapes = [64] * 20
-
-    rank_0_shapes, rank_0_complete = _localize_qkv_split_shapes(
-        global_split_shapes, local_start=0, local_rows=160
+    assert _get_qkv_split_shapes(mla_layout) == ([128, 64], [128, 64] * 4)
+    assert _get_qkv_split_shapes(mla_layout, split_qkv_per_head=True) == (
+        [128, 64] * 4,
+        [128, 64] * 4,
     )
-    rank_1_shapes, rank_1_complete = _localize_qkv_split_shapes(
-        global_split_shapes, local_start=160, local_rows=160
-    )
-    aligned_shapes, aligned_complete = _localize_qkv_split_shapes(
-        global_split_shapes, local_start=0, local_rows=640
-    )
-
-    assert rank_0_shapes == [64, 64, 32]
-    assert rank_1_shapes == [32, 64, 64]
-    assert not rank_0_complete
-    assert not rank_1_complete
-    assert aligned_shapes == [64] * 10
-    assert aligned_complete
 
 
 def test_muon_qkv_query_group_layout_localization():
@@ -1097,8 +1077,8 @@ class TestMuonOptimizerMultiRankTP:
         if split_per_head:
             assert first_qkv.qkv_split_shapes_global == [4] * 6
             assert second_qkv.qkv_split_shapes_global == [4] * 4
-            assert first_qkv.qkv_split_heads_are_complete
-            assert second_qkv.qkv_split_heads_are_complete
+            assert first_qkv.qkv_split_shapes == [4] * 6
+            assert second_qkv.qkv_split_shapes == [4] * 4
         else:
             assert first_qkv.qkv_split_shapes_global == [4, 4, 4] * 2
             assert second_qkv.qkv_split_shapes_global == [8, 4, 4]
@@ -1170,8 +1150,8 @@ class TestMuonOptimizerMultiRankTP:
         assert q_up_weight.qkv_split_shapes_global == [4, 2] * 2
         assert kv_up_weight.qkv_split_shapes_global == [4, 3] * 2
         if split_per_head:
-            assert q_up_weight.qkv_split_heads_are_complete
-            assert kv_up_weight.qkv_split_heads_are_complete
+            assert q_up_weight.qkv_split_shapes == [4, 2] * 2
+            assert kv_up_weight.qkv_split_shapes == [4, 3] * 2
         else:
             assert q_up_weight.qkv_split_groups_are_complete
             assert kv_up_weight.qkv_split_groups_are_complete
@@ -1266,7 +1246,6 @@ class TestMuonOptimizerMultiRankTP:
         param.is_qkv = True
         param.qkv_split_shapes = [2, 2]
         param.qkv_split_shapes_global = [2, 2, 2]
-        param.qkv_split_heads_are_complete = False
 
         optimizer = TensorParallelMuon(
             params=[param],
@@ -1355,7 +1334,6 @@ def test_muon_qkv_distributed_mode_routing_warns_once(monkeypatch, layout, expec
     param.qkv_split_shapes = [2, 1, 1]
     param.qkv_split_shapes_global = [2, 1, 1]
     param.qkv_split_groups_are_complete = layout != "fragmented"
-    param.qkv_split_heads_are_complete = True
     if layout == "gtp":
         param.is_gtp_weight_remat = True
 
