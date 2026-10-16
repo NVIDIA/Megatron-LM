@@ -1,5 +1,6 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
 import logging
 import weakref
 from contextlib import contextmanager
@@ -194,8 +195,13 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
-        buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
+        # Compact Muon keeps FP8 and high-precision gradient reductions together;
+        # parameter gather chooses separate transport storage for each kind.
+        buffer_groups = group_params_for_buffers(
+            all_params,
+            self.ddp_config.grad_reduce_in_fp32,
+            merge_layerwise_fp8_grads=not self.ddp_config.use_layer_wise_param_layout,
+        )
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
@@ -206,12 +212,17 @@ class DistributedDataParallel(_BaseDataParallel):
                 logging.WARNING,
                 "DistributedDataParallel: full_param_layout not provided with "
                 "use_distributed_optimizer=True. Auto-computing layout inside DDP. "
-                "Callers should pre-compute layouts via "
-                "DistributedOptimizer.compute_full_param_layout() and pass them in.",
+                "Callers should pre-compute their optimizer's full parameter layout "
+                "and pass it in.",
             )
             from ..optimizer.distrib_optimizer import DistributedOptimizer
 
-            full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            compute_layout = DistributedOptimizer.compute_full_param_layout
+            if any(key.is_managed_by_layer_wise_optimizer for key in buffer_groups):
+                from ..optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+                compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+            full_param_layout = compute_layout(
                 all_params,
                 self.bucket_size,
                 self.intra_dp_cp_group.size(),
@@ -338,9 +349,19 @@ class DistributedDataParallel(_BaseDataParallel):
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
             )
+            buffer_ddp_config = self.ddp_config
+            if (
+                buffer_key.is_managed_by_layer_wise_optimizer
+                and not self.ddp_config.use_layer_wise_param_layout
+            ):
+                # Compact Muon all-reduces whole gradients; Adam keeps DistOpt sharding.
+                # Bucket sizing is already resolved, so do not revalidate num_buckets.
+                buffer_ddp_config = dataclasses.replace(
+                    self.ddp_config, use_distributed_optimizer=False, num_buckets=None
+                )
             params_with_names = [(p, param_to_name[p]) for p in params]
             buffer = _ParamAndGradBuffer(
-                self.ddp_config,
+                buffer_ddp_config,
                 buffer_key.param_dtype,
                 buffer_key.grad_dtype,
                 params_with_names,
@@ -678,6 +699,12 @@ class DistributedDataParallel(_BaseDataParallel):
                 "parameter all-gather is still in flight."
             )
             bucket_group.param_gather_dispatched = False
+
+    def finish_pending_param_sync(self) -> None:
+        """Publish existing gathers before clearing or restaging gradient storage."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            if bucket_group.param_gather_handle is not None:
+                bucket_group.start_param_sync(force_sync=True)
 
     @_otel_trace_fn('communication', 'megatron.grad_sync.start')
     def start_grad_sync(self, *unused):
