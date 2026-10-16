@@ -144,18 +144,14 @@ def _is_routing_coupled(name):
     return _is_routed_expert(name) or name.endswith("block_sparse_moe.gate.weight")
 
 
-def _grads_by_hf_name(model, cfg, ps, dist=None):
-    """Parameter gradients gathered across TP/EP/PP through the weight-export path, keyed by HF disk name."""
+def _grads_by_hf_name(model, cfg, ps):
+    """Parameter gradients gathered across EP/PP through the weight-export path, keyed by HF disk name."""
     from megatron.lite.model.minimax_m3.lite.checkpoint import export_hf_weights
 
     params = list(model.named_parameters())
     saved = [p.data for _, p in params]
-    sp_ids = {id(p) for p in getattr(model, "sp_params", [])}
     for _, p in params:
         g = p.grad if p.grad is not None else torch.zeros_like(p.data)
-        if dist is not None and id(p) in sp_ids and ps.tp_size > 1:  # SP-sharded input: DDP sums these grads over TP
-            g = g.clone()
-            dist.all_reduce(g, group=ps.tp_group)
         p.data = g
     try:
         grads = {n: t.detach().clone() for n, t in export_hf_weights(model, cfg, ps)}

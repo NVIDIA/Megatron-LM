@@ -246,30 +246,6 @@ class MiniMaxM3WeightSpec:
         return []
 
     # ------------------------------------------------------------------ sharding hooks
-    def merge_dense_shards(self, native_name: str, shards: list[torch.Tensor]) -> torch.Tensor | None:
-        """Inverse of ``split_qkv`` / ``split_gate_up``: each TP shard is ``[q_i|k_i|v_i]`` (or ``[gate_i|up_i]``)."""
-        if len(shards) <= 1:
-            return None
-        if native_name.endswith(".attn.qkv.linear.weight"):
-            c = self.config
-            tp = len(shards)
-            if c.num_key_value_heads < tp:
-                return None  # replicated KV: shards are contiguous slices of [Q | K | V]; the default cat is right
-            q_rows = c.num_attention_heads * c.head_dim // tp
-            kv_rows = c.num_key_value_heads * c.head_dim // tp
-            parts = [shard.split([q_rows, kv_rows, kv_rows], dim=0) for shard in shards]
-            return torch.cat([torch.cat([p[i] for p in parts]) for i in range(3)]).contiguous()
-        if native_name.endswith((".mlp.gate_up.linear.weight", ".moe.shared_expert.gate_up.linear.weight")):
-            halves = [shard.chunk(2, dim=0) for shard in shards]
-            return torch.cat([torch.cat([h[0] for h in halves]), torch.cat([h[1] for h in halves])]).contiguous()
-        return None
-
-    def qkv_spec(self, native_name: str) -> tuple[int, int, int] | None:
-        if native_name.endswith(".attn.qkv.linear.weight"):
-            c = self.config
-            return (c.num_attention_heads, c.num_key_value_heads, c.head_dim)
-        return None
-
     def tp_spec(self, native_name: str) -> tuple[int, int] | None:
         if self.is_expert(native_name):
             if ".fc1." in native_name:

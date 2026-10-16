@@ -286,11 +286,6 @@ def plan_magi_batch(
             causal=True,
             dist_attn_config=m.DistAttnConfig(dispatch_config=dcfg),
         )
-    if position_ids.numel() % max(ps.tp_size, 1) != 0:
-        raise ValueError(
-            f"local token count {position_ids.numel()} is not divisible by tp={ps.tp_size}; "
-            f"choose magi_chunk_size divisible by tp"
-        )
     if dense_key is not None and os.environ.get("MLITE_MAGI_DEBUG") == "1":
         ar = torch.arange(cu_seqlens[-1], device=position_ids.device)
         if not torch.equal(m.msa.dispatch(ar, key), m.native_dispatch(ar, dense_key)):
