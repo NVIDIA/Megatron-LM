@@ -708,6 +708,29 @@ def _build_head_perm_for_split_sections(
     return torch.cat(parts, dim=-1).view(-1)
 
 
+@lru_cache(maxsize=8)
+def _build_head_perm_and_inverse_for_split_sections(
+    split_sections: tuple[int, ...], cp_size: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    perm = _build_head_perm_for_split_sections(split_sections, cp_size, device)
+    return perm, torch.argsort(perm)
+
+
+class _PermuteAlongDim(torch.autograd.Function):
+    """``index_select`` by a permutation; backward gathers by the inverse, not scatter-add."""
+
+    @staticmethod
+    def forward(ctx, x, perm, inverse_perm, dim):
+        ctx.dim = dim
+        ctx.save_for_backward(inverse_perm)
+        return x.index_select(dim, perm)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (inverse_perm,) = ctx.saved_tensors
+        return grad.index_select(ctx.dim, inverse_perm), None, None, None
+
+
 ####################
 # Context parallel utilities
 ####################
@@ -911,10 +934,10 @@ def a2a_cp_to_hp(
     """
     if cp_size > 1:
         # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
-        head_perm = _build_head_perm_for_split_sections(
+        head_perm, head_perm_inv = _build_head_perm_and_inverse_for_split_sections(
             in_proj_split_sections, cp_size, qkvzba.device
         )
-        qkvzba = qkvzba.index_select(-1, head_perm)
+        qkvzba = _PermuteAlongDim.apply(qkvzba, head_perm, head_perm_inv, -1)
 
     thd_cp_a2a_inv = None
     if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -926,7 +949,7 @@ def a2a_cp_to_hp(
             # is equivalent to per-sequence a2a.
             # This also folds the ``_undo_attention_load_balancing`` step.
             thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(cu_seqlens_q, cp_size, seq_len)
-            qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
+            qkvzba = _PermuteAlongDim.apply(qkvzba, thd_cp_a2a_idx, thd_cp_a2a_inv, 0)
     else:
         qkvzba = tensor_a2a_cp2hp(qkvzba, seq_dim=0, head_dim=-1, cp_group=cp_group)
 
@@ -957,7 +980,11 @@ def a2a_hp_to_cp(
     if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
         if cp_size > 1:
             assert thd_cp_a2a_inv is not None
-            norm_out = norm_out.index_select(0, thd_cp_a2a_inv)
+            thd_cp_a2a_idx = torch.empty_like(thd_cp_a2a_inv)
+            thd_cp_a2a_idx[thd_cp_a2a_inv] = torch.arange(
+                thd_cp_a2a_inv.numel(), device=thd_cp_a2a_inv.device
+            )
+            norm_out = _PermuteAlongDim.apply(norm_out, thd_cp_a2a_inv, thd_cp_a2a_idx, 0)
         norm_out = tensor_a2a_hp2cp(
             norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group, redo_attention_load_balancing=False
         )
