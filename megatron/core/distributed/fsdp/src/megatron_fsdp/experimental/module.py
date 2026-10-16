@@ -382,12 +382,13 @@ class FsdpModule:
         if is_recomputing:
             # Backward reuses BF16 weights and any gathered MXFP8 columnwise planes,
             # but no longer needs the MXFP8 rowwise planes used for recomputation.
-            groups = [group for group in self._parameter_groups if group.has_forward_only_planes]
-            if groups:
+            if groups_to_release := [
+                group for group in self._parameter_groups if group.has_forward_only_planes
+            ]:
                 allgather_stream = self.context.allgather_stream
                 allgather_stream.wait_stream(self.context.current_stream())
                 with torch.cuda.stream(allgather_stream):
-                    for group in groups:
+                    for group in groups_to_release:
                         group.release_unsharded_storage(rowwise_only=True)
                 self._unshard_events.pop(Phase.FORWARD, None)
         else:
