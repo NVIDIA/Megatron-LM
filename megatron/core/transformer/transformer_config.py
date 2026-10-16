@@ -331,12 +331,24 @@ class TransformerConfig(ModelParallelConfig):
     (kv_lora_rank + qk_pos_emb_head_dim channels) between CP ranks and recomputes the KV
     up-projection per ring step, bypassing the Transformer Engine attention wrapper. Requires
     multi_latent_attention, THD packed input in the zigzag CP layout (a contiguous layout for MLA
-    depends on PR #7545), cp_comm_type p2p/a2a/a2a+p2p and attention_backend fused/flash."""
+    depends on PR #7545), cp_comm_type p2p/a2a/a2a+p2p and attention_backend fused/flash/auto (the
+    core-attention kernel can also be set per direction, see mla_latent_cp_fwd_backend)."""
 
     mla_latent_cp_two_stream: bool = False
     """MLAWithLatentCP only: run alternate ring steps of the forward on a second CUDA stream (TE's
     cp_stream pattern). Off by default: measured neutral at 64K/CP4 and 512K/CP16 on GB300 (the
     overlapped attention kernels run correspondingly slower); kept for short-sequence experiments."""
+
+    mla_latent_cp_fwd_backend: Optional[AttnBackend] = None
+    """MLAWithLatentCP only: core-attention kernel of the forward ring steps, AttnBackend.fused
+    (cuDNN through Transformer Engine) or AttnBackend.flash (FlashAttention-4); None follows
+    attention_backend. The forward and backward kernels share only the merged output and its fp32
+    log-sum-exp, so the two directions may use different backends: at MLA head dimensions cuDNN has
+    the faster forward and FlashAttention-4 the faster backward."""
+
+    mla_latent_cp_bwd_backend: Optional[AttnBackend] = None
+    """MLAWithLatentCP only: core-attention kernel of the backward ring steps, AttnBackend.fused or
+    AttnBackend.flash (see mla_latent_cp_fwd_backend); None follows attention_backend."""
 
     no_rope_freq: Optional[Union[int, List[int]]] = None
     """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
@@ -3299,6 +3311,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.mla_latent_cp_two_stream and not self.mla_latent_cp:
             raise ValueError("mla_latent_cp_two_stream requires mla_latent_cp=True.")
 
+        mla_latent_cp_backends = (self.mla_latent_cp_fwd_backend, self.mla_latent_cp_bwd_backend)
+        if any(b is not None for b in mla_latent_cp_backends) and not self.mla_latent_cp:
+            raise ValueError(
+                "mla_latent_cp_fwd_backend/mla_latent_cp_bwd_backend require mla_latent_cp=True."
+            )
+
         if self.mla_latent_cp:
             cp_comm_types = (
                 self.cp_comm_type if isinstance(self.cp_comm_type, list) else [self.cp_comm_type]
@@ -3328,6 +3346,10 @@ class TransformerConfig(ModelParallelConfig):
                 and "mla_up_proj" in self.recompute_modules,
                 "attention_backend other than fused/flash/auto": self.attention_backend
                 not in (AttnBackend.fused, AttnBackend.flash, AttnBackend.auto),
+                "mla_latent_cp_fwd_backend/mla_latent_cp_bwd_backend other than fused/flash": any(
+                    b not in (None, AttnBackend.fused, AttnBackend.flash)
+                    for b in mla_latent_cp_backends
+                ),
                 "tensor parallelism without sequence_parallel": self.tensor_model_parallel_size > 1
                 and not self.sequence_parallel,
                 "attention_dropout > 0": self.attention_dropout != 0.0,

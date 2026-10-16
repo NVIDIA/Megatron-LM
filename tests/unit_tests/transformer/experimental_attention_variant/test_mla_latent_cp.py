@@ -504,9 +504,27 @@ class TestMLALatentCPFlashAttn4:
     """FA4 backend against the cuDNN backend of the same module."""
 
     @pytest.mark.parametrize(
-        ("tp", "cp", "comm", "a2a"), ((1, 2, "p2p", 1), (1, 4, "p2p", 1), (1, 4, "a2a+p2p", 2))
+        ("tp", "cp", "comm", "a2a", "knobs"),
+        (
+            (1, 2, "p2p", 1, dict(attention_backend=AttnBackend.flash)),
+            (1, 4, "p2p", 1, dict(attention_backend=AttnBackend.flash)),
+            (1, 4, "a2a+p2p", 2, dict(attention_backend=AttnBackend.flash)),
+            # Mixed directions: cuDNN forward with FlashAttention-4 backward (the recipe setting,
+            # attention_backend stays fused) and the reverse pairing.
+            (1, 4, "p2p", 1, dict(mla_latent_cp_bwd_backend=AttnBackend.flash)),
+            (1, 4, "a2a+p2p", 2, dict(mla_latent_cp_bwd_backend=AttnBackend.flash)),
+            (
+                1,
+                2,
+                "p2p",
+                1,
+                dict(
+                    attention_backend=AttnBackend.flash, mla_latent_cp_bwd_backend=AttnBackend.fused
+                ),
+            ),
+        ),
     )
-    def test_flash_matches_fused(self, tp, cp, comm, a2a):
+    def test_flash_matches_fused(self, tp, cp, comm, a2a, knobs):
         world = tp * cp
         if Utils.world_size < world or Utils.world_size % world != 0:
             pytest.skip(f"Needs a multiple of {world} CUDA ranks.")
@@ -525,9 +543,20 @@ class TestMLALatentCPFlashAttn4:
             )
             pgs = ProcessGroupCollection.use_mpu_process_groups()
             fused = _build(spec, _make_config(tp, cp, **mode), pg_collection=pgs)
-            flash_config = _make_config(tp, cp, attention_backend=AttnBackend.flash, **mode)
-            flash = _build(spec, flash_config, pg_collection=pgs)
+            flash = _build(spec, _make_config(tp, cp, **knobs, **mode), pg_collection=pgs)
             flash.load_state_dict(fused.state_dict())
+            # Each direction resolves its own knob, falling back to attention_backend.
+            default = knobs.get("attention_backend", AttnBackend.fused)
+            fwd_is_fa4 = knobs.get("mla_latent_cp_fwd_backend", default) == AttnBackend.flash
+            bwd_is_fa4 = knobs.get("mla_latent_cp_bwd_backend", default) == AttnBackend.flash
+            assert fused._attn_fwd is mla_latent_cp._cudnn_fwd
+            assert fused._attn_bwd is mla_latent_cp._cudnn_bwd
+            assert flash._attn_fwd is (
+                mla_latent_cp._fa4_fwd if fwd_is_fa4 else mla_latent_cp._cudnn_fwd
+            )
+            assert flash._attn_bwd is (
+                mla_latent_cp._fa4_bwd if bwd_is_fa4 else mla_latent_cp._cudnn_bwd
+            )
             torch.manual_seed(7)
             full_hidden = torch.randn(TOTAL_TOKENS, 1, HIDDEN, dtype=torch.bfloat16).cuda()
             idx = _thd_sp_shard_token_indices(CU_SEQLENS_PADDED, cp, cp_rank, tp, tp_rank).cuda()
@@ -548,9 +577,14 @@ class TestMLALatentCPFlashAttn4:
 
 
 def _backends():
-    yield pytest.param((mla_latent_cp._cudnn_fwd, mla_latent_cp._cudnn_bwd), id="cudnn")
+    cudnn = (mla_latent_cp._cudnn_fwd, mla_latent_cp._cudnn_bwd)
+    yield pytest.param(cudnn, id="cudnn")
     if _IS_BLACKWELL and HAVE_FA4_B11:
-        yield pytest.param((mla_latent_cp._fa4_fwd, mla_latent_cp._fa4_bwd), id="fa4")
+        fa4 = (mla_latent_cp._fa4_fwd, mla_latent_cp._fa4_bwd)
+        yield pytest.param(fa4, id="fa4")
+        # Mixed directions share only out and the natural-log lse (and a placeholder rng state).
+        yield pytest.param((cudnn[0], fa4[1]), id="cudnn_fwd-fa4_bwd")
+        yield pytest.param((fa4[0], cudnn[1]), id="fa4_fwd-cudnn_bwd")
 
 
 @pytest.mark.experimental
@@ -648,6 +682,9 @@ def test_a2a_permutation_matches_chunk_bookkeeping(cp, a2a):
             cp_comm_type="a2a", recompute_granularity="selective", recompute_modules=["mla_up_proj"]
         ),
         dict(attention_backend=AttnBackend.unfused),
+        dict(mla_latent_cp_fwd_backend=AttnBackend.unfused),
+        dict(mla_latent_cp_bwd_backend=AttnBackend.auto),
+        dict(mla_latent_cp=False, mla_latent_cp_bwd_backend=AttnBackend.flash),
         dict(tensor_model_parallel_size=2, sequence_parallel=False),
         dict(attention_dropout=0.1),
         dict(recompute_granularity="selective", recompute_modules=["core_attn"]),
@@ -659,8 +696,33 @@ def test_a2a_permutation_matches_chunk_bookkeeping(cp, a2a):
     ),
 )
 def test_config_rejections(overrides):
-    with pytest.raises(ValueError, match=r"mla_latent_cp( does not support|_two_stream requires)"):
+    with pytest.raises(
+        ValueError,
+        match=r"mla_latent_cp( does not support|_two_stream requires|_fwd_backend/\w+ require)",
+    ):
         _make_config(1, 1, **overrides)
+
+
+@requires_te
+def test_backend_resolution_without_flash():
+    """attention_backend=auto and an explicit fused knob both resolve to the cuDNN shims (no FA4
+    import on hosts without it); the two directions resolve independently."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        spec = apply_mla_latent_cp_spec(_attention_spec())
+        for knobs in (
+            dict(attention_backend=AttnBackend.auto),
+            dict(attention_backend=AttnBackend.auto, mla_latent_cp_fwd_backend=AttnBackend.fused),
+            dict(
+                mla_latent_cp_fwd_backend=AttnBackend.fused,
+                mla_latent_cp_bwd_backend=AttnBackend.fused,
+            ),
+        ):
+            module = _build(spec, _make_config(1, 1, **knobs))
+            assert module._attn_fwd is mla_latent_cp._cudnn_fwd
+            assert module._attn_bwd is mla_latent_cp._cudnn_bwd
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @requires_te

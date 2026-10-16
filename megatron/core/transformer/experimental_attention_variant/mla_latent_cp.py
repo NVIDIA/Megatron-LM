@@ -8,10 +8,12 @@ re-runs the inherited ``linear_kv_up_proj`` on the received latent, attends to i
 partial outputs in fp32. Backward re-circulates ``(latent, dlatent)`` pairs and recomputes the
 up-projection per step, so no full K/V is ever saved. Core attention runs directly on the public
 Transformer Engine ``fused_attn_fwd/bwd`` (cuDNN) or FlashAttention-4 kernels instead of TE's
-attention wrapper. THD packed input in the zigzag CP layout, causal self-attention. RoPE is
-applied as in ``MLASelfAttention``: the query's and the latent's positional channels are rotated
-once before the ring; a parent that marks a layer RoPE-free (``use_rope=False``) skips it. A
-contiguous CP layout for MLA depends on the input conversion of PR #7545.
+attention wrapper, selectable per direction (``mla_latent_cp_fwd_backend`` /
+``mla_latent_cp_bwd_backend``; default ``attention_backend``). THD packed input in the zigzag CP
+layout, causal self-attention. RoPE is applied as in ``MLASelfAttention``: the query's and the
+latent's positional channels are rotated once before the ring; a parent that marks a layer
+RoPE-free (``use_rope=False``) skips it. A contiguous CP layout for MLA depends on the input
+conversion of PR #7545.
 
 ``cp_comm_type`` ``a2a+p2p`` (hierarchical CP groups) and ``a2a`` add a Ulysses stage over the a2a
 group: the latents of its ``A`` ranks are gathered, query tokens are exchanged for heads, and the
@@ -212,6 +214,9 @@ def _a2a_permutation(packed_seq_params, cp_size: int, a2a_size: int, num_tokens:
 
 # Backend shims. fwd(q, k, v, step, scale) -> (out bf16 [n, H, dv], lse fp32 [n, H], rng_state);
 # bwd(q, k, v, out, dout, lse, rng, step, scale, deterministic) -> (dq, dk, dv).
+# The two directions may come from different backends: a backward only needs the merged output
+# and its log-sum-exp, which both kernels keep as the natural-log LSE of the scaled scores (cuDNN's
+# softmax stats, FlashAttention's lse); without dropout the rng state is a placeholder.
 
 
 def _lengths(cu):
@@ -252,6 +257,8 @@ def _cudnn_fwd(q, k, v, step, scale):
 
 
 def _cudnn_bwd(q, k, v, out, dout, lse, rng, step, scale, det):
+    if rng is None:  # forward ran on FlashAttention-4; cuDNN reads the seed only with dropout
+        rng = torch.zeros(2, dtype=torch.int64, device=q.device)
     dq, dk, dv, *_ = fused_attn_bwd(
         step.max_q,
         step.max_kv,
@@ -288,7 +295,9 @@ def _fa4():
             fa4_version = version("flash-attn-4")
         except (ImportError, PackageNotFoundError) as e:
             raise ImportError(
-                "attention_backend=flash with mla_latent_cp needs the flash_attn_4 (CuTe) package."
+                "FlashAttention-4 (flash, via attention_backend or mla_latent_cp_fwd_backend / "
+                "mla_latent_cp_bwd_backend) with mla_latent_cp needs the flash_attn_4 (CuTe) "
+                "package."
             ) from e
         if fa4_version != _FA4_VERSION:
             raise RuntimeError(
@@ -629,18 +638,25 @@ class MLAWithLatentCP(MLASelfAttention):
                 "mla_latent_cp runs linear_kv_up_proj without per-step tensor-parallel "
                 "communication, which needs a Transformer Engine linear."
             )
-        if self.config.attention_backend == AttnBackend.flash:
+        # One kernel per direction: mla_latent_cp_{fwd,bwd}_backend, each falling back to
+        # attention_backend (fused or auto = cuDNN, flash = FlashAttention-4).
+        backends = tuple(
+            self.config.attention_backend if b is None else b
+            for b in (self.config.mla_latent_cp_fwd_backend, self.config.mla_latent_cp_bwd_backend)
+        )
+        if AttnBackend.flash in backends:
             if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 10:
-                raise ValueError("attention_backend=flash with mla_latent_cp needs SM100 or newer.")
-            _fa4()
-            self._attn_fwd, self._attn_bwd = _fa4_fwd, _fa4_bwd
-        else:  # fused or auto
-            if not _FUSED_ATTN_API_OK:
-                raise ImportError(
-                    "mla_latent_cp needs a Transformer Engine whose fused_attn_fwd/bwd accept the "
-                    "THD layout keywords (o_format, do_format, dqkv_layout, deterministic)."
+                raise ValueError(
+                    "FlashAttention-4 (flash) with mla_latent_cp needs SM100 or newer."
                 )
-            self._attn_fwd, self._attn_bwd = _cudnn_fwd, _cudnn_bwd
+            _fa4()
+        if any(b != AttnBackend.flash for b in backends) and not _FUSED_ATTN_API_OK:
+            raise ImportError(
+                "mla_latent_cp needs a Transformer Engine whose fused_attn_fwd/bwd accept the "
+                "THD layout keywords (o_format, do_format, dqkv_layout, deterministic)."
+            )
+        self._attn_fwd = _fa4_fwd if backends[0] == AttnBackend.flash else _cudnn_fwd
+        self._attn_bwd = _fa4_bwd if backends[1] == AttnBackend.flash else _cudnn_bwd
         # The layer passes cp_comm_type only when CP is on; the config holds it otherwise (a list
         # is per layer, as TransformerLayer indexes it).
         mode = kwargs.get("cp_comm_type")
