@@ -315,6 +315,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     def _finalize(self) -> None:
         super()._finalize()
+        self.optimizer.finalize_optimizer_config()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
 
