@@ -1675,16 +1675,17 @@ class CuteDSLFusedCPBwdPreProcessWS(CPHostCaches):
             cutlass.Int32((1 if emit_h else 0) | (2 if emit_m else 0)),
             self._cu_stream(_stream_handle),
         )
-        # Aligned / ragged specialization (see the class docstring).  The
-        # geometry is otherwise fixed by the wrapper, so this is the whole key.
-        # Per-key `gk` always takes the ragged specialization: the aligned
-        # program really is different there (`need_lam` and `need_mask` both
-        # off), and compiling it lazily at the first non-64-aligned boundary
-        # window would stall one rank at a random mid-training step while its
-        # peers spin (see `fused_ws.PreProcessFwdFusedWS.build_key`).  One
-        # compile per wrapper, at the first launch, instead; the cost is the
-        # lambda table and the dV tail mask on aligned calls.
-        full_chunks = int(T) % BT == 0 and self.gate_mode != "gk"
+        # One backward program per wrapper: the ragged (tail-masked)
+        # specialization serves every `T`, in every gate mode.  Keying the
+        # compile cache on `T % 64 == 0` meant that, in a packed layout where
+        # only some ranks own an unaligned boundary window, those ranks paid a
+        # multi-minute `cute.compile` at the first such window while their
+        # peers spun in the symmetric-memory handshake, and the two programs
+        # then ran side by side across ranks; the g-mode ragged case of the
+        # GB300 harness never completed that way.  One compile per wrapper, at
+        # the first launch; the cost on aligned calls is the lambda table and
+        # the dV tail mask (see `fused_ws.PreProcessFwdFusedWS.build_key`).
+        full_chunks = False
         geometry = (full_chunks,)
         op = self._ops.get(geometry)
         if op is None:

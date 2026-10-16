@@ -49,16 +49,7 @@ Only the warp-specialized (tcgen05) engines remain:
 | `_host.py` | host helpers shared by the wrappers: pointer / CUstream memoization, gate normalization |
 | `symm.py` | `CPSymmBuffers`: the symmetric `hm_sym` / `flags` / `acks` tensors and peer pointer tables |
 
-Each wrapper compiles one specialization per chunk alignment (`T % 64 == 0`
-or not); under scalar `g` the forward's two specializations are the same
-program and share one cache entry. Under per-key `gk` both wrappers run the
-ragged (tail-masked) specialization for every `T`: the aligned program would
-differ there, and compiling it lazily at the first non-64-aligned boundary
-window would stall one rank at a random mid-training step while its peers
-spin in symmetric memory. Each direction therefore pays exactly one compile,
-at its first launch, right after the rank-consistent handshake; the cost is
-the lambda 1/0 table (and the backward's dV tail mask) on aligned calls, the
-same work scalar `g` already does for lambda. The wrapper cache key and the
+Each wrapper compiles exactly one program. The forward's aligned and ragged specializations are the same program under scalar `g` (`need_lam` is on either way) and the per-key `gk` wrapper is built as the ragged specialization; the backward wrapper runs the ragged (tail-masked) specialization for every `T` in every gate mode. Keying the backward on `T % 64 == 0` used to compile the ragged program lazily on only the ranks that own an unaligned boundary window, several minutes into a packed run while their peers spun, and mixed two programs across ranks; the single program costs the lambda table and the dV tail mask on aligned calls. The wrapper cache key and the
 handshake signature carry the gate mode, so a GDN and a KDA layer of the same
 head geometry never share a wrapper. The forward engine's K = 64 `gk` pairing
 is unverified and unreachable: the dispatcher admits only K = V = 128.
