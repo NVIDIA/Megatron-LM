@@ -1132,7 +1132,9 @@ class TestMuonOptimizerMultiRankTP:
         )
         model = GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_local_spec(multi_latent_attention=True),
+            transformer_layer_spec=get_gpt_layer_local_spec(
+                multi_latent_attention=True, normalization=transformer_config.normalization
+            ),
             vocab_size=32,
             max_sequence_length=8,
             pre_process=False,
@@ -1684,18 +1686,24 @@ def test_muon_optimizer_uniform_per_head_splits_use_batched_ns():
 def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
     """The pinned Emerging-Optimizers 3D Newton-Schulz path matches 2D head calls."""
     torch.manual_seed(42)
-    grad = torch.randn(8, 16, dtype=torch.float32, device='cuda')
+    # Match Emerging-Optimizers v0.3.0's batched parity case. Tiny matrices can select
+    # different baddbmm/addmm kernels and amplify their otherwise valid rounding differences.
+    num_heads, head_rows, hidden_size = 4, 128, 256
+    split_shapes = [head_rows] * num_heads
+    grad = torch.randint(
+        -3, 4, (num_heads * head_rows, hidden_size), dtype=torch.float32, device='cuda'
+    )
     param = torch.nn.Parameter(torch.zeros_like(grad))
     param.is_qkv = True
-    param.qkv_split_shapes = [2] * 4
+    param.qkv_split_shapes = split_shapes
     optimizer = TensorParallelMuon(
         params=[param],
         split_qkv=True,
         split_qkv_per_head=True,
         is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
-        qkv_split_shapes=[2] * 4,
+        qkv_split_shapes=split_shapes,
         fp32_matmul_prec="highest",
-        num_ns_steps=2,
+        num_ns_steps=5,
         pg_collection=None,
     )
 
@@ -1703,10 +1711,10 @@ def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
     expected = torch.cat(
         [
             optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
-            for head in torch.split(grad, [2] * 4)
+            for head in torch.split(grad, split_shapes)
         ]
     )
-    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
 
 
 def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns():
