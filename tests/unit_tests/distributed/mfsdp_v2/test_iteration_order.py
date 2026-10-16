@@ -29,6 +29,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration imp
     StaticOrder,
     iteration,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
 def _demand(order, module, phase):
@@ -195,6 +196,10 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
 
         def forward(self, x):
             x = checkpoint(self.fc1, x, use_reentrant=reentrant)
+            if not record_iteration and isinstance(self.fc2, FsdpModule):
+                # The next owner is prefetched before its own demand hook runs,
+                # including on the first step, without recording an iteration.
+                assert self.fc2._unshard_event is not None
             return checkpoint(self.fc2, x.relu(), use_reentrant=reentrant)
 
     device = distributed_setup.device
