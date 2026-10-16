@@ -27,7 +27,7 @@ from torch.distributed.tensor import Partial, Replicate
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .dbuffer import DBuffer, symmetric_memory_allocation
+from .dbuffer import DBuffer
 from .placement import changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -120,6 +120,8 @@ class FsdpParameterGroup:
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
+        if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
+            raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
@@ -246,7 +248,7 @@ class FsdpParameterGroup:
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
             return nullcontext()
-        return symmetric_memory_allocation(self._symm_mem_pool)
+        return torch.cuda.use_mem_pool(self._symm_mem_pool)
 
     def _set_module_parameter(self, fqns: tuple[str, ...], parameter: nn.Parameter) -> None:
         owning_module = self._owning_module()

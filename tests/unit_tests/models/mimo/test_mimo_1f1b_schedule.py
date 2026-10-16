@@ -452,6 +452,7 @@ def get_mimo_model(
             overlap_param_gather=use_layer_wise_distributed_optimizer,
             bucket_size=10000,
             use_distributed_optimizer=True,
+            use_layer_wise_param_layout=use_layer_wise_distributed_optimizer,
         )
 
     if use_layer_wise_distributed_optimizer:

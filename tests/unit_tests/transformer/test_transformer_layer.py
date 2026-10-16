@@ -134,6 +134,7 @@ class TestParallelTransformerLayer:
             use_cpu_initialization=True,
             context_parallel_size=1,
             dynamic_context_parallel=True,
+            max_seqlen_per_dp_cp_rank=32,
             cp_comm_type=cp_comm_type,
         )
 

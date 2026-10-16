@@ -70,6 +70,7 @@ training = [
     "wandb",
     "transformers",
     "accelerate",
+    "gigatoken",
 ]
 
 ### 'mlm' group is deprecated. please use 'training' instead ###
@@ -80,6 +81,7 @@ mlm = [
     "wandb",
     "transformers",
     "accelerate",
+    "gigatoken",
 ]
 
 dev = [

@@ -1552,6 +1552,8 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, cached_blocks[:mamba_cached_blocks])
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
+        # The engine records the Mamba match before admission; the context only reads it.
+        req2._mamba_num_matched_blocks = _StubEngine(ctx)._find_mamba_match_count(req2)
         start, end = self._add_chunk(ctx, req2)
 
         skipped_blocks = 1 if mamba_cached_blocks == 1 else 2

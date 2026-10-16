@@ -123,6 +123,8 @@ def test_encoder_optimizer_uses_nonoverlapped_mxfp8_param_copy():
         timers=None,
         is_stub_optimizer=False,
         optimizer=MagicMock(),
+        _optimizer_state_offloader=None,
+        _layer_wise_non_distopt_child=False,
         _copy_main_params_to_model_params=MagicMock(),
         _copy_main_params_to_param_buffer=MagicMock(),
     )

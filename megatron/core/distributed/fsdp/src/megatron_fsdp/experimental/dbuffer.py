@@ -14,8 +14,6 @@
 
 """Distributed tensor buffers for Megatron-FSDP."""
 
-import contextlib
-import contextvars
 import dataclasses
 from collections.abc import Iterable
 
@@ -35,29 +33,6 @@ class _OwnedRange:
     numel: int
     tensor_relative_offset: int
     buffer_relative_offset: int
-
-
-# True while DBuffers are allocated from the NCCL symmetric-memory pool; see
-# symmetric_memory_allocation.
-_ALLOCATING_FROM_SYMM_MEM: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "megatron_fsdp_allocating_from_symm_mem", default=False
-)
-
-
-@contextlib.contextmanager
-def symmetric_memory_allocation(pool: torch.cuda.MemPool):
-    """Allocate DBuffers created in this scope from the symmetric-memory ``pool``.
-
-    DBuffers constructed inside the scope record ``allocated_from_symm_mem``, so
-    ``DBuffer.is_symmetric_memory`` still recognizes them, and their collectives still
-    rendezvous, on PyTorch builds without ``symm_mem.is_symm_mem_tensor``.
-    """
-    token = _ALLOCATING_FROM_SYMM_MEM.set(True)
-    try:
-        with torch.cuda.use_mem_pool(pool):
-            yield
-    finally:
-        _ALLOCATING_FROM_SYMM_MEM.reset(token)
 
 
 def _validate_placements(placements: Iterable[Placement]) -> None:
@@ -102,9 +77,6 @@ class DBuffer:
     # before deleting the buffer. See https://github.com/NVIDIA/Megatron-LM/pull/6187 and
     # https://docs.pytorch.org/docs/2.13/generated/torch.Tensor.record_stream.html.
     allocation_stream: torch.cuda.Stream | None
-    # Whether ``local_buffer`` was allocated inside ``symmetric_memory_allocation``. Only
-    # consulted on PyTorch builds without ``symm_mem.is_symm_mem_tensor``.
-    allocated_from_symm_mem: bool = False
 
     def __init__(
         self,
@@ -138,7 +110,6 @@ class DBuffer:
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
-        self.allocated_from_symm_mem = _ALLOCATING_FROM_SYMM_MEM.get()
         self.allocation_stream = (
             torch.cuda.current_stream(self.local_buffer.device)
             if self.local_buffer.is_cuda
@@ -158,12 +129,9 @@ class DBuffer:
     @property
     def is_symmetric_memory(self) -> bool:
         """Whether the local buffer is allocated from symmetric memory."""
-        # PyTorch builds that predate symm_mem.is_symm_mem_tensor (such as dev's 2.12
-        # pre-release) cannot report whether the buffer is symmetric, so fall back to the
-        # allocation-time flag. Ordinary buffers leave it False and keep the plain path.
-        if hasattr(symm_mem, "is_symm_mem_tensor"):
-            return symm_mem.is_symm_mem_tensor(self.local_buffer)
-        return self.allocated_from_symm_mem
+        return hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
+            self.local_buffer
+        )
 
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""

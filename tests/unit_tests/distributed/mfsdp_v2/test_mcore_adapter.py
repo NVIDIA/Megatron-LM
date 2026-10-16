@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch.distributed._symmetric_memory as symm_mem
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -28,6 +29,14 @@ from megatron.core.transformer.transformer_layer import MoETransformerLayer, Tra
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
+
+# Symmetric-memory MFSDP requires PyTorch 2.12 or later: FsdpParameterGroup raises on builds
+# without torch.distributed._symmetric_memory.is_symm_mem_tensor (such as dev's 2.12
+# pre-release).
+requires_symmetric_memory = pytest.mark.skipif(
+    not hasattr(symm_mem, "is_symm_mem_tensor"),
+    reason="Symmetric-memory MFSDP requires PyTorch 2.12 or later.",
+)
 
 
 def _build_layer(config: TransformerConfig) -> TransformerLayer:
@@ -104,6 +113,7 @@ class TestMcoreAdapterDense:
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
 
+    @requires_symmetric_memory
     def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
         config = TransformerConfig(
             num_layers=1,

@@ -407,9 +407,10 @@ def _make_dsv4_cp_config(
             if cuda_graph_impl != "none" and context_parallel_size > 1
             else None
         ),
+        # The CP > 1 sequence_packing_scheduler above requires a per-rank packing capacity.
         max_seqlen_per_dp_cp_rank=(
             sum(_DSV4_CP_RAGGED_PADDED_SEG_LENS) // context_parallel_size
-            if cuda_graph_impl != "none" and context_parallel_size > 1
+            if context_parallel_size > 1
             else None
         ),
         pad_packed_seq_alignment=(
@@ -740,6 +741,7 @@ class TestDSv4HybridAttentionTHDCP:
             context_parallel_size=self.cp_size,
             cp_partition_mode="contiguous",
             sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=local_rows,
         )
         config_ref = _make_config(
             **common_config,

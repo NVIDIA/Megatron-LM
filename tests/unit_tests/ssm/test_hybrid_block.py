@@ -785,6 +785,28 @@ class TestHybridBlock:
         assert isinstance(block.layers[0], TransformerLayer)
         assert isinstance(block.layers[0].self_attention, KimiDeltaAttention)
 
+    @pytest.mark.parametrize(
+        ("layer_pattern", "linear_cp_layout", "should_raise"),
+        [
+            (Symbols.GDN + Symbols.ATTENTION, "contiguous", True),
+            (Symbols.KDA + Symbols.ATTENTION, "contiguous", True),
+            (Symbols.GDN + Symbols.ATTENTION, "zigzag", False),
+            (Symbols.MAMBA + Symbols.ATTENTION, "contiguous", False),
+        ],
+    )
+    def test_contiguous_linear_cp_layout_with_gdn_kda(
+        self, layer_pattern, linear_cp_layout, should_raise
+    ):
+        """GDN/KDA reject contiguous linear CP; zigzag GDN and contiguous Mamba still build."""
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=2)
+        config_kwargs = {"context_parallel_size": 2, "linear_cp_layout": linear_cp_layout}
+        if should_raise:
+            with pytest.raises(ValueError, match="GDN/KDA hybrid layers"):
+                self.get_hybrid_block(layer_pattern, **config_kwargs)
+        else:
+            block = self.get_hybrid_block(layer_pattern, **config_kwargs)
+            assert block._cp_layout_manager is not None
+
     def test_gdn_inference_spec(self):
         """The inference stack must materialize GDN rather than its IdentityOp default."""
         gdn_spec = hybrid_inference_stack_spec.submodules.gdn_layer

@@ -23,6 +23,9 @@ def _make_config(**overrides):
         )
     if variant == "dsa":
         kwargs.update(add_bias_linear=False, dsa_kernel_backend="none")
+    if overrides.get("sequence_packing_scheduler") or overrides.get("dynamic_context_parallel"):
+        # A sequence-packing scheduler (auto-selected by Dynamic CP) requires a per-rank capacity.
+        kwargs["max_seqlen_per_dp_cp_rank"] = 128
     kwargs.update(overrides)
     config_type = (
         MLATransformerConfig

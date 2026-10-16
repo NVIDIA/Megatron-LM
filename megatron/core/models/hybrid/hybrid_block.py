@@ -1006,6 +1006,21 @@ class HybridStack(MegatronModule):
         self.layer_type_list = layer_type_list
         self._cp_layout_manager = None
         if self.cp_group.size() > 1:
+            if self.config.linear_cp_layout == "contiguous":
+                # GDN and KDA derive their CP input layout from config.cp_partition_mode
+                # (zigzag by default), not from linear_cp_layout, so they would re-partition
+                # already-contiguous shards and scramble token order.
+                unsupported_layers = [
+                    symbol
+                    for symbol in (LayerSymbols.GDN, LayerSymbols.KDA)
+                    if symbol in self.layer_type_list
+                ]
+                if unsupported_layers:
+                    raise ValueError(
+                        "linear_cp_layout='contiguous' with context parallelism is not yet "
+                        "supported for GDN/KDA hybrid layers (found layer types "
+                        f"{unsupported_layers}). Use linear_cp_layout='zigzag'."
+                    )
             layer_layouts = tuple(
                 (
                     self.config.attention_cp_layout
