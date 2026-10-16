@@ -519,6 +519,28 @@ def test_vllm_fused_moe_and_moe_sum_replay():
     assert_replays_bit_exact(moe_sum, (inp, probs), replays=4, backward=False, what="_moe_sum")
 
 
+@pytest.mark.parametrize(
+    "num_experts,topk,scaling_factor", [(128, 6, 2.5), (512, 22, 5.0)], ids=["nano", "super-ultra"]
+)
+@pytest.mark.parametrize("num_tokens", [2, 2048])
+def test_sigmoid_topk_routing_replay(num_experts, topk, scaling_factor, num_tokens):
+    from megatron.core.inference.moe.sigmoid_topk import HAVE_PARALLEL_TOPK, sigmoid_topk_routing
+
+    if topk >= 8 and not HAVE_PARALLEL_TOPK:
+        pytest.skip("Large top-k fusion requires triton.language.topk")
+    seeded()
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    expert_bias = torch.randn(num_experts, device="cuda") * 0.05
+    assert_replays_bit_exact(
+        lambda lg, b: sigmoid_topk_routing(lg, b, topk, scaling_factor),
+        (logits, expert_bias),
+        replays=4,
+        backward=False,
+        what=f"sigmoid_topk_routing[tokens={num_tokens}, experts={num_experts}, topk={topk}]",
+    )
+
+
+
 # --- batch-invariant kernels -----------------------------------------------------------------
 
 

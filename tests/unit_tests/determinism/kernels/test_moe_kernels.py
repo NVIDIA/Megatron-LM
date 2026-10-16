@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
@@ -31,7 +32,7 @@ from megatron.core.transformer.moe.experts import (
     _te_supports_scaled_tanh_srelu,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -371,6 +372,51 @@ class TestMoEModules:
             grad_output=grad_output,
             contention=hash_routing,
             what=f"TopKRouter[{balancing}, hash={hash_routing}]",
+        )
+
+    @pytest.mark.parametrize(
+        "num_experts,topk,scaling_factor",
+        [(128, 6, 2.5), (512, 22, 5.0)],
+        ids=["nano", "super-ultra"],
+    )
+    @pytest.mark.parametrize("num_tokens", [2, 512])
+    def test_inference_topk_router_replays(self, num_experts, topk, scaling_factor, num_tokens):
+        """Inference router, sigmoid scores with expert bias: the single-kernel top-k path."""
+        from megatron.core.inference.moe.sigmoid_topk import HAVE_PARALLEL_TOPK
+
+        if topk >= 8 and not HAVE_PARALLEL_TOPK:
+            pytest.skip("Large top-k fusion requires triton.language.topk")
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=num_experts,
+            moe_router_topk=topk,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0.0,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_topk_scaling_factor=scaling_factor,
+        )
+        router = InferenceTopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        with torch.no_grad():
+            router.expert_bias.uniform_(-0.05, 0.05)
+        hidden = torch.randn(num_tokens, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.inference_mode():
+            assert router._uses_sigmoid_topk_kernel(router.gating(hidden).squeeze(1), None)
+
+        def route(h):
+            with InferenceMode.active(), torch.inference_mode():
+                return router(h)
+
+        assert_replays_bit_exact(
+            route,
+            (hidden,),
+            replays=3,
+            backward=False,
+            what=f"InferenceTopKRouter[sigmoid+bias, experts={num_experts}, topk={topk}]",
         )
 
     @pytest.mark.skipif(
