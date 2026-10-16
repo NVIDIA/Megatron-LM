@@ -21,7 +21,7 @@ import torch
 from torch import nn
 
 from .execution_order import ExecutionOrder
-from .iteration import IterationOrder, StaticOrder
+from .iteration import IterationOrder
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -94,7 +94,6 @@ class FsdpContext:
         self.iteration_order = IterationOrder()
         self.forward_order: ExecutionOrder[nn.Module] = ExecutionOrder()
         self.backward_order: ExecutionOrder[nn.Module] = ExecutionOrder()
-        self._static_orders: dict[str, StaticOrder] = {}
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
@@ -164,14 +163,6 @@ class FsdpContext:
         self._registered_modules.clear()
         self.parameter_to_owner = None
         self._is_finalized = True
-
-    def static_order(self, phase: str) -> StaticOrder:
-        """Bind cursors lazily, including after the user replaces an explicit order."""
-        order = self.forward_order if phase == "forward" else self.backward_order
-        cursor = self._static_orders.get(phase)
-        if cursor is None or cursor.order is not order:
-            cursor = self._static_orders[phase] = StaticOrder(order)
-        return cursor
 
     def is_root(self, module: nn.Module) -> bool:
         """Return whether ``module`` is an outermost FSDP module in this context."""

@@ -260,10 +260,9 @@ def test_nested_and_sibling_roots_have_independent_names(distributed_setup):
     assert list(context.forward_order) == [model.left, model.left.inner, model.right]
     assert list(context.backward_order) == [model.right, model.left, model.left.inner]
     replacement = ExecutionOrder([model.right, model.left, model.left.inner])
-    cursor = context.static_order("forward")
     context.forward_order = replacement
-    assert context.static_order("forward") is not cursor
-    assert context.static_order("forward").advance() is model.right
+    assert context.forward_order.advance() is model.right
+    assert context.backward_order.position == 0
 
 
 def test_fully_shard_requires_context(distributed_setup):

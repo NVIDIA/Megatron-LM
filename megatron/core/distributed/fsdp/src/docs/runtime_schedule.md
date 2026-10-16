@@ -64,7 +64,7 @@ with a record-and-replay mechanism.
 
 Ordinary forward/backward loops prefetch without an iteration scope or recording.
 Context finalization builds separate static `forward_order` and `backward_order`
-sequences from construction. Each has independent execution and prefetch cursors;
+sequences from construction. Each `ExecutionOrder` owns its execution and prefetch cursors;
 execution starts another pass after consuming the complete sequence. Forward-only
 validation advances only the forward order, leaving backward progress unchanged.
 
@@ -90,7 +90,7 @@ mixed F/B schedules such as VPP/combined 1F1B use the iteration scope below.
 The experimental v2 runtime can record one complete iteration and prefetch from
 that demand order on subsequent iterations. Forward, backward, recomputation,
 and repeated calls share one occurrence sequence. Independent execution and
-prefetch iterators consume this sequence; prefetch never changes execution progress
+prefetch cursors in `ExecutionOrder` consume this sequence; prefetch never changes execution progress
 and its targets do not depend on materialization state. Prefetch gathers are not recorded.
 The first successful iteration of each schedule gathers on demand; failed or
 incompletely replayed iterations invalidate that schedule's recording.
@@ -128,7 +128,7 @@ The recorder neither reduces gradients nor infers completion from node counts.
 Iteration recording is disabled for CUDA graph schedules because Python hooks
 do not cover graph replay. CUDA graph lifecycle support and performance tuning
 are outside this change. Outside an iteration scope, static F/B prefetch remains
-available as described above. `ExecutionOrder` only holds weak occurrences:
+available as described above. `ExecutionOrder` holds weak occurrences and both cursors:
 `_unique_index` and the module argument to `advance()` remain removed.
 
 # Alternatives considered

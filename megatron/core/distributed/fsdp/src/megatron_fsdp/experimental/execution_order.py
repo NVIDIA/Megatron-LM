@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A weak occurrence sequence with independent caller-owned iterators."""
+"""A weak occurrence sequence with independent execution and prefetch cursors."""
 
 from collections.abc import Iterable, Iterator
 from typing import Generic, TypeVar
@@ -22,15 +22,44 @@ T = TypeVar("T")
 
 
 class ExecutionOrder(Generic[T]):
-    """Store occurrences without identity lookup or implicit cursor resets.
+    """Track execution and prefetch independently without identity lookup.
 
-    Callers can traverse the same sequence independently for execution and
-    prefetch. A missing item is an error: skipping it would change occurrence
-    positions. Appends are visible to an iterator used during recording.
+    Execution starts a new pass after consuming the complete sequence; prefetch
+    never wraps into the next pass. Ordinary iteration does not move either
+    cursor. Missing owners are errors rather than skipped occurrences.
     """
 
     def __init__(self, items: Iterable[T] = ()) -> None:
         self._items: list[ref[T]] = [ref(item) for item in items]
+        self.reset()
+
+    @property
+    def position(self) -> int:
+        """Number of execution occurrences consumed in the current pass."""
+        return self._execution_position
+
+    def reset(self) -> None:
+        """Start a fresh execution and prefetch traversal."""
+        self._execution_position = self._prefetch_position = 0
+
+    def advance(self) -> T:
+        """Consume the next execution occurrence, restarting completed passes."""
+        if not self._items:
+            raise RuntimeError("The FSDP execution order is empty.")
+        if self._execution_position == len(self):
+            self.reset()
+        item = self._dereference(self._items[self._execution_position])
+        self._execution_position += 1
+        return item
+
+    def next_prefetch(self) -> T | None:
+        """Consume one upcoming occurrence without advancing execution."""
+        self._prefetch_position = max(self._prefetch_position, self._execution_position)
+        if self._prefetch_position == len(self):
+            return None
+        item = self._dereference(self._items[self._prefetch_position])
+        self._prefetch_position += 1
+        return item
 
     def append(self, item: T) -> None:
         """Append one weakly held occurrence, preserving repetitions."""
@@ -39,15 +68,13 @@ class ExecutionOrder(Generic[T]):
     def __len__(self) -> int:
         return len(self._items)
 
+    @staticmethod
+    def _dereference(item_ref: ref[T]) -> T:
+        item = item_ref()
+        if item is None:
+            raise RuntimeError("A module in the FSDP execution order was destroyed.")
+        return item
+
     def __iter__(self) -> Iterator[T]:
-        """Traverse occurrences strictly without consuming another iterator."""
-
-        def dereference(item_ref: ref[T]) -> T:
-            item = item_ref()
-            if item is None:
-                raise RuntimeError("A module in the FSDP execution order was destroyed.")
-            return item
-
-        # Unlike a generator with a local `item`, this iterator does not retain
-        # the last yielded module while suspended between demands.
-        return map(dereference, self._items)
+        """Traverse weak occurrences without moving or retaining cursor items."""
+        return map(self._dereference, self._items)

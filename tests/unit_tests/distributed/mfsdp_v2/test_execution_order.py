@@ -24,6 +24,20 @@ def test_independent_occurrence_iterators():
     assert list(prefetch) == [b, a]
     assert list(order) == [a, a, b, b, a]
     assert len(order) == 5
+    assert order.position == 0
+    assert order.advance() is a
+    assert order.next_prefetch() is a
+    assert order.next_prefetch() is b
+    assert order.position == 1
+    assert list(order) == [a, a, b, b, a]
+    assert [order.advance() for _ in range(4)] == [a, b, b, a]
+    assert order.next_prefetch() is None
+    assert order.advance() is a  # a completed static pass restarts both cursors
+    assert order.position == 1
+    assert order.next_prefetch() is a
+    order.reset()
+    assert order.position == 0
+    assert order.advance() is a
 
 
 def test_append_during_recording_and_empty_order():
@@ -37,6 +51,8 @@ def test_append_during_recording_and_empty_order():
     assert next(execution) is b
     assert list(execution) == []
     assert list(ExecutionOrder()) == []
+    with pytest.raises(RuntimeError, match="empty"):
+        ExecutionOrder().advance()
 
 
 def test_order_does_not_retain_modules_or_skip_dead_occurrences():
@@ -58,3 +74,5 @@ def test_order_does_not_retain_modules_or_skip_dead_occurrences():
     del a
     gc.collect()
     assert a_ref() is None
+    with pytest.raises(RuntimeError, match="destroyed"):
+        order.advance()

@@ -32,7 +32,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .iteration import DemandPhase
+from .iteration import DemandPhase, _prefetch_parameters
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
@@ -296,7 +296,9 @@ class FsdpModule:
             if expected is not self or phase != prefetch:
                 raise RuntimeError("FSDP module calls diverged from the recorded iteration order.")
         elif prefetch in ("forward", "backward"):
-            static_order = self.context.static_order(prefetch)
+            static_order = (
+                self.context.forward_order if prefetch == "forward" else self.context.backward_order
+            )
             if static_order.advance() is not self:
                 raise RuntimeError("FSDP module calls diverged from the static prefetch order.")
         with self._nvtx_range("unshard"):
@@ -316,7 +318,7 @@ class FsdpModule:
                 if scoped:
                     context.iteration_order.prefetch(0 if prefetch == "none" else budget)
                 else:
-                    static_order.prefetch(budget)
+                    _prefetch_parameters(static_order, budget)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
