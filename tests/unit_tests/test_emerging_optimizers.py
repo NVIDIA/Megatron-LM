@@ -1276,8 +1276,7 @@ class TestMuonOptimizerMultiRankTP:
             tp_mode="blockwise",
         )
 
-        def center_rows(x, tp_group=None, partition_dim=None):
-            del tp_group, partition_dim
+        def center_rows(x, *_args, **_kwargs):
             return x - x.mean(dim=-2, keepdim=True)
 
         optimizer.scaled_orthogonalize_fn = center_rows
@@ -1321,8 +1320,7 @@ class TestMuonOptimizerMultiRankTP:
             tp_mode="blockwise",
         )
 
-        def center_rows(x, tp_group=None, partition_dim=None):
-            del tp_group, partition_dim
+        def center_rows(x, *_args, **_kwargs):
             return x - x.mean(dim=-2, keepdim=True)
 
         optimizer.scaled_orthogonalize_fn = center_rows
@@ -1371,7 +1369,7 @@ def test_muon_qkv_distributed_mode_routing_warns_once(monkeypatch, layout, expec
     orthogonalize_args = []
     log_records = []
 
-    def passthrough(x, tp_group=None, partition_dim=None):
+    def passthrough(x, tp_group=None, partition_dim=None, **_kwargs):
         orthogonalize_args.append((tp_group, partition_dim))
         return x
 
@@ -1611,8 +1609,7 @@ def test_muon_optimizer_qkv_split_per_head_is_opt_in():
     head_param.qkv_split_shapes = [2] * 8
     orthogonalize_call_shapes = []
 
-    def center_rows(x, tp_group=None, partition_dim=None):
-        del tp_group, partition_dim
+    def center_rows(x, *_args, **_kwargs):
         orthogonalize_call_shapes.append(tuple(x.shape))
         return x - x.mean(dim=-2, keepdim=True)
 
@@ -1671,8 +1668,7 @@ def test_muon_optimizer_uniform_per_head_splits_use_batched_ns():
     )
     call_shapes = []
 
-    def center_rows(x, tp_group=None, partition_dim=None):
-        del tp_group, partition_dim
+    def center_rows(x, *_args, **_kwargs):
         call_shapes.append(tuple(x.shape))
         return x - x.mean(dim=-2, keepdim=True)
 
@@ -1729,8 +1725,7 @@ def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns():
     )
     call_shapes = []
 
-    def center_rows(x, tp_group=None, partition_dim=None):
-        del tp_group, partition_dim
+    def center_rows(x, *_args, **_kwargs):
         call_shapes.append(tuple(x.shape))
         return x - x.mean(dim=-2, keepdim=True)
 

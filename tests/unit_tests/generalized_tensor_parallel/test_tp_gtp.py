@@ -450,8 +450,7 @@ def _worker_muon_qkv_padding(
         tp_mode="blockwise",
     )
 
-    def center_rows(x, tp_group=None, partition_dim=None):
-        del tp_group, partition_dim
+    def center_rows(x, *_args, **_kwargs):
         return x - x.mean(dim=-2, keepdim=True)
 
     optimizer.scaled_orthogonalize_fn = center_rows
