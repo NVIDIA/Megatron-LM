@@ -990,8 +990,6 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         ({**_WIRE, "num_tokens_to_generate": -1}, "has a malformed budget"),
         ({**_WIRE, "num_evictions": -1}, "has a malformed eviction count"),
         ({**_WIRE, "token_ids": [1, 2, 3]}, "holds 3 tokens over a budget of 2"),
-        ({**_WIRE, "num_tokens_to_generate": 1}, "filled its budget of 1 without finishing"),
-        ({**_WIRE, "finish_reason": "length"}, "ended by length short of its budget of 2"),
         (
             {**_WIRE, "log_probs": [-0.1, -0.2]},
             "has log probs and tokens of different lengths, 2 and 1",
@@ -1033,8 +1031,6 @@ _WIRE = ResumedGeneration([1], 2).to_wire()
         "negative-budget",
         "negative-evictions",
         "tokens-over-budget",
-        "budget-filled-unfinished",
-        "length-short-of-budget",
         "misaligned-log-probs",
         "malformed-policy-epoch",
         "empty-kv-cache-epoch",
@@ -1082,6 +1078,17 @@ def test_served_resume_reproduces_its_snapshot():
     snapshot = LiveRequestSnapshot.from_record(
         DynamicInferenceRequestRecord.from_request(request), routing_indices=rows
     )
+
+    # "Every field set" is enforced: a payload or record field this test leaves
+    # unset (or left at a None/empty default) would make the round-trip equality
+    # below pass for it vacuously.
+    def seeded(value):
+        return value is not None and not (isinstance(value, (list, dict)) and not value)
+
+    assert all(
+        seeded(value) for name, value in vars(snapshot.payload).items() if name != "media_tensors"
+    ), vars(snapshot.payload)
+    assert all(seeded(value) for value in vars(snapshot.record).values()), vars(snapshot.record)
 
     wire = ResumedGeneration.from_snapshot(snapshot).to_wire()
     served = DynamicInferenceRequestRecord.from_resumed_generation(

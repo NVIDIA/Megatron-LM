@@ -2345,7 +2345,9 @@ class DynamicInferenceEngine(AbstractEngine):
         return failed_requests
 
     async def snapshot_live_requests(self) -> List[LiveRequestSnapshot]:
-        """Snapshot every live request for later resumption, on the engine loop while it is live."""
+        """Snapshot every non-failed request for later resumption; must run on the
+        engine loop whenever that loop is running (any loop may run it while the
+        engine loop is stopped, as between a suspend and a resume)."""
         if self._loop.is_running() and asyncio.get_running_loop() is not self._loop:
             raise RuntimeError(
                 "snapshot_live_requests must run on the engine loop while it is running"
@@ -2373,6 +2375,8 @@ class DynamicInferenceEngine(AbstractEngine):
         """A resident request's expert routing, read from its blocks as its completion reads it."""
         allocator = self.context.kv_block_allocator
         if not allocator.block_routing:  # routing replay off: nothing was recorded
+            return None
+        if not hasattr(self.context, "request_ids"):
             return None
         index = self.context.get_index_of_request(request.request_id)
         if index < 0:
@@ -2721,7 +2725,9 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         return self._admit_request(request)
 
-    def _admit_request(self, request: DynamicInferenceRequest) -> asyncio.Future:
+    def _admit_request(
+        self, request: DynamicInferenceRequest
+    ) -> asyncio.Future[DynamicInferenceRequest]:
         """Admit a built request, resuming the generation its preparer handed back, if any."""
         params = request.offload_params if isinstance(request.offload_params, dict) else {}
         wire = params.pop(RESUMED_GENERATION_FIELD, None)
@@ -4615,7 +4621,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
-        # Increment finished_request_count.
         nvtx_range_push("bookkeeping")
         cuda_graph_request_count = None
 
