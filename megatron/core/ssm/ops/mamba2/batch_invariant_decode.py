@@ -7,6 +7,12 @@ import torch
 import triton
 import triton.language as tl
 
+from megatron.core.ssm.ops.mamba2.batch_invariant_decode_rows import (
+    bmm_rows,
+    chunk_scan_rows,
+    chunk_state_passing_rows,
+    row_kernel_configs,
+)
 from megatron.core.ssm.ops.mamba2.ssd_bmm import _bmm_chunk_fwd
 from megatron.core.ssm.ops.mamba2.ssd_chunk_scan import _chunk_scan_fwd
 from megatron.core.ssm.ops.mamba2.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
@@ -56,6 +62,74 @@ def _masked_update_rows(states: torch.Tensor, indices: torch.Tensor, values: tor
     )
 
 
+@triton.jit
+def _decode_step_prep_kernel(
+    batch_indices_ptr,
+    num_buffered_ptr,
+    x_ptr,
+    dt_ptr,
+    B_ptr,
+    C_ptr,
+    x_buf_ptr,
+    dt_buf_ptr,
+    B_buf_ptr,
+    C_buf_ptr,
+    out_ptr,
+    target_rows_ptr,
+    chunk_flags_ptr,
+    chunk_starts_ptr,
+    stride_x,
+    stride_dt,
+    stride_B,
+    stride_C,
+    X_SIZE: tl.constexpr,
+    DT_SIZE: tl.constexpr,
+    BC_SIZE: tl.constexpr,
+    OUT_SIZE: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """One decode entry's bookkeeping: integer updates and row copies only.
+
+    For entry e with slot s and write position w = num_buffered[s]: copy the current
+    token's x / dt / B / C rows into buffer row s * CHUNK_SIZE + w, set target_rows[e] = w,
+    chunk_flags[e] = (w + 1 == CHUNK_SIZE), chunk_starts[e] = s * CHUNK_SIZE, zero out[e]
+    and advance num_buffered[s] (0 after a crossing). Inactive entries (s < 0) only get
+    target row -1, flag 0 and a zero output.
+    """
+    e = tl.program_id(0)
+    slot = tl.load(batch_indices_ptr + e)
+    tl.store(chunk_starts_ptr + e, slot * CHUNK_SIZE)
+    offs = tl.arange(0, BLOCK_SIZE)
+    zeros = tl.zeros([BLOCK_SIZE], dtype=out_ptr.dtype.element_ty)
+    for o in range(0, OUT_SIZE, BLOCK_SIZE):
+        tl.store(out_ptr + e * OUT_SIZE + o + offs, zeros, mask=o + offs < OUT_SIZE)
+    if slot < 0:
+        tl.store(target_rows_ptr + e, -1)
+        tl.store(chunk_flags_ptr + e, 0)
+        return
+    write_pos = tl.load(num_buffered_ptr + slot)
+    row = (slot * CHUNK_SIZE + write_pos).to(tl.int64)
+    for o in range(0, X_SIZE, BLOCK_SIZE):
+        mask = o + offs < X_SIZE
+        values = tl.load(x_ptr + e * stride_x + o + offs, mask=mask)
+        tl.store(x_buf_ptr + row * X_SIZE + o + offs, values, mask=mask)
+    for o in range(0, DT_SIZE, BLOCK_SIZE):
+        mask = o + offs < DT_SIZE
+        values = tl.load(dt_ptr + e * stride_dt + o + offs, mask=mask)
+        tl.store(dt_buf_ptr + row * DT_SIZE + o + offs, values, mask=mask)
+    for o in range(0, BC_SIZE, BLOCK_SIZE):
+        mask = o + offs < BC_SIZE
+        values = tl.load(B_ptr + e * stride_B + o + offs, mask=mask)
+        tl.store(B_buf_ptr + row * BC_SIZE + o + offs, values, mask=mask)
+        values = tl.load(C_ptr + e * stride_C + o + offs, mask=mask)
+        tl.store(C_buf_ptr + row * BC_SIZE + o + offs, values, mask=mask)
+    crossed = write_pos + 1 == CHUNK_SIZE
+    tl.store(target_rows_ptr + e, write_pos)
+    tl.store(chunk_flags_ptr + e, crossed.to(tl.int32))
+    tl.store(num_buffered_ptr + slot, tl.where(crossed, 0, write_pos + 1))
+
+
 def _mamba_chunk_scan_decode_rows(
     x,
     z,
@@ -74,6 +148,7 @@ def _mamba_chunk_scan_decode_rows(
     dt_bias=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
+    use_row_kernels=True,
 ):
     """Run the training scan pipeline over buffered decode chunks.
 
@@ -82,6 +157,10 @@ def _mamba_chunk_scan_decode_rows(
     the current token's gate per entry (decode_batch_size, nheads, headdim): the
     gate is row-local and only the target row is computed, so no other row's z
     is needed.
+
+    When the training kernels are pinned to one config each, the row kernels
+    (``batch_invariant_decode_rows``) compute the same bits with that config and
+    less work; otherwise the training kernels run in target-rows mode.
     """
     dA_cumsum, dt = _chunk_cumsum_fwd(
         dt,
@@ -94,6 +173,31 @@ def _mamba_chunk_scan_decode_rows(
         chunk_starts=chunk_starts,
         target_rows=target_rows,
     )
+    configs = row_kernel_configs(C, chunk_size) if use_row_kernels else None
+    if configs is not None:
+        scan_config, bmm_config, state_config = configs
+        CB = bmm_rows(C, B, chunk_size, target_rows, chunk_starts, bmm_config)
+        # Scan before the boundary update: both read the slot's incoming state.
+        chunk_scan_rows(
+            CB,
+            x,
+            z,
+            dt,
+            dA_cumsum,
+            C,
+            out,
+            slots,
+            target_rows,
+            chunk_starts,
+            initial_states,
+            D,
+            scan_config,
+        )
+        chunk_state_passing_rows(
+            x, B, dt, dA_cumsum, chunk_starts, chunk_flags, slots, initial_states, state_config
+        )
+        return
+
     states = _chunk_state_fwd(
         B,
         x,
@@ -160,6 +264,7 @@ class BatchInvariantDecodeBuffers:
     out: torch.Tensor  # (max_requests, nheads, headdim)
     target_rows: torch.Tensor  # (max_requests,) int32
     chunk_flags: torch.Tensor  # (max_requests,) int32
+    chunk_starts: torch.Tensor  # (max_requests,) int32
 
     @classmethod
     def allocate(
@@ -183,6 +288,7 @@ class BatchInvariantDecodeBuffers:
             out=torch.empty(max_requests, nheads, headdim, device=device, dtype=dtype),
             target_rows=torch.empty(max_requests, device=device, dtype=torch.int32),
             chunk_flags=torch.empty(max_requests, device=device, dtype=torch.int32),
+            chunk_starts=torch.empty(max_requests, device=device, dtype=torch.int32),
         )
 
     def seed(
@@ -262,28 +368,46 @@ def batch_invariant_decode_buffered_scan(
         f"({output_capacity}); increase max_requests."
     )
 
+    assert batch_indices.dtype == torch.int32
     out = buffers.out[:decode_batch_size]
     target_rows = buffers.target_rows[:decode_batch_size]
     chunk_flags = buffers.chunk_flags[:decode_batch_size]
+    chunk_starts = buffers.chunk_starts[:decode_batch_size]
 
-    active = batch_indices >= 0
-    safe_slots = batch_indices.clamp_min(0)
-    write_pos = buffers.num_buffered[safe_slots].to(torch.long)
-    buffer_rows = torch.where(active, safe_slots * chunk_size + write_pos, -1).to(torch.int32)
-
-    _masked_update_rows(buffers.x.view(-1, nheads * headdim), buffer_rows, x[:, 0].flatten(1))
-    _masked_update_rows(buffers.dt.view(-1, nheads), buffer_rows, dt[:, 0])
-    _masked_update_rows(
-        buffers.B.view(-1, buffers.B.shape[-2] * dstate), buffer_rows, B[:, 0].flatten(1)
-    )
-    _masked_update_rows(
-        buffers.C.view(-1, buffers.C.shape[-2] * dstate), buffer_rows, C[:, 0].flatten(1)
-    )
-
-    crossed = active & (write_pos + 1 == chunk_size)
-    target_rows.copy_(torch.where(active, write_pos, -1).to(torch.int32))
-    chunk_flags.copy_(crossed.to(torch.int32))
-    out.zero_()
+    # Write the current token into the replay buffers and set this step's target
+    # rows, chunk flags and chunk starts in one launch. The scan pipeline does not
+    # read num_buffered, so its update happens here too.
+    x_rows, dt_rows = x[:, 0].flatten(1), dt[:, 0]
+    B_rows, C_rows = B[:, 0].flatten(1), C[:, 0].flatten(1)
+    assert all(t.stride(-1) == 1 for t in (x_rows, dt_rows, B_rows, C_rows))
+    assert all(t.is_contiguous() for t in (out, buffers.x, buffers.dt, buffers.B, buffers.C))
+    if decode_batch_size > 0:
+        _decode_step_prep_kernel[(decode_batch_size,)](
+            batch_indices,
+            buffers.num_buffered,
+            x_rows,
+            dt_rows,
+            B_rows,
+            C_rows,
+            buffers.x,
+            buffers.dt,
+            buffers.B,
+            buffers.C,
+            out,
+            target_rows,
+            chunk_flags,
+            chunk_starts,
+            x_rows.stride(0),
+            dt_rows.stride(0),
+            B_rows.stride(0),
+            C_rows.stride(0),
+            X_SIZE=nheads * headdim,
+            DT_SIZE=nheads,
+            BC_SIZE=buffers.B.shape[-2] * dstate,
+            OUT_SIZE=nheads * headdim,
+            CHUNK_SIZE=chunk_size,
+            BLOCK_SIZE=1024,
+        )
 
     # Run the gated pipeline over the buffers and ssm_state in place. State
     # passing writes crossing slots' boundary states straight into
@@ -296,7 +420,7 @@ def batch_invariant_decode_buffered_scan(
         buffers.B.view(-1, buffers.B.shape[-2], dstate),
         buffers.C.view(-1, buffers.C.shape[-2], dstate),
         chunk_size,
-        chunk_starts=batch_indices * chunk_size,
+        chunk_starts=chunk_starts,
         slots=batch_indices,
         target_rows=target_rows,
         chunk_flags=chunk_flags,
@@ -305,11 +429,6 @@ def batch_invariant_decode_buffered_scan(
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-    )
-
-    next_write_pos = torch.where(crossed, 0, write_pos + 1).to(torch.int32)
-    _masked_update_rows(
-        buffers.num_buffered.unsqueeze(1), batch_indices, next_write_pos.unsqueeze(1)
     )
 
     return out.unsqueeze(1)

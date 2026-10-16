@@ -177,6 +177,7 @@ def test_batch_invariant_decode_step_replays():
             out=torch.empty(slots, nheads, headdim, device="cuda"),
             target_rows=torch.empty(slots, dtype=torch.int32, device="cuda"),
             chunk_flags=torch.empty(slots, dtype=torch.int32, device="cuda"),
+            chunk_starts=torch.empty(slots, dtype=torch.int32, device="cuda"),
         )
         y = batch_invariant_decode_buffered_scan(
             buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
