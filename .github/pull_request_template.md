@@ -14,6 +14,24 @@ For PRs from open-source community contributors:
 
 Linked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->
 
+## Code provenance
+
+Select exactly one:
+
+- [ ] I developed these changes independently and did not copy or adapt code from external sources.
+- [ ] This PR includes code copied or adapted from external sources, documented below.
+
+For each external source, provide the following details (write `N/A` if none):
+
+- Source URL, revision, and original file(s):
+- Files in this PR containing the copied or adapted code:
+- Applicable license(s):
+- Required copyright notices and attribution, and where they are retained or added:
+
+Author acknowledgment (required for all PRs):
+
+- [ ] I have reviewed the provenance of these changes and included all required license notices and attribution.
+
 ## Contribution process
 
 ### Pre-checks
