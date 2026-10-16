@@ -19,6 +19,10 @@ from typing import MutableMapping
 
 import torch
 
+# Explicit: `import torch` does not reliably bind the `torch.utils.deterministic`
+# submodule, and this module writes to one of its attributes.
+import torch.utils.deterministic
+
 # Maps each arg name to the value it must hold for bit-exact execution;
 # verified by :func:`apply_determinism_to_args`.
 ARG_VALUES_REQUIRED_FOR_DETERMINISM = {
@@ -35,8 +39,15 @@ AUX_LOSS_FUSION_ARG = "moe_router_aux_loss_fusion"
 # Env-var defaults required for bit-exact reproducibility.
 DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
     "NCCL_ALGO": "Ring",
+    # NCCL EP's count-exchange path assigns expert slots with atomic counters.
+    # Scan mode preserves token order, and therefore expert wgrad reduction order.
+    # NCCL EP snapshots this setting when its group is created.
+    "NCCL_EP_HT_EM_AG_SCAN_MODE": "1",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    # TRITON_CACHE_AUTOTUNING is deliberately absent: --deterministic-mode pins every
+    # autotuner in the megatron.core.tuning scope without timing, and the variable only
+    # changes Triton's behaviour for kernels outside it. See apply_determinism_env().
 }
 
 # Accepted NCCL_ALGO tokens under --deterministic-mode. Comma-separated lists
@@ -66,9 +77,17 @@ ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset({"Ring", "CollnetDirect", 
 #   - ``CUBLAS_WORKSPACE_CONFIG``: NVIDIA docs list ``:4096:8`` (4x4MiB) and
 #     ``:16:8`` (8x16KiB) as the two deterministic workspace configurations;
 #     any other value breaks reproducibility.
+#   - ``TRITON_CACHE_AUTOTUNING``: Triton tests it as ``== "1"``, so any other
+#     truthy spelling ("true", "yes") would silently read as opted out. It only
+#     affects autotuners outside the pinned ``megatron.core.tuning`` scope, so
+#     neither setting is defaulted -- see :func:`apply_determinism_env`.
+#   - ``NCCL_EP_HT_EM_AG_SCAN_MODE``: require the canonical enabled value to
+#     preserve expert token order instead of using atomic slot assignment.
 ACCEPTED_ENV_VAR_VALUES: dict[str, frozenset[str]] = {
+    "NCCL_EP_HT_EM_AG_SCAN_MODE": frozenset({"1"}),
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": frozenset({"0"}),
     "CUBLAS_WORKSPACE_CONFIG": frozenset({":4096:8", ":16:8"}),
+    "TRITON_CACHE_AUTOTUNING": frozenset({"0", "1"}),
 }
 
 
@@ -79,11 +98,18 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
 
     * ``NCCL_ALGO`` — if set, each comma-separated token must be in
       :data:`ACCEPTED_NCCL_ALGO_TOKENS`.
-    * ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` / ``CUBLAS_WORKSPACE_CONFIG`` —
+    * ``NCCL_EP_HT_EM_AG_SCAN_MODE`` / ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` /
+      ``CUBLAS_WORKSPACE_CONFIG`` —
       if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
     * ``MAMBA_DETERMINISTIC`` / ``CAUSAL_CONV1D_DETERMINISTIC`` — if set
-      (non-empty), must start with ``'1'``; unset auto-follows
-      :func:`torch.are_deterministic_algorithms_enabled`.
+      (non-empty), must start with ``'1'``; unset, the external ``mamba_ssm`` and
+      ``causal_conv1d`` packages auto-follow
+      :func:`torch.are_deterministic_algorithms_enabled`. Megatron's own Triton
+      kernels do not read them; they follow ``--deterministic-mode``.
+    * ``TRITON_CACHE_AUTOTUNING`` — opt-in; if set to ``'1'``, requires
+      ``TRITON_CACHE_DIR``. Autotuners inside the ``--triton-autotune-modules``
+      scope are pinned without timing either way; the cache only applies to
+      autotuners outside that scope.
 
     After validation, ``setdefault`` fills every key in
     :data:`DETERMINISM_ENV_VAR_DEFAULTS` that has not been set — a value the
@@ -120,6 +146,25 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
                 "--deterministic-mode. Unset it or set to '1'."
             )
 
+    # Cross-field rule, so it cannot go in ACCEPTED_ENV_VAR_VALUES: caching only makes ranks
+    # agree if they share one cache, and unset TRITON_CACHE_DIR means a node-local one.
+    if env.get("TRITON_CACHE_AUTOTUNING") == "1":
+        assert env.get("TRITON_CACHE_DIR"), (
+            "TRITON_CACHE_AUTOTUNING=1 under --deterministic-mode requires TRITON_CACHE_DIR "
+            "(a shared-filesystem path). It only affects autotuners outside the pinned "
+            "--triton-autotune-modules scope; add their modules to that scope to pin them "
+            "instead, or unset TRITON_CACHE_AUTOTUNING."
+        )
+
+        # print() because this runs from validate_args, before logging is configured.
+        print(
+            "Deterministic mode: TRITON_CACHE_AUTOTUNING=1 only applies to autotuners outside "
+            "the pinned scope; pinned kernels ignore the cache and TRITON_PRINT_AUTOTUNING. "
+            "Pass --triton-autotune-enumerate-autotuners to list which autotuners are pinned and "
+            "--triton-autotune-verify-every N to compare the choices ranks made.",
+            flush=True,
+        )
+
     # setdefault preserves any launcher-set value that just passed validation.
     for k, v in DETERMINISM_ENV_VAR_DEFAULTS.items():
         env.setdefault(k, v)
@@ -135,10 +180,14 @@ def apply_determinism_to_args(args) -> None:
        mutates ``args``.
     2. Calls :func:`apply_determinism_env` on ``os.environ`` — validates
        every determinism-relevant env var (``NCCL_ALGO``,
-       ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``, ``CUBLAS_WORKSPACE_CONFIG``,
-       ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``) and
+       ``NCCL_EP_HT_EM_AG_SCAN_MODE``, ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``,
+       ``CUBLAS_WORKSPACE_CONFIG``,
+       ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``,
+       ``TRITON_CACHE_AUTOTUNING`` and its required ``TRITON_CACHE_DIR``) and
        setdefaults the canonical values.
-    3. Calls ``torch.use_deterministic_algorithms(True)``.
+    3. Calls ``torch.use_deterministic_algorithms(True)``, then clears
+       ``torch.utils.deterministic.fill_uninitialized_memory``, which that call
+       turns on and which reproducibility does not need.
 
     Incompatible options are rejected with an explicit error rather than
     silently overridden: the user must turn them off themselves so the
@@ -173,3 +222,17 @@ def apply_determinism_to_args(args) -> None:
 
     # Torch global state last — all assertions have already passed.
     torch.use_deterministic_algorithms(True)
+
+    # Reproducibility comes from the independent output buffer that replaces an
+    # unordered atomic accumulation and fixes the summation order. That stays.
+    #
+    # The line above also fills every uninitialized allocation (torch.empty,
+    # empty_like, empty_strided, Tensor.resize_) with NaN/MAX_INT, pinning what a
+    # kernel would read from memory it never wrote. Reproducibility does not need
+    # that: with no padding feeding the computation, results are bit-identical
+    # either way.
+    #
+    # It costs a kernel launch per empty allocation, serialized between real work
+    # — roughly 15% TFLOP/s on large configs. Set back to True only to debug a
+    # suspected uninitialized-memory read.
+    torch.utils.deterministic.fill_uninitialized_memory = False

@@ -15,20 +15,24 @@
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
 import dataclasses
+import functools
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from contextvars import ContextVar
 
-import torch
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .module import FsdpContext, FsdpModule
+from .context import FsdpContext, current_fully_shard_context
+from .module import FsdpModule
 from .schedule import SchedulePolicy
 
-_FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
+# TODO(wujingyue): Separate fully_shard_context from FsdpContext in a follow-up PR.
+# Scope management and shared runtime state are separate responsibilities (SRP):
+# https://blog.cleancoder.com/uncle-bob/2014/05/08/SingleReponsibilityPrinciple.html
+# Keep this alias for now to avoid changing callers and limit this PR's scope.
+fully_shard_context = FsdpContext
 
 MeshAxis = int | str
 
@@ -57,50 +61,6 @@ class Placements:
         ):
             if len(placements) != axis_count:
                 raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
-
-
-@contextmanager
-def fully_shard_context(
-    device: torch.device | None = None,
-    *,
-    use_symmetric_memory: bool = False,
-    unify_communication_stream: bool = False,
-) -> Iterator[FsdpContext]:
-    """Construct FSDP modules that share runtime streams and prefetch orders.
-
-    Independent roots are ordered by their root-level ``fully_shard`` calls.
-    Construction must finish before any of the registered modules run forward.
-
-    Args:
-        device: CUDA device on which to create communication streams. Defaults to
-            the current CUDA device.
-        use_symmetric_memory: Allocate communication staging buffers from PyTorch's
-            NCCL symmetric-memory pool.
-        unify_communication_stream: Whether all-gathers and reduce-scatters share one
-            communication stream to reduce peak transient memory. See
-            https://github.com/NVIDIA/Megatron-LM/issues/6471.
-    """
-    if _FSDP_CONTEXT.get() is not None:
-        raise RuntimeError("fully_shard_context does not support nesting.")
-
-    device = device or torch.device("cuda", torch.cuda.current_device())
-    if device.type != "cuda":
-        raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
-
-    context = FsdpContext(
-        device=device,
-        use_symmetric_memory=use_symmetric_memory,
-        unify_communication_stream=unify_communication_stream,
-    )
-    token = _FSDP_CONTEXT.set(context)
-    try:
-        yield context
-    except Exception:
-        raise
-    else:
-        context.finalize()
-    finally:
-        _FSDP_CONTEXT.reset(token)
 
 
 def fully_shard(
@@ -142,7 +102,7 @@ def fully_shard(
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
-    context = _FSDP_CONTEXT.get()
+    context = current_fully_shard_context()
     if context is None:
         raise RuntimeError("fully_shard must run inside fully_shard_context.")
     for submodule in module.modules():
@@ -229,6 +189,10 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
 def _attach_mixin(module: nn.Module) -> None:
     if isinstance(module, FsdpModule):
         return
-    module_cls = module.__class__
-    fsdp_cls = type(f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
-    module.__class__ = fsdp_cls
+    module.__class__ = _get_fsdp_class(module.__class__)
+
+
+@functools.cache
+def _get_fsdp_class(module_cls: type[nn.Module]) -> type[nn.Module]:
+    """Reuse the subclass so classmethods share lazy state, such as CUDA streams."""
+    return type(f"Fsdp{module_cls.__name__}", (FsdpModule, module_cls), {})

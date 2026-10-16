@@ -95,6 +95,11 @@ GATED_CASES = {
         lambda x, w: weighted_squared_relu_impl(x, w, clamp_scale=10.0),
         (_act((TOKENS, FFN)), _weights(TOKENS)),
     ),
+    # Unweighted clamped path (weights=None) used by the dense MLP; saves only x for backward.
+    "clamped_squared_relu": lambda: (
+        lambda x: weighted_squared_relu_impl(x, None, clamp_scale=10.0),
+        (_act((TOKENS, FFN)),),
+    ),
 }
 
 
@@ -103,6 +108,33 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     seeded()
     fn, inputs = GATED_CASES[case]()
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+def test_clamped_swiglu_boundaries_replay_bit_exactly(weighted):
+    seeded()
+    # Include both endpoints and their adjacent BF16 values in each clamp branch.
+    bounds = torch.tensor(
+        [-10.0625, -10.0, -9.9375, 9.9375, 10.0, 10.0625], device="cuda", dtype=DTYPE
+    )
+    x = torch.cat((bounds, bounds)).repeat(32, 1).requires_grad_(True)
+    if weighted:
+        fn = lambda x, w: weighted_bias_swiglu_impl(x, None, w, clamp_value=10.0)
+        inputs = (x, _weights(32) + 1.0)
+    else:
+        fn = lambda x: bias_swiglu_impl(x, None, clamp_value=10.0)
+        inputs = (x,)
+    _, grads = assert_replays_bit_exact(fn, inputs, replays=3, what="clamped SwiGLU boundaries")
+
+    # Replay alone would also accept a consistently wrong endpoint derivative.
+    # Compare its zero mask with the installed PyTorch scalar-clamp contract.
+    reference_x = x.detach().clone().requires_grad_(True)
+    gate, linear = reference_x.float().chunk(2, dim=-1)
+    reference = (F.silu(gate.clamp(max=10.0)) * linear.clamp(-10.0, 10.0)).to(DTYPE)
+    if weighted:
+        reference = (reference * inputs[1]).to(DTYPE)
+    reference_grad = torch.autograd.grad(reference.sum(), reference_x)[0]
+    assert torch.equal(grads["in[0]"] == 0, reference_grad == 0)
 
 
 # --- plain compiled activations -----------------------------------------------------------
@@ -194,21 +226,25 @@ class TestFusedCrossEntropy:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
     @pytest.mark.xfail(
         strict=False,
         reason="op-catalog lists the fused cross entropy as non-deterministic; recorded, not gated",
     )
-    def test_fused_vocab_parallel_cross_entropy_replays(self):
+    def test_fused_vocab_parallel_cross_entropy_replays(self, dtype):
+        """Both logits dtypes: fp32 logits skip the internal upcast, and the backward must
+        hand back a gradient in the logits dtype rather than a hardcoded one."""
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
-        logits = _act((TOKENS, 32768))
+        logits = _act((TOKENS, 32768), dtype=dtype)
         target = torch.randint(0, 32768 * tp_group.size(), (TOKENS,), device="cuda")
-        assert_replays_bit_exact(
+        _, grads = assert_replays_bit_exact(
             lambda l, t: fused_vocab_parallel_cross_entropy(l, t, tp_group),
             (logits, target),
             replays=4,
             what="fused_vocab_parallel_cross_entropy",
         )
+        assert grads["in[0]"].dtype == dtype
 
 
 # --- DeepSeek-V4 hybrid attention: compiled query RMS norm -----------------------------------

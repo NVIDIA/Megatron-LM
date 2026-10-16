@@ -60,6 +60,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.sequence_parallel = self.config.sequence_parallel
 
         self.inference_context = inference_context
+        configured_prompt_contract = getattr(
+            self.inference_context.config, "multimodal_prompt_config", None
+        )
+        if configured_prompt_contract is not None:
+            self.multimodal_prompt_config = configured_prompt_contract
 
         # Get the inference pg_collection from the config if it exists; otherwise the training
         # pg_collection might be used during RL
@@ -69,6 +74,15 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)
+
+        if (
+            getattr(self.config, "enable_mhc_connections", False)
+            and torch.distributed.get_world_size(self.pp_group) > 1
+        ):
+            raise NotImplementedError(
+                "mHC inference with pipeline parallelism is not supported: receive buffers "
+                "do not account for the expanded residual streams."
+            )
 
         if self.config.fp8 is not None and self.config.transformer_impl != "inference_optimized":
             self.model = prepare_model_for_fp8_inference(self.model)

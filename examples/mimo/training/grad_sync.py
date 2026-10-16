@@ -167,7 +167,9 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
             mimo_model.language_model.scale_gradients(inv)
 
         for name, submodule in mimo_model.modality_submodules.items():
-            if submodule is None:
+            if submodule is None or not any(
+                parameter.requires_grad for parameter in submodule.parameters()
+            ):
                 continue
             vision_pg = module_pgs.get(name)
             finalize_model_grads(

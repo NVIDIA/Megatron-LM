@@ -42,6 +42,7 @@ _ROUND_TRIP_ARGS = {
     "do_test",
     "do_train",
     "do_valid",
+    "exit_interval",
     "exit_on_missing_checkpoint",
     "iteration",
     "load",
@@ -59,6 +60,7 @@ def _run_launcher(
         "MIMO_CHECKPOINT_PADDING_MANIFEST_DIR": str(scratch / "padding-manifest"),
         "MIMO_CHECKPOINT_TEST_PRETRAIN": "1",
         "MIMO_PRETRAIN_MODULE": _MODULE,
+        "NVTE_FLASH_ATTN_V4": "0",
         "TRAIN_ITERS": "2",
         "TORCHRUN_LOG_DIR": str(scratch / f"torchrun-{name}"),
     }
@@ -66,14 +68,22 @@ def _run_launcher(
         env["MIMO_CHECKPOINT_TEST_RESAVE"] = "1"
     env.pop("NVTE_FLASH_ATTN", None)
     env.pop("NVTE_FUSED_ATTN", None)
+    placement_args = (
+        ["--mimo-run-input-projections-on-llm-ranks"]
+        if os.environ.get("MIMO_RUN_INPUT_PROJECTIONS_ON_LLM_RANKS")
+        else []
+    )
     command = [
         "bash",
         str(_LAUNCHER),
+        "--flash-attention-version",
+        "2",
         "--num-experts",
         "8",
         "--no-save-tokenizer-assets",
         "--ckpt-format",
         "torch_dist",
+        *placement_args,
         *args,
     ]
     return subprocess.run(
@@ -439,6 +449,8 @@ def test_hetero_mimo_20l_checkpoint_round_trip_is_exact():
             "--save",
             str(round_trip_root),
             "--save-interval",
+            "1",
+            "--exit-interval",
             "1",
             "--load",
             str(source_root),

@@ -38,7 +38,7 @@ Selected by `torch.are_deterministic_algorithms_enabled()` or
 | Vocab-parallel embedding | `megatron/core/tensor_parallel/layers.py` | direct indexing `weight[idx]` (deterministic backward) | `F.embedding` (non-deterministic atomic backward) |
 | Gated-delta-net kernel | `megatron/core/ssm/gated_delta_net.py` | torch `chunk_gated_delta_rule` | FLA fused kernel |
 | Gated-delta-net causal conv1d | `megatron/core/ssm/gated_delta_net/` | `F.conv1d` (plus transposes) | FLA `causal_conv1d` |
-| Mamba/SSM Triton ops | `megatron/core/ssm/ops/common/determinism.py` | one fixed autotune config plus a zero-initialized tiled workspace reduced with an ordered `sum` | timing-based autotune, uninitialized workspace |
+| Mamba/SSM Triton ops | `megatron/core/tuning` (config selection), `megatron/core/ssm/ops/common/determinism.py` (workspaces) | one fixed autotune config plus a zero-initialized tiled workspace reduced with an ordered `sum` | timing-based autotune, uninitialized workspace |
 | Mamba/GDP causal conv1d | `megatron/core/ssm/causal_conv1d.py` | causal_conv1d >= 1.6.0 — per-block workspace for the weight and bias gradients, reduced with an ordered `sum` | `atomicAdd` accumulation (order varies per launch) |
 | Transformer Engine attention | `megatron/core/extensions/transformer_engine.py` | requires `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`, under which TE selects only backends that support deterministic execution (including deterministic FlashAttention backward) | TE picks freely, including atomic-accumulation attention backward |
 | Inference DP scheduling and RL rollout order | `megatron/core/inference/engines/dynamic_engine.py`, `megatron/rl/rl_utils.py` | sort by stable key | completion order |
@@ -68,6 +68,8 @@ are known open gaps.
 | Fused cross-entropy loss (`--cross-entropy-loss-fusion`) | rejected by `--deterministic-mode` (`megatron/training/determinism.py`) | The fused kernel is non-deterministic. Whether a deterministic variant is feasible remains an open question. Until then, the framework uses the native vocab-parallel path. |
 | TP communication overlap (`--tp-comm-overlap`) | rejected by `--deterministic-mode` | Overlapped collective ordering is not reproducible. |
 | Packed sequence (`thd`) in gated-delta-net | assertion in `megatron/core/ssm/gated_delta_net.py` | No deterministic packed-sequence SSM path exists yet. |
+| Pre-GDR fusion (`--gdn-pre-gated-delta-rule-fusion`) | rejected by `GatedDeltaNet._setup_variant_attrs` | Uses atomic parameter-gradient reductions and timing-based Triton autotuning. |
+| Post-GDR fusion (`--gdn-gated-output-norm-fusion`) | rejected on every fused forward by `validate_gated_norm` | The supported configuration requires `deterministic_mode=False`; preserve the unfused path for deterministic mode. |
 | Cross-allocation floating-point collectives (TP all-reduce, DP grad reduce-scatter) | open gap | `NCCL_ALGO=Ring` pins the algorithm but not the physical ring an allocation receives. The environment variable alone does not guarantee bit-exactness across *different* allocations for these reductions. Runs repeated within one allocation, or on allocations with identical topology, remain bit-exact. |
 
 ## Performance Notes

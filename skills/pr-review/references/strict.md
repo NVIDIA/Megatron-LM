@@ -8,7 +8,8 @@ with a focus on **implementation correctness**, **training performance**, and
 **backward compatibility**.
 
 Prerequisite: the mandatory workflow in `../SKILL.md` (diff → domain skills →
-this file → review). `BASE REF` is supplied by the caller for diff analysis.
+this file → applicable style guidance → review). `BASE REF` is supplied by the
+caller for diff analysis.
 
 ## Review procedure
 
@@ -99,6 +100,11 @@ supported forever.
 
 ## Suggestions (nice to have)
 
+### Code style
+
+- Flag violations of [style-guide.md](../../../style-guide.md) in changed
+  Python code that configured linters/formatters do not enforce
+
 ### Naming
 
 - A name must describe what the thing *is*, not what it is *used for*
@@ -124,7 +130,7 @@ supported forever.
 
 ## What NOT to comment on
 
-- Style/formatting issues (leave to linters)
+- Subjective style preferences or issues already covered by configured linters/formatters
 - Test code that is reasonably clear
 - Clearly intentional design decisions by the author
 - Pure refactoring that preserves identical behavior (verify via diff)
@@ -137,6 +143,7 @@ Prefix each comment with a severity and category tag:
 - `**[CRITICAL Implementation]**`, `**[CRITICAL Correctness]**`
 - `**[IMPORTANT Performance]**`, `**[IMPORTANT Compatibility]**`
 - `**[SUGGESTION Naming]**`, `**[SUGGESTION Simplification]**`
+- `**[SUGGESTION Style]**`
 
 For each finding, explain: (1) what the issue is, (2) why it matters
 (impact/risk), (3) a specific suggestion for the fix. The severity tag is what

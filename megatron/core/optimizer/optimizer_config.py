@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
@@ -284,13 +285,38 @@ class OptimizerConfig:
     each shard independently, which makes the update rule depend on the parallelism config;
     "duplicated" and "distributed" both orthogonalize the whole matrix, so results do not
     change as TP changes. "auto" select between duplicated and distributed mode per-weight for
-    dense weights. Defaults to "duplicated"."""
+    dense weights. "layer_sharded" uses LayerShardedMuon instead of TensorParallelMuon:
+    each 2D weight is assigned one NS home rank in the (GTP_remat x TP) domain — i.e. the
+    GTP domain — all_to_all stages over the gtp_remat and tp groups assemble the complete
+    (P, Q) momentum on the home, the exact same full-matrix Newton-Schulz as duplicated
+    mode runs there with zero communication and zero redundancy, and reverse all_to_all
+    stages scatter the result back to the original shards. layer_sharded requires
+    optimizer='muon', the layer-wise distributed optimizer path and muon_split_qkv=False
+    (split-QKV Newton-Schulz is not implemented on the layer-sharded path); __post_init__
+    checks all three. Defaults to "duplicated"."""
 
     muon_use_syrk: bool = False
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
+
+    muon_ns_batch_size: int = 1
+    """Max number of same-shape matrices fused into one batched Newton-Schulz under
+    muon_tp_mode='layer_sharded'. MoE assigns hundreds of identically shaped expert weights
+    to a single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
+    transient stack of this many matrices for far fewer launches. The value is an upper
+    bound per same-shape bucket, so oversizing it is harmless. Batches of more than one use
+    baddbmm instead of addmm and differ from the per-matrix path by kernel-level rounding,
+    so bitwise parity with duplicated mode is lost; the default of 1 keeps the bit-exact
+    path. Values > 1 require emerging-optimizers >= 0.3.0."""
+
+    muon_concurrent_groups: bool = True
+    """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
+    on its own CUDA stream so one group's compute fills another group's all_to_all stall.
+    Bitwise-neutral (op order within a group is unchanged), but the transient buffers of
+    all groups are live at once — disable (or lower muon_ns_batch_size) if peak memory is
+    tight. Only used when muon_tp_mode='layer_sharded'. Defaults to True."""
 
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
@@ -430,6 +456,30 @@ class OptimizerConfig:
                 "overlap_param_gather_with_optimizer_step is not supported with "
                 "reuse_grad_buf_for_mxfp8_param_ag."
             )
+
+        if self.optimizer_cuda_graph:
+            assert not math.isfinite(
+                self.grad_norm_skip_threshold
+            ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
+
+        if self.muon_tp_mode == 'layer_sharded':
+            # 'dist_muon' is the deprecated alias for muon + the layer-wise path.
+            if self.optimizer not in ('muon', 'dist_muon'):
+                raise ValueError(
+                    f"muon_tp_mode='layer_sharded' requires optimizer='muon' (got "
+                    f"{self.optimizer!r}); other optimizers, including adaptive_muon, do not "
+                    "implement layer sharding."
+                )
+            if self.optimizer == 'muon' and not self.use_layer_wise_distributed_optimizer:
+                raise ValueError(
+                    "muon_tp_mode='layer_sharded' requires the layer-wise distributed "
+                    "optimizer path (use_layer_wise_distributed_optimizer=True)."
+                )
+            if self.muon_split_qkv:
+                raise ValueError(
+                    "muon_tp_mode='layer_sharded' does not implement split-QKV Newton-Schulz; "
+                    "set muon_split_qkv=False."
+                )
 
         if self.use_precision_aware_optimizer:
             assert (

@@ -7,7 +7,12 @@ import logging
 
 import torch
 
-from megatron.core.tensor_parallel.random import get_all_rng_states
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.tensor_parallel.random import (
+    cudagraph_needs_generator_registration,
+    get_all_rng_states,
+    prime_cuda_rng_states_for_graph_capture,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -219,16 +224,23 @@ class FullCudaGraphWrapper:
             torch.distributed.barrier()
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
-            for _, state in get_all_rng_states().items():
-                FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
+            if cudagraph_needs_generator_registration():
+                for _, state in get_all_rng_states().items():
+                    FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
-            with torch.cuda.graph(
-                FullCudaGraphWrapper.cuda_graph[training_str],
-                stream=capture_stream,
-                pool=get_graph_pool(self.use_single_mempool),
-                capture_error_mode="thread_local",
+            rerun_state_machine = get_rerun_state_machine()
+            with (
+                torch.cuda.graph(
+                    FullCudaGraphWrapper.cuda_graph[training_str],
+                    stream=capture_stream,
+                    pool=get_graph_pool(self.use_single_mempool),
+                    capture_error_mode="thread_local",
+                ),
+                rerun_state_machine.capture_deferred_validations(training_str),
             ):
+                # Must precede all other captured work; see the helper's docstring.
+                prime_cuda_rng_states_for_graph_capture()
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
                 )
@@ -240,6 +252,8 @@ class FullCudaGraphWrapper:
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
         self.next_iter(training_str)
+        # Validate before returning to the training loop's rerun/update decision.
+        get_rerun_state_machine().run_deferred_validations(training_str)
         return FullCudaGraphWrapper.result[training_str]
 
     def curr_iter(self, stage):
@@ -258,10 +272,12 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['training'] = None
             FullCudaGraphWrapper.result['training'] = None
             FullCudaGraphWrapper.curr_iteration['training'] = 0
+            get_rerun_state_machine().clear_deferred_validations("training")
         if stage is None or stage == 'validation':
             if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
                 del FullCudaGraphWrapper.cuda_graph['validation']
                 FullCudaGraphWrapper.cuda_graph['validation'] = None
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
+            get_rerun_state_machine().clear_deferred_validations("validation")
         gc.collect()

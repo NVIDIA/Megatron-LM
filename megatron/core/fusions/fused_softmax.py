@@ -253,6 +253,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         if (
             self.scaled_masked_softmax_fusion  # user want to fuse
             and self.input_in_float16  # input must be fp16
+            and self.window_size is None  # apex kernels have no sliding-window support
             and 16 < sk <= 4096  # sk must be 16 ~ 2048
             and sq % 4 == 0  # sq must be divisor of 4
             and sk % 4 == 0  # sk must be divisor of 4
@@ -319,7 +320,10 @@ class FusedScaleMaskSoftmax(nn.Module):
         # Generate causal mask if not given
         sq, sk = input.size(2), input.size(3)
         if self.window_size is not None:
-            mask = get_sliding_window_causal_mask(sq, sk, self.window_size)
+            sliding_window_mask = get_sliding_window_causal_mask(sq, sk, self.window_size)
+            # Compose with a caller-provided (e.g. padding or packed-sequence) mask
+            # instead of silently discarding it; both are bool with True = masked.
+            mask = sliding_window_mask if mask is None else (mask | sliding_window_mask)
         elif self.attn_mask_type == AttnMaskType.causal and mask is None and sq > 1:
             # If sq == 1 then either KV cache is used or one-element context is passed
             # so keeping mask=None in this case; subsequent code should handle it

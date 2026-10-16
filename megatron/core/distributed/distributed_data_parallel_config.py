@@ -116,7 +116,7 @@ class DistributedDataParallelConfig:
       (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
       already sharded over a narrower DP group than non-expert parameters when expert
       parallelism is enabled, so the two classes have very different traffic-per-byte.
-      When None, `data_parallel_sharding_strategy` applies to all parameters."""
+      None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -147,6 +147,14 @@ class DistributedDataParallelConfig:
       | NVL+IB               | True      | 6 / 6               |
       | IB                   | False     | 1 / 4               |
       | IB                   | True      | 1 / 1               |
+    """
+
+    grad_buffer_offload: bool = False
+    """If true, gradient buffers may be released between training phases.
+
+    With ``nccl_ub``, gradient storage is allocated in a separate NCCL memory
+    pool so that it can be deregistered, released, recreated, and registered
+    again without disturbing persistent parameter storage.
     """
 
     fsdp_double_buffer: bool = False
@@ -182,9 +190,11 @@ class DistributedDataParallelConfig:
     Valid values are 'no_shard', 'optim'. This option is only effective when Hybrid FSDP is enabled.
     """
 
-    expert_outer_dp_sharding_strategy: str = 'no_shard'
+    expert_outer_dp_sharding_strategy: Optional[str] = None
     """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
-    Valid values are ``'no_shard'`` and ``'optim'``.
+    Valid values are ``'no_shard'``, ``'optim'``, ``'optim_grads'``, and
+    ``'optim_grads_params'``. None is replaced with
+    ``outer_dp_sharding_strategy`` during initialization.
     """
 
     disable_symmetric_registration: bool = False
@@ -307,25 +317,33 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
-        for name in ("data_parallel_sharding_strategy", "outer_dp_sharding_strategy"):
+        if self.expert_data_parallel_sharding_strategy is None:
+            self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
+        if self.expert_outer_dp_sharding_strategy is None:
+            self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
+
+        for name in (
+            "data_parallel_sharding_strategy",
+            "expert_data_parallel_sharding_strategy",
+            "outer_dp_sharding_strategy",
+            "expert_outer_dp_sharding_strategy",
+        ):
             value = getattr(self, name)
             if value not in _SHARDING_STRATEGIES:
                 raise ValueError(
                     f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
                 )
-        # Unlike the two above, this one is optional: None means expert parameters follow
-        # data_parallel_sharding_strategy rather than taking a strategy of their own.
-        expert_strategy = self.expert_data_parallel_sharding_strategy
-        if expert_strategy is not None and expert_strategy not in _SHARDING_STRATEGIES:
-            raise ValueError(
-                "expert_data_parallel_sharding_strategy must be None or one of "
-                f"{list(_SHARDING_STRATEGIES)}, got {expert_strategy!r}."
-            )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+
+        if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with "
+                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+            )
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
