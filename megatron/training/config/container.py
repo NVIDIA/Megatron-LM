@@ -311,7 +311,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             use_torch_fsdp2=self.dist.use_torch_fsdp2,
             moe_single_grouped_weight=self.model.moe_single_grouped_weight,
             virtual_pipeline_model_parallel_size=self.model.virtual_pipeline_model_parallel_size,
-            use_dist_ckpt=self.checkpoint.use_dist_ckpt,
+            ckpt_format=self.checkpoint.ckpt_format,
         )
 
     def _finalize(self) -> None:

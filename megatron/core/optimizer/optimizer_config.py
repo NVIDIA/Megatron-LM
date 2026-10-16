@@ -537,7 +537,7 @@ class OptimizerConfig:
         use_torch_fsdp2: bool,
         moe_single_grouped_weight: bool,
         virtual_pipeline_model_parallel_size: int | None,
-        use_dist_ckpt: bool,
+        ckpt_format: bool,
     ) -> None:
         if self.lr is not None:
             assert self.min_lr <= self.lr
@@ -598,7 +598,7 @@ class OptimizerConfig:
         if self.overlap_param_gather_with_optimizer_step:
             assert virtual_pipeline_model_parallel_size is not None, \
                 '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
-            assert not use_dist_ckpt, \
+            assert ckpt_format == "torch", \
                 '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 
         if self.fp16:
