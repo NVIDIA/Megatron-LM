@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -189,7 +190,9 @@ def test_layerwise_prefetches_single_managed_child_state():
 
     def child(name, managed):
         return SimpleNamespace(
-            _optimizer_state_offloader=object() if managed else None,
+            _optimizer_state_offloader=(
+                SimpleNamespace(staging_pool=SimpleNamespace(hold=nullcontext)) if managed else None
+            ),
             prefetch_optimizer_master_weights_for_step=lambda: events.append(f"master:{name}"),
             prefetch_optimizer_state_for_step=lambda: events.append(f"state:{name}"),
             step_with_ready_grads=lambda: events.append(f"step:{name}") or True,

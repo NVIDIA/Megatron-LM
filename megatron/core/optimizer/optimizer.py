@@ -7,6 +7,7 @@ import logging
 import math
 import warnings
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -254,7 +255,10 @@ class MegatronOptimizer(ABC):
     def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
         """Start the optimizer prefetch that may overlap gradient finalization."""
 
-        self.prefetch_optimizer_state_for_step()
+        if self._defer_optimizer_state_prefetch_to_step:
+            self.prefetch_optimizer_master_weights_for_step()
+        else:
+            self.prefetch_optimizer_state_for_step()
 
     def prefetch_optimizer_master_weights_for_step(self) -> None:
         """Prefetch master weights without restoring an optimizer-state chunk."""
@@ -1651,26 +1655,80 @@ class ChainedOptimizer(MegatronOptimizer):
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
         self._share_optimizer_state_offload_streams()
+        self._defer_later_children_state_prefetch()
+
+    def _defer_later_children_state_prefetch(self) -> None:
+        """Bound the chain's tensor-state staging to one manager's two slots.
+
+        Children step one after another. Only the first offloading child restores its first
+        state chunk ahead of the update, where the copy overlaps gradient clipping. Each later
+        child restores its own when its step begins, into the staging windows the previous
+        child handed over, instead of holding a chunk through every earlier child's update.
+        """
+
+        # A nested chain such as LayerWise counts through the manager of its child.
+        offloading_children = [
+            child
+            for child in self.chained_optimizers
+            if any(self._iter_optimizer_state_offloaders(child))
+        ]
+        for child in offloading_children[1:]:
+            self._defer_state_prefetch_to_step(child)
+
+    @classmethod
+    def _defer_state_prefetch_to_step(cls, optimizer: MegatronOptimizer) -> None:
+        """Move ``optimizer``'s first state-chunk restore from gradient finalization to its step.
+
+        A nested chain is marked too, because LayerWise prefetches its managed child through
+        its own gradient-finalization policy rather than the child's.
+        """
+
+        if getattr(optimizer, '_optimizer_state_offloader', None) is not None:
+            optimizer.set_optimizer_state_offload_deferred_lifecycle(
+                state_prefetch_to_step=True,
+                master_offload_for_param_sync=(
+                    optimizer._defer_optimizer_master_offload_for_param_sync
+                ),
+            )
+            return
+        optimizer._defer_optimizer_state_prefetch_to_step = True
+        for child in getattr(optimizer, 'chained_optimizers', ()):
+            if any(cls._iter_optimizer_state_offloaders(child)):
+                cls._defer_state_prefetch_to_step(child)
+
+    @staticmethod
+    def _iter_optimizer_state_offloaders(optimizer: MegatronOptimizer):
+        """Yield every chunked offload manager in ``optimizer``, nested chains included."""
+
+        manager = getattr(optimizer, '_optimizer_state_offloader', None)
+        if manager is not None:
+            yield manager
+        for child in getattr(optimizer, 'chained_optimizers', ()):
+            yield from ChainedOptimizer._iter_optimizer_state_offloaders(child)
 
     def _share_optimizer_state_offload_streams(self) -> None:
-        """Serialize all nested offload managers on one D2H/H2D stream pair."""
+        """Serialize all nested offload managers on one D2H/H2D stream pair and one pair of
+        staging windows."""
 
-        managers = []
-
-        def collect(current_optimizer: MegatronOptimizer) -> None:
-            manager = getattr(current_optimizer, '_optimizer_state_offloader', None)
-            if manager is not None:
-                managers.append(manager)
-            for child in getattr(current_optimizer, 'chained_optimizers', ()):
-                collect(child)
-
-        collect(self)
+        managers = list(self._iter_optimizer_state_offloaders(self))
         if len(managers) < 2:
             return
 
         d2h_stream, h2d_stream = managers[0].transfer_streams
         for manager in managers[1:]:
             manager.use_transfer_streams(d2h_stream, h2d_stream)
+            manager.use_staging_pool(managers[0].staging_pool)
+
+    def _hold_optimizer_state_staging(self):
+        """Keep the shared staging windows alive while the children step one after another.
+
+        Each child then hands its windows to the next instead of freeing them while its last
+        D2H copies are still in flight; see ``_StagingSlotPool``. Only the children loop holds
+        them, so post-step parameter staging does not run beside two idle windows.
+        """
+
+        manager = next(self._iter_optimizer_state_offloaders(self), None)
+        return manager.staging_pool.hold() if manager is not None else nullcontext()
 
     @property
     def optimizer(self):
@@ -1717,15 +1775,13 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.offload_optimizer_state_for_forward(offload_master=offload_master)
 
     def prefetch_optimizer_state_for_step(self) -> None:
-        """Eagerly prefetch state/master data for every optimizer in the chain.
+        """Prefetch for the next chained step without exceeding the chain's staging bound.
 
-        This general-purpose entry can exceed a configured chunk staging bound because every
-        child may hold a prefetched window concurrently. LayerWise uses a dedicated
-        gradient-finalization policy for its single managed Muon child.
+        This is the gradient-finalization policy: children deferred to their own step restore
+        only master weights here, so at most one child holds a prefetched state chunk.
         """
 
-        for optimizer in self.chained_optimizers:
-            optimizer.prefetch_optimizer_state_for_step()
+        self.prefetch_optimizer_state_for_gradient_finalization()
 
     def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
         """Start each child's gradient-finalization prefetch policy."""
@@ -1939,13 +1995,14 @@ class ChainedOptimizer(MegatronOptimizer):
     def _step(self) -> bool:
         """Step all optimizers in this chain."""
         success = True
-        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
-            self._before_child_step(optimizer_idx)
-            success &= optimizer.step_with_ready_grads()
-            if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
-                assert success
-                assert len(optimizer.model_chunks) == 1
-                optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+        with self._hold_optimizer_state_staging():
+            for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+                self._before_child_step(optimizer_idx)
+                success &= optimizer.step_with_ready_grads()
+                if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
+                    assert success
+                    assert len(optimizer.model_chunks) == 1
+                    optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
         return success
 
     def _should_defer_mxfp8_param_sync(self) -> bool:
