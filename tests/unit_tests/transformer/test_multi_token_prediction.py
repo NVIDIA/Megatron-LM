@@ -2170,11 +2170,14 @@ class TestMultiTokenPrediction:
         assert output.shape == (self.micro_batch_size, self.seq_length // cp)
         assert torch.isfinite(output).all()
 
+        # Reduce local normalized contributions so tracker["values"] becomes available.
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
-        assert "loss_values" in tracker
-        mtp_loss = tracker['loss_values'].clone()
+        assert "values" in tracker
+        mtp_loss = tracker['values'].clone()
         assert mtp_loss.shape[0] == args.mtp_num_layers
         assert torch.isfinite(mtp_loss).all()
+        MTPLossLoggingHelper.clean_loss_in_tracker()
 
         output.mean().backward()
         for name, param in gpt_model[0].named_parameters():
@@ -3597,6 +3600,7 @@ class TestMultiTokenPredictionHybrid:
                 mtp_num_layers=1,
                 use_mup=False,
                 inference_cuda_graph_scope=None,
+                moe_n_hash_layers=0,
             ),
             pre_process=False,
             post_process=True,
@@ -3609,7 +3613,7 @@ class TestMultiTokenPredictionHybrid:
             output_layer=output_layer,
             training=True,
             compute_language_model_loss=compute_language_model_loss,
-            pg_collection=types.SimpleNamespace(cp=None),
+            pg_collection=types.SimpleNamespace(cp=None, dp_cp=None),
             tp_group=None,
             _scale_logits=lambda logits: logits,
         )
@@ -3688,7 +3692,6 @@ class TestMultiTokenPredictionHybrid:
         inference_context = types.SimpleNamespace(
             is_dynamic_batching=lambda: True,
             num_speculative_tokens=1,
-            mtp_decoder_hidden_states=None,
             config=types.SimpleNamespace(materialize_only_last_token_logits=False),
         )
 
@@ -3713,7 +3716,8 @@ class TestMultiTokenPredictionHybrid:
             )
 
         torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
-        torch.testing.assert_close(inference_context.mtp_decoder_hidden_states, hidden_states)
+        # dev captures the speculative-decoding MTP input on the model, not the context.
+        torch.testing.assert_close(model._decoder_hidden_states_cache, hidden_states)
         assert call_counts == {"mtp": 0, "mtp_loss": 0, "main_loss": 0}
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")

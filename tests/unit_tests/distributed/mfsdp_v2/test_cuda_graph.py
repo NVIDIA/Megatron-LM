@@ -7,6 +7,7 @@ import logging
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
@@ -18,6 +19,14 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Symmetric-memory MFSDP requires PyTorch 2.12 or later: FsdpParameterGroup raises on builds
+# without torch.distributed._symmetric_memory.is_symm_mem_tensor (such as dev's 2.12
+# pre-release).
+requires_symmetric_memory = pytest.mark.skipif(
+    not hasattr(symm_mem, "is_symm_mem_tensor"),
+    reason="Symmetric-memory MFSDP requires PyTorch 2.12 or later.",
+)
 
 # Sized so NCCL selects its symmetric-memory (ncclSymk*) kernels over ring for the
 # sharded Linear collectives; see test_symmetric_memory.py for the rationale.
@@ -54,7 +63,9 @@ def _flat_placements() -> Placements:
     [
         pytest.param(False, id="default"),
         pytest.param(
-            True, id="symmetric_memory", marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev]
+            True,
+            id="symmetric_memory",
+            marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev, requires_symmetric_memory],
         ),
     ],
 )

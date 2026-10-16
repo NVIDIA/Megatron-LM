@@ -7,6 +7,7 @@ from itertools import chain
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Partial, Replicate, Shard
@@ -23,6 +24,14 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import Mix
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
     collect_linked_event_groups,
     event_groups_overlap,
+)
+
+# Symmetric-memory MFSDP requires PyTorch 2.12 or later: FsdpParameterGroup raises on builds
+# without torch.distributed._symmetric_memory.is_symm_mem_tensor (such as dev's 2.12
+# pre-release).
+requires_symmetric_memory = pytest.mark.skipif(
+    not hasattr(symm_mem, "is_symm_mem_tensor"),
+    reason="Symmetric-memory MFSDP requires PyTorch 2.12 or later.",
 )
 
 
@@ -83,7 +92,7 @@ _GEMM_OP_NAME_SUBSTRING = "aten::mm"
         # The symmetric-memory variant uses zero-CTA all-gather kernels, so its overlap
         # measurement is more stable and remains enabled.
         pytest.param(False, marks=(pytest.mark.flaky, pytest.mark.flaky_in_dev)),
-        pytest.param(True),
+        pytest.param(True, marks=requires_symmetric_memory),
     ],
     ids=["default", "symmetric_memory"],
 )

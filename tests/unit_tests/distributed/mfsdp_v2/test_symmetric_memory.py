@@ -7,6 +7,7 @@ from itertools import chain
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Shard
@@ -19,6 +20,14 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
 )
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
+
+# Symmetric-memory MFSDP requires PyTorch 2.12 or later: FsdpParameterGroup raises on builds
+# without torch.distributed._symmetric_memory.is_symm_mem_tensor (such as dev's 2.12
+# pre-release).
+pytestmark = pytest.mark.skipif(
+    not hasattr(symm_mem, "is_symm_mem_tensor"),
+    reason="Symmetric-memory MFSDP requires PyTorch 2.12 or later.",
+)
 
 # Each sharded Linear's collective must be large enough that NCCL selects its
 # symmetric-memory (ncclSymk*) kernels over ring. Sub-KB collectives fall back to

@@ -1487,8 +1487,9 @@ def test_balanced_dynamic_packs_cannot_be_set_as_a_constructor_option(monkeypatc
             "with PP/VPP requires cuda_graph_dynamic_microbatches=True",
         ),
         (
+            # main #5902 rejects a missing value in ModelParallelConfig before this check.
             {"max_seqlen_per_dp_cp_rank": None, "pad_packed_seq_alignment": None},
-            "requires max_seqlen_per_dp_cp_rank",
+            "max_seqlen_per_dp_cp_rank must be set when sequence_packing_scheduler",
         ),
         ({"max_seqlen_per_dp_cp_rank": 127}, "requires an even max_seqlen_per_dp_cp_rank"),
         ({"max_seqlen_per_dp_cp_rank": 0}, "requires a positive max_seqlen_per_dp_cp_rank"),

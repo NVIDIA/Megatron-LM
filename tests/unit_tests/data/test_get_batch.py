@@ -361,7 +361,7 @@ def test_hybrid_legacy_thd_prebuilds_after_forward_constructs_params(monkeypatch
         pad_packed_seq_alignment=12,
         cuda_graph_impl="local",
     )
-    args = SimpleNamespace(seq_length=4096)
+    args = SimpleNamespace(seq_length=4096, linear_cp_layout="zigzag", context_parallel_size=1)
     cu_seqlens = torch.tensor([[0, 1024, 4096]], dtype=torch.int32)
     loss_mask = torch.ones(4096)
     tokens = torch.zeros(4096, dtype=torch.long)
