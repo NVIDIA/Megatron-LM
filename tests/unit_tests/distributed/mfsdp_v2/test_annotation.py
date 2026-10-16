@@ -15,6 +15,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
+    iteration,
 )
 
 _NVTX_LABEL_PATTERN = re.compile(r"MFSDP (.+) (\S+)")
@@ -134,7 +135,8 @@ def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
-    model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
+    with iteration(model.layers[0].context):
+        model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
     assert _forward_backward_events(events) == [
         ("push", "<root>", "forward"),

@@ -170,6 +170,7 @@ def test_fully_shard_sgd_losses_match_baseline(
     with fully_shard_context(device=device) as context:
         fully_shard(model.fc1, mesh=mesh, placements=placements)
         fully_shard(model.fc2, mesh=mesh, placements=placements)
+        fully_shard(model, mesh=mesh, placements=placements)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     fully_shard_optimizer(optimizer)
@@ -651,6 +652,7 @@ def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setu
     with fully_shard_context(device=device):
         fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     baseline_optimizer = torch.optim.Adam(baseline.parameters(), lr=0.01)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
