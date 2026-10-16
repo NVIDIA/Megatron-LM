@@ -32,7 +32,7 @@ def process_batch(batch):
     types = batch['types'].long().cuda().contiguous()
     labels = batch['label'].long().cuda().contiguous()
     attention_mask = batch['padding_mask'].float().cuda().contiguous()
-    if cfg.optimizer.fp16:
+    if args.fp16:
         attention_mask = attention_mask.half()
 
     return tokens, types, labels, attention_mask

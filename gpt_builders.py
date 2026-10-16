@@ -94,7 +94,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,
-        fp16_lm_cross_entropy=cfg.optimizer.fp16_lm_cross_entropy,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         logit_dtype=getattr(args, 'logit_dtype', None),
         parallel_output=True,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,

@@ -32,6 +32,7 @@ from typing import List
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.global_vars import get_run_config
 from megatron.training.initialize import initialize_megatron
 
 
@@ -119,6 +120,7 @@ def main():
     load_checkpoint(model, None, None)
     model = model[0]
 
+    cfg = get_run_config()
     args = get_args()
 
     inference_engine = get_inference_engine(args, model)

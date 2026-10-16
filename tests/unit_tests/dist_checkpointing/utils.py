@@ -190,9 +190,9 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.bf16 = bf16
     args.accumulate_allreduce_grads_in_fp32 = False
     args.overlap_grad_reduce = False
-    cfg.overlap_param_gather_with_optimizer_step = False
+    args.overlap_param_gather_with_optimizer_step = False
     args.fp8_param_gather = False
-    cfg.optimizer.use_distributed_optimizer = True
+    args.use_distributed_optimizer = True
     args.ddp_bucket_size = None
     args.check_for_nan_in_loss_and_grad = False
     args.ddp_average_in_collective = False
@@ -292,7 +292,7 @@ def setup_model_and_optimizer(
         mock_args.fp4_param_gather = fp4_param_gather
         # MXFP8 params cannot be re-pointed into the grad buffer (TE has no replace_raw_data for
         # MXFP8Tensor); production keeps them out of it with this flag.
-        mock_cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag = reuse_grad_buf_for_mxfp8_param_ag
+        mock_args.reuse_grad_buf_for_mxfp8_param_ag = reuse_grad_buf_for_mxfp8_param_ag
         if ddp_num_buckets is not None:
             # resolve_ddp_bucket_size() forces a single bucket unless grad reduction
             # overlaps, so both knobs are needed to actually split the grad buffer.
@@ -313,10 +313,10 @@ def setup_model_and_optimizer(
             mock_args.megatron_fsdp_main_grads_dtype = None
             mock_args.megatron_fsdp_grad_comm_dtype = None
         mock_args.gradient_accumulation_fusion = False
-        mock_cfg.optimizer.use_distributed_optimizer = ddp_use_dist_opt
-        mock_cfg.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        mock_args.use_distributed_optimizer = ddp_use_dist_opt
+        mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
-            mock_cfg.optimizer.optimizer = optimizer
+            mock_args.optimizer = optimizer
         model = get_model(
             partial(
                 initialize_fn,
@@ -448,10 +448,10 @@ def setup_moe_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
-        mock_cfg.optimizer.use_distributed_optimizer = ddp_use_dist_opt
-        mock_cfg.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        mock_args.use_distributed_optimizer = ddp_use_dist_opt
+        mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
-            mock_cfg.optimizer.optimizer = optimizer
+            mock_args.optimizer = optimizer
         model = get_model(
             partial(
                 initialize_fn,

@@ -63,7 +63,7 @@ class MegatronCheckpointLoaderBase:
 
         # Copy data types from checkpoint
         margs.fp16 = checkpoint_args.fp16
-        mcfg.optimizer.bf16 = checkpoint_cfg.optimizer.bf16
+        margs.bf16 = checkpoint_args.bf16
 
         # Expert parallelism requires sequence parallelism
         if margs.expert_model_parallel_size > 1:
@@ -444,7 +444,7 @@ class MegatronCheckpointLoaderBase:
         md.max_position_embeddings = self.margs.max_position_embeddings
         md.tokenizer_type = self.margs.tokenizer_type
         md.iteration = self.margs.iteration
-        md.params_dtype = self.mcfg.optimizer.params_dtype
+        md.params_dtype = self.margs.params_dtype
         md.bert_binary_head = self.margs.bert_binary_head
         md.output_layer = self.margs.untie_embeddings_and_output_weights
         md.position_embedding_type = self.margs.position_embedding_type

@@ -25,7 +25,7 @@ def add_arguments(parser):
                        help='Base directory of deepspeed repository')
 
 
-def load_args_from_checkpoint(args):
+def load_args_from_checkpoint(args, cfg):
     # Read Mixtral 8x7B args.
     from transformers import MixtralConfig
     mixtral_config = MixtralConfig.from_pretrained(args.load)
@@ -38,7 +38,7 @@ def load_args_from_checkpoint(args):
     args.add_position_embedding = False
     args.use_rotary_position_embeddings = True
     args.swiglu = True
-    cfg.optimizer.bf16 = True
+    cfg.bf16 = True
     args.add_bias_linear = False
     args.normalization = "RMSNorm"
     args.tokenizer_type = "Llama2Tokenizer"
@@ -139,7 +139,7 @@ def load_checkpoint_to_model(args):
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(cfg.optimizer.params_dtype)
+    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(cfg.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)
@@ -165,7 +165,7 @@ def _load_checkpoint(queue, args):
     try:
         from megatron.training.argument_utils import inference_cfg_container_from_args
         from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables
+        from megatron.training.global_vars import get_run_config, set_args, set_global_variables
         from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -195,8 +195,9 @@ def _load_checkpoint(queue, args):
                 ]
 
     margs = parse_args()
+    cfg = get_run_config()
     margs.tokenizer_model = args.tokenizer_model
-    load_args_from_checkpoint(margs)
+    load_args_from_checkpoint(margs, cfg.optimizer)
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes.
@@ -259,7 +260,7 @@ def _load_checkpoint(queue, args):
     md.max_position_embeddings = margs.max_position_embeddings
     md.tokenizer_type = margs.tokenizer_type
     md.iteration = margs.iteration
-    md.params_dtype = mcfg.optimizer.params_dtype
+    md.params_dtype = cfg.params_dtype
     md.bert_binary_head = margs.bert_binary_head
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embedding_type = margs.position_embedding_type
