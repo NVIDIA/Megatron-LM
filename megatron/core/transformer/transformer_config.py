@@ -1229,6 +1229,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    moe_apply_probs_after_fc2: bool = False
+    """Apply FP32 routing probabilities after the expert output projection, then restore
+    its activation dtype. Matches the probability placement in HF GLM5Next routed experts.
+    Initially limited to bias-free BF16/FP32 TEGroupedMLP, TP/ETP1 and AllToAll dispatch.
+    The default retains probability weighting between the activation and FC2.
+    """
+
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
@@ -1780,12 +1787,70 @@ class TransformerConfig(ModelParallelConfig):
     Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
     negative = actual-max; scale = abs(factor)."""
 
+    def _validate_moe_probs_after_fc2(self) -> None:
+        """Reject expert paths that do not implement the opt-in output-weighting contract."""
+        if not isinstance(self.moe_apply_probs_after_fc2, bool):
+            raise ValueError("moe_apply_probs_after_fc2 must be a bool.")
+        if not self.moe_apply_probs_after_fc2:
+            return
+        if (
+            self.transformer_impl != "transformer_engine"
+            or not self.moe_grouped_gemm
+            or not self.num_moe_experts
+            or not is_te_min_version("1.9.0.dev0")
+        ):
+            raise ValueError("moe_apply_probs_after_fc2 requires TEGroupedMLP and TE>=1.9.0.dev0.")
+        if (
+            self.fp16
+            or self.params_dtype not in (torch.bfloat16, torch.float32)
+            or self.fp8
+            or self.fp4
+            or self.fp8_param
+            or self.fp4_param
+            or self.activation_func_fp8_input_store
+            or self.quant_recipe is not None
+        ):
+            raise ValueError("moe_apply_probs_after_fc2 supports non-quantized BF16/FP32 only.")
+        if (
+            self.tensor_model_parallel_size != 1
+            or self.expert_tensor_parallel_size != 1
+            or self.sequence_parallel
+            or self.moe_token_dispatcher_type != "alltoall"
+            or self.moe_router_dtype != "fp32"
+        ):
+            raise ValueError(
+                "moe_apply_probs_after_fc2 requires TP/ETP1, no SP, AllToAll and FP32 routing."
+            )
+        if (
+            self.add_bias_linear
+            or not self.gated_linear_unit
+            or self.activation_func is not F.silu
+            or self.use_te_activation_func
+            or self.moe_mlp_glu_interleave_size is not None
+            or self.glu_linear_offset != 0
+            or self.moe_latent_size is not None
+        ):
+            raise ValueError("moe_apply_probs_after_fc2 requires bias-free standard SwiGLU.")
+        if (
+            self.moe_apply_probs_on_input
+            or self.use_transformer_engine_op_fuser
+            or self.moe_use_grouped_tensor
+            or self.moe_single_grouped_weight
+            or self.moe_single_grouped_bias
+            or self.moe_megakernel_backend is not None
+        ):
+            raise ValueError(
+                "moe_apply_probs_after_fc2 does not support fused/packed experts "
+                "or input weighting."
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+        self._validate_moe_probs_after_fc2()
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 

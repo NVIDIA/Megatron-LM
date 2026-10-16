@@ -220,6 +220,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,
     "mlp_chunks_for_prefill": 1,
+    "moe_apply_probs_after_fc2": False,
     "moe_apply_probs_on_input": False,
     "moe_aux_loss_coeff": 0.0,
     "moe_deepep_num_sms": None,
