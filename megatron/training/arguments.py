@@ -2711,10 +2711,11 @@ def _add_regularization_args(parser):
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
     group.add_argument('--muon-split-qkv-per-head', action='store_true',
-                       help='Orthogonalize each Q, gate, K, and V head independently. '
-                       'Uniform head sizes use batched Newton-Schulz and require '
-                       'emerging-optimizers 0.3.0 or newer. By default, '
-                       'Q, gate, K, and V projections are orthogonalized separately')
+                       help='Use per-head Muon for Q/K/V and AdamW for attention output gates '
+                       'and GDN controls; split dense SwiGLU gate/up and MLA down components. '
+                       'Requires QKV splitting; uniform all-Muon QKV heads require '
+                       'emerging-optimizers >= 0.3.0. Without this flag, retain default '
+                       'projection-level QKV/MLA splitting.')
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',

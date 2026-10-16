@@ -26,6 +26,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.muon_layout import MuonProjectionLayout
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -381,6 +382,9 @@ class AbsorbedMLASelfAttention(Attention):
         )
         self.linear_kv_up_proj.weight.qkv_layout = QKVLayout.from_mla_head_components(
             self.config.num_attention_heads, (self.config.qk_head_dim, self.config.v_head_dim)
+        )
+        self.linear_kv_down_proj.weight.muon_layout = MuonProjectionLayout.matrices(
+            (self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim)
         )
 
         if self.config.q_lora_rank is not None:
