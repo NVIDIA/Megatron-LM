@@ -2,10 +2,11 @@
 
 """Distributed unit test of the two-sided NCCL transfer backend.
 
-Prefill TP2 {0,1} -> decode TP1 {2} on real GPUs: the decode posts
-begin_pull_blocks, the prefills post the matching begin_push_blocks, and the
+Prefill TP2 -> decode TP1 and prefill TP1 -> decode TP2 on real GPUs: decode posts
+begin_pull_blocks, prefill posts the matching begin_push_blocks, and the
 decode's paged buffer must end up byte-identical to a direct shard of a known
-global KV. Exercises the hetero head-merge through the same reshard plan the
+global KV, including remapped destination blocks. Exercises head merging and
+splitting through the same reshard plan the
 NIXL backend uses. The test uses the process group provided by the unit-test
 runner instead of spawning a nested distributed job.
 """
@@ -16,7 +17,7 @@ import pytest
 import torch
 
 L, H, HD, T, NB = 4, 8, 16, 8, 6  # layers, kv heads, head dim, tokens/block, pool blocks
-BLOCKS = [1, 3]  # the request's blocks (same ids both sides for simplicity)
+BLOCKS = [1, 3]  # The request's source blocks.
 
 
 def _global_blocks():
@@ -92,9 +93,13 @@ def _meta_stub(rank, tp_size, tp_rank):
         and torch.cuda.device_count() >= 3
         and int(os.environ.get("WORLD_SIZE", "1")) >= 3
     ),
-    reason="requires torchrun with >=3 CUDA ranks (prefill TP2 {0,1} + decode TP1 {2})",
+    reason="requires torchrun with >=3 CUDA ranks for prefill/decode TP2/TP1 layouts",
 )
-def test_nccl_push_pull_tp2_to_tp1():
+@pytest.mark.parametrize("prefill_tp,decode_tp", [(2, 1), (1, 2)])
+@pytest.mark.parametrize(
+    "destination_blocks", [BLOCKS, [4, 0]], ids=["same-blocks", "remapped-blocks"]
+)
+def test_nccl_push_pull_tp_layouts(prefill_tp, decode_tp, destination_blocks):
     import torch.distributed as dist
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -113,24 +118,29 @@ def test_nccl_push_pull_tp2_to_tp1():
 
     transfer_ok = True
     g = _global_blocks().to(device)
-    if rank in (0, 1):  # prefill TP2
-        backend, buf = _backend(rank, 2, rank, device)
-        heads = slice(rank * (H // 2), (rank + 1) * (H // 2))
+    if rank < prefill_tp:
+        backend, buf = _backend(rank, prefill_tp, rank, device)
+        heads = slice(rank * (H // prefill_tp), (rank + 1) * (H // prefill_tp))
         for i, block in enumerate(BLOCKS):
             # buffer layout [2, L, B, T, h, d]
             buf[:, :, block] = g[i, :, :, :, heads, :]
         # In production the decode's metas arrive in SEND_KV.
-        handle = backend.begin_push_blocks({"tp_metas": [_meta_stub(2, 1, 0)]}, BLOCKS)
+        metas = [
+            _meta_stub(prefill_tp + tp_rank, decode_tp, tp_rank) for tp_rank in range(decode_tp)
+        ]
+        handle = backend.begin_push_blocks({"tp_metas": metas}, BLOCKS)
         handle.wait()
-    elif rank == 2:  # decode TP1
-        backend, buf = _backend(rank, 1, 0, device)
+    elif rank < prefill_tp + decode_tp:
+        tp_rank = rank - prefill_tp
+        backend, buf = _backend(rank, decode_tp, tp_rank, device)
         # In production the prefills' metas arrive in the hand-off kv_meta.
-        metas = [_meta_stub(0, 2, 0), _meta_stub(1, 2, 1)]
-        handle = backend.begin_pull_blocks({"tp_metas": metas}, BLOCKS, BLOCKS)
+        metas = [_meta_stub(src_rank, prefill_tp, src_rank) for src_rank in range(prefill_tp)]
+        handle = backend.begin_pull_blocks({"tp_metas": metas}, BLOCKS, destination_blocks)
         handle.wait()
         expected = torch.zeros_like(buf)
-        for i, block in enumerate(BLOCKS):
-            expected[:, :, block] = g[i]
+        heads = slice(tp_rank * (H // decode_tp), (tp_rank + 1) * (H // decode_tp))
+        for i, block in enumerate(destination_blocks):
+            expected[:, :, block] = g[i, :, :, :, heads, :]
         transfer_ok = torch.equal(buf, expected)
 
     result = torch.tensor(int(transfer_ok))

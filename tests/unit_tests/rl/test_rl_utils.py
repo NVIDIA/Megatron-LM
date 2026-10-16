@@ -65,6 +65,38 @@ SEQ = 4
 VOCAB = 768
 
 
+def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
+    """Refit uses RLConfig while shard layout remains a launch argument."""
+    rl_config = RLConfig(refit_method="nccl", refit_execution_batch_bytes=4096)
+    monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+    args = SimpleNamespace(inference_shards="tp=1,role=prefill+tp=1,role=decode", world_size=2)
+    model, inference_model = object(), object()
+    with (
+        patch.object(rl_utils, "disagg_refit_pools", return_value=(2, 1)) as pools,
+        patch.object(rl_utils, "prepare_swap_model_weights") as prepare,
+        patch.object(rl_utils, "swap_model_weights") as swap,
+    ):
+        assert rl_utils.refit_inference_model(model, inference_model, args) == 2
+    pools.assert_called_once_with(args.inference_shards, args.world_size)
+    prepare.assert_called_once_with(
+        src_model=model,
+        target_model=inference_model,
+        num_dst_pools=2,
+        dst_pool_index=1,
+        execution_batch_bytes=4096,
+    )
+    swap.assert_called_once_with(
+        model,
+        inference_model,
+        "nccl",
+        num_dst_pools=2,
+        dst_pool_index=1,
+        execution_batch_bytes=4096,
+    )
+    with rl_utils.inference_model_alloc_context():
+        pass
+
+
 class MockModel(LanguageModule):
     def __init__(self, batch=BATCH, seq=SEQ, vocab=VOCAB, dtype=torch.float32):
         self.batch = batch
