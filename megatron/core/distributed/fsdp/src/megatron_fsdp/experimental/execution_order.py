@@ -12,60 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Weakly held construction or recorded module execution sequences."""
+"""A weak occurrence sequence with independent caller-owned iterators."""
 
 from collections.abc import Iterable, Iterator
 from typing import Generic, TypeVar
-from weakref import WeakKeyDictionary, ref
+from weakref import ref
 
 T = TypeVar("T")
 
 
 class ExecutionOrder(Generic[T]):
-    """Look up unique modules and validate repeated module-call occurrences.
+    """Store occurrences without identity lookup or implicit cursor resets.
 
-    A module appearing once can unambiguously select its position, preserving
-    construction-order prefetch for reordered or repeated demand calls. Modules
-    appearing more than once must match the next occurrence at the cursor.
-    Prefetch lookahead never advances that cursor.
+    Callers can traverse the same sequence independently for execution and
+    prefetch. A missing item is an error: skipping it would change occurrence
+    positions. Appends are visible to an iterator used during recording.
     """
 
     def __init__(self, items: Iterable[T] = ()) -> None:
-        """Create a weak execution sequence, preserving repeated occurrences."""
-        self._items: list[ref[T]] = []
-        # An index identifies a unique item; None marks an ambiguous repeated item.
-        self._unique_index: WeakKeyDictionary[T, int | None] = WeakKeyDictionary()
-        self._position = 0
-        for item in items:
-            self.append(item)
+        self._items: list[ref[T]] = [ref(item) for item in items]
 
     def append(self, item: T) -> None:
-        """Append an occurrence and mark previously seen items as repeated."""
-        self._unique_index[item] = None if item in self._unique_index else len(self._items)
+        """Append one weakly held occurrence, preserving repetitions."""
         self._items.append(ref(item))
 
+    def __len__(self) -> int:
+        return len(self._items)
+
     def __iter__(self) -> Iterator[T]:
-        """Iterate over live occurrences in execution order."""
+        """Traverse occurrences strictly without consuming another iterator."""
         for item_ref in self._items:
             item = item_ref()
-            if item is not None:
-                yield item
-
-    def advance(self, item: T) -> None:
-        """Locate a unique demand call or consume the next expected repeated call."""
-        index = self._unique_index.get(item)
-        if index is None:
-            if not self._items or self._items[self._position]() is not item:
-                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-            index = self._position
-        self._position = (index + 1) % len(self._items)
-
-    def next_item(self, offset: int = 1) -> T | None:
-        """Look ahead from the last consumed occurrence without moving the cursor."""
-        if not self._items:
-            return None
-        index = (self._position - 1) % len(self._items)
-        next_index = index + offset
-        if next_index >= len(self._items):
-            return None
-        return self._items[next_index]()
+            if item is None:
+                raise RuntimeError("A module in the recorded FSDP execution order was destroyed.")
+            yield item

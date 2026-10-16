@@ -8,8 +8,8 @@ def _make_unshard_forward_hook(owner: FsdpModule):
     forward."""
 
     def hook(submodule, _args, _kwargs):
-        if owner.is_root():
-            context = owner.context
+        context = owner.context
+        if owner.is_root() and not context.iteration_order.active:
             context.allgather_stream.wait_stream(context.current_stream())
         owner.unshard(prefetch="forward" if owner.context.iteration_order.active else "none")
 

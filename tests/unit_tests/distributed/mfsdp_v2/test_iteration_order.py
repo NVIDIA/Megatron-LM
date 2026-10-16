@@ -26,6 +26,14 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration imp
 )
 
 
+def _demand(order, module, phase):
+    if order.recording:
+        order.record(module, phase)
+    expected, expected_phase = order.advance()
+    if expected is not module or expected_phase != phase:
+        raise RuntimeError("Demand diverged from the recorded iteration order.")
+
+
 class _Unit(nn.Module):
     def __init__(self):
         super().__init__()
@@ -46,10 +54,14 @@ def test_record_and_replay_mixed_occurrences():
         (a, "forward"),
         (a, "backward"),
     ]
+    gathers = Mock()
+    gathers.attach_mock(a._unshard_parameter_groups, "a")
+    gathers.attach_mock(b._unshard_parameter_groups, "b")
     for replay in (False, True, True):
+        gathers.reset_mock()
         with order.iteration("train"):
-            for module, phase in events:
-                order.advance(module, phase)
+            for index, (module, phase) in enumerate(events):
+                _demand(order, module, phase)
                 # Demand always materializes the current owner before prefetch.
                 module._unshard_event = object()
                 before = (
@@ -59,16 +71,19 @@ def test_record_and_replay_mixed_occurrences():
                 after = (
                     a._unshard_parameter_groups.call_count + b._unshard_parameter_groups.call_count
                 )
-                assert after - before <= int(replay)
+                assert after - before == int(replay and index + 1 < len(events))
+                if replay and index + 1 < len(events):
+                    expected = "a" if events[index + 1][0] is a else "b"
+                    assert gathers.mock_calls[-1][0] == expected
                 module._unshard_event = None
         assert not order.active
     assert a._unshard_parameter_groups.called and b._unshard_parameter_groups.called
     with order.iteration("validation"):
-        order.advance(a, "forward")
+        _demand(order, a, "forward")
     assert len(order._orders) == 2
     # Zero disables prefetch; a positive budget allows more than one owner.
     with order.iteration("train"):
-        order.advance(a, "forward")
+        _demand(order, a, "forward")
         a._unshard_event = object()
         before = b._unshard_parameter_groups.call_count
         order.prefetch(0)
@@ -76,7 +91,7 @@ def test_record_and_replay_mixed_occurrences():
         order.prefetch(2)
         assert b._unshard_parameter_groups.call_count == before + 1
         for module, phase in events[1:]:
-            order.advance(module, phase)
+            _demand(order, module, phase)
 
 
 def test_replay_rejects_changed_or_incomplete_iterations():
@@ -85,42 +100,47 @@ def test_replay_rejects_changed_or_incomplete_iterations():
     order = IterationOrder()
     for changed in ([(b, "forward")], [(a, "backward")], [], [(a, "forward"), (a, "forward")]):
         with order.iteration("train"):
-            order.advance(a, "forward")
+            _demand(order, a, "forward")
         with pytest.raises(RuntimeError):
             with order.iteration("train"):
                 for module, phase in changed:
-                    order.advance(module, phase)
+                    _demand(order, module, phase)
         assert not order.active and "train" not in order._orders
     with pytest.raises(ValueError):
         with order.iteration("train"):
-            order.advance(a, "forward")
+            _demand(order, a, "forward")
             raise ValueError("failed compute")
     assert "train" not in order._orders
     with order.iteration("train"):
         with pytest.raises(RuntimeError, match="overlap"):
             with order.iteration("validation"):
                 pass
-        order.advance(a, "forward")
+        _demand(order, a, "forward")
     with order.iteration("train", rerecord=True):
-        order.advance(b, "forward")
+        _demand(order, b, "forward")
     with order.iteration("train"):
-        order.advance(b, "forward")
+        _demand(order, b, "forward")
 
 
 def test_iteration_does_not_retain_modules():
     """Completed sequences retain only weak references and detect a missing owner."""
-    context = SimpleNamespace(ensure_finalized=Mock(), iteration_order=IterationOrder())
+    context = SimpleNamespace(
+        ensure_finalized=Mock(),
+        iteration_order=IterationOrder(),
+        allgather_stream=Mock(),
+        current_stream=Mock(),
+    )
     a, b = _Unit(), _Unit()
     with iteration(context):
-        context.iteration_order.advance(a, "forward")
-        context.iteration_order.advance(b, "backward")
+        _demand(context.iteration_order, a, "forward")
+        _demand(context.iteration_order, b, "backward")
     b_ref = ref(b)
     del b
     gc.collect()
     assert b_ref() is None
     with pytest.raises(RuntimeError, match="destroyed"):
         with iteration(context):
-            context.iteration_order.advance(a, "forward")
+            _demand(context.iteration_order, a, "forward")
             context.iteration_order.prefetch(None)
     assert not context.iteration_order.active
 
@@ -170,7 +190,7 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant):
             actual.backward()
         optimizer.step()
         torch.testing.assert_close(actual, expected)
-    events = context.iteration_order._orders["default"]
-    assert any(phase == "recompute" for _, phase in events)
+    _, phases = context.iteration_order._orders["default"]
+    assert "recompute" in phases
     for expected, actual in zip(baseline.parameters(), model.parameters()):
         torch.testing.assert_close(actual.full_tensor(), expected)

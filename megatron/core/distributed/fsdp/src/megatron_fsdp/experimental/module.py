@@ -32,7 +32,6 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionOrder
 from .iteration import DemandPhase
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
@@ -280,17 +279,22 @@ class FsdpModule:
     def unshard(self, prefetch: DemandPhase = "none") -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
-        External schedulers invoking this directly (rather than through the
-        automatic ``pre_forward`` hook) must first synchronize the all-gather
-        stream on the root by calling
-        ``context.allgather_stream.wait_stream(context.current_stream())``
-        before this when ``self.is_root()``; the automatic forward path
-        performs that root sync in ``pre_forward()`` immediately before this.
+        An iteration scope synchronizes the all-gather stream before demands.
+        Outside a scope, external schedulers invoking this directly must call
+        ``context.allgather_stream.wait_stream(context.current_stream())`` on
+        roots first, as the automatic ``pre_forward`` hook does.
         """
         # Combined hooks may run forward recomputation inside backward.
         if prefetch == "forward" and _is_in_backward():
             prefetch = "recompute"
-        scoped = self.context.iteration_order.advance(self, prefetch)
+        order = self.context.iteration_order
+        scoped = order.active
+        if scoped:
+            if order.recording:
+                order.record(self, prefetch)
+            expected, phase = order.advance()
+            if expected is not self or phase != prefetch:
+                raise RuntimeError("FSDP module calls diverged from the recorded iteration order.")
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
@@ -306,35 +310,6 @@ class FsdpModule:
                     else self._schedule_policy.backward_prefetch_size
                 )
                 context.iteration_order.prefetch(0 if prefetch == "none" else budget)
-            elif prefetch == "forward":
-                self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
-                )
-            elif prefetch == "backward":
-                self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
-                )
-
-    def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
-    ) -> None:
-        """Prefetch successors from ``order`` according to this module's budget."""
-        module = cast(nn.Module, self)
-        order.advance(module)
-        next_module = order.next_item()
-        if prefetch_size is None:
-            if next_module is not None:
-                cast(FsdpModule, next_module)._unshard_parameter_groups()
-            return
-
-        prefetched_size = 0
-        offset = 1
-        while next_module is not None and prefetched_size < prefetch_size:
-            fsdp_module = cast(FsdpModule, next_module)
-            fsdp_module._unshard_parameter_groups()
-            prefetched_size += fsdp_module.num_parameter_elements
-            offset += 1
-            next_module = order.next_item(offset)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.

@@ -64,7 +64,9 @@ with a record-and-replay mechanism.
 
 The experimental v2 runtime can record one complete iteration and prefetch from
 that demand order on subsequent iterations. Forward, backward, recomputation,
-and repeated calls share one occurrence cursor. Prefetch gathers are not recorded.
+and repeated calls share one occurrence sequence. Independent execution and
+prefetch iterators consume this sequence; prefetch never changes execution progress
+and its targets do not depend on materialization state. Prefetch gathers are not recorded.
 The first successful iteration of each schedule gathers on demand; failed or
 incompletely replayed iterations invalidate that schedule's recording.
 
@@ -72,6 +74,11 @@ Pipeline entry points use `with_mfsdp_iteration` to scope the complete local
 schedule, including all VPP chunks and combined 1F1B nodes. Nested combined
 calls join the existing scope. Root hooks do not reset cursors. Training and
 validation, microbatch counts, and VPP grouping select separate recordings.
+
+GPU validation of the combined VPP replay path currently stalls in P2P/MoE
+synchronization. Recorded demand order alone does not describe every communication
+boundary; resolving speculative-collective ordering is required before enabling
+this implementation for production use.
 
 Custom schedules can use the scope directly:
 
@@ -93,10 +100,11 @@ reshard invalidated an earlier speculative prefetch. Existing release and
 parameter-completion hooks retain CUDA stream and gradient-readiness ownership.
 The recorder neither reduces gradients nor infers completion from node counts.
 
-CUDA graph schedules retain their prior behavior: Python-hook recording does
-not cover graph replay. CUDA graph lifecycle support and performance tuning
-are outside this change. The construction-order path remains available when
-no iteration scope is active.
+Iteration recording is disabled for CUDA graph schedules because Python hooks
+do not cover graph replay. CUDA graph lifecycle support and performance tuning
+are outside this change. Outside an iteration scope, parameters are gathered on
+demand. `ExecutionOrder` only holds weak occurrences: construction-order lookup,
+`_unique_index`, and the module argument to `advance()` are removed.
 
 # Alternatives considered
 
