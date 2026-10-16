@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    native_h_aggregate,
+    native_h_aggregate_into,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -69,6 +73,55 @@ def test_mhc_precision(fp32_mixing, input_scale):
     (actual.float().square().mean() + aggregated.float().square().mean()).backward()
     for tensor in (residual, output, layer.mapping_proj.weight, layer.bias):
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
+
+
+@pytest.mark.parametrize("fp32_mappings", [False, True])
+def test_mhc_caller_owned_aggregation_matches_regular_path(fp32_mappings):
+    """The graph-input buffer must preserve FP32 mixing before the BF16 cast."""
+    torch.manual_seed(43)
+    x = torch.randn(8, 2, 4, 4096, device="cuda", dtype=torch.bfloat16)
+    mapping_dtype = torch.float32 if fp32_mappings else torch.bfloat16
+    weights = torch.randn(8, 2, 4, device="cuda", dtype=mapping_dtype)
+    actual_input, reference_input = (x.clone().requires_grad_() for _ in range(2))
+    actual_weights, reference_weights = (weights.clone().requires_grad_() for _ in range(2))
+    out = torch.empty(8, 2, 4096, device="cuda", dtype=x.dtype)
+    actual = native_h_aggregate_into(actual_input, actual_weights, out)
+    expected = native_h_aggregate(reference_input, reference_weights)
+    assert actual.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    grad = torch.randn_like(actual)
+    actual.backward(grad)
+    expected.backward(grad)
+    torch.testing.assert_close(actual_input.grad, reference_input.grad)
+    # The explicit-buffer custom op accumulates weight gradients in FP32.
+    torch.testing.assert_close(
+        actual_weights.grad, (grad.float().unsqueeze(2) * x.float()).sum(-1).to(mapping_dtype)
+    )
+
+
+@pytest.mark.parametrize("pre_dtype", [torch.bfloat16, torch.float32])
+def test_mhc_caller_owned_aggregation_eager_body_rounds_once(monkeypatch, pre_dtype):
+    """The uncompiled caller-owned forward sums the promoted products and rounds once.
+
+    Dynamo runs this body eagerly once its cache is full. With FP32 coefficients and a BF16
+    ``out``, ``torch.sum(..., out=out)`` would round each product before the streams are
+    summed; the regular path sums in FP32 and casts once.
+    """
+    import megatron.core.transformer.hyper_connection as hyper_connection_module
+
+    monkeypatch.setattr(
+        hyper_connection_module,
+        "_native_h_aggregate_into_forward",
+        hyper_connection_module._native_h_aggregate_into_forward.__wrapped__,
+    )
+    generator = torch.Generator().manual_seed(7)
+    x = torch.randn(16, 2, 4, 256, generator=generator).to(torch.bfloat16)
+    h_pre = torch.rand(16, 2, 4, generator=generator).to(pre_dtype)
+    out = torch.empty(16, 2, 256, dtype=torch.bfloat16)
+    actual = native_h_aggregate_into(x, h_pre, out)
+    expected = (x * h_pre.unsqueeze(-1)).sum(dim=2).to(torch.bfloat16)
+    assert actual.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
