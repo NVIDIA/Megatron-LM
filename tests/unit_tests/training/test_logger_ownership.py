@@ -125,7 +125,13 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
         wandb_save_dir=str(tmp_path),
         log_interval=17,
     )
-    args = Namespace(rank=0, world_size=1, log_interval=99, run_workload_inspector_server=False)
+    args = Namespace(
+        rank=0,
+        world_size=1,
+        log_interval=99,
+        run_workload_inspector_server=False,
+        _runtime_state=object(),
+    )
     before = vars(args).copy()
     run_config.logger = config
     run_config.profiling.run_workload_inspector_server = True
@@ -133,8 +139,7 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
     kwargs = wandb.init.call_args.kwargs
     assert kwargs['project'] == 'project' and kwargs['name'] == 'run'
     assert kwargs['entity'] == 'team' and kwargs['dir'] == str(tmp_path)
-    assert kwargs['config'] is vars(args)
-    assert kwargs['config'] == before
+    assert kwargs['config'] == {k: v for k, v in before.items() if not k.startswith('_')}
     assert vars(args) == before
 
 
