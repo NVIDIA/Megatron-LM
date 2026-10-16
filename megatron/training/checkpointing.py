@@ -576,8 +576,8 @@ def _build_sharded_state_dict_metadata(
     # for non-Muon params (embeddings, biases, layernorm, ...), so it needs the
     # same sharding-type metadata even though the parser flips
     # ``use_distributed_optimizer`` off in that mode.
-    has_distributed_optimizer = args.use_distributed_optimizer or getattr(
-        args, 'use_layer_wise_distributed_optimizer', False
+    has_distributed_optimizer = cfg.optimizer.use_distributed_optimizer or getattr(
+        cfg.optimizer, 'use_layer_wise_distributed_optimizer', False
     )
 
     if has_distributed_optimizer and args.ckpt_format == 'fsdp_dtensor':
@@ -772,7 +772,7 @@ def save_checkpoint(
 
     # Save distributed optimizer's custom parameter state.
     if (
-        args.use_distributed_optimizer
+        cfg.optimizer.use_distributed_optimizer
         and not args.no_save_optim
         and optimizer is not None
         and ckpt_type == CheckpointType.LEGACY
@@ -783,7 +783,7 @@ def save_checkpoint(
             optimizer.save_parameter_state(optim_checkpoint_name)
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(args, 'use_layer_wise_distributed_optimizer', False) and args.ckpt_format == 'torch':
+    if getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False) and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(
             os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
@@ -831,7 +831,7 @@ def save_checkpoint(
     ):
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
-            if args.use_distributed_optimizer:
+            if cfg.optimizer.use_distributed_optimizer:
                 print_rank_0(
                     f'Storing distributed optimizer sharded state of type'
                     f' {sharded_sd_metadata["distrib_optim_sharding_type"]}'
@@ -2838,7 +2838,7 @@ def load_checkpoint(
             gen_sd_optim = optimizer
             gen_sd_opt_param_scheduler = opt_param_scheduler
 
-            if args.use_distributed_optimizer:
+            if cfg.optimizer.use_distributed_optimizer:
                 if sharded_sd_metadata is None:
                     # Backward-compatibility with old checkpoints which don't have content versioning
                     # Can be removed after ending support for MLM optimizer checkpoints with MCore < v0.13
@@ -3233,7 +3233,7 @@ def load_checkpoint(
         try:
             # Load state dict.
             if (
-                getattr(args, 'use_layer_wise_distributed_optimizer', False)
+                getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False)
                 and args.ckpt_format == 'torch'
             ):
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
@@ -3253,7 +3253,7 @@ def load_checkpoint(
             # For distributed checkpoint it's already loaded in load_state_dict above
             is_torch_dist = ckpt_format == 'torch_dist'
             if (
-                args.use_distributed_optimizer
+                cfg.optimizer.use_distributed_optimizer
                 and not is_torch_dist
                 and ckpt_format not in ['torch_dcp', 'fsdp_dtensor']
             ):
@@ -3295,11 +3295,11 @@ def load_checkpoint(
                 else:
                     for param_group in optimizer.param_groups:
                         if param_group.get("is_decoupled_lr", False):
-                            max_lr = getattr(args, "decoupled_lr", None)
-                            min_lr = getattr(args, "decoupled_min_lr", None)
+                            max_lr = getattr(cfg.optimizer, "decoupled_lr", None)
+                            min_lr = getattr(cfg.optimizer, "decoupled_min_lr", None)
                         else:
-                            max_lr = args.lr
-                            min_lr = args.min_lr
+                            max_lr = cfg.optimizer.lr
+                            min_lr = cfg.optimizer.min_lr
                         if max_lr is not None:
                             param_group["max_lr"] = max_lr
                         if min_lr is not None:
@@ -3353,7 +3353,7 @@ def load_checkpoint(
                 'ones the saving job chose, so the weights are not guaranteed to be bit-wise '
                 'identical to those saved. Load the optimizer state to avoid this.'
             )
-        if (args.fp16 or args.bf16) and optimizer is not None:
+        if (cfg.optimizer.fp16 or cfg.optimizer.bf16) and optimizer is not None:
             if args.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)
             else:

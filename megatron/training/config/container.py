@@ -306,9 +306,17 @@ class PretrainConfigContainer(ConfigContainerBase):
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
         )
+        self.optimizer.validate_run(
+            ddp_config=self.ddp,
+            use_torch_fsdp2=self.dist.use_torch_fsdp2,
+            moe_single_grouped_weight=self.model.moe_single_grouped_weight,
+            virtual_pipeline_model_parallel_size=self.model.virtual_pipeline_model_parallel_size,
+            ckpt_format=self.checkpoint.ckpt_format,
+        )
 
     def _finalize(self) -> None:
         super()._finalize()
+        self.optimizer.finalize_optimizer_config()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
 
@@ -319,11 +327,12 @@ class InferenceConfigContainer(ConfigContainerBase):
 
     This is the inference counterpart to :class:`PretrainConfigContainer`. It holds only the
     configs that inference actually needs and is intentionally shaped differently from the
-    training container: there is no optimizer, LR schedule, train/validation loop, DDP, rerun
-    state machine, or straggler detection.
+    training container: there is no LR schedule, train/validation loop, DDP, rerun state
+    machine, or straggler detection. ``OptimizerConfig`` is included only as a settings
+    section; no optimizer is constructed for inference.
 
     Explicitly NOT included (relative to ``PretrainConfigContainer``): ``TrainingConfig``,
-    ``OptimizerConfig``, ``SchedulerConfig``, ``ValidationConfig``,
+    ``SchedulerConfig``, ``ValidationConfig``,
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
 
@@ -337,6 +346,10 @@ class InferenceConfigContainer(ConfigContainerBase):
     """Declarative inference settings (the serializable, args-shaped layer). Use
     ``InferenceSetupConfig.to_inference_config(model, ...)`` to build the runtime
     ``megatron.core.inference.config.InferenceConfig`` consumed by the engine."""
+
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    """Optimizer settings. Inference never builds an optimizer; this section carries the
+    optimizer-owned values (e.g. precision flags) that shared code reads from the run config."""
 
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)

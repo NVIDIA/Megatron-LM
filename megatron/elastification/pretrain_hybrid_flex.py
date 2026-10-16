@@ -559,8 +559,8 @@ if __name__ == "__main__":
                 )
             )
             router_override = ParamGroupOverride(
-                max_lr=args.lr * lr_mult,
-                min_lr=args.min_lr * lr_mult,
+                max_lr=cfg.optimizer.lr * lr_mult,
+                min_lr=cfg.optimizer.min_lr * lr_mult,
             )
             config_overrides = {**(config_overrides or {}), router_key: router_override}
         return config, config_overrides

@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
@@ -407,7 +408,7 @@ def core_transformer_config_from_args(args, config_class=None):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
-    kw_args['pipeline_dtype'] = args.params_dtype
+    kw_args['pipeline_dtype'] = cfg.optimizer.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     if kw_args.get('hash_moe_vocab_size') is None:
@@ -437,7 +438,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['num_query_groups'] = args.num_query_groups
     else:
         kw_args['num_query_groups'] = None
-    kw_args['config_logger_dir'] = args.config_logger_dir
+    kw_args['config_logger_dir'] = cfg.optimizer.config_logger_dir
     if args.rope_type is None:
         # Pop 'rope_type' to let the config class use the default value.
         kw_args.pop('rope_type', None)
@@ -833,8 +834,8 @@ def inference_cfg_container_from_args(
     """Build an InferenceConfigContainer from the argparse arguments.
 
     This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that
-    inference needs (no optimizer, scheduler, training, validation, DDP, rerun, or straggler
-    configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
+    inference needs (an optimizer settings section, but no scheduler, training, validation, DDP,
+    rerun, or straggler configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
 
     Args:
         args: Parsed and validated argparse namespace (e.g. from ``parse_and_validate_args``).
@@ -864,6 +865,7 @@ def inference_cfg_container_from_args(
         model=model_cfg,
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         inference=inference_cfg_from_args(args),
+        optimizer=_default_config_from_args(OptimizerConfig, args),
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),

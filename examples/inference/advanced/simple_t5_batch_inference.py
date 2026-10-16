@@ -32,6 +32,7 @@ from typing import List
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.global_vars import get_run_config
 from megatron.training.initialize import initialize_megatron
 
 
@@ -86,7 +87,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         hidden_size=args.hidden_size,
         inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
         fp32_residual_connection=args.fp32_residual_connection,
-        params_dtype=args.params_dtype,
+        params_dtype=cfg.optimizer.params_dtype,
         padded_vocab_size=args.padded_vocab_size,
     )
 
@@ -119,6 +120,7 @@ def main():
     load_checkpoint(model, None, None)
     model = model[0]
 
+    cfg = get_run_config()
     args = get_args()
 
     inference_engine = get_inference_engine(args, model)

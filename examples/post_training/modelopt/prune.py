@@ -48,7 +48,11 @@ from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import (
+    get_run_config,
+    initialize_runtime_services,
+    set_run_config,
+)
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -184,6 +188,7 @@ if __name__ == "__main__":
     initialize_runtime_services(args, training=True)
     initialize_megatron(training=True)
 
+    cfg = get_run_config()
     args = get_args()
     check_arguments(args)
 
@@ -209,7 +214,7 @@ if __name__ == "__main__":
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:
-        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
+        import_dtype = torch.float16 if cfg.optimizer.fp16 else torch.bfloat16
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
         import_kwargs = {
             "dtype": import_dtype,

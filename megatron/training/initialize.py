@@ -562,8 +562,9 @@ def set_jit_fusion_options(tp_size=None):
 
 def _warmup_jit_function(tp_size=None):
     """Compilie JIT functions before the main training steps"""
+    cfg = get_run_config()
     args = get_args()
-    if args.bf16:
+    if cfg.optimizer.bf16:
         dtype = torch.bfloat16
     elif args.fp16:
         dtype = torch.float16
