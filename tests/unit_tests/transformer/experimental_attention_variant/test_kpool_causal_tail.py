@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -302,6 +303,75 @@ def test_kpool_chunked_topk_matches_full_score_reference(
             )
     assert scores is not None and no_scores is None
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _left_padded_causal_mask(sequence, paddings):
+    """Additive causal masks whose first padding keys and query rows are fully masked."""
+    positions = torch.arange(sequence, device="cuda")
+    causal = positions[None, :] <= positions[:, None]
+    masks = []
+    for padding in paddings:
+        valid = positions >= padding
+        visible = causal & valid[None, :] & valid[:, None]
+        masks.append(
+            torch.zeros(sequence, sequence, device="cuda").masked_fill(~visible, float("-inf"))
+        )
+    return torch.stack(masks)
+
+
+@pytest.mark.parametrize("score_mode", ["chunked", "full"])
+@pytest.mark.parametrize("mask_ndim", [2, 3])
+@pytest.mark.parametrize("always_select_tail", [False, True])
+@pytest.mark.parametrize("use_relu", [False, True])
+@pytest.mark.parametrize("input_mode", ["none", "fp8", "rotate"])
+def test_kpool_explicit_left_padding_matches_shifted_unpadded_suffix(
+    input_mode, use_relu, always_select_tail, mask_ndim, score_mode
+):
+    """Pools start at the first valid key, so left padding only shifts the selected tokens."""
+    torch.manual_seed(463)
+    sequence, batch, heads, dim, pool_size, index_topk = 16, 2, 3, 8, 4, 8
+    # A 2D mask shares one padding; a 3D mask gives each sample its own origin.
+    paddings = (2, 2) if mask_ndim == 2 else (2, 3)
+    # Positive operands keep scores positive, so ReLU cannot create zero-score ties.
+    q = torch.rand(sequence, batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.rand(sequence, batch, dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(sequence, batch, heads, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(k)
+    ape = torch.randn(pool_size, dim, device="cuda")
+    options = dict(
+        use_relu=use_relu,
+        always_select_tail=always_select_tail,
+        fp8_indexer=input_mode == "fp8",
+        rotate_activation_enabled=input_mode == "rotate",
+        return_index_scores=score_mode == "full",
+    )
+
+    def select(rows, samples, mask):
+        args = (q[rows, samples], k[rows, samples], weights[rows, samples], index_topk, pool_size)
+        return fused_qk_topk_kpool(*args, gate[rows, samples], ape, mask=mask, **options)[1]
+
+    chunking = (
+        patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa._KPOOL_SCORE_CHUNK_BYTES",
+            128,
+        )
+        if score_mode == "chunked"
+        else nullcontext()
+    )
+    with chunking:
+        with torch.no_grad():
+            mask = _left_padded_causal_mask(sequence, paddings)
+            padded = select(slice(None), slice(None), mask[0] if mask_ndim == 2 else mask)
+            for sample, padding in enumerate(paddings):
+                suffix_mask = _left_padded_causal_mask(sequence - padding, (0,))
+                expected = select(
+                    slice(padding, None),
+                    slice(sample, sample + 1),
+                    suffix_mask[0] if mask_ndim == 2 else suffix_mask,
+                )[0]
+                expected = torch.where(expected >= 0, expected + padding, expected)
+                torch.testing.assert_close(padded[sample, padding:], expected, rtol=0, atol=0)
+                assert torch.all(padded[sample, :padding] == -1)
 
 
 def test_kpool_chunked_topk_with_no_complete_pool():

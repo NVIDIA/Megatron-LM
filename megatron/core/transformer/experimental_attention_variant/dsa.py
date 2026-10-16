@@ -611,12 +611,18 @@ def _kpool_fp8_input(x: torch.Tensor) -> torch.Tensor:
 
 
 def _kpool_compress_keys(
-    k: torch.Tensor, gate_score: torch.Tensor, ape: torch.Tensor, pool_size: int
+    k: torch.Tensor,
+    gate_score: torch.Tensor,
+    ape: torch.Tensor,
+    pool_size: int,
+    kpool_key_dtype_compression: bool = False,
 ) -> torch.Tensor:
-    """Softmax-weighted pool keys, accumulated in FP32 and returned in BF16.
+    """Softmax-weighted pool keys with an explicit compression rounding profile.
 
     Keys and gates are [tokens, batch, head_dim]; ape is [pool_size, head_dim].
     Only complete pools are compressed. Query-local tails are appended separately.
+    The default preserves PR 7522's FP32 reduction and BF16 output. The key-dtype
+    profile matches HF GLM5Next's rounded probabilities and products before reduction.
     """
     seqlen, bsz, head_dim = k.shape
     assert head_dim == ape.shape[1], f"head_dim {head_dim} != ape dim1 {ape.shape[1]}"
@@ -636,6 +642,11 @@ def _kpool_compress_keys(
     # ape: [pool_size, head_dim] -> broadcast over (num_pools, batch).
     ape_f = ape.to(dtype=torch.float32, device=k.device)  # [pool_size, head_dim]
     score = g + ape_f.unsqueeze(0).unsqueeze(2)  # [num_pools, pool_size, batch, head_dim]
+    if kpool_key_dtype_compression:
+        # HF 93c8b7b Glm5NextTextIndexer.get_pooled_states casts the FP32
+        # softmax to key dtype before multiplying, not after an FP32 weighted sum.
+        probabilities = torch.nan_to_num(score.softmax(dim=1)).to(k_p.dtype)
+        return (probabilities * k_p).sum(dim=1)
     # Numerically-stable per-dim softmax over dim=1 (the pool slot dim).
     score_max = score.max(dim=1, keepdim=True).values
     prob = torch.exp(score - score_max)
@@ -740,6 +751,7 @@ def _kpool_compress_keys_per_seg(
     ape: torch.Tensor,
     pool_size: int,
     cu_seqlens_kv: torch.Tensor,
+    kpool_key_dtype_compression: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compress complete pools within each packed segment.
 
@@ -752,7 +764,9 @@ def _kpool_compress_keys_per_seg(
     max_pools = sk // pool_size
     if max_pools == 0:
         return (
-            k.new_empty((0, bsz, head_dim), dtype=torch.bfloat16),
+            k.new_empty(
+                (0, bsz, head_dim), dtype=k.dtype if kpool_key_dtype_compression else torch.bfloat16
+            ),
             torch.empty(0, device=k.device, dtype=torch.int64),
         )
 
@@ -769,7 +783,13 @@ def _kpool_compress_keys_per_seg(
     token_positions = pool_token_base.unsqueeze(-1) + torch.arange(pool_size, device=k.device)
     token_positions = token_positions.clamp(0, sk - 1).reshape(-1)
     pooled_gate = gate_score[token_positions] if gate_score is not None else None
-    k_pooled = _kpool_compress_keys(k[token_positions], pooled_gate, ape, pool_size)
+    k_pooled = _kpool_compress_keys(
+        k[token_positions],
+        pooled_gate,
+        ape,
+        pool_size,
+        kpool_key_dtype_compression=kpool_key_dtype_compression,
+    )
     pool_token_base = pool_token_base.masked_fill(~pool_valid, -1)
     return k_pooled, pool_token_base
 
@@ -830,7 +850,68 @@ def _expand_query_bounds_for_batch(bounds: torch.Tensor, batch: int, seqlen: int
     )
 
 
+def _kpool_explicit_mask_pool_phase(mask: torch.Tensor, pool_size: int) -> torch.Tensor:
+    """Return the pool-grid phase of each sample's first valid key in an explicit mask.
+
+    A key that no query row can see is padding, so the first valid key is the first key
+    visible to any row: one value for a shared [sq, sk] mask, or [batch] for a
+    [batch, sq, sk] mask. HF GLM5Next starts pools at that key; earlier pools are
+    invalid, so only its offset modulo pool_size matters. Samples without a visible key
+    get phase 0. Computed on device without a host sync.
+    """
+    sk = mask.size(-1)
+    key_visible = torch.isfinite(mask).any(dim=-2)
+    positions = torch.arange(sk, device=mask.device, dtype=torch.int64).expand_as(key_visible)
+    first_key = positions.masked_fill(~key_visible, sk).amin(dim=-1)
+    return first_key.masked_fill(first_key == sk, 0).remainder(pool_size)
+
+
+def _shift_kpool_explicit_mask_inputs(
+    k: torch.Tensor, gate_score: Optional[torch.Tensor], mask: torch.Tensor, phase: torch.Tensor
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Shift each sample's key axis left by its pool phase: x'[t] = x[t + phase].
+
+    Keys and gates are [keys, batch, dim]; the mask is [sq, sk] or [batch, sq, sk] and
+    phase matches its leading shape. Positions past the last key get zero keys and
+    gates and are masked, so they only belong to invalid pools. A zero phase is an
+    exact identity.
+    """
+    sk, batch = k.shape[:2]
+    positions = torch.arange(sk, device=k.device, dtype=torch.int64)
+    source = positions + phase.unsqueeze(-1)
+    in_range = source < sk
+    source = source.clamp_max(sk - 1)
+    shifted_mask = torch.gather(mask, -1, source.unsqueeze(-2).expand_as(mask))
+    shifted_mask = shifted_mask.masked_fill(~in_range.unsqueeze(-2), float("-inf"))
+
+    key_source = source.reshape(-1, sk).t().expand(sk, batch).unsqueeze(-1)
+    key_in_range = in_range.reshape(-1, sk).t().expand(sk, batch).unsqueeze(-1)
+
+    def shift(x: torch.Tensor) -> torch.Tensor:
+        shifted = torch.gather(x, 0, key_source.expand(-1, -1, x.size(-1)))
+        return shifted.masked_fill(~key_in_range, 0)
+
+    return shift(k), shift(gate_score) if gate_score is not None else None, shifted_mask
+
+
 _KPOOL_SCORE_CHUNK_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _compute_kpool_hf_scores(
+    q: torch.Tensor, k_pooled: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
+    """HF GLM5Next FP32 score scaling, ReLU and matrix-product head reduction.
+
+    ``weights`` contains only the head-count scale, not the QK head-dimension
+    scale. Preserve the pinned HF operation ordering rather than moving that
+    scale through ReLU or replacing the head-reduction GEMM with mul/sum.
+    """
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        queries = q.permute(1, 0, 2, 3).float()  # [batch, query, heads, dim]
+        keys = k_pooled.permute(1, 2, 0).float().unsqueeze(1)
+        scores = torch.relu(torch.matmul(queries, keys) * (q.size(-1) ** -0.5))
+        head_weights = weights.permute(1, 0, 2).float().unsqueeze(-2)
+        return torch.matmul(head_weights, scores).squeeze(-2)
 
 
 @torch.no_grad()
@@ -848,6 +929,7 @@ def _kpool_topk_from_score_chunks(
     pool_token_base: torch.Tensor,
     sk: int,
     use_relu: bool,
+    hf_scoring: bool = False,
 ) -> torch.Tensor:
     """Compute KPool scores and selection in query chunks.
 
@@ -869,12 +951,15 @@ def _kpool_topk_from_score_chunks(
 
     for start in range(0, sq, chunk_size):
         end = min(start + chunk_size, sq)
-        scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
-        if use_relu:
-            scores.relu_()
-        scores.mul_(weights[start:end].unsqueeze(-1))
-        score_chunk = scores.sum(dim=2).transpose(0, 1)
-        del scores
+        if hf_scoring:
+            score_chunk = _compute_kpool_hf_scores(q[start:end], k_pooled, weights[start:end])
+        else:
+            scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
+            if use_relu:
+                scores.relu_()
+            scores.mul_(weights[start:end].unsqueeze(-1))
+            score_chunk = scores.sum(dim=2).transpose(0, 1)
+            del scores
 
         if varlen_starts is not None:
             valid = dsa_masking.build_valid_mask_from_starts_ends(
@@ -927,6 +1012,8 @@ def fused_qk_topk_kpool(
     fp8_indexer: bool = False,
     rotate_activation_enabled: bool = False,
     return_index_scores: bool = True,
+    kpool_key_dtype_compression: bool = False,
+    hf_scoring: bool = False,
 ):
     """Select complete causal pools and append each query's incomplete tail.
 
@@ -935,7 +1022,30 @@ def fused_qk_topk_kpool(
     coordinates. Output indices are [batch, queries, index_topk + pool_size - 1]
     when always_select_tail is enabled, with -1 for unused slots.
     Set return_index_scores=False to select in query chunks without retaining scores.
+    Compression rounding is independent of Hadamard rotation and score quantization.
+    With hf_scoring, weights must contain only the FP32 head-count scale.
+
+    Without packing, an explicit mask starts the pool grid at each sample's first
+    valid key, as HF GLM5Next does. That key is the first one visible to any query
+    row of the sample's [batch, sq, sk] mask, or of a shared [sq, sk] mask; earlier
+    keys are padding. Index scores use the same grid: pool c covers keys from
+    phase + c * pool_size, where phase is the first valid key modulo pool_size.
+    Explicit-mask support:
+
+    - Contiguous left and/or right padding with causal rows: HF parity. Padded query
+      rows must be fully masked. A mask that lets padded rows see every key hides
+      the padding, so pools keep the global grid.
+    - Masks with gaps, sliding windows or row-dependent starts: tokens stay inside
+      the mask, but leading partial pools only use unused slots and there is no HF
+      parity claim.
+    - Packed THD (cu_seqlens_kv) restarts pools per document; no mask and varlen
+      bounds use the global grid. Neither is shifted.
+
+    Model-level left padding is unsupported: causal DSA layers ignore the attention
+    mask and treat padded tokens as real keys.
     """
+    if hf_scoring and not use_relu:
+        raise ValueError("HF KPool scoring requires use_relu=True.")
     sk = k.size(0)
     if q.size(0) == 0:
         # Empty packed-CP ranks still need a fixed-width index tensor; reshape
@@ -947,14 +1057,29 @@ def fused_qk_topk_kpool(
 
     # Packed pools restart at each document boundary.
     use_per_seg = cu_seqlens_kv is not None and cu_seqlens_kv.numel() >= 2
+    # Explicit masks pool from each sample's first valid key. Select on a key axis
+    # shifted by its pool phase, then map tokens back and mask with the caller's mask.
+    token_mask = mask
+    pool_phase = None
+    explicit_mask = mask is not None and mask.ndim in (2, 3) and mask.size(-1) == sk
+    if explicit_mask and not use_per_seg and sk > 0:
+        pool_phase = _kpool_explicit_mask_pool_phase(mask, pool_size)
+        k, gate_score, mask = _shift_kpool_explicit_mask_inputs(k, gate_score, mask, pool_phase)
     if use_per_seg:
         k_pooled, pool_token_base = _kpool_compress_keys_per_seg(
-            k, gate_score, ape, pool_size, cu_seqlens_kv
+            k,
+            gate_score,
+            ape,
+            pool_size,
+            cu_seqlens_kv,
+            kpool_key_dtype_compression=kpool_key_dtype_compression,
         )
         num_pools = k_pooled.size(0)
     else:
         num_pools = sk // pool_size
-        k_pooled = _kpool_compress_keys(k, gate_score, ape, pool_size)
+        k_pooled = _kpool_compress_keys(
+            k, gate_score, ape, pool_size, kpool_key_dtype_compression=kpool_key_dtype_compression
+        )
         pool_token_base = torch.arange(num_pools, device=k.device, dtype=torch.int64) * pool_size
 
     if fp8_indexer:
@@ -978,7 +1103,10 @@ def fused_qk_topk_kpool(
         device=q.device,
     )
     if return_index_scores:
-        index_scores = _compute_index_scores(q, weights, k_pooled, use_relu=use_relu)
+        if hf_scoring:
+            index_scores = _compute_kpool_hf_scores(q, k_pooled, weights)
+        else:
+            index_scores = _compute_index_scores(q, weights, k_pooled, use_relu=use_relu)
         if v_starts is not None:
             index_scores = dsa_masking.apply_starts_ends_mask_to_scores(
                 index_scores, v_starts, v_ends, k_pos
@@ -1027,6 +1155,7 @@ def fused_qk_topk_kpool(
             pool_token_base=pool_token_base,
             sk=sk,
             use_relu=use_relu,
+            hf_scoring=hf_scoring,
         )
 
     # Expand [batch * queries, pools] to a fixed token budget.
@@ -1065,8 +1194,9 @@ def fused_qk_topk_kpool(
             starts = torch.zeros_like(ends)
         lengths = ends - starts
         if mask is not None and v_starts is None:
-            # Explicit masks use globally aligned pools. Fill a leading partial pool into
-            # unused expanded-pool slots, then append only the trailing global-grid tail.
+            # Pools are aligned to the shifted key axis. Fill a leading partial pool, which
+            # only a row starting off the grid has, into unused expanded-pool slots, then
+            # append the trailing tail on the same grid.
             starts = _expand_query_bounds_for_batch(starts, batch, sq).to(
                 device=token_topk.device, dtype=torch.int64
             )
@@ -1093,8 +1223,11 @@ def fused_qk_topk_kpool(
             tail_count_override=tail_counts.reshape(-1) if tail_counts is not None else None,
         ).reshape(batch, sq, -1)
 
-    if mask is not None:
-        token_topk = _mask_topk_tokens_with_token_mask(token_topk, mask)
+    if pool_phase is not None:
+        phase = pool_phase.view(-1, 1, 1).to(token_topk.dtype)
+        token_topk = torch.where(token_topk >= 0, token_topk + phase, token_topk)
+    if token_mask is not None:
+        token_topk = _mask_topk_tokens_with_token_mask(token_topk, token_mask)
 
     return index_scores, token_topk
 
@@ -2198,7 +2331,12 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
         weights = self._project_indexer_weights(x)
-        weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
+        if self.config.dsa_indexer_hf_scoring:
+            # HF rounds the projection output to BF16, then upcasts before the
+            # head-count scale. The QK scale belongs to the subsequent score GEMM.
+            weights = weights.float() * (self.index_n_heads**-0.5)
+        else:
+            weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
         # Save token-aligned compression scores for the subsequent pool selection.
         if self.index_kpool > 1 and self.index_kpool_compress_gate is not None:
@@ -2228,7 +2366,7 @@ class DSAIndexer(MegatronModule):
             x: hidden states [seqlen, batch, hidden_size].
             qr: Low-rank query tensor [seqlen, batch, q_lora_rank].
             mask: Optional additive attention mask [seqlen, seqlen] or
-                [batch, seqlen, seqlen].
+                [batch, seqlen, seqlen]. See fused_qk_topk_kpool for KPool support.
             packed_seq_params: Packed sequence parameters for variable length sequences.
             return_index_scores: Skip materializing KPool scores when only top-k is needed.
 
@@ -2262,6 +2400,8 @@ class DSAIndexer(MegatronModule):
                 fp8_indexer=self.index_kpool_use_quantization,
                 rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
                 return_index_scores=return_index_scores,
+                kpool_key_dtype_compression=self.config.dsa_indexer_kpool_key_dtype_compression,
+                hf_scoring=self.config.dsa_indexer_hf_scoring,
             )
             self._kpool_gate_score = None
         else:
@@ -3265,6 +3405,10 @@ class DSAttention(MegatronModule):
                         fp8_indexer=self.indexer.index_kpool_use_quantization,
                         rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
                         return_index_scores=False,
+                        kpool_key_dtype_compression=(
+                            self.config.dsa_indexer_kpool_key_dtype_compression
+                        ),
+                        hf_scoring=self.config.dsa_indexer_hf_scoring,
                     )
                     del _index_scores
                     self.indexer._kpool_gate_score = None
