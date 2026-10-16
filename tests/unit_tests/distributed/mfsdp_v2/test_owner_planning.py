@@ -4,21 +4,16 @@
 
 import pytest
 import torch
-import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Replicate
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Placements,
-    fully_shard,
-    fully_shard_context,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
-    GroupOwnerLayout,
     assign_owner_work,
     ns_cost_fn,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 
 
 def _layout(
@@ -61,66 +56,50 @@ def test_assign_owner_work(shapes, offsets, size, ranks, indices, expected, dist
     if mesh.get_coordinate() is None:
         pytest.skip("Rank is outside the test mesh.")
     layout = _layout(shapes, offsets, size, mesh.size())
-    assert assign_owner_work(layout, mesh, iter(indices)) == expected
+    buffer = DBuffer(mesh, [RowAtomic()], layout, torch.float32, distributed_setup.device)
+    assert assign_owner_work(buffer, iter(indices)) == expected
 
 
 def test_assign_owner_work_requires_a_nonempty_shard(distributed_setup):
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    buffer = DBuffer(
+        mesh,
+        [RowAtomic()],
+        _layout([(0, 2)], [0], 4 * mesh.size(), mesh.size()),
+        torch.float32,
+        distributed_setup.device,
+    )
     with pytest.raises(RuntimeError, match="No eligible owner for tensor 0"):
-        assign_owner_work(_layout([(0, 2)], [0], 4 * mesh.size(), mesh.size()), mesh, [0])
+        assign_owner_work(buffer, [0])
 
 
 def test_ns_cost_uses_full_shape():
     assert ns_cost_fn(5)(torch.Size((2, 3, 4))) == 24 * (2 * 5 + 1)
 
 
-def test_group_owner_layout_reuses_dbuffer_layout(distributed_setup):
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    module = nn.ParameterList(
-        nn.Parameter(torch.zeros(shape, device=distributed_setup.device))
-        for shape in [(6, 3), (4,), (4, 2)]
+def test_assign_owner_work_uses_buffer_placements(distributed_setup):
+    """Replicated ranks hold the full buffer instead of all-RowAtomic fragments."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size, 1))
+    layout = _layout([(2, 2)], [4 * (mesh.size() - 1)], 4 * mesh.size(), mesh.size())
+    buffer = DBuffer(
+        mesh, [Replicate(), RowAtomic()], layout, torch.float32, distributed_setup.device
     )
-    with fully_shard_context(device=distributed_setup.device):
-        fully_shard(
-            module,
-            mesh=mesh,
-            placements=Placements(
-                dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
-            ),
-        )
-    (group,) = module.parameter_groups
-    layout = group.main_weight.layout
-    owner_layout = GroupOwnerLayout.from_group(group)
-    assert owner_layout.mesh is group.mesh
-    assert owner_layout.layout is layout
-    assert set(owner_layout.tensor_to_owner) == {0, 2}
-    assert owner_layout.tensor_to_owner == assign_owner_work(layout, group.mesh, [0, 2])
+    # Every rank holds the tensor; a hard-coded all-RowAtomic layout picks the last rank.
+    assert assign_owner_work(buffer, [0]) == {0: 0}
 
 
-def test_group_owner_layout_custom_eligibility_and_cost(distributed_setup):
+def test_assign_owner_work_custom_selection_and_cost(distributed_setup):
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    module = nn.ParameterList(
-        nn.Parameter(torch.zeros(shape, device=distributed_setup.device))
-        for shape in [(6, 3), (4, 2), (2, 2)]
+    buffer = DBuffer.empty(
+        mesh, [RowAtomic()], [(6, 3), (4,), (4, 2)], torch.float32, distributed_setup.device
     )
-    with fully_shard_context(device=distributed_setup.device):
-        fully_shard(
-            module,
-            mesh=mesh,
-            placements=Placements(
-                dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
-            ),
-        )
-    (group,) = module.parameter_groups
     seen_shapes = []
 
     def cost(shape):
         seen_shapes.append(shape)
         return shape.numel()
 
-    owner_layout = GroupOwnerLayout.from_group(
-        group, cost_fn=cost, eligible_fn=lambda p: p.numel() >= 8
-    )
-    assert owner_layout.layout is group.main_weight.layout
-    assert set(owner_layout.tensor_to_owner) == {0, 1}
+    indices = (i for i, shape in enumerate(buffer.layout.tensor_shapes) if len(shape) >= 2)
+    tensor_to_owner = assign_owner_work(buffer, indices, cost_fn=cost)
+    assert set(tensor_to_owner) == {0, 2}
     assert seen_shapes == [torch.Size((6, 3)), torch.Size((4, 2))]
