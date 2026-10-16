@@ -4,6 +4,7 @@ import gc
 import logging
 import os
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -403,6 +404,167 @@ def test_duplicate_storage_accounting_is_scoped_to_one_group():
         assert group.duplicate_storage_bytes == 0
 
 
+class _RecordingOffloadInterface:
+    """CPU stand-in for FineGrainedActivationOffloadingInterface.
+
+    Records which tensors autograd saves inside each offload group, keeps a host copy of every
+    tensor not opted out with ``mark_not_offload``, and hands the copy back on unpack, so a test
+    can check both the grouping and that backward runs from the offloaded copies.
+    """
+
+    groups: List[Dict] = []
+
+    def __init__(self, offload: bool, tensor: torch.Tensor, name: str):
+        self.offload = offload
+        self.tensor = tensor
+        self.name = name
+        self._hooks = None
+
+    def __enter__(self):
+        if self.offload:
+            group = {"name": self.name, "input": self.tensor, "offloaded": [], "kept": []}
+            type(self).groups.append(group)
+
+            def pack(tensor):
+                if getattr(tensor, "_do_not_offload", False):
+                    group["kept"].append(tensor)
+                    return tensor
+                group["offloaded"].append(tensor)
+                return ("host", tensor.detach().clone())
+
+            def unpack(state):
+                return state[1] if isinstance(state, tuple) else state
+
+            self._hooks = torch.autograd.graph.saved_tensors_hooks(pack, unpack)
+            self._hooks.__enter__()
+        return self.tensor
+
+    def __exit__(self, *args):
+        if self._hooks is not None:
+            self._hooks.__exit__(*args)
+
+    def group_offload(self, tensor, forced_released_tensors=None, delay_offload=False):
+        if self.offload:
+            type(self).groups[-1]["committed"] = True
+        return tensor
+
+    @staticmethod
+    def mark_not_offload(tensor: torch.Tensor):
+        tensor._do_not_offload = True
+
+
+class _ToyLayer(torch.nn.Module):
+    """Takes the MambaLayer branch of ``checkpointed_forward`` (not a TransformerLayer)."""
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.linear = torch.nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, hidden_states, attention_mask, rotary_pos_emb, **kwargs):
+        return hidden_states + torch.tanh(self.linear(hidden_states * rotary_pos_emb))
+
+
+def _run_checkpointed_forward(monkeypatch, *, offload_modules, recompute_method, num_ckpt):
+    """Run ``checkpointed_forward`` on CPU over toy layers and return outputs and grads."""
+    from megatron.core import recompute
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+
+    def cpu_checkpoint(function, config, tp_group, *args, distribute_saved_activations=False):
+        # torch's reentrant checkpoint saves its tensor inputs with save_for_backward, like
+        # tensor_parallel.checkpoint, without touching CUDA RNG state.
+        return torch.utils.checkpoint.checkpoint(
+            function, *args, use_reentrant=True, preserve_rng_state=False
+        )
+
+    _RecordingOffloadInterface.groups = []
+    monkeypatch.setattr(recompute, "precision_aware_checkpoint", cpu_checkpoint)
+    monkeypatch.setattr(
+        off_module, "FineGrainedActivationOffloadingInterface", _RecordingOffloadInterface
+    )
+
+    num_layers, seq, batch, hidden = 4, 8, 2, 16
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList(_ToyLayer(hidden) for _ in range(num_layers))
+    config = SimpleNamespace(
+        recompute_method=recompute_method,
+        recompute_num_layers=num_ckpt,
+        distribute_saved_activations=False,
+        fp8=None,
+        fp4=None,
+        fine_grained_activation_offloading=bool(offload_modules),
+        offload_modules=offload_modules,
+    )
+    block = SimpleNamespace(
+        config=config,
+        layers=layers,
+        num_layers_per_pipeline_rank=num_layers,
+        pg_collection=SimpleNamespace(tp=None),
+    )
+    hidden_states = torch.randn(seq, batch, hidden, requires_grad=True)
+    attention_mask = torch.ones(batch, 1, seq, seq, dtype=torch.bool)
+    rotary_pos_emb = torch.randn(seq, 1, hidden)
+
+    output = recompute.checkpointed_forward(
+        block,
+        hidden_states,
+        attention_mask,
+        None,
+        None,
+        rotary_pos_emb,
+        None,
+        None,
+        use_inner_quantization_context=False,
+    )
+    output.sum().backward()
+    grads = [hidden_states.grad] + [p.grad for p in layers.parameters()]
+    return output.detach(), grads, (hidden_states, attention_mask, rotary_pos_emb)
+
+
+@pytest.mark.parametrize(
+    "recompute_method, num_ckpt, expected_groups",
+    [
+        pytest.param("uniform", 1, 4, id="uniform-1"),
+        pytest.param("uniform", 2, 2, id="uniform-2"),
+        pytest.param("block", 3, 3, id="block-3"),
+    ],
+)
+def test_full_recompute_input_offloads_only_checkpoint_hidden_states(
+    monkeypatch, recompute_method, num_ckpt, expected_groups
+):
+    """Each checkpoint opens one offload group holding just its hidden-states input, and
+    backward through the offloaded copies matches the run without offloading."""
+    ref_out, ref_grads, _ = _run_checkpointed_forward(
+        monkeypatch, offload_modules=[], recompute_method=recompute_method, num_ckpt=num_ckpt
+    )
+    assert _RecordingOffloadInterface.groups == []
+
+    out, grads, (hidden_states, attention_mask, rotary_pos_emb) = _run_checkpointed_forward(
+        monkeypatch,
+        offload_modules=["full_recompute_input"],
+        recompute_method=recompute_method,
+        num_ckpt=num_ckpt,
+    )
+    groups = _RecordingOffloadInterface.groups
+
+    assert len(groups) == expected_groups
+    for group in groups:
+        assert group["name"] == "full_recompute_input"
+        assert group.get("committed", False)
+        # Exactly the chunk's hidden-states input is offloaded; the shared mask and RoPE
+        # tensors are saved inside the group but kept on device.
+        assert len(group["offloaded"]) == 1
+        assert group["offloaded"][0].data_ptr() == group["input"].data_ptr()
+        assert {t.data_ptr() for t in group["kept"]} == {
+            attention_mask.data_ptr(),
+            rotary_pos_emb.data_ptr(),
+        }
+    assert groups[0]["input"].data_ptr() == hidden_states.data_ptr()
+
+    torch.testing.assert_close(out, ref_out)
+    for grad, ref_grad in zip(grads, ref_grads):
+        torch.testing.assert_close(grad, ref_grad)
+
+
 def _build_gpt_model(
     *,
     seed: int,
@@ -416,11 +578,23 @@ def _build_gpt_model(
     offload_modules: Optional[List[str]],
     min_offloaded_tensor_size: int,
     is_mla: bool,
+    full_recompute: bool = False,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
+    if full_recompute:
+        recompute_kwargs = dict(
+            recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1
+        )
+    else:
+        recompute_kwargs = dict(
+            recompute_modules=(
+                ["layernorm", "moe_act"] if num_experts is not None else ["layernorm"]
+            ),
+            recompute_granularity="selective",
+        )
     transformer_config = ConfigClass(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -429,8 +603,7 @@ def _build_gpt_model(
         attention_backend=AttnBackend.unfused,
         bf16=True,
         # Recompute
-        recompute_modules=["layernorm", "moe_act"] if num_experts is not None else ["layernorm"],
-        recompute_granularity="selective",
+        **recompute_kwargs,
         # MoE
         num_moe_experts=num_experts,
         moe_grouped_gemm=(num_experts is not None),
@@ -688,6 +861,84 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             print(
                 f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB"
             )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_gpt_full_recompute_input_offloading_correctness_and_memory():
+    """Under full recompute, offloading the checkpoint inputs keeps logits and grads unchanged
+    and lowers peak GPU memory."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    seed = 123
+    model_kwargs = dict(
+        seed=seed,
+        num_layers=8,
+        hidden_size=2048,
+        num_attention_heads=16,
+        vocab_size=1024,
+        seq_length=1024,
+        num_experts=None,
+        is_mla=False,
+        full_recompute=True,
+    )
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=1024, micro_batch_size=2, device=torch.device("cuda")
+    )
+    inputs = dict(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask)
+    off_interface.reset_instance()
+
+    try:
+        _reset_cuda_memory()
+        base_model = _build_gpt_model(
+            fine_grained_activation_offloading=False,
+            offload_modules=None,
+            min_offloaded_tensor_size=1024 * 1024,
+            **model_kwargs,
+        ).cuda()
+        base_model.train()
+        base_params = _capture_params(base_model)
+        _run_one_iter_and_capture(base_model, **inputs, enable_offload_reset=False)
+        _reset_cuda_memory()
+        base_logits, base_grads, base_peak = _run_one_iter_and_capture(
+            base_model, **inputs, enable_offload_reset=False
+        )
+        del base_model
+        _reset_cuda_memory()
+
+        off_model = _build_gpt_model(
+            fine_grained_activation_offloading=True,
+            offload_modules=["full_recompute_input"],
+            min_offloaded_tensor_size=1024,
+            **model_kwargs,
+        ).cuda()
+        _restore_params(off_model, base_params)
+        off_model.train()
+        # Warmup iteration records the offload groups; the reset applies steady-state decisions.
+        _run_one_iter_and_capture(off_model, **inputs, enable_offload_reset=True)
+        off_interface.reset()
+        offload_bytes = PipelineOffloadManager.get_instance().offload_summary_bytes.get(
+            "full_recompute_input", 0
+        )
+        _reset_cuda_memory()
+        off_logits, off_grads, off_peak = _run_one_iter_and_capture(
+            off_model, **inputs, enable_offload_reset=True
+        )
+        del off_model
+        _reset_cuda_memory()
+
+        assert offload_bytes > 0
+        assert torch.allclose(off_logits, base_logits, rtol=1e-3, atol=1e-3)
+        for name, gb in base_grads.items():
+            go = off_grads[name]
+            if gb is None or go is None:
+                assert gb is None and go is None, f"Grad None mismatch for {name}"
+                continue
+            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Grad mismatch for {name}"
+        assert off_peak < base_peak, (
+            f"Expected lower peak memory with full_recompute_input offloading "
+            f"(base={base_peak / 1024**2:.2f}MiB, off={off_peak / 1024**2:.2f}MiB)"
+        )
     finally:
         Utils.destroy_model_parallel()
 

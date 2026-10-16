@@ -160,31 +160,61 @@ def checkpointed_forward(
 
         return custom_forward
 
+    # Imported lazily to avoid a circular import.
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface as off_interface,
+    )
+
+    offload_checkpoint_inputs = (
+        self.config.fine_grained_activation_offloading
+        and "full_recompute_input" in self.config.offload_modules
+    )
+
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
         cf = custom(start, end)
-        # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
-        args = (
-            hidden_states,
-            attention_mask,
-            context,
-            context_mask,
-            *rotary_pos_emb,
-            padding_mask,
-            input_ids,
-        )
-        if use_checkpoint:
-            hidden_states, context = precision_aware_checkpoint(
-                cf,
-                self.config,
-                self.pg_collection.tp,
-                *args,
-                distribute_saved_activations=self.config.distribute_saved_activations,
+        # A checkpoint keeps only its inputs for backward. Saving them inside a fine-grained
+        # offload group moves the hidden-states input to host memory until this chunk is
+        # recomputed in backward. The other inputs (masks, RoPE, token IDs) are shared by every
+        # chunk, so copying them to host would free no GPU memory.
+        offload_input = use_checkpoint and offload_checkpoint_inputs
+        if offload_input:
+            shared_args = (
+                attention_mask,
+                context,
+                context_mask,
+                *rotary_pos_emb,
+                padding_mask,
+                input_ids,
             )
-        else:
-            # Note: original block-branch no-checkpoint path omitted padding_mask
-            # (relied on its default=None); restored here for consistency.
-            hidden_states, context = cf(*args)
+            for arg in shared_args:
+                if isinstance(arg, Tensor):
+                    off_interface.mark_not_offload(arg)
+        offload_manager = off_interface(offload_input, hidden_states, "full_recompute_input")
+        with offload_manager as hidden_states:
+            # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
+            args = (
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                *rotary_pos_emb,
+                padding_mask,
+                input_ids,
+            )
+            if use_checkpoint:
+                hidden_states, context = precision_aware_checkpoint(
+                    cf,
+                    self.config,
+                    self.pg_collection.tp,
+                    *args,
+                    distribute_saved_activations=self.config.distribute_saved_activations,
+                )
+            else:
+                # Note: original block-branch no-checkpoint path omitted padding_mask
+                # (relied on its default=None); restored here for consistency.
+                hidden_states, context = cf(*args)
+        hidden_states = offload_manager.group_offload(hidden_states)
 
         if self.config.recompute_method == "uniform":
             if (end - 1 + layer_offset) in extract_layer_indices:

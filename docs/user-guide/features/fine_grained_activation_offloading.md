@@ -13,7 +13,7 @@ Contributed in collaboration with RedNote.
 
 Fine-grained activation offloading reduces GPU memory by asynchronously transferring activations to CPU at the granularity of individual submodules within a transformer layer. Unlike layer-level offloading, it allows precise control over which activations to offload, enabling a tradeoff between memory savings and PCIe bandwidth overhead.
 
-Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, and `"shortcut_post_norm"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`.
+Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, `"shortcut_post_norm"`, and `"full_recompute_input"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`. `full_recompute_input` applies to full activation recomputation instead; see [Combining with Full Recomputation](#combining-with-full-recomputation).
 
 ## User Guide
 
@@ -24,7 +24,7 @@ Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `
 --fine-grained-activation-offloading
 
 # Modules whose inputs are offloaded (refer to your training script for list or delimiter syntax).
-# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "shortcut_post_norm".
+# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "shortcut_post_norm", "full_recompute_input".
 --offload-modules core_attn attn_proj expert_fc1
 ```
 
@@ -43,6 +43,7 @@ Each module offloads its **input** activation to CPU during forward and reloads 
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
+| `full_recompute_input` | Hidden-states input of each full-recompute checkpoint | Requires `--recompute-granularity full`; cannot be combined with other modules |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
 connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the
@@ -139,6 +140,20 @@ Offloading and recomputation are complementary:
 ```
 
 ![Fine-grained Activation Offloading and Fine-grained Recomputation](../../images/fine_grained_activation_offloading/offloading_and_recomputing.png)
+
+### Combining with Full Recomputation
+
+With `--recompute-granularity full`, each checkpointed layer (or chunk of `--recompute-num-layers` layers with `--recompute-method uniform`) runs its forward without saving activations and keeps only its hidden-states input for backward. These inputs are the activations that stay on the GPU from the forward pass until backward reaches the layer, so with many layers and long sequences they add up to a large share of peak memory. `full_recompute_input` offloads them to CPU in forward, on the offload stream while the next chunk's forward runs, and reloads each one before its chunk is recomputed in backward. As with the other modules, after warmup the group that backward needs first (the last checkpoint of a microbatch whose backward starts right after its forward) stays on the GPU. The masks, rotary embeddings, and token IDs passed to the checkpoint are shared by all chunks and stay on the GPU.
+
+```bash
+--recompute-granularity full
+--recompute-method uniform
+--recompute-num-layers 1
+--fine-grained-activation-offloading
+--offload-modules full_recompute_input
+```
+
+The other offload modules run inside the checkpointed region, so they cannot be combined with `full_recompute_input`.
 
 
 ### Compatibility
