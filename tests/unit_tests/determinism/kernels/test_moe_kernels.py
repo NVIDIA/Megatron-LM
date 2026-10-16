@@ -457,6 +457,39 @@ class TestMoEModules:
             what=f"TopKRouter[{balancing}, hash={hash_routing}]",
         )
 
+    def test_topk_router_per_token_loss_replays_and_captures(self):
+        """seq_aux_loss with per-token-loss scaling replays bit-exactly and its scale tensor can
+        be created inside CUDA graph capture (a pageable H2D copy there fails the capture)."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_router_score_function="sigmoid",
+            moe_aux_loss_coeff=0.01,
+            calculate_per_token_loss=True,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        assert_module_replays_bit_exact(
+            router, (hidden,), replays=3, what="TopKRouter[seq_aux_loss, per_token_loss]"
+        )
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            router(hidden)
+        torch.cuda.current_stream().wait_stream(side_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            router(hidden)
+        graph.replay()
+        torch.cuda.synchronize()
+        moe_utils.get_moe_metrics_tracker().clear()
+
     @pytest.mark.skipif(
         not (HAVE_TE_ROUTER and moe_utils.fused_topk_with_score_function_supports_topk_indices),
         reason="TE dense fused router output is not available",

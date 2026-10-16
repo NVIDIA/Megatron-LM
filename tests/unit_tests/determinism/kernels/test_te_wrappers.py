@@ -32,6 +32,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
+    _compute_index_scores,
     _dsa_weights_proj_forward_gemm,
     _DSAWeightsProjection,
 )
@@ -192,6 +193,49 @@ class TestTEWrappers:
         assert gradients["in[0]"].dtype is torch.bfloat16
         assert gradients["in[1]"].dtype is torch.bfloat16
         assert indexer._weights_proj_te_gemm_supported is te_gemm_supported
+
+    @pytest.mark.parametrize("use_relu", [False, True], ids=["no-relu", "relu"])
+    @pytest.mark.parametrize("grad", [False, True], ids=["no-grad", "grad"])
+    def test_dsa_indexer_compute_index_scores_replays(self, grad, use_relu):
+        """Replay the chunked DSA index-score path (no-grad in-place vs grad-collect)."""
+        seeded()
+        sq, batch, n_heads, head_dim, sk = 9, 2, 4, 8, 7
+        q = torch.randn(sq, batch, n_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(sk, batch, head_dim, device="cuda", dtype=torch.bfloat16)
+        weights = torch.randn(sq, batch, n_heads, device="cuda", dtype=torch.bfloat16)
+        if grad:
+            q.requires_grad_(True)
+            weights.requires_grad_(True)
+            k.requires_grad_(True)
+
+        def score(query, head_w, key):
+            return _compute_index_scores(query, head_w, key, use_relu=use_relu)
+
+        if grad:
+            grad_output = torch.randn(batch, sq, sk, device="cuda", dtype=torch.float32)
+            outputs, gradients = assert_replays_bit_exact(
+                score,
+                (q, weights, k),
+                replays=3,
+                backward=True,
+                grad_outputs={"out": grad_output},
+                contention=True,
+                what=f"DSA index scores[relu={use_relu}, grad={grad}]",
+            )
+            assert outputs["out"].dtype is torch.float32
+            assert gradients["in[0]"].dtype is torch.bfloat16
+            assert gradients["in[1]"].dtype is torch.bfloat16
+            assert gradients["in[2]"].dtype is torch.bfloat16
+        else:
+            outputs, _ = assert_replays_bit_exact(
+                score,
+                (q, weights, k),
+                replays=3,
+                backward=False,
+                contention=True,
+                what=f"DSA index scores[relu={use_relu}, grad={grad}]",
+            )
+            assert outputs["out"].dtype is torch.float32
 
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
@@ -527,7 +571,8 @@ class TestTEWrappers:
             assert module.weight0 is parameter
             assert torch.equal(module.weight0, expected)
 
-    def test_te_fused_cross_entropy_replays(self):
+    @pytest.mark.parametrize("return_argmax", [False, True])
+    def test_te_fused_cross_entropy_replays(self, return_argmax):
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
         tokens = TOKENS // 2
@@ -536,7 +581,7 @@ class TestTEWrappers:
         )
         target = torch.randint(0, 32768 * tp_group.size(), (tokens, 1), device="cuda")
         assert_replays_bit_exact(
-            lambda l, t: te_cross_entropy(l, t, tp_group),
+            lambda l, t: te_cross_entropy(l, t, tp_group, return_argmax=return_argmax),
             (logits, target),
             replays=4,
             what="te_fused_cross_entropy",
@@ -653,6 +698,44 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_te_fused_mla_kv_rope_mxfp8_replays():
+    """The fused MLA key/value split + key RoPE + MXFP8 quantization that MLA dispatches with
+    use_fused_mla_kv_rope_quant (its backward is the replayed Triton key/value split RoPE)."""
+    from megatron.core.transformer import multi_latent_attention as mla
+
+    if not _IS_BLACKWELL or mla.fused_mla_kv_rope_mxfp8 is None:
+        pytest.skip("needs Transformer Engine's fused_mla_kv_rope_mxfp8 on SM100+")
+    seeded()
+    s, b, h = 2048, 2, 16
+    kv = torch.randn(s, b, h, 256, device="cuda", dtype=torch.bfloat16)
+    kv_down = torch.randn(s, b, 512 + 64, device="cuda", dtype=torch.bfloat16)
+    k_pos_emb = kv_down[..., 512:].unsqueeze(-2)
+    cos = torch.randn(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
+
+    def fn(kv, k_pos_emb, cos, sin):
+        key, value = mla.fused_mla_kv_rope_mxfp8(kv, k_pos_emb, cos, sin, 128)
+        return tuple(
+            getattr(t, name)
+            for t in (key, value)
+            for name in (
+                "_rowwise_data",
+                "_rowwise_scale_inv",
+                "_columnwise_data",
+                "_columnwise_scale_inv",
+            )
+        )
+
+    assert_replays_bit_exact(
+        fn,
+        (kv, k_pos_emb, cos, sin),
+        replays=3,
+        backward=False,
+        contention=True,
+        what="TE fused MLA key/value RoPE + MXFP8",
+    )
 
 
 # --- fused top-k router with dense indices ------------------------------------------------------

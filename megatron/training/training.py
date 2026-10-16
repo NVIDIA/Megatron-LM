@@ -40,7 +40,7 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
-from megatron.core import mpu, nccl_allocator, tensor_parallel
+from megatron.core import mpu, tensor_parallel
 
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
@@ -121,6 +121,7 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
@@ -189,13 +190,13 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
     get_wandb_writer,
-    get_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -1726,7 +1727,12 @@ def pretrain(
         warmup_tp_group = pg_collection.tp
     else:
         warmup_tp_group = mpu.get_tensor_model_parallel_group()
-    warmup_training_kernels(args, warmup_tp_group)
+    warmup_training_kernels(
+        cfg_container.model,
+        warmup_tp_group,
+        seq_length=args.seq_length,
+        micro_batch_size=cfg_container.train.micro_batch_size,
+    )
     print_rank_0("Finished training-kernel warmup.")
 
     timestamp_after_set_jit_fusion_options = time.time()
@@ -2564,8 +2570,8 @@ def _forward_backward_grad_context(args):
     return grad_context, forward_only
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
-    """Build the model."""
+def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
+    """Build the model using a finalized DDP config, or legacy args if omitted."""
     cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
@@ -2703,7 +2709,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         config = get_model_config(model[0])
 
-        ddp_config = get_megatron_ddp_config(args)
+        if ddp_config is None:
+            ddp_config = get_megatron_ddp_config(args)
         if not getattr(args, "use_torch_fsdp2", False):
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(
@@ -2954,7 +2961,13 @@ def setup_model_and_optimizer(
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
-            return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
+            return get_model(
+                model_provider_func,
+                model_type,
+                wrap_with_ddp=wrap_with_ddp,
+                pg_collection=pg_collection,
+                ddp_config=cfg_container.ddp if cfg_container is not None else None,
+            )
 
     # Configure GTP weight-remat padding/loss reduction before model construction (pad
     # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
@@ -3161,7 +3174,7 @@ def setup_model_and_optimizer(
     data_parallel_size = (
         mpu.get_data_parallel_world_size()
         if mpu.model_parallel_is_initialized()
-        else args.data_parallel_size
+        else get_batch_parallel_size(args)
     )
     assert num_microbatches is not None and num_microbatches >= 1, (
         f'current global batch size ({current_global_batch_size}) is too small for '
@@ -3293,12 +3306,7 @@ def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
     samples_seen_value = samples_seen.item()
     if samples_seen_value >= 0:
         return int(samples_seen_value)
-    return (
-        get_num_microbatches()
-        * args.micro_batch_size
-        * args.data_parallel_size
-        * args.gtp_weight_remat_size
-    )
+    return get_num_microbatches() * args.micro_batch_size * get_batch_parallel_size(args)
 
 
 def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
@@ -3761,13 +3769,10 @@ def training_log(
     if cfg.rl.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
-    # Calculate batch size. data_parallel_size excludes the GTP-remat axis (it's folded into
-    # total_model_size at arguments.py:446); each gtp-remat peer consumes a distinct microbatch,
-    # so multiply it back in for the global sample count.
+    # Count independent sequences; weight-sharding ranks may share a sequence through CP.
     batch_size = (
         args.micro_batch_size
-        * args.data_parallel_size
-        * args.gtp_weight_remat_size
+        * get_batch_parallel_size(args)
         * get_num_microbatches()
     )
 
@@ -4740,15 +4745,18 @@ def train(
     )
 
     def _dp_world_size():
-        # Full DP x gtp_remat degree (num_microbatches spans the full data-distribution axis).
-        gtp_remat = args.gtp_weight_remat_size
+        # Independent-sequence degree, which can differ from the weight-replica degree.
         if lang_pgc is not None:
-            return lang_pgc.dp.size() * gtp_remat
+            sample_group = getattr(lang_pgc, "dp_gtp_remat", None)
+            if sample_group is None:
+                if getattr(args, "gtp_remat_num_sequence_shards", 1) == 1:
+                    return lang_pgc.dp.size() * args.gtp_weight_remat_size
+                raise ValueError("Language process groups must include dp_gtp_remat")
+            return sample_group.size()
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
-        # args.data_parallel_size is the language (llm) dp on all ranks (set in validate_args) and
-        # excludes gtp_remat, so scale by gtp_remat to span the full data-distribution axis.
-        return args.data_parallel_size * gtp_remat
+        # Bootstrap fallback before process groups are initialized.
+        return get_batch_parallel_size(args)
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if cfg.rl.perform_rl_step:
@@ -5609,8 +5617,7 @@ def train(
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
-                    if getattr(buf, 'nccl_mem_pool', None) is not None:
-                        nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
+                    buf.deregister_nccl_mem_pools()
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
         )
@@ -5680,11 +5687,9 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
-    # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
-    # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so include it in the
-    # global sample breadth we divide out to recover the microbatch count.
+    # Divide by independently assigned sequences; CP ranks share the same sequence.
     eval_num_microbatches = eval_batch_size // (
-        eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
+        eval_micro_batch_size * get_batch_parallel_size(args)
     )
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).

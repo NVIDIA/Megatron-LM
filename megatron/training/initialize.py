@@ -85,7 +85,9 @@ def initialize_megatron(
     args = get_args()
 
     cfg = get_run_config()
-    cfg.validate()
+    # Resolve runtime config before any service, process group, or RNG is initialized.
+    # Shared by training, inference, and legacy initialization entry points.
+    cfg.finalize()
     if not training and args.tp_comm_overlap:
         raise ValueError(
             "--tp-comm-overlap uses fixed training user buffers and is not supported by "
@@ -413,16 +415,18 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                     "Set both --gtp_remat-weight-remat-size and "
                     "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
                 )
+            # Dense grid: world_size must be divisible by
+            # TP * PP * (runtime_CP / gtp_remat_num_sequence_shards) * GTP_remat.
+            # Expert grid: world_size must be divisible by ETP * EP * PP * EGTP_remat.
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 use_sharp=args.use_sharp,
-                # GTP_remat/EGTP_remat need world divisible by TP*PP*CP*GTP_remat (expert grid
-                # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1.
                 gtp_remat_size=args.gtp_weight_remat_size,
                 expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
+                gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 hybrid_context_parallel=args.hybrid_context_parallel,
