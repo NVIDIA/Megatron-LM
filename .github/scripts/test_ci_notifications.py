@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Validate nightly testing notifications without model or YAML dependencies."""
+"""Validate merge-group testing notifications without model or YAML dependencies."""
 
 import re
 import unittest
@@ -10,12 +10,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
-class TestScheduledNotification(unittest.TestCase):
-    """Keep nightly test alerts complete, immutable, and out of cache population."""
+class TestMergeGroupNotification(unittest.TestCase):
+    """Keep merge-group test alerts complete, immutable, and out of cache population."""
 
     def setUp(self) -> None:
         self.workflow = (ROOT / ".github/workflows/cicd-main.yml").read_text()
-        self.notify = self.workflow.split("  notify-nightly-failure:\n", 1)[1].split(
+        self.notify = self.workflow.split("  notify-merge-group-failure:\n", 1)[1].split(
             "\n  Coverage_Fake:", 1
         )[0]
 
@@ -41,6 +41,7 @@ class TestScheduledNotification(unittest.TestCase):
         )
         self.assertEqual(set(dependencies[1].split(", ")), testing_jobs)
         self.assertIn("runs-on: ubuntu-latest", self.notify)
+        self.assertIn("environment: main", self.notify)
         self.assertIn("permissions: {}", self.notify)
         self.assertIn(
             "uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/notify-ci-failure@"
@@ -52,29 +53,34 @@ class TestScheduledNotification(unittest.TestCase):
         self.assertNotIn("checkout", self.notify)
         self.assertNotIn("run:", self.notify)
 
-    def test_only_alerts_on_uncancelled_nightly_test_failures(self) -> None:
+    def test_only_alerts_on_uncancelled_default_branch_merge_group_failures(self) -> None:
         condition = self.notify.split("    if: >-\n", 1)[1].split("    steps:", 1)[0]
         self.assertIn("always() && !cancelled() && contains(needs.*.result, 'failure')", condition)
         self.assertNotIn("failure()", condition)
         self.assertIn("github.repository == 'NVIDIA/Megatron-LM'", condition)
+        self.assertIn("github.event_name == 'merge_group'", condition)
         self.assertIn(
-            "(github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')",
+            "github.event.merge_group.base_ref == "
+            "format('refs/heads/{0}', github.event.repository.default_branch)",
             condition,
         )
-        self.assertIn("github.ref_name == github.event.repository.default_branch", condition)
+        self.assertNotIn("github.ref", condition)
+        self.assertNotIn("schedule", condition)
+        self.assertNotIn("workflow_dispatch", condition)
+        self.assertNotIn("||", condition)
         self.assertNotIn("outputs", condition)
         self.assertNotIn("push", condition)
-        self.assertNotIn("merge_group", condition)
 
     def test_cache_population_does_not_send_testing_notifications(self) -> None:
         cache = (ROOT / ".github/workflows/populate-build-cache.yml").read_text()
-        self.assertNotIn("notify-nightly-failure:", cache)
+        self.assertNotIn("notify-merge-group-failure:", cache)
         self.assertNotIn("/notify-ci-failure@", cache)
 
     def test_does_not_restore_daily_gpu_test_schedule(self) -> None:
         triggers = self.workflow.split("\non:\n", 1)[1].split("\nconcurrency:", 1)[0]
         self.assertNotIn("schedule:", triggers)
-        self.assertIn("      - name: Test nightly testing notification wiring", self.workflow)
+        self.assertIn("  merge_group:\n    types: [checks_requested]", triggers)
+        self.assertIn("      - name: Test merge-group testing notification wiring", self.workflow)
         self.assertIn("run: python3 .github/scripts/test_ci_notifications.py", self.workflow)
 
 

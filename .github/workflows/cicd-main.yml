@@ -657,7 +657,7 @@ jobs:
       - name: Test DCO gate publisher
         run: python3 .github/scripts/test_dco_gate.py
 
-      - name: Test nightly testing notification wiring
+      - name: Test merge-group testing notification wiring
         run: python3 .github/scripts/test_ci_notifications.py
 
       - name: Test superseded merge-group cleanup
@@ -1515,19 +1515,19 @@ jobs:
             exit 1
           fi
 
-  notify-nightly-failure:
-    name: Notify nightly testing failure
+  notify-merge-group-failure:
+    name: Notify merge-group testing failure
     runs-on: ubuntu-latest
     environment: main
     needs: [cicd-unit-tests-latest, cicd-unit-tests-latest-gb200, cicd-integration-tests-latest-h100, cicd-integration-tests-latest-gb200]
     permissions: {}
     # Report test failures, not failed ancestors or build-cache population.
-    # Main's nightly CI is dispatched; keep the workflow triggers unchanged.
+    # Queue runs use a synthetic head ref; check the target branch instead.
     if: >-
       ${{ always() && !cancelled() && contains(needs.*.result, 'failure') &&
           github.repository == 'NVIDIA/Megatron-LM' &&
-          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
-          github.ref_name == github.event.repository.default_branch }}
+          github.event_name == 'merge_group' &&
+          github.event.merge_group.base_ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     steps:
       - name: Notify CI alerts channel
         uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/notify-ci-failure@631c404d00a9e60afc591cd071d35d2e18f82fc6
