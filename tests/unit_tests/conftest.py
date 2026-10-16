@@ -69,6 +69,13 @@ def cleanup():
 
 
 @pytest.fixture(scope="function", autouse=True)
+def destroy_retired_process_groups():
+    """Destroy the model-parallel process groups a test retired once it finishes."""
+    yield
+    Utils.destroy_retired_process_groups()
+
+
+@pytest.fixture(scope="function", autouse=True)
 def set_env():
     if is_te_min_version("1.3"):
         os.environ['NVTE_FLASH_ATTN'] = '0'

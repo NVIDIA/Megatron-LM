@@ -170,10 +170,12 @@ class TestLifecycleGuards:
         monkeypatch.setattr(dist, "get_rank", lambda: 0)
         monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
 
-        llm.serve(ServeConfig(port=1234), blocking=False)
+        sock = MagicMock()
+        llm.serve(ServeConfig(port=1234, sock=sock), blocking=False)
         assert llm._serve_started is True
         assert started["coordinator_addr"] == "tcp://coord:5555"
         assert started["server_port"] == 1234
+        assert started["sock"] is sock
 
 
 class TestNormalizePrompts:

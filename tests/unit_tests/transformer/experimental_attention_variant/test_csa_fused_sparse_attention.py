@@ -2401,6 +2401,44 @@ class TestFusedIndexerSparseAttn:
         assert torch.all(det_k[:, topk:] == 0) and torch.any(det_k[:, :topk] != 0)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_sparse_loss_raises_when_compact_softmax_is_missing(self, reset_lazy_kernel_state):
+        """Sparse loss raises when the compact path returns no Top-K softmax."""
+        s = self.SHAPES
+        topk = 2
+        inputs = self._make_inputs()
+        fake_dsa, _ = _install_full_dsa_mock(
+            b=s['b'],
+            sq=s['sq'],
+            np_=s['np_'],
+            d=s['d'],
+            n_comp=s['n_comp'],
+            idx_nh=s['idx_nh'],
+            target_fn=lambda B, S, K, dev: _peaked_dist(B, S, K, dev, peak_idx=0),
+        )
+
+        def fake_compact(q_bshd, _k_bshd, _w_bsh, top_k, **kwargs):
+            indices = torch.arange(top_k, dtype=torch.int32, device=q_bshd.device)
+            indices = indices.view(1, 1, top_k).expand(s['b'], s['sq'], top_k).contiguous()
+            logits = torch.zeros(s['b'], s['sq'], top_k, dtype=torch.float32, device=q_bshd.device)
+            return {'indices': indices, 'logits': logits, 'softmax': None}
+
+        fake_dsa.indexer_forward_top_k_wrapper = MagicMock(side_effect=fake_compact)
+        with (
+            patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)),
+            pytest.raises(RuntimeError, match='compact Top-K softmax'),
+        ):
+            fused_csa_indexer_sparse_attn(
+                **inputs,
+                indexer_topk=topk,
+                ratio=4,
+                softmax_scale=0.5,
+                loss_coeff=1.0,
+                sparse_loss=True,
+                kv_offset=s['skv'] - s['n_comp'],
+                deterministic=True,
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_disabled_loss_uses_compact_without_softmax(self, reset_lazy_kernel_state):
         """A disabled dense loss must not force dense-score materialization."""
         s = self.SHAPES
@@ -3851,6 +3889,51 @@ class TestRealKernelKLLossDense:
 # ---------------------------------------------------------------------------
 
 
+def _patch_indexer_score_budget(monkeypatch, chunk_rows, max_seqlen_kv):
+    """Score ``chunk_rows`` query rows per dense-fallback chunk."""
+    monkeypatch.setattr(dk, '_CSA_INDEXER_SCORE_CHUNK_MAX_BYTES', chunk_rows * max_seqlen_kv * 4)
+    monkeypatch.setattr(dk, '_CSA_INDEXER_SCORE_CHUNK_ROW_ALIGNMENT', 1)
+
+
+def _count_indexer_core_calls(monkeypatch):
+    """Count entries to ``_indexer_topk_core``, including each chunk's inner call."""
+    calls = {'n': 0}
+    original = dk._indexer_topk_core
+
+    def _wrapped(*args, **kwargs):
+        calls['n'] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dk, '_indexer_topk_core', _wrapped)
+    return calls
+
+
+def _assert_real_indexer_topk_set(topk_indices, topk_length, q_indexer, k_indexer, weights, spec):
+    """Lengths match the causal mask, and each row's Top-K set overlaps the reference."""
+    q_bshd = q_indexer.permute(1, 0, 2, 3).contiguous().float()
+    k_bsd = k_indexer.permute(1, 0, 2).contiguous().float()
+    w_bsh = weights.permute(1, 0, 2).contiguous().float()
+    ref_scores = _ref_indexer_full_score(
+        q_bshd, k_bsd, w_bsh, sm_scale=spec['indexer_softmax_scale'], ratio=spec['ratio']
+    )
+    n_valid = (ref_scores > float('-inf')).sum(dim=-1)
+    expected_length = n_valid.clamp(max=spec['indexer_topk']).int()
+    assert torch.equal(topk_length, expected_length)
+    ref_topk = torch.topk(ref_scores, k=spec['indexer_topk'], dim=-1).indices
+    for bi in range(spec['b']):
+        for qi in range(spec['sq']):
+            n = int(expected_length[bi, qi].item())
+            if n == 0:
+                assert torch.all(topk_indices[bi, qi] == -1)
+                continue
+            actual_set = set(topk_indices[bi, qi, :n].tolist())
+            ref_set = set(ref_topk[bi, qi, :n].tolist())
+            overlap = len(actual_set & ref_set)
+            assert overlap >= max(
+                1, n - 1
+            ), f"row (b={bi}, q={qi}): actual {sorted(actual_set)} vs ref {sorted(ref_set)}"
+
+
 class TestRealKernelIndexerTopk:
     """Real-kernel parity for :func:`indexer_topk`: the SET of selected
     top-K indices must match a PyTorch reference ranking. We compare sets
@@ -3931,6 +4014,96 @@ class TestRealKernelIndexerTopk:
                     f"row (b={bi}, q={qi}): "
                     f"actual {sorted(actual_set)} vs ref {sorted(ref_set)}"
                 )
+
+    @pytest.mark.parametrize('chunk_rows', [48, 100])
+    def test_real_indexer_topk_row_chunked_matches_single_pass(
+        self, chunk_rows, reset_lazy_kernel_state, monkeypatch
+    ):
+        """Multi-chunk dense fallback matches one deterministic dense pass.
+
+        ``chunk_rows=48`` splits rows 96:144 across the batch boundary at 128,
+        so one kernel call contains a segment with K rows and no query rows.
+        """
+        _skip_if_real_kernels_unavailable()
+        s = dict(
+            b=2,
+            sq=128,
+            idx_nh=32,
+            idx_hd=128,
+            sk=128,
+            indexer_topk=8,
+            ratio=4,
+            indexer_softmax_scale=128**-0.5,
+        )
+        torch.manual_seed(0)
+        dev = 'cuda'
+        q_indexer = torch.randn(
+            s['sq'], s['b'], s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev
+        )
+        k_indexer = torch.randn(s['sk'], s['b'], s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        weights = torch.randn(s['sq'], s['b'], s['idx_nh'], dtype=torch.bfloat16, device=dev)
+        kwargs = dict(
+            topk=s['indexer_topk'],
+            ratio=s['ratio'],
+            indexer_softmax_scale=s['indexer_softmax_scale'],
+            use_compact=False,
+            deterministic=True,
+        )
+        full_idx, full_len = indexer_topk(q_indexer, k_indexer, weights, **kwargs)
+
+        _patch_indexer_score_budget(monkeypatch, chunk_rows, s['sk'])
+        calls = _count_indexer_core_calls(monkeypatch)
+        idx, length = indexer_topk(q_indexer, k_indexer, weights, **kwargs)
+
+        total_q = s['b'] * s['sq']
+        assert calls['n'] == 1 + math.ceil(total_q / chunk_rows)
+        assert torch.equal(length, full_len)
+        assert torch.equal(idx, full_idx)
+        _assert_real_indexer_topk_set(idx, length, q_indexer, k_indexer, weights, s)
+
+    def test_real_indexer_topk_thd_row_chunked_matches_single_pass(
+        self, reset_lazy_kernel_state, monkeypatch
+    ):
+        """A packed segment that spans two chunks matches the single THD pass.
+
+        Query lengths ``[80, 64]`` and a 48-row budget put the boundary between
+        the two segments inside the second chunk. Causal offsets are ``[5, 0]``.
+        """
+        _skip_if_real_kernels_unavailable()
+        chunk_rows = 48
+        q_lens, k_lens = [80, 64], [32, 24]
+        total_q = sum(q_lens)
+        idx_nh, idx_hd, topk = 32, 128, 8
+        cu_q = _make_cu_seqlens(q_lens, device='cuda')
+        cu_k = _make_cu_seqlens(k_lens, device='cuda')
+        offsets = torch.tensor([5, 0], dtype=torch.int32, device='cuda')
+        torch.manual_seed(0)
+        q = torch.randn(total_q, idx_nh, idx_hd, dtype=torch.bfloat16, device='cuda')
+        k = torch.randn(sum(k_lens), idx_hd, dtype=torch.bfloat16, device='cuda')
+        w = torch.randn(total_q, idx_nh, dtype=torch.bfloat16, device='cuda')
+        kwargs = dict(
+            topk=topk,
+            ratio=4,
+            indexer_softmax_scale=idx_hd**-0.5,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_k,
+            max_seqlen_q=max(q_lens),
+            max_seqlen_kv=max(k_lens),
+            q_causal_offsets=offsets,
+            use_compact=False,
+            deterministic=True,
+        )
+        full_idx, full_len = indexer_topk(q, k, w, **kwargs)
+
+        _patch_indexer_score_budget(monkeypatch, chunk_rows, max(k_lens))
+        calls = _count_indexer_core_calls(monkeypatch)
+        idx, length = indexer_topk(q, k, w, **kwargs)
+
+        assert calls['n'] == 1 + math.ceil(total_q / chunk_rows)
+        assert idx.shape == (total_q, topk)
+        assert idx.dtype == torch.int32
+        assert torch.equal(length, full_len)
+        assert torch.equal(idx, full_idx)
 
     @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
     def test_real_thd_compact_topk_cuda_graph_capture(self, precision, reset_lazy_kernel_state):
@@ -4771,8 +4944,12 @@ class TestThdWrapperDispatchAndValidation:
         }
         dk._DSA = fake_dsa
 
+        # Quantization and the compact kernel are mocked, so the dispatch must
+        # not depend on Transformer Engine or Triton actually being installed.
         with (
             patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+            patch.object(dk, "HAVE_TE_MXFP8", True),
+            patch.object(dk, "HAVE_TRITON", True),
             patch.object(
                 dk, "quantize_indexer_mxfp8", side_effect=[(q_fp8, q_scale), (k_fp8, k_scale)]
             ) as quantize,

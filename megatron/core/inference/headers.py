@@ -29,6 +29,9 @@ class Request(IntEnum):
     ENGINE_REPLY = 21
     ENGINE_REPLY_PARTIAL = 22
     ABORT_REQUEST = 23
+    SUBMIT_REQUEST_WITH_KV = 24  # Decode-side KV import.
+    RELEASE_KV = 25  # Free pinned handoff blocks.
+    SEND_KV = 26  # Tell the prefill engine to send a handoff's KV.
 
 
 class Control(IntEnum):
@@ -55,6 +58,7 @@ class Transport(IntEnum):
     """Low-level transport framing."""
 
     TP_BROADCAST = 80
+    KV_HANDOFF_COMPLETE = 81  # Internal MP-wide decode admission decision.
 
 
 # All header categories. To add a new class of headers, define a new IntEnum in

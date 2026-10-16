@@ -42,7 +42,7 @@ Defined in `megatron/core/telemetry/span_groups.py`. Extends lens's base `SpanGr
 | `communication` | `megatron.p2p.{recv,send}_{forward,backward}`, `megatron.grad_sync.{start,finish}`, `megatron.pp.recv_forward.linked` | every iteration |
 | `activation_offload` | `megatron.activation.offload`, `megatron.activation.reload` | every microbatch |
 | `data_loading` | (reserved for future use) | every iteration |
-| `inference` | `text_completion {model}` | every inference request |
+| `inference` | (reserved for the inference server) | every inference request |
 
 ## Examples
 
@@ -92,8 +92,6 @@ megatron.pretrain                                          # job
         │     └── megatron.save_checkpoint.io_write        # checkpoint
         └── megatron.evaluate                              # evaluate
               └── megatron.evaluate.step                   # evaluate (×N)
-
-text_completion {model}                                    # inference (GenAI semconv)
 ```
 
 ## Span attributes
@@ -125,32 +123,3 @@ Key Megatron-specific span attributes:
 | `all` (includes microbatch, layer) | Highest | Development / profiling only |
 
 Non-exporting ranks have `frozenset()` span groups — `is_span_group_enabled()` returns `False` everywhere, so **no span objects are created at all**. The disabled path is a frozenset lookup followed by an immediate return, not a no-op span that still allocates. See [lens: architecture](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/design/architecture.md).
-
-## Inference spans (GenAI semconv)
-
-The inference server (`MegatronGenerate`) emits spans that follow the [OTel GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/).
-
-### Span name
-
-```
-text_completion {gen_ai.request.model}
-```
-
-e.g. `text_completion gpt` or `text_completion llama`.
-
-### Span attributes
-
-| Attribute | Requirement | Value / source |
-|---|---|---|
-| `gen_ai.operation.name` | Required | `"text_completion"` |
-| `gen_ai.provider.name` | Required | `"megatron"` |
-| `gen_ai.request.model` | Conditionally Required | `args.model_type` |
-| `gen_ai.request.max_tokens` | Recommended | `tokens_to_generate` from request |
-| `gen_ai.request.temperature` | Recommended | `temperature` from request |
-| `gen_ai.request.top_k` | Recommended | `top_k` if > 0 |
-| `gen_ai.request.top_p` | Recommended | `top_p` if > 0.0 |
-| `gen_ai.request.seed` | Recommended | `random_seed` if ≥ 0 |
-| `gen_ai.usage.output_tokens` | Recommended | token count from response |
-| `error.type` | Conditionally Required | set on error by `span_cm` |
-
-W3C TraceContext is extracted from incoming HTTP headers so upstream callers can propagate trace context into the Megatron span.

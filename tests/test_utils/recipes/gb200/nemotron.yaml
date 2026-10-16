@@ -15,8 +15,8 @@ spec:
     set -euo pipefail
     unset https_proxy
     umask 077
-    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> /root/.netrc
-    trap 'rm -f /root/.netrc; unset RO_API_TOKEN' EXIT
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -37,68 +37,24 @@ spec:
     git checkout $MCORE_BACKWARDS_COMMIT
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
-    rm -f /root/.netrc
+    rm -f "$HOME/.netrc"
     unset RO_API_TOKEN
   script: |-
-    rm -f /root/.netrc
+    rm -f "${{HOME}}/.netrc"
     unset RO_API_TOKEN
     set -euo pipefail
     : "${{RUN_ID:=pr-$$}}"
     cd /opt/megatron-lm
 
     export GPUS_PER_NODE={gpus}
-    DATA_PATH=/mnt/rp2
-    DATA_BLEND=(
-        0.03846154 "$DATA_PATH/perp_head/head_01_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_02_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_03_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_04_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_05_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_06_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_07_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_08_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_09_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_10_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_11_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_12_text_document"
-        0.03846154 "$DATA_PATH/perp_head/head_13_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_01_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_02_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_03_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_04_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_05_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_06_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_07_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_08_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_09_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_10_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_11_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_12_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_13_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_14_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_15_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_16_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_17_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_18_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_19_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_20_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_21_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_22_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_23_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_24_text_document"
-        0.02 "$DATA_PATH/perp_middle/middle_25_text_document"
-    )
 
     ARGUMENTS=(
-        "DATA_PATH=$DATA_PATH"
-        "DATA_BLEND=${{DATA_BLEND[*]}}"
+        "DATA_PATH=/mnt/artifacts"
         "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
-        "TOKENIZER_TYPE=SentencePieceTokenizer"
-        "TOKENIZER_MODEL_PATH=$DATA_PATH/tokenizer/tokenizer.model"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
-        "CHECKPOINT_LOAD_PATH=$DATA_PATH"
+        "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "TRAINING_SCRIPT_PATH=pretrain_hybrid.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
@@ -110,7 +66,7 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh "${{ARGUMENTS[@]}}"
 
 products:
-  - test_case: [nemotron3_5_lightning_nightly_tp1_pp1_cp1_ep8_dgx_gb200_2N8G]
+  - test_case: [nemotron3_5_lightning_nightly_tp1_pp1_cp1_ep8_dgx_gb200]
     products:
       - environment: [dev]
         scope: [L2]

@@ -8,6 +8,7 @@ from megatron.core.tensor_parallel.random import (
     CheckpointFunction,
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
+    MHCCheckpointManager,
     checkpoint,
     convert_cuda_rng_state,
     get_cuda_rng_tracker,
@@ -451,5 +452,84 @@ def test_checkpoint_recomputes_te_linear_with_fp8_parameters(recipe_name):
         torch.testing.assert_close(out, ref_out)
         torch.testing.assert_close(x_grad, ref_x_grad)
         torch.testing.assert_close(main_grad, ref_main_grad, rtol=1e-3, atol=1e-2)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+class _FusedResidualNorm(torch.autograd.Function):
+    """Mimics TEFusedResidualRMSNorm: returns (norm(input), input) where the
+    residual shares storage with the input (the MakeExtraOutput pattern).
+    Backward combines grad_norm and grad_residual into a single grad_input."""
+
+    @staticmethod
+    def forward(ctx, x, weight):
+        rms = x.float().pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
+        normed = (x.float() * rms).to(x.dtype) * weight
+        ctx.save_for_backward(x, weight, rms)
+        return normed, x
+
+    @staticmethod
+    def backward(ctx, grad_normed, grad_residual):
+        x, weight, rms = ctx.saved_tensors
+        x_float = x.float()
+        normed_float = x_float * rms
+        grad_normed_float = (grad_normed * weight).float()
+        d = x.shape[-1]
+        grad_x = (
+            grad_normed_float * rms
+            - normed_float * (grad_normed_float * normed_float).sum(-1, keepdim=True) / d
+        )
+        grad_x = grad_x.to(x.dtype) + grad_residual
+        grad_weight = (grad_normed * normed_float.to(x.dtype)).sum(
+            dim=tuple(range(grad_normed.ndim - 1))
+        )
+        return grad_x, grad_weight
+
+
+@pytest.mark.parametrize("use_manager", [False, True])
+def test_checkpoint_without_output_retain_input_tensors(use_manager):
+    """CheckpointWithoutOutput with retain_input_tensors=True must not free
+    outputs that share storage with inputs (the fused residual norm pattern)."""
+
+    hidden = 32
+
+    def fused_norm(x):
+        return _FusedResidualNorm.apply(x, weight)
+
+    def normal_forward(x):
+        normed, residual = fused_norm(x)
+        return normed + residual
+
+    def checkpoint_forward(x):
+        manager = MHCCheckpointManager() if use_manager else None
+        ckpt = CheckpointWithoutOutput(ckpt_manager=manager, retain_input_tensors=True)
+        normed, residual = ckpt.checkpoint(fused_norm, x)
+        y = normed + residual
+        if manager is None:
+            ckpt.discard_output_and_register_recompute(y)
+        else:
+            manager.discard_all_outputs_and_register_unified_recompute(y)
+        return y
+
+    Utils.initialize_model_parallel()
+    try:
+        weight = torch.randn(hidden, requires_grad=True)
+        input_ref = torch.randn((4, hidden), requires_grad=True)
+
+        input1 = input_ref.detach().clone().requires_grad_(True)
+        output1 = normal_forward(input1)
+
+        input2 = input_ref.detach().clone().requires_grad_(True)
+        weight.grad = None
+        output2 = checkpoint_forward(input2)
+        assert torch.allclose(output1, output2)
+
+        grad = torch.randn_like(output1)
+        output1.backward(grad)
+        ref_input_grad = input1.grad.clone()
+
+        weight.grad = None
+        output2.backward(grad)
+        assert torch.allclose(ref_input_grad, input2.grad)
     finally:
         Utils.destroy_model_parallel()

@@ -23,6 +23,7 @@ For PR-label or trigger questions, lead with the exact values:
   explicitly asks for LTS validation; never add it on your own initiative, even
   for a container or dependency change.**
 - `Run MBridge tests` additionally triggers the MBridge L1 suite.
+- `Run NeMoRL tests` additionally triggers NeMo RL's Megatron functional test suite.
 - ⚠️ **WARNING — destructive remote write.** `tools/trigger_internal_ci.py`
   **force-pushes the current branch** to the internal GitLab remote as
   `pull-request/<branch>`. Always run with `--dry-run` first and confirm the
@@ -78,6 +79,7 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 |-------|--------|
 | **`container::lts`** | Build on the older long-term-support NGC PyTorch base instead of `dev`'s latest — a backward-compat check, not a different test set (combinable with any scope label) |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
+| **`Run NeMoRL tests`** | Also triggers NeMo RL's Megatron functional test suite |
 
 ### Which label to attach when opening a PR
 
@@ -92,6 +94,7 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | Could affect training numerics (model arch, attention, optimizer, distributed, MoE routing) | `Run functional tests` |
 | Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` (add `container::lts` **only if the user explicitly asks** to validate LTS) |
 | Touches MBridge integration | add `Run MBridge tests` |
+| Could affect NeMo RL's Megatron integration | add `Run NeMoRL tests` |
 
 **Rule of thumb:** default to `Run tests`. Always use `Run functional tests` when the PR adds new test cases (golden values must be generated) or when the change could plausibly shift loss curves.
 

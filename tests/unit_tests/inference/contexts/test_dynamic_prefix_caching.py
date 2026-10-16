@@ -14,6 +14,9 @@ from megatron.core.inference.contexts.mamba_slot_allocator import (
     MambaSlotAllocator,
     MambaSlotCapacityError,
 )
+from megatron.core.inference.disaggregation.inference_state_handoff import (
+    InferenceStateHandoffMixin,
+)
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -934,6 +937,42 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
+    def test_mamba_cache_budget_too_small_raises(self):
+        # The CUDA-graph extraction scratch (sized to the per-step token-budget
+        # cap, max_mamba_intermediate_states_per_step) is reserved from
+        # prefix_caching_mamba_gb before the durable cache is sized. A budget too
+        # small to fit the scratch plus at least one durable slot is a hard
+        # configuration error, not a silent over-allocation (which previously
+        # could OOM at startup).
+        with pytest.raises(ValueError, match="prefix cache budget"):
+            self._mctx(prefix_caching_mamba_gb=1e-5)
+
+    @pytest.mark.internal
+    def test_hybrid_admission_resumes_after_handoff_releases_live_slot(self):
+        ctx = self._mctx(max_requests=1, rounder=1)
+        ctx.kv_block_allocator.enable_handoff_pinning = True
+        slot = ctx.mamba_metadata.allocate_slot()
+        assert slot is not None
+        ctx.mamba_metadata.request_to_mamba_state_idx[0] = slot
+        ctx.mamba_metadata.detach_state_slot(0)
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert not request_available
+
+        engine = InferenceStateHandoffMixin()
+        engine.context = ctx
+        engine._initialize_disaggregation_state()
+        engine._pinned_handoff_ssm_slots[7] = slot
+        engine.release_handoff_blocks(7)
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+        assert ctx.mamba_metadata.mamba_state_free_slot_count == 1
+
+    @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):
         # mamba match limits prefill skip
         ctx = self._mctx()
@@ -1505,8 +1544,11 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         assert mixed_slots[0] == pre_slot
         assert msa3.free_count == free_before3 - 2  # only 2 new
 
-        # Eviction: exhaust free pool, verify eviction fires and returns valid slots
-        ctx4 = self._mctx(prefix_caching_mamba_gb=0.001)
+        # Eviction: exhaust free pool, verify eviction fires and returns valid slots.
+        # Budget must cover the CUDA-graph extraction scratch (3 * max_requests
+        # slots) plus the durable cache; a budget too small to fit the scratch now
+        # raises (see test_mamba_cache_budget_too_small_raises).
+        ctx4 = self._mctx(prefix_caching_mamba_gb=0.01)
         msa4 = ctx4.mamba_slot_allocator
         total_slots = msa4.max_slots
         ctx4.add_request(self._req(ctx4, self._prompt(bs * 4)))

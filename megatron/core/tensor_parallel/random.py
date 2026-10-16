@@ -481,6 +481,8 @@ def model_parallel_cuda_manual_seed(
     gtp_remat_rank: Optional[int] = None,
     egtp_remat_rank: Optional[int] = None,
     force_reset_rng: bool = False,
+    gtp_remat_world_size: Optional[int] = None,
+    egtp_remat_world_size: Optional[int] = None,
 ):
     """Initialize model parallel cuda seed.
 
@@ -509,6 +511,10 @@ def model_parallel_cuda_manual_seed(
         gtp_remat_rank = get_gtp_weight_remat_rank()
     if egtp_remat_rank is None:
         egtp_remat_rank = get_expert_gtp_weight_remat_rank()
+    if gtp_remat_world_size is None:
+        gtp_remat_world_size = get_gtp_weight_remat_world_size()
+    if egtp_remat_world_size is None:
+        egtp_remat_world_size = get_expert_gtp_weight_remat_world_size()
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
     tensor_model_parallel_seed = offset + tp_rank
@@ -533,10 +539,10 @@ def model_parallel_cuda_manual_seed(
     # must draw DIFFERENT values (everything above is identical across peers by design). The 65536
     # stride keeps these disjoint from the tp/ep/etp seeds. Added only when the axis is active, so
     # non-GTP runs keep a byte-identical tracker set (and checkpoint rng payload).
-    if get_gtp_weight_remat_world_size() > 1:
+    if gtp_remat_world_size > 1:
         gtp_remat_seed = tensor_model_parallel_seed + 65536 * (1 + gtp_remat_rank)
         _CUDA_RNG_STATE_TRACKER.add(_GTP_REMAT_RNG_TRACKER_NAME, gtp_remat_seed)
-    if get_expert_gtp_weight_remat_world_size() > 1:
+    if egtp_remat_world_size > 1:
         egtp_remat_seed = expert_parallel_seed + 32768 + 65536 * (1 + egtp_remat_rank)
         _CUDA_RNG_STATE_TRACKER.add(_EXPERT_GTP_REMAT_RNG_TRACKER_NAME, egtp_remat_seed)
 
@@ -826,7 +832,13 @@ def _save_args_to_ctx(ctx, args):
             continue
         non_tensor_entries.append((index, arg))
 
-    ctx.save_for_backward(*detach_variable(tuple(tensor_args)))
+    # Save the raw tensors (as torch.utils.checkpoint does) rather than
+    # detach_variable()-ed copies: detaching here creates leaf tensors that require
+    # grad, and autograd's SavedVariable keeps such leaves alive until backward even
+    # when saved-tensor hooks (e.g. fine-grained activation offload) pack them away,
+    # pinning the input storage on GPU for the whole forward-backward interval.
+    # _load_args_from_ctx() detaches the unpacked tensors before they are reused.
+    ctx.save_for_backward(*tensor_args)
     ctx._non_tensor_entries = tuple(non_tensor_entries)
     ctx._total_args_count = len(args)
 
@@ -999,8 +1011,8 @@ class MHCCheckpointManager:
                 for output in ckpt.outputs:
                     ckpt.output_slot.validate_output(output)
                 continue
-            for output in ckpt.outputs:
-                output.untyped_storage().resize_(0)
+            # Honor retain_input_tensors: outputs aliasing checkpoint inputs keep storage.
+            ckpt._discard_outputs()
         self._outputs_discarded = True
 
     def recompute_until(self, phase) -> None:
@@ -1070,7 +1082,14 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False, ckpt_manager=None, output_slot=None, recompute_phase=None):
+    def __init__(
+        self,
+        fp8=False,
+        ckpt_manager=None,
+        output_slot=None,
+        recompute_phase=None,
+        retain_input_tensors=False,
+    ):
         """
         Initialize CheckpointWithoutOutput.
 
@@ -1084,6 +1103,8 @@ class CheckpointWithoutOutput(object):
                          producer and consumed at its captured address.
             recompute_phase: Earliest explicit backward barrier that needs this
                              checkpoint. Defaults to the conservative first phase.
+            retain_input_tensors: Whether outputs sharing storage with checkpoint inputs
+                                  should be retained when discarding outputs.
         """
         from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot, MHCRecomputePhase
 
@@ -1095,6 +1116,7 @@ class CheckpointWithoutOutput(object):
         self.recompute_phase = MHCRecomputePhase(
             MHCRecomputePhase.BEFORE_COMBINE_BWD if recompute_phase is None else recompute_phase
         )
+        self.retain_input_tensors = retain_input_tensors
         self.run_function = None
         # Snapshot taken in checkpoint(), consumed and cleared in _recompute().
         # This replaced three separate fwd_* fields; declaring it here keeps the
@@ -1127,6 +1149,11 @@ class CheckpointWithoutOutput(object):
         # in between would replay the wrong draw. The cost is one clone_state()
         # per tracked state per checkpoint.
         self.rng_states = _get_all_rng_states()
+
+        if self.retain_input_tensors:
+            self._saved_input_ptrs = {
+                t.untyped_storage().data_ptr() for t in args if isinstance(t, torch.Tensor)
+            }
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
@@ -1217,6 +1244,19 @@ class CheckpointWithoutOutput(object):
         self.outputs = None
         self.ctx = None
 
+    def _discard_outputs(self):
+        """Release output storage, preserving outputs that alias retained inputs."""
+        if self.retain_input_tensors:
+            # Skip outputs whose storage is shared with a saved input — freeing those
+            # would destroy the data needed for recomputation (e.g. TE.ops.Sequential
+            # operations with MakeExtraOutput).
+            for output in self.outputs:
+                if output.untyped_storage().data_ptr() not in self._saved_input_ptrs:
+                    output.untyped_storage().resize_(0)
+        else:
+            for output in self.outputs:
+                output.untyped_storage().resize_(0)
+
     def discard_output_and_register_recompute(self, hook_tensor):
         """
         Release the output tensor storages and register the recompute function as a grad hook of
@@ -1233,10 +1273,8 @@ class CheckpointWithoutOutput(object):
         if self.ckpt_manager is not None or is_graph_warmup():
             return
 
-        # use resize to release the output tensor memory and still keep the metadata in the tensors.
-        # the metadata is still needed for backward
-        for output in self.outputs:
-            output.untyped_storage().resize_(0)
+        # Release output tensor memory while keeping metadata for backward.
+        self._discard_outputs()
 
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
         # is computed, the recomputation will be triggered. The hook_tensor should be selected

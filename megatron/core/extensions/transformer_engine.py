@@ -1102,6 +1102,7 @@ class TENorm:
             **_get_extra_te_kwargs(config),
         )
 
+        instance.returns_residual = use_fused_residual
         return cast(LayerNormInterface, instance)
 
 
@@ -1918,7 +1919,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
     ``delay_wgrad_compute`` is forced off to mirror its no-op ``backward_dw``,
     and ``get/set_extra_state`` match the bf16 LM head's state-dict shim. The
     LM-head kwargs ``keep_master_weight_for_test``, ``skip_weight_param_allocation``,
-    ``defer_embedding_wgrad_compute`` buffers, and ``disable_grad_reduce`` are
+    ``defer_embedding_wgrad_compute`` buffers, ``disable_grad_reduce``, and ``output_dtype`` are
     accepted to preserve the ``ColumnParallelLinear`` signature but currently
     raise when set non-default — TE will not support them natively, so they
     would have to be implemented in this subclass, which has not been done yet.
@@ -1945,6 +1946,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         tp_comm_buffer_name: Optional[str] = None,
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        output_dtype: Optional[torch.dtype] = None,
     ):
         from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 
@@ -1963,6 +1965,8 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
             )
         if disable_grad_reduce:
             raise ValueError("TE output projection does not support disable_grad_reduce.")
+        if output_dtype is not None:
+            raise ValueError("TE MXFP8 output projection does not support output_dtype.")
 
         te_config = copy.copy(config)
         # Match ColumnParallelLinear.backward_dw's no-op so the LM head keeps
@@ -2345,6 +2349,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_partition_mode")
         self.kept_packed_seq_params.discard("cp_partition_route")
+        self.kept_packed_seq_params.discard("cp_scatter_cache")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
@@ -2639,25 +2644,20 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group_for_te = None
 
             if is_te_min_version("2.14.0"):
-                # nemo_26.04 ships TE 2.14.0+71bbefbf whose GroupedLinear.__init__ does NOT
-                # yet accept single_grouped_{weight,bias}, even though the version string
-                # passes is_te_min_version("2.14.0"). Introspect the signature instead of
-                # version-gating, mirroring the patch in dsv4_fused_attn / main_megatron.
-                # The GroupedLinear.__init__ signature is constant for a given TE install, so
-                # introspect once and cache at module scope rather than on every TEGroupedLinear
-                # instantiation (matters for large MoE models with many expert groups).
+                # Some TE 2.14 builds predate these keyword arguments. Cache the
+                # installed constructor signature instead of relying on the version alone.
                 global _TE_GROUPED_LINEAR_INIT_PARAMS
                 try:
-                    _gl_params = _TE_GROUPED_LINEAR_INIT_PARAMS
+                    grouped_linear_init_params = _TE_GROUPED_LINEAR_INIT_PARAMS
                 except NameError:
-                    _gl_params = _TE_GROUPED_LINEAR_INIT_PARAMS = set(
+                    grouped_linear_init_params = _TE_GROUPED_LINEAR_INIT_PARAMS = set(
                         inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
                     )
-                if "single_grouped_weight" in _gl_params:
+                if "single_grouped_weight" in grouped_linear_init_params:
                     extra_kwargs["single_grouped_weight"] = getattr(
                         config, "moe_single_grouped_weight", False
                     )
-                if "single_grouped_bias" in _gl_params:
+                if "single_grouped_bias" in grouped_linear_init_params:
                     extra_kwargs["single_grouped_bias"] = getattr(
                         config, "moe_single_grouped_bias", False
                     )

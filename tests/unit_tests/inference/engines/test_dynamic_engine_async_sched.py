@@ -9,6 +9,10 @@ import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.contexts.dynamic_context import DynamoHelper
+from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
+from megatron.core.inference.disaggregation.inference_state_handoff import (
+    InferenceStateHandoffMixin,
+)
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState, _get_decode_only_log_state
 from megatron.core.inference.sampling_params import SamplingParams
@@ -18,13 +22,17 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 
 
-def _make_engine(async_sched_mode=AsyncScheduleMode.ASYNC, **overrides):
-    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+def _make_engine(
+    async_sched_mode=AsyncScheduleMode.ASYNC, engine_cls=DynamicInferenceEngine, **overrides
+):
+    engine = engine_cls.__new__(engine_cls)
     context = SimpleNamespace(
         config=SimpleNamespace(async_sched_mode=async_sched_mode),
         is_hybrid_model=False,
         enable_prefix_caching=False,
         num_prefill_requests=0,
+        total_request_count=0,
+        max_requests=8,
         can_prepare_requests=mock.Mock(return_value=True),
         active_token_count=0,
         max_tokens=8,
@@ -173,6 +181,23 @@ def test_async_sched_overlap_probe_routes_schedulable_chunk_to_no_overlap():
     engine.get_request = mock.Mock(return_value=SimpleNamespace(request_id=10))
 
     assert not engine._should_run_async_sched_overlap()
+
+
+def test_ready_handoff_uses_safe_no_overlap_admission_point():
+    """A completed import cannot join the batch before pending logits are consumed."""
+
+    engine = _make_engine(engine_cls=DisaggDynamicInferenceEngine)
+    engine._initialize_disaggregation_state()
+    engine.waiting_request_ids = deque()
+    engine._pending_kv_imports.append(SimpleNamespace(request_id=7, resume_tokens=[55]))
+    engine._handoff_completion_notifications[7] = False
+
+    assert not engine._should_run_async_sched_overlap()
+
+    # Keep overlap enabled while the active batch is full; the normal lifecycle
+    # boundary will select no-overlap once capacity becomes available.
+    engine.context.total_request_count = engine.context.max_requests
+    assert engine._should_run_async_sched_overlap()
 
 
 @pytest.mark.parametrize(
@@ -364,3 +389,26 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id():
 def test_get_decode_only_log_state(mode, decode_only, expected):
     """Console logging reports transitions and colors the latest available phase."""
     assert _get_decode_only_log_state(mode, decode_only) == expected
+
+
+def test_base_engine_rejects_kv_handoff_commands():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+
+    assert InferenceStateHandoffMixin not in DynamicInferenceEngine.mro()
+    assert engine.pending_kv_import_count == 0
+    with pytest.raises(RuntimeError, match="SUBMIT_REQUEST_WITH_KV"):
+        engine.add_request_with_kv_handoff(1, [], SamplingParams(), {}, [])
+    with pytest.raises(RuntimeError, match="RELEASE_KV"):
+        engine.release_handoff_blocks(1)
+
+
+def test_disagg_engine_resolves_handoff_methods_from_mixin():
+    assert DisaggDynamicInferenceEngine.mro()[:3] == [
+        DisaggDynamicInferenceEngine,
+        InferenceStateHandoffMixin,
+        DynamicInferenceEngine,
+    ]
+    assert (
+        DisaggDynamicInferenceEngine.add_request_with_kv_handoff
+        is InferenceStateHandoffMixin.add_request_with_kv_handoff
+    )
