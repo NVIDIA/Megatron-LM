@@ -195,6 +195,126 @@ def run_fused_qk_topk(
     return result
 
 
+def run_fused_qk_topk_with_scores(
+    config: TransformerConfig,
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    index_topk: int,
+    starts: Tensor,
+    ends: Tensor,
+    block_size: int,
+    use_relu: bool = True,
+    use_local_indexer_varlen: bool = False,
+    single_packed_thd_sequence: bool = False,
+    local_packed_cp_rank: int = 0,
+    local_packed_cp_query_start: int = 0,
+    local_packed_cp_query_len: Optional[int] = None,
+    packed_seq_params: Optional[PackedSeqParams] = None,
+    cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
+    query: Optional[Tensor] = None,
+    key: Optional[Tensor] = None,
+) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+    """Optional fused indexer hook that also returns the selected indexer scores.
+
+    Returns the same index-sorted ``(topk_indices, topk_length)`` as ``run_fused_qk_topk``
+    plus fp32 ``topk_scores`` aligned slot-for-slot with the indices, for
+    ``run_sparse_indexer_loss_from_topk`` to consume in a later checkpoint replay. The
+    attention ``query``/``key`` let the backend decline layouts that replay cannot consume.
+    """
+    fn = _resolve_fused_hook(config, "run_fused_qk_topk_with_scores")
+    if fn is None:
+        return None
+    legacy_local_varlen, legacy_single_sequence = _legacy_packed_cp_flags(
+        cp_size=cp_size,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+    )
+    result = fn(
+        q=q,
+        k=k,
+        weights=weights,
+        index_topk=index_topk,
+        starts=starts,
+        ends=ends,
+        block_size=block_size,
+        use_relu=use_relu,
+        use_local_indexer_varlen=legacy_local_varlen,
+        single_packed_thd_sequence=legacy_single_sequence,
+        local_packed_cp_rank=local_packed_cp_rank,
+        local_packed_cp_query_start=local_packed_cp_query_start,
+        local_packed_cp_query_len=local_packed_cp_query_len,
+        packed_seq_params=packed_seq_params,
+        cp_size=cp_size,
+        **filter_kwargs_for_callable(
+            fn,
+            {
+                "deterministic": _deterministic_dsa_requested(config),
+                "query": query,
+                "key": key,
+                "config": config,
+            },
+        ),
+        **_packed_layout_hook_kwargs(
+            fn,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            packed_thd_causal_identity_layout=use_local_indexer_varlen,
+            packed_thd_single_sequence=single_packed_thd_sequence,
+        ),
+    )
+    if result is None:
+        _log_declined_hook(config, "run_fused_qk_topk_with_scores", "backend returned None")
+    return result
+
+
+def run_sparse_indexer_loss_from_topk(
+    config: TransformerConfig,
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    topk_indices: Tensor,
+    topk_length: Tensor,
+    topk_scores: Tensor,
+    query: Tensor,
+    key: Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    pg_collection: ProcessGroupCollection,
+    query_valid_rows: Optional[Tensor] = None,
+    calculate_per_token_loss: bool = False,
+) -> Optional[Tensor]:
+    """Optional sparse indexer-loss hook for an already selected top-k set.
+
+    Consumes the output of ``run_fused_qk_topk_with_scores`` instead of rerunning the
+    dense indexer and top-k. Returns a graph-connected loss whose backward produces the
+    indexer ``q``/``k``/``weights`` gradients, or None when the backend declines.
+    """
+    fn = _resolve_fused_hook(config, "run_sparse_indexer_loss_from_topk")
+    if fn is None:
+        return None
+    result = fn(
+        config=config,
+        q=q,
+        k=k,
+        weights=weights,
+        topk_indices=topk_indices,
+        topk_length=topk_length,
+        topk_scores=topk_scores,
+        query=query,
+        key=key,
+        softmax_scale=softmax_scale,
+        loss_coeff=loss_coeff,
+        pg_collection=pg_collection,
+        query_valid_rows=query_valid_rows,
+        calculate_per_token_loss=calculate_per_token_loss,
+        **filter_kwargs_for_callable(fn, {"deterministic": _deterministic_dsa_requested(config)}),
+    )
+    if result is None:
+        _log_declined_hook(config, "run_sparse_indexer_loss_from_topk", "backend returned None")
+    return result
+
+
 def run_fused_qk_topk_with_loss(
     config: TransformerConfig,
     q: Tensor,
@@ -404,5 +524,7 @@ __all__ = [
     "run_fused_dsa_attention",
     "run_fused_qk_topk",
     "run_fused_qk_topk_with_loss",
+    "run_fused_qk_topk_with_scores",
+    "run_sparse_indexer_loss_from_topk",
     "use_fused_dsa_kernels",
 ]
