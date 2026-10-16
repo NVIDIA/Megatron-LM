@@ -2,6 +2,7 @@
 
 """Tests for configurable sampling defaults on inference server CLIs."""
 
+import sys
 from argparse import ArgumentParser, Namespace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,6 +13,7 @@ import examples.inference.launch_inference_server as high_level_server
 import tools.run_dynamic_text_generation_server as legacy_server
 from examples.inference.launch_inference_server import add_serve_args
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.training.arguments import parse_args
 from tools.run_dynamic_text_generation_server import add_text_generation_server_args
 
 
@@ -55,6 +57,25 @@ def test_sampling_default_flags(add_args, required_args, serve_args, expected_de
         args.default_top_k,
         args.eval_mode,
     ) == expected_defaults
+
+
+def test_server_args_extend_the_core_parser(monkeypatch):
+    """The server adds the multimodal args to the core parser; no option may be defined twice."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_dynamic_text_generation_server.py",
+            "--language-model-type",
+            "placeholder",
+            "--tokenizer-prompt-format",
+            "mistral",
+        ],
+    )
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("RANK", "0")
+    # --dataloader-prefetch-factor is a core argument that the multimodal args used to repeat.
+    assert parse_args(add_text_generation_server_args).dataloader_prefetch_factor is None
 
 
 @pytest.mark.asyncio

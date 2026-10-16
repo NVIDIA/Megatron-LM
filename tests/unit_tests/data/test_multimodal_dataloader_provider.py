@@ -11,6 +11,9 @@ MULTIMODAL_EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "mul
 sys.path.insert(0, str(MULTIMODAL_EXAMPLE_DIR))
 
 import dataloader_provider  # noqa: E402
+from multimodal_args import add_multimodal_extra_args  # noqa: E402
+
+from megatron.training.arguments import parse_args  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -36,23 +39,12 @@ def test_dataloader_rank_cp_deduplication(monkeypatch, tp_rank, cp_rank, dedupli
     )
 
 
-@pytest.mark.parametrize(
-    ("num_workers", "configured_prefetch_factor", "expected_prefetch_factor"),
-    [(0, 4, None), (1, 4, 4), (1, None, 8)],
-)
-def test_new_dataloader_prefetch_factor(
-    monkeypatch, num_workers, configured_prefetch_factor, expected_prefetch_factor
-):
-    values = {
-        "dataloader_seed": 0,
-        "encoder_pipeline_model_parallel_size": 0,
-        "load": None,
-        "num_workers": num_workers,
-        "packing_buffer_size": 10000,
-    }
-    if configured_prefetch_factor is not None:
-        values["dataloader_prefetch_factor"] = configured_prefetch_factor
-    args = SimpleNamespace(**values)
+# Stands for a namespace without dataloader_prefetch_factor, as before the core flag.
+_UNSET = object()
+
+
+def _new_dataloader_kwargs(monkeypatch, args):
+    """Build the new-path loaders for ``args`` and return the train loader's kwargs."""
     loader_kwargs = {}
 
     monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
@@ -72,6 +64,8 @@ def test_new_dataloader_prefetch_factor(
     )
     monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: True)
     monkeypatch.setattr(dataloader_provider, "FileStoreCachePool", lambda **kwargs: kwargs)
+    # 'auto' sizes the window to one training step of 7 microbatches.
+    monkeypatch.setattr(dataloader_provider, "get_train_num_microbatches_per_step", lambda: 7)
 
     def fake_get_savable_loader(dataset, **kwargs):
         loader_kwargs.update(kwargs)
@@ -88,10 +82,78 @@ def test_new_dataloader_prefetch_factor(
     assert train_loader._dataloader == ["train-dataset"]
     assert valid_loader is None
     assert test_loader._dataloader is None
+    return loader_kwargs
+
+
+@pytest.mark.parametrize(
+    ("num_workers", "configured_prefetch_factor", "expected_prefetch_factor"),
+    [
+        (0, 4, None),
+        (1, 4, 4),
+        # Unset (the core flag's None, or no attribute) keeps the Energon default.
+        (1, None, 8),
+        (1, _UNSET, 8),
+        (0, None, None),
+        # 'auto' keeps one step in flight as in core: ceil(7 / 2) + 1.
+        (2, "auto", 5),
+        (0, "auto", None),
+    ],
+)
+def test_new_dataloader_prefetch_factor(
+    monkeypatch, num_workers, configured_prefetch_factor, expected_prefetch_factor
+):
+    values = {
+        "dataloader_seed": 0,
+        "encoder_pipeline_model_parallel_size": 0,
+        "load": None,
+        "num_workers": num_workers,
+        "packing_buffer_size": 10000,
+    }
+    if configured_prefetch_factor is not _UNSET:
+        values["dataloader_prefetch_factor"] = configured_prefetch_factor
+    loader_kwargs = _new_dataloader_kwargs(monkeypatch, SimpleNamespace(**values))
+
     if expected_prefetch_factor is None:
         assert "prefetch_factor" not in loader_kwargs
     else:
         assert loader_kwargs["prefetch_factor"] == expected_prefetch_factor
+
+
+@pytest.mark.parametrize(
+    ("cli", "expected_flag", "expected_prefetch_factor"),
+    [
+        ([], None, 8),
+        (["--dataloader-prefetch-factor", "16"], 16, 16),
+        (["--dataloader-prefetch-factor", "auto"], "auto", 5),
+    ],
+)
+def test_core_parser_accepts_multimodal_args(
+    monkeypatch, cli, expected_flag, expected_prefetch_factor
+):
+    """The multimodal args extend the core parser, which owns --dataloader-prefetch-factor."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--language-model-type",
+            "test-language-model",
+            "--tokenizer-prompt-format",
+            "nemotron6-moe",
+            "--num-workers",
+            "2",
+            "--packing-buffer-size",
+            "10000",
+            *cli,
+        ],
+    )
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("RANK", "0")
+    args = parse_args(add_multimodal_extra_args)
+    assert args.dataloader_prefetch_factor == expected_flag
+
+    loader_kwargs = _new_dataloader_kwargs(monkeypatch, args)
+    assert loader_kwargs["prefetch_factor"] == expected_prefetch_factor
 
 
 def test_new_dataloader_rejects_non_positive_prefetch_factor(monkeypatch):
