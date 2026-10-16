@@ -82,6 +82,7 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.telemetry import telemetry as _otel
 
 MSC_PREFIX = "msc://"
 
@@ -896,6 +897,18 @@ def _get_filesystem_writer(
     return FileSystemWriter(checkpoint_dir, thread_count=thread_count)
 
 
+def _trace_read_metadata(fs_reader: FileSystemReader) -> FileSystemReader:
+    """Record each metadata read, including reads issued inside DCP."""
+    read_metadata = fs_reader.read_metadata
+
+    def traced_read_metadata(*args, **kwargs):
+        with _otel.managed_span(_otel.DETAIL, _otel.SPAN_CHECKPOINT_LOAD_READ_METADATA):
+            return read_metadata(*args, **kwargs)
+
+    fs_reader.read_metadata = traced_read_metadata
+    return fs_reader
+
+
 def _get_filesystem_reader(
     checkpoint_dir: Union[str, Path], cache_metadata: bool = False
 ) -> FileSystemReader:
@@ -909,16 +922,20 @@ def _get_filesystem_reader(
                 "will be re-read on every load. Pass --enable-msc only when this is intended.",
                 stacklevel=2,
             )
-        return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
+        return _trace_read_metadata(
+            msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
+        )
 
     if cache_metadata:
         from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
             CachedMetadataFileSystemReader,
         )
 
-        return CachedMetadataFileSystemReader(checkpoint_dir, cache_metadata=cache_metadata)
+        return _trace_read_metadata(
+            CachedMetadataFileSystemReader(checkpoint_dir, cache_metadata=cache_metadata)
+        )
 
-    return FileSystemReader(checkpoint_dir)
+    return _trace_read_metadata(FileSystemReader(checkpoint_dir))
 
 
 class TorchDistLoadShardedStrategy:
@@ -964,24 +981,26 @@ class TorchDistLoadShardedStrategy:
 
         orig_sharded_state_dict = sharded_state_dict
         # MCore state dict to PyT Distributed compatible
-        sharded_state_dict, flat_mapping, rename_mapping = (
-            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
-        )
-        pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
+        with _otel.managed_span(_otel.DETAIL, _otel.SPAN_CHECKPOINT_LOAD_MCORE_TO_PYT):
+            sharded_state_dict, flat_mapping, rename_mapping = (
+                _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+            )
+            pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
         fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=self.cache_metadata)
-        checkpoint.load(
-            pyt_state_dict,
-            fsr,
-            planner=MCoreLoadPlanner(
-                shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
-                allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
-                stream_ckpt_dequant=self.stream_ckpt_dequant,
-                flatten_state_dict=False,
-                flatten_sharded_tensors=False,
-            ),
-            no_dist=True,
-        )
+        with _otel.managed_span(_otel.DETAIL, _otel.SPAN_CHECKPOINT_LOAD_IO):
+            checkpoint.load(
+                pyt_state_dict,
+                fsr,
+                planner=MCoreLoadPlanner(
+                    shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
+                    allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                    stream_ckpt_dequant=self.stream_ckpt_dequant,
+                    flatten_state_dict=False,
+                    flatten_sharded_tensors=False,
+                ),
+                no_dist=True,
+            )
 
         if self.cache_metadata:
             self.cached_global_metadata = (

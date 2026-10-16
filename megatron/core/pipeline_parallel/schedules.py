@@ -24,6 +24,7 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
+from megatron.core.telemetry import telemetry as _otel
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
 from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
@@ -41,11 +42,6 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_no_pipelining,
 )
 from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
-
-try:
-    from nemo.lens.helpers import trace_fn as _otel_trace_fn
-except ImportError:
-    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -400,7 +396,7 @@ def forward_step_calc_loss(
     return output_tensor, num_tokens
 
 
-@_otel_trace_fn('microbatch', 'megatron.microbatch.forward')
+@_otel.trace_fn(_otel.DETAIL, _otel.SPAN_MICROBATCH_FORWARD)
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -536,7 +532,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
-@_otel_trace_fn('microbatch', 'megatron.microbatch.backward')
+@_otel.trace_fn(_otel.DETAIL, _otel.SPAN_MICROBATCH_BACKWARD)
 def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     """Backward step through passed-in output tensor.
 
@@ -1452,7 +1448,14 @@ def forward_backward_pipelining_with_interleaving(
                     grad_sync_virtual_microbatch_id, forward=False
                 )
                 enable_grad_sync()
-                config.grad_sync_func[grad_sync_chunk_id](model[grad_sync_chunk_id].parameters())
+                _grad_sync_func = config.grad_sync_func[grad_sync_chunk_id]
+                _grad_sync_params = model[grad_sync_chunk_id].parameters()
+                with _otel.managed_span(
+                    _otel.DETAIL,
+                    _otel.SPAN_GRAD_SYNC_START,
+                    **{_otel.GRAD_SYNC_START_SITE: _otel.GRAD_SYNC_SITE_INTERLEAVED_BACKWARD},
+                ):
+                    _grad_sync_func(_grad_sync_params)
                 synchronized_model_chunks.add(grad_sync_chunk_id)
         disable_grad_sync()
 
@@ -2066,7 +2069,14 @@ def forward_backward_pipelining_with_interleaving(
         if config.grad_sync_func is not None:
             for model_chunk_id in range(num_model_chunks):
                 if model_chunk_id not in synchronized_model_chunks:
-                    config.grad_sync_func[model_chunk_id](model[model_chunk_id].parameters())
+                    _grad_sync_func = config.grad_sync_func[model_chunk_id]
+                    _grad_sync_params = model[model_chunk_id].parameters()
+                    with _otel.managed_span(
+                        _otel.DETAIL,
+                        _otel.SPAN_GRAD_SYNC_START,
+                        **{_otel.GRAD_SYNC_START_SITE: _otel.GRAD_SYNC_SITE_INTERLEAVED_COOLDOWN},
+                    ):
+                        _grad_sync_func(_grad_sync_params)
                     synchronized_model_chunks.add(model_chunk_id)
     nvtx_range_pop(suffix="cooldown")
 
@@ -2520,7 +2530,14 @@ def forward_backward_pipelining_without_interleaving(
         if no_sync_context is not None:
             enable_grad_sync()
             if config.grad_sync_func is not None:
-                config.grad_sync_func(model.parameters())
+                _grad_sync_func = config.grad_sync_func
+                _grad_sync_params = model.parameters()
+                with _otel.managed_span(
+                    _otel.DETAIL,
+                    _otel.SPAN_GRAD_SYNC_START,
+                    **{_otel.GRAD_SYNC_START_SITE: _otel.GRAD_SYNC_SITE_NON_INTERLEAVED_COOLDOWN},
+                ):
+                    _grad_sync_func(_grad_sync_params)
 
     if config.finalize_model_grads_func is not None and not forward_only:
 

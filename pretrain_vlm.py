@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain vision language model."""
 
-# Capture the true program start time BEFORE any heavy imports.
+# Capture entrypoint execution BEFORE heavy imports, after interpreter startup.
 import time
 
 _PROGRAM_START_TIME = time.time()

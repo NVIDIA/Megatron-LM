@@ -37,6 +37,7 @@ from megatron.core.dist_checkpointing.validation import (
     determine_global_metadata,
     validate_sharding_integrity,
 )
+from megatron.core.telemetry import telemetry as _otel
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +272,10 @@ class FullyParallelLoadStrategyWrapper:
             )
 
         # Step 1 and 2: exchange load metadata and distribute the load
-        with debug_time("self.apply_loading_parallelization", logger):
+        with (
+            debug_time("self.apply_loading_parallelization", logger),
+            _otel.managed_span(_otel.DETAIL, _otel.SPAN_CHECKPOINT_LOAD_FULLY_PARALLEL_PLAN),
+        ):
             precomputed_distribution: ShardDistribution | None = self.apply_loading_parallelization(
                 sharded_state_dict
             )
@@ -331,38 +335,39 @@ class FullyParallelLoadStrategyWrapper:
             with debug_time("base_load_ShardedTensors", logger):
                 loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
 
-        with debug_time("self.exchange_loaded_tensors", logger):
-
-            # Step 4: exchange data between ranks
-            logger.debug(f'Applying parallel load with algo {self.exchange_algo}')
-            all_loaded_tensors = exchange_by_distribution(
-                loaded_tensors,
-                unloaded_shards,
-                precomputed_distribution,
-                self.parallelization_group,
-                self.exchange_algo,
-                exchange_quantized_storage=self.stream_ckpt_dequant,
-            )
-            if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
-                missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
-                raise CheckpointingException(
-                    f'Missing shards after fully parallel loading: {missing_shards}'
+        with _otel.managed_span(_otel.DETAIL, _otel.SPAN_CHECKPOINT_LOAD_EXCHANGE):
+            with debug_time("self.exchange_loaded_tensors", logger):
+                # Step 4: exchange data between ranks
+                logger.debug(f'Applying parallel load with algo {self.exchange_algo}')
+                all_loaded_tensors = exchange_by_distribution(
+                    loaded_tensors,
+                    unloaded_shards,
+                    precomputed_distribution,
+                    self.parallelization_group,
+                    self.exchange_algo,
+                    exchange_quantized_storage=self.stream_ckpt_dequant,
                 )
+                if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
+                    missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
+                    raise CheckpointingException(
+                        f'Missing shards after fully parallel loading: {missing_shards}'
+                    )
 
-            with debug_time("torch.cuda.synchronize", logger):
+                with debug_time("torch.cuda.synchronize", logger):
+                    torch.cuda.synchronize()
+
+            if self.per_rank_object_load:
+                # No object exchange: each rank already loaded every object it needs.
+                all_loaded_objects = loaded_objects
+            else:
+                all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
+                if not set(unloaded_objects.keys()).issubset(all_loaded_objects.keys()):
+                    missing_object_shards = set(unloaded_objects.keys()) - all_loaded_objects.keys()
+                    raise CheckpointingException(
+                        'Missing object shards after fully parallel loading: '
+                        f'{missing_object_shards}'
+                    )
                 torch.cuda.synchronize()
-
-        if self.per_rank_object_load:
-            # No object exchange: each rank already loaded every object it needs.
-            all_loaded_objects = loaded_objects
-        else:
-            all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
-            if not set(unloaded_objects.keys()).issubset(all_loaded_objects.keys()):
-                missing_object_shards = set(unloaded_objects.keys()) - all_loaded_objects.keys()
-                raise CheckpointingException(
-                    f'Missing object shards after fully parallel loading: {missing_object_shards}'
-                )
-            torch.cuda.synchronize()
 
         self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
         self.fill_in_deferred_sharded_objects(sharded_objects, all_loaded_objects)

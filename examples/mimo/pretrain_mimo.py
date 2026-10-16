@@ -4,6 +4,11 @@
 
 from __future__ import annotations
 
+# Capture entrypoint execution before heavy imports, after interpreter startup.
+import time
+
+_PROGRAM_START_TIME = time.time()
+
 from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 
 # Quiet the duplicate warnings before the heavy imports below: torch raises its
@@ -37,7 +42,7 @@ from megatron.core.utils import unwrap_model
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import initialize_runtime_services, set_args, set_run_config
-from megatron.training.training import pretrain
+from megatron.training.training import pretrain, set_startup_timestamps
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 
@@ -168,4 +173,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    _MAIN_ENTRY_TIME = time.time()
+    set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
     main()
