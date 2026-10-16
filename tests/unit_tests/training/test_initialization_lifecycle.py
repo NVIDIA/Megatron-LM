@@ -97,7 +97,7 @@ def test_explicit_inference_bootstrap_preserves_sparse_args(monkeypatch, isolate
     assert cfg.checkpoint.fully_parallel_save is (True if aliases is None else aliases)
     assert cfg.checkpoint.fully_parallel_load is bool(aliases)
     assert cfg.profiling.use_nsys_profiler is bool(aliases)
-    initialize.assert_called_once_with(args, build_tokenizer=True, training=True)
+    initialize.assert_called_once_with(args, build_tokenizer=True, training=False)
     with pytest.raises(AssertionError, match="already initialized"):
         global_vars.set_global_variables(args, cfg)
 
@@ -209,9 +209,17 @@ def test_vocabulary_resolves_after_config_construction(
 
 
 @pytest.mark.parametrize("use_bootstrap", [False, True])
-def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globals, use_bootstrap):
+def test_runtime_service_order_and_microbatch_inputs(
+    monkeypatch, isolated_globals, use_bootstrap, run_config
+):
     args = _runtime_args()
-    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg = run_config
+    cfg.train.global_batch_size = 8
+    cfg.train.micro_batch_size = 2
+    # Runtime services must use the container even when legacy args disagree.
+    args.global_batch_size = 99
+    args.micro_batch_size = 99
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     if not use_bootstrap:
         global_vars.set_args(args)
         global_vars.set_run_config(cfg)
@@ -280,6 +288,26 @@ def test_custom_model_config_does_not_receive_vocabulary(monkeypatch, isolated_g
     resolve_tokenizer_vocab_size(cfg, 128)
     assert vars(custom_model) == {}
     assert cfg.tokenizer.padded_vocab_size == 128
+
+
+@pytest.mark.parametrize("eval_batch_sizes", [None, (16, 4)])
+@pytest.mark.parametrize("schedule", [None, "0:8 32:16"])
+def test_native_batch_defaults_preserve_explicit_eval_sizes(run_config, eval_batch_sizes, schedule):
+    run_config.train.micro_batch_size = 2
+    run_config.train.step_batch_size_schedule = schedule
+    if eval_batch_sizes is not None:
+        (
+            run_config.validation.eval_global_batch_size,
+            run_config.validation.eval_micro_batch_size,
+        ) = eval_batch_sizes
+    run_config.finalize_batch_sizes(batch_parallel_size=2)
+    # Repeated finalization also accepts the resolved GBS alongside a step schedule.
+    run_config.finalize_batch_sizes(batch_parallel_size=2)
+    assert run_config.train.global_batch_size == 4
+    assert (
+        run_config.validation.eval_global_batch_size,
+        run_config.validation.eval_micro_batch_size,
+    ) == (eval_batch_sizes or (4, 2))
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])

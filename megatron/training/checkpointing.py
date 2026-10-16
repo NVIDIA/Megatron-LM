@@ -188,24 +188,33 @@ def check_checkpoint_args(
     args = get_args()
     skip_args = skip_args or set()
 
-    def _compare(arg_name, old_arg_name=None, default=None):
+    def _compare(arg_name, old_arg_name=None, default=None, *, config_section=None):
+        """Prefer saved config values, falling back to args for older checkpoints."""
         if arg_name in skip_args:
             return
         if old_arg_name is not None:
             ckpt_arg_name = old_arg_name
         else:
             ckpt_arg_name = arg_name
-        if default is not None:
+        saved_config = (
+            checkpoint_config.get(config_section, {})
+            if checkpoint_config is not None and config_section is not None
+            else {}
+        )
+        if arg_name in saved_config:
+            checkpoint_value = saved_config[arg_name]
+        elif default is not None:
             checkpoint_value = getattr(checkpoint_args, ckpt_arg_name, default)
         else:
             checkpoint_value = getattr(checkpoint_args, ckpt_arg_name)
-        args_value = getattr(args, arg_name)
+        current_config = getattr(cfg, config_section) if config_section is not None else args
+        current_value = getattr(current_config, arg_name)
         error_message = (
-            '{} value from checkpoint ({}) is not equal to the input argument value ({}).'.format(
-                arg_name, checkpoint_value, args_value
+            '{} value from checkpoint ({}) is not equal to the input value ({}).'.format(
+                arg_name, checkpoint_value, current_value
             )
         )
-        assert checkpoint_value == args_value, error_message
+        assert checkpoint_value == current_value, error_message
 
     _compare('num_layers')
     _compare('hidden_size')
@@ -231,18 +240,10 @@ def check_checkpoint_args(
         if not args.use_dist_ckpt:
             _compare('padded_vocab_size')
         _compare('tokenizer_type')
-    if cfg.rng.data_parallel_random_init and 'data_parallel_random_init' not in skip_args:
-        saved_rng = checkpoint_config.get('rng', {}) if checkpoint_config is not None else {}
-        if 'data_parallel_random_init' in saved_rng:
-            saved_dp_random_init = saved_rng['data_parallel_random_init']
-        else:
-            # Older checkpoints predate run_config.yaml.
-            saved_dp_random_init = checkpoint_args.data_parallel_random_init
-        assert saved_dp_random_init == cfg.rng.data_parallel_random_init, (
-            'data_parallel_random_init value from checkpoint does not match cfg.rng.'
-        )
+    if cfg.rng.data_parallel_random_init:
+        _compare('data_parallel_random_init', config_section='rng')
     if check_training_state and args.phase_transition_iterations:
-        _compare('global_batch_size')
+        _compare('global_batch_size', config_section='train')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size')
     if get_checkpoint_version() >= 3.0 and not args.use_dist_ckpt:
@@ -3140,20 +3141,23 @@ def load_checkpoint(
     # GBS-match check applies only when adopting this checkpoint's own args (not a finetune load).
     if restore_training_state and getattr(args, 'override_ckpt_iteration', None) is not None:
         if 'args' in state_dict and not args.finetune:
-            ckpt_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
+            saved_train = checkpoint_config.get('train', {}) if checkpoint_config is not None else {}
+            ckpt_global_batch_size = saved_train.get(
+                'global_batch_size', getattr(state_dict['args'], 'global_batch_size', None)
+            )
             if (
                 ckpt_global_batch_size is not None
-                and ckpt_global_batch_size != args.global_batch_size
+                and ckpt_global_batch_size != cfg.train.global_batch_size
             ):
                 warn_rank_0(
                     '--override-ckpt-iteration recomputes consumed_train_samples = target_iter * '
-                    f'current global_batch_size ({args.global_batch_size}), but this checkpoint '
+                    f'current global_batch_size ({cfg.train.global_batch_size}), but this checkpoint '
                     f'was saved at global_batch_size {ckpt_global_batch_size}. If the target '
                     "iteration is in the checkpoint run's units, the data loader resumes from a "
                     'shifted sample offset.'
                 )
         iteration = args.override_ckpt_iteration
-        args.consumed_train_samples = iteration * args.global_batch_size
+        args.consumed_train_samples = iteration * cfg.train.global_batch_size
         args.skipped_train_samples = 0
         print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
                      f'(consumed_train_samples {args.consumed_train_samples})')

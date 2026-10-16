@@ -13,10 +13,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.utils import compile_helpers
+from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_train_valid_test_num_samples
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.global_vars import set_args, unset_global_variables
+from megatron.training.global_vars import set_args, set_run_config, unset_global_variables
 from megatron.training.training import update_train_iters
 from megatron.training.utils import get_blend_and_blend_per_split
 
@@ -170,8 +172,11 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
     set_args(args)
 
     try:
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.finalize_batch_sizes(get_batch_parallel_size(args))
+        set_run_config(cfg)
         # Derive train_iters from --train-samples when needed (pretrain() does the same).
-        update_train_iters(args)
+        update_train_iters(cfg.train)
         train_valid_test_num_samples = get_train_valid_test_num_samples()
         _print_effective_configuration(args, train_valid_test_num_samples, ignored_flags)
 

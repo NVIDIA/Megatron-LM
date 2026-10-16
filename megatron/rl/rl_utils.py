@@ -2547,7 +2547,7 @@ def prepare_data_for_update(
         rollouts = [r for g in rollouts for r in g]
 
         # We might sample more than we consume in one step.
-        samples_ratio_per_step = args.global_batch_size / cfg.rl.grpo_samples_per_iteration
+        samples_ratio_per_step = cfg.train.global_batch_size / cfg.rl.grpo_samples_per_iteration
         assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
 
         # Build training rows. A rollout collapses to one combined row when its turns form a
@@ -2575,7 +2575,7 @@ def prepare_data_for_update(
         # The rollout count is data-dependent (oversampling, group filtering), so it need not
         # divide evenly across ranks and microbatches. Pad to the next multiple of
         # (DP size * micro_batch_size) with inert rows (zero advantage, no loss contribution).
-        pad_to_multiple = data_parallel_world_size * args.micro_batch_size
+        pad_to_multiple = data_parallel_world_size * cfg.train.micro_batch_size
         if pad_n := -len(rows) % pad_to_multiple:
             rows = rows + [PAD_ROW] * pad_n
             advantages = global_advantages = torch.cat(
@@ -2648,9 +2648,9 @@ def prepare_data_for_update(
                 compute_position_ids = original_position_ids
                 data_loader = DataLoader(
                     TensorDataset(compute_trajs, compute_position_ids),
-                    batch_size=args.micro_batch_size,
+                    batch_size=cfg.train.micro_batch_size,
                 )
-                logprobs_batch_size = args.micro_batch_size
+                logprobs_batch_size = cfg.train.micro_batch_size
 
 
         with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
@@ -2759,11 +2759,11 @@ def prepare_data_for_update(
                     samples_ratio_per_step=samples_ratio_per_step,
                     num_bins_this_rank = len(packing_context.packed_trajs),
                     bin_seq_indices = packing_context.packing_info.bin_seq_indices,
-                    global_batch_size=args.global_batch_size,
-                    micro_batch_size=args.micro_batch_size,
-                    decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+                    global_batch_size=cfg.train.global_batch_size,
+                    micro_batch_size=cfg.train.micro_batch_size,
+                    decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
                )
-                loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
+                loader = get_microbatch_dataloader(len(packing_context.packed_trajs), cfg.train.micro_batch_size)
         else:
             with nvtx_range("rl/align-inference-logprobs", time=True):
                 if inference_logprobs is not None:
@@ -2786,8 +2786,8 @@ def prepare_data_for_update(
                 reconfigure_num_microbatches_calculator(
                     rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
                     global_batch_size=math.ceil(samples_ratio_per_step*total_rows),
-                    micro_batch_size=args.micro_batch_size,
-                    decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+                    micro_batch_size=cfg.train.micro_batch_size,
+                    decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )
 
@@ -2804,7 +2804,7 @@ def prepare_data_for_update(
                 else:
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
                 data = TensorDataset(*dataset_tensors)
-                loader = DataLoader(data, batch_size=args.micro_batch_size)
+                loader = DataLoader(data, batch_size=cfg.train.micro_batch_size)
 
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 

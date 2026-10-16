@@ -68,13 +68,17 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
 
 
 @pytest.mark.parametrize("restored_samples", [0, 8, 32])
-def test_resume_updates_microbatches_before_setup_validation(monkeypatch, restored_samples):
+def test_resume_updates_microbatches_before_setup_validation(
+    monkeypatch, restored_samples, run_config
+):
     from megatron.training import training
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.skip_train = True  # Evaluation-only setup must also restore the calculator.
+    run_config.validation.skip_train = True
+    run_config.train.micro_batch_size = 1
     args.load = "checkpoint"
     args.data_parallel_size = 1
     args.micro_batch_size = 1

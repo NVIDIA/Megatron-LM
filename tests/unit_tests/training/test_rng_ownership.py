@@ -271,6 +271,7 @@ def test_cached_logits_identity_uses_dataset_seed_not_legacy_args(monkeypatch, r
     from megatron.training.distillation import utils_logits
 
     args = Namespace(seed=999, seq_length=32, train_samples=16)
+    run_config.train.train_samples = 16
     monkeypatch.setattr(utils_logits, "get_args", lambda: args)
     monkeypatch.setattr(utils_logits, "_blend_identifiers", lambda args: {"mock": True})
     run_config.rng.seed = 123
