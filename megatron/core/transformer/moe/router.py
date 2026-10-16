@@ -791,8 +791,10 @@ class TopKRouter(Router):
                         device=activation.device
                     )
                 else:
-                    aux_loss_scale_num_tokens = torch.tensor(
-                        num_local_tokens, device=activation.device
+                    # torch.full is a device-side fill; torch.tensor(int, device=cuda) does a
+                    # pageable H2D copy that fails inside the moe_router CUDA graph capture.
+                    aux_loss_scale_num_tokens = torch.full(
+                        (), num_local_tokens, dtype=torch.int64, device=activation.device
                     )
                 if aux_loss_scale_reduce_groups is None:
                     assert reduce_group is not None, "reduce_group is required for aux-loss scaling"
