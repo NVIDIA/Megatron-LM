@@ -103,6 +103,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_kpool": 1,
     "dsa_indexer_kpool_use_quantization": False,
     "dsa_indexer_kpool_always_select_tail": True,
+    "dsa_indexer_kpool_shard_queries_across_tp": False,
     "dsa_indexer_loss_coeff": None,
     "dsa_indexer_n_heads": None,
     "dsa_indexer_qk_proj_use_quantization": True,
