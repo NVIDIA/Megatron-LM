@@ -1,19 +1,20 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Single-kernel sigmoid top-k routing for inference.
+"""Sigmoid top-k routing kernels for inference.
 
 Replaces the compiled ``topk_routing_with_score_function`` sequence for sigmoid
 scores with an expert bias (an inductor sigmoid+bias kernel, aten ``topk``, and
-two inductor gather/normalize kernels) with one launch. Expert selection and
-ordering match ``torch.topk(..., sorted=False)``. Small top-k also matches the
-compiled probability bits; large top-k uses a fixed fp32 reduction tree and can
-differ in rounding from Inductor's autotuned reduction. Batch-invariant routing
-does not use this kernel.
+two inductor gather/normalize kernels) with one launch for top-k below eight.
+Expert selection and ordering match ``torch.topk(..., sorted=False)``, and
+probabilities match the compiled left-fold normalization bitwise. Larger top-k
+uses parallel expert selection while preserving the compiled sigmoid and
+normalization graph. Batch-invariant routing does not use these kernels.
 """
 
 from typing import Optional
 from unittest.mock import MagicMock
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from megatron.core.utils import null_decorator
 
@@ -30,84 +31,119 @@ if not HAVE_TRITON:
     triton.jit = null_decorator
     tl = MagicMock()
 
-HAVE_PARALLEL_TOPK = HAVE_TRITON and hasattr(tl, "topk")
-
 
 def is_sigmoid_topk_supported(num_experts: int, topk: int) -> bool:
-    """Whether the fused path covers this expert count and top-k width."""
+    """Whether the fused path preserves the compiled router's normalization order."""
+    return 1 < topk < 8 and topk <= num_experts <= 512
+
+
+def is_topk_scores_supported(num_experts: int, topk: int) -> bool:
+    """Whether parallel top-k selection is available for this inference shape."""
     return (
-        1 < topk <= min(num_experts, 32) and num_experts <= 512 and (topk < 8 or HAVE_PARALLEL_TOPK)
+        HAVE_TRITON
+        and hasattr(tl, "topk")
+        and hasattr(TorchDispatchMode, "ignore_compile_internals")
+        and 8 <= topk <= min(32, num_experts)
+        and num_experts <= 512
     )
 
 
 @triton.jit
-def _sigmoid_topk_parallel_kernel(
-    logits_ptr,
-    expert_bias_ptr,
-    probs_ptr,
+def _topk_scores_kernel(
+    scores_ptr,
+    values_ptr,
     indices_ptr,
-    num_tokens,
-    scaling_factor,
     NUM_EXPERTS: tl.constexpr,
     EXPERTS_POW2: tl.constexpr,
     TOPK: tl.constexpr,
     TOPK_POW2: tl.constexpr,
-    APPLY_SCALING: tl.constexpr,
-    BLOCK_T: tl.constexpr,
 ):
-    """Select large top-k in parallel and normalize only the selected slots.
-
-    Repeated full-row maxima scale poorly with top-k, particularly when a decode
-    step has only one or two tokens. Two integer top-k operations find the cutoff
-    and restore aten's unsorted output order without a loop over selected experts.
-    """
-    rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
-    rows64 = rows.to(tl.int64)
+    """Parallel cutoff selection with aten's unsorted expert order."""
+    row = tl.program_id(0)
     cols = tl.arange(0, EXPERTS_POW2)
-    mask = (rows[:, None] < num_tokens) & (cols[None, :] < NUM_EXPERTS)
-    logits = tl.load(logits_ptr + rows64[:, None] * NUM_EXPERTS + cols[None, :], mask, other=0)
-    bias = tl.load(expert_bias_ptr + cols, cols < NUM_EXPERTS, other=0)
-    scores = tl.sigmoid(logits)
-    bits = (scores + bias[None, :]).to(tl.int32, bitcast=True)
+    valid = cols < NUM_EXPERTS
+    scores = tl.load(scores_ptr + row.to(tl.int64) * NUM_EXPERTS + cols, valid, other=0.0)
+    bits = scores.to(tl.int32, bitcast=True)
     keys = tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
-    keys = tl.where(cols[None, :] < NUM_EXPERTS, keys, -2147483648)
+    keys = tl.where(valid, keys, -2147483648)
+    largest = tl.topk(keys, TOPK_POW2, dim=0)
+    kth = tl.sum(tl.where(tl.arange(0, TOPK_POW2) == TOPK - 1, largest, 0))
 
-    largest = tl.topk(keys, TOPK_POW2, dim=1)
-    kth = tl.gather(largest, tl.full((BLOCK_T, 1), TOPK - 1, tl.int32), axis=1)
-    # aten emits experts strictly above the cutoff in ascending column order,
-    # then fills the remaining slots with ties, also in ascending column order.
-    priority = tl.where(
-        keys > kth,
-        2 * NUM_EXPERTS - cols[None, :],
-        tl.where(keys == kth, NUM_EXPERTS - cols[None, :], 0),
-    )
-    priority = tl.where(cols[None, :] < NUM_EXPERTS, priority, 0)
-    ordered = tl.topk(priority, TOPK_POW2, dim=1)
-    indices = tl.where(ordered > NUM_EXPERTS, 2 * NUM_EXPERTS - ordered, NUM_EXPERTS - ordered)
-    # Unselected power-of-two padding slots may decode to NUM_EXPERTS.
-    indices = tl.minimum(indices, NUM_EXPERTS - 1)
-    slots = tl.arange(0, TOPK_POW2)
-    selected = tl.gather(scores, indices, axis=1)
-    selected = tl.where(slots[None, :] < TOPK, selected, 0.0)
+    # Use only the cutoff from topk. Emit above-cutoff columns first, followed
+    # by enough cutoff ties to reach k; both groups follow input column order.
+    above = (keys > kth) & valid
+    tied = (keys == kth) & valid
+    num_above = tl.sum(above.to(tl.int32), axis=0)
+    tied_rank = tl.cumsum(tied.to(tl.int32), axis=0)
+    selected_tied = tied & (tied_rank <= TOPK - num_above)
+    slot = tl.where(above, tl.cumsum(above.to(tl.int32), axis=0) - 1, num_above + tied_rank - 1)
+    offsets = row.to(tl.int64) * TOPK + slot
+    tl.store(indices_ptr + offsets, cols.to(tl.int64), above | selected_tied)
+    tl.store(values_ptr + offsets, scores, above | selected_tied)
 
-    # Use a fixed butterfly tree, matching Inductor's one-row persistent reduction.
-    # A plain tl.sum can change the local sum order when topk's result layout puts
-    # multiple slots in one thread. Inductor may autotune a different reduction
-    # layout for larger batches, so equivalence to it is numerical, not bitwise.
-    folded = selected
-    for level in tl.static_range(triton.next_power_of_2(TOPK).bit_length() - 1):
-        partner = tl.broadcast_to(
-            (slots ^ (TOPK_POW2 >> (level + 1)))[None, :], (BLOCK_T, TOPK_POW2)
+
+def topk_scores(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unsorted top-k for contiguous finite fp32 inference scores on CUDA.
+
+    Called at execution time by ``ParallelTopKMode`` so the original compiled
+    router, including its cached normalization kernels, stays unchanged.
+    """
+    assert scores.is_cuda and scores.ndim == 2 and scores.dtype == torch.float32
+    assert scores.is_contiguous()
+    num_tokens, num_experts = scores.shape
+    assert is_topk_scores_supported(num_experts, topk)
+    values = scores.new_empty((num_tokens, topk))
+    indices = scores.new_empty((num_tokens, topk), dtype=torch.int64)
+    if num_tokens:
+        _topk_scores_kernel[(num_tokens,)](
+            scores,
+            values,
+            indices,
+            NUM_EXPERTS=num_experts,
+            EXPERTS_POW2=triton.next_power_of_2(num_experts),
+            TOPK=topk,
+            TOPK_POW2=triton.next_power_of_2(topk),
+            # Wide prefill batches expose enough row-level parallelism to use
+            # fewer warps per CTA. Tiny decode batches benefit from four warps.
+            num_warps=1 if num_experts == 512 and num_tokens >= 1024 else 4,
         )
-        folded = folded + tl.gather(folded, partner, axis=1)
-    total = tl.gather(folded, tl.full((BLOCK_T, 1), 0, tl.int32), axis=1)
-    probs = selected / (total + 1e-20)
-    if APPLY_SCALING:
-        probs *= scaling_factor
-    out_offsets = rows64[:, None] * TOPK + slots[None, :]
-    out_mask = (rows[:, None] < num_tokens) & (slots[None, :] < TOPK)
-    tl.store(probs_ptr + out_offsets, probs, out_mask)
-    tl.store(indices_ptr + out_offsets, indices.to(tl.int64), out_mask)
+    return values, indices
+
+
+class ParallelTopKMode(TorchDispatchMode):
+    """Replace aten top-k only while executing the original compiled router.
+
+    Replacing top-k in the FX graph changes its cache key. A new graph can
+    autotune normalization differently from a cached reference, changing
+    probability bits even if its mathematical expressions are unchanged.
+    This mode leaves tracing, compilation and cache lookup untouched; only
+    the runtime top-k call is replaced. The selected values and indices are
+    identical, so the same compiled probability kernels see the same inputs.
+    """
+
+    @classmethod
+    def ignore_compile_internals(cls):
+        return True
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func is torch.ops.aten.topk.default:
+            scores, topk, *options = args
+            dim = options[0] if options else kwargs.get("dim", -1)
+            largest = options[1] if len(options) > 1 else kwargs.get("largest", True)
+            sorted_output = options[2] if len(options) > 2 else kwargs.get("sorted", True)
+            if (
+                scores.is_cuda
+                and scores.ndim == 2
+                and scores.dtype == torch.float32
+                and scores.is_contiguous()
+                and dim in (1, -1)
+                and largest
+                and not sorted_output
+                and is_topk_scores_supported(scores.shape[1], topk)
+            ):
+                return topk_scores(scores, topk)
+        return func(*args, **kwargs)
 
 
 @triton.jit
@@ -119,6 +155,7 @@ def _sigmoid_topk_kernel(
     num_tokens,
     scaling_factor,
     NUM_EXPERTS: tl.constexpr,
+    BIAS_STRIDE: tl.constexpr,
     EXPERTS_POW2: tl.constexpr,
     TOPK: tl.constexpr,
     APPLY_SCALING: tl.constexpr,
@@ -141,7 +178,7 @@ def _sigmoid_topk_kernel(
     rows64 = rows.to(tl.int64)
 
     logits = tl.load(logits_ptr + rows64[:, None] * NUM_EXPERTS + cols[None, :], mask=mask)
-    bias = tl.load(expert_bias_ptr + cols, mask=col_mask)
+    bias = tl.load(expert_bias_ptr + cols * BIAS_STRIDE, mask=col_mask)
     scores = tl.sigmoid(logits)
     routing_scores = scores + bias[None, :]
 
@@ -209,51 +246,41 @@ def sigmoid_topk_routing(
     Equivalent to ``topk_routing_with_score_function(logits, topk,
     score_function="sigmoid", expert_bias=expert_bias, scaling_factor=...,
     dense_output=True)`` evaluated by torch.compile with gradients disabled
-    (which selects with ``torch.topk(sorted=False)``) for finite fp32 logits in
-    the shape range covered by ``is_sigmoid_topk_supported``. Small top-k uses
-    the compiled left fold and matches bitwise. Top-k 8--32 uses a fixed butterfly
-    reduction: indices match exactly, but probabilities may differ by fp32 rounding
-    from the compiled path's autotuned sum order. Repeated calls on identical inputs
-    produce identical bits. This path is not used in batch-invariant mode.
+    (which selects with ``torch.topk(sorted=False)``) for finite fp32 logits and bias in
+    the shape range covered by ``is_sigmoid_topk_supported``. Both indices and
+    probabilities match bitwise. Top-k of eight or more is unsupported: its compiled
+    reduction order can depend on autotuning and prior batch shapes. The inference
+    router replaces only top-k selection for those calls, retaining compiled
+    sigmoid and normalization. This kernel is not used in batch-invariant mode.
 
     Args:
         logits: [num_tokens, num_experts] fp32 router logits.
-        expert_bias: [num_experts] fp32 routing bias (selection only).
-        topk: experts per token, in [2, 32] and no greater than num_experts.
+        expert_bias: [num_experts] fp32 routing bias on the same device as logits
+            (selection only). Strided views are supported.
+        topk: experts per token, in [2, 7] and no greater than num_experts.
         scaling_factor: optional multiplier applied to the normalized probabilities.
-        block_tokens: optional rows per CTA; defaults to four for small top-k and
-            one for large top-k so tiny decode batches expose independent CTAs.
+        block_tokens: optional rows per CTA; defaults to one for up to 128 experts
+            and four for wider rows.
 
     Returns:
         probs [num_tokens, topk] fp32 and top_indices [num_tokens, topk] int64.
     """
     assert logits.dim() == 2 and logits.dtype == torch.float32 and logits.is_contiguous()
+    assert expert_bias.dim() == 1, "expert_bias must be one-dimensional"
     assert expert_bias.dtype == torch.float32 and expert_bias.numel() == logits.shape[1]
+    assert expert_bias.device == logits.device, "expert_bias and logits must be on the same device"
     num_tokens, num_experts = logits.shape
     assert is_sigmoid_topk_supported(num_experts, topk)
+    num_warps = 4
     if block_tokens is None:
-        block_tokens = 4 if topk < 8 else 1
+        # One warp per short row avoids idle rows on decode batches and exposes
+        # more independent CTAs on prefill. Wider rows retain the existing layout.
+        block_tokens = 1 if num_experts <= 128 else 4
+        num_warps = 1 if num_experts <= 128 else 4
     assert block_tokens > 0 and block_tokens & (block_tokens - 1) == 0
     probs = torch.empty(num_tokens, topk, dtype=torch.float32, device=logits.device)
     indices = torch.empty(num_tokens, topk, dtype=torch.int64, device=logits.device)
     if num_tokens == 0:
-        return probs, indices
-    if topk >= 8:
-        _sigmoid_topk_parallel_kernel[(triton.cdiv(num_tokens, block_tokens),)](
-            logits,
-            expert_bias,
-            probs,
-            indices,
-            num_tokens,
-            float(scaling_factor) if scaling_factor else 1.0,
-            NUM_EXPERTS=num_experts,
-            EXPERTS_POW2=triton.next_power_of_2(num_experts),
-            TOPK=topk,
-            TOPK_POW2=triton.next_power_of_2(topk),
-            APPLY_SCALING=bool(scaling_factor),
-            BLOCK_T=block_tokens,
-            num_warps=4,
-        )
         return probs, indices
     _sigmoid_topk_kernel[(triton.cdiv(num_tokens, block_tokens),)](
         logits,
@@ -263,9 +290,11 @@ def sigmoid_topk_routing(
         num_tokens,
         float(scaling_factor) if scaling_factor else 1.0,
         NUM_EXPERTS=num_experts,
+        BIAS_STRIDE=expert_bias.stride(0),
         EXPERTS_POW2=triton.next_power_of_2(num_experts),
         TOPK=topk,
         APPLY_SCALING=bool(scaling_factor),
         BLOCK_T=block_tokens,
+        num_warps=num_warps,
     )
     return probs, indices

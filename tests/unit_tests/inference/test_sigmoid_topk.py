@@ -2,17 +2,21 @@
 
 """Unit tests for megatron.core.inference.moe.sigmoid_topk.
 
-Expert indices must match the compiled inference router exactly. Probabilities
-are bit-exact for top-k below eight. Larger top-k uses a fixed reduction tree,
-while Inductor autotunes its tree, so their fp32 probabilities may differ within
-5e-7 relative error. Batch-invariant and autograd paths retain exact comparisons.
+Expert indices and probabilities must match the compiled inference router bit
+for bit. Top-k below eight uses the fused kernel; larger top-k uses parallel
+selection and preserves compiled probabilities. Batch-invariant and autograd
+paths retain their existing behavior.
 """
 
 import pytest
 import torch
 
 from megatron.core.inference.moe import sigmoid_topk as sigmoid_topk_module
-from megatron.core.inference.moe.sigmoid_topk import sigmoid_topk_routing
+from megatron.core.inference.moe.sigmoid_topk import (
+    is_topk_scores_supported,
+    sigmoid_topk_routing,
+    topk_scores,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
@@ -27,21 +31,15 @@ MODEL_ROUTING_CONFIGS = [
 ]
 
 
-def _require_parallel_topk(topk):
-    if topk >= 8 and not sigmoid_topk_module.HAVE_PARALLEL_TOPK:
-        pytest.skip("Large top-k fusion requires triton.language.topk")
-
-
-def _assert_matches_compiled(probs, indices, ref_probs, ref_indices, topk, case=None):
+def _assert_matches_compiled(probs, indices, ref_probs, ref_indices, case=None):
     assert indices.dtype == ref_indices.dtype, case
     assert probs.dtype == ref_probs.dtype, case
     assert torch.equal(indices, ref_indices), case
-    if topk < 8:
-        assert torch.equal(probs.view(torch.int32), ref_probs.view(torch.int32)), case
-    else:
-        # Inductor may choose a different fp32 addition tree for static and dynamic
-        # batch sizes. The fused kernel keeps a fixed tree and exact expert selection.
-        torch.testing.assert_close(probs, ref_probs, rtol=5e-7, atol=0, msg=str(case))
+    assert torch.equal(probs.view(torch.int32), ref_probs.view(torch.int32)), case
+
+
+def _unexpected_fused_routing(*args, **kwargs):
+    pytest.fail("Large top-k must preserve the compiled probability computation")
 
 
 def _compiled_reference(logits, expert_bias, topk, scaling_factor):
@@ -85,6 +83,15 @@ def _inputs(kind, num_tokens, num_experts, seed):
     return logits.contiguous(), bias
 
 
+def _strided_expert_bias(bias):
+    # Unused entries must differ from the logical bias to expose contiguous loads.
+    storage = torch.full((2 * bias.numel() + 1,), 10.0, device=bias.device, dtype=bias.dtype)
+    view = storage[1::2]
+    view.copy_(bias)
+    assert view.storage_offset() == 1 and view.stride() == (2,)
+    return view
+
+
 @pytest.mark.internal
 class TestSigmoidTopkRouting:
 
@@ -93,12 +100,9 @@ class TestSigmoidTopkRouting:
     # compiled probability reduction. Compiling several top-k values without resetting
     # dynamo can make top-k symbolic and change the reduction order.
     @pytest.mark.parametrize(
-        "num_experts,topk,scaling_factor",
-        MODEL_ROUTING_CONFIGS
-        + [(64, 7, None), (96, 2, 1.5), (128, 8, 2.5), (96, 16, None), (256, 32, 1.5)],
+        "num_experts,topk,scaling_factor", [MODEL_ROUTING_CONFIGS[0], (64, 7, None), (96, 2, 1.5)]
     )
     def test_matches_compiled_router_across_batch_sizes(self, num_experts, topk, scaling_factor):
-        _require_parallel_topk(topk)
         torch._dynamo.reset()
         try:
             for kind in ("normal", "wide", "ties", "all_equal", "zero_scores"):
@@ -110,31 +114,43 @@ class TestSigmoidTopkRouting:
                         )
                         probs, indices = sigmoid_topk_routing(logits, bias, topk, scaling_factor)
                     _assert_matches_compiled(
-                        probs, indices, ref_probs, ref_indices, topk, case=(kind, num_tokens)
+                        probs, indices, ref_probs, ref_indices, case=(kind, num_tokens)
                     )
         finally:
             torch._dynamo.reset()
 
-    @pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 8, 17, 40, 65, 1024, 8192])
-    def test_large_topk_matches_fresh_static_compiled_router(self, num_tokens):
-        """Compile each batch size first so dynamic-shape reuse cannot hide autotuning."""
-        _require_parallel_topk(22)
+    @pytest.mark.parametrize("num_experts,topk,scaling_factor", [MODEL_ROUTING_CONFIGS[0]])
+    @pytest.mark.parametrize("layout", ["strided", "broadcast"])
+    def test_expert_bias_views_match_contiguous(self, num_experts, topk, scaling_factor, layout):
         torch._dynamo.reset()
         try:
-            for kind in ("normal", "wide", "ties", "all_equal", "zero_scores"):
-                logits, bias = _inputs(kind, num_tokens, 512, seed=num_tokens)
-                with torch.inference_mode():
-                    ref_probs, ref_indices = _compiled_reference(logits, bias, 22, 5.0)
-                    probs, indices = sigmoid_topk_routing(logits, bias, 22, 5.0)
-                _assert_matches_compiled(
-                    probs, indices, ref_probs, ref_indices, 22, case=(kind, num_tokens)
+            logits, bias = _inputs("normal", 3, num_experts, seed=37)
+            if layout == "strided":
+                bias = _strided_expert_bias(bias)
+            else:
+                # Keep enough backing storage for an incorrect contiguous load to
+                # read different values without accessing an invalid address.
+                storage = torch.full_like(bias, 10.0)
+                storage[0] = bias[0]
+                bias = storage[:1].expand(num_experts)
+                # Expert zero must be selected with the broadcast bias, but an
+                # incorrect contiguous load gives every other expert a +10 bias.
+                logits[:, 0] = 10.0
+                assert bias.stride() == (0,)
+            with torch.inference_mode():
+                probs, indices = sigmoid_topk_routing(logits, bias, topk, scaling_factor)
+                contiguous_probs, contiguous_indices = sigmoid_topk_routing(
+                    logits, bias.contiguous(), topk, scaling_factor
                 )
+                ref_probs, ref_indices = _compiled_reference(logits, bias, topk, scaling_factor)
+            assert torch.equal(indices, contiguous_indices)
+            assert torch.equal(probs.view(torch.int32), contiguous_probs.view(torch.int32))
+            _assert_matches_compiled(probs, indices, ref_probs, ref_indices, case=layout)
         finally:
             torch._dynamo.reset()
 
-    @pytest.mark.parametrize("num_experts,topk,scaling_factor", MODEL_ROUTING_CONFIGS)
+    @pytest.mark.parametrize("num_experts,topk,scaling_factor", [MODEL_ROUTING_CONFIGS[0]])
     def test_empty_batch(self, num_experts, topk, scaling_factor):
-        _require_parallel_topk(topk)
         logits = torch.empty(0, num_experts, device="cuda")
         probs, indices = sigmoid_topk_routing(
             logits, torch.zeros(num_experts, device="cuda"), topk, scaling_factor
@@ -144,6 +160,45 @@ class TestSigmoidTopkRouting:
     def test_rejects_single_expert_routing(self):
         with pytest.raises(AssertionError):
             sigmoid_topk_routing(torch.randn(4, 8, device="cuda"), torch.zeros(8, device="cuda"), 1)
+
+    @pytest.mark.parametrize("topk", [8, 16, 22, 32])
+    def test_rejects_large_topk(self, topk):
+        with pytest.raises(AssertionError):
+            sigmoid_topk_routing(
+                torch.randn(2, 512, device="cuda"), torch.zeros(512, device="cuda"), topk, 5.0
+            )
+
+    @pytest.mark.parametrize("invalid_bias", ["rank", "device"])
+    def test_rejects_invalid_expert_bias(self, invalid_bias):
+        logits = torch.randn(2, 128, device="cuda")
+        bias = (
+            torch.zeros(128, 1, device="cuda")
+            if invalid_bias == "rank"
+            else torch.zeros(128, device="cpu")
+        )
+        with pytest.raises(AssertionError):
+            sigmoid_topk_routing(logits, bias, 6, 2.5)
+
+    @pytest.mark.skipif(
+        not is_topk_scores_supported(512, 22),
+        reason="Requires Triton topk and runtime dispatch modes",
+    )
+    @pytest.mark.parametrize("num_experts", [32, 96, 512])
+    @pytest.mark.parametrize("topk", [8, 16, 22, 32])
+    def test_parallel_topk_matches_aten(self, num_experts, topk):
+        with torch.inference_mode():
+            for rows in (0, 2, 33, 256, 2048):
+                for kind in ("normal", "wide", "ties", "all_equal", "zero_scores"):
+                    logits, bias = _inputs(kind, rows, num_experts, seed=31)
+                    scores = torch.sigmoid(logits) + bias
+                    if kind == "all_equal":
+                        scores.zero_()
+                        scores[:, 1::2] = -0.0
+                    values, indices = topk_scores(scores, topk)
+                    ref_values, ref_indices = torch.topk(scores, topk, dim=1, sorted=False)
+                    _assert_matches_compiled(
+                        values, indices, ref_values, ref_indices, case=(rows, kind)
+                    )
 
 
 @pytest.mark.internal
@@ -184,12 +239,90 @@ class TestInferenceRouterUsesKernel:
                 router.expert_bias.uniform_(-0.05, 0.05)
         return router
 
+    def _check_large_topk_selection(self, monkeypatch, batch_sizes, reference_first=False):
+        router = self._router(
+            num_moe_experts=512, moe_router_topk=22, moe_router_topk_scaling_factor=5.0
+        )
+        # Inject controlled scores while exercising the public inference forward
+        # and its dispatch, including tied and underflowed sigmoid probabilities.
+        monkeypatch.setattr(router, "gating", lambda logits: logits)
+        monkeypatch.setattr(router_module, "sigmoid_topk_routing", _unexpected_fused_routing)
+        with InferenceMode.active(), torch.inference_mode():
+            for kind in ("normal", "wide", "ties", "all_equal", "zero_scores"):
+                for num_tokens in batch_sizes:
+                    logits, bias = _inputs(
+                        kind, num_tokens, 512, seed=31 if num_tokens == 256 else num_tokens
+                    )
+                    router.expert_bias.copy_(bias)
+                    assert router._uses_sigmoid_topk_kernel(logits, None) == (
+                        is_topk_scores_supported(512, 22)
+                    )
+                    if reference_first:
+                        _compiled_reference(logits, router.expert_bias, 22, 5.0)
+                    probs, indices = router(logits.unsqueeze(1))
+                    ref_probs, ref_indices = _compiled_reference(
+                        logits, router.expert_bias, 22, 5.0
+                    )
+                    _assert_matches_compiled(
+                        probs, indices, ref_probs, ref_indices, case=(kind, num_tokens)
+                    )
+
+    @pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 8, 17, 40, 65, 256, 1024, 8192])
+    def test_large_topk_matches_fresh_static_compiled_router(self, monkeypatch, num_tokens):
+        """Each test starts with a fresh Dynamo cache and one static batch size."""
+        self._check_large_topk_selection(monkeypatch, (num_tokens,))
+
+    def test_large_topk_preserves_cold_prefill_normalization(self, monkeypatch):
+        """T256/seed31 exposed a different reduction tree with precomputed indices."""
+        self._check_large_topk_selection(monkeypatch, (256,), reference_first=True)
+
+    @pytest.mark.skipif(
+        not is_topk_scores_supported(512, 22),
+        reason="Requires Triton topk and runtime dispatch modes",
+    )
+    @pytest.mark.parametrize("selected_first", [False, True])
+    def test_parallel_selection_reuses_the_same_compiled_graph(self, monkeypatch, selected_first):
+        """A separate FX graph can reuse a different cached normalization layout."""
+        from torch._dynamo.testing import CompileCounterWithBackend
+
+        counter = CompileCounterWithBackend("inductor")
+        compiled = torch.compile(router_module.topk_routing_with_score_function, backend=counter)
+        router = self._router(
+            num_moe_experts=512, moe_router_topk=22, moe_router_topk_scaling_factor=5.0
+        )
+        monkeypatch.setattr(router, "_compiled_topk_routing", compiled)
+        with torch.inference_mode():
+            for rows in (2, 32, 256, 8192, 2):
+                logits, bias = _inputs("normal", rows, 512, seed=31)
+                kwargs = dict(
+                    topk=22,
+                    scaling_factor=5.0,
+                    score_function="sigmoid",
+                    expert_bias=bias,
+                    dense_output=True,
+                )
+                first, second = (
+                    (router._parallel_topk_routing, compiled)
+                    if selected_first
+                    else (compiled, router._parallel_topk_routing)
+                )
+                expected = first(logits, **kwargs)
+                frames = counter.frame_count
+                actual = second(logits, **kwargs)
+                assert frames > 0 and counter.frame_count == frames
+                _assert_matches_compiled(*actual, *expected, case=(rows, selected_first))
+
+    def test_large_topk_matches_compiled_router_across_batch_sizes(self, monkeypatch):
+        """Return to tiny decode batches after warming larger and dynamic shapes."""
+        self._check_large_topk_selection(
+            monkeypatch, (40, 65, 2, 1, 8192, 2, 3, 4, 8, 17, 33, 256, 1024, 2048, 2)
+        )
+
     @pytest.mark.parametrize("num_experts,topk,scaling_factor", MODEL_ROUTING_CONFIGS)
     @pytest.mark.parametrize("num_tokens", [2, 40])
     def test_router_output_matches_compiled_path(
         self, monkeypatch, num_experts, topk, scaling_factor, num_tokens
     ):
-        _require_parallel_topk(topk)
         router = self._router(
             num_moe_experts=num_experts,
             moe_router_topk=topk,
@@ -198,37 +331,118 @@ class TestInferenceRouterUsesKernel:
         hidden = torch.randn(num_tokens, 1, 256, device="cuda", dtype=torch.bfloat16)
         logits = router.gating(hidden).squeeze(1)
         with torch.inference_mode():
-            assert router._uses_sigmoid_topk_kernel(logits, None)
+            assert router._uses_sigmoid_topk_kernel(logits, None) == (
+                topk < 8 or is_topk_scores_supported(num_experts, topk)
+            )
         outputs = []
         for enabled in (True, False):
             monkeypatch.setattr(router_module, "HAVE_SIGMOID_TOPK_KERNEL", enabled)
             with InferenceMode.active(), torch.inference_mode():
                 outputs.append(router(hidden))
         (probs, indices), (ref_probs, ref_indices) = outputs
-        _assert_matches_compiled(probs, indices, ref_probs, ref_indices, topk)
+        _assert_matches_compiled(probs, indices, ref_probs, ref_indices)
 
-    def test_missing_parallel_topk_preserves_compiled_routing(self, monkeypatch):
-        monkeypatch.setattr(sigmoid_topk_module, "HAVE_PARALLEL_TOPK", False)
+    @pytest.mark.parametrize("num_experts,topk,scaling_factor", MODEL_ROUTING_CONFIGS)
+    def test_router_preserves_strided_expert_bias(
+        self, monkeypatch, num_experts, topk, scaling_factor
+    ):
+        router = self._router(
+            num_moe_experts=num_experts,
+            moe_router_topk=topk,
+            moe_router_topk_scaling_factor=scaling_factor,
+        )
+        bias = _strided_expert_bias(router.expert_bias)
+        router.expert_bias = bias
+        # The router's fp32 conversion must preserve this view, not hide the stride.
+        assert router.expert_bias.float().data_ptr() == bias.data_ptr()
+        assert router.expert_bias.float().stride() == (2,)
+        hidden = torch.randn(2, 1, 256, device="cuda", dtype=torch.bfloat16)
+        if topk >= 8:
+            monkeypatch.setattr(router_module, "sigmoid_topk_routing", _unexpected_fused_routing)
+        with InferenceMode.active(), torch.inference_mode():
+            assert router._uses_sigmoid_topk_kernel(router.gating(hidden).squeeze(1), None) == (
+                topk < 8 or is_topk_scores_supported(num_experts, topk)
+            )
+            probs, indices = router(hidden)
+            router.expert_bias = bias.contiguous()
+            contiguous_probs, contiguous_indices = router(hidden)
+            router.expert_bias = bias
+            monkeypatch.setattr(router_module, "HAVE_SIGMOID_TOPK_KERNEL", False)
+            ref_probs, ref_indices = router(hidden)
+        assert torch.equal(indices, contiguous_indices)
+        assert torch.equal(probs.view(torch.int32), contiguous_probs.view(torch.int32))
+        _assert_matches_compiled(probs, indices, ref_probs, ref_indices)
+
+    @pytest.mark.parametrize("topk", [8, 16, 22, 32])
+    def test_large_topk_preserves_compiled_probabilities(self, monkeypatch, topk):
         small_router = self._router()
         large_router = self._router(
-            num_moe_experts=512, moe_router_topk=22, moe_router_topk_scaling_factor=5.0
+            num_moe_experts=512, moe_router_topk=topk, moe_router_topk_scaling_factor=5.0
         )
         hidden = torch.randn(2, 1, 256, device="cuda", dtype=torch.bfloat16)
 
-        def unexpected_fused_routing(*args, **kwargs):
-            pytest.fail("Large top-k must fall back when triton.language.topk is unavailable")
+        compiled = large_router._compiled_topk_routing
+        calls = []
+        selection_calls = []
 
-        monkeypatch.setattr(router_module, "sigmoid_topk_routing", unexpected_fused_routing)
+        def select(scores, k):
+            selection_calls.append(k)
+            return topk_scores(scores, k)
+
+        def compiled_with_selection(*args, **kwargs):
+            assert kwargs["precomputed_indices"] is None
+            assert "topk_function" not in kwargs
+            calls.append(True)
+            return compiled(*args, **kwargs)
+
+        monkeypatch.setattr(large_router, "_compiled_topk_routing", compiled_with_selection)
+        monkeypatch.setattr(sigmoid_topk_module, "topk_scores", select)
+
+        monkeypatch.setattr(router_module, "sigmoid_topk_routing", _unexpected_fused_routing)
         with InferenceMode.active(), torch.inference_mode():
             assert small_router._uses_sigmoid_topk_kernel(
                 small_router.gating(hidden).squeeze(1), None
             )
             logits = large_router.gating(hidden).squeeze(1)
-            assert not large_router._uses_sigmoid_topk_kernel(logits, None)
+            assert large_router._uses_sigmoid_topk_kernel(logits, None) == (
+                is_topk_scores_supported(512, topk)
+            )
             probs, indices = large_router(hidden)
-            ref_probs, ref_indices = _compiled_reference(logits, large_router.expert_bias, 22, 5.0)
-        assert torch.equal(indices, ref_indices)
-        assert torch.equal(probs.view(torch.int32), ref_probs.view(torch.int32))
+            ref_probs, ref_indices = _compiled_reference(
+                logits, large_router.expert_bias, topk, 5.0
+            )
+        _assert_matches_compiled(probs, indices, ref_probs, ref_indices)
+        assert len(calls) == 1
+        # The subsequent reference call must run outside the selection mode.
+        assert selection_calls == ([topk] if is_topk_scores_supported(512, topk) else [])
+
+    def test_unavailable_parallel_selection_preserves_compiled_path(self, monkeypatch):
+        router = self._router(
+            num_moe_experts=512, moe_router_topk=22, moe_router_topk_scaling_factor=5.0
+        )
+        hidden = torch.randn(2, 1, 256, device="cuda", dtype=torch.bfloat16)
+        monkeypatch.setattr(router_module, "is_topk_scores_supported", lambda *args: False)
+        monkeypatch.setattr(sigmoid_topk_module, "topk_scores", _unexpected_fused_routing)
+        with InferenceMode.active(), torch.inference_mode():
+            logits = router.gating(hidden).squeeze(1)
+            assert not router._uses_sigmoid_topk_kernel(logits, None)
+            probs, indices = router(hidden)
+            ref_probs, ref_indices = _compiled_reference(logits, router.expert_bias, 22, 5.0)
+        _assert_matches_compiled(probs, indices, ref_probs, ref_indices)
+
+    def test_large_topk_noncontiguous_logits_preserve_compiled_path(self, monkeypatch):
+        router = self._router(
+            num_moe_experts=512, moe_router_topk=22, moe_router_topk_scaling_factor=5.0
+        )
+        logits = torch.randn(512, 4, device="cuda").t()
+        assert not logits.is_contiguous()
+        monkeypatch.setattr(router, "gating", lambda hidden: hidden)
+        monkeypatch.setattr(sigmoid_topk_module, "topk_scores", _unexpected_fused_routing)
+        with InferenceMode.active(), torch.inference_mode():
+            assert not router._uses_sigmoid_topk_kernel(logits, None)
+            probs, indices = router(logits.unsqueeze(1))
+            ref_probs, ref_indices = _compiled_reference(logits, router.expert_bias, 22, 5.0)
+        _assert_matches_compiled(probs, indices, ref_probs, ref_indices)
 
     @pytest.mark.parametrize("num_experts,topk,scaling_factor", MODEL_ROUTING_CONFIGS)
     def test_grad_enabled_preserves_compiled_routing_and_autograd(
@@ -257,29 +471,41 @@ class TestInferenceRouterUsesKernel:
     @pytest.mark.parametrize("num_experts,topk,scaling_factor", MODEL_ROUTING_CONFIGS)
     @pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 17, 65, 1024, 8192])
     def test_graph_replay_uses_updated_logits_and_bias(
-        self, num_experts, topk, scaling_factor, num_tokens
+        self, monkeypatch, num_experts, topk, scaling_factor, num_tokens
     ):
         """Captured routing must read new inputs on every replay, including tied scores."""
-        _require_parallel_topk(topk)
         logits, bias = _inputs("normal", num_tokens, num_experts, seed=17)
-        with torch.inference_mode():
+        router = self._router(
+            num_moe_experts=num_experts,
+            moe_router_topk=topk,
+            moe_router_topk_scaling_factor=scaling_factor,
+        )
+        monkeypatch.setattr(router, "gating", lambda logits: logits)
+        if topk >= 8:
+            monkeypatch.setattr(router_module, "sigmoid_topk_routing", _unexpected_fused_routing)
+        router.expert_bias = bias
+        routing_input = logits.unsqueeze(1)
+        with InferenceMode.active(), torch.inference_mode():
+            assert router._uses_sigmoid_topk_kernel(logits, None) == (
+                topk < 8 or is_topk_scores_supported(num_experts, topk)
+            )
             # Compile both paths before capture with a fixed top-k specialization.
             _compiled_reference(logits, bias, topk, scaling_factor)
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
-                sigmoid_topk_routing(logits, bias, topk, scaling_factor)
+                router(routing_input)
             torch.cuda.current_stream().wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                probs, indices = sigmoid_topk_routing(logits, bias, topk, scaling_factor)
+                probs, indices = router(routing_input)
             for seed, kind in enumerate(("wide", "ties", "all_equal", "zero_scores", "normal")):
                 new_logits, new_bias = _inputs(kind, num_tokens, num_experts, seed=seed)
                 logits.copy_(new_logits)
                 bias.copy_(new_bias)
                 graph.replay()
                 ref_probs, ref_indices = _compiled_reference(logits, bias, topk, scaling_factor)
-                _assert_matches_compiled(probs, indices, ref_probs, ref_indices, topk, case=kind)
+                _assert_matches_compiled(probs, indices, ref_probs, ref_indices, case=kind)
 
     @pytest.mark.parametrize("num_experts,topk,scaling_factor", MODEL_ROUTING_CONFIGS)
     def test_batch_invariant_mode_preserves_uncompiled_routing(
@@ -296,6 +522,7 @@ class TestInferenceRouterUsesKernel:
             pytest.fail("Batch-invariant routing must keep the uncompiled reference path")
 
         monkeypatch.setattr(router_module, "sigmoid_topk_routing", unexpected_routing)
+        monkeypatch.setattr(sigmoid_topk_module, "topk_scores", unexpected_routing)
         monkeypatch.setattr(router, "_compiled_topk_routing", unexpected_routing)
         with set_batch_invariant_mode(True), InferenceMode.active(), torch.inference_mode():
             logits = router.gating(hidden).squeeze(1)

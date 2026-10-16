@@ -520,14 +520,12 @@ def test_vllm_fused_moe_and_moe_sum_replay():
 
 
 @pytest.mark.parametrize(
-    "num_experts,topk,scaling_factor", [(128, 6, 2.5), (512, 22, 5.0)], ids=["nano", "super-ultra"]
+    "num_experts,topk,scaling_factor", [(128, 6, 2.5), (512, 6, 5.0)], ids=["nano", "512-experts"]
 )
 @pytest.mark.parametrize("num_tokens", [2, 2048])
 def test_sigmoid_topk_routing_replay(num_experts, topk, scaling_factor, num_tokens):
-    from megatron.core.inference.moe.sigmoid_topk import HAVE_PARALLEL_TOPK, sigmoid_topk_routing
+    from megatron.core.inference.moe.sigmoid_topk import sigmoid_topk_routing
 
-    if topk >= 8 and not HAVE_PARALLEL_TOPK:
-        pytest.skip("Large top-k fusion requires triton.language.topk")
     seeded()
     logits = torch.randn(num_tokens, num_experts, device="cuda")
     expert_bias = torch.randn(num_experts, device="cuda") * 0.05
@@ -539,6 +537,23 @@ def test_sigmoid_topk_routing_replay(num_experts, topk, scaling_factor, num_toke
         what=f"sigmoid_topk_routing[tokens={num_tokens}, experts={num_experts}, topk={topk}]",
     )
 
+
+@pytest.mark.parametrize("topk", [8, 22, 32])
+@pytest.mark.parametrize("num_tokens", [2, 2048])
+def test_topk_scores_replay(topk, num_tokens):
+    from megatron.core.inference.moe.sigmoid_topk import is_topk_scores_supported, topk_scores
+
+    if not is_topk_scores_supported(512, topk):
+        pytest.skip("Requires Triton topk and runtime dispatch modes")
+    seeded()
+    scores = torch.randn(num_tokens, 512, device="cuda")
+    assert_replays_bit_exact(
+        lambda s: topk_scores(s, topk),
+        (scores,),
+        replays=4,
+        backward=False,
+        what=f"topk_scores[tokens={num_tokens}, topk={topk}]",
+    )
 
 
 # --- batch-invariant kernels -----------------------------------------------------------------

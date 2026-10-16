@@ -381,11 +381,9 @@ class TestMoEModules:
     )
     @pytest.mark.parametrize("num_tokens", [2, 512])
     def test_inference_topk_router_replays(self, num_experts, topk, scaling_factor, num_tokens):
-        """Inference router, sigmoid scores with expert bias: the single-kernel top-k path."""
-        from megatron.core.inference.moe.sigmoid_topk import HAVE_PARALLEL_TOPK
+        """Inference router replay through small top-k fusion and parallel selection."""
+        from megatron.core.inference.moe.sigmoid_topk import is_topk_scores_supported
 
-        if topk >= 8 and not HAVE_PARALLEL_TOPK:
-            pytest.skip("Large top-k fusion requires triton.language.topk")
         self._init()
         seeded()
         config = _moe_config(
@@ -405,7 +403,9 @@ class TestMoEModules:
             router.expert_bias.uniform_(-0.05, 0.05)
         hidden = torch.randn(num_tokens, 1, 1024, device="cuda", dtype=torch.bfloat16)
         with torch.inference_mode():
-            assert router._uses_sigmoid_topk_kernel(router.gating(hidden).squeeze(1), None)
+            assert router._uses_sigmoid_topk_kernel(router.gating(hidden).squeeze(1), None) == (
+                topk < 8 or is_topk_scores_supported(num_experts, topk)
+            )
 
         def route(h):
             with InferenceMode.active(), torch.inference_mode():

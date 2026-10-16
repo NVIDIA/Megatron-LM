@@ -8,7 +8,12 @@ from typing import Optional, Union
 import torch
 
 from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID_TOPK_KERNEL
-from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
+from megatron.core.inference.moe.sigmoid_topk import (
+    ParallelTopKMode,
+    is_sigmoid_topk_supported,
+    is_topk_scores_supported,
+    sigmoid_topk_routing,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
@@ -1289,16 +1294,15 @@ class InferenceTopKRouter(TopKRouter):
     def _uses_sigmoid_topk_kernel(
         self, logits: torch.Tensor, precomputed_indices: Optional[torch.Tensor]
     ) -> bool:
-        """Whether sigmoid_topk_routing supports this inference call.
+        """Whether the sigmoid top-k kernels support this inference call.
 
         It covers sigmoid scores with an expert bias, fp32 logits and supported shapes,
         with gradients disabled, without group-limited routing, router replay,
-        precomputed indices or TE's
-        fused router; batch-invariant mode keeps its uncompiled reference path.
-        Small top-k uses the compiled left fold. Larger top-k uses parallel selection
-        and an explicit butterfly sum over the selected slots, avoiding serial
-        full-row reductions on small decode batches. Its probabilities can differ
-        by fp32 rounding from the compiled path's autotuned reduction order.
+        precomputed indices or TE's fused router; batch-invariant mode keeps its
+        uncompiled reference path. Top-k below eight uses a fully fused kernel
+        matching the compiled left fold. Larger top-k replaces only expert
+        selection, keeping the original compiled probability computation and
+        its autotuned reduction order.
         """
         return (
             HAVE_SIGMOID_TOPK_KERNEL
@@ -1309,13 +1313,23 @@ class InferenceTopKRouter(TopKRouter):
             and not torch.is_grad_enabled()
             and self.score_function == "sigmoid"
             and self.expert_bias is not None
-            and is_sigmoid_topk_supported(logits.shape[-1], self.topk)
+            and (
+                is_sigmoid_topk_supported(logits.shape[-1], self.topk)
+                or (
+                    logits.is_contiguous() and is_topk_scores_supported(logits.shape[-1], self.topk)
+                )
+            )
             and precomputed_indices is None
             and self.config.moe_router_group_topk is None
             and not self.config.moe_router_fusion
             and self.router_replay is None
             and not is_batch_invariant_mode_enabled()
         )
+
+    def _parallel_topk_routing(self, *args, **kwargs):
+        # Reuse the exact compiled callable/cache; intercept only its runtime top-k.
+        with ParallelTopKMode():
+            return self._compiled_topk_routing(*args, **kwargs)
 
     def _forward(
         self,
@@ -1341,21 +1355,20 @@ class InferenceTopKRouter(TopKRouter):
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
 
-        if self._uses_sigmoid_topk_kernel(logits, precomputed_indices):
-            # One launch; large top-k uses a fixed fp32 normalization tree.
-            probs, top_indices = sigmoid_topk_routing(
-                logits.contiguous(),
-                self.expert_bias.float(),
-                self.topk,
-                self.config.moe_router_topk_scaling_factor,
-            )
-            return probs, top_indices
-
         routing = (
             topk_routing_with_score_function
             if is_batch_invariant_mode_enabled()
             else self._compiled_topk_routing
         )
+        if self._uses_sigmoid_topk_kernel(logits, precomputed_indices):
+            if is_sigmoid_topk_supported(logits.shape[-1], self.topk):
+                return sigmoid_topk_routing(
+                    logits.contiguous(),
+                    self.expert_bias.float(),
+                    self.topk,
+                    self.config.moe_router_topk_scaling_factor,
+                )
+            routing = self._parallel_topk_routing
         probs, top_indices = routing(
             logits,
             self.topk,
