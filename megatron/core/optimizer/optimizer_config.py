@@ -567,9 +567,14 @@ class OptimizerConfig:
                     "Use --optimizer muon --use-distributed-optimizer instead."
                 )
 
-        assert not (
-            self.use_layer_wise_distributed_optimizer and moe_single_grouped_weight
-        ), (
+        # finalize_optimizer_config() enables the layer-wise path for non-sgd/adam optimizers
+        # that use the distributed optimizer (or the deprecated dist_muon alias), so check the
+        # value it will produce, not only the pre-finalize flag.
+        will_be_layer_wise = self.use_layer_wise_distributed_optimizer or (
+            self.optimizer not in ('sgd', 'adam')
+            and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
+        )
+        assert not (will_be_layer_wise and moe_single_grouped_weight), (
             "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
             "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
             "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
