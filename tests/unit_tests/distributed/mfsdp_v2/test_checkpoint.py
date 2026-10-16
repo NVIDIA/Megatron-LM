@@ -119,7 +119,6 @@ def _build_sharded(
     with fully_shard_context(device=device):
         fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
-        fully_shard(model, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     # main_weight is fp32 by default, so a bf16 model feeds the fp32 optimizer bf16 grads; the
     # adapter casts them around each step.
@@ -135,7 +134,6 @@ def _build_packed_sharded(
     with fully_shard_context(device=device):
         fully_shard(model.block, mesh=mesh, placements=_default_placements())
         fully_shard(model.linear, mesh=mesh, placements=_default_placements())
-        fully_shard(model, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     fully_shard_optimizer(optimizer)
     return model, optimizer

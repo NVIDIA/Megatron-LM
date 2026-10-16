@@ -46,7 +46,6 @@ def test_adam_without_adapter_raises_precision_error(distributed_setup):
     with fully_shard_context(device=device):
         fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
-        fully_shard(model, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
     x = torch.randn(6, 8, device=device, dtype=torch.bfloat16)
@@ -174,7 +173,6 @@ def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, m
     with fully_shard_context(device=device):
         fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
-        fully_shard(model, mesh=mesh, placements=_default_placements())
     parameter_groups = (*model.fc1.parameter_groups, *model.fc2.parameter_groups)
     sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
 
