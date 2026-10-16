@@ -238,3 +238,36 @@ class TestT5ModelAttentionDimensions:
             "engine version < 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0"
             "or upgrade transformer engine >= 1.7"
         )
+
+
+class TestT5ModelDefaultProcessGroups:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("tp_only_amax_red", [False, True])
+    def test_default_collection_carries_the_amax_reduction_groups(self, tp_only_amax_red):
+        """FP8/FP4 layers of a T5 model built without a collection reduce over the global groups."""
+        from megatron.core.process_groups_config import amax_reduction_group
+
+        config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+        model = T5Model(
+            config=config,
+            encoder_config=deepcopy(config),
+            transformer_encoder_layer_spec=get_t5_encoder_with_local_block_spec(2),
+            transformer_decoder_layer_spec=get_t5_decoder_with_local_block_spec(2),
+            vocab_size=128,
+            max_sequence_length=8,
+        )
+        expected = ps.get_amax_reduction_group(
+            with_context_parallel=True, tp_only_amax_red=tp_only_amax_red
+        )
+
+        for block in (model.encoder, model.decoder):
+            assert amax_reduction_group(block.pg_collection, tp_only_amax_red) is expected

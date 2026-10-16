@@ -176,8 +176,9 @@ class T5Model(LanguageModule):
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
         if pg_collection is None:
+            # tp_cp and tp_dp_cp are the FP8/FP4 amax reduction groups of the layers.
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'pp']
+                required_pgs=['tp', 'cp', 'pp', 'tp_cp', 'tp_dp_cp']
             )
         self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
 

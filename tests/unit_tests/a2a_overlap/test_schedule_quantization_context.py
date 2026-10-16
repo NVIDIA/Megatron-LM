@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -34,6 +35,7 @@ def test_transformer_layer_uses_fp4_context():
     torch.nn.Module.__init__(layer)
     layer.config = config
     layer.layer_number = 3
+    layer.pg_collection = ProcessGroupCollection()
     expected_context = nullcontext()
 
     with patch(
@@ -42,7 +44,7 @@ def test_transformer_layer_uses_fp4_context():
         context = layer.get_inner_quantization_context()
 
     assert context is expected_context
-    get_fp4_context.assert_called_once_with(config, 2)
+    get_fp4_context.assert_called_once_with(config, 2, pg_collection=layer.pg_collection)
 
 
 def test_transformer_layer_uses_fp8_context():
@@ -51,6 +53,7 @@ def test_transformer_layer_uses_fp8_context():
     torch.nn.Module.__init__(layer)
     layer.config = config
     layer.layer_number = 3
+    layer.pg_collection = ProcessGroupCollection()
     expected_context = nullcontext()
 
     with patch(
@@ -59,7 +62,7 @@ def test_transformer_layer_uses_fp8_context():
         context = layer.get_inner_quantization_context()
 
     assert context is expected_context
-    get_fp8_context.assert_called_once_with(config, 2)
+    get_fp8_context.assert_called_once_with(config, 2, pg_collection=layer.pg_collection)
 
 
 def test_mtp_layer_uses_global_fp8_context():
@@ -68,6 +71,7 @@ def test_mtp_layer_uses_global_fp8_context():
     torch.nn.Module.__init__(layer)
     layer.config = config
     layer.layer_number = 1
+    layer.pg_collection = ProcessGroupCollection()
     expected_context = nullcontext()
 
     with patch(
@@ -77,7 +81,7 @@ def test_mtp_layer_uses_global_fp8_context():
         context = layer.get_inner_quantization_context()
 
     assert context is expected_context
-    get_fp8_context.assert_called_once_with(config)
+    get_fp8_context.assert_called_once_with(config, pg_collection=layer.pg_collection)
 
 
 def test_mtp_layer_uses_fp4_context():
@@ -85,6 +89,7 @@ def test_mtp_layer_uses_fp4_context():
     layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
     torch.nn.Module.__init__(layer)
     layer.config = config
+    layer.pg_collection = ProcessGroupCollection()
     expected_context = nullcontext()
 
     with patch(
@@ -95,4 +100,4 @@ def test_mtp_layer_uses_fp4_context():
 
     assert context is expected_context
     # MTP layer numbers are depth-local, so no decoder layer index is passed.
-    get_fp4_context.assert_called_once_with(config)
+    get_fp4_context.assert_called_once_with(config, pg_collection=layer.pg_collection)
