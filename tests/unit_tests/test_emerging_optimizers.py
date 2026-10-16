@@ -13,7 +13,10 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -1132,8 +1135,8 @@ class TestMuonOptimizerMultiRankTP:
         )
         model = GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_local_spec(
-                multi_latent_attention=True, normalization=transformer_config.normalization
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+                multi_latent_attention=True
             ),
             vocab_size=32,
             max_sequence_length=8,
@@ -1178,6 +1181,7 @@ class TestMuonOptimizerMultiRankTP:
         if q_lora_rank is not None:
             assert not getattr(attention.linear_q_down_proj.weight, 'is_qkv', False)
         assert not getattr(attention.linear_kv_down_proj.weight, 'is_qkv', False)
+        assert attention.linear_kv_down_proj.weight.muon_layout.splits == (4, 2)
 
     def test_optimizer_factory_skips_mismatched_qkv_layout(self):
         """A QKV layout mismatch falls back to whole-matrix Muon orthogonalization."""
@@ -1706,11 +1710,13 @@ def test_muon_optimizer_batched_per_head_ns_rejects_old_emerging_optimizers(monk
         optimizer.orthogonalize(param, grad)
 
 
-def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
-    """The pinned Emerging-Optimizers 3D Newton-Schulz path matches 2D head calls."""
+def test_muon_optimizer_batched_per_head_ns_matches_individual_heads(record_property):
+    """Batched and individual heads agree with an independent FP64 polynomial."""
+    from emerging_optimizers.orthogonalized_optimizers import muon_utils
+    from emerging_optimizers.utils import fp32_matmul_precision
+
     torch.manual_seed(42)
-    # Match Emerging-Optimizers v0.3.0's batched parity case. Tiny matrices can select
-    # different baddbmm/addmm kernels and amplify their otherwise valid rounding differences.
+    # Match Emerging-Optimizers v0.3.0's batched parity case.
     num_heads, head_rows, hidden_size = 4, 128, 256
     split_shapes = [head_rows] * num_heads
     grad = torch.randint(
@@ -1730,14 +1736,34 @@ def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
         pg_collection=None,
     )
 
-    actual = optimizer.orthogonalize(param, grad)
-    expected = torch.cat(
-        [
-            optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
-            for head in torch.split(grad, split_shapes)
-        ]
-    )
-    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
+    # step() establishes this context. Direct calls must use the same precision
+    # for batched and individual NS instead of inheriting ambient TF32 settings.
+    with fp32_matmul_precision(optimizer.fp32_matmul_prec):
+        actual = optimizer.orthogonalize(param, grad)
+        expected = torch.cat(
+            [
+                optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
+                for head in torch.split(grad, split_shapes)
+            ]
+        )
+    # addmm and baddbmm may choose different FP32 kernels. Five NS iterations
+    # amplify their rounding differences, so neither FP32 path is an exact oracle.
+    # Evaluate each head's polynomial independently in FP64 as a third reference.
+    reference_heads = []
+    for head in torch.split(grad, split_shapes):
+        x = head.double()
+        x = x / torch.linalg.vector_norm(x)
+        for a, b, c in muon_utils._COEFFICIENT_SETS['quintic']:
+            gram = x @ x.mT
+            x = a * x + (b * gram + c * (gram @ gram)) @ x
+        # Spectral scaling uses the real head shape, not the fused QKV shape.
+        reference_heads.append(x * max(head_rows, hidden_size) ** 0.5)
+    reference = torch.cat(reference_heads).float()
+    for name, value in [('batched', actual), ('individual', expected)]:
+        record_property(f'{name}_fp64_max_abs_error', (value - reference).abs().max().item())
+        torch.testing.assert_close(value, reference, atol=1e-5, rtol=1e-5)
+    record_property('batched_individual_max_abs_error', (actual - expected).abs().max().item())
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns(monkeypatch):
