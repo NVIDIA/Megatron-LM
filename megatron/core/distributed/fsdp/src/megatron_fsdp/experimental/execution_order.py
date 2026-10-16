@@ -16,33 +16,30 @@
 
 from collections.abc import Iterable, Iterator
 from typing import Generic, TypeVar
-from weakref import WeakKeyDictionary, ref
+from weakref import ref
 
 T = TypeVar("T")
 
 
 class ExecutionOrder(Generic[T]):
-    """Look up unique modules and validate repeated module-call occurrences.
+    """Consume weak occurrences with an explicitly reset execution cursor.
 
-    A module appearing once can unambiguously select its position, preserving
-    construction-order prefetch for reordered or repeated demand calls. Modules
-    appearing more than once must match the next occurrence at the cursor.
-    Prefetch lookahead never advances that cursor.
+    Repeated items are ordinary occurrences. The caller validates each item
+    returned by advance(); lookahead never changes execution progress.
     """
 
     def __init__(self, items: Iterable[T] = ()) -> None:
         """Create a weak execution sequence, preserving repeated occurrences."""
-        self._items: list[ref[T]] = []
-        # An index identifies a unique item; None marks an ambiguous repeated item.
-        self._unique_index: WeakKeyDictionary[T, int | None] = WeakKeyDictionary()
+        self._items: list[ref[T]] = [ref(item) for item in items]
         self._position = 0
-        for item in items:
-            self.append(item)
 
     def append(self, item: T) -> None:
-        """Append an occurrence and mark previously seen items as repeated."""
-        self._unique_index[item] = None if item in self._unique_index else len(self._items)
+        """Append one weakly held occurrence."""
         self._items.append(ref(item))
+
+    def reset(self) -> None:
+        """Start a new traversal; root hooks own static traversal boundaries."""
+        self._position = 0
 
     def __iter__(self) -> Iterator[T]:
         """Iterate over live occurrences in execution order."""
@@ -51,21 +48,19 @@ class ExecutionOrder(Generic[T]):
             if item is not None:
                 yield item
 
-    def advance(self, item: T) -> None:
-        """Locate a unique demand call or consume the next expected repeated call."""
-        index = self._unique_index.get(item)
-        if index is None:
-            if not self._items or self._items[self._position]() is not item:
-                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-            index = self._position
-        self._position = (index + 1) % len(self._items)
+    def advance(self) -> T:
+        """Consume the next occurrence without lookup or automatic wrapping."""
+        if self._position >= len(self._items):
+            raise RuntimeError("FSDP calls exceeded the static execution order; reset it first.")
+        item = self._items[self._position]()
+        if item is None:
+            raise RuntimeError("A module in the FSDP execution order was destroyed.")
+        self._position += 1
+        return item
 
     def next_item(self, offset: int = 1) -> T | None:
         """Look ahead from the last consumed occurrence without moving the cursor."""
-        if not self._items:
-            return None
-        index = (self._position - 1) % len(self._items)
-        next_index = index + offset
-        if next_index >= len(self._items):
+        next_index = self._position - 1 + offset
+        if next_index < 0 or next_index >= len(self._items):
             return None
         return self._items[next_index]()

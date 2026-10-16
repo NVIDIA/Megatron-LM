@@ -62,13 +62,24 @@ with a record-and-replay mechanism.
 
 ## MFSDP v2 static prefetch
 
-Ordinary forward/backward loops retain the existing `ExecutionOrder` behavior
-and prefetch without an iteration scope or recording. Context finalization builds
-separate `forward_order` and `backward_order` sequences; users can supply explicit
-orders after construction. Unique modules select their position by identity,
-while repeated modules validate the next occurrence. Forward-only validation
-uses only the forward order. Recomputation gathers on demand without advancing
-the static orders.
+Ordinary forward/backward loops prefetch without an iteration scope or recording.
+Context finalization builds separate `forward_order` and `backward_order`
+sequences; users can supply explicit orders after construction. `ExecutionOrder`
+holds weak occurrences, exposes an argument-free `advance()` and lookahead, and
+starts another traversal only through `reset()`. Calls must follow the configured
+sequence, including repeated occurrences; there is no identity lookup.
+
+Outside an iteration scope, the root forward hook resets the forward cursor
+before normal forward execution, and the root backward hook resets the backward
+cursor. For concatenated static roots, only the first root in the corresponding
+order resets it; subsequent roots continue the same traversal. Forward-only
+validation resets only the forward order. Recomputation does not reset or advance
+the static forward order.
+
+While an iteration scope is active, root hooks never reset either static order
+or the recorded cursors. The scope owns the complete VPP/combined recording and
+replay lifetime. Mixed or partial multi-root schedules must use an iteration scope
+rather than treating each root call as a fresh static traversal.
 
 ## MFSDP v2 iteration demand recording
 
@@ -113,8 +124,9 @@ The recorder neither reduces gradients nor infers completion from node counts.
 Iteration recording is disabled for CUDA graph schedules because Python hooks
 do not cover graph replay. CUDA graph lifecycle support and performance tuning
 are outside this change. Outside an iteration scope, static F/B prefetch remains
-available as described above. `ExecutionOrder` and its static prefetch API remain unchanged. The recorded
-sequence, phase metadata, and both replay cursors belong to `IterationOrder`.
+available as described above. `ExecutionOrder` uses explicit root-hook resets for static F/B execution.
+The recorded sequence, phase metadata, and both replay cursors belong to
+`IterationOrder`, independently of static execution.
 
 # Alternatives considered
 

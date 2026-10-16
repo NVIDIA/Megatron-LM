@@ -149,7 +149,7 @@ def test_iteration_does_not_retain_modules():
 
 @pytest.mark.parametrize("reentrant", [False, True])
 @pytest.mark.parametrize("record_iteration", [False, True], ids=["static", "recorded"])
-def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iteration):
+def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iteration, monkeypatch):
     """Static and recorded prefetch preserve SGD with both checkpoint variants."""
 
     class Model(nn.Module):
@@ -178,6 +178,10 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
         fully_shard(model.fc1, mesh=mesh, placements=placements)
         fully_shard(model.fc2, mesh=mesh, placements=placements)
         fully_shard(model, mesh=mesh, placements=placements)
+    forward_reset = Mock(wraps=context.forward_order.reset)
+    backward_reset = Mock(wraps=context.backward_order.reset)
+    monkeypatch.setattr(context.forward_order, "reset", forward_reset)
+    monkeypatch.setattr(context.backward_order, "reset", backward_reset)
     ref_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.01)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
@@ -197,6 +201,12 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
             actual.backward()
         optimizer.step()
         torch.testing.assert_close(actual, expected)
+    for _ in range(2):
+        with torch.no_grad():
+            with iteration(context, key="validation") if record_iteration else nullcontext():
+                torch.testing.assert_close(model(x), baseline(x))
+    assert forward_reset.call_count == (0 if record_iteration else 5)
+    assert backward_reset.call_count == (0 if record_iteration else 3)
     if record_iteration:
         _, phases = context.iteration_order._orders["default"]
         assert "recompute" in phases
