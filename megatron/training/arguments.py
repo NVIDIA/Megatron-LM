@@ -1801,6 +1801,31 @@ def validate_args(args, defaults={}):
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
 
+    if args.stream_ckpt_dequant:
+        # Inference-only load path: the loaded state dict holds the re-quantized params
+        # themselves, so nothing that consumes the loaded values in high precision (optimizer
+        # main params) may run. `load_checkpoint` additionally refuses any optimizer.
+        assert args.no_load_optim and not args.finetune, (
+            '--stream-ckpt-dequant is an inference-only load path: it requires --no-load-optim '
+            'and cannot be used with --finetune.'
+        )
+        assert not args.load_main_params_from_ckpt, (
+            '--stream-ckpt-dequant cannot be used with --load-main-params-from-ckpt: the main '
+            'params would be initialized from the re-quantized params instead of the '
+            'high-precision checkpoint values.'
+        )
+        assert args.fp8 is None or args.fp8_recipe != 'delayed', (
+            '--stream-ckpt-dequant does not support --fp8-recipe delayed (its scale is only '
+            'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
+        )
+        assert (
+            not args.ckpt_fully_parallel_load
+            or args.ckpt_fully_parallel_load_exchange_algo == 'broadcast'
+        ), (
+            '--stream-ckpt-dequant supports --ckpt-fully-parallel-load only with '
+            '--ckpt-fully-parallel-load-exchange-algo broadcast.'
+        )
+
     if args.use_dist_ckpt and args.async_save:
         if not args.use_persistent_ckpt_worker:
             warn_rank_0(
@@ -3042,6 +3067,9 @@ def _add_distributed_args(parser):
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
 
+    group.add_argument('--use-megatron-fsdp', action='store_true', default=False,
+                       help="Use Megatron's Fully Sharded Data Parallel. Cannot be used together with use_torch_fsdp2.")
+
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
                        help=('The number of transformer layers on the first pipeline stage of the decoder. '
@@ -3201,10 +3229,6 @@ def _add_distributed_args(parser):
                        'of each CP rank when we use packed samples with variable sequence lengths. '
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
     group.add_argument('--sequence-packing-scheduler', type=str, default=None, choices=['dp_balanced'])
-    group.add_argument('--fake-process-group', action='store_true', default=False,
-                       help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
-                       This is quite useful for profiling memory usage of distributed training with just one GPU. \
-                       Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
     return parser
 
 

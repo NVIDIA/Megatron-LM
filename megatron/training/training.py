@@ -40,7 +40,7 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
-from megatron.core import mpu, nccl_allocator, tensor_parallel
+from megatron.core import mpu, tensor_parallel
 
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
@@ -190,13 +190,13 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
     get_wandb_writer,
-    get_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -2004,7 +2004,7 @@ def pretrain(
                 cp_size=1 if force_cp1_inference_model else None,
                 ep_size=cfg_container.rl.rl_inference_expert_model_parallel_size,
                 expt_tp_size=cfg_container.rl.rl_inference_expert_tensor_model_parallel_size,
-                use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+                use_tp_pp_dp_mapping=cfg_container.dist.use_tp_pp_dp_mapping,
             )
 
             # Build an isolated inference config so training config remains unchanged
@@ -2575,8 +2575,8 @@ def _forward_backward_grad_context(args):
     return grad_context, forward_only
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
-    """Build the model."""
+def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
+    """Build the model using a finalized DDP config, or legacy args if omitted."""
     cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
@@ -2584,7 +2584,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         if args.create_all_gather_group:
-            timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
+            timeout = timedelta(minutes=cfg.dist.distributed_timeout_minutes) if cfg.dist.distributed_timeout_minutes else None
             dp_cp_ag, expt_dp_ag = create_all_gather_groups(
                 for_expert_parallelism=(args.expert_model_parallel_size > 1),
                 timeout=timeout,
@@ -2681,7 +2681,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     if (
-        not (args.use_torch_fsdp2 and args.use_cpu_initialization)
+        not (cfg.dist.use_torch_fsdp2 and args.use_cpu_initialization)
         and not args.init_model_with_meta_device
     ):
         for model_module in model:
@@ -2693,7 +2693,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [Float16Module(config, model_module) for model_module in model]
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
-    if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
+    if args.init_model_with_meta_device and not cfg.dist.use_torch_fsdp2 and not args.use_megatron_fsdp:
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
@@ -2704,7 +2704,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     correct_amax_history_if_needed(model)
 
     if wrap_with_ddp:
-        if args.use_torch_fsdp2:
+        if cfg.dist.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
         elif args.use_megatron_fsdp:
@@ -2714,8 +2714,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         config = get_model_config(model[0])
 
-        ddp_config = get_megatron_ddp_config(args)
-        if not getattr(args, "use_torch_fsdp2", False):
+        if ddp_config is None:
+            ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=cfg.dist.use_torch_fsdp2)
+        if not cfg.dist.use_torch_fsdp2:
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(
                 ddp_config,
@@ -2865,10 +2866,12 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 
     return config, config_overrides
 
-def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallelConfig:
+def get_megatron_ddp_config(
+    args: argparse.Namespace, *, use_torch_fsdp2: bool
+) -> DistributedDataParallelConfig:
     """Return an MCore DDPConfig from the argparse arguments."""
 
-    if getattr(args, "use_torch_fsdp2", False):
+    if use_torch_fsdp2:
         reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
         return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
     else:
@@ -2917,6 +2920,7 @@ def setup_model_and_optimizer(
     """Setup model and optimizer."""
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
+    cfg = cfg_container if cfg_container is not None else get_run_config()
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
@@ -2939,7 +2943,6 @@ def setup_model_and_optimizer(
 
             start_memory_history_recording(cfg_container.profiling)
 
-            cfg = cfg_container
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
@@ -2956,7 +2959,7 @@ def setup_model_and_optimizer(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
-                use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+                use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
                 use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
@@ -2965,7 +2968,13 @@ def setup_model_and_optimizer(
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
-            return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
+            return get_model(
+                model_provider_func,
+                model_type,
+                wrap_with_ddp=wrap_with_ddp,
+                pg_collection=pg_collection,
+                ddp_config=cfg_container.ddp if cfg_container is not None else None,
+            )
 
     # Configure GTP weight-remat padding/loss reduction before model construction (pad
     # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
@@ -3052,7 +3061,7 @@ def setup_model_and_optimizer(
             config,
             model,
             config_overrides=config_overrides,
-            use_gloo_process_groups=args.use_gloo_process_groups,
+            use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
@@ -3125,7 +3134,7 @@ def setup_model_and_optimizer(
                 checkpointing_context=checkpointing_context,
                 restore_training_state=True,
                 skip_load_to_model_and_opt=HAVE_FSDP2
-                and getattr(args, "use_torch_fsdp2", False)
+                and cfg.dist.use_torch_fsdp2
                 and args.ckpt_format == "torch_dist",
                 tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
                 pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
@@ -4712,7 +4721,7 @@ def train(
                     checkpointing_context=checkpointing_context,
                     restore_training_state=True,
                     skip_load_to_model_and_opt=HAVE_FSDP2
-                    and getattr(args, "use_torch_fsdp2", False)
+                    and cfg.dist.use_torch_fsdp2
                     and args.ckpt_format == "torch_dist",
                 )
             ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
@@ -4728,7 +4737,7 @@ def train(
                     checkpointing_context=checkpointing_context,
                     restore_training_state=True,
                     skip_load_to_model_and_opt=HAVE_FSDP2
-                    and getattr(args, "use_torch_fsdp2", False)
+                    and cfg.dist.use_torch_fsdp2
                     and args.ckpt_format == "torch_dist",
                 )
             update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
@@ -4851,7 +4860,7 @@ def train(
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
-        if args.align_grad_reduce:
+        if cfg.dist.align_grad_reduce:
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
@@ -5091,13 +5100,13 @@ def train(
         # Update the timeout for all process groups after initialization
         # We update the timeout after the first successful iteration,
         # which takes longer than others usually
-        if args.distributed_timeout_seconds_after_init is not None and iteration == start_iteration+1:
+        if cfg.dist.distributed_timeout_seconds_after_init is not None and iteration == start_iteration+1:
             # TODO: some dynamic timeout setting is required
             # based on the iteration time considering interval-based steps (e.g. eval, checkpoint)
             # e.g. timeout for normal iterations vs timeout for iterations with checkpoint
             # this timeout is triggered when there's no collective communication
             # for the duration of timeout
-            update_pg_timeout(timedelta(seconds=args.distributed_timeout_seconds_after_init))
+            update_pg_timeout(timedelta(seconds=cfg.dist.distributed_timeout_seconds_after_init))
         # Update number of microbatches first without consistency check to decide if a
         # checkpoint should be saved. If the number of microbatches is different
         # from the previous iteration, save a checkpoint. Then run consistency check
@@ -5615,8 +5624,7 @@ def train(
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
-                    if getattr(buf, 'nccl_mem_pool', None) is not None:
-                        nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
+                    buf.deregister_nccl_mem_pools()
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
         )

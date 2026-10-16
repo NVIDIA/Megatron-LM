@@ -759,12 +759,49 @@ class DistributedDataParallel(_BaseDataParallel):
         Args:
             synchronize: Whether to call torch.cuda.synchronize() before freeing.
             empty_cache: Whether to call torch.cuda.empty_cache() after freeing.
+
+        Registered gradient storage is deregistered and its private pool is
+        destroyed after the storage is released. Parameter pools remain live.
+        If deregistration fails, no gradient storage is released, but earlier
+        deregistrations are not rolled back. Abort the run; do not retry offload
+        or reuse the model with potentially partial registration state.
+
+        Raises:
+            RuntimeError: If registered gradient storage was not constructed
+                with an offload-capable separate pool, or pool deregistration fails.
         """
         if synchronize:
             torch.cuda.synchronize()
 
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        buffers = self.buffers + self.expert_parallel_buffers
+        # Only registered buffers own pools that need collective deregistration and release;
+        # every buffer still offloads its gradient storage in the full buffers loop below.
+        registered_buffers = [buffer for buffer in buffers if buffer.nccl_mem_pool is not None]
+        if any(not buffer.nccl_grad_pool_is_separate for buffer in registered_buffers):
+            raise RuntimeError(
+                "Gradient-buffer offload requires a separate NCCL gradient pool; construct "
+                "DistributedDataParallel with grad_buffer_offload=True."
+            )
+
+        # Deregister all pools before releasing any storage. If one fails,
+        # storage remains intact, but earlier deregistrations are not undone.
+        # The caller must abort the run rather than retry or reuse the model.
+        try:
+            for buffer in registered_buffers:
+                buffer.deregister_grad_pool_for_offload()
+        except RuntimeError as error:
+            error.add_note(
+                "Gradient-buffer offload failed during NCCL pool deregistration. "
+                "Registration state may be partial; abort this run and do not retry "
+                "offload or reuse this model."
+            )
+            raise
+
+        for buffer in buffers:
             buffer.offload_to_cpu(move_params=False, move_grads=True)
+
+        for buffer in registered_buffers:
+            buffer.release_offloaded_grad_pool()
 
         if empty_cache:
             torch.cuda.empty_cache()
@@ -781,7 +818,10 @@ class DistributedDataParallel(_BaseDataParallel):
             synchronize: Whether to call torch.cuda.synchronize() after allocation.
         """
         for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.reload_from_cpu(move_params=False, move_grads=True)
+            if buffer.nccl_grad_pool_is_separate and buffer.nccl_mem_pool is None:
+                buffer.reload_grad_buffer_into_nccl_pool()
+            else:
+                buffer.reload_from_cpu(move_params=False, move_grads=True)
 
         if synchronize:
             torch.cuda.synchronize()
