@@ -328,6 +328,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "recompute_method": None,
     "recompute_modules": ["core_attn"],
     "recompute_num_layers": None,
+    "rmsnorm_cast_before_weight": False,
     "rotary_base_per_layer": None,
     "rotary_interleaved": False,
     "sequence_parallel": True,

@@ -1084,7 +1084,15 @@ class TENorm:
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
-            if use_fused_residual:
+            if config.rmsnorm_cast_before_weight:
+                if use_fused_residual:
+                    raise ValueError(
+                        "rmsnorm_cast_before_weight does not support fused residual RMSNorm."
+                    )
+                from megatron.core.transformer.glm5_next_norm import GLM5NextRMSNorm
+
+                norm_module = GLM5NextRMSNorm
+            elif use_fused_residual:
                 assert (
                     TEFusedResidualRMSNorm is not None
                 ), "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"

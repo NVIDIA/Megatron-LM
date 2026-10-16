@@ -555,6 +555,11 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    rmsnorm_cast_before_weight: bool = False
+    """Round the normalized activation before applying RMSNorm gamma, matching HF GLM5Next.
+    This is an explicit numerical path, not a change to Transformer Engine's default.
+    """
+
     kda_disable_fp8: bool = False
     """Force KDA projections to BF16 even under FP8 training,
     (KDA projections are BF16 in the checkpoint)."""
