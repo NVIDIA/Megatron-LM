@@ -1,8 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+import pytest
 import torch
 
+from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateMachine
+from megatron.training import checkpointing
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -155,3 +159,62 @@ class TestRerunStateMachineCheckpointContract:
         sd = machine.state_dict(data_iterator=None, ckpt_format="fsdp_dtensor", force=True)
         assert sd is not None
         self._assert_sharded_object_shape(sd["sharded"])
+
+    @pytest.mark.parametrize(
+        'saved_state', (RerunState.NOT_RUNNING_YET, RerunState.WILL_RERUN_FROM_CHECKPOINT)
+    )
+    @pytest.mark.parametrize('runtime_mode', (RerunMode.VALIDATE_RESULTS, RerunMode.DISABLED))
+    def test_strict_native_roundtrip_requests_idle_and_pending_shards(
+        self, tmp_path_dist_ckpt, monkeypatch, saved_state, runtime_mode
+    ):
+        """A healthy saved sentinel is still part of the strict DCP request."""
+        saving_machine = RerunStateMachine(mode=RerunMode.VALIDATE_RESULTS)
+        saving_machine.state = saved_state
+        pending = saved_state == RerunState.WILL_RERUN_FROM_CHECKPOINT
+        saving_machine.rerun_requested = pending
+        saving_machine.checkpoint_requested = pending
+        saved = saving_machine.state_dict(data_iterator=None, ckpt_format='torch_dist')
+        expected_payload = dict(saved['sharded'].data)
+        loading_machine = RerunStateMachine(mode=runtime_mode)
+        monkeypatch.setattr(checkpointing, 'get_rerun_state_machine', lambda: loading_machine)
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'rerun_strict_roundtrip', sync=True) as ckpt_dir:
+            dist_checkpointing.save({'rerun_state_machine': saved}, ckpt_dir)
+            common = dist_checkpointing.load_common_state_dict(ckpt_dir)
+            # The ShardedObject is extracted from common state by save preprocessing.
+            assert 'sharded' not in common['rerun_state_machine']
+            request, ignore = checkpointing._get_rerun_state_dict_for_load(common, 'torch_dist')
+            self._assert_sharded_object_shape(request['sharded'])
+            assert ignore is (not pending)
+            loaded = dist_checkpointing.load(
+                {'rerun_state_machine': request}, ckpt_dir, strict='raise_all'
+            )
+            assert loaded['rerun_state_machine']['sharded'] == expected_payload
+
+        if not ignore:
+            loading_machine.load_state_dict(loaded['rerun_state_machine'])
+        if pending and runtime_mode != RerunMode.DISABLED:
+            assert loading_machine.state == saved_state
+            assert loading_machine.rerun_requested is True
+            assert loading_machine.checkpoint_requested is True
+        else:
+            # Reading a sentinel must not turn an ordinary resume into a rerun;
+            # the existing DISABLED-mode restore short-circuit also stays intact.
+            assert loading_machine.state == RerunState.NOT_RUNNING_YET
+            assert loading_machine.rerun_requested is False
+
+    @pytest.mark.parametrize(
+        'common',
+        (
+            {},
+            {'rerun_state_machine': None},
+            {'rerun_state_machine': {}},
+            {'rerun_state_machine': {'mode': RerunMode.VALIDATE_RESULTS}},
+        ),
+    )
+    def test_legacy_missing_rerun_state_does_not_request_a_new_shard(self, monkeypatch, common):
+        def unexpected_machine_lookup():
+            raise AssertionError('Legacy state must not create a rerun shard request.')
+
+        monkeypatch.setattr(checkpointing, 'get_rerun_state_machine', unexpected_machine_lookup)
+        assert checkpointing._get_rerun_state_dict_for_load(common, 'torch_dist') == (None, True)

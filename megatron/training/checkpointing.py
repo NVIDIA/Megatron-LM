@@ -2471,6 +2471,25 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     return layer_maps, load_optim
 
 
+def _get_rerun_state_dict_for_load(state_dict, ckpt_format):
+    """Read saved rerun shards independently of whether a step must be rerun.
+
+    Healthy saves carry a NOT_RUNNING_YET sentinel to keep their sharded
+    structure stable. It must be requested during strict loading too, while
+    validate_state_dict retains its existing pending-rerun restoration policy.
+    Legacy absent/None/state-less entries do not establish a shard to request.
+    The caller keeps topology, release and finetune eligibility guards.
+    """
+    saved_rerun_state = state_dict.get('rerun_state_machine')
+    if saved_rerun_state is None or 'state' not in saved_rerun_state:
+        return None, True
+    rerun_state_machine = get_rerun_state_machine()
+    template = rerun_state_machine.state_dict(
+        data_iterator=None, ckpt_format=ckpt_format, force=True
+    )
+    return template, not rerun_state_machine.validate_state_dict(saved_rerun_state)
+
+
 def load_checkpoint(
     ddp_model,
     optimizer,
@@ -2715,12 +2734,9 @@ def load_checkpoint(
             and not args.finetune
             and 'rerun_state_machine' in state_dict
         ):
-            rerun_state_machine = get_rerun_state_machine()
-            if rerun_state_machine.validate_state_dict(state_dict['rerun_state_machine']):
-                gen_sd_rerun_state = rerun_state_machine.state_dict(
-                    data_iterator=None, ckpt_format=ckpt_format, force=True
-                )
-                ignore_rerun_state = False
+            gen_sd_rerun_state, ignore_rerun_state = _get_rerun_state_dict_for_load(
+                state_dict, ckpt_format
+            )
         if ckpt_world_size != run_world_size or ckpt_tp_pp != run_tp_pp or ckpt_dp != run_dp:
             print_rank_0('Job sharding has changed: Rerun state will be ignored')
 
