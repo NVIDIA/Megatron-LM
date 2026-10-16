@@ -8,7 +8,12 @@ from megatron.core.transformer.moe.paged_stash import PagedStashManager, PagedSt
 
 
 def _config(moe_paged_stash):
-    return SimpleNamespace(moe_paged_stash=moe_paged_stash, moe_expert_rank_capacity_factor=1.5)
+    return SimpleNamespace(
+        moe_paged_stash=moe_paged_stash,
+        moe_expert_rank_capacity_factor=1.5,
+        cuda_graph_impl="none",
+        cuda_graph_modules=[],
+    )
 
 
 class _FakeTokenDispatcher:

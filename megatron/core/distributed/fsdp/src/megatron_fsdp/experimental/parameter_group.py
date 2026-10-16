@@ -26,7 +26,7 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .dbuffer import DBuffer
+from .dbuffer import DBuffer, symmetric_memory_allocation
 from .placement import Partial, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -244,7 +244,7 @@ class FsdpParameterGroup:
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
             return nullcontext()
-        return torch.cuda.use_mem_pool(self._symm_mem_pool)
+        return symmetric_memory_allocation(self._symm_mem_pool)
 
     def _set_module_parameter(self, fqns: tuple[str, ...], parameter: nn.Parameter) -> None:
         owning_module = self._owning_module()
@@ -331,17 +331,13 @@ class FsdpParameterGroup:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
             grads.append(fsdp_parameter.unsharded.grad)
         with self._symmetric_memory_context():
-            partial_grad = DBuffer(
+            return DBuffer(
                 mesh=self.mesh,
                 placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
             )
-        # Lets DBuffer.reduce_scatter select the symmetric-memory SUM path on PyTorch builds
-        # without symm_mem.is_symm_mem_tensor.
-        partial_grad.allocated_from_symm_mem = self._symm_mem_pool is not None
-        return partial_grad
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
