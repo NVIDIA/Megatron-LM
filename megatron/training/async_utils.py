@@ -222,11 +222,6 @@ def maybe_finalize_async_save(blocking: bool = False, terminate=False):
         # matching dispatch + worker spans.
         _tag_current_span_call_idx(finalized)
 
-    # Clean up finished deletion processes to prevent zombies
-    # Import here to avoid circular dependency
-    from .checkpointing import finalize_deletion_processes
-    finalize_deletion_processes(blocking=blocking or terminate)
-
     if terminate and async_calls_queue is not None:
         async_calls_queue.close()
 
