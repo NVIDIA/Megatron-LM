@@ -306,9 +306,16 @@ class PretrainConfigContainer(ConfigContainerBase):
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
         )
+        self.scheduler.validate_run(
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
+            skip_train=self.validation.skip_train,
+            weight_decay=self.optimizer.weight_decay,
+        )
 
     def _finalize(self) -> None:
         super()._finalize()
+        self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
 

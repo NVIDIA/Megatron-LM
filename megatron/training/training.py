@@ -2779,54 +2779,55 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
     args = get_args()
+    cfg = get_run_config()
 
     # Iteration-based training.
     if args.train_iters:
-        if args.lr_decay_iters is None:
-            args.lr_decay_iters = args.train_iters
-        lr_decay_steps = args.lr_decay_iters * args.global_batch_size
+        if cfg.scheduler.lr_decay_iters is None:
+            cfg.scheduler.lr_decay_iters = args.train_iters
+        lr_decay_steps = cfg.scheduler.lr_decay_iters * args.global_batch_size
         wd_incr_steps = args.train_iters * args.global_batch_size
         wsd_decay_steps = None
-        if args.lr_wsd_decay_iters is not None:
-            wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
-        if args.lr_warmup_fraction is not None:
-            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
+        if cfg.scheduler.lr_wsd_decay_iters is not None:
+            wsd_decay_steps = cfg.scheduler.lr_wsd_decay_iters * args.global_batch_size
+        if cfg.scheduler.lr_warmup_fraction is not None:
+            lr_warmup_steps = cfg.scheduler.lr_warmup_fraction * lr_decay_steps
         else:
-            lr_warmup_steps = args.lr_warmup_iters * args.global_batch_size
+            lr_warmup_steps = cfg.scheduler.lr_warmup_iters * args.global_batch_size
     # Sample-based training.
     elif args.train_samples:
         # We need to set training iters for later use. Technically
         # we need to adjust the training samples too (due to last
         # batch being incomplete) but we leave it as is for now.
         update_train_iters(args)
-        if args.lr_decay_samples is None:
-            args.lr_decay_samples = args.train_samples
-        lr_decay_steps = args.lr_decay_samples
+        if cfg.scheduler.lr_decay_samples is None:
+            cfg.scheduler.lr_decay_samples = args.train_samples
+        lr_decay_steps = cfg.scheduler.lr_decay_samples
         wd_incr_steps = args.train_samples
-        wsd_decay_steps = args.lr_wsd_decay_samples
-        if args.lr_warmup_fraction is not None:
-            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
+        wsd_decay_steps = cfg.scheduler.lr_wsd_decay_samples
+        if cfg.scheduler.lr_warmup_fraction is not None:
+            lr_warmup_steps = cfg.scheduler.lr_warmup_fraction * lr_decay_steps
         else:
-            lr_warmup_steps = args.lr_warmup_samples
+            lr_warmup_steps = cfg.scheduler.lr_warmup_samples
     else:
         raise Exception('either train-iters or train-samples should be provided.')
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
-        init_lr=args.lr_warmup_init,
+        init_lr=cfg.scheduler.lr_warmup_init,
         max_lr=args.lr,
         min_lr=args.min_lr,
         lr_warmup_steps=lr_warmup_steps,
         lr_decay_steps=lr_decay_steps,
-        lr_decay_style=args.lr_decay_style,
-        start_wd=args.start_weight_decay,
-        end_wd=args.end_weight_decay,
+        lr_decay_style=cfg.scheduler.lr_decay_style,
+        start_wd=cfg.scheduler.start_weight_decay,
+        end_wd=cfg.scheduler.end_weight_decay,
         wd_incr_steps=wd_incr_steps,
-        wd_incr_style=args.weight_decay_incr_style,
-        use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
-        override_opt_param_scheduler=args.override_opt_param_scheduler,
+        wd_incr_style=cfg.scheduler.weight_decay_incr_style,
+        use_checkpoint_opt_param_scheduler=cfg.scheduler.use_checkpoint_opt_param_scheduler,
+        override_opt_param_scheduler=cfg.scheduler.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
-        lr_wsd_decay_style=args.lr_wsd_decay_style,
+        lr_wsd_decay_style=cfg.scheduler.lr_wsd_decay_style,
     )
 
     return opt_param_scheduler
