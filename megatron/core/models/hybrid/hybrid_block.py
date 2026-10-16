@@ -737,8 +737,9 @@ class HybridStack(MegatronModule):
             Tensor in the common case. With MTP, an outer post-process stack may
             return a 2-tuple whose second element is either the pre-contraction
             mHC multi-stream tensor or the complete AttnRes trunk source tuple.
-            The two modes are mutually exclusive. Nested MTP stacks always
-            return only their updated partial tensor.
+            The two modes are mutually exclusive, and the mHC tuple is returned only
+            while MTP hyper-connections are not explicitly disabled. Nested MTP stacks
+            always return only their updated partial tensor.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -1181,7 +1182,9 @@ class HybridStack(MegatronModule):
 
         mhc_multistream = None
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
-            if (self.config.mtp_num_layers or 0) > 0:
+            if (
+                self.config.mtp_num_layers or 0
+            ) > 0 and self.config.mtp_enable_hyper_connections is not False:
                 mhc_multistream = hidden_states
             if self.config.mhc_learned_output_contract:
                 hidden_states = learned_output_contract(
