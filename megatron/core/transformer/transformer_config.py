@@ -1300,6 +1300,12 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # Hyper-Connection Configuration
     ####################
+    mhc_single_pass: bool = False
+    """Use the preceding sublayer's input mix, including the final output contraction."""
+
+    mhc_epsilon: float = 1e-6
+    """Positive stabilizer for single-pass mHC input and Sinkhorn coefficients."""
+
     enable_mhc_connections: bool = False
     """Enable mHC residual connections."""
 
@@ -2650,6 +2656,20 @@ class TransformerConfig(ModelParallelConfig):
                 "recompute_modules with selective recompute. Consider adding 'mhc' to "
                 "recompute_modules with selective recompute to reduce activation memory."
             )
+
+        if self.mhc_single_pass:
+            if self.cuda_graph_impl != "none":
+                raise NotImplementedError(
+                    "Single-pass mHC requires an explicit tensor-state graph adapter"
+                )
+            if not self.enable_mhc_connections:
+                raise ValueError("mhc_single_pass requires enable_mhc_connections=True")
+            if not math.isfinite(self.mhc_epsilon) or self.mhc_epsilon <= 0:
+                raise ValueError("mhc_epsilon must be positive and finite")
+            if self.moe_shortcut_connection or self.mtp_num_layers:
+                raise NotImplementedError("Single-pass mHC does not support shortcut MoE or MTP")
+            if self.sequence_parallel or self.tensor_model_parallel_size != 1:
+                raise NotImplementedError("Single-pass mHC currently requires TP=1 without SP")
 
         if self.use_fused_mhc and not self.enable_mhc_connections:
             raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")

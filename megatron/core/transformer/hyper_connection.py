@@ -1,8 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+from dataclasses import dataclass
 from functools import partial
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,38 @@ from megatron.core.utils import nvtx_decorator
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
+
+
+@dataclass
+class SinglePassMHCState:
+    """Previous sublayer's input mix, owned by one forward invocation.
+
+    A fresh state is required for every microbatch. The final sublayer's mix
+    contracts the stack output; no separate learned output head is needed.
+    """
+
+    pre_mix: Tensor | None = None
+
+    def contract(
+        self,
+        hidden_states: Tensor,
+        n: int,
+        *,
+        aggregate: Callable[[Tensor, Tensor], Tensor] | None = None,
+    ) -> Tensor:
+        """Contract residual streams in FP32, selecting stream zero at stack entry."""
+        if n < 1 or hidden_states.ndim != 3 or hidden_states.shape[-1] % n:
+            raise ValueError("Expected [sequence, batch, n * hidden] residual streams")
+        streams = hidden_states.unflatten(-1, (n, -1))
+        if self.pre_mix is None:
+            return streams[..., 0, :].contiguous()
+        if self.pre_mix.shape != hidden_states.shape[:2] + (n,):
+            raise ValueError("The preceding mHC mix must have shape [sequence, batch, n]")
+        if aggregate is not None:
+            return aggregate(streams, self.pre_mix).to(hidden_states.dtype)
+        return (
+            (streams.float() * self.pre_mix.float().unsqueeze(-1)).sum(-2).to(hidden_states.dtype)
+        )
 
 
 def build_mhc_recompute_layer_plan(
@@ -201,8 +234,9 @@ class HyperConnectionModule(MegatronModule):
         self.n = config.mhc_num_residual_streams
         self.hidden_size = config.hidden_size
         self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
-        self.sinkhorn_eps = _MHC_SINKHORN_EPS
-        self.compute_h_eps = _MHC_COMPUTE_H_EPS
+        self.single_pass = config.mhc_single_pass
+        self.sinkhorn_eps = config.mhc_epsilon if self.single_pass else _MHC_SINKHORN_EPS
+        self.compute_h_eps = config.mhc_epsilon if self.single_pass else _MHC_COMPUTE_H_EPS
 
         # Projection weights for dynamic mappings
         # Input: [s, b, n*C] -> Output: n^2 + 2n values per token
@@ -226,7 +260,7 @@ class HyperConnectionModule(MegatronModule):
         mark_keep_in_fp32(self.alpha_post)
         mark_keep_in_fp32(self.alpha_res)
         mark_keep_in_fp32(self.bias)
-        self.norm_eps = 1e-6
+        self.norm_eps = config.layernorm_epsilon if self.single_pass else 1e-6
 
         # Choose implementation: unified fused kernels vs reference modules.
         # The fused public API selects the backend per operation internally.
@@ -329,6 +363,29 @@ class HyperConnectionModule(MegatronModule):
         h_res = h[..., 2 * self.n :]
         return h_pre, h_post, h_res
 
+    @torch.compile
+    def _single_pass_coefficients(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Fuse FP32 normalization and coefficient activations around the projection."""
+        x = hidden_states.float()
+        # V4.1 requires epsilon inside sqrt, including for zero/small inputs.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            projected = F.linear(x, self.mapping_proj.weight.float())
+        projected = projected * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        pre = (projected[..., : self.n] * self.alpha_pre + self.bias[: self.n]).sigmoid()
+        post = (
+            projected[..., self.n : 2 * self.n] * self.alpha_post + self.bias[self.n : 2 * self.n]
+        ).sigmoid()
+        residual = (
+            projected[..., 2 * self.n :] * self.alpha_res + self.bias[2 * self.n :]
+        ).unflatten(-1, (self.n, self.n))
+        return pre + self.compute_h_eps, 2 * post, residual
+
+    def _compute_single_pass_mappings(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Predict FP32 coefficients, then apply the configured Sinkhorn kernel."""
+        pre, post, residual = self._single_pass_coefficients(hidden_states)
+        residual = self._sinkhorn_op(residual, self.sinkhorn_iterations, self.sinkhorn_eps)
+        return pre, post, residual
+
     @nvtx_decorator(message="HyperConnection::compute_mappings")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -344,6 +401,9 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights (2*sigmoid activated)
             h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
         """
+        if self.single_pass:
+            return self._compute_single_pass_mappings(x)
+
         s, b, _ = x.shape
 
         if self._proj_rms_compute_h_op is not None:
@@ -511,6 +571,7 @@ class HyperConnectionModule(MegatronModule):
         hidden_states: Tensor,
         mhc_recompute_manager: Optional[CheckpointWithoutOutputManager] = None,
         return_residual: bool = False,
+        mhc_state: SinglePassMHCState | None = None,
     ) -> Tuple[Tensor, ...]:
         """
         Full mHC forward pass.
@@ -535,11 +596,33 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights
             residual: [s, b, n*C] - residual view for fused_h_res_h_post_bda
         """
-        if mhc_recompute_manager is not None:
+        if self.single_pass:
+            if mhc_state is None:
+                raise ValueError("Single-pass mHC requires a forward-local SinglePassMHCState")
+            h_pre, h_post, h_res = self.compute_mappings(hidden_states)
+            if mhc_recompute_manager is None:
+                aggregated = self._single_pass_aggregate(hidden_states, mhc_state.pre_mix)
+            else:
+                from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+
+                # Replay receives the incoming mix explicitly, never the mutable state.
+                aggregated = CheckpointWithoutOutput(ckpt_manager=mhc_recompute_manager).checkpoint(
+                    self._single_pass_aggregate, hidden_states, mhc_state.pre_mix
+                )
+            mhc_state.pre_mix = h_pre
+            result = aggregated, h_res, h_post, hidden_states
+        elif mhc_recompute_manager is not None:
             result = self._forward_with_checkpoint(hidden_states, mhc_recompute_manager)
         else:
             result = self._forward_normal(hidden_states)
         return result if return_residual else result[:3]
+
+    def _single_pass_aggregate(self, hidden_states: Tensor, pre_mix: Tensor | None) -> Tensor:
+        """Aggregate with an explicit predecessor, safe for checkpoint replay."""
+        aggregate = self._h_aggregate_op if self.config.use_fused_mhc else None
+        output = SinglePassMHCState(pre_mix).contract(hidden_states, self.n, aggregate=aggregate)
+        # Entry selection can alias residual storage for one token or one stream.
+        return output.clone() if pre_mix is None else output
 
     def _forward_normal(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
@@ -688,6 +771,22 @@ class HyperConnectionModule(MegatronModule):
         Returns:
             output: [s, b, n*C] - final output after all operations
         """
+        if self.single_pass:
+            args = (
+                h_res,
+                original_residual,
+                h_post,
+                *layer_output_with_bias,
+                dropout_prob,
+                training,
+            )
+            if manager is None:
+                return self._single_pass_bda(*args)
+            from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+
+            return CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+                self._single_pass_bda, *args
+            )
         if manager is not None:
             return self._fused_h_res_h_post_bda_with_checkpoint(
                 h_res,
@@ -709,6 +808,28 @@ class HyperConnectionModule(MegatronModule):
                 training,
                 fused,
             )
+
+    def _single_pass_bda(
+        self, h_res, original_residual, h_post, x, bias, dropout_prob, training
+    ) -> Tensor:
+        """Apply residual mixing and branch expansion once, preserving FP32 coefficients."""
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            streams = original_residual.unflatten(-1, (self.n, self.hidden_size))
+            if self.config.use_fused_mhc and (not training or dropout_prob == 0.0):
+                return self._h_post_bda_op(
+                    h_res,
+                    streams,
+                    h_post,
+                    # Bias gradients reduce across tokens; retain FP32 partials.
+                    x if bias is None else x.float(),
+                    None if bias is None else bias.float(),
+                    output_dtype=x.dtype,
+                ).flatten(-2)
+            mixed = torch.einsum("sbij,sbic->sbjc", h_res.float(), streams.float())
+            branch = x.float() if bias is None else x.float() + bias.float()
+            expanded = h_post.float().unsqueeze(-1) * branch.unsqueeze(-2)
+            expanded = F.dropout(expanded, p=dropout_prob, training=training)
+            return (mixed + expanded).flatten(-2).to(x.dtype)
 
     def _fused_h_res_h_post_bda_native(
         self,
