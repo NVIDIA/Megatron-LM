@@ -16,11 +16,15 @@ from typing import Callable
 
 import torch
 
-from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.pipeline_parallel.utils import (
+    ScheduleNode,
+    ScheduleNodeInputWrapper,
+    make_viewless,
+)
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
-from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 def weak_method(method):
@@ -39,74 +43,6 @@ def weak_method(method):
         return method_ref()(*args, **kwarg)
 
     return wrapped_func
-
-
-@internal_api
-def should_free_input(name, is_moe, config, num_local_experts):
-    """Whether the schedule node named ``name`` can free its input after forward.
-
-    The schedule decomposes a transformer layer into ``pre_dispatch_computation``,
-    ``moe_dispatch``, ``mlp``, and ``moe_combine`` nodes; the inputs to some of
-    those nodes are not needed in backward and can be released early to lower
-    peak activation memory. Dense layers and the ``pre_dispatch_computation``
-    node always need their input retained (the attention residual flows through
-    the post-MLP BDA).
-
-    Args:
-        name: Schedule node name.
-        is_moe: True for MoE layers; dense layers always retain inputs.
-        config: ``TransformerConfig`` for the layer.
-        num_local_experts: Local expert count on this rank (None for dense).
-
-    Returns:
-        True iff the named node may free its input after forward.
-    """
-    # For dense layers [pre_dispatch_computation, fake, mlp, fake], the input is needed
-    # during backward pass
-    if not is_moe:
-        return False
-    enable_deepep = (
-        config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
-    )
-    enable_hybridep = (
-        config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "hybridep"
-    )
-    enable_ncclep = (
-        config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "ncclep"
-    )
-    # Define which nodes should free input memory.
-    # Since we split the computing graph into multiple nodes, we can manually control
-    # when and how to free the input memory.
-    # The input and output of A2A are not needed anymore after the forward pass,
-    # so we can free the input memory after the forward pass.
-
-    # When low precision fp8/4 is enabled, the casted tensors are saved and the
-    # original bf16 tensors are safe to be freed.
-    free_mlp = config.fp8 is not None or config.fp4 is not None
-    if not free_mlp:
-        # AlltoAll dispatcher with local_num_experts=1, HybridEP, and NCCL EP all use
-        # identity operation for `dispatch_postprocess`, hence the mlp inputs will be
-        # directly passed to GroupedGemm and should be saved for backward pass.
-        free_mlp = num_local_experts > 1 or config.moe_token_dispatcher_type != "alltoall"
-        free_mlp = free_mlp and not (enable_hybridep or enable_ncclep)
-
-    free_input_nodes = {
-        "mlp": free_mlp,
-        "moe_combine": True,
-        # For non-DeepEP/HybridEP/NCCL-EP dispatcher mode, the input is the un-dispatched
-        # tokens and probs before dispatch A2A and it's not needed anymore after the
-        # forward pass. For DeepEP, HybridEP, and NCCL EP dispatcher mode, they are all
-        # needed in backward pass and cannot be freed.
-        # If moe_preprocess is in cuda graph scope, tokens and probs are fixed size
-        # tensors, so they cannot be freed.
-        "moe_dispatch": not (enable_deepep or enable_hybridep or enable_ncclep)
-        and (CudaGraphModule.moe_preprocess not in config.cuda_graph_modules),
-    }
-
-    return free_input_nodes.get(name, False)
 
 
 class LayerState:
@@ -222,10 +158,8 @@ class TransformerLayerNode(ScheduleNode):
 
     Each transformer layer is decomposed into ``pre_dispatch_computation``,
     ``moe_dispatch``, ``mlp``, and ``moe_combine`` slots; this class is the scheduler-side
-    handle for one slot. It owns the slot's stream / event, the per-slot
-    ``free_input`` policy, and the optional delayed weight-gradient hook.
-    Subclasses override ``_resolve_free_input`` to specialize the policy
-    (HybridStackNode does this for grouped layers).
+    handle for one slot. It owns the slot's stream / event and the optional
+    delayed weight-gradient hook.
     """
 
     def __init__(
@@ -239,11 +173,6 @@ class TransformerLayerNode(ScheduleNode):
         bwd_dw_callables=None,
         extra_args={},
     ):
-        config = extra_args.get("config", None)
-        assert config is not None, "model config must be passed to TransformerLayerNode."
-        is_moe = extra_args.get("is_moe", False)
-        num_local_experts = extra_args.get("num_local_experts", None)
-        free_input = self._resolve_free_input(name, is_moe, config, num_local_experts)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
@@ -251,15 +180,13 @@ class TransformerLayerNode(ScheduleNode):
             stream,
             event,
             weak_method(self.backward_impl),
-            free_input=free_input,
             name=name,
-            ncclep_zero_copy=config.moe_ncclep_zero_copy,
         )
         self.layer_state = layer_state
         self.chunk_state = chunk_state
         self.submodule = submodule
-        self.detached = tuple()
-        self.before_detached = tuple()
+        self.detached_wrappers = tuple()
+        self.before_detached_edges = tuple()
         self.is_mtp = extra_args.get("is_mtp", False)
         self.post_wgrad_grad_acc_hooks = None
 
@@ -278,28 +205,30 @@ class TransformerLayerNode(ScheduleNode):
                 bwd_dw_callables if isinstance(bwd_dw_callables, list) else [bwd_dw_callables]
             )
 
-    @staticmethod
-    def _resolve_free_input(name, is_moe, config, num_local_experts):
-        """Free-input policy hook. Subclasses override to specialize."""
-        return should_free_input(name, is_moe, config, num_local_experts)
-
     def detach(self, t):
-        """Detach a tensor and remember it for backward through the schedule node."""
-        detached = make_viewless(t).detach()
-        detached.requires_grad = t.requires_grad
-        self.before_detached = self.before_detached + (t,)
-        self.detached = self.detached + (detached,)
+        """Create a storage-free autograd boundary for a saved side output."""
+        t = make_viewless(t)
+        before_detached_edge = (
+            torch.autograd.graph.get_gradient_edge(t) if t.requires_grad else None
+        )
+        wrapper = ScheduleNodeInputWrapper(t)
+        if before_detached_edge is not None:
+            self.before_detached_edges = self.before_detached_edges + (before_detached_edge,)
+            self.detached_wrappers = self.detached_wrappers + (wrapper,)
+        detached = wrapper.unwrap_real_tensor()
         return detached
 
     def forward_impl(self, *args):
         """Invoke the slot's submodule forward."""
         return self.submodule(self, *args)
 
-    def backward_impl(self, outputs, output_grad):
+    def backward_impl(self, output_edges, output_grads):
         """Run the slot's backward and return the input grads."""
-        detached_grad = tuple([e.grad for e in self.detached])
-        grads = output_grad + detached_grad
-        self.default_backward_func(outputs + self.before_detached, grads)
+        detached_grads = tuple(wrapper.grad for wrapper in self.detached_wrappers)
+        grads = output_grads + detached_grads
+        self.default_backward_func(output_edges + self.before_detached_edges, grads)
+        self.detached_wrappers = tuple()
+        self.before_detached_edges = tuple()
 
         return grads
 
@@ -370,8 +299,8 @@ class TransformerLayerNode(ScheduleNode):
 
     def __del__(self):
         # Release references early to help avoid leaks across iterations.
-        self.before_detached = None
-        self.detached = None
+        self.detached_wrappers = None
+        self.before_detached_edges = None
         self.layer_state = None
         self.chunk_state = None
         self.submodule = None
