@@ -14,6 +14,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.hybrid.layers.utils import create_layer_config
 from megatron.core.pipeline_parallel.schedules import custom_backward, deallocate_output_tensor
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -853,4 +854,107 @@ class TestHybridMHCContraction:
         for name, parameter in checkpointed.named_parameters():
             torch.testing.assert_close(
                 parameter.grad, baseline.get_parameter(name).grad, msg=name, **grad_close_kwargs
+            )
+
+    @pytest.mark.parametrize("mtp_hyper_connections", [None, False, True])
+    def test_mean_contraction_preserves_multistream_mtp_handoff(self, mtp_hyper_connections):
+        config = _config(
+            mhc_learned_output_contract=False,
+            mtp_num_layers=1,
+            mtp_enable_hyper_connections=mtp_hyper_connections,
+        )
+        stack = _stack(config)
+        hidden = torch.randn(8, 2, 32, device="cuda", requires_grad=True)
+        output = stack(hidden, attention_mask=None)
+        if mtp_hyper_connections is False:
+            assert isinstance(output, torch.Tensor)
+            contracted = output
+            assert contracted.shape == (8, 2, 32)
+        else:
+            contracted, multistream = output
+            assert multistream.shape == (8, 2, 128)
+            torch.testing.assert_close(contracted, multistream.unflatten(-1, (4, 32)).mean(-2))
+        contracted.sum().backward()
+        assert hidden.grad is not None
+
+    @pytest.mark.parametrize("layer_source", ["pattern", "config_list"])
+    def test_single_stream_mtp_inventory_and_one_postprocess(self, layer_source):
+        """A one-depth checkpoint must not acquire random inner mHC parameters."""
+        config = _config(
+            mhc_learned_output_contract=False, mtp_num_layers=1, mtp_enable_hyper_connections=False
+        )
+        # pattern: the MTP block copies the decoder config into each per-layer config.
+        # config_list: the caller provides the configs (HybridModel passes its
+        # hybrid_layer_config_list entries unchanged, #7555); this one is built from the
+        # decoder config, so it carries the mHC flags.
+        layer_kwargs = (
+            dict(mtp_layer_pattern=Symbols.MAMBA)
+            if layer_source == "pattern"
+            else dict(mtp_layer_config_list=[create_layer_config(config, Symbols.MAMBA)])
+        )
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=hybrid_stack_spec.submodules.mtp_block_spec,
+            **layer_kwargs,
+            hybrid_submodules=HybridStackSubmodules(
+                mamba_layer=ModuleSpec(module=_ResidualOnlyLayer)
+            ),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp", "dp_cp"]
+            ),
+        ).cuda()
+        layer = mtp.layers[0]
+        assert layer.config is config
+        assert config.enable_hyper_connections
+        assert not layer.mhc_enabled
+        assert layer.mtp_model_layer.config is not config
+        assert not layer.mtp_model_layer.config.enable_hyper_connections
+        assert isinstance(layer.mtp_model_layer.layers[0], _ResidualOnlyLayer)
+        # _ResidualOnlyLayer ignores the mHC flags, but a real TransformerLayer built from a
+        # per-layer config that keeps them rejects a call outside the hybrid mHC wrapper.
+        layer_configs = [*layer.mtp_model_layer.layer_config_list]
+        layer_configs.append(layer.mtp_model_layer.layers[0].config)
+        for layer_config in layer_configs:
+            assert not layer_config.enable_mhc_connections
+            assert not layer_config.enable_hyper_connections
+        assert layer.eh_proj.weight.shape == (32, 64)
+        assert layer.e_proj is None and layer.h_proj is None
+        keys = set(mtp.state_dict())
+        assert "layers.0.eh_proj.weight" in keys
+        assert not any("hyper_connection" in key or "hc_head_" in key for key in keys)
+
+        postprocess_calls = []
+
+        def count_postprocess(module, inputs, output):
+            postprocess_calls.append(1)
+
+        hidden = torch.randn(8, 2, 32, device="cuda", requires_grad=True)
+        tokens = torch.arange(8, device="cuda").expand(2, -1)
+        embedding_weight = torch.randn(16, 32, device="cuda", requires_grad=True)
+
+        def embedding(input_ids, position_ids):
+            return torch.nn.functional.embedding(input_ids, embedding_weight).transpose(0, 1)
+
+        with layer.final_layernorm.register_forward_hook(count_postprocess):
+            actual = mtp(
+                hidden_states=hidden,
+                input_ids=tokens,
+                position_ids=tokens,
+                attention_mask=None,
+                embedding=embedding,
+            )
+        assert actual.shape == (16, 2, 32)
+        assert postprocess_calls == [1]
+        actual.square().mean().backward()
+        assert hidden.grad is not None
+        assert layer.eh_proj.weight.grad is not None
+        assert layer.mtp_model_layer.layers[0].proj.weight.grad is not None
+        with pytest.raises(ValueError, match="MTP hyper-connections are disabled"):
+            mtp(
+                hidden_states=hidden,
+                input_ids=tokens,
+                position_ids=tokens,
+                attention_mask=None,
+                embedding=embedding,
+                mhc_multistream=hidden.repeat(1, 1, 4),
             )
