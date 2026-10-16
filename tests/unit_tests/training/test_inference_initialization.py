@@ -272,6 +272,13 @@ def test_distributed_training_services_require_explicit_opt_in(
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize, "set_default_log_ranks", Mock())
     events = []
+    finalize = run_config.finalize
+
+    def finalize_config():
+        finalize()
+        events.append("finalize_config")
+
+    monkeypatch.setattr(run_config, "finalize", finalize_config)
     for name in (
         "init_persistent_async_worker",
         "initialize_rerun_state_machine",
@@ -290,6 +297,7 @@ def test_distributed_training_services_require_explicit_opt_in(
     initialize.initialize_megatron(allow_no_cuda=True, training=True)
 
     assert events == [
+        "finalize_config",
         "init_persistent_async_worker",
         "initialize_rerun_state_machine",
         "_initialize_distributed",

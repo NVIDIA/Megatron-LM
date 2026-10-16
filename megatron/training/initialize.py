@@ -89,7 +89,8 @@ def initialize_megatron(
     args = get_args()
 
     cfg = get_run_config()
-    cfg.validate()
+    # Resolve runtime config before distributed initialization and RNG setup.
+    cfg.finalize()
     transformer_config = getattr(cfg.model, "transformer", None)
     # Legacy model-provider entrypoints do not construct a model config yet.
     tp_comm_overlap = (
