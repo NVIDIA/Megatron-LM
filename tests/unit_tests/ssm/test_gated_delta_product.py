@@ -60,7 +60,7 @@ def test_decay_parameters_stay_fp32_in_float16_module(parameter_name):
     model_parallel_cuda_manual_seed(123)
     try:
         config = _make_config([])
-        config.gdp_cutedsl_kernel = not HAVE_FLA
+        config.gdp_backend = "fla" if HAVE_FLA else "cudnn"
         mixer = _build_mixer(config)
         parameter = getattr(mixer, parameter_name)
         assert parameter.dtype == torch.float32
