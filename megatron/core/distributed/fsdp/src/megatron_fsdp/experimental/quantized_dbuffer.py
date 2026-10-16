@@ -25,6 +25,8 @@ try:
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 except ImportError as exc:
+    # Keep "UnavailableError": .gitlab/scripts/check_imports.py imports this module
+    # directly and uses that string to classify missing optional dependencies as graceful.
     raise ImportError(
         "UnavailableError: QuantizedDBuffer requires Transformer Engine MXFP8 support"
     ) from exc
