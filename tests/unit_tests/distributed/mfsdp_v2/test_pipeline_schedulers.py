@@ -13,7 +13,9 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
+    iteration,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -149,9 +151,17 @@ def test_vpp_training_validation_training(distributed_setup):
         assert len(orders) == 2
         assert all(len(order) > 0 for order, _ in orders.values())
         # Also check parameters on non-last PP ranks, which do not return losses.
-        for ref, model in zip(reference, sharded):
-            for expected, actual in zip(ref.parameters(), model.parameters()):
-                torch.testing.assert_close(actual.full_tensor(), expected)
+        for chunk_id, (ref, model) in enumerate(zip(reference, sharded)):
+            units = [module for module in model.modules() if isinstance(module, FsdpModule)]
+            with iteration(units[0].context, key=("parameter_check", chunk_id)):
+                for unit in units:
+                    unit.unshard()
+                try:
+                    for expected, actual in zip(ref.parameters(), model.parameters()):
+                        torch.testing.assert_close(actual, expected)
+                finally:
+                    for unit in reversed(units):
+                        unit.reshard()
     finally:
         Utils.destroy_model_parallel()
 

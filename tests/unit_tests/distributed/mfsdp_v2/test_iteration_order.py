@@ -192,5 +192,14 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant):
         torch.testing.assert_close(actual, expected)
     _, phases = context.iteration_order._orders["default"]
     assert "recompute" in phases
-    for expected, actual in zip(baseline.parameters(), model.parameters()):
-        torch.testing.assert_close(actual.full_tensor(), expected)
+    # Group-packed shards need the FSDP layout to reconstruct parameters;
+    # DTensor.full_tensor() assumes ordinary per-tensor chunking instead.
+    with iteration(context, key="parameter_check"):
+        for unit in (model, model.fc1, model.fc2):
+            unit.unshard()
+        try:
+            for expected, actual in zip(baseline.parameters(), model.parameters()):
+                torch.testing.assert_close(actual, expected)
+        finally:
+            for unit in (model.fc2, model.fc1, model):
+                unit.reshard()
