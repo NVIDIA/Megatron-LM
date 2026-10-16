@@ -2,6 +2,7 @@
 
 """Dataloaders."""
 
+import logging
 import random
 
 import numpy as np
@@ -10,8 +11,73 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
+from megatron.core.num_microbatches_calculator import (
+    get_current_running_global_batch_size,
+    get_global_batch_size_upper_bound,
+    get_num_microbatches,
+)
+from megatron.core.utils import log_single_rank
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
+
+logger = logging.getLogger(__name__)
+
+
+def get_dataloader_prefetch_factor(prefetch_factor, num_workers, num_microbatches_per_step=None):
+    """Resolve --dataloader-prefetch-factor into the DataLoader prefetch_factor.
+
+    torch keeps ``prefetch_factor * num_workers`` batches outstanding and dispatches
+    one new index each time a batch is consumed. A training step pulls
+    ``num_microbatches_per_step`` batches (one microbatch each) from the loader, so a
+    window of at least that many batches has every batch of step k+1 dispatched while
+    step k still runs. 'auto' resolves to ``ceil(num_microbatches_per_step /
+    num_workers) + 1``; the extra batch per worker keeps the window above one step.
+
+    Args:
+        prefetch_factor: None (keep torch's default), a positive int, or 'auto'.
+        num_workers: Number of DataLoader worker processes.
+        num_microbatches_per_step: Batches one step pulls from this loader. When None,
+            'auto' keeps torch's default.
+
+    Returns:
+        The prefetch_factor to pass to the DataLoader, or None to leave it unset.
+    """
+    if prefetch_factor is None:
+        return None
+    if prefetch_factor != 'auto' and (
+        not isinstance(prefetch_factor, int)
+        or isinstance(prefetch_factor, bool)
+        or prefetch_factor <= 0
+    ):
+        raise ValueError(
+            f"--dataloader-prefetch-factor must be a positive integer or 'auto', "
+            f"got {prefetch_factor!r}"
+        )
+    if num_workers == 0:
+        if prefetch_factor == 'auto':
+            # Without worker processes nothing is prefetched, so there is nothing to size.
+            return None
+        raise ValueError(
+            f"--dataloader-prefetch-factor {prefetch_factor} requires --num-workers > 0: "
+            "the DataLoader only prefetches in worker processes."
+        )
+    if prefetch_factor != 'auto':
+        return prefetch_factor
+    if num_microbatches_per_step is None:
+        return None
+    return -(-num_microbatches_per_step // num_workers) + 1
+
+
+def _get_train_num_microbatches_per_step():
+    """Return the most batches one training step pulls from this rank's loader."""
+    # The packing schedulers (get_batch_and_global_seqlens) and the ordinary schedules
+    # pull get_num_microbatches() batches per step. A step batch-size schedule grows
+    # that after the loader is built, so scale to the largest global batch of the run.
+    return -(
+        -get_num_microbatches()
+        * get_global_batch_size_upper_bound()
+        // get_current_running_global_batch_size()
+    )
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
@@ -114,12 +180,40 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     # without consuming a draw.
     loader_generator = torch.Generator()
     loader_generator.manual_seed(torch.initial_seed())
-    if args.sequence_packing_scheduler is not None and args.num_workers > 0 and not is_eval:
-        # Keep a full next global batch in flight for packing schedulers.
+    # Only the training loader gets a prefetch window: persistent validation/test workers
+    # would fill it when their iterators are created and hold it between evaluations.
+    flag = getattr(args, 'dataloader_prefetch_factor', None)
+    prefetch_factor = None
+    if not is_eval and flag is not None:
+        # An explicit --dataloader-prefetch-factor overrides the packing default below.
+        num_microbatches_per_step = (
+            _get_train_num_microbatches_per_step()
+            if flag == 'auto' and args.num_workers > 0
+            else None
+        )
+        prefetch_factor = get_dataloader_prefetch_factor(
+            flag, args.num_workers, num_microbatches_per_step
+        )
+        source = f"--dataloader-prefetch-factor {flag}"
+    elif not is_eval and args.sequence_packing_scheduler is not None and args.num_workers > 0:
+        # Packing schedulers draw a whole global batch, global_batch_size /
+        # (micro_batch_size * DP) items on every DP rank, at the start of each
+        # step. Keeping that many items in flight lets the workers and the
+        # pin-memory thread build the next step's batch while the current step
+        # trains, at the cost of host memory for one more global batch.
         items_per_step = args.global_batch_size // (
             micro_batch_size * mpu.get_data_parallel_world_size()
         )
-        extra_kwargs["prefetch_factor"] = max(2, -(-items_per_step // args.num_workers))
+        prefetch_factor = max(2, -(-items_per_step // args.num_workers))
+        source = f"sequence-packing scheduler default, {items_per_step} items per step"
+    if prefetch_factor is not None:
+        extra_kwargs["prefetch_factor"] = prefetch_factor
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"> dataloader prefetch_factor {prefetch_factor} ({source}; "
+            f"num_workers {args.num_workers}, split {split})",
+        )
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
