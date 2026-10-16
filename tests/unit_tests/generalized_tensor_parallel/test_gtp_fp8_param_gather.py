@@ -77,7 +77,7 @@ def _gdp_moe_test_args(overlap, *, num_weight_shards):
         mamba_num_groups=2,
         mamba_state_dim=128,
         gdp_num_householder=3,
-        gdp_cutedsl_kernel=False,
+        gdp_cudnn_kernel=False,
         num_experts=2,
         moe_grouped_gemm=True,
         moe_single_grouped_weight=False,

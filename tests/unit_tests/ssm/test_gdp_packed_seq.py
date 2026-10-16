@@ -33,7 +33,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.gated_delta_product import (
-    HAVE_CUTEDSL_GDP_CP,
+    HAVE_CUDNN_GDP_CP,
     GatedDeltaProductMixer,
     GatedDeltaProductMixerSubmodules,
 )
@@ -429,7 +429,7 @@ class TestGDPPackedSequence:
     reason="CP=2 test requires at least 2 GPUs",
 )
 @pytest.mark.skipif(not HAVE_MAMBA_DEPS, reason="GDP mixer requires mamba_ssm + einops")
-@pytest.mark.skipif(not HAVE_CUTEDSL_GDP_CP, reason="CuTeDSL GDP CP backend is unavailable")
+@pytest.mark.skipif(not HAVE_CUDNN_GDP_CP, reason="cuDNN GDP CP backend is unavailable")
 @pytest.mark.skipif(
     not is_causal_conv1d_min_version("1.7.0"),
     reason="GDP CP causal convolution requires causal-conv1d >= 1.7.0",
@@ -444,10 +444,10 @@ class TestGDPPackedSequence:
         pytest.param([64, 192], [], id="thd-varlen"),
     ),
 )
-def test_cutedsl_chunkwise_forward_and_backward_equivalence(seq_lens, recompute_modules):
-    """CuTeDSL CP=2 matches CP=1 for BLH, packed THD, and selective recompute."""
+def test_cudnn_chunkwise_forward_and_backward_equivalence(seq_lens, recompute_modules):
+    """cuDNN CP=2 matches CP=1 for BLH, packed THD, and selective recompute."""
     if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("CuTeDSL GDP requires an SM100 GPU")
+        pytest.skip("cuDNN GDP requires an SM100 GPU")
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=2
@@ -464,8 +464,8 @@ def test_cutedsl_chunkwise_forward_and_backward_equivalence(seq_lens, recompute_
             mamba_head_dim=64,
             mamba_num_groups=2,
             mamba_state_dim=128,
-            gdp_cutedsl_kernel=True,
-            gdp_num_chunk_states_to_recompute=2,
+            gdp_cudnn_kernel=True,
+            gdp_checkpoint_every_n_tokens=192,
             recompute_granularity="selective" if recompute_modules else None,
             recompute_modules=recompute_modules,
         )
