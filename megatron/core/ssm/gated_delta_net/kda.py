@@ -48,6 +48,12 @@ except ImportError:  # pragma: no cover
     HAVE_FLA_KDA = False
 
 
+def _is_identity_spec(spec: ModuleSpec | type) -> bool:
+    """Whether a submodule spec builds an IdentityOp placeholder."""
+    module = spec.module if isinstance(spec, ModuleSpec) else spec
+    return isinstance(module, type) and issubclass(module, IdentityOp)
+
+
 @dataclass
 class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
     """Submodules used by Kimi Delta Attention."""
@@ -65,7 +71,9 @@ class KimiDeltaAttention(_GDNBase):
     """Channel-wise Gated DeltaNet variant with direct Q/K/V/F/G projections.
 
     Supports direct or two-stage gates with equal query/key and value heads.
-    Two-stage gates require a ``KDALayerConfig``. Recurrent inference is not implemented.
+    Two-stage gates (``kda_two_stage_gates`` on a ``KDALayerConfig`` or ``TransformerConfig``)
+    require a spec with f_a/f_b/g_a/g_b projections, such as the hybrid ``kda_layer``.
+    Recurrent inference is not implemented.
     """
 
     def __init__(
@@ -93,9 +101,24 @@ class KimiDeltaAttention(_GDNBase):
                 "FLA KDA is not installed. Install flash-linear-attention with KDA support."
             )
 
-        # Non-hybrid models build KDA from a plain TransformerConfig, which has no
-        # two-stage gate setting, so read it with a direct-gate default.
+        # KDALayerConfig and TransformerConfig both declare kda_two_stage_gates; the
+        # direct-gate default covers config stand-ins that do not.
         self.two_stage_gates = getattr(config, "kda_two_stage_gates", False)
+        if self.two_stage_gates:
+            # Fail here rather than in forward: a spec without the low-rank gate
+            # projections (dev's GPT KDA spec) would build IdentityOp gates.
+            missing = [
+                name
+                for name in ("f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj")
+                if _is_identity_spec(getattr(submodules, name))
+            ]
+            if missing:
+                raise ValueError(
+                    "kda_two_stage_gates requires f_a_proj, f_b_proj, g_a_proj and g_b_proj "
+                    f"submodules, but the KDA spec leaves {', '.join(missing)} as IdentityOp; "
+                    "use a spec with the two-stage gate projections, such as the hybrid "
+                    "kda_layer."
+                )
 
         super().__init__(
             config=config,
