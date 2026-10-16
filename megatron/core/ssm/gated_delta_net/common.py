@@ -264,14 +264,18 @@ class _GDNBase(MegatronModule):
             self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
-        if self.config.fp8 and not getattr(self.config, "kda_disable_fp8", False):
+        # kda_disable_fp8 is a shared TransformerConfig field on dev, so GDN and GDN2
+        # layers of a mixed hybrid stack see it too; only KDA honors it. KDA is the only
+        # GDN-family layer that sets ``two_stage_gates``, before calling this constructor.
+        projection_config = self.config if hasattr(self, "two_stage_gates") else None
+        if self.config.fp8 and not getattr(projection_config, "kda_disable_fp8", False):
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
                 "For FP8, the innermost dimension of the GDN-family layer "
                 "input projection output tensor must be a multiple of 16."
             )
         self.in_proj = _build_with_kda_fp8_disabled(
-            self.config,
+            projection_config,
             submodules.in_proj,
             self.hidden_size,
             self.in_proj_dim,
@@ -341,7 +345,7 @@ class _GDNBase(MegatronModule):
             self.recompute_gdn = "gdn" in self.config.recompute_modules
 
         self.out_proj = _build_with_kda_fp8_disabled(
-            self.config,
+            projection_config,
             submodules.out_proj,
             self.v_dim,
             self.hidden_size,

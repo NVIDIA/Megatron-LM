@@ -8,13 +8,19 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.fp8_utils import get_fp8_context, is_float8tensor
+from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_context, is_float8tensor
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, KimiDeltaAttention
+from megatron.core.ssm.gated_delta_net import (
+    HAVE_FLA_GDN2,
+    HAVE_FLA_KDA,
+    GatedDeltaNet,
+    GatedDeltaNet2,
+    KimiDeltaAttention,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
@@ -185,6 +191,12 @@ def test_kda_config_rejects_invalid_safe_gate_lower_bound(lower_bound):
         _make_config(kda_safe_gate=True, kda_lower_bound=lower_bound)
 
 
+def test_kda_two_stage_defaults_preserve_direct_gates():
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    assert config.kda_two_stage_gates is False
+    assert config.kda_disable_fp8 is False
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
 @pytest.mark.parametrize("two_stage_gates", [False, True])
@@ -331,6 +343,96 @@ def test_kda_fp8_parameter_initialization(two_stage_gates, disable_fp8):
             if disable_fp8:
                 assert weight.dtype == torch.bfloat16
                 torch.testing.assert_close(weight, getattr(reference, name).weight, atol=0, rtol=0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+# GDN and GDN2 layers of a mixed hybrid stack share the KDA layers' TransformerConfig.
+_GDN_FAMILY_NON_KDA_LAYERS = [
+    pytest.param(GatedDeltaNet, id="gdn"),
+    pytest.param(
+        GatedDeltaNet2,
+        id="gdn2",
+        marks=pytest.mark.skipif(
+            not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed."
+        ),
+    ),
+]
+
+
+def _build_gdn_family_layer(module: type, config: TransformerConfig):
+    """Build a GDN or GDN2 mixer from the hybrid stack's 'G' layer spec."""
+    spec = hybrid_stack_spec.submodules.gdn_layer.submodules.self_attention
+    return module(
+        config,
+        submodules=spec.submodules,
+        layer_number=1,
+        conv_init=1.0,
+        pg_collection=ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        ),
+    ).cuda()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("gdn_module", _GDN_FAMILY_NON_KDA_LAYERS)
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_disable_fp8_keeps_gdn_fp8_parameters(gdn_module, two_stage_gates):
+    """kda_disable_fp8 keeps KDA projections BF16 but GDN-family projections FP8."""
+    if torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8 is not supported on this GPU.")
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = _make_config(
+            two_stage_gates=two_stage_gates,
+            linear_num_key_heads=16,
+            linear_num_value_heads=16,
+            fp8="hybrid",
+            fp8_param=True,
+            kda_disable_fp8=True,
+            use_cpu_initialization=False,
+        )
+        model_parallel_cuda_manual_seed(321)
+        with get_fp8_context(config, is_init=True):
+            gdn = _build_gdn_family_layer(gdn_module, config)
+            kda = _build_kda(config)
+
+        for name in ("in_proj", "out_proj"):
+            assert is_float8tensor(getattr(gdn, name).weight), name
+            assert not is_float8tensor(getattr(kda, name).weight), name
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_disable_fp8_keeps_gdn_fp8_alignment_check(two_stage_gates):
+    """kda_disable_fp8 skips the FP8 in_proj alignment check for KDA layers only."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        # Two heads of width 20 leave every in_proj width off the FP8 GEMM alignment:
+        # 164 for GDN, and 200 (direct gates) or 120 (two-stage gates) for KDA.
+        config = _make_config(
+            two_stage_gates=two_stage_gates,
+            linear_key_head_dim=20,
+            linear_value_head_dim=20,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            fp8="hybrid",
+            kda_disable_fp8=True,
+        )
+        model_parallel_cuda_manual_seed(321)
+
+        with pytest.raises(AssertionError, match="For FP8, the innermost dimension"):
+            _build_gdn_family_layer(GatedDeltaNet, config)
+
+        kda = _build_kda(config)
+        assert kda.in_proj_dim % get_fp8_align_size(config.fp8_recipe) != 0
+        with pytest.raises(AssertionError, match="For FP8, the innermost dimension"):
+            _build_kda(replace(config, kda_disable_fp8=False))
     finally:
         Utils.destroy_model_parallel()
 
@@ -512,8 +614,11 @@ def test_kda_cp2_packed_with_physical_padding_matches_cp1(two_stage_gates):
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_parallel_kda_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode):
-    config = _make_config(linear_cp_mode=linear_cp_mode)
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_parallel_kda_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode, two_stage_gates
+):
+    config = _make_config(linear_cp_mode=linear_cp_mode, two_stage_gates=two_stage_gates)
     _test_parallel_attention_correctness(
         transformer_config=config,
         transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,
