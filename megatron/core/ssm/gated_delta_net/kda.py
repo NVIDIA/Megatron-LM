@@ -3,6 +3,7 @@
 """Kimi Delta Attention, a channel-wise Gated DeltaNet variant."""
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Optional
@@ -46,6 +47,33 @@ except ImportError:  # pragma: no cover
     HAVE_FLA_KDA = False
 
 
+def _activate_beta(beta: torch.Tensor, *, two_stage_gates: bool) -> torch.Tensor:
+    """Retain the official GLM projection-dtype sigmoid and legacy direct-KDA order.
+
+    Transformers 93c8b7b485963a10800c91f55304db6be211c2bd applies sigmoid
+    before promoting beta for the recurrent kernel. This deliberately differs
+    from PR 7054's FP32-first sigmoid in the two-stage path.
+    """
+    if two_stage_gates:
+        return beta.sigmoid().float()
+    return beta.float().sigmoid()
+
+
+def _prepare_fp32_kda_core_inputs(query, key, value, g, beta, *, use_qk_l2norm):
+    """Promote the complete core, not only Q/K norms, without reactivating gates.
+
+    HF93c8b7b's recurrent fallback promotes all five operands before its optional
+    sqrt/divide L2 normalization (modeling_glm5_next.py:416-447). Scaling remains
+    the FLA core's responsibility, exactly once. FP32 storage does not select
+    IEEE GEMMs: FLA may still use TF32 internally.
+    """
+    query, key, value, g, beta = (tensor.float() for tensor in (query, key, value, g, beta))
+    if use_qk_l2norm:
+        query = query / torch.sqrt((query * query).sum(dim=-1, keepdim=True) + 1e-6)
+        key = key / torch.sqrt((key * key).sum(dim=-1, keepdim=True) + 1e-6)
+    return dict(q=query, k=key, v=value, g=g, beta=beta)
+
+
 @dataclass
 class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
     """Submodules used by Kimi Delta Attention."""
@@ -65,6 +93,10 @@ class KimiDeltaAttention(_GDNBase):
     Supports direct or two-stage gates with equal query/key and value heads.
     Recurrent inference is not implemented.
     """
+
+    # Opt-in precision profile; the class default keeps dev's path for layers built
+    # without __init__, such as the quantized-recompute test harness.
+    core_in_fp32 = False
 
     def __init__(
         self,
@@ -90,6 +122,8 @@ class KimiDeltaAttention(_GDNBase):
             )
 
         self.two_stage_gates = config.kda_two_stage_gates
+        self.conv_in_fp32 = getattr(config, "kda_conv_in_fp32", False)
+        self.core_in_fp32 = getattr(config, "kda_core_in_fp32", False)
 
         super().__init__(
             config=config,
@@ -129,6 +163,11 @@ class KimiDeltaAttention(_GDNBase):
         # FP32 through model casting, optimizer construction, and checkpointing.
         mark_keep_in_fp32(self.dt_bias)
         mark_keep_in_fp32(self.A_log)
+        if self.conv_in_fp32:
+            # Official HF93c8b7b keeps conv1d FP32 even for BF16 from_pretrained.
+            mark_keep_in_fp32(self.conv1d.weight)
+            if self.conv1d.bias is not None:
+                mark_keep_in_fp32(self.conv1d.bias)
 
         # Low-rank gates are precomputed in FP32.
         if self.two_stage_gates:
@@ -236,7 +275,7 @@ class KimiDeltaAttention(_GDNBase):
         raw_g, beta = gate_feats
         num_key_heads = A_log_local_cp.numel()
         raw_g = raw_g.reshape(batch, seq_len, num_key_heads, self.key_head_dim)
-        beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
+        beta = _activate_beta(beta.reshape(batch, seq_len, num_key_heads), two_stage_gates=False)
         return raw_g, {"beta": beta.contiguous()}
 
     @jit_fuser
@@ -272,6 +311,32 @@ class KimiDeltaAttention(_GDNBase):
         """KDA currently implements only the atomic forward path."""
         return False
 
+    def _torch_causal_conv1d(self, x, weight, bias, sequence_length, groups):
+        """Match HF's FP32 convolution/SiLU and only then restore activation dtype.
+
+        The default direct-KDA path retains its original convolution dtype and
+        autocast behavior. FLA's Triton path independently loads FP32 weights and
+        inputs into FP32 accumulators and casts only its final activated output.
+        """
+        input_dtype = x.dtype
+        conv_context = (
+            torch.autocast(device_type=x.device.type, enabled=False)
+            if self.conv_in_fp32
+            else nullcontext()
+        )
+        with conv_context:
+            output = F.conv1d(
+                input=x.float() if self.conv_in_fp32 else x,
+                weight=weight,
+                bias=bias,
+                stride=self.conv1d.stride,
+                padding=self.conv1d.padding,
+                dilation=self.conv1d.dilation,
+                groups=groups,
+            )
+            output = self.act_fn(output[..., :sequence_length])
+            return output.to(input_dtype) if self.conv_in_fp32 else output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -292,6 +357,10 @@ class KimiDeltaAttention(_GDNBase):
         active_pg_collection = pg_collection if pg_collection is not None else self.pg_collection
         base_cp_group = active_pg_collection.cp
         cp_group = resolve_cp_group(base_cp_group, packed_seq_params)
+        if self.core_in_fp32 and cp_group.size() != 1:
+            # Dynamic CP may override a configured CP=1; reject before any CP
+            # conversion/all-to-all or convolution-history communication.
+            raise ValueError("kda_core_in_fp32 currently supports runtime CP=1 only.")
         if self.config.linear_cp_mode == "chunkwise":
             cp_group_chunkwise = cp_group
             cp_group_headwise = None
@@ -571,17 +640,20 @@ class KimiDeltaAttention(_GDNBase):
         nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            **kernel_inputs,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=self.two_stage_gates and self.use_qk_l2norm,
-            use_gate_in_kernel=True,
-            safe_gate=self.config.kda_safe_gate,
-            lower_bound=self.config.kda_lower_bound,
-            cu_seqlens=cu_seqlens_q,
-            cp_context=chunkwise_cp_context,
-        )
+        if self.core_in_fp32:
+            core_attn_out = self._run_fp32_core(kernel_inputs, cu_seqlens_q, chunkwise_cp_context)
+        else:
+            core_attn_out, _ = self.gated_delta_rule(
+                **kernel_inputs,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=self.two_stage_gates and self.use_qk_l2norm,
+                use_gate_in_kernel=True,
+                safe_gate=self.config.kda_safe_gate,
+                lower_bound=self.config.kda_lower_bound,
+                cu_seqlens=cu_seqlens_q,
+                cp_context=chunkwise_cp_context,
+            )
         nvtx_range_pop(suffix="gated_delta_rule")
 
         if self.recompute_norm_out and self.training:
@@ -623,6 +695,49 @@ class KimiDeltaAttention(_GDNBase):
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _run_fp32_core(self, kernel_inputs, cu_seqlens, cp_context):
+        """Run the explicit two-stage/CP1 profile and cast before norm checkpointing."""
+        if not self.two_stage_gates or cp_context is not None:
+            raise ValueError("kda_core_in_fp32 requires two-stage gates and CP=1.")
+        activation_dtype = kernel_inputs['q'].dtype
+        # The default two-stage path activates the decay gate inside chunk_kda (PR #7054
+        # "Always use gate_in kernel"). The FP32 core runs chunk_kda with
+        # use_gate_in_kernel=False, so it activates the raw gate first, with the same
+        # fused_kda_gate call and the same CP-local A_log/dt_bias (CP=1 here).
+        from fla.ops.kda.gate import fused_kda_gate
+
+        g = fused_kda_gate(
+            kernel_inputs['g'],
+            kernel_inputs['A_log'].contiguous(),
+            dt_bias=kernel_inputs['dt_bias'].contiguous(),
+            lower_bound=self.config.kda_lower_bound if self.config.kda_safe_gate else None,
+        )
+        prepared = _prepare_fp32_kda_core_inputs(
+            kernel_inputs['q'],
+            kernel_inputs['k'],
+            kernel_inputs['v'],
+            g,
+            kernel_inputs['beta'],
+            use_qk_l2norm=self.use_qk_l2norm,
+        )
+        core_out, _ = self.gated_delta_rule(
+            **prepared,
+            scale=self.key_head_dim**-0.5,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            use_gate_in_kernel=False,
+            use_beta_sigmoid_in_kernel=False,
+            safe_gate=self.config.kda_safe_gate,
+            lower_bound=self.config.kda_lower_bound,
+            state_v_first=True,
+            cu_seqlens=cu_seqlens,
+            cp_context=None,
+        )
+        if core_out.dtype != torch.float32:
+            raise RuntimeError("kda_core_in_fp32 requires an FLA backend with FP32 core output.")
+        return core_out.to(activation_dtype)
 
     def _gated_norm_and_layout_restore(
         self,
@@ -705,16 +820,13 @@ class KimiDeltaAttention(_GDNBase):
         )
         if self.config.deterministic_mode or causal_conv1d is None:
             qkv = qkv.transpose(1, 2).contiguous()
-            conv_out = F.conv1d(
-                input=qkv,
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // cp_size_headwise,
+            qkv = self._torch_causal_conv1d(
+                qkv,
+                conv1d_weight,
+                conv1d_bias,
+                kernel_seq_len,
+                self.conv_dim_local_tp // cp_size_headwise,
             )
-            qkv = self.act_fn(conv_out[..., :kernel_seq_len])
             qkv = qkv.transpose(1, 2).contiguous()
         else:
             if self.activation not in ("silu", "swish"):
@@ -775,7 +887,7 @@ class KimiDeltaAttention(_GDNBase):
                 key = key.repeat_interleave(repeat_factor, dim=2)
             num_key_heads = A_log_local_cp.numel()
             raw_g = raw_g.reshape(batch, seq_len, num_key_heads, self.key_head_dim)
-            beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
+            beta = _activate_beta(beta.reshape(batch, seq_len, num_key_heads), two_stage_gates=True)
             return (
                 query.contiguous(),
                 key.contiguous(),

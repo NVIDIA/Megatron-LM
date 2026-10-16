@@ -197,6 +197,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "init_method_std": 0.014,
     "init_model_with_meta_device": False,
     "is_hybrid_model": True,
+    "kda_conv_in_fp32": False,
+    "kda_core_in_fp32": False,
     "kda_disable_fp8": False,
     "kda_lower_bound": None,
     "kda_safe_gate": False,
