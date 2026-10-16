@@ -85,7 +85,9 @@ def initialize_megatron(
     args = get_args()
 
     cfg = get_run_config()
-    cfg.validate()
+    # Resolve runtime config before any service, process group, or RNG is initialized.
+    # Shared by training, inference, and legacy initialization entry points.
+    cfg.finalize()
     if not training and args.tp_comm_overlap:
         raise ValueError(
             "--tp-comm-overlap uses fixed training user buffers and is not supported by "

@@ -37,9 +37,7 @@ from .placement import BlockAtomic, RowAtomic, TensorAtomic
 if HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
 else:
-
-    class QuantizedDBuffer:
-        """Fallback for parameter grouping when Transformer Engine is unavailable."""
+    QuantizedDBuffer = DBuffer
 
     def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
         """Without TE, all parameters use their native storage dtype."""
@@ -58,16 +56,6 @@ def _contains_any_placement_type(
             if isinstance(placement, placement_types):
                 return True
     return False
-
-
-def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
-    """Return the FSDP parameter group that owns ``parameter``, if any."""
-    # This parameter-owned backedge must be weak; otherwise it forms a reference
-    # cycle with the parameter group and delays releasing its CUDA storage.
-    parameter_group_ref = getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
-    if parameter_group_ref is None:
-        return None
-    return parameter_group_ref()
 
 
 def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> None:
@@ -108,9 +96,9 @@ class FsdpParameterGroup:
     dtype: torch.dtype
     requires_grad: bool
     main_weight: DBuffer
-    model_weight: "DBuffer | QuantizedDBuffer"
+    model_weight: DBuffer | QuantizedDBuffer
     # Optimizer-layout representation of model_weight after an optimizer step.
-    post_optimizer_model_weight: "DBuffer | QuantizedDBuffer"
+    post_optimizer_model_weight: DBuffer | QuantizedDBuffer
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
@@ -122,7 +110,10 @@ class FsdpParameterGroup:
     # reduction created a smaller view (e.g. ZeRO-1 or HFSDP), the remaining main_grad
     # storage is stale and must be cleared before the next accumulation begins.
     _main_grad_is_stale: bool
-    _unsharded_model_weight: "DBuffer | QuantizedDBuffer"
+    # dtype of the reduce-scatter input (partial_grad): MixedPrecisionPolicy.grad_comm_dtype,
+    # or main_grad's dtype when unset.
+    grad_comm_dtype: torch.dtype
+    _unsharded_model_weight: DBuffer | QuantizedDBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
 
@@ -350,10 +341,11 @@ class FsdpParameterGroup:
         self.main_grad = None
         self.pre_optimizer_main_grad = None
         self._main_grad_is_stale = False
+        grad_dtype = mixed_precision_policy.main_grads_dtype or parameters[0].dtype
+        self.grad_comm_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
         if not self.requires_grad:
             return
 
-        grad_dtype = mixed_precision_policy.main_grads_dtype or parameters[0].dtype
         # Keep main_grad persistent for the initial implementation. For micro-batch
         # size 1, this allocation could be delayed until post_backward and then
         # eagerly deallocated right after optimizer.step(), avoiding main_grad
@@ -513,7 +505,7 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
-                dtype=grads[0].dtype,
+                dtype=self.grad_comm_dtype,
                 device=grads[0].device,
             )
 
@@ -599,3 +591,13 @@ class FsdpParameterGroup:
             # sharded.grad is only read by the optimizer. However, for consistency and
             # debugging, keep sharded.grad valid even between microbatches.
             install_sharded_grads(self.main_grad)
+
+
+def get_containing_parameter_group(parameter: nn.Parameter) -> FsdpParameterGroup | None:
+    """Return the FSDP parameter group that owns ``parameter``, if any."""
+    # This parameter-owned backedge must be weak; otherwise it forms a reference
+    # cycle with the parameter group and delays releasing its CUDA storage.
+    parameter_group_ref = getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
+    if parameter_group_ref is None:
+        return None
+    return parameter_group_ref()
