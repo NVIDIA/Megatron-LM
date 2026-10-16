@@ -937,6 +937,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    mtp_enable_hyper_connections: Optional[bool] = None
+    """Override the MTP residual-stream architecture; None inherits the main decoder."""
+
     rmsnorm_cast_before_weight: bool = False
     """Round the normalized activation before applying RMSNorm gamma, matching HF GLM5Next.
     This is an explicit numerical path, not a change to Transformer Engine's default.
@@ -1954,8 +1957,29 @@ class TransformerConfig(ModelParallelConfig):
     mhc_norm_eps_inside_sqrt: bool = False
     """Use rsqrt(mean(x**2) + layernorm_epsilon) for the mHC mapping norm."""
 
+    mhc_normalize_before_projection: bool = False
+    """Feed the RMS-normalized residual to the FP32 mHC mapping projection, as HF GLM5Next
+    does, instead of scaling the projection by the norm afterwards. The norm is the one
+    mhc_norm_eps_inside_sqrt selects. Incompatible with use_fused_mhc. False preserves the
+    projection-before-normalization path.
+    """
+
     mhc_keep_mappings_in_fp32: bool = False
     """Keep mHC coefficients and stream mixing in FP32 until the output cast."""
+
+    mhc_keep_pre_in_fp32: bool = False
+    """Keep input-aggregation coefficients in FP32 independently of residual mixing.
+    Official GLM5Next uses FP32 pre coefficients but activation-dtype post/residual
+    coefficients. Keeping all mappings in FP32 also keeps pre in FP32.
+    """
+
+    mhc_preserve_activation_dtype_rounding: bool = False
+    """Preserve eager activation-dtype intermediate rounding in compiled mHC residual updates.
+    Uses the opt-in Inductor emulate_precision_casts option for the native no-dropout
+    post-multiply/residual-add operator, including backward and checkpoint replay.
+    Requires compiler support and is incompatible with use_fused_mhc. False preserves
+    the existing compiler precision policy; this does not change global matmul precision.
+    """
 
     mhc_learned_output_contract: bool = True
     """Contract residual streams to the ordinary hidden width using token-dependent gating;
@@ -4678,10 +4702,18 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
-            if self.mhc_norm_eps_inside_sqrt or self.mhc_keep_mappings_in_fp32:
+            if (
+                self.mhc_norm_eps_inside_sqrt
+                or self.mhc_normalize_before_projection
+                or self.mhc_keep_mappings_in_fp32
+                or self.mhc_keep_pre_in_fp32
+                or self.mhc_preserve_activation_dtype_rounding
+            ):
                 raise ValueError(
-                    "use_fused_mhc does not support mhc_norm_eps_inside_sqrt or "
-                    "mhc_keep_mappings_in_fp32; use the unfused mHC path."
+                    "use_fused_mhc does not support mhc_norm_eps_inside_sqrt, "
+                    "mhc_normalize_before_projection, mhc_keep_mappings_in_fp32, "
+                    "mhc_keep_pre_in_fp32 or mhc_preserve_activation_dtype_rounding; "
+                    "use the unfused mHC path."
                 )
 
         valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")

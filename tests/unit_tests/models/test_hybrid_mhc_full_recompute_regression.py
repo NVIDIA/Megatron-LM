@@ -45,6 +45,7 @@ class TestHybridMHCFullRecomputeRegression:
                 recompute_method="block",
                 fp32_mixing=False,
                 autocast_forward=False,
+                normalize_before_projection=False,
                 distribute_saved_activations=False,
             )
         except BaseException:

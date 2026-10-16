@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
-from functools import partial
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -172,9 +172,7 @@ def native_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
     return NativeHAggregateInto.apply(x, h_pre, out)
 
 
-# dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile
-def native_h_post_bda(
+def _native_h_post_bda_impl(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
     """Native H_res.T @ residual + H_post * (x [+ bias])."""
@@ -190,21 +188,64 @@ def native_h_post_bda(
     return (x_expanded + mixed).to(original_residual.dtype)
 
 
+# Preserve the legacy compiled entry point and its default compiler options.
+@torch.compile
+def native_h_post_bda(
+    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+) -> Tensor:
+    """Legacy compiled mHC residual update."""
+    return _native_h_post_bda_impl(h_res, original_residual, h_post, x, bias)
+
+
+@lru_cache(maxsize=1)
+def _get_precision_preserving_h_post_bda():
+    """Lazily compile HF's activation-dtype rounding, without changing global settings."""
+    message = (
+        "mhc_preserve_activation_dtype_rounding requires torch.compile support for "
+        "emulate_precision_casts; no eager or reduced-precision fallback is supported."
+    )
+    try:
+        from torch._inductor import list_options
+    except ImportError as error:
+        raise RuntimeError(message) from error
+    if "emulate_precision_casts" not in list_options():
+        raise RuntimeError(message)
+    try:
+        return torch.compile(_native_h_post_bda_impl, options={"emulate_precision_casts": True})
+    except (RuntimeError, TypeError) as error:
+        raise RuntimeError(message) from error
+
+
 def _proj_rms_impl(
-    x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
+    x: Tensor,
+    weight: Tensor,
+    eps: float = 1e-6,
+    eps_inside_sqrt: bool = False,
+    normalize_before_projection: bool = False,
 ) -> Tuple[Tensor, Tensor]:
-    """FP32 projection + RMS normalization from an activation-dtype input."""
+    """FP32 projection + RMS normalization from an activation-dtype input.
+
+    With normalize_before_projection, the projection consumes the RMS-normalized input,
+    as GLM does, and the caller must not scale it by the returned norm again. Otherwise
+    the caller scales the projection afterwards. Preserve this distinction rather than
+    commuting the FP32 GEMM.
+    """
     x = x.to(torch.float32)
     weight = weight.to(torch.float32)
     # Casting the operands is not sufficient under CUDA/CPU autocast: matmul and
     # reductions are still eligible to downcast float32 inputs.  Keep the whole
     # projection/RMS recipe in FP32; the caller controls the output cast.
     with torch.autocast(device_type=x.device.type, enabled=False):
-        proj = torch.matmul(x, weight.t())
         if eps_inside_sqrt:
             norm = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
         else:
             norm = 1.0 / (x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1]) + eps)
+        if normalize_before_projection:
+            # HF 93c8b7b Glm5NextTextHyperConnection normalizes the FP32 residual
+            # before F.linear. This intentionally differs from PR 7521's ordering.
+            proj = F.linear(x * norm, weight)
+        else:
+            proj = torch.matmul(x, weight.t())
     return proj, norm
 
 
@@ -343,11 +384,24 @@ class HyperConnectionModule(MegatronModule):
         # reached on the unfused path.
         # Full recompute forwards run under no_grad and replay with gradients. Use the
         # same FP32 arithmetic in both passes; compiling only one changes norm reductions.
-        self._proj_rms_op = partial(_proj_rms_impl, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt)
+        self._proj_rms_op = partial(
+            _proj_rms_impl,
+            eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt,
+            normalize_before_projection=config.mhc_normalize_before_projection,
+        )
 
         if config.use_fused_mhc:
-            if config.mhc_norm_eps_inside_sqrt or config.mhc_keep_mappings_in_fp32:
-                raise ValueError("Fused mHC does not support FP32 mixing or epsilon inside sqrt.")
+            if (
+                config.mhc_norm_eps_inside_sqrt
+                or config.mhc_normalize_before_projection
+                or config.mhc_keep_mappings_in_fp32
+                or config.mhc_keep_pre_in_fp32
+                or config.mhc_preserve_activation_dtype_rounding
+            ):
+                raise ValueError(
+                    "Fused mHC does not support FP32 mixing, epsilon inside sqrt, "
+                    "normalize-before-projection or activation-dtype rounding preservation."
+                )
             from megatron.core.fusions.fused_mhc_kernels import (
                 fused_h_aggregate,
                 fused_h_aggregate_into,
@@ -368,7 +422,11 @@ class HyperConnectionModule(MegatronModule):
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
             self._h_aggregate_into_op = native_h_aggregate_into
-            self._h_post_bda_op = native_h_post_bda
+            self._h_post_bda_op = (
+                _get_precision_preserving_h_post_bda()
+                if config.mhc_preserve_activation_dtype_rounding
+                else native_h_post_bda
+            )
             self._proj_rms_compute_h_op = None
 
         self._init_weights()
@@ -440,7 +498,11 @@ class HyperConnectionModule(MegatronModule):
             dim=-1,
         )
 
-        h = r * proj * alpha_ + self.bias
+        # A normalize-before-projection GEMM already consumed the RMS scaling.
+        if self.config.mhc_normalize_before_projection:
+            h = proj * alpha_ + self.bias
+        else:
+            h = r * proj * alpha_ + self.bias
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
         h_pre = h[..., : self.n].sigmoid() + self.compute_h_eps  # [s, b, n]
 
@@ -497,7 +559,8 @@ class HyperConnectionModule(MegatronModule):
         )  # [s, b, n, n]
 
         dtype = torch.float32 if self.config.mhc_keep_mappings_in_fp32 else x.dtype
-        return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
+        pre_dtype = torch.float32 if self.config.mhc_keep_pre_in_fp32 else dtype
+        return h_pre.to(pre_dtype), h_post.to(dtype), h_res.to(dtype)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile
