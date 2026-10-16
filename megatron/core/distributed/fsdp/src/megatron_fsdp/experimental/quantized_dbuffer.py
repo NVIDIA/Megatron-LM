@@ -238,7 +238,9 @@ class QuantizedDBuffer:
             # or beyond the end of the local buffer. This is the producer-side
             # counterpart of the GEMM padding in get_tensor() (TE issue 3518):
             # quantize into the padded scales that get_tensor() builds and copy the
-            # compact region back.
+            # compact region back. Once TE quantizes into compact scales in bounds,
+            # this loop body reduces to:
+            #   self.get_tensor_view(index).quantize_(main_weight.get_tensor_view(index))
             tensor = self.get_tensor(index)
             tensor.quantize_(main_weight.get_tensor_view(index))
             for plane, padded in (
