@@ -14,15 +14,33 @@ with ``use_forward_sharing_state``.
 
 from __future__ import annotations
 
+import enum
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable, Iterator, TypeVar
 
+import torch
+
 _FORWARD_SHARING_STATE_ATTR = "_forward_sharing_state"
 
 T = TypeVar("T")
+
+
+class CheckpointPhase(enum.Enum):
+    """Which call of a ``preserve_forward_sharing_for_checkpoint`` wrapper is running.
+
+    ``FIRST_FORWARD`` marks a reentrant checkpoint's original call, which runs without
+    grad, when a backward replay is expected to follow: the wrapper was built with grad
+    enabled and an argument requires grad. ``REPLAY`` marks the backward-time recompute
+    bound to that call's private snapshot. Everything else, including direct
+    grad-enabled calls through the wrapper and schedule-owned states, stays ``NONE``.
+    """
+
+    NONE = "none"
+    FIRST_FORWARD = "first_forward"
+    REPLAY = "replay"
 
 
 def is_forward_sharing_enabled(config: object) -> bool:
@@ -42,11 +60,13 @@ class ForwardSharingState:
 
     Payloads manage their own per-layer data. Checkpoint snapshots copy the payload
     objects, not tensor storage; payloads with mutable containers implement ``__copy__``.
+    ``checkpoint_phase`` is call-scoped and never copied into snapshots.
     """
 
     def __init__(self) -> None:
         self._entries: dict[type[Any], Any] = {}
         self.active = False
+        self.checkpoint_phase = CheckpointPhase.NONE
 
     def get(self, payload_type: type[T]) -> T | None:
         """Return the payload registered for an exact type."""
@@ -177,9 +197,16 @@ def preserve_forward_sharing_for_checkpoint(
     the single replay. Payload tensors can also be checkpoint outputs whose autograd node
     holds this closure, so keeping them longer would form a reference cycle that only the
     garbage collector frees. This does not make arbitrary recompute boundaries safe.
+
+    The wrapper also marks the bound state's ``checkpoint_phase``: ``FIRST_FORWARD``
+    for a checkpoint's original call when a replay can follow, ``REPLAY`` for the
+    recompute. A reentrant checkpoint runs its original call without grad, so a replay
+    can follow only when the wrapper was built with grad enabled (outside the
+    checkpoint), the call itself runs without grad, and an argument requires grad.
     """
     saved_state = None
     replayed = False
+    replay_expected = torch.is_grad_enabled()
 
     @wraps(function)
     def wrapped(*args):
@@ -191,7 +218,18 @@ def preserve_forward_sharing_for_checkpoint(
                 "released after the first replay."
             )
         if saved_state is None:
-            result = function(*args)
+            live_state = get_forward_sharing_state(packed_seq_params, attention_mask, config)
+            previous_phase = live_state.checkpoint_phase
+            if (
+                replay_expected
+                and not torch.is_grad_enabled()
+                and any(isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args)
+            ):
+                live_state.checkpoint_phase = CheckpointPhase.FIRST_FORWARD
+            try:
+                result = function(*args)
+            finally:
+                live_state.checkpoint_phase = previous_phase
             saved_state = get_forward_sharing_state(
                 packed_seq_params, attention_mask, config
             ).snapshot()
@@ -199,6 +237,7 @@ def preserve_forward_sharing_for_checkpoint(
 
         replay_state = saved_state.snapshot()
         replay_state.active = True
+        replay_state.checkpoint_phase = CheckpointPhase.REPLAY
         replayed = True
         saved_state.clear()
         try:

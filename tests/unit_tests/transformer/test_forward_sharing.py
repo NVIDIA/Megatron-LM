@@ -442,6 +442,137 @@ def test_overlap_nodes_bind_plan_owned_payloads_and_release_them():
     assert not hasattr(config, "_forward_sharing_state")
 
 
+@pytest.mark.parametrize("carrier_kind", ["mask", "packed", "config"])
+def test_checkpoint_marks_first_forward_and_replay_phases(monkeypatch, carrier_kind):
+    import torch
+
+    from megatron.core import tensor_parallel
+    from megatron.core.transformer.forward_sharing import CheckpointPhase
+
+    monkeypatch.setattr(
+        tensor_parallel.random, "_get_all_rng_states", lambda: (torch.get_rng_state(),)
+    )
+    monkeypatch.setattr(tensor_parallel.random, "_set_all_rng_states", torch.set_rng_state)
+    config = SimpleNamespace(dsa_indexer_topk_freq=4)
+    packed = SimpleNamespace() if carrier_kind == "packed" else None
+    mask = torch.zeros(1) if carrier_kind == "mask" else None
+    phases = []
+
+    def layer(hidden, attention_mask):
+        state = get_forward_sharing_state(packed, attention_mask, config)
+        phases.append((state.checkpoint_phase, torch.is_grad_enabled()))
+        return hidden.square()
+
+    with forward_sharing_lifetime(packed, mask, config) as state:
+        hidden = torch.tensor([2.0, 3.0], requires_grad=True)
+        wrapped = preserve_forward_sharing_for_checkpoint(
+            layer, packed, config, attention_mask_arg=1
+        )
+        output = tensor_parallel.checkpoint(wrapped, False, hidden, mask)
+        assert state.checkpoint_phase is CheckpointPhase.NONE
+        assert state.snapshot().checkpoint_phase is CheckpointPhase.NONE
+    output.sum().backward()
+
+    assert phases == [(CheckpointPhase.FIRST_FORWARD, False), (CheckpointPhase.REPLAY, True)]
+    torch.testing.assert_close(hidden.grad, torch.tensor([4.0, 6.0]))
+    assert get_forward_sharing_state(packed, mask, config).checkpoint_phase is CheckpointPhase.NONE
+
+
+def test_checkpoint_phase_needs_an_expected_replay():
+    import torch
+
+    from megatron.core.transformer.forward_sharing import CheckpointPhase
+
+    config = SimpleNamespace(dsa_indexer_topk_freq=4)
+    phases = []
+
+    def layer(hidden, attention_mask):
+        state = get_forward_sharing_state(None, attention_mask, config)
+        phases.append(state.checkpoint_phase)
+        return hidden
+
+    def build():
+        return preserve_forward_sharing_for_checkpoint(layer, None, config, attention_mask_arg=1)
+
+    trainable = torch.ones(1, requires_grad=True)
+    with forward_sharing_lifetime(None, None, config):
+        # Built under no_grad (evaluation): no replay can follow the first call.
+        with torch.no_grad():
+            evaluation_wrapper = build()
+            evaluation_wrapper(trainable, None)
+        # No input requires grad: a reentrant checkpoint never replays.
+        frozen_wrapper = build()
+        with torch.no_grad():
+            frozen_wrapper(torch.ones(1), None)
+        # A direct, non-checkpointed call runs with grad and never replays.
+        direct_wrapper = build()
+        direct_wrapper(trainable, None)
+        # A checkpoint's original call: built with grad, called without grad.
+        checkpoint_wrapper = build()
+        with torch.no_grad():
+            checkpoint_wrapper(trainable, None)
+    assert phases == [
+        CheckpointPhase.NONE,
+        CheckpointPhase.NONE,
+        CheckpointPhase.NONE,
+        CheckpointPhase.FIRST_FORWARD,
+    ]
+
+
+def test_checkpoint_phase_is_restored_after_failure_and_nesting():
+    import torch
+
+    from megatron.core.transformer.forward_sharing import CheckpointPhase
+
+    config = SimpleNamespace(dsa_indexer_topk_freq=4)
+    phases = []
+
+    def inner(hidden, attention_mask):
+        phases.append(get_forward_sharing_state(None, attention_mask, config).checkpoint_phase)
+        return hidden
+
+    inner_wrapper = preserve_forward_sharing_for_checkpoint(inner, None, config, 1)
+
+    def outer(hidden, attention_mask):
+        phases.append(get_forward_sharing_state(None, attention_mask, config).checkpoint_phase)
+        inner_wrapper(hidden, attention_mask)
+        phases.append(get_forward_sharing_state(None, attention_mask, config).checkpoint_phase)
+        raise RuntimeError("layer failed")
+
+    outer_wrapper = preserve_forward_sharing_for_checkpoint(outer, None, config, 1)
+    trainable = torch.ones(1, requires_grad=True)
+    with forward_sharing_lifetime(None, None, config) as state:
+        with torch.no_grad(), pytest.raises(RuntimeError, match="layer failed"):
+            outer_wrapper(trainable, None)
+        assert state.checkpoint_phase is CheckpointPhase.NONE
+    assert phases == [CheckpointPhase.FIRST_FORWARD] * 3
+
+
+def test_dsa_index_payload_snapshot_carries_checkpoint_topk_scores():
+    import torch
+
+    from megatron.core.transformer.experimental_attention_variant.dsa import _DSAIndexSharingPayload
+
+    config = SimpleNamespace(dsa_indexer_topk_freq=4)
+    state = get_forward_sharing_state(None, None, config)
+    payload = state.get_or_create(_DSAIndexSharingPayload)
+    indices, length, scores = torch.tensor([[[0, 1]]]), torch.tensor([[2]]), torch.ones(1, 1, 2)
+    payload.topk_by_layer[3] = indices
+    payload.topk_length_by_layer[3] = length
+    payload.topk_scores_by_layer[3] = scores
+    payload.topk_key_len_by_layer[3] = 8
+
+    snapshot = state.snapshot().get(_DSAIndexSharingPayload)
+    payload.topk_scores_by_layer.pop(3)
+    payload.topk_key_len_by_layer[3] = 16
+
+    assert snapshot.topk_by_layer[3] is indices
+    assert snapshot.topk_length_by_layer[3] is length
+    assert snapshot.topk_scores_by_layer[3] is scores
+    assert snapshot.topk_key_len_by_layer == {3: 8}
+    state.clear()
+
+
 def test_checkpoint_releases_pinned_outputs_after_replay_without_gc(monkeypatch):
     import gc
     import weakref
