@@ -2,10 +2,11 @@
 
 import json
 import logging
+from functools import cached_property
 from typing import List, Optional
 
 try:
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, BatchEncoding, PreTrainedTokenizerFast
     from transformers.utils import cached_file
 
     HAVE_TRANSFORMERS = True
@@ -229,10 +230,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
         self._hf_tokenizer = self.tokenizer
         if self.use_gigatoken:
-            # restore tokenizer with gigatoken
-            from megatron.core.tokenizers.utils import init_gigatoken_from_hf
-
-            self.tokenizer = init_gigatoken_from_hf(self.tokenizer, tokenizer_path)
+            self.tokenizer = _GigatokenTokenizer(self.tokenizer)
 
     def add_special_tokens(self, special_tokens_dict: dict) -> int:
         """
@@ -310,11 +308,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
     def text_to_ids(self, text: str) -> List[int]:
         """Converts text to tokens ids."""
-        if self.include_special_tokens:
-            return self.tokenizer(text).input_ids
-        tokens = self.text_to_tokens(text)
-        ids = self.tokens_to_ids(tokens)
-        return ids
+        return self.tokenizer(text, add_special_tokens=self.include_special_tokens).input_ids
 
     def ids_to_text(self, ids: List[int], remove_special_tokens: Optional[bool] = None) -> str:
         """Converts list of ids to text.
@@ -335,7 +329,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
     def apply_chat_template(self, conversation, chat_template, **kwargs):
         """Applies chat template and tokenizes results"""
-        return self._hf_tokenizer.apply_chat_template(
+        return self.tokenizer.apply_chat_template(
             conversation=conversation, chat_template=chat_template, **kwargs
         )
 
@@ -442,3 +436,90 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
     def save_pretrained(self, save_directory: str):
         """Saves tokenizer's vocabulary and other artifacts to the specified directory"""
         return self._hf_tokenizer.save_pretrained(save_directory)
+
+
+if HAVE_TRANSFORMERS:
+
+    class _GigatokenTokenizer(PreTrainedTokenizerFast):
+        """Keep HF rendering, metadata and decoding while accelerating text encoding."""
+
+        def __init__(self, tokenizer):
+            from megatron.core.tokenizers.utils import init_gigatoken_from_hf
+
+            # Preserve the loaded HF configuration and native decoder for DecodeStream.
+            self.__dict__.update(tokenizer.__dict__)
+            self._hf_tokenizer = tokenizer
+            self._gigatoken = init_gigatoken_from_hf(tokenizer, tokenizer.name_or_path)
+            self.tokenizer = self._gigatoken.tokenizer
+
+        def __reduce__(self):
+            # Spawned serving workers rebuild native encoders from the retained HF tokenizer.
+            state = self.__dict__.copy()
+            for name in ('tokenizer', '_gigatoken', '_split_special_tokenizer'):
+                state.pop(name, None)
+            return type(self), (self._hf_tokenizer,), state
+
+        @cached_property
+        def _split_special_tokenizer(self):
+            import gigatoken as gt
+
+            # Gigatoken's matcher is immutable. Ordinary text needs a separate matcher
+            # without special added tokens; non-special added tokens still match.
+            config = json.loads(self.backend_tokenizer.to_str())
+            config['added_tokens'] = [
+                t for t in config.get('added_tokens', []) if not t.get('special')
+            ]
+            return gt.Tokenizer.from_json(json.dumps(config)).as_hf()
+
+        def __call__(self, text=None, text_pair=None, *args, **kwargs):
+            supported = {
+                'add_special_tokens',
+                'split_special_tokens',
+                'return_attention_mask',
+                'return_tensors',
+                'padding',
+                'truncation',
+                'max_length',
+            }
+            if (
+                args
+                or text_pair is not None
+                or not (
+                    isinstance(text, str)
+                    or (
+                        isinstance(text, (list, tuple))
+                        and text
+                        and all(isinstance(t, str) for t in text)
+                    )
+                )
+                or kwargs.keys() - supported
+                or kwargs.get('padding')
+                or kwargs.get('truncation')
+                or kwargs.get('max_length') is not None
+                or set(self.model_input_names) - {'input_ids', 'attention_mask'}
+            ):
+                return super().__call__(text, text_pair, *args, **kwargs)
+
+            tokenizer = (
+                self._split_special_tokenizer
+                if kwargs.get('split_special_tokens', self.split_special_tokens)
+                else self._gigatoken
+            )
+            encoded = tokenizer(
+                text,
+                add_special_tokens=kwargs.get('add_special_tokens', True),
+                return_attention_mask=kwargs.get(
+                    'return_attention_mask', 'attention_mask' in self.model_input_names
+                ),
+            )
+            return BatchEncoding(
+                dict(encoded),
+                tensor_type=kwargs.get('return_tensors'),
+                prepend_batch_axis=isinstance(text, str),
+            )
+
+        def apply_chat_template(self, *args, **kwargs):
+            if kwargs.get('return_assistant_tokens_mask'):
+                # Assistant masks require HF's character-to-token alignment data.
+                return self._hf_tokenizer.apply_chat_template(*args, **kwargs)
+            return super().apply_chat_template(*args, **kwargs)
