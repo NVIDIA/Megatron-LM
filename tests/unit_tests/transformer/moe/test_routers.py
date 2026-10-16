@@ -468,7 +468,19 @@ class TestDynamicCPRouterDistributed:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("runtime_cp_size", [1, 2, 4])
-    def test_runtime_group_aux_loss_gradient_scaling(self, runtime_cp_size):
+    @pytest.mark.parametrize(
+        "token_count_source,empty_first_rank",
+        [
+            ("python_int", False),
+            ("python_int", True),
+            ("tensor", False),
+            ("tensor", True),
+            ("implicit", False),
+        ],
+    )
+    def test_runtime_group_aux_loss_gradient_scaling(
+        self, runtime_cp_size, token_count_source, empty_first_rank, monkeypatch
+    ):
         world_size = torch.distributed.get_world_size()
         if world_size < runtime_cp_size or world_size % runtime_cp_size != 0:
             pytest.skip(f"world size {world_size} cannot form CP{runtime_cp_size} groups")
@@ -485,6 +497,20 @@ class TestDynamicCPRouterDistributed:
         activation = torch.zeros(1, device="cuda", requires_grad=True)
         aux_source = torch.tensor(float(runtime_cp_rank + 1), device="cuda", requires_grad=True)
         MoEAuxLossAutoScaler.set_loss_scale(torch.tensor(1.0, device="cuda"))
+        local_valid_tokens = runtime_cp_rank + int(not empty_first_rank)
+        if token_count_source == "tensor":
+            valid_token_count = torch.full(
+                (), local_valid_tokens, dtype=torch.long, device=activation.device
+            )
+        elif token_count_source == "implicit":
+            valid_token_count = None
+            local_valid_tokens = activation.shape[0]
+        else:
+            valid_token_count = local_valid_tokens
+
+        # Python counts must be filled on-device rather than copied from a CPU tensor.
+        scalar_factory = Mock(wraps=torch.full)
+        monkeypatch.setattr(torch, "full", scalar_factory)
         output = self.router.attach_and_log_load_balancing_loss(
             activation,
             aux_loss_coeff=1.0,
@@ -492,12 +518,25 @@ class TestDynamicCPRouterDistributed:
             aux_loss_name="dynamic_cp_gradient_test",
             reduce_group=None,
             needs_dp_avg=False,
-            valid_token_count=runtime_cp_rank + 1,
+            valid_token_count=valid_token_count,
             aux_loss_scale_reduce_groups=loss_groups,
         )
+        if token_count_source == "tensor":
+            scalar_factory.assert_not_called()
+            # The reductions must not modify the caller's local count tensor.
+            assert valid_token_count.item() == local_valid_tokens
+        else:
+            scalar_factory.assert_called_once_with(
+                (), local_valid_tokens, dtype=torch.long, device=activation.device
+            )
         output.sum().mul_(0).backward()
 
-        group_token_count = runtime_cp_size * (runtime_cp_size + 1) // 2
+        if token_count_source == "implicit":
+            group_token_count = runtime_cp_size
+        else:
+            group_token_count = sum(
+                rank + int(not empty_first_rank) for rank in range(runtime_cp_size)
+            )
         expected_grad = 2 * aux_source.detach() * group_token_count
         torch.testing.assert_close(aux_source.grad, expected_grad)
 

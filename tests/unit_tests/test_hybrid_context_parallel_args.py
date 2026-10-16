@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""validate_args must reject CUDA graphs with hybrid (dynamic) context parallelism.
+"""validate_args must reject CUDA graphs with dynamic context parallelism.
 
 A captured graph bakes in static communicators, so it cannot follow the per-microbatch
-context-parallel group that hybrid context parallelism selects at runtime.
+context-parallel group that dynamic context parallelism selects at runtime.
 """
 
 import sys
@@ -12,7 +12,7 @@ import pytest
 
 from megatron.training.arguments import parse_args, validate_args
 
-_GUARD = "Hybrid context parallelism not supported with CUDA Graph"
+_GUARD = "Dynamic context parallelism not supported with CUDA Graph"
 
 
 def _hybrid_cp_args(monkeypatch, **overrides):
@@ -32,7 +32,7 @@ def _hybrid_cp_args(monkeypatch, **overrides):
     args.lr = 1e-4
     args.tokenizer_type = "NullTokenizer"
     args.vocab_size = 1024
-    args.hybrid_context_parallel = True
+    args.dynamic_context_parallel = True
     args.max_seqlen_per_dp_cp_rank = 1024
     args.calculate_per_token_loss = True
     args.dataloader_type = "single"

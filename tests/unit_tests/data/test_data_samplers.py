@@ -49,7 +49,7 @@ class TestDataLoaderResume:
                 micro_batch_size=1,
                 global_batch_size=Utils.world_size,
                 num_workers=0,
-                hybrid_context_parallel=False,
+                dynamic_context_parallel=False,
                 sequence_packing_scheduler=None,
                 use_varlen_dataset=False,
                 varlen_sbhd_validation=False,

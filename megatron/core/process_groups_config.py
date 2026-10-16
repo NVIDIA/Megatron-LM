@@ -38,6 +38,9 @@ class ProcessGroupCollection:
         embd: Embedding process group
         pos_embd: Position embedding process group
         cp: Context parallel process group
+        dynamic_cp: Runtime CP groups keyed by CP size; the full DPxCP domain and
+            the singleton CP-off group are included when initialized
+        dynamic_tp_cp: TP x runtime-CP groups keyed by CP size (not TP x CP size)
         tp_cp: Tensor and context parallel group
         hcp: Hierarchical context parallel groups
         ep: Expert model parallel group
@@ -91,6 +94,12 @@ class ProcessGroupCollection:
 
     # _CONTEXT_PARALLEL_GROUP
     cp: torch.distributed.ProcessGroup = field(init=False)
+
+    # Runtime groups are selected per microbatch without changing the static CP group.
+    dynamic_cp: Dict[int, torch.distributed.ProcessGroup] = field(init=False)
+
+    # The map key is the CP size; each group's size is TP size times that key.
+    dynamic_tp_cp: Dict[int, torch.distributed.ProcessGroup] = field(init=False)
 
     # _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     tp_cp: torch.distributed.ProcessGroup = field(init=False)
@@ -202,6 +211,10 @@ class ProcessGroupCollection:
             elif isinstance(pg, list):
                 sizes = [g.size() for g in pg]
                 active_pgs.append(f"{field_info.name}({sizes})")
+            elif isinstance(pg, dict):
+                if pg:
+                    sizes = {key: group.size() for key, group in sorted(pg.items())}
+                    active_pgs.append(f"{field_info.name}({sizes})")
             else:
                 active_pgs.append(f"{field_info.name}({pg.size()})")
         return (
@@ -245,6 +258,8 @@ class ProcessGroupCollection:
             ),
             'mp': partial(parallel_state.get_model_parallel_group, check_initialized=False),
             'cp': partial(parallel_state.get_context_parallel_group, check_initialized=False),
+            'dynamic_cp': parallel_state.get_dynamic_data_context_parallel_group_map,
+            'dynamic_tp_cp': parallel_state.get_dynamic_tensor_data_context_parallel_group_map,
             'tp_cp': partial(
                 parallel_state.get_tensor_and_context_parallel_group, check_initialized=False
             ),

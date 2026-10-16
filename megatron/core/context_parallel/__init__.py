@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from .groups import get_valid_dynamic_context_parallel_group_sizes
 from .layout import (
     ContextParallelLayoutManager,
     ContextParallelLayoutState,
@@ -22,5 +23,6 @@ __all__ = [
     "contiguous_to_zigzag",
     "convert_cp_layout",
     "get_batches_on_this_cp_rank",
+    "get_valid_dynamic_context_parallel_group_sizes",
     "zigzag_to_contiguous",
 ]
