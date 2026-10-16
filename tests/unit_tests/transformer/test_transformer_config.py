@@ -332,7 +332,9 @@ def test_mhc_fused_backend_defaults_to_auto():
     assert config.mhc_fused_backend == "auto"
 
 
-@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
+@pytest.mark.parametrize(
+    "flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32", "mhc_keep_pre_in_fp32"]
+)
 def test_mhc_fused_rejects_unsupported_precision_at_construction(flag):
     with pytest.raises(ValueError, match="use_fused_mhc does not support"):
         TransformerConfig(
