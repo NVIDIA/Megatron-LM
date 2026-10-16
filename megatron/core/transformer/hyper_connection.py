@@ -105,7 +105,9 @@ def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
 @torch.compile
 def _native_h_aggregate_into_forward(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
     """Fuse the same multiply/reduction as native_h_aggregate into caller-owned storage."""
-    return torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+    # Reduce in the promoted dtype and round once into ``out``, as native_h_aggregate does.
+    # sum(..., out=out) would round FP32 mapping products to a BF16 buffer before reducing.
+    return out.copy_((x * h_pre.unsqueeze(-1)).sum(dim=2))
 
 
 class NativeHAggregateInto(torch.autograd.Function):
@@ -140,7 +142,10 @@ class NativeHAggregateInto(torch.autograd.Function):
         # An eager multiply materializes a rounded intermediate;
         # the allocating path fuses it with the reduction. Keep both paths fused
         # without allocating an aggregate and copying it into the graph's slot.
-        _native_h_aggregate_into_forward(x, h_pre, out)
+        # The forward is always no-grad. Canonicalize the inputs' requires_grad flags, as
+        # SinkhornKnopp.forward does, so a checkpoint's no-grad forward and its replay reuse
+        # one compiled specialization even when Dynamo's cache is full.
+        _native_h_aggregate_into_forward(x.detach(), h_pre.detach(), out)
         ctx.save_for_backward(x, h_pre)
         return out
 
