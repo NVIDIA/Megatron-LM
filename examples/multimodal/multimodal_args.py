@@ -122,12 +122,8 @@ def add_multimodal_extra_args(parser):
         default=0,
         help="The seed for the dataloader to use for training.",
     )
-    group.add_argument(
-        "--dataloader-prefetch-factor",
-        type=int,
-        default=8,
-        help="Number of batches prefetched by each Energon worker. Default: 8.",
-    )
+    # --dataloader-prefetch-factor is a core data argument. Unset, the Energon training
+    # loader keeps 8 batches per worker (see dataloader_provider.py).
     group.add_argument(
         "--lr-data-range-start",
         type=float,

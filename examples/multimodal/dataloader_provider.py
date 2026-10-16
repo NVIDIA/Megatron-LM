@@ -32,6 +32,14 @@ from megatron.energon import (
 from megatron.energon.errors import log_exception
 from megatron.training import get_args, get_train_state
 from megatron.training.checkpointing import get_checkpoint_name
+from megatron.training.datasets.data_samplers import (
+    get_dataloader_prefetch_factor,
+    get_train_num_microbatches_per_step,
+)
+
+# Batches each Energon training-loader worker prefetches when --dataloader-prefetch-factor
+# is unset.
+DEFAULT_ENERGON_PREFETCH_FACTOR = 8
 
 
 def use_new_dataloader_path():
@@ -131,8 +139,11 @@ def train_valid_test_dataloaders_provider(
     """Build dataloaders, optionally skipping state restoration for a length-only probe."""
     args = get_args()
 
-    dataloader_prefetch_factor = getattr(args, "dataloader_prefetch_factor", 8)
-    if dataloader_prefetch_factor <= 0:
+    # The core --dataloader-prefetch-factor: None (unset), a positive integer or 'auto'.
+    dataloader_prefetch_factor = getattr(args, "dataloader_prefetch_factor", None)
+    if dataloader_prefetch_factor is None:
+        dataloader_prefetch_factor = DEFAULT_ENERGON_PREFETCH_FACTOR
+    elif dataloader_prefetch_factor != "auto" and dataloader_prefetch_factor <= 0:
         raise ValueError(
             "--dataloader-prefetch-factor must be positive, " f"got {dataloader_prefetch_factor}"
         )
@@ -172,7 +183,17 @@ def train_valid_test_dataloaders_provider(
     if use_new_dataloader_path():
         prefetch_kwargs = {}
         if args.num_workers > 0:
-            prefetch_kwargs["prefetch_factor"] = dataloader_prefetch_factor
+            # Each batch the Energon loader yields is one microbatch, so 'auto' resolves as
+            # for core training loaders: one whole step in flight.
+            prefetch_kwargs["prefetch_factor"] = get_dataloader_prefetch_factor(
+                dataloader_prefetch_factor,
+                args.num_workers,
+                (
+                    get_train_num_microbatches_per_step()
+                    if dataloader_prefetch_factor == "auto"
+                    else None
+                ),
+            )
         train_dataloader = get_savable_loader(
             train_ds,
             cache_pool=FileStoreCachePool(
