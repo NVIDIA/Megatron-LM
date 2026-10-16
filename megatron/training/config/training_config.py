@@ -243,7 +243,6 @@ class SchedulerConfig:
         weight_decay: float | None,
     ) -> None:
         """Check this section against the rest of the run it belongs to."""
-
         if train_iters and not skip_train:
             # If we use iteration-based training, make sure the
             # sample-based options are off.
@@ -273,8 +272,11 @@ class SchedulerConfig:
                     'and lr-warmup-samples'
 
         if self.weight_decay_incr_style == "constant":
-            for v in (self.start_weight_decay, self.end_weight_decay):
-                assert v is None or v == weight_decay
+            for w in (self.start_weight_decay, self.end_weight_decay):
+                assert w is None or w == weight_decay
+        else:
+            assert self.start_weight_decay is not None
+            assert self.end_weight_decay is not None
 
     def finalize_scheduler_config(self, weight_decay: float | None) -> None:
         """Finalize the scheduler configuration after validation and before training starts."""
