@@ -277,11 +277,15 @@ class SchedulerConfig:
         if self.weight_decay_incr_style == 'constant':
             assert self.start_weight_decay is None
             assert self.end_weight_decay is None
-            self.start_weight_decay = weight_decay
-            self.end_weight_decay = weight_decay
         else:
             assert self.start_weight_decay is not None
             assert self.end_weight_decay is not None
+
+    def finalize_scheduler_config(self, weight_decay: float | None) -> None:
+        """Finalize the scheduler configuration after validation and before training starts."""
+        if self.weight_decay_incr_style == "constant":
+            self.start_weight_decay = weight_decay
+            self.end_weight_decay = weight_decay
 
 
 @dataclass(kw_only=True)
