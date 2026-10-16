@@ -16,11 +16,6 @@ import torch
 import torch.distributed
 from torch import Tensor
 
-try:
-    from nemo.lens.helpers import managed_span as _otel_managed_span
-except ImportError:
-    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
-
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -28,6 +23,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.telemetry import telemetry as _otel
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -839,7 +835,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             self._set_proj_residual(residual)
 
         nvtx_range_push(suffix="self_attention")
-        with _otel_managed_span('layer', 'megatron.layer.self_attention'):
+        with _otel.managed_span(_otel.DETAIL, _otel.SPAN_LAYER_SELF_ATTENTION):
             attention_output_with_bias = self.self_attention(
                 input_layernorm_output,
                 attention_mask=attention_mask,
@@ -885,7 +881,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         )
 
         nvtx_range_push(suffix="self_attention")
-        with _otel_managed_span('layer', 'megatron.layer.self_attention'):
+        with _otel.managed_span(_otel.DETAIL, _otel.SPAN_LAYER_SELF_ATTENTION):
             attention_intermediate = self.self_attention.forward_pre_attn_and_core_attn(
                 input_layernorm_output,
                 attention_mask=attention_mask,
@@ -1131,11 +1127,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        with _otel_managed_span(
-            'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
+        with _otel.managed_span(
+            _otel.DETAIL, _otel.SPAN_LAYER_FORWARD, **{_otel.LAYER_NUMBER: self.layer_number}
         ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
-            with _otel_managed_span('layer', 'megatron.layer.mlp'):
+            with _otel.managed_span(_otel.DETAIL, _otel.SPAN_LAYER_MLP):
                 residual_stream_recompute_context = kwargs.get(
                     "residual_stream_recompute_context", None
                 )
