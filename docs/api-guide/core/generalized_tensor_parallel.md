@@ -587,6 +587,13 @@ recompute-fwd of shared_experts  (per layer: GEMM fc1 → SReLU → GEMM fc2, th
 
 Under **full-iteration CUDA graphs** the recompute-forward is captured; `wait_async_comms(GRAPHED)` drains the recompute handle too (sets `_recompute_already_drained`) so the captured consumer skips its cross-graph wait — the same producer-drain pattern as the fwd/bwd chains.
 
+A drained handoff marker certifies only the gather that produced its event. A recompute tail
+can leave an unused prefetch that the backward fence drains; its marker can survive until a
+later forward issues another gather for the same parameter. A pending Work handle therefore
+always takes precedence over that marker: both ordinary and recompute consumers drain the
+current handle and refresh the event before reading the buffer. Waiting only on the old event
+can expose a partially written weight, as seen in Kimi-K3's output projection on the second step.
+
 > **When *not* to recompute a GTP_remat weight.** Recompute on a GTP_remat-sharded weight adds this extra rowwise gather. For MLP-like blocks at short context (`SeqLen ≤ 2 × HiddenSize`), GTP_remat-sharding the weight saves *more* memory than recomputing its activations, so the better trade is to keep such modules GTP_remat-sharded and **out** of `--recompute-modules` (offload their activations if needed) — avoiding the third gather entirely. Build the recompute chain only for modules that genuinely need both.
 
 ### 3.2 DDP buckets with (E)GTP_remat

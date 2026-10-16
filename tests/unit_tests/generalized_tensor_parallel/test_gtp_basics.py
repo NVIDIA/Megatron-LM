@@ -1734,62 +1734,54 @@ class TestGTPCaptureParamReadiness:
         assert ordinary._recompute_already_drained is False
         assert incoming._prefetch_handle is None
 
-    def test_drained_cross_graph_prefetch_still_waits_on_ag_event(self, monkeypatch):
+    @pytest.mark.parametrize("recompute", [False, True], ids=["ordinary", "recompute"])
+    @pytest.mark.parametrize("pending", [False, True], ids=["already_drained", "new_handle"])
+    def test_prefetch_handoff_readiness(self, monkeypatch, recompute, pending):
+        """Retain the event dependency and wait any handle newer than the drain marker."""
+        calls = []
+
         class ExpectedEventWait(Exception):
             pass
-
-        calls = []
 
         class FakeEvent:
             def wait(self):
                 calls.append("event_wait")
                 raise ExpectedEventWait
 
+        handle_attr = "_recompute_prefetch_handle" if recompute else "_prefetch_handle"
+        marker_attr = "_recompute_already_drained" if recompute else "_already_ag_drained"
+        wait_method = "_wait_recompute_param_gather" if recompute else "_wait_param_gather"
+        event_attr = "_recompute_ag_event" if recompute else "ag_event"
+
+        def wait_for_current_gather(param):
+            assert getattr(param, handle_attr) is not None
+            calls.append("handle_wait")
+            setattr(param, handle_attr, None)
+
         param = type(
             "Param",
             (),
             {
-                "_already_ag_drained": True,
+                marker_attr: True,
+                handle_attr: object() if pending else None,
                 "_weights": (),
-                "ag_event": FakeEvent(),
-                "_wait_param_gather": lambda self: calls.append("handle_wait"),
+                event_attr: FakeEvent(),
+                wait_method: wait_for_current_gather,
             },
         )()
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", False)
 
         with pytest.raises(ExpectedEventWait):
-            GTPShardedParam._get_prefetched_weight(param, fwd=True)
+            if recompute:
+                GTPShardedParam._get_recompute_prefetched_weight(param)
+            else:
+                # Forward and backward share this readiness path; their buffer selection
+                # occurs after the event wait where this regression deliberately stops.
+                GTPShardedParam._get_prefetched_weight(param, fwd=True)
 
-        assert calls == ["event_wait"]
-        assert param._already_ag_drained is False
-
-    def test_drained_recompute_prefetch_still_waits_on_ag_event(self):
-        class ExpectedEventWait(Exception):
-            pass
-
-        calls = []
-
-        class FakeEvent:
-            def wait(self):
-                calls.append("event_wait")
-                raise ExpectedEventWait
-
-        param = type(
-            "Param",
-            (),
-            {
-                "_recompute_already_drained": True,
-                "_weights": (),
-                "_recompute_ag_event": FakeEvent(),
-                "_wait_recompute_param_gather": lambda self: calls.append("handle_wait"),
-            },
-        )()
-
-        with pytest.raises(ExpectedEventWait):
-            GTPShardedParam._get_recompute_prefetched_weight(param)
-
-        assert calls == ["event_wait"]
-        assert param._recompute_already_drained is False
+        assert calls == (["handle_wait", "event_wait"] if pending else ["event_wait"])
+        assert getattr(param, handle_attr) is None
+        assert getattr(param, marker_attr) is False
 
     def test_warmup_exception_is_not_masked_by_leaked_handle(self):
         class WarmupError(Exception):
