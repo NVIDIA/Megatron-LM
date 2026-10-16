@@ -3,6 +3,8 @@ import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
+from megatron.training.utils import print_rank_0
+
 
 @dataclass(kw_only=True)
 class TrainingConfig:
@@ -238,6 +240,62 @@ class SchedulerConfig:
 
     wsd_decay_steps: int | None = field(init=False, default=None)
     """Number of samples to decay WSD weight decay. Calculated at runtime."""
+
+    def validate_run(
+        self,
+        *,
+        train_iters: int | None,
+        train_samples: int | None,
+        skip_train: bool,
+    ) -> None:
+        """Check this section against the rest of the run it belongs to."""
+        if train_iters and not skip_train:
+            # If we use iteration-based training, make sure the
+            # sample-based options are off.
+            assert train_samples is None, \
+                'expected iteration-based training'
+            assert self.lr_decay_samples is None, \
+                'expected iteration-based learning rate decay'
+            assert self.lr_warmup_samples == 0, \
+                'expected iteration-based learning rate warmup'
+            if self.lr_warmup_fraction is not None:
+                assert self.lr_warmup_iters == 0, \
+                    'can only specify one of lr-warmup-fraction and lr-warmup-iters'
+
+        # Sample-based training.
+        if train_samples and not skip_train:
+            # If we use sample-based training, make sure the
+            # iteration-based options are off.
+            assert train_iters is None, \
+                'expected sample-based training'
+            assert self.lr_decay_iters is None, \
+                'expected sample-based learning rate decay'
+            assert self.lr_warmup_iters == 0, \
+                'expected sample-based learning rate warmup'
+            if self.lr_warmup_fraction is not None:
+                assert self.lr_warmup_samples == 0, \
+                    'can only specify one of lr-warmup-fraction ' \
+                    'and lr-warmup-samples'
+
+        if self.no_weight_decay_cond_type is not None:
+            print_rank_0(
+                'WARNING: --no-weight-decay-cond-type is deprecated. Please use --apply-wd-to-qk-layernorm instead.',
+                args.rank,
+            )
+            if self.no_weight_decay_cond_type == "apply_wd_to_qk_layernorm":
+                self.apply_wd_to_qk_layernorm = True
+            else:
+                raise ValueError(f"Invalid no_weight_decay_cond_type: {self.no_weight_decay_cond_type}")
+            self.no_weight_decay_cond_type = None
+
+        if self.weight_decay_incr_style == 'constant':
+            assert self.start_weight_decay is None
+            assert self.end_weight_decay is None
+            self.start_weight_decay = self.weight_decay
+            self.end_weight_decay = self.weight_decay
+        else:
+            assert self.start_weight_decay is not None
+            assert self.end_weight_decay is not None
 
 
 @dataclass(kw_only=True)
