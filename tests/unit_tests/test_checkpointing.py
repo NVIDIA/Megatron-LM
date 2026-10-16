@@ -27,6 +27,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _maybe_setup_gpt_to_hybrid_load,
     check_checkpoint_args,
     get_checkpoint_tracker_filename,
     get_checkpoint_version,
@@ -43,6 +44,33 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.usefixtures("run_config")
+
+
+@pytest.mark.parametrize("ckpt_args", [None, SimpleNamespace()])
+def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
+    """Missing checkpoint args do not identify a model-only checkpoint as GPT."""
+
+    args = SimpleNamespace(hybrid_layer_pattern="M*E")
+    assert _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, [object()]) == (None, False)
+
+
+@pytest.mark.parametrize("auto_detect", [False, True])
+def test_inference_shards_reject_legacy_checkpoint(create_ckpt_load_args, monkeypatch, auto_detect):
+    from megatron.training import checkpointing
+
+    args = create_ckpt_load_args
+    args.load = "unused"
+    args.ckpt_format = "torch_dist" if auto_detect else "torch"
+    args.auto_detect_ckpt_format = auto_detect
+    args.inference_shards = "tp=1,role=prefill+tp=1,role=decode"
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        mock.Mock(return_value=({}, "unused", False, CheckpointType.LEGACY)),
+    )
+    with pytest.raises(ValueError, match="incompatible with legacy torch checkpoints"):
+        load_checkpoint([], None, None)
 
 
 class MockModel(MegatronModule):
@@ -820,6 +848,22 @@ def test_load_checkpoint(
             assert new_opt_param_scheduler.state_dict() == {"opt_param_scheduler": "dummy2"}
 
 
+def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_args):
+    """The streaming dequantize load is weights-only (inference): the loaded state dict holds
+    the re-quantized params, so `load_checkpoint` must refuse any optimizer up front, before
+    anything is read."""
+    args = create_ckpt_load_args
+    args.load = "/nonexistent"
+    args.no_load_optim = True
+    args.stream_ckpt_dequant = True
+    set_args(args)
+
+    with pytest.raises(ValueError, match="inference-only"):
+        load_checkpoint(
+            [MockModel(TransformerConfig(num_layers=1, kv_channels=1))], MockState({}), None
+        )
+
+
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 def test_load_checkpoint_override_opt_param_scheduler(
     init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
@@ -1017,6 +1061,8 @@ def test_checkpoint_load_without_microbatch_calculator(
         )
 
         def build_model():
+            # CPU-initialized DP replicas must match the weights saved by rank 0.
+            torch.manual_seed(123)
             return (
                 GPTModel(
                     config=config,
@@ -1028,6 +1074,7 @@ def test_checkpoint_load_without_microbatch_calculator(
                 .eval()
             )
 
+        torch.manual_seed(123)
         model = build_model()
         save_checkpoint(123, [model], None, None, 456)
         saved_rng = torch.get_rng_state().clone()
