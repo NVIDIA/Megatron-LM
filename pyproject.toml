@@ -97,7 +97,7 @@ dev = [
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "multi-storage-client~=0.50",
+    "multi-storage-client~=1.1; sys_platform != 'win32'",
     "opentelemetry-api>=1.33.1,<2",
     "nemo-lens",
     "megatron-energon[av_decode]~=7.0",

@@ -2616,7 +2616,7 @@ dev = [
     { name = "flashinfer-python" },
     { name = "hypercorn" },
     { name = "megatron-energon", extra = ["av-decode"] },
-    { name = "multi-storage-client" },
+    { name = "multi-storage-client", marker = "sys_platform != 'win32'" },
     { name = "nemo-lens" },
     { name = "nvidia-cudnn-frontend", extra = ["cutedsl"] },
     { name = "nvidia-modelopt", marker = "sys_platform != 'darwin'" },
@@ -2747,7 +2747,7 @@ requires-dist = [
     { name = "hypercorn", marker = "extra == 'dev'" },
     { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" },
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
-    { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.50" },
+    { name = "multi-storage-client", marker = "sys_platform != 'win32' and extra == 'dev'", specifier = "~=1.1" },
     { name = "nemo-lens", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'otel'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "numpy" },
@@ -3012,7 +3012,7 @@ wheels = [
 
 [[package]]
 name = "multi-storage-client"
-version = "0.51.0"
+version = "1.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
@@ -3030,12 +3030,15 @@ dependencies = [
     { name = "xattr" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/80/5a/689d5dda8b75a2384673bca8ff8a5fc5ab6b3f88ad10962996cb01e4405d/multi_storage_client-0.51.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:a4b50338b7dbedffa65c3e99efa3503d945ce5e9ef3d8b5b57e383c59606b12f", size = 10251610, upload-time = "2026-07-02T01:55:19.468Z" },
-    { url = "https://files.pythonhosted.org/packages/74/0a/898e7d6d127224f7be4a51045151772b5adf96db78a93b7c862509c06d9b/multi_storage_client-0.51.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c3d69d06f44744469e0dc0327ecf94ce01cf166c62857157ab6f9eb1738addad", size = 6380649, upload-time = "2026-07-02T01:55:41.832Z" },
-    { url = "https://files.pythonhosted.org/packages/19/08/99dfe1f5dd026191d2e3c3e59ddb802b2ccd5dcc7954bc04330542d2f814/multi_storage_client-0.51.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1282ed2fe187529a75b05b14986f10ae065864ec1236f5fc6e7d92f78e371857", size = 6579965, upload-time = "2026-07-02T01:56:03.083Z" },
-    { url = "https://files.pythonhosted.org/packages/49/e0/024820ccc27fa72b1342a5959c35f6263a9052278f3491541b208140878b/multi_storage_client-0.51.0-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:23bfecc1edef4d9721c7b7d67996c3e01a3195bf730a35cab7faa808ab0e78e2", size = 10253983, upload-time = "2026-07-02T01:56:25.15Z" },
-    { url = "https://files.pythonhosted.org/packages/3e/8d/c04e536cf7d6db9ff32e6bd677fcf32c55207147aa8453ed2039fb76159d/multi_storage_client-0.51.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:2e28de6e2b9512e5bf7ad29e5b079ae1f7f254230fa63ff2e26223560a93c7b3", size = 6384149, upload-time = "2026-07-02T01:56:47.617Z" },
-    { url = "https://files.pythonhosted.org/packages/fe/0e/821fa079153fe0c0eb1431d5745085bfce65eb7f1908675f9088970ae90f/multi_storage_client-0.51.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f6ee184c796b2b78c7e9d3581e115a48ad5b26fd3f229485e61bc0d70475f06e", size = 6583188, upload-time = "2026-07-02T01:57:06.994Z" },
+    { url = "https://files.pythonhosted.org/packages/28/95/8c27b9bedbe93dfa6a7de9355a948a772344a7d9878f408da4dc410e09e8/multi_storage_client-1.1.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:3a71e371a3920f83eb4a80b046dbd72168b1b50fd65f0d83ebea93048055ff12", size = 10286796, upload-time = "2026-09-04T16:41:21.693Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/eb/11a69d131550d57f3387da379f7859de464017edbb7ced23f780a4f4cd18/multi_storage_client-1.1.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:8c47dcf14d43e0e09c0ce7a58fa65c362ea41e0474c0713f5bea3c95a243debb", size = 6414782, upload-time = "2026-09-04T16:41:43.774Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/bc/d352adcbe7265c3736ad0751fd275d515b405b5f6ec588d46613714daab4/multi_storage_client-1.1.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:80c90a3336305cd65831613f7b0854a7086eed5b75a762804a33234c29421b1b", size = 6614620, upload-time = "2026-09-04T16:42:06.613Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/57/763ada0cb08570556c6435cc142735a68fb78d9db3dc87905b0cbfad924b/multi_storage_client-1.1.0-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:d68a23572f52cb946ce71b56532dbc793ced0929c619662f3e0b55a8084d1f0b", size = 10289075, upload-time = "2026-09-04T16:42:33.456Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/5b/1c025a5c6539211e2d8169e17a89216a92cf4d1e6125a7863a4ed16ad40f/multi_storage_client-1.1.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:1e9bbcfb9b2db4bacb662c36f072ebd77dacfba9bd2182d2b54a9083ee0635f0", size = 6417859, upload-time = "2026-09-04T16:42:51.249Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/06/188729d44e88f8c556311eaa391f6b9fcaea0bf82e338ac5a41c2b40b790/multi_storage_client-1.1.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ea4b2bdd8e31181866bfebee4383fbdbc8fc1409b477ee08c6173aacc2bdf9de", size = 6617489, upload-time = "2026-09-04T16:43:16.505Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/f1/fa7794b2766c31f50a4bb650fb7639b86ddff3321d33b455ec8098c72238/multi_storage_client-1.1.0-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:ab74c537a3c0b2c8fcb28b50011be8ecfa981761a601fdb1a42339467fa923ec", size = 10344887, upload-time = "2026-09-04T16:43:40.895Z" },
+    { url = "https://files.pythonhosted.org/packages/38/11/f68591ab542ee1c6d7a4aa25f619a038d0a571a6d34e8f8c698b546d3b6f/multi_storage_client-1.1.0-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:070a13f198f8ef4f12f970f4d0dea872417039caffffa3f056ccf65e37d258f6", size = 6471821, upload-time = "2026-09-04T16:44:20.339Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/93/36b0155cea7be85d6647eca1fa17306b9aa074b436fefff9f391337dd3c6/multi_storage_client-1.1.0-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:48bc29dfa0fe6a0442bdf2b4562ce9b7718497a9ef61a84f72fd73458dd33ac4", size = 6670606, upload-time = "2026-09-04T16:44:45.612Z" },
 ]
 
 [[package]]
