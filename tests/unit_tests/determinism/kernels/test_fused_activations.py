@@ -314,3 +314,23 @@ def test_dsv4_q_rms_norm_grad_mode_parity(dtype, layout, dim):
         ), "deterministic query norm gradients changed across replays"
     finally:
         torch.compiler.reset()
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("grad_enabled", [False, True])
+def test_dsv4_q_rms_norm_fp32_uses_eager_operators(monkeypatch, grad_enabled):
+    """FP32 must not re-enter the compiler path that differs across grad modes on H100."""
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4,
+    )
+
+    def unexpected_compilation(*args, **kwargs):
+        raise AssertionError("Deterministic FP32 query norm must not use the compiled path")
+
+    monkeypatch.setattr(dsv4, "_q_rms_norm_deterministic_compiled", unexpected_compilation)
+    q = _act((2, 3, 128), dtype=torch.float32)
+    with torch.set_grad_enabled(grad_enabled):
+        actual = dsv4._q_rms_norm_deterministic(q, 1e-5)
+        expected = dsv4._q_rms_norm_impl(q, 1e-5)
+    assert torch.equal(actual, expected)
+    assert actual.requires_grad == grad_enabled
