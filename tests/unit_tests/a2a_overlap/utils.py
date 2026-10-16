@@ -82,6 +82,8 @@ def deterministic_mode():
         "NCCL_NVLS_ENABLE": "0",
         "NVTE_FUSED_ATTN": "0",
         "NCCL_ALGO": "^NVLS",
+        # Preserve expert token order before NCCL EP creates its process-wide group.
+        "NCCL_EP_HT_EM_AG_SCAN_MODE": "1",
         "NVTE_FWD_LAYERNORM_SM_MARGIN": "8",
         "NVTE_BWD_LAYERNORM_SM_MARGIN": "8",
     }
@@ -249,13 +251,13 @@ def get_valid_flex_dispatcher_backends():
     its TransformerEngine NCCL EP build is present, so each overlap test exercises ncclep alongside
     the existing reference backend.
     """
-    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+    from tests.unit_tests.test_utilities import is_nccl_ep_available
 
     backends = []
     primary = get_valid_flex_dispatcher_backend()
     if primary is not None:
         backends.append(primary)
-    if HAVE_TE_EP and "ncclep" not in backends:
+    if is_nccl_ep_available() and "ncclep" not in backends:
         backends.append("ncclep")
     return backends
 

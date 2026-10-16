@@ -70,8 +70,10 @@ def softplus(x):
 def gdp_decode_prepare_kernel(
     x,
     x_n_stride,
+    x_s_stride,
     ba,
     ba_n_stride,
+    ba_s_stride,
     A_log,
     dt_bias,
     q,
@@ -79,6 +81,7 @@ def gdp_decode_prepare_kernel(
     v,
     beta,
     g,
+    S: tl.constexpr,
     H: tl.constexpr,
     G: tl.constexpr,
     P: tl.constexpr,
@@ -90,13 +93,15 @@ def gdp_decode_prepare_kernel(
     BP: tl.constexpr,
     BN: tl.constexpr,
 ):
-    """One program per (request, Householder copy, head).
+    """One program per (request-token, Householder copy, head).
 
-    `x` is the post-conv `[n, M*H*P + M*G*N + G*N]` row -- value, key, query
-    concatenated -- and `ba` is the `[n, M*H + H]` gating row. Each program
-    emits one head-slice of every output.
+    `x` is the post-conv `[n, S, M*H*P + M*G*N + G*N]` tensor -- value, key,
+    query concatenated -- and `ba` is the `[n, S, M*H + H]` gating tensor, where
+    `S` is 1 plus the speculative draft length. Each program emits one
+    head-slice of every output.
     """
-    i_n, i_m, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_ns, i_m, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_n, i_s = i_ns // S, i_ns % S
     i_g = i_h // HEADS_PER_GROUP
 
     o_p = tl.arange(0, BP)
@@ -104,10 +109,12 @@ def gdp_decode_prepare_kernel(
     mask_p = o_p < P
     mask_n = o_n < N
 
-    p_x = x + i_n * x_n_stride
-    # Output row for this (request, copy, head), shared by every output below
-    # because they are all laid out as [n, M, H, ...].
-    i_o = (i_n * M + i_m) * H + i_h
+    p_x = x + i_n * x_n_stride + i_s * x_s_stride
+    # Output row for this (request, token, copy, head), shared by every output
+    # below because they are all laid out as [n, S*M, H, ...] -- the Householder
+    # copies folded into the sequence dimension behind the draft tokens, which
+    # is the order the recurrent kernel walks them in.
+    i_o = (i_ns * M + i_m) * H + i_h
 
     # Value: the only tensor that is a straight copy, no GQA expansion.
     b_v = tl.load(p_x + (i_m * H + i_h) * P + o_p, mask=mask_p, other=0.0)
@@ -125,7 +132,7 @@ def gdp_decode_prepare_kernel(
     b_q = tl.where(i_m == M - 1, b_q, 0.0)
     tl.store(q + i_o * N + o_n, b_q.to(q.dtype.element_ty), mask=mask_n)
 
-    p_ba = ba + i_n * ba_n_stride
+    p_ba = ba + i_n * ba_n_stride + i_s * ba_s_stride
     # beta is per (copy, head); `b` is laid out as (M, H) inside `ba`.
     b_b = tl.load(p_ba + i_m * H + i_h).to(tl.float32)
     # `1 / (1 + exp(-x))` in fp32, as torch's sigmoid computes it; `div_rn` because
@@ -156,9 +163,10 @@ def gdp_decode_prepare(
     """Split, reshape and gate one decode step's post-conv activations.
 
     Args:
-        x: Post-conv activations `[n, 1, M*H*P + M*G*N + G*N]`, value/key/query
-            concatenated along the last dimension.
-        ba: The `ba` slice of the input projection, `[n, 1, M*H + H]`. May be a
+        x: Post-conv activations `[n, S, M*H*P + M*G*N + G*N]`, value/key/query
+            concatenated along the last dimension. `S` is 1 plus the number of
+            speculative draft tokens.
+        ba: The `ba` slice of the input projection, `[n, S, M*H + H]`. May be a
             non-contiguous view; only the last dimension must be contiguous.
         A_log: Log decay rates `[H]`.
         dt_bias: Softplus bias `[H]`.
@@ -168,37 +176,39 @@ def gdp_decode_prepare(
         head_dim: Value head dimension `P`.
         state_dim: Key/query head dimension `N`.
 
-    Returns `(query, key, value, beta, g)` shaped `[n, M, H, N]`, `[n, M, H, N]`,
-    `[n, M, H, P]`, `[n, M, H]` and `[n, M, H]` (fp32) -- the exact layouts
-    `fused_recurrent_gated_delta_rule_update` expects for an `M`-length
-    sequence per request.
+    Returns `(query, key, value, beta, g)` shaped `[n, S*M, H, N]`,
+    `[n, S*M, H, N]`, `[n, S*M, H, P]`, `[n, S*M, H]` and `[n, S*M, H]` (fp32)
+    -- the exact layouts `fused_recurrent_gated_delta_rule_update` expects for
+    an `S*M`-length sequence per request.
     """
     assert HAVE_TRITON, "gdp_decode_prepare requires Triton"
     assert HAVE_TRITON_LIBDEVICE, (
         "gdp_decode_prepare needs `triton.language.extra.libdevice` for its math, which "
         f"requires Triton >= 3.0; found {getattr(triton, '__version__', 'unknown')}"
     )
-    assert x.shape[1] == 1 and ba.shape[1] == 1, "decode runs one token per request"
     assert num_heads % num_groups == 0, "num_heads must be a multiple of num_groups"
 
     M, H, G, P, N = num_householder, num_heads, num_groups, head_dim, state_dim
-    n = x.shape[0]
+    n, S = x.shape[0], x.shape[1]
+    assert ba.shape[1] == S, f"x and ba disagree on the token count: {S} vs {ba.shape[1]}"
     assert x.shape[2] == M * H * P + (M + 1) * G * N, "unexpected post-conv width"
     assert ba.shape[2] == (M + 1) * H, "unexpected gating width"
     # The kernel indexes rows with a single stride and reads each row densely.
     assert x.stride(2) == 1 and ba.stride(2) == 1, "the feature dimension must be contiguous"
 
-    query = x.new_empty(n, M, H, N)
-    key = x.new_empty(n, M, H, N)
-    value = x.new_empty(n, M, H, P)
-    beta = ba.new_empty(n, M, H)
-    g = torch.empty(n, M, H, device=x.device, dtype=torch.float32)
+    query = x.new_empty(n, S * M, H, N)
+    key = x.new_empty(n, S * M, H, N)
+    value = x.new_empty(n, S * M, H, P)
+    beta = ba.new_empty(n, S * M, H)
+    g = torch.empty(n, S * M, H, device=x.device, dtype=torch.float32)
 
-    gdp_decode_prepare_kernel[(n, M, H)](
+    gdp_decode_prepare_kernel[(n * S, M, H)](
         x=x,
         x_n_stride=x.stride(0),
+        x_s_stride=x.stride(1),
         ba=ba,
         ba_n_stride=ba.stride(0),
+        ba_s_stride=ba.stride(1),
         A_log=A_log,
         dt_bias=dt_bias,
         q=query,
@@ -206,6 +216,7 @@ def gdp_decode_prepare(
         v=value,
         beta=beta,
         g=g,
+        S=S,
         H=H,
         G=G,
         P=P,

@@ -3,6 +3,7 @@
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import set_attention_backend
 
 
 # Note: This is only a stub at the moment. This will be expanded in follow-up changes.
@@ -15,3 +16,4 @@ class VisionModule(MegatronModule):
 
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__(config=config)
+        set_attention_backend(self.config)

@@ -1,8 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fused MoE: permute -> FC1 -> activation -> FC2 -> unpermute.
 
-Supports BF16 weights with torch.nn.functional.grouped_mm.
-All permutation logic is handled internally — callers invoke a single function.
+Supports BF16 grouped GEMM and MXFP8 scaled grouped GEMM. All permutation
+logic is handled internally — callers invoke a single function.
 """
 
 from enum import Enum
@@ -97,7 +97,7 @@ def _get_activation_func(
         return func if clamp_scale is None else partial(func, clamp_scale=clamp_scale)
     elif activation_type == ActivationType.SWIGLU:
         if fused_quant:
-            raise NotImplementedError("SWIGLU + MXFP8 fused-quant not implemented (bf16 only)")
+            raise NotImplementedError("SWIGLU requires separate activation and MXFP8 quantization")
         if activation_kwargs.get("clamp_scale") is not None:
             raise NotImplementedError(
                 "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; "
@@ -124,9 +124,9 @@ def mcore_fused_moe(
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
-    Unless disable_fused_quant_kernels=True, when weights are MXFP8, uses fused
-    kernels that combine permute/activation with MXFP8 quantization into single
-    kernel launches.
+    Batch-invariant MXFP8 and non-batch-invariant squared-ReLU fuse input permutation
+    with quantization unless ``disable_fused_quant_kernels=True``. Outside
+    batch-invariant mode, squared-ReLU additionally fuses activation and quantization.
 
     Args:
         hidden_states: [max_tokens, hidden_size] BF16 input. max_tokens =
@@ -134,7 +134,7 @@ def mcore_fused_moe(
         probs: [max_tokens, topk] routing probabilities.
         fc1_weight: stacked weight for FC1 (torch.Tensor for BF16, MXFP8Tensor for MXFP8).
         fc2_weight: stacked weight for FC2 (same type as fc1_weight).
-        activation_type: ActivationType enum (SQUARED_RELU).
+        activation_type: supported expert activation type.
         num_local_experts: number of experts on this rank.
         local_expert_start: first global expert index on this rank.
         valid_tokens: scalar int32 CUDA tensor holding the number of valid tokens this
@@ -161,27 +161,29 @@ def mcore_fused_moe(
 
     max_tokens = hidden_states.shape[0]
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
-    # Fused quant kernels only apply to MXFP8 path
-    use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
     batch_invariant_mode = batch_invariant.enabled()
+    use_fused_activation_quant = (
+        use_mxfp8
+        and activation_type == ActivationType.SQUARED_RELU
+        and not disable_fused_quant_kernels
+        and not batch_invariant_mode
+    )
+    use_fused_permute_quant = use_fused_activation_quant or (
+        use_mxfp8 and batch_invariant_mode and not disable_fused_quant_kernels
+    )
+    mm_fn: Callable[[Any, Any, torch.Tensor], torch.Tensor]
 
-    if batch_invariant_mode:
-        # The MXFP8 path uses scaled_grouped_mm and is not batch invariant.
-        assert not use_mxfp8, (
-            "batch_invariant_mode requires the bf16 grouped GEMM path; got "
-            "MXFP8 weights. Disable mxfp8 or batch_invariant_mode."
-        )
-        mm_fn = batch_invariant.grouped_mm
-        expert_alignment = batch_invariant.grouped_mm_alignment()
-    elif use_mxfp8:
+    if use_mxfp8:
         assert (
             HAVE_SCALED_GMM
         ), "torch.nn.functional.scaled_grouped_mm not available. Install PyTorch 2.10+."
         mm_fn = _mxfp8_grouped_mm
-        # scaled_grouped_mm requires each expert's token count aligned to 32,
-        # but swizzled MXFP8 scales require alignment to 128. Use 128 to
-        # satisfy both constraints.
-        expert_alignment = 128
+        # scaled_grouped_mm needs each expert's token count aligned to 32; the
+        # swizzled MXFP8 scale layout needs 128, which satisfies both constraints.
+        expert_alignment = MXFP8_SCALE_ROW_BLOCK
+    elif batch_invariant_mode:
+        mm_fn = batch_invariant.grouped_mm
+        expert_alignment = batch_invariant.grouped_mm_alignment()
     else:
         assert (
             HAVE_GROUPED_MM
@@ -191,15 +193,14 @@ def mcore_fused_moe(
 
     activation_func = _get_activation_func(
         activation_type,
-        fused_quant=use_fused_quant,
+        fused_quant=use_fused_activation_quant,
         activation_kwargs={"clamp_scale": activation_clamp_scale},
     )
 
     # --- Pre-processing: permute ---
-    if use_fused_quant:
+    if use_fused_permute_quant:
         # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
-        batch_invariant_inverse_map = None
-        hidden_states, permuted_probs, permutation_map, offs = permute_and_quantize_mxfp8(
+        permuted = permute_and_quantize_mxfp8(
             hidden_states,
             probs,
             routing_map,
@@ -207,7 +208,11 @@ def mcore_fused_moe(
             num_local_experts,
             valid_tokens,
             alignment=expert_alignment,
+            zero_padding=batch_invariant_mode,
+            return_batch_invariant_inverse_map=batch_invariant_mode,
         )
+        hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
+        batch_invariant_inverse_map = permuted[4] if batch_invariant_mode else None
     else:
         permuted = permute_tokens(
             hidden_states,
@@ -218,6 +223,7 @@ def mcore_fused_moe(
             valid_tokens,
             alignment=expert_alignment,
             row_alignment=MXFP8_SCALE_ROW_BLOCK if use_mxfp8 else 1,
+            zero_padding=batch_invariant_mode and use_mxfp8,
             return_batch_invariant_inverse_map=batch_invariant_mode,
         )
         hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
@@ -244,11 +250,16 @@ def mcore_fused_moe(
                 "the gated form (SiTU-GLU) has no inference kernel yet."
             )
             activation_out = batch_invariant.swiglu_with_probs(
-                fc1_output, permutation_map, n_used, permuted_probs
+                fc1_output, permutation_map, n_used, permuted_probs, zero_padding=use_mxfp8
             )
         else:
             activation_out = batch_invariant.squared_relu_with_probs(
-                fc1_output, permutation_map, n_used, permuted_probs, activation_clamp_scale
+                fc1_output,
+                permutation_map,
+                n_used,
+                permuted_probs,
+                activation_clamp_scale,
+                zero_padding=use_mxfp8,
             )
     else:
         activation_out = activation_func(fc1_output, permutation_map, n_used)

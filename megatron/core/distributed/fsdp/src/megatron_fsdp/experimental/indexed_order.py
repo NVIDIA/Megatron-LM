@@ -43,9 +43,20 @@ class IndexedOrder(Generic[T]):
         self._index_by_item[item] = len(self._items)
         self._items.append(ref(item))
 
+    def __contains__(self, item: object) -> bool:
+        """Return whether ``item`` is in the order."""
+        return item in self._index_by_item
+
     def __iter__(self) -> Iterator[T]:
         """Iterate over live items in order."""
         for item_ref in self._items:
+            item = item_ref()
+            if item is not None:
+                yield item
+
+    def __reversed__(self) -> Iterator[T]:
+        """Iterate over live items in reverse order."""
+        for item_ref in reversed(self._items):
             item = item_ref()
             if item is not None:
                 yield item

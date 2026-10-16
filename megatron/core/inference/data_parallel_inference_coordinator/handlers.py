@@ -94,7 +94,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         flags -- carrying the identity the routing policy keys on. Both are small
         by construction, which is why they are decoded and repacked here on every
         request.
-    ``bodies``: ``[prompt, block_hashes, media]``.
+    ``bodies``: ``[prompt, block_hashes, media, offload_params]``.
 
         ``prompt`` is a string or token id list. It is forwarded to the engine
         verbatim and never decoded here, which is the point of the split.
@@ -112,6 +112,10 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         wire, and decoding it per request would cost this one serial loop far more
         than the prompt decode the split already removed.
 
+        ``offload_params`` is opaque client metadata for the engine's prompt
+        preparer and payload stager, None when the client sent none. It is
+        unbounded, so it is forwarded verbatim and never decoded here.
+
     Returns True (stopping the loop) if no engines are reachable.
     """
     # Message from a known client
@@ -123,9 +127,10 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # rank and every client, so an IndexError raised out of it takes the whole
     # coordinator down; a client that framed its request wrongly should only cost
     # itself that request.
-    if len(metadata) != 4 or len(bodies) != 3:
+    if len(metadata) != 4 or len(bodies) != 4:
         logging.error(
-            "Coordinator: malformed SUBMIT_REQUEST with %d metadata fields, %d bodies",
+            "Coordinator: malformed SUBMIT_REQUEST with %d metadata fields, %d bodies "
+            "(expected 3 fields after the header and 4 bodies)",
             len(metadata) - 1,
             len(bodies),
         )
@@ -134,6 +139,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     _, client_request_id, sampling_params, media_meta = metadata
     prompt_frame = bodies[0]
     media_frame = bodies[2]
+    offload_frame = bodies[3]
 
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
@@ -196,7 +202,9 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         next_identity = coordinator.get_best_data_parallel_rank(
             request_hashes, media_cache_key=media_cache_key
         )
-        if coordinator._send_to_engine(next_identity, [engine_metadata, prompt_frame, media_frame]):
+        if coordinator._send_to_engine(
+            next_identity, [engine_metadata, prompt_frame, media_frame, offload_frame]
+        ):
             break
     else:
         # If all engines have died, we are in an abnormal state, and must exit cleanly.
@@ -400,11 +408,11 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
                 coordinator._pending_counts[idx] -= 1
 
         if needs_detokenize:
-            # Detokenizing writes generated_text into the reply, so this one has
-            # to be decoded and re-encoded. Clients that detokenize for
-            # themselves (the OpenAI frontend does) never take this path.
+            # Detokenization writes generated_text into the reply, so the body must
+            # be unpacked and repacked. The OpenAI endpoints detokenize in the
+            # frontend and never take this path.
             finished_request = msgpack.unpackb(body, raw=False)
-            coordinator.detokenize(finished_request)
+            coordinator.finalize_text(finished_request)
             body = msgpack.packb(finished_request, use_bin_type=True)
 
         reply_metadata = msgpack.packb(

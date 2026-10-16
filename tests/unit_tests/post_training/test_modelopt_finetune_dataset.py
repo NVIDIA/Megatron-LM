@@ -111,6 +111,18 @@ def test_load_parquet_data_files_ignores_huggingface_schema_metadata(tmp_path):
     assert dataset["text"] == ["sample"]
 
 
+def test_explicit_dataset_loading_does_not_use_global_barriers(monkeypatch):
+    monkeypatch.setattr(
+        torch.distributed,
+        "barrier",
+        lambda: pytest.fail("dataset loading must not enter a global barrier"),
+    )
+
+    dataset = object()
+
+    assert SFTDataset._load_dataset_synchronized(lambda: dataset) is dataset
+
+
 @pytest.mark.parametrize(
     ("input_ids", "expected"),
     [

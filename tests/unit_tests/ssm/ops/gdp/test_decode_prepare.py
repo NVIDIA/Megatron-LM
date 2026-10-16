@@ -51,17 +51,19 @@ class TestGDPDecodePrepare:
     @pytest.mark.parametrize("num_householder", [1, 2, 3])
     @pytest.mark.parametrize("num_heads,num_groups", [(8, 8), (8, 2), (4, 1)])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-    def test_matches_reference(self, num_householder, num_heads, num_groups, dtype):
+    # seq_len > 1 is a speculative-decoding step: one token plus its drafts.
+    @pytest.mark.parametrize("seq_len", [1, 4])
+    def test_matches_reference(self, num_householder, num_heads, num_groups, dtype, seq_len):
         _requires_cuda()
         torch.manual_seed(1234)
         M, H, G, P, N = num_householder, num_heads, num_groups, 64, 32
-        n = 5
+        n, S = 5, seq_len
         device = "cuda"
 
         conv_dim = H * P * M + (M + 1) * G * N
         # `x` and `ba` reach the kernel as slices of one projection output, so
         # exercise the strided-row path rather than handing it dense tensors.
-        packed = torch.randn(n, 1, conv_dim + (M + 1) * H, device=device, dtype=dtype)
+        packed = torch.randn(n, S, conv_dim + (M + 1) * H, device=device, dtype=dtype)
         x, ba = torch.split(packed, [conv_dim, (M + 1) * H], dim=-1)
         A_log = torch.randn(H, device=device, dtype=torch.float32)
         dt_bias = torch.randn(H, device=device, dtype=dtype)
@@ -80,11 +82,11 @@ class TestGDPDecodePrepare:
         ref = decode_prepare_ref(x, ba, A_log, dt_bias, M, H, G, P, N)
 
         query, key, value, beta, g = out
-        assert query.shape == (n, M, H, N)
-        assert key.shape == (n, M, H, N)
-        assert value.shape == (n, M, H, P)
-        assert beta.shape == (n, M, H)
-        assert g.shape == (n, M, H)
+        assert query.shape == (n, S * M, H, N)
+        assert key.shape == (n, S * M, H, N)
+        assert value.shape == (n, S * M, H, P)
+        assert beta.shape == (n, S * M, H)
+        assert g.shape == (n, S * M, H)
         assert g.dtype == torch.float32
         assert value.dtype == dtype and beta.dtype == dtype
 
@@ -98,14 +100,17 @@ class TestGDPDecodePrepare:
         for got, want, name in zip(out, ref, names):
             assert torch.equal(got, want), f"{name} is not bitwise equal to the eager path"
 
-    def test_decay_and_query_placement(self):
-        """The decay sits on the first Householder copy, the query on the last."""
+    @pytest.mark.parametrize("seq_len", [1, 3])
+    def test_decay_and_query_placement(self, seq_len):
+        """Within every token's Householder group, the decay sits on the first
+        copy and the query on the last -- including for each speculative draft
+        token, which is what makes a per-token state snapshot meaningful."""
         _requires_cuda()
         torch.manual_seed(0)
         M, H, G, P, N = 3, 4, 2, 16, 16
-        n = 2
-        x = torch.randn(n, 1, H * P * M + (M + 1) * G * N, device="cuda", dtype=torch.bfloat16)
-        ba = torch.randn(n, 1, (M + 1) * H, device="cuda", dtype=torch.bfloat16)
+        n, S = 2, seq_len
+        x = torch.randn(n, S, H * P * M + (M + 1) * G * N, device="cuda", dtype=torch.bfloat16)
+        ba = torch.randn(n, S, (M + 1) * H, device="cuda", dtype=torch.bfloat16)
         A_log = torch.randn(H, device="cuda", dtype=torch.float32)
         dt_bias = torch.randn(H, device="cuda", dtype=torch.bfloat16)
 
@@ -120,10 +125,12 @@ class TestGDPDecodePrepare:
             head_dim=P,
             state_dim=N,
         )
-        assert (query[:, :-1] == 0).all()
-        assert (query[:, -1] != 0).any()
-        assert (g[:, 1:] == 0).all()
-        assert (g[:, 0] != 0).any()
+        query = query.view(n, S, M, H, N)
+        g = g.view(n, S, M, H)
+        assert (query[:, :, :-1] == 0).all()
+        assert (query[:, :, -1] != 0).any()
+        assert (g[:, :, 1:] == 0).all()
+        assert (g[:, :, 0] != 0).any()
 
     @pytest.mark.parametrize("a_value", [100.0, 20.0, 0.0, -20.0, -80.0])
     def test_softplus_tails(self, a_value):

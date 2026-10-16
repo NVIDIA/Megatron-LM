@@ -135,8 +135,12 @@ class DummyEngine(DynamicInferenceEngine):
         self.rank = torch.distributed.get_rank()
 
     def add_request(
-        self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
-    ) -> asyncio.Future[DynamicInferenceRequestRecord]:
+        self,
+        request_id: int,
+        prompt: str,
+        sampling_params: Optional[SamplingParams] = None,
+        offload_params=None,
+    ) -> asyncio.Future[DynamicInferenceRequest]:
         self.requests[request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(
                 DynamicInferenceRequest(
@@ -152,7 +156,7 @@ class DummyEngine(DynamicInferenceEngine):
         return self.requests[request_id].future
 
     async def async_step(self, *, verbose: Optional[bool] = False) -> Dict:
-        finished_request_records = []
+        finished_requests = []
         to_remove = []
         for request_id, entry in self.requests.items():
             request = entry.record[-1]
@@ -162,12 +166,12 @@ class DummyEngine(DynamicInferenceEngine):
                     continue
                 request.status = Status.COMPLETED
                 self.context.active_cnt -= 1
-                finished_request_records.append(entry.record)
-                entry.future.set_result(entry.record)
+                finished_request = self._complete_request(entry)
+                finished_requests.append(finished_request)
                 to_remove.append(request_id)
                 if self.is_mp_coordinator:
                     self.socket_for_receiving_requests.send_multipart(
-                        _engine_reply_frames([entry.record.serialize()])
+                        _engine_reply_frames([finished_request.serialize()])
                     )
 
         for request_id in to_remove:
@@ -183,7 +187,7 @@ class DummyEngine(DynamicInferenceEngine):
 
         return {
             "active_request_ids": active_request_ids,
-            "finished_request_records": finished_request_records,
+            "finished_requests": finished_requests,
             "step_time": 0.01,
             "cuda_graph_request_count": 1,
         }
@@ -305,6 +309,7 @@ class TestSubmitDoesNotDecodePrompt:
 
     UNDECODABLE_PROMPT = b"\xc1not-valid-msgpack"
     UNDECODABLE_MEDIA = b"\xc1not-valid-msgpack-either"
+    UNDECODABLE_OFFLOAD = b"\xc1not-valid-msgpack-at-all"
 
     def _submit(self, coordinator, block_hashes=None, media_meta=None):
         """Drive handle_submit_request once and return the frames sent onward."""
@@ -322,6 +327,7 @@ class TestSubmitDoesNotDecodePrompt:
             self.UNDECODABLE_PROMPT,
             msgpack.packb(block_hashes, use_bin_type=True),
             self.UNDECODABLE_MEDIA,
+            self.UNDECODABLE_OFFLOAD,
         ]
         handle_submit_request(coordinator, b"client-A", metadata, bodies)
         return coordinator.router_socket.send_multipart.call_args.args[0]
@@ -330,13 +336,17 @@ class TestSubmitDoesNotDecodePrompt:
         """LOAD_BALANCED ignores hashes, so the prompt is never decoded."""
         coordinator = make_coordinator_direct(data_parallel_size=2)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-        _identity, _metadata, prompt_frame, _media = self._submit(coordinator, block_hashes=[])
+        _identity, _metadata, prompt_frame, _media, _offload = self._submit(
+            coordinator, block_hashes=[]
+        )
         assert prompt_frame is self.UNDECODABLE_PROMPT
 
     def test_disabled_prefix_caching_forwards_prompt_verbatim(self):
         """With prefix caching off there are no hashes to compute either."""
         coordinator = make_coordinator_direct(data_parallel_size=2, enable_prefix_caching=False)
-        _identity, _metadata, prompt_frame, _media = self._submit(coordinator, block_hashes=[])
+        _identity, _metadata, prompt_frame, _media, _offload = self._submit(
+            coordinator, block_hashes=[]
+        )
         assert prompt_frame is self.UNDECODABLE_PROMPT
 
     def test_prefix_routing_uses_frontend_hashes_without_decoding_prompt(self):
@@ -350,7 +360,7 @@ class TestSubmitDoesNotDecodePrompt:
         coordinator.prefix_caching_coordinator_policy = (
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         )
-        _identity, _metadata, prompt_frame, _media = self._submit(
+        _identity, _metadata, prompt_frame, _media, _offload = self._submit(
             coordinator, block_hashes=[11, 22]
         )
         assert prompt_frame is self.UNDECODABLE_PROMPT
@@ -361,9 +371,11 @@ class TestSubmitDoesNotDecodePrompt:
         coordinator.prefix_caching_coordinator_policy = (
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         )
-        identity, _metadata, _prompt, _media = self._submit(coordinator, block_hashes=[11, 22])
+        identity, _metadata, _prompt, _media, _offload = self._submit(
+            coordinator, block_hashes=[11, 22]
+        )
         # A second request with the same prefix must now land on the same rank.
-        again, _m, _p, _md = self._submit(coordinator, block_hashes=[11, 22])
+        again, _m, _p, _md, _o = self._submit(coordinator, block_hashes=[11, 22])
         assert again == identity
 
     def test_unhashed_prompt_falls_back_to_the_coordinator(self):
@@ -399,7 +411,12 @@ class TestSubmitDoesNotDecodePrompt:
             coordinator,
             b"client-A",
             metadata,
-            [prompt, msgpack.packb(None, use_bin_type=True), self.UNDECODABLE_MEDIA],
+            [
+                prompt,
+                msgpack.packb(None, use_bin_type=True),
+                self.UNDECODABLE_MEDIA,
+                self.UNDECODABLE_OFFLOAD,
+            ],
         )
 
         # Decoded here, and salted with whatever media key the metadata carried.
@@ -416,7 +433,9 @@ class TestSubmitDoesNotDecodePrompt:
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         )
         coordinator.compute_request_hashes = MagicMock(return_value=[5])
-        _identity, _metadata, prompt_frame, _media = self._submit(coordinator, block_hashes=[])
+        _identity, _metadata, prompt_frame, _media, _offload = self._submit(
+            coordinator, block_hashes=[]
+        )
         assert prompt_frame is self.UNDECODABLE_PROMPT
         coordinator.compute_request_hashes.assert_not_called()
 
@@ -432,16 +451,30 @@ class TestSubmitDoesNotDecodePrompt:
         coordinator.prefix_caching_coordinator_policy = (
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         )
-        _identity, _metadata, _prompt, media_frame = self._submit(
+        _identity, _metadata, _prompt, media_frame, _offload = self._submit(
             coordinator, block_hashes=[11, 22], media_meta={"media_cache_key": "img-1"}
         )
         assert media_frame is self.UNDECODABLE_MEDIA
+
+    def test_offload_frame_is_forwarded_without_being_decoded(self):
+        """Offload params reach the engine untouched.
+
+        They are unbounded client metadata for the engine's prompt preparer and
+        payload stager, which is why they ride in their own frame rather than
+        in the metadata frame this loop unpacks and repacks per request.
+        """
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        _identity, _metadata, _prompt, _media, offload_frame = self._submit(
+            coordinator, block_hashes=[]
+        )
+        assert offload_frame is self.UNDECODABLE_OFFLOAD
 
     def test_media_identity_routes_without_the_media_payload(self):
         """Affinity keys on the descriptor in metadata, never on the bytes."""
         coordinator = make_coordinator_direct(data_parallel_size=2)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-        identity, _m, _p, _md = self._submit(
+        identity, _m, _p, _md, _o = self._submit(
             coordinator, block_hashes=[], media_meta={"media_cache_key": "img-1"}
         )
         assert coordinator._media_cache_affinity["img-1"] == identity
@@ -450,12 +483,16 @@ class TestSubmitDoesNotDecodePrompt:
         """The client's request id is swapped for the coordinator's own."""
         coordinator = make_coordinator_direct(data_parallel_size=2)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-        _identity, metadata_frame, _prompt, _media = self._submit(coordinator, block_hashes=[])
+        _identity, metadata_frame, _prompt, _media, offload_frame = self._submit(
+            coordinator, block_hashes=[]
+        )
         header, request_id, sampling_params, media_meta = msgpack.unpackb(metadata_frame, raw=False)
         assert header == Headers.SUBMIT_REQUEST.value
         assert request_id == 0  # server-side id, not the client's 7
         assert sampling_params == {"temperature": 1.0}
         assert media_meta is None
+        # Offload params stay out of the rewritten metadata frame.
+        assert offload_frame is self.UNDECODABLE_OFFLOAD
         assert coordinator.request_id_to_client_request_id[0] == 7
 
 
@@ -751,8 +788,10 @@ class TestCoordinatorEndToEnd:
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
 
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
+                    assert result["generated_text"] == ""
+                    assert "requests" not in result
         finally:
             if torch.distributed.get_rank() == 0:
                 await asyncio.wait_for(client.stop_engines(), timeout=10.0)
@@ -1221,11 +1260,27 @@ class TestMalformedSubmissionsAreDropped:
         coordinator.router_socket.send_multipart.assert_not_called()
         assert coordinator.next_request_id == 0
 
+    def test_submission_missing_the_offload_frame_is_dropped(self):
+        """Three bodies was the previous wire format; offload params now ride in a fourth."""
+        coordinator = self._coordinator()
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}, None]
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0", b"\xc0", b"\xc0"])
+        coordinator.router_socket.send_multipart.assert_not_called()
+        assert coordinator.next_request_id == 0
+
     def test_submission_with_short_metadata_is_dropped(self):
         """Too few metadata fields must not raise a ValueError on unpack."""
         coordinator = self._coordinator()
         metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}]
-        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0", b"\xc0", b"\xc0"])
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0"] * 4)
+        coordinator.router_socket.send_multipart.assert_not_called()
+        assert coordinator.next_request_id == 0
+
+    def test_submission_with_offload_params_in_metadata_is_dropped(self):
+        """Offload params in the metadata frame was the previous layout; it must be rejected."""
+        coordinator = self._coordinator()
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}, None, {"k": "v"}]
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0"] * 4)
         coordinator.router_socket.send_multipart.assert_not_called()
         assert coordinator.next_request_id == 0
 
@@ -1243,15 +1298,15 @@ class TestEngineReplyDetokenization:
         coordinator._pending_counts = np.zeros(1, dtype=np.int32)
         coordinator.identity_to_rank_index = {b"rank_0": 0}
         coordinator.router_socket = MagicMock()
-        coordinator.detokenize = MagicMock()
+        coordinator.tokenizer.detokenize = MagicMock(wraps=coordinator.tokenizer.detokenize)
         return coordinator
 
     def test_detokenizes_when_the_client_asked(self):
         coordinator = self._coordinator()
         metadata = [Headers.ENGINE_REPLY.value, [[5, True]]]
-        body = msgpack.packb({"request_id": 5}, use_bin_type=True)
+        body = msgpack.packb({"request_id": 5, "generated_tokens": [1, 2]}, use_bin_type=True)
         handle_engine_reply(coordinator, b"rank_0", metadata, [body])
-        coordinator.detokenize.assert_called_once()
+        coordinator.tokenizer.detokenize.assert_called_once()
 
     def test_forwards_the_body_untouched_when_it_did_not(self):
         """The opt-out is the whole point: the body is never decoded."""
@@ -1259,6 +1314,6 @@ class TestEngineReplyDetokenization:
         metadata = [Headers.ENGINE_REPLY.value, [[5, False]]]
         body = msgpack.packb({"request_id": 5}, use_bin_type=True)
         handle_engine_reply(coordinator, b"rank_0", metadata, [body])
-        coordinator.detokenize.assert_not_called()
+        coordinator.tokenizer.detokenize.assert_not_called()
         sent = coordinator.router_socket.send_multipart.call_args.args[0]
         assert body in sent, "an un-detokenized body must be forwarded verbatim"

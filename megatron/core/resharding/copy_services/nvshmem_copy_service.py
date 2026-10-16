@@ -134,6 +134,7 @@ class NVSHMEMCopyService(CopyService):
                     f"missing_recvs={sorted(list(missing_recvs))[:10]}"
                 )
 
+            self._local_copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.no_grad():
                 with torch.cuda.stream(self._local_copy_stream):
                     for task_id, dst in self._local_recv_ops.items():
