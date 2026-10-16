@@ -214,6 +214,151 @@ def _test_fused_mla_rope_inplace(
     )
 
 
+def _packed_thd_positions(cu_seqlens, num_rows, cp_size, cp_rank):
+    """Reference position of every CP-local row of a packed THD batch.
+
+    The rows of each sequence follow those of the previous one. With context parallelism, a
+    sequence is split into ``2 * cp_size`` equal chunks and rank ``r`` holds chunks ``r`` and
+    ``2 * cp_size - 1 - r``, in that order. Rows past ``cu_seqlens[-1] // cp_size`` (CUDA-graph
+    padding) belong to no sequence and use position 0.
+    """
+    positions = torch.zeros(num_rows, dtype=torch.int64)
+    bounds = cu_seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        if cp_size == 1:
+            positions[start:end] = torch.arange(end - start)
+            continue
+        chunk = (end - start) // (2 * cp_size)
+        row = start // cp_size
+        for chunk_id in (cp_rank, 2 * cp_size - 1 - cp_rank):
+            positions[row : row + chunk] = chunk_id * chunk + torch.arange(chunk)
+            row += chunk
+    return positions.to(cu_seqlens.device)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("kernel", ["inplace", "concat", "kv_split"])
+def test_mla_rope_many_packed_thd_sequences_match_reference_positions(monkeypatch, kernel, cp_size):
+    """Every packed THD row must be rotated with the position it has in its own sequence.
+
+    The in-place, packing and key/value split kernels look up the sequence of each row in
+    ``cu_seqlens``. Use hundreds of short sequences, zero-length ones (first, last and a run in
+    the middle), CUDA-graph padding rows and every CP rank, forward and backward. Run the batch
+    also without its last, zero-length sequence, so that the last sequence has rows. The result
+    must equal, bit for bit, the same kernel on an SBHD view with batch size 1 (which reads the
+    cos/sin row of its own row index) with the tables gathered at the reference positions.
+    """
+    triton = pytest.importorskip("triton")
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as rope_kernels
+
+    # One BLOCK_H for both layouts: the key/value split backward sums the heads in tiles of
+    # BLOCK_H. A single-config autotuner runs that config without benchmarking.
+    autotuners = {
+        "inplace": ("_mla_rope_fwd_inplace_kernel", "_mla_rope_bwd_kernel"),
+        "concat": ("_mla_rope_concat_fwd_kernel", "_mla_rope_concat_bwd_kernel"),
+        "kv_split": ("_mla_rope_fwd_kv_split_kernel", "_mla_rope_bwd_kv_split_kernel"),
+    }[kernel]
+    for name in autotuners:
+        monkeypatch.setattr(getattr(rope_kernels, name), "configs", [triton.Config({"BLOCK_H": 2})])
+
+    emb_dim, num_heads, num_seqs, padding_rows = 64, 4, 300, 5
+    generator = torch.Generator().manual_seed(1234)
+    # Context parallelism needs every sequence length to be a multiple of 2 * cp_size.
+    multiple = 1 if cp_size == 1 else 2 * cp_size
+    lengths = torch.randint(1, 33, (num_seqs,), generator=generator) * multiple
+    lengths[::7] = 0
+    lengths[100:104] = 0
+    lengths[-1] = 0
+    cu_seqlens = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    cu_seqlens = cu_seqlens.to(device="cuda", dtype=torch.int32)
+    num_rows = int(cu_seqlens[-1]) // cp_size + padding_rows
+    freqs = torch.randn(int(lengths.max()), emb_dim, generator=generator).cuda()
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+
+    if kernel == "inplace":
+        nope_dim = 64
+        shapes = [(num_heads, nope_dim + emb_dim)]
+
+        def run(inputs, cos, sin, cu_seqlens=None, cp_rank=0, cp_size=1):
+            # remove_interleaving=True stores every channel where it was loaded.
+            out = rope_kernels.fused_mla_rope_inplace(
+                inputs[0],
+                cos,
+                sin,
+                nope_dim,
+                emb_dim,
+                cu_seqlens_q=cu_seqlens,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                remove_interleaving=True,
+            )
+            return (out,)
+
+    elif kernel == "concat":
+        nope_dim = 128
+        shapes = [(num_heads, nope_dim), (num_heads, emb_dim)]
+
+        def run(inputs, cos, sin, cu_seqlens=None, cp_rank=0, cp_size=1):
+            nope, rope = inputs
+            out = rope_kernels.fused_mla_rope_concat(
+                nope, rope, cos, sin, cu_seqlens, cp_rank, cp_size
+            )
+            return (out,)
+
+    else:
+        k_dim = v_dim = 32
+        shapes = [(num_heads, k_dim + v_dim), (1, emb_dim)]
+
+        def run(inputs, cos, sin, cu_seqlens=None, cp_rank=0, cp_size=1):
+            kv, k_pos_emb = inputs
+            return rope_kernels.fused_mla_rope_kv_split(
+                kv,
+                k_pos_emb,
+                cos,
+                sin,
+                emb_dim,
+                k_dim,
+                v_dim,
+                cu_seqlens_kv=cu_seqlens,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+
+    # Without its last, zero-length sequence, the batch has the same rows and positions, but the
+    # last sequence of cu_seqlens is no longer empty.
+    batches = [(cu, rank) for cu in (cu_seqlens, cu_seqlens[:-1]) for rank in range(cp_size)]
+    for batch_cu_seqlens, cp_rank in batches:
+        positions = _packed_thd_positions(batch_cu_seqlens, num_rows, cp_size, cp_rank)
+        values = [
+            torch.randn(num_rows, *shape, dtype=torch.bfloat16, device="cuda") for shape in shapes
+        ]
+        thd_inputs = [v.clone().requires_grad_(True) for v in values]
+        sbhd_inputs = [v.unsqueeze(1).clone().requires_grad_(True) for v in values]
+        thd_outputs = run(thd_inputs, cos, sin, batch_cu_seqlens, cp_rank, cp_size)
+        sbhd_outputs = run(sbhd_inputs, cos[positions], sin[positions])
+        label = f"{len(batch_cu_seqlens) - 1} sequences, cp_rank {cp_rank}"
+        for thd, sbhd in zip(thd_outputs, sbhd_outputs):
+            torch.testing.assert_close(
+                thd, sbhd.squeeze(1), rtol=0, atol=0, msg=lambda msg: f"{label} fwd: {msg}"
+            )
+        grads = [torch.randn_like(out) for out in thd_outputs]
+        torch.autograd.backward(thd_outputs, [g.clone() for g in grads])
+        torch.autograd.backward(sbhd_outputs, [g.unsqueeze(1).clone() for g in grads])
+        for thd, sbhd in zip(thd_inputs, sbhd_inputs):
+            torch.testing.assert_close(
+                thd.grad,
+                sbhd.grad.squeeze(1),
+                rtol=0,
+                atol=0,
+                msg=lambda msg: f"{label} bwd: {msg}",
+            )
+
+
 @pytest.mark.experimental
 @pytest.mark.internal
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
@@ -292,12 +437,131 @@ def test_mla_rope_contiguous_thd_global_start_matches_position_ids(
     torch.testing.assert_close(contiguous_input.grad, position_input.grad)
 
 
+def _channel_permuting_rope_reference(x, cos, sin, emb_dim, rope_first, backward):
+    """fp32 result of the in-place kernels with ``remove_interleaving=False``.
+
+    The forward rotates the interleaved pairs of the RoPE channels and stores them as two halves;
+    the backward applies the transposed rotation to the halves and stores interleaved pairs.
+    ``cos`` and ``sin`` hold one row per input row.
+    """
+    out = x.to(torch.float32, copy=True)
+    rope = out[..., :emb_dim] if rope_first else out[..., -emb_dim:]
+    half = emb_dim // 2
+    cos = cos.float()[:, None, :]
+    sin = sin.float()[:, None, :]
+    if backward:
+        left, right = rope[..., :half], rope[..., half:]
+        x1 = left * cos[..., :half] + right * sin[..., half:]
+        x2 = right * cos[..., half:] - left * sin[..., :half]
+        rotated = torch.stack((x1, x2), dim=-1).flatten(-2)
+    else:
+        x1, x2 = rope[..., 0::2], rope[..., 1::2]
+        left = x1 * cos[..., :half] - x2 * sin[..., :half]
+        right = x2 * cos[..., half:] + x1 * sin[..., half:]
+        rotated = torch.cat((left, right), dim=-1)
+    rope.copy_(rotated)
+    return out
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("block_h", [1, 2, 4, 8, 16, 32, 64, 128])
+@pytest.mark.parametrize(
+    ("num_heads", "head_dim", "rope_first"),
+    [pytest.param(16, 192, False, id="mla-query"), pytest.param(32, 128, True, id="dsa-indexer")],
+)
+def test_mla_rope_inplace_channel_permutation_is_race_free(
+    monkeypatch, num_heads, head_dim, rope_first, block_h
+):
+    """In-place RoPE with ``remove_interleaving=False`` must not depend on thread timing.
+
+    The MLA query RoPE (``fused_apply_mla_rope_for_q``) and the DSA indexer RoPE
+    (``rope_first=True``) use this mode: the forward kernel rotates their inputs in place, and in
+    training the backward kernel un-rotates the incoming gradient in place. The forward kernel
+    loads interleaved pairs and stores halves of the same channels, and the backward kernel does
+    the reverse, so the stores of one thread overwrite values that other threads of the same
+    program load. Without a barrier in between, the backward kernel at BLOCK_H=2 returned wrong
+    values whenever its warps drifted apart, which many short packed sequences make likely (every
+    row first walks ``cu_seqlens_q``). The backward kernel is run in place and with ``out=``
+    aliasing its input (which also copies the leading channels), so both need the barrier. The
+    forward barrier cannot be caught here: with Triton 3.6 the forward kernel keeps every head
+    within one warp at BLOCK_H <= 2 and converts its layout through shared memory, with a
+    barrier, from BLOCK_H=4 on.
+    """
+    triton = pytest.importorskip("triton")
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as rope_kernels
+
+    # A single-config autotuner runs that config without benchmarking.
+    for autotuner in (rope_kernels._mla_rope_fwd_inplace_kernel, rope_kernels._mla_rope_bwd_kernel):
+        monkeypatch.setattr(autotuner, "configs", [triton.Config({"BLOCK_H": block_h})])
+
+    emb_dim = 64
+    nope_dim = head_dim - emb_dim
+    seq_len, num_seqs = 64, 64
+    rows = seq_len * num_seqs
+    torch.manual_seed(1234)
+    cu_seqlens = torch.arange(0, rows + 1, seq_len, dtype=torch.int32, device="cuda")
+    freqs = torch.randn(seq_len, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    positions = torch.arange(rows, device="cuda") % seq_len
+    x = torch.randn(rows, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+
+    def unapply_into_input(t, *args, **kwargs):
+        return rope_kernels.mla_rope_unapply_raw(t, *args, out=t, **kwargs)
+
+    variants = (
+        ("forward", rope_kernels.fused_mla_rope_inplace, False),
+        ("backward", rope_kernels.mla_rope_unapply_raw, True),
+        ("backward into out=input", unapply_into_input, True),
+    )
+    for name, apply_rope, backward in variants:
+        expected = _channel_permuting_rope_reference(
+            x, cos[positions], sin[positions], emb_dim, rope_first, backward
+        )
+        first = None
+        for run in range(8):
+            out = apply_rope(
+                x.clone(),
+                cos,
+                sin,
+                nope_dim,
+                emb_dim,
+                cu_seqlens_q=cu_seqlens,
+                rope_first=rope_first,
+            )
+            label = f"{name} run {run}"
+            torch.testing.assert_close(
+                out.float(),
+                expected,
+                msg=lambda msg: f"Mismatch in {label}: {msg}",
+                **dtype_tols(torch.bfloat16),
+            )
+            if first is None:
+                first = out
+            torch.testing.assert_close(
+                out, first, rtol=0, atol=0, msg=lambda msg: f"{label} differs from run 0: {msg}"
+            )
+
+
 def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
     assert fused_mla_rope_kv_split is not None
     num_heads = 32
     k_dim = 128
     v_dim = 128
     emb_dim = 64
+    _check_fused_mla_rope_kv_split(
+        input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+    )
+
+
+def _check_fused_mla_rope_kv_split(
+    input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+):
+    """Compare the fused key/value split, forward and backward, with the unfused PyTorch path."""
+    assert fused_mla_rope_kv_split is not None
     dtype = torch.bfloat16
     transformer_config = TransformerConfig(
         num_attention_heads=num_heads,
@@ -532,6 +796,24 @@ class TestFusedApplyMLARope:
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):
         _test_fused_mla_rope_kv_split(input_format, remove_interleaving=remove_interleaving)
+
+    @pytest.mark.parametrize("remove_interleaving", [False, True])
+    @pytest.mark.parametrize(
+        ("num_heads", "k_dim", "v_dim", "emb_dim"),
+        [
+            # GLM-5 at TP 8: qk_head_dim 192, v_head_dim 256, qk_pos_emb_head_dim 64.
+            pytest.param(8, 192, 256, 64, id="glm5-tp8"),
+            # Key, value and rotary half (24 pairs) all padded.
+            pytest.param(4, 96, 160, 48, id="k96-v160-rope48"),
+        ],
+    )
+    def test_kv_split_non_power_of_two_head_dims(
+        self, input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+    ):
+        """The key/value split must handle head dims that are not powers of two."""
+        _check_fused_mla_rope_kv_split(
+            input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+        )
 
 
 @pytest.mark.experimental
