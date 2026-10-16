@@ -20,6 +20,7 @@ from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
+from megatron.core.muon_layout import MuonProjectionLayout
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
@@ -283,6 +284,14 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
             name=(name + ".in_proj") if name is not None else None,
+        )
+
+        # Variant-owned TP-local sections distinguish Q/K/V matrices from controls.
+        self.in_proj.weight.muon_layout = MuonProjectionLayout.gdn(
+            self.in_proj_split_names,
+            self.in_proj_split_sections,
+            self.key_head_dim,
+            self.value_head_dim,
         )
 
         # Conv1d for QKV
