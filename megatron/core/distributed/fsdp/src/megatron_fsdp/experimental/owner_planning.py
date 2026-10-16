@@ -1,27 +1,19 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Owner assignment for MFSDP v2's all-`RowAtomic` layout.
+"""Owner assignment for MFSDP v2 distributed buffers.
 
-Tensor shapes and shard ranges come from the group's existing `GlobalLayout`.
+Tensor shapes and shard ranges come from the buffer's layout and placements.
 Owner assignments use global process ranks.
 """
 
 import dataclasses
 from collections.abc import Callable, Iterable
-from typing import Self
 
 import torch
-from torch.distributed.device_mesh import DeviceMesh
 
-from .layout import GlobalLayout, non_leading_numel
-from .parameter_group import FsdpParameterGroup
-from .placement import RowAtomic
+from .dbuffer import DBuffer
+from .layout import non_leading_numel
 from .range import intersect_ranges
-
-
-def select_ge_2d_params(param: torch.Tensor) -> bool:
-    """Whether the given tensor has dimensionality ≥2."""
-    return param.ndim >= 2
 
 
 def ns_cost_fn(num_ns_steps: int) -> Callable[[torch.Size], int]:
@@ -57,8 +49,7 @@ class _OwnerWork:
 
 
 def assign_owner_work(
-    layout: GlobalLayout,
-    mesh: DeviceMesh,
+    buffer: DBuffer,
     tensor_indices: Iterable[int],
     cost_fn: Callable[[torch.Size], float] | None = None,
 ) -> dict[int, int]:
@@ -69,18 +60,20 @@ def assign_owner_work(
     least-loaded holder. Ties follow buffer order.
 
     Args:
-        layout: The group's DBuffer layout, including padding and ineligible tensors.
-        mesh: The device mesh across which the buffer is all-RowAtomic sharded.
-        tensor_indices: Indices of participating tensors in `layout`.
+        buffer: Distributed buffer providing the layout, mesh, and placements.
+        tensor_indices: Indices of participating tensors in `buffer.layout`. The caller
+            selects eligible tensors, for example those with at least two dimensions.
         cost_fn: Positive cost estimate from a tensor's full shape. Defaults to
             Newton-Schulz with five iterations.
     """
     if cost_fn is None:
         cost_fn = ns_cost_fn(num_ns_steps=5)
 
-    placements = (RowAtomic(),) * mesh.ndim
+    layout = buffer.layout
+    mesh = buffer.mesh
     rank_ranges = {
-        rank: layout.get_rank_range(mesh, placements, rank) for rank in mesh.mesh.flatten().tolist()
+        rank: layout.get_rank_range(mesh, buffer.placements, rank)
+        for rank in mesh.mesh.flatten().tolist()
     }
     # Offset order, rather than global rank order, determines load-balancing ties.
     ranks_in_buffer_order = sorted(rank_ranges, key=lambda rank: (rank_ranges[rank].start, rank))
@@ -110,41 +103,3 @@ def assign_owner_work(
         assignments[item.tensor_index] = owner
         running_cost[owner] += item.cost
     return assignments
-
-
-@dataclasses.dataclass(frozen=True)
-class GroupOwnerLayout:
-    """A group's shared buffer layout and owner assignments.
-
-    Attributes:
-        mesh: The device mesh over which the buffer is all-RowAtomic sharded.
-        layout: The existing `DBuffer.layout`, including all tensors in the group.
-        tensor_to_owner: Participating tensor index to owner global process rank. These keys
-            identify the participating tensors; no filtered layout copy is stored.
-    """
-
-    mesh: DeviceMesh
-    layout: GlobalLayout
-    tensor_to_owner: dict[int, int]
-
-    @classmethod
-    def from_group(
-        cls,
-        group: FsdpParameterGroup,
-        *,
-        cost_fn: Callable[[torch.Size], float] | None = None,
-        eligible_fn: Callable[[torch.Tensor], bool] | None = None,
-    ) -> Self:
-        """Select participating parameters and balance their owner assignments.
-
-        `eligible_fn` defaults to selecting ≥2D parameters. `cost_fn` receives
-        full tensor shapes; see `assign_owner_work` for the default estimate.
-        """
-        if eligible_fn is None:
-            eligible_fn = select_ge_2d_params
-        tensor_indices = (
-            i for i, param in enumerate(group.fsdp_parameters) if eligible_fn(param.sharded)
-        )
-        layout = group.main_weight.layout
-        tensor_to_owner = assign_owner_work(layout, group.mesh, tensor_indices, cost_fn)
-        return cls(mesh=group.mesh, layout=layout, tensor_to_owner=tensor_to_owner)
