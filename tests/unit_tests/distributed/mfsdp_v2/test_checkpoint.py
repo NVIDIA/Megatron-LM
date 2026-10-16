@@ -4,6 +4,7 @@
 
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,11 +24,19 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     load_checkpoint,
     save_checkpoint,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtensor import (
     attach_uneven_dtensor_metadata,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
+)
+from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+    handle_mla_down_proj_in_state_dict,
+    handle_swiglu_in_state_dict,
+    split_fused_fsdp_param,
 )
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 
@@ -465,3 +474,151 @@ def test_metadata_attach_issues_no_collectives(
     attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
 
     assert model_state_dict.keys() == dict(model.named_parameters()).keys()
+
+
+def _fused_checkpoint_parameter(parameter):
+    """Build a checkpoint view from the owning group on either runtime tensor path."""
+    group = get_containing_parameter_group(parameter)
+    assert group is not None
+    index = next(
+        index
+        for index, fsdp_parameter in enumerate(group.fsdp_parameters)
+        if fsdp_parameter.sharded is parameter
+    )
+    return group.main_weight.get_dtensor(index)
+
+
+@pytest.mark.parametrize(
+    "parameter_name,split_sizes",
+    [
+        ("block.regular", [2, 2]),
+        ("block.regular", [1, 3]),
+        ("block.fragment", [1, 1]),
+        ("block.tail", [1, 1]),
+        ("linear.weight", [3, 13]),
+        ("linear.bias", [8, 8]),
+    ],
+)
+@pytest.mark.parametrize("generic_metadata", [False, True])
+def test_fused_checkpoint_split_aliases_local_storage(
+    distributed_setup, tmp_path_dist_ckpt, parameter_name, split_sizes, generic_metadata
+):
+    """Logical SwiGLU/MLA sections preserve packed shards, empty chunks and load aliases."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(123)
+    model = _PackedModel()
+    expected = model.get_parameter(parameter_name).detach().clone().to(device)
+    model, _ = _build_sharded(model, mesh, device)
+    parameter = model.get_parameter(parameter_name)
+    data = _fused_checkpoint_parameter(parameter)
+    local_state = data.to_local().detach().to(dtype=torch.bfloat16).clone()
+    state = DTensor.from_local(
+        local_state,
+        device_mesh=data.device_mesh,
+        placements=data.placements,
+        run_check=False,
+        shape=data.shape,
+        stride=data.stride(),
+    )
+    model_sections = split_fused_fsdp_param(data, parameter, split_sizes)
+    state_sections = split_fused_fsdp_param(state, parameter, split_sizes)
+    split_state = {
+        **{f"model{index}": section for index, section in enumerate(model_sections)},
+        **{f"state{index}": section for index, section in enumerate(state_sections)},
+    }
+    for section in split_state.values():
+        chunk = section.__create_chunk_list__()[0]
+        assert chunk.sizes == section.to_local().shape
+        items = section.__create_write_items__("section", section)
+        assert bool(items) == bool(section.to_local().numel())
+        if section.to_local().numel():
+            original = data if section.dtype == data.dtype else state
+            assert (
+                section.to_local().untyped_storage().data_ptr()
+                == original.to_local().untyped_storage().data_ptr()
+            )
+    if generic_metadata:
+        chunks = {key: value.__create_chunk_list__() for key, value in split_state.items()}
+        preprocess_state_dict_for_uneven_dtensor(split_state)
+        assert {key: value.__create_chunk_list__() for key, value in split_state.items()} == chunks
+
+    with TempNamedDir(tmp_path_dist_ckpt / "fused_sections", sync=True) as path:
+        dcp.save(split_state, checkpoint_id=path)
+        full_state = {
+            key: torch.empty(value.shape, dtype=value.dtype, device=device)
+            for key, value in split_state.items()
+        }
+        dcp.load(full_state, checkpoint_id=path)
+        for index, expected_section in enumerate(expected.split(split_sizes, dim=0)):
+            torch.testing.assert_close(
+                full_state[f"model{index}"], expected_section, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                full_state[f"state{index}"], expected_section.bfloat16(), rtol=0, atol=0
+            )
+        snapshot = data.to_local().detach().clone()
+        state_snapshot = local_state.clone()
+        with torch.no_grad():
+            data.to_local().zero_()
+            local_state.zero_()
+        dcp.load(split_state, checkpoint_id=path)
+        torch.testing.assert_close(data.to_local(), snapshot, rtol=0, atol=0)
+        torch.testing.assert_close(local_state, state_snapshot, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", ["swiglu", "mla"])
+def test_fused_checkpoint_handler_uses_v2_layout(distributed_setup, kind):
+    """Both fused handlers dispatch to local-tensor layouts without v1 attributes."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    inner = nn.Module()
+    inner.layer = nn.Module()
+    if kind == "swiglu":
+        inner.layer.mlp = nn.Module()
+        inner.layer.mlp.linear_fc1 = nn.Linear(4, 8, bias=False)
+        parameter_name = "layer.mlp.linear_fc1.weight"
+        handler = handle_swiglu_in_state_dict
+    else:
+        inner.layer.self_attention = nn.Module()
+        inner.layer.self_attention.config = SimpleNamespace(
+            q_lora_rank=1, kv_lora_rank=2, qk_pos_emb_head_dim=1
+        )
+        inner.layer.self_attention.linear_qkv_down_proj = nn.Linear(4, 4, bias=False)
+        parameter_name = "layer.self_attention.linear_qkv_down_proj.weight"
+        handler = handle_mla_down_proj_in_state_dict
+    inner = inner.to(device)
+    with fully_shard_context(device=device):
+        fully_shard(inner, mesh=mesh, placements=_default_placements())
+    model = nn.Module()
+    model.module = inner
+    model.config = SimpleNamespace(num_moe_experts=None)
+    parameter = inner.get_parameter(parameter_name)
+    assert not hasattr(parameter, "megatron_fsdp_slice")
+    data = _fused_checkpoint_parameter(parameter)
+    model_state = {parameter_name: data}
+    sections, optimizer_state = handler(model, model_state, None)
+    assert optimizer_state is None
+    assert parameter_name not in sections
+    assert len(sections) == 2
+    assert (
+        sum(section.to_local().numel() for section in sections.values()) == data.to_local().numel()
+    )
+    with torch.no_grad():
+        for section in sections.values():
+            section.to_local().fill_(17)
+    assert torch.equal(data.to_local(), torch.full_like(data.to_local(), 17))
+
+
+@pytest.mark.parametrize("split_sizes", [[], [0, 4], [-1, 5], [1, 2]])
+def test_fused_checkpoint_split_rejects_invalid_sections(distributed_setup, split_sizes):
+    """Invalid sections cannot silently omit, overlap or invent checkpoint rows."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model, _ = _build_sharded(_PackedModel(), mesh, device)
+    parameter = model.get_parameter("block.regular")
+    data = _fused_checkpoint_parameter(parameter)
+    with pytest.raises(ValueError, match="split sizes"):
+        split_fused_fsdp_param(data, parameter, split_sizes)
+    with pytest.raises(NotImplementedError, match="dim 0"):
+        split_fused_fsdp_param(data, parameter, [2, 2], split_dim=1)
