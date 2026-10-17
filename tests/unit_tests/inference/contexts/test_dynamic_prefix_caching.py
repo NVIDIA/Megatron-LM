@@ -1175,32 +1175,38 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert _m2.effective_prefill_chunk_length == len(p2)
 
     @pytest.mark.internal
+    def test_batch_invariant_mamba_prefix_cache_alignment(self):
+        ctx = self._mctx(batch_invariant_mode=True)
+        assert ctx.enable_prefix_caching
+        assert ctx.mamba_slot_allocator is not None
+        with pytest.raises(AssertionError, match="multiple of ssm_chunk_alignment"):
+            self._mctx(batch_invariant_mode=True, block_size_tokens=32)
+
+    @pytest.mark.internal
+    def test_batch_invariant_mamba_cached_suffix_uses_compute_budget(self):
+        ctx = self._mctx(batch_invariant_mode=True, enable_chunked_prefill=True)
+        engine = _StubEngine(ctx, enable_chunked_prefill=True)
+        # A warm 512-token prefix of a 600-token prompt leaves only 88 tokens to
+        # compute. The old scheduler rounded the full 600 down against the 88-token
+        # budget to zero and could never admit the request.
+        assert engine._mamba_batch_invariant_prefill_chunk_length(600 - 512, 88) == 88
+        assert engine._mamba_batch_invariant_prefill_chunk_length(1025 - 512, 512) == 384
+        assert engine._mamba_batch_invariant_prefill_chunk_length(1025 - 512, 100) == 0
+
+    @pytest.mark.internal
     def test_batch_invariant_mamba_chunked_prefill_scheduler_alignment(self):
         ctx = self._mctx(
             block_size_tokens=32, batch_invariant_mode=True, enable_prefix_caching=False
         )
         engine = _StubEngine(ctx, enable_chunked_prefill=True)
-        req = self._req(ctx, self._prompt(500), enable_prefix_caching=False)
+        chunk = ctx.mamba_chunk_size
 
-        assert engine._mamba_batch_invariant_prefill_chunk_length(req, 300) == 256
-        assert engine._mamba_batch_invariant_prefill_chunk_length(req, 100) == 0
-
-        short_req = self._req(ctx, self._prompt(200), request_id=2, enable_prefix_caching=False)
-        assert engine._mamba_batch_invariant_prefill_chunk_length(short_req, 300) == 200
-
-        one_left_req = self._req(
-            ctx, self._prompt(ctx.mamba_chunk_size + 1), request_id=3, enable_prefix_caching=False
-        )
-        assert (
-            engine._mamba_batch_invariant_prefill_chunk_length(one_left_req, ctx.mamba_chunk_size)
-            == 0
-        )
-        assert (
-            engine._mamba_batch_invariant_prefill_chunk_length(
-                one_left_req, ctx.mamba_chunk_size + 1
-            )
-            == ctx.mamba_chunk_size + 1
-        )
+        assert engine._mamba_batch_invariant_prefill_chunk_length(500, 300) == 256
+        assert engine._mamba_batch_invariant_prefill_chunk_length(500, 100) == 0
+        assert engine._mamba_batch_invariant_prefill_chunk_length(200, 300) == 200
+        # Never leave a single prompt token for the final call.
+        assert engine._mamba_batch_invariant_prefill_chunk_length(chunk + 1, chunk) == 0
+        assert engine._mamba_batch_invariant_prefill_chunk_length(chunk + 1, chunk + 1) == chunk + 1
 
         with pytest.raises(AssertionError, match="max_tokens > ssm_chunk_alignment"):
             self._mctx(
@@ -1210,9 +1216,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
                 max_tokens=ctx.mamba_chunk_size,
                 max_requests=64,
             )
-
-        with pytest.raises(AssertionError, match="does not support Mamba prefix caching"):
-            self._mctx(batch_invariant_mode=True)
 
     @pytest.mark.internal
     def test_mamba_intermediate_offsets(self):
@@ -1811,6 +1814,40 @@ def test_attention_only_cached_continuation_still_skips():
     assert match.overall_required_blocks == 11
     assert match.prefix_skip_tokens == 6 * ctx.block_size_tokens
     assert match.effective_prefill_chunk_length == 2
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("pipeline_has_recurrent_layers", [False, True])
+def test_attention_only_stage_of_hybrid_pipeline_skips_like_recurrent_stages(
+    pipeline_has_recurrent_layers,
+):
+    """A stage without recurrent layers in a hybrid pipeline skips no prompt tokens.
+
+    Its recurrent peers restore no Mamba state in memory-only mode, so every stage must
+    recompute the whole prompt while still inheriting the matched KV blocks.
+    """
+    ctx = object.__new__(DynamicInferenceContext)
+    ctx.block_size_tokens = 256
+    ctx.enable_prefix_caching = True
+    ctx.enable_mtp_kv_cache = False
+    ctx.is_hybrid_model = False
+    ctx.pipeline_has_recurrent_layers = pipeline_has_recurrent_layers
+    ctx.mamba_slot_allocator = None
+    hashes = list(range(1, 11))
+    ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
+    req = SimpleNamespace(finished_chunk_token_count=0, precomputed_block_hashes=hashes)
+    chunk_length = 4 * ctx.block_size_tokens
+
+    match = ctx._compute_prefix_match(req, chunk_length)
+
+    assert match.matched_block_ids == hashes[:4]
+    assert match.num_blocks_from_pool == 0
+    if pipeline_has_recurrent_layers:
+        assert match.prefix_skip_tokens == 0
+        assert match.effective_prefill_chunk_length == chunk_length
+    else:
+        assert match.prefix_skip_tokens == chunk_length - 1
+        assert match.effective_prefill_chunk_length == 1
 
 
 def _make_cpu_mamba_slot_allocator(
