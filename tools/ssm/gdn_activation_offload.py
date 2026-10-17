@@ -291,7 +291,6 @@ def benchmark_arm(
         ),
     }
     if reference is not None:
-        # Every checked step has required zero outstanding pooled buffers above.
         result.update(
             bitwise_equal=True,
             checked_steps=len(inputs_cpu),

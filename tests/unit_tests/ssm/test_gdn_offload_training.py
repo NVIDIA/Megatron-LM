@@ -113,8 +113,7 @@ def _build_training_model(
     config: TransformerConfig, groups: ProcessGroupCollection
 ) -> tuple[list[DistributedDataParallel], MegatronOptimizer]:
     """Construct full decoder blocks, DDP gradient buffers and the BF16 Adam optimizer."""
-    # Both layer recipes include their MLP: eight complete decoder blocks,
-    # with three GDN blocks for every gated GQA block.
+    # Both recipes include MLPs, so this fixture exercises complete decoder blocks.
     layer_specs = get_transformer_layer_with_experimental_attention_variant_spec(config)
     stack_spec = ModuleSpec(
         module=HybridStack,
