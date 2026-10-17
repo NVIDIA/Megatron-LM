@@ -38,14 +38,15 @@ from tests.unit_tests.test_utilities import Utils
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize("tp,pp", [(1, 1), (2, 1), (1, 2)], ids=["tp1", "tp2-sp", "pp2"])
 @pytest.mark.parametrize(
-    "variant,fused,recompute_norm,whole_layer,delay",
+    "variant,fused,recompute_norm,whole_layer,delay,fraction",
     [
-        ("gdn", False, False, False, False),
-        ("gdn", True, True, False, True),
-        ("gdn", True, False, True, False),
-        ("gdn", False, True, True, True),
-        ("gdn2", False, False, True, False),
-        ("gdn2", False, True, False, True),
+        ("gdn", False, False, False, False, 1.0),
+        ("gdn", True, True, False, True, 1.0),
+        ("gdn", True, False, True, False, 1.0),
+        ("gdn", False, True, True, True, 1.0),
+        ("gdn2", False, False, True, False, 1.0),
+        ("gdn2", False, True, False, True, 1.0),
+        ("gdn2", False, False, True, False, 0.0),
     ],
 )
 def test_gdn_offload_with_te_graphs(
@@ -54,6 +55,7 @@ def test_gdn_offload_with_te_graphs(
     recompute_norm: bool,
     whole_layer: bool,
     delay: bool,
+    fraction: float,
     tp: int,
     pp: int,
     monkeypatch: pytest.MonkeyPatch,
@@ -89,7 +91,7 @@ def test_gdn_offload_with_te_graphs(
                     1,
                     pp,
                     None,
-                    1.0,
+                    fraction,
                     recompute_norm,
                     fused_pre_gdr=fused,
                     variant=variant,
@@ -175,7 +177,7 @@ def test_gdn_offload_with_te_graphs(
                 )
             assert len(pool_checks) == 6
             if enabled:
-                assert manager.offload_summary_total_bytes > 0
+                assert (manager.offload_summary_total_bytes > 0) == (fraction > 0)
                 if fused:
                     torch.testing.assert_close(states, references, rtol=1e-5, atol=1e-8)
                 else:
