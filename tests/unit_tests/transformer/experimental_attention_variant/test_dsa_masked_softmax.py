@@ -72,6 +72,44 @@ def test_masked_softmax_saves_only_one_probability_buffer():
     assert torch.isfinite(logits.grad).all()
 
 
+@pytest.mark.parametrize("mask_shape", [(2, 1, 3, 17), (1, 1, 3, 17), (2, 4, 3, 1)])
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_masked_softmax_preserves_broadcast_mask_storage(mask_shape, transpose, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    torch.manual_seed(42)
+    logits = torch.randn(2, 4, 3, 17, device=device)
+    mask = torch.rand(mask_shape, device=device) > 0.3
+    valid = mask.expand_as(logits)
+    if transpose:
+        logits, valid = logits.transpose(2, 3), valid.transpose(2, 3)
+    dim = -2 if transpose else -1
+    original_mask = mask.clone()
+    logits.requires_grad_()
+    ref_logits = logits.detach().clone().requires_grad_()
+    saved_mask_bytes = []
+
+    def pack(tensor):
+        if tensor.dtype == torch.bool:
+            saved_mask_bytes.append(tensor.untyped_storage().nbytes())
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        result = masked_softmax(logits, valid, dim=dim)
+    # Neither the shared validity mask nor the small row-validity mask should
+    # become a full [batch, heads, query, key] allocation saved for backward.
+    assert saved_mask_bytes
+    assert max(saved_mask_bytes) <= max(mask.numel(), logits.numel() // logits.size(dim))
+    reference = masked_softmax(ref_logits, valid.contiguous(), dim=dim)
+    upstream = torch.randn_like(result)
+    grad = torch.autograd.grad(result, logits, upstream)[0]
+    ref_grad = torch.autograd.grad(reference, ref_logits, upstream)[0]
+    torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    torch.testing.assert_close(grad, ref_grad, rtol=0, atol=0)
+    assert torch.equal(mask, original_mask)
+
+
 @pytest.mark.parametrize("eps", [1e-10, 2.0])
 def test_masked_softmax_first_and_second_derivatives(eps):
     torch.manual_seed(3)

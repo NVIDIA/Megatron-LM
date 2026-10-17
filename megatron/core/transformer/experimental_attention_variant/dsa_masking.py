@@ -362,7 +362,12 @@ def masked_softmax(
     if logits.shape != valid_mask.shape:
         raise ValueError("logits and valid_mask must have the same shape")
 
-    invalid_mask = ~valid_mask
+    # DSA expands one validity mask across attention heads. Invert only its
+    # non-broadcast dimensions so autograd does not retain a copy per head.
+    mask_slices = tuple(
+        slice(0, 1) if stride == 0 else slice(None) for stride in valid_mask.stride()
+    )
+    invalid_mask = ~valid_mask[mask_slices]
     masked_logits = logits.masked_fill(invalid_mask, torch.finfo(logits.dtype).min)
     row_has_valid = valid_mask.any(dim=dim, keepdim=True)
     row_max = masked_logits.max(dim=dim, keepdim=True).values
