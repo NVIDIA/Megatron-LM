@@ -44,6 +44,10 @@ backward access. The recurrence saves Q/K/V, gates and its internal WY
 representation. Some saves alias inputs retained by neighboring operations;
 moving one saved reference does not free a storage still used on GPU.
 
+GDN2 keeps differentiable write-gate outputs on GPU because sigmoid backward
+also retains their storage. The erase gate stays on GPU when its heads do not
+need expansion; expanded and frozen gates remain eligible for offloading.
+
 The offload scope wraps only the FLA recurrence. A differentiable recurrence input
 anchors backward prefetch, including a trainable gate when Q is frozen. The scope
 commits on the raw recurrence output, before gated output normalization, so reload
@@ -218,8 +222,30 @@ fingerprints; all performance pairs also match their loss and gradient-norm
 sequences. Pinned-buffer ownership returns to zero before schedule resets and
 pool allocation counters stay constant during replay.
 [Commands, raw timings, rank logs and verification](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/6ec7df0dc5adcd9f704077636398999ebdfea027/gdn-graph-training-20261017)
-identify the exact source, environment and workload. Later documentation changes
-leave the runtime, tests and tools unchanged from this executed source.
+identify the exact source, environment and workload. These measurements precede
+the GDN2 live-gate change below; `d18040ba5a` used the same runtime as this source.
+
+Profiling at `d18040ba5a` identifies transfer time without overlapping kernels as
+the main graph-offload cost. GDN2 copies 1600 MiB in each direction per optimizer
+step; its write-gate storage is also retained by sigmoid backward outside the
+recurrence. At `367d014c7bf74ba3553c9db58da47fa5bcba906e`, keeping live sigmoid
+gates resident reduces each direction to 1440 MiB with unchanged kernel call counts.
+
+Three fresh-process pairs compare the previous and adjusted GDN2 implementations,
+both with offloading enabled and the same whole-layer graph workload above.
+Paired median step time falls by 5.93% (5.89–5.95%); the medians of process-median
+times are 451.71 and 424.91 ms. Peak reserved falls by an additional paired median
+22 MiB (20–38 MiB); allocated peaks are unchanged. The retained pinned-buffer count
+falls from 54 to 48. These results measure the gate-selection adjustment, not a
+speedup from enabling offloading. Transfer overhead remains substantial.
+
+At the adjusted source, two ranks each pass 20 scope, 18 native training and nine
+real TE graph cases without skips. Separate complete-model comparisons with
+linear key/value heads 8/16 and 16/16 match all six steps of losses, gradients,
+weights and complete optimizer/master-state fingerprints. Evaluation and frozen
+gate regressions exercise the resident-gate boundary.
+[Transfer traces, paired samples, rank logs and verification](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/a2cd3e9ddc1bfefe92c2a2b4052251c996c16544/gdn-graph-profile-20261017)
+retain exact commands, source identities and the earlier configuration probes.
 
 The earlier GDN2 stack result at `043e3173451bea74e63c02b197867bf356ad72e9`
 saved 192 MiB allocated (16.88%), with +58.42% median runtime. It excludes
