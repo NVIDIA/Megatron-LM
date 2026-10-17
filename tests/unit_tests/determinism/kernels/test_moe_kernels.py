@@ -1189,3 +1189,28 @@ class TestMoEModules:
                 )
             finally:
                 torch.utils.deterministic.fill_uninitialized_memory = prev_fill
+
+    def test_alltoall_dispatcher_releases_router_probs_after_forward(self):
+        """combine_preprocess drops ``self.probs`` so it does not pin the recompute graph.
+
+        The all-to-all dispatcher sets ``self.probs`` during dispatch and clears it at the end
+        of ``combine_preprocess`` (the last consumer of router probs). After a forward pass the
+        reference must be gone, otherwise the recomputed MoE forward graph is retained until the
+        next iteration.
+        """
+        self._init(ep=1)
+        seeded()
+        config = _moe_config(moe_token_dispatcher_type="alltoall", expert_model_parallel_size=1)
+        if not HAVE_TE:
+            config.moe_grouped_gemm = False
+            mlp_spec = get_gpt_layer_local_submodules(num_experts=8, moe_grouped_gemm=False).mlp
+        else:
+            mlp_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=8, moe_grouped_gemm=True
+            ).submodules.mlp
+        layer = MoELayer(config, get_submodules(mlp_spec)).cuda()
+        layer.set_layer_number(0)
+        hidden = torch.randn(2048, 2, 1024, device="cuda", dtype=torch.bfloat16)
+        with deterministic_algorithms(True):
+            layer(hidden)
+        assert layer.token_dispatcher.probs is None
