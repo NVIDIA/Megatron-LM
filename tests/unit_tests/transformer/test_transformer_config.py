@@ -526,3 +526,53 @@ class TestTransformerConfig:
         # num_query_groups then defaults to 0 and the check is skipped.
         config = TransformerConfig(num_layers=1, kv_channels=1)
         assert config.num_query_groups == 0
+
+
+def _make_full_recompute_input_offload_config(**overrides) -> TransformerConfig:
+    kwargs = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        fine_grained_activation_offloading=True,
+        offload_modules=["full_recompute_input"],
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def test_full_recompute_input_offload_accepts_full_recompute():
+    config = _make_full_recompute_input_offload_config()
+
+    assert config.offload_modules == ["full_recompute_input"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param(
+            {"recompute_granularity": None, "recompute_method": None, "recompute_num_layers": None},
+            id="no-recompute",
+        ),
+        pytest.param(
+            {
+                "recompute_granularity": "selective",
+                "recompute_method": None,
+                "recompute_num_layers": None,
+            },
+            id="selective-recompute",
+        ),
+    ],
+)
+def test_full_recompute_input_offload_requires_full_recompute(overrides):
+    with pytest.raises(ValueError, match="requires recompute_granularity='full'"):
+        _make_full_recompute_input_offload_config(**overrides)
+
+
+def test_full_recompute_input_offload_rejects_other_offload_modules():
+    with pytest.raises(ValueError, match="cannot be combined with other offload_modules"):
+        _make_full_recompute_input_offload_config(
+            offload_modules=["full_recompute_input", "core_attn"]
+        )

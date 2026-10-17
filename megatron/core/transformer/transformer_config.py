@@ -1551,7 +1551,7 @@ class TransformerConfig(ModelParallelConfig):
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
              "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv",
-             "shortcut_post_norm".
+             "shortcut_post_norm", "full_recompute_input".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1564,6 +1564,11 @@ class TransformerConfig(ModelParallelConfig):
                GatedDeltaProduct mixer.
     "shortcut_post_norm": offload the input of the shortcut output normalization.
             Requires moe_shortcut_connection=True.
+    "full_recompute_input": offload the hidden-states input of each full-recompute checkpoint
+            (one per checkpointed layer or chunk of layers), which is otherwise the only
+            activation kept on the GPU between a checkpoint's forward and its recompute in
+            backward. Requires recompute_granularity="full" and cannot be combined with the
+            other modules, which run inside the checkpointed region.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -2818,12 +2823,29 @@ class TransformerConfig(ModelParallelConfig):
                 "qkv_linear",
                 "gdp_qkv",
                 "shortcut_post_norm",
+                "full_recompute_input",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
+            if "full_recompute_input" in self.offload_modules:
+                if self.recompute_granularity != "full":
+                    raise ValueError(
+                        "full_recompute_input in offload_modules requires "
+                        "recompute_granularity='full': it offloads the inputs that full "
+                        "activation recomputation keeps for backward, got "
+                        f"recompute_granularity={self.recompute_granularity!r}."
+                    )
+                other_modules = set(self.offload_modules) - {"full_recompute_input"}
+                if other_modules:
+                    raise ValueError(
+                        "full_recompute_input cannot be combined with other offload_modules "
+                        f"{sorted(other_modules)}: those modules run inside the checkpointed "
+                        "region, where their offload groups would open both in the no-grad "
+                        "forward and again in the recompute during backward."
+                    )
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "
