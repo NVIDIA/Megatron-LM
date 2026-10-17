@@ -10,6 +10,7 @@ a different number of tokens. The caller provides:
 One CTA processes one token; the outer loop is persistent over local_tokens.
 """
 
+from typing import Optional
 from unittest.mock import MagicMock
 
 import torch
@@ -126,7 +127,7 @@ def _multimem_all_gather_v_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 # Each 64-bit pack is exactly 1 uint64, so offsets index directly (no * 2 stride).
@@ -136,7 +137,7 @@ def _multimem_all_gather_v_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
     sync_threads()
@@ -151,6 +152,21 @@ def _multimem_all_gather_v_kernel(
 
 
 @triton.jit
+def _f32_bits_to_bf16_bits(v, addend, HAS_ADDEND: tl.constexpr):
+    """Round fp32 bits ``v`` to bf16 like ``Tensor.to(torch.bfloat16)`` (nearest even).
+
+    With HAS_ADDEND, then add the bf16 value held in the low 16 bits of ``addend`` as a
+    bf16 + bf16 tensor addition does: fp32 sum of both operands, rounded once to bf16.
+    Returns the bf16 bits in the low 16 bits of a uint32.
+    """
+    r = v.to(tl.float32, bitcast=True).to(tl.bfloat16)
+    if HAS_ADDEND:
+        a = (addend << 16).to(tl.float32, bitcast=True)
+        r = (r.to(tl.float32) + a).to(tl.bfloat16)
+    return r.to(tl.uint16, bitcast=True).to(tl.uint32)
+
+
+@triton.jit
 def _multimem_reduce_scatter_v_kernel(
     local_ptr,
     multicast_ptr,
@@ -159,12 +175,15 @@ def _multimem_reduce_scatter_v_kernel(
     rank_token_offset_ptr,
     ep_max_tokens_ptr,
     input_byte_offset,
+    addend_ptr,
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUMEL_PER_THREAD: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     REDUCE_F32: tl.constexpr = False,
+    OUT_BF16: tl.constexpr = False,
+    HAS_ADDEND: tl.constexpr = False,
 ):
     """Variable-count multicast reduce-scatter kernel. One CTA processes one token.
 
@@ -186,11 +205,16 @@ def _multimem_reduce_scatter_v_kernel(
             across all EP ranks. Fixed address; set each step. CTAs with pid >= this value exit
             immediately — safe because the value is identical on all ranks.
         input_byte_offset: byte offset of the input tensor within the symmetric memory buffer.
+        addend_ptr: bf16 [local_tokens, hidden_size] tensor added to the bf16 output when
+            HAS_ADDEND (unused otherwise).
         HIDDEN_SIZE: number of elements per token row (constexpr).
         BLOCK_SIZE: threads per block (constexpr, >= numel_per_token).
-        NUMEL_PER_THREAD: elements per thread per load/store, i.e. 128 / element_bits (constexpr).
+        NUMEL_PER_THREAD: elements per thread per load, i.e. 128 / input element bits (constexpr).
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
+        REDUCE_F32: the symmetric buffer holds fp32 (constexpr).
+        OUT_BF16: round the fp32 sums to a bf16 output (constexpr, requires REDUCE_F32).
+        HAS_ADDEND: add addend_ptr to the bf16 output (constexpr, requires OUT_BF16).
     """
     pid = tl.program_id(axis=0)
 
@@ -245,12 +269,31 @@ def _multimem_reduce_scatter_v_kernel(
                 + input_byte_offset // 8
                 + global_offsets * 2
             )
-            local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-
-            (x, y, z, w) = ld_128(
-                multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32
-            )
-            st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
+            x, y, z, w = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
+            if OUT_BF16:
+                # Four fp32 sums become four bf16 outputs: one 64-bit store per thread.
+                local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets
+                if HAS_ADDEND:
+                    addend = tl.load(
+                        addend_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets,
+                        mask=mask,
+                        other=0,
+                    )
+                    a_lo = addend.to(tl.uint32)
+                    a_hi = (addend >> 32).to(tl.uint32)
+                    ax, ay, az, aw = a_lo & 0xFFFF, a_lo >> 16, a_hi & 0xFFFF, a_hi >> 16
+                else:
+                    ax, ay, az, aw = x, y, z, w
+                lo = _f32_bits_to_bf16_bits(x, ax, HAS_ADDEND) | (
+                    _f32_bits_to_bf16_bits(y, ay, HAS_ADDEND) << 16
+                )
+                hi = _f32_bits_to_bf16_bits(z, az, HAS_ADDEND) | (
+                    _f32_bits_to_bf16_bits(w, aw, HAS_ADDEND) << 16
+                )
+                st_64(local_ptrs, lo, hi, mask=mask, multicast_op=False)
+            else:
+                local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
+                st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
 
 
 def multimem_reduce_scatter_v(
@@ -261,6 +304,7 @@ def multimem_reduce_scatter_v(
     ep_max_tokens: torch.Tensor,
     per_rank_max_tokens: int,
     input_byte_offset: int = 0,
+    addend: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
     """Variable-count multicast reduce-scatter for a single 2-D tensor.
@@ -270,8 +314,13 @@ def multimem_reduce_scatter_v(
     symmetric buffer using multimem.ld_reduce (which atomically sums all ranks'
     contributions), and writes the result to output_tensor.
 
-    Both tensors must be 2-D and 16-byte row-aligned (128-bit path only).
+    Both tensors must be 2-D and the input 16-byte row-aligned (128-bit path only).
     hidden_size is inferred from output_tensor.shape[1].
+
+    A bf16 output_tensor for an fp32 input_tensor receives the fp32 sums rounded
+    as ``Tensor.to(torch.bfloat16)`` rounds them, plus ``addend`` if given, added
+    as a bf16 + bf16 tensor addition does. This is bitwise identical to
+    ``fp32_output.to(torch.bfloat16) + addend`` without the two extra launches.
 
     Args:
         output_tensor: local output, shape [local_tokens, hidden_size].
@@ -287,6 +336,8 @@ def multimem_reduce_scatter_v(
             as min(per_rank_max_tokens, MAX_NUM_BLOCKS).
         input_byte_offset: byte offset of input_tensor within the symmetric memory
             buffer (for packing multiple tensors into one buffer; 0 otherwise).
+        addend: optional contiguous bf16 tensor shaped like output_tensor; requires
+            a bf16 output_tensor and an fp32 input_tensor.
 
     Returns:
         output_tensor populated with this rank's reduced token outputs.
@@ -307,17 +358,27 @@ def multimem_reduce_scatter_v(
         torch.bfloat16,
         torch.float32,
     ), f"Only bfloat16 and float32 are supported, got {output_tensor.dtype}"
-    assert (
-        output_tensor.dtype == input_tensor.dtype
-    ), f"output and input dtype mismatch: {output_tensor.dtype} vs {input_tensor.dtype}"
+    out_bf16 = output_tensor.dtype == torch.bfloat16 and input_tensor.dtype == torch.float32
+    assert out_bf16 or output_tensor.dtype == input_tensor.dtype, (
+        f"output and input dtype mismatch: {output_tensor.dtype} vs {input_tensor.dtype} "
+        "(only an fp32 input may be reduced into a bf16 output)"
+    )
+    if addend is not None:
+        assert out_bf16, "addend requires an fp32 input_tensor and a bf16 output_tensor."
+        assert (
+            addend.dtype == torch.bfloat16
+            and addend.shape == output_tensor.shape
+            and addend.is_contiguous()
+            and addend.device == output_tensor.device
+        ), "addend must be a contiguous bf16 tensor shaped like output_tensor."
 
     hidden_size = output_tensor.shape[1]
     assert (
         input_tensor.shape[1] == hidden_size
     ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
-    row_bytes = hidden_size * output_tensor.element_size()
+    row_bytes = hidden_size * input_tensor.element_size()
     assert row_bytes % 16 == 0, (
-        f"Row size ({hidden_size} elements × {output_tensor.element_size()} bytes) = "
+        f"Row size ({hidden_size} elements × {input_tensor.element_size()} bytes) = "
         f"{row_bytes} bytes is not 16-byte aligned; RSV requires 128-bit alignment."
     )
 
@@ -326,14 +387,14 @@ def multimem_reduce_scatter_v(
     WARP_SIZE = 32
 
     local_tokens = output_tensor.shape[0]
-    numel_per_thread = 128 // (output_tensor.element_size() * 8)
+    numel_per_thread = 128 // (input_tensor.element_size() * 8)
     numel_per_token = (hidden_size + numel_per_thread - 1) // numel_per_thread
 
     block_size = min(triton.next_power_of_2(numel_per_token), MAX_BLOCK_SIZE)
     num_warps = max(1, block_size // WARP_SIZE)
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
 
-    reduce_f32 = output_tensor.dtype == torch.float32
+    reduce_f32 = input_tensor.dtype == torch.float32
     _multimem_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
         output_tensor.data_ptr(),
         symm_mem_hdl.multicast_ptr,
@@ -342,12 +403,15 @@ def multimem_reduce_scatter_v(
         rank_token_offset_ptr=rank_token_offset,
         ep_max_tokens_ptr=ep_max_tokens,
         input_byte_offset=input_byte_offset,
+        addend_ptr=(addend if addend is not None else output_tensor).data_ptr(),
         HIDDEN_SIZE=hidden_size,
         BLOCK_SIZE=block_size,
         NUMEL_PER_THREAD=numel_per_thread,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
         REDUCE_F32=reduce_f32,
+        OUT_BF16=out_bf16,
+        HAS_ADDEND=addend is not None,
         num_warps=num_warps,
     )
 
@@ -369,6 +433,8 @@ def _multimem_all_gatherv_3tensor_kernel(
     local_tokens,
     rank_token_offset_ptr,
     ep_max_tokens_ptr,
+    mask_rows_from_ptr,
+    mask_row_offset,
     HIDDEN_SIZE_0: tl.constexpr,
     HIDDEN_SIZE_1: tl.constexpr,
     HIDDEN_SIZE_2: tl.constexpr,
@@ -381,6 +447,7 @@ def _multimem_all_gatherv_3tensor_kernel(
     BITS_2: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    MASK_ROWS_1: tl.constexpr = False,
 ):
     """Variable-count multicast all-gather for three tensors in a single kernel.
 
@@ -409,12 +476,17 @@ def _multimem_all_gatherv_3tensor_kernel(
             write offset in the global output (prefix sum over lower-ranked EP ranks).
         ep_max_tokens_ptr: pointer to a scalar int32 CUDA tensor holding the maximum
             local_tokens across all EP ranks. CTAs with pid >= this value exit immediately.
+        mask_rows_from_ptr: with MASK_ROWS_1, pointer to a scalar int32 CUDA tensor; local
+            rows r with r + mask_row_offset >= its value gather tensor 1 as all-ones bits
+            (-1 for an integer routing map) instead of their local values.
+        mask_row_offset: row offset added to local rows for that comparison.
         HIDDEN_SIZE_0/1/2: hidden dimension (elements per token row) for each tensor (constexpr).
         BLOCK_SIZE: threads per block — max of the three per-tensor block sizes (constexpr).
         NUMEL_PER_THREAD_0/1/2: elements per thread per load/store for each tensor (constexpr).
         BITS_0/1/2: load/store width in bits (128 or 64) for each tensor (constexpr).
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
+        MASK_ROWS_1: apply the row mask above to tensor 1 (constexpr).
     """
     pid = tl.program_id(axis=0)
 
@@ -424,6 +496,8 @@ def _multimem_all_gatherv_3tensor_kernel(
 
     tid = tl.arange(0, BLOCK_SIZE)
     rank_token_offset = tl.load(rank_token_offset_ptr)
+    if MASK_ROWS_1:
+        mask_rows_from = tl.load(mask_rows_from_ptr).to(tl.int32)
 
     numel_per_token_0 = tl.cdiv(HIDDEN_SIZE_0, NUMEL_PER_THREAD_0)
     numel_per_token_1 = tl.cdiv(HIDDEN_SIZE_1, NUMEL_PER_THREAD_1)
@@ -452,7 +526,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr_0.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 multicast_ptrs = (
@@ -461,10 +535,15 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr_0.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
         # --- Tensor 1 ---
+        # Masked rows gather as all-ones bits: OR every 32-bit word with 0xFFFFFFFF.
+        fill_1 = tl.zeros([BLOCK_SIZE], dtype=tl.uint32)
+        if MASK_ROWS_1:
+            if token_offset + mask_row_offset >= mask_rows_from:
+                fill_1 = ~fill_1
         for channel_offset in range(0, numel_per_token_1, BLOCK_SIZE):
             local_offsets = token_offset * numel_per_token_1 + channel_offset + tid
             token_mask = local_offsets < local_numel_1
@@ -477,7 +556,9 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                if MASK_ROWS_1:
+                    x, y, z, w = x | fill_1, y | fill_1, z | fill_1, w | fill_1
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 multicast_ptrs = (
@@ -486,7 +567,9 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
+                if MASK_ROWS_1:
+                    x, y = x | fill_1, y | fill_1
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
         # --- Tensor 2 ---
@@ -502,7 +585,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr_2.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 multicast_ptrs = (
@@ -511,7 +594,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr_2.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
     sync_threads()
@@ -644,6 +727,8 @@ def multimem_all_gatherv_3tensor(
     output_byte_offset_0: int = 0,
     output_byte_offset_1: int = 0,
     output_byte_offset_2: int = 0,
+    mask_rows_from: Optional[torch.Tensor] = None,
+    mask_row_offset: int = 0,
     **kwargs,
 ) -> tuple:
     """Variable-count multicast all-gather for three tensors in a single kernel launch.
@@ -677,6 +762,11 @@ def multimem_all_gatherv_3tensor(
             min(per_rank_max_tokens, MAX_NUM_BLOCKS).
         output_byte_offset_0/1/2: byte offset of each tensor within its symmetric memory
             buffer (for packing multiple tensors into one buffer; 0 otherwise).
+        mask_rows_from: optional scalar int32 CUDA tensor. Local rows r of tensor 1 with
+            r + mask_row_offset >= mask_rows_from[0] are gathered as all-ones bits (-1
+            for an integer routing map), as if they had been filled with -1 before the
+            gather. Read on device, so the boundary may change between graph replays.
+        mask_row_offset: row offset added to local rows for that comparison.
 
     Returns:
         Tuple of (output_tensor_0, output_tensor_1, output_tensor_2) with all ranks'
@@ -714,6 +804,12 @@ def multimem_all_gatherv_3tensor(
     assert (
         symm_mem_hdl_0.world_size == symm_mem_hdl_1.world_size == symm_mem_hdl_2.world_size
     ), "All three symmetric memory handles must belong to the same EP group (world_size mismatch)."
+    if mask_rows_from is not None:
+        assert (
+            mask_rows_from.numel() == 1
+            and mask_rows_from.dtype == torch.int32
+            and mask_rows_from.is_cuda
+        ), "mask_rows_from must be a scalar int32 CUDA tensor."
 
     MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", 128)
     MAX_BLOCK_SIZE = 1024
@@ -758,6 +854,8 @@ def multimem_all_gatherv_3tensor(
         local_tokens=local_tokens,
         rank_token_offset_ptr=rank_token_offset,
         ep_max_tokens_ptr=ep_max_tokens,
+        mask_rows_from_ptr=mask_rows_from if mask_rows_from is not None else rank_token_offset,
+        mask_row_offset=mask_row_offset,
         HIDDEN_SIZE_0=hidden_size_0,
         HIDDEN_SIZE_1=hidden_size_1,
         HIDDEN_SIZE_2=hidden_size_2,
@@ -770,6 +868,7 @@ def multimem_all_gatherv_3tensor(
         BITS_2=bits_2,
         RANK=symm_mem_hdl_0.rank,
         WORLD_SIZE=symm_mem_hdl_0.world_size,
+        MASK_ROWS_1=mask_rows_from is not None,
         num_warps=num_warps,
     )
 
