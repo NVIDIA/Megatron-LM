@@ -365,6 +365,178 @@ class TestNCCLAllGatherDispatcher:
         expected = (global_hidden[offset : offset + local_tokens].float() * ep_size).bfloat16()
         torch.testing.assert_close(combined, expected)
 
+    @pytest.mark.parametrize("use_allgather_v", [False, True])
+    @pytest.mark.parametrize("grad_input", ["hidden", "probs"])
+    def test_dispatch_protocol_with_rank_local_gradients(
+        self, use_allgather_v, grad_input, monkeypatch
+    ):
+        """Detached ranks must issue the same collectives as ranks requiring gradients."""
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if Utils.world_size < 2:
+            pytest.skip("Rank-local gradient flags require EP > 1.")
+        dispatcher = self._make_dispatcher()
+        ep_size, rank = dispatcher.ep_size, torch.distributed.get_rank()
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", use_allgather_v)
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_local_tokens_per_rank", [4] * ep_size)
+        dispatcher._runs_metadata_sync = False
+        hidden = torch.full(
+            (4, NANOV3_BASE["hidden_size"]), rank, device="cuda", dtype=torch.bfloat16
+        )
+        probs = torch.full(
+            (4, NANOV3_BASE["moe_router_topk"]), rank, device="cuda", dtype=torch.float32
+        )
+        routing = torch.full_like(probs, rank, dtype=torch.int64)
+        (hidden if grad_input == "hidden" else probs).requires_grad_(bool(rank % 2))
+        calls = []
+
+        def gather_local(tensor, **kwargs):
+            calls.append(tensor.dtype)
+            return tensor.repeat(ep_size, 1)
+
+        def gather_into_local(output, tensor, **kwargs):
+            output.copy_(gather_local(tensor))
+
+        # Inspect every rank's protocol before issuing real collectives. This makes
+        # a regression fail with an assertion instead of hanging mismatched NCCL calls.
+        with torch.enable_grad():
+            with monkeypatch.context() as patch:
+                patch.setattr(torch.distributed, "all_gather_into_tensor", gather_into_local)
+                patch.setattr(
+                    "megatron.core.transformer.moe.token_dispatcher_inference."
+                    "gather_from_sequence_parallel_region",
+                    gather_local,
+                )
+                dispatcher.routing_map = routing
+                dispatcher.token_dispatch(hidden, probs)
+            protocols = [None] * ep_size
+            torch.distributed.all_gather_object(protocols, calls, group=dispatcher.ep_group)
+            expected = [torch.bfloat16, torch.float32, torch.int64]
+            if not use_allgather_v:
+                expected.reverse()
+            assert all(protocol == expected for protocol in protocols), protocols
+
+            dispatcher.routing_map = routing
+            gathered_hidden, gathered_probs = dispatcher.token_dispatch(hidden, probs)
+        for gathered in (gathered_hidden, gathered_probs, dispatcher.routing_map):
+            expected_rows = torch.arange(ep_size, device="cuda", dtype=gathered.dtype)
+            expected_rows = expected_rows.repeat_interleave(4)[:, None].expand_as(gathered)
+            torch.testing.assert_close(gathered, expected_rows, atol=0, rtol=0)
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(128, 6, 8), (2688, 6, 128), (1024, 22, 512), (2048, 22, 512), (128, 3, 8)],
+        ids=["small", "nano", "super", "ultra", "unaligned"],
+    )
+    @pytest.mark.parametrize("mode", ["equal", "ragged", "zero_rank", "empty", "graph"])
+    @pytest.mark.parametrize("bi_enabled", [False, True])
+    def test_dispatch_packed_gather_matches_reference(self, shape, mode, bi_enabled, monkeypatch):
+        """Gather bytes exactly, with one data collective only on eligible ordinary paths."""
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if Utils.world_size < 2:
+            pytest.skip("Packed dispatch requires EP > 1.")
+        hidden_size, topk, experts = shape
+        dispatcher = self._make_dispatcher(
+            hidden_size=hidden_size, moe_router_topk=topk, num_moe_experts=experts
+        )
+        world, rank = dispatcher.ep_size, torch.distributed.get_rank()
+        variable = mode in ("ragged", "zero_rank", "empty")
+        counts = [r + 1 for r in range(world)] if variable else [3] * world
+        if mode == "zero_rank":
+            counts[0] = 0
+        if mode == "empty":
+            counts = [0] * world
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", variable)
+        total, start, local = sum(counts), sum(counts[:rank]), counts[rank]
+        reference = (
+            torch.randn(total, hidden_size, device="cuda", dtype=torch.bfloat16),
+            torch.randn(total, topk, device="cuda"),
+            torch.randint(-1, experts, (total, topk), device="cuda"),
+        )
+        for tensor in reference:
+            torch.distributed.broadcast(tensor, src=0)
+        packed = not bi_enabled and topk != 3
+        # Exercise strided inputs on the packed path; preserve the reference
+        # variable-count path's requirement for contiguous collective inputs.
+        inputs = []
+        for tensor in reference:
+            storage = tensor.new_empty(local, tensor.shape[1] * 2)
+            view = storage[:, ::2]
+            view.copy_(tensor[start : start + local])
+            inputs.append(view if packed else view.contiguous())
+
+        calls = []
+        gather = torch.distributed.all_gather_into_tensor
+
+        def checked_gather(output, tensor, *args, **kwargs):
+            calls.append(tensor.dtype)
+            return gather(output, tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", checked_gather)
+        # The reference gather retains an import-time alias of this collective.
+        monkeypatch.setattr(
+            "megatron.core.tensor_parallel.mappings.dist_all_gather_func", checked_gather
+        )
+
+        def run():
+            dispatcher.routing_map = inputs[2]
+            hidden, probs = dispatcher.token_dispatch(inputs[0], inputs[1])
+            return hidden, probs, dispatcher.routing_map
+
+        def check(outputs):
+            for actual, expected in zip(outputs, reference):
+                assert actual.dtype == expected.dtype and actual.is_contiguous()
+                assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+        expected_calls = [torch.uint8] if packed else [torch.bfloat16, torch.float32, torch.int64]
+        if not packed and not variable:
+            expected_calls.reverse()
+        if variable:
+            expected_calls.insert(0, torch.int32)
+        with torch.no_grad(), set_batch_invariant_mode(bi_enabled):
+            check(run())
+            assert calls == expected_calls
+            if mode == "graph":
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    for _ in range(3):
+                        run()
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    outputs = run()
+                for _ in range(3):
+                    for tensor, source in zip(inputs, reference):
+                        source.neg_()
+                        tensor.copy_(source[start : start + local])
+                    graph.replay()
+                    check(outputs)
+
+    def test_dispatch_keeps_autograd_with_gradients(self, monkeypatch):
+        """With gradients enabled, the gathers stay differentiable (no packed raw collective)."""
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if Utils.world_size == 1:
+            pytest.skip("The packed all-gather requires EP > 1.")
+        dispatcher = self._make_dispatcher()
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", False)
+        hidden_size, topk = NANOV3_BASE["hidden_size"], NANOV3_BASE["moe_router_topk"]
+        hidden = torch.randn(
+            4, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        probs = torch.rand(4, topk, device="cuda")
+        dispatcher.routing_map = torch.zeros(4, topk, device="cuda", dtype=torch.int64)
+        d_hidden, _ = dispatcher.token_dispatch(hidden, probs)
+        assert d_hidden.requires_grad
+        d_hidden.float().sum().backward()
+        expected = torch.full_like(hidden, dispatcher.ep_size)
+        torch.testing.assert_close(hidden.grad, expected, atol=0, rtol=0)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # NVLSAllGatherVDispatcher
