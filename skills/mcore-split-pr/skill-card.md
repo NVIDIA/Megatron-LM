@@ -19,7 +19,7 @@ Risk: Review before execution as proposals could introduce incorrect or misleadi
 Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
-- [SKILL.md](skills/mcore-split-pr/SKILL.md) <br>
+- [SKILL.md](./SKILL.md) <br>
 - [Megatron-LM Repository](https://github.com/NVIDIA/Megatron-LM) <br>
 
 
