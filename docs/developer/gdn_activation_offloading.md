@@ -66,16 +66,31 @@ python -m torch.distributed.run --standalone --nproc-per-node=1 \
   --output /tmp/gdn-benchmark.json
 ```
 
+Add `--variant gdn2` to profile or benchmark the GDN2 recurrence. These stack
+benchmarks exclude vocabulary loss and optimizer updates.
+
 The reduced-model test trains complete GDN/attention decoder blocks, embeddings,
 MLPs and vocabulary loss with the native schedules and BF16 Adam. Four ranks
-cover DP, TP, TP+SP, CP, PP, PP+VPP, TP+SP+CP and TP+SP+PP, with both fusion
-variants, both norm-recomputation settings and fractions 0/0.5/1:
+cover DP, TP, TP+SP, CP, PP, PP+VPP, TP+SP+CP and TP+SP+PP, with GDN's two fusion
+settings and unfused GDN2, both norm-recomputation settings and fractions 0/0.5/1:
 
 ```bash
 python -m torch.distributed.run --standalone --nproc-per-node=4 \
   --log-dir /tmp/gdn-training-ranks --redirects 3 --tee 3 \
   -m pytest -q tests/unit_tests/ssm/test_gdn_offload_training.py
 ```
+
+The TE graph test captures attention or whole layers after three native optimizer
+steps, verifies that graphs were created, then compares three replay steps with
+offloading disabled and enabled. It covers GDN/GDN2, norm recomputation and
+delayed offload on single-stage DP, TP2+SP and PP2 configurations:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  -m pytest -q tests/unit_tests/ssm/test_gdn_offload_cuda_graphs.py
+```
+
+For a one-GPU check, use `--nproc-per-node=1` and select `-k tp1`.
 
 The optional Qwen tool imports local Hugging Face Qwen3.5-0.8B weights through
 Megatron Bridge and trains all 24 text decoder blocks. Vision and MTP are excluded.

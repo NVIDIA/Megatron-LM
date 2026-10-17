@@ -36,7 +36,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-@pytest.mark.parametrize("tp", [1, 2], ids=["tp1", "tp2-sp"])
+@pytest.mark.parametrize("tp,pp", [(1, 1), (2, 1), (1, 2)], ids=["tp1", "tp2-sp", "pp2"])
 @pytest.mark.parametrize(
     "variant,fused,recompute_norm,whole_layer,delay",
     [
@@ -55,24 +55,25 @@ def test_gdn_offload_with_te_graphs(
     whole_layer: bool,
     delay: bool,
     tp: int,
+    pp: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Compare complete optimizer states after captured backward on changing inputs."""
-    if Utils.world_size < tp:
-        pytest.skip("Requires two GPUs for tensor and sequence parallelism.")
+    if Utils.world_size % (tp * pp):
+        pytest.skip("This topology requires two GPUs.")
     if variant == "gdn2":
         pytest.importorskip("fla.ops.gdn2")
     if fused:
         pytest.importorskip("causal_conv1d", minversion="1.6.1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-    Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+    Utils.initialize_model_parallel(tp, pp)
     initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
     init_num_microbatches_calculator(
         rank=torch.distributed.get_rank(),
-        global_batch_size=4 * (Utils.world_size // tp),
+        global_batch_size=4 * (Utils.world_size // (tp * pp)),
         micro_batch_size=1,
-        data_parallel_size=Utils.world_size // tp,
+        data_parallel_size=Utils.world_size // (tp * pp),
         decrease_batch_size_if_needed=False,
     )
     helper = None
@@ -86,7 +87,7 @@ def test_gdn_offload_with_te_graphs(
                     tp,
                     tp > 1,
                     1,
-                    1,
+                    pp,
                     None,
                     1.0,
                     recompute_norm,
@@ -118,7 +119,7 @@ def test_gdn_offload_with_te_graphs(
                 pool_checks.append(in_use)
 
             config.finalize_model_grads_func = partial(finalize, pg_collection=groups)
-            schedule = get_forward_backward_func(pp_size=1, vp_size=None)
+            schedule = get_forward_backward_func(pp_size=pp, vp_size=None)
             generator = torch.Generator().manual_seed(19 + groups.dp.rank())
             states = []
             for step in range(6):

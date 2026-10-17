@@ -53,9 +53,10 @@ replay-owned forward so that replay and offloading do not release the same activ
 
 Use `--fine-grained-activation-offloading --offload-modules gdn_core_attn` with BF16
 GDN (`--experimental-attention-variant gdn`, including the legacy `gated_delta_net`
-alias), or `--experimental-attention-variant gdn2`. This scope captures tensors saved by FLA's recurrence, including
-Q/K/V and its internal WY representation. It commits the transfer on the recurrence
-output, before the gated output norm, and reloads before recurrence backward.
+alias), or `--experimental-attention-variant gdn2`. This scope captures tensors saved
+by FLA's recurrence, including Q/K/V and its internal WY representation. It commits
+the transfer on the recurrence output, before the gated output norm, and reloads
+before recurrence backward.
 
 Megatron's training CLI requires `NVTE_CPU_OFFLOAD_V1=1` with Transformer Engine
 2.10 or newer. Set it before starting the training process.
