@@ -1077,6 +1077,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
+    moe_combine_reduce_in_activation_dtype: bool = False
+    """With the alltoall token dispatcher and an expert tensor parallel size of exactly 2, run
+    the expert-TP Reduce-Scatter in the token combine in the activation dtype (e.g. bf16) instead
+    of upcasting to the router probs dtype. With two ranks the reduction is one addition, which
+    NCCL's Ring and PAT kernels accumulate in FP32 and round once, so the result is bit-identical
+    to the FP32 path while sending half the bytes and skipping the FP32 copy of every
+    token-expert row. Ignored for other expert-TP sizes and when ``NCCL_ALGO`` asks for NVLS."""
+
     moe_router_fusion: bool = False
     """Enable fusion for MoE TopK routing and aux-loss computation. This is only
     supported in TransformerEngine 2.7.0 and above.
