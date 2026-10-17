@@ -2,9 +2,10 @@
 
 """Bit-exact replay of the local (non-TE) tensor-parallel layers and the apex CUDA extensions.
 
-* ``VocabParallelEmbedding``: the deterministic branch (``weight[ids]``) and the default
-  ``F.embedding`` path, with heavily duplicated ids so the backward accumulates thousands of
-  rows into the same embedding row.
+* ``VocabParallelEmbedding``: the deterministic branch (``weight[ids]`` until torch 2.16)
+  and the default ``F.embedding`` path. 32,768 indices hit the sort-based backward;
+  2,048 indices hit ``embedding_backward_feature_kernel``. Ids are heavily duplicated
+  so the backward accumulates many rows into the same embedding row.
 * ``vocab_parallel_cross_entropy``: the unfused path deterministic mode relies on.
 * ``ColumnParallelLinear`` / ``RowParallelLinear``: cuBLAS GEMMs under the pinned workspace,
   with and without apex ``fused_weight_gradient_mlp_cuda`` gradient-accumulation fusion.
@@ -73,22 +74,31 @@ class TestTensorParallelLayers:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
-        "deterministic_branch", [True, False], ids=["weight_index", "F.embedding"]
+        "deterministic_branch", [True, False], ids=["deterministic_mode", "default"]
     )
-    def test_vocab_parallel_embedding_backward_replays(self, deterministic_branch):
-        """64 distinct ids over 32k positions: ~500 duplicate rows accumulate per embedding row."""
+    @pytest.mark.parametrize(
+        "index_shape",
+        [(8, 4096), (2, 1024)],
+        ids=["32768_indices", "2048_indices"],
+    )
+    def test_vocab_parallel_embedding_backward_replays(self, deterministic_branch, index_shape):
+        """64 distinct ids. 32768 indices use the sort kernel; 2048 use the feature kernel."""
         seeded()
         config = _config(deterministic_mode=deterministic_branch)
         module = VocabParallelEmbedding(
             8192, 1024, init_method=init_method_normal(0.02), config=config
         ).cuda()
-        ids = torch.randint(0, 64, (8, 4096), device="cuda") * 100
+        # 2048 is inside the 2017..3072 CUDA window of embedding_backward_feature_kernel.
+        ids = torch.randint(0, 64, index_shape, device="cuda") * 100
         with deterministic_algorithms(deterministic_branch):
             assert_module_replays_bit_exact(
                 module,
                 (ids,),
                 replays=4,
-                what=f"VocabParallelEmbedding[det={deterministic_branch}]",
+                what=(
+                    f"VocabParallelEmbedding[det={deterministic_branch}, "
+                    f"indices={index_shape[0] * index_shape[1]}]"
+                ),
             )
 
     @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
