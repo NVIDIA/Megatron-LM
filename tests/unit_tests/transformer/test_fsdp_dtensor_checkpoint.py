@@ -1378,3 +1378,16 @@ class TestMCoreDataGuard:
         m = FakeMetadata()
         assert hasattr(m, "mcore_data")
         assert "key" in m.mcore_data
+
+
+@pytest.mark.parametrize(
+    "key, expected",
+    [
+        ("decoder.layers.2.routed_experts.linear_fc1.weight3", 3),
+        ("decoder.layers.2.routed_experts.linear_fc2.weight12", 12),
+        ("decoder.layers.2.routed_experts.local_experts.5.linear_fc1.weight", 5),
+    ],
+)
+def test_shortcut_owned_expert_indices(key, expected):
+    """Moving experts to the shortcut owner must preserve expert-index parsing."""
+    assert get_expert_index_from_key(key) == expected

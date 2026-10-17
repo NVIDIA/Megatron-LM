@@ -54,6 +54,14 @@ class _FakeCompute(torch.nn.Module, TwoStageAttentionLayer):
         self.is_first_layer = True
         self.is_last_layer = False
         self.supports_two_stage = supports_two_stage
+        if config.wide_residual is not None:
+            self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnection(
+                config, self.layer_number, "test", operation="read"
+            )
+            self.input_layernorm = torch.nn.Identity()
+            self.residual_write_self_attn = StreamwiseSigmoidWideResidualConnection(
+                config, 1, "self_attention", operation="write"
+            )
 
     def supports_two_stage_attention(self) -> bool:
         return self.supports_two_stage
@@ -69,6 +77,7 @@ class _FakeMLP(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.tp_group = None
+        self.experts = torch.nn.Identity()
 
 
 class _FakeNorm:
@@ -178,11 +187,8 @@ def test_wide_shortcut_owns_independent_registered_read():
 
     state_keys = set(block.state_dict())
     assert "shortcut_residual_read.read_map.logit" in state_keys
-    assert "moe_layer.residual_read_mlp.read_map.logit" in state_keys
-    assert (
-        block.shortcut_residual_read.read_map.logit
-        is not block.moe_layer.residual_read_mlp.read_map.logit
-    )
+    assert "moe_residual_read.read_map.logit" in state_keys
+    assert block.shortcut_residual_read.read_map.logit is not block.moe_residual_read.read_map.logit
 
     wide_hidden = torch.randn(
         5, 3 * config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
@@ -552,6 +558,7 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.route_scale = torch.nn.Parameter(torch.tensor(13.0))
             self.prob_scale = torch.nn.Parameter(torch.tensor(17.0))
             self.shared_scale = torch.nn.Parameter(torch.tensor(19.0))
+            self.pre_mlp_layernorm = torch.nn.Identity()
             self.mlp = FakeMLP()
 
         def shortcut_route_preprocess(
