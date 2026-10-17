@@ -362,15 +362,25 @@ def masked_softmax(
     if logits.shape != valid_mask.shape:
         raise ValueError("logits and valid_mask must have the same shape")
 
-    masked_logits = logits.masked_fill(~valid_mask, torch.finfo(logits.dtype).min)
+    invalid_mask = ~valid_mask
+    masked_logits = logits.masked_fill(invalid_mask, torch.finfo(logits.dtype).min)
     row_has_valid = valid_mask.any(dim=dim, keepdim=True)
     row_max = masked_logits.max(dim=dim, keepdim=True).values
     row_max = torch.where(row_has_valid, row_max, torch.zeros_like(row_max))
 
-    probs = torch.exp(masked_logits - row_max)
-    probs = probs.masked_fill(~valid_mask, 0.0)
-    probs = probs / probs.sum(dim=dim, keepdim=True).clamp_min(eps)
-    return probs.masked_fill(~valid_mask, 0.0)
+    # Reuse our private logits buffer. Mask before exp so its saved output already
+    # contains zeros at invalid positions and needs no subsequent masked copies.
+    masked_logits.sub_(row_max)
+    masked_logits.masked_fill_(invalid_mask, float("-inf"))
+    probs = masked_logits.exp_()
+    normalizer = probs.sum(dim=dim, keepdim=True).clamp_min(eps)
+    # Division backward needs the unnormalized probabilities. Without autograd
+    # (including full-recompute forwards), normalization can reuse that buffer too.
+    if probs.requires_grad:
+        probs = probs / normalizer
+    else:
+        probs.div_(normalizer)
+    return probs.masked_fill_(invalid_mask, 0.0)
 
 
 def masked_log_softmax(
