@@ -12,6 +12,7 @@ import torch
 from megatron.core.optimizer import Adam
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
+from megatron.training.utils.common_utils import _get_param_data
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
@@ -139,3 +140,37 @@ def test_fused_adam_step_replays():
         assert len(got) == len(ref)
         for j, (a, b) in enumerate(zip(ref, got)):
             assert bytes_equal(a, b), f"Adam tensor {j} differs on replay {i}"
+
+
+@pytest.mark.parametrize("non_owner_has_main_param", [False, True])
+def test_sharded_param_norm_owner_selection_replays(non_owner_has_main_param):
+    """Stale BF16 replicas must not change a norm sourced from owner FP32 masters."""
+    owner = torch.nn.Parameter(torch.ones(257, device="cuda", dtype=torch.bfloat16))
+    owner.main_param = torch.full((257,), 2.0, device="cuda", dtype=torch.float32)
+    owner.main_param_sharded = True
+    non_owner = torch.nn.Parameter(torch.ones_like(owner))
+    non_owner.main_param_sharded = True
+    if non_owner_has_main_param:
+        non_owner.main_param = None
+
+    reference = None
+    for value in (1.0, 8.0, -16.0, 0.0):
+        with torch.no_grad():
+            owner.fill_(value)
+            non_owner.fill_(-value)
+        with RacingStreams():
+            owner_data, owner_sharded = _get_param_data(owner, False, True)
+            non_owner_data, non_owner_sharded = _get_param_data(non_owner, False, True)
+            assert owner_data is owner.main_param
+            assert owner_sharded and non_owner_sharded
+            assert non_owner_data is None
+            norm = torch.linalg.vector_norm(owner_data)
+        torch.cuda.synchronize()
+        if reference is None:
+            reference = norm.clone()
+        else:
+            assert bytes_equal(reference, norm), "stale model copies changed the owner norm"
+
+    model_data, model_sharded = _get_param_data(non_owner, True, True)
+    assert not model_sharded
+    assert torch.equal(model_data, non_owner.detach().float())
