@@ -39,14 +39,18 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+    get_combined_1f1b_grad_accumulation_count,
+    register_combined_1f1b_hooks,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
-from megatron.core.utils import is_te_min_version, log_single_rank
+from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, log_single_rank
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import (
@@ -688,6 +692,17 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             schedule_policy=schedule_policy,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
+
+        def shard_unit(unit, **kwargs):
+            # Materialization must precede this call so the count uses the final
+            # Parameter identities, before fully_shard replaces them with DTensors.
+            if config.overlap_moe_expert_parallel_comm:
+                model = get_attr_wrapped_model(module, "pre_process", return_model_obj=True)
+                kwargs["grad_accumulation_count"] = get_combined_1f1b_grad_accumulation_count(
+                    unit, model
+                )
+            fully_shard(unit, **kwargs, **common_fully_shard_kwargs)
+
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
@@ -714,12 +729,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     if isinstance(submodule, MoELayer):
                         if config.init_model_with_meta_device:
                             _materialize_owned_meta_modules(submodule.experts, device)
-                        fully_shard(
+                        shard_unit(
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
                             grad_divisor=config.expert_model_parallel_size,
-                            **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -729,17 +743,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
-                    fully_shard(
-                        submodule,
-                        mesh=dp_mesh,
-                        placements=dense_placements,
-                        **common_fully_shard_kwargs,
-                    )
+                    shard_unit(submodule, mesh=dp_mesh, placements=dense_placements)
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
-            fully_shard(
-                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
-            )
+            shard_unit(module, mesh=dp_mesh, placements=dense_placements)
         super().__init__(config=config, module=module)
 
         if config.overlap_moe_expert_parallel_comm:
@@ -906,6 +913,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """Wait on all submitted reductions, including delayed weight gradients."""
         self.module.context.finish_grad_sync()
+
+        for submodule in self.module.modules():
+            if isinstance(submodule, FsdpModule):
+                countdown = submodule._trainable_parameter_countdown
+                if not countdown.is_complete:
+                    raise ValueError(
+                        f"gradient window sealed mid-flight for FSDP module "
+                        f"{submodule.name or '<root>'!r}: expected "
+                        f"{countdown.initial_value} callbacks per window"
+                    )
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

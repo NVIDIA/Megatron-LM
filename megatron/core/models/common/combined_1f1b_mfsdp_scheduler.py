@@ -1,6 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from collections import Counter
+
+from torch import nn
+
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+    FsdpModule,
+    _collect_owned_parameters,
+)
+from megatron.core.utils import get_attr_wrapped_model
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -31,6 +39,14 @@ def _module_post_backward_hook(module: FsdpModule) -> None:
     module._reduce_gradient_groups()
 
 
+def _register_unshard_hooks(module, owner: FsdpModule) -> None:
+    """Install the owning unit's forward and backward unshard hooks."""
+    module.register_forward_pre_hook(
+        _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
+    )
+    module.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
+
+
 def reshard_fsdp_module(module: FsdpModule) -> None:
     """Reshard the FSDP module after fine-grained computation."""
     assert isinstance(module, FsdpModule), "Expected an FsdpModule."
@@ -38,22 +54,173 @@ def reshard_fsdp_module(module: FsdpModule) -> None:
 
 
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
-    """Install the sub-module hooks required by MCore combined 1F1B."""
+    """Install execution hooks for units whose callback counts are set at construction."""
+
+    # Nearest owning FSDP unit per module (first parent wins), recorded by the walk
+    # below: unshard/reshard act on an FSDP *unit*, so a module that consumes another
+    # module's parameter needs the unit owning that parameter, not its own nearest.
+    owners = {}
 
     def register_hooks(submodule, owner):
         if isinstance(submodule, FsdpModule):
             owner = submodule  # BEFORE registering: an FSDP unit owns itself
-        if len(list(submodule.parameters(recurse=False))) > 0:
-            submodule.register_forward_pre_hook(
-                _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
-            )
-            submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
+        owners.setdefault(submodule, owner)
+        if next(submodule.parameters(recurse=False), None) is not None:
+            _register_unshard_hooks(submodule, owner)
         for child in submodule.children():
             register_hooks(child, owner)
 
     assert isinstance(module, FsdpModule), "Owner must be an FsdpModule."
+
+    # This runs once per model chunk, so the declaration derives from that chunk's own
+    # ``pre_process``/``mtp_process``. Those flags live on the inner model: MCore wraps
+    # it in the mixed-precision wrapper before FSDP and ``Float16Module`` defines no
+    # ``__getattr__``, hence the shared unwrapping helper instead of reading them off
+    # the FSDP unit.
+    model = get_attr_wrapped_model(module, "pre_process", return_model_obj=True)
     register_hooks(module, module)
+    _register_borrowed_weight_unshard_hooks(model, owners)
 
     for submodule in module.modules():
-        if isinstance(submodule, FsdpModule):
-            submodule.register_post_backward_hook(_module_post_backward_hook)
+        if not isinstance(submodule, FsdpModule):
+            continue
+        submodule.register_post_backward_hook(_module_post_backward_hook)
+
+
+def _register_borrowed_weight_unshard_hooks(model, owners) -> None:
+    """Unshard the borrowed weight for a tied output projection that owns no parameter.
+
+    ``gpt_model`` builds that projection with
+    ``skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights``
+    and ``bias=False``, so the hook walk skips it and nothing re-unshards the embedding
+    weight before the PostProcessNode backward, the first backward consumer of it. That
+    backward then reads storage the post-forward reshard released:
+    ``RuntimeError: The tensor has a non-zero number of elements, but its data is not
+    allocated yet`` (tensor_parallel/layers.py:760). ``dbuffer.release_storage`` is not
+    at fault -- it keeps the Storage object so a later reallocate restores saved aliases.
+
+    Narrow on purpose: only a tied projection that really owns nothing gets the hooks,
+    so the untied path registers exactly what it registered before.
+    """
+    if not model.share_embeddings_and_output_weights:
+        return
+    output_layer = getattr(model, 'output_layer', None)
+    if output_layer is None or list(output_layer.parameters(recurse=False)):
+        return
+    embedding = getattr(model, 'embedding', None)
+    owner = owners.get(getattr(embedding, 'word_embeddings', None) or embedding)
+    if owner is None:
+        return
+    _register_unshard_hooks(output_layer, owner)
+
+
+def _window_extras(model) -> Counter[int]:
+    """Extra backward contributions per weight for one backward window.
+
+    A parameter accumulates its gradient once per schedule node that consumes it in its
+    own GraphTask, and nearly every parameter has exactly one such node -- the base
+    count of 1 in ``_unit_grad_accumulation_count``. Three groups have more:
+
+      1. The output projection: the ``post_process`` node and the ``mtp_post_process``
+         node (one per MTP layer) each consume it. When the weights are tied it runs
+         against the embedding weight instead of one of its own, so both land there.
+      2. The embedding: one MTP pre-dispatch node per MTP layer consumes it
+         (``_get_embeddings``).
+      3. The second loss node's own weights: the MTP layer's
+         ``enorm``/``hnorm``/``eh_proj``/``final_layernorm`` and the decoder's final
+         layernorm. The last one is easy to miss -- an ordinary decoder parameter, but
+         with MTP it feeds both the main loss and the MTP head.
+
+    Groups 1 and 3 have a second consumer only on the interleaved schedule, where each
+    node's backward runs as its own GraphTask: ``schedules.py:162-169`` selects it
+    exactly when ``pipeline_model_parallel_size > 1``. At PP=1 the two loss nodes share
+    one GraphTask and fire once between them.
+
+    Counts are keyed by weight identity, so aliases add without tensor equality checks.
+    """
+    tied = model.share_embeddings_and_output_weights and (model.pre_process or model.mtp_process)
+    mtp_depth = getattr(model.config, 'mtp_num_layers', None) or 0
+    if mtp_depth and not model.mtp_process:
+        mtp_depth = 0
+    assert mtp_depth in (0, 1), (
+        "overlap_moe_expert_parallel_comm requires mtp_num_layers <= 1 "
+        "(transformer_config.py:3485-3489); per-parameter multiplicity does not "
+        f"model deeper MTP (got {mtp_depth})."
+    )
+    interleaved = model.config.pipeline_model_parallel_size > 1
+
+    embedding_weight = _resolve(model, 'embedding', 'word_embeddings', 'weight')
+    # Group 1 consumes the embedding weight when tied, the projection's own otherwise.
+    projection_weight = embedding_weight if tied else _resolve(model, 'output_layer', 'weight')
+
+    extras = Counter()
+    if tied and embedding_weight is not None:
+        extras[id(embedding_weight)] += 1
+    if mtp_depth and embedding_weight is not None:
+        extras[id(embedding_weight)] += mtp_depth
+    if mtp_depth and interleaved:
+        extras.update(
+            id(weight)
+            for weight in (
+                projection_weight,
+                *_mtp_layer_weights(model),
+                _resolve(model, 'decoder', 'final_layernorm', 'weight'),
+            )
+            if weight is not None
+        )
+    return extras
+
+
+def _resolve(obj, *path):
+    """``getattr`` along ``path``; any missing link resolves to ``None``."""
+    for name in path:
+        obj = getattr(obj, name, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def _mtp_layer_weights(model):
+    """Return the weights ``MultiTokenPredictionLayer`` owns directly.
+
+    Its MTP-specific modules (``enorm``/``hnorm``/``eh_proj``/``final_layernorm``) minus
+    ``mtp_model_layer``, the ordinary transformer layer it borrows: that layer's weights
+    are consumed once per window like every other decoder layer's.
+    """
+    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
+    return tuple(
+        param
+        for submodule in model.modules()
+        if isinstance(submodule, MultiTokenPredictionLayer)
+        for name, child in submodule.named_children()
+        if name != 'mtp_model_layer'
+        for param in child.parameters()
+    )
+
+
+def get_combined_1f1b_grad_accumulation_count(unit: nn.Module, model: nn.Module) -> int:
+    """Declare the unit's callback total after materialization and before sharding.
+
+    Read the model's current parameter identities each time: meta initialization
+    and earlier child-unit sharding may have replaced Parameters since construction
+    began. Counts depend on this model chunk's stage flags and pipeline size.
+    """
+    return _unit_grad_accumulation_count(unit, _window_extras(model))
+
+
+def _unit_grad_accumulation_count(unit: nn.Module, extras: Counter[int]) -> int:
+    """Count unique, trainable parameters owned by the next FSDP unit.
+
+    Already-sharded child units own their own parameters and are excluded, using
+    the same ownership traversal as fully_shard(). Aliases within this unit count
+    once, with additive contributions from every consumer of that weight.
+    """
+    parameters = {
+        id(parameter): parameter for parameter in _collect_owned_parameters(unit).values()
+    }
+    return sum(
+        1 + extras.get(identity, 0)
+        for identity, parameter in parameters.items()
+        if parameter.requires_grad
+    )
