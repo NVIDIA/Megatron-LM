@@ -5037,8 +5037,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return selected_log_probs, log_probs
 
         logits_squeezed = logits_squeezed.float()
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        active_query_lengths_cpu = self.request_query_lengths[active_slice]
         active_query_lengths_gpu = self.gpu_view.request_query_lengths[:n_active]
 
         # Shift away each request's first prompt token, then insert its sampled token.
@@ -5046,23 +5044,32 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         new_token_idx = active_query_lengths_gpu.cumsum(0) - 1
         active_token_ids[new_token_idx] = new_tokens
 
-        log_probs = self._processed_log_probs(
-            logits_squeezed, n_active, active_query_lengths_cpu, sampling
-        )
+        # Prompt rows score tokens the engine did not sample, so they always use the
+        # raw distribution. Sampling settings apply only to engine-sampled rows.
+        log_probs = F.log_softmax(logits_squeezed, dim=-1)
+        num_sampled = 0
+        if self.config.logprobs_mode != "raw_logprobs":
+            # A partial chunk's final row scores its next prompt token. The chunked
+            # prefill request is always the last active request.
+            num_sampled = n_active
+            if self.get_index_of_chunked_prefill_request(safe=True) != -1:
+                num_sampled -= 1
+            if num_sampled > 0:
+                sampled_idx = new_token_idx[:num_sampled]
+                sampled_logits = logits_squeezed[sampled_idx]
+                log_probs[sampled_idx] = self._processed_log_probs(
+                    sampled_logits, n_active, None, sampling, torch.arange(num_sampled)
+                )
         seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
         selected_log_probs = log_probs[seq_idx, active_token_ids]
-        if self.config.logprobs_mode != "raw_logprobs" and not all(
-            self.active_sampling_filter_flags(n_active)
-        ):
-            # Only each request's final row is engine-sampled; prompt rows may keep -inf.
-            temperature = self.gpu_view.temperature[:n_active]
-            scaled = logits_squeezed[new_token_idx] / temperature.clamp(
-                min=MIN_SAMPLING_TEMPERATURE
-            ).unsqueeze(1)
-            gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
+        if num_sampled > 0 and not all(self.active_sampling_filter_flags(n_active)):
+            # Sampled tokens outside the filtered support fall back to the tempered logprob.
+            temperature = self.gpu_view.temperature[:num_sampled]
+            scaled = sampled_logits / temperature.clamp(min=MIN_SAMPLING_TEMPERATURE).unsqueeze(1)
+            gathered = scaled.gather(1, new_tokens[:num_sampled].view(-1, 1).long()).squeeze(1)
             tempered = gathered - scaled.logsumexp(dim=1)
-            sampled = selected_log_probs[new_token_idx]
-            selected_log_probs[new_token_idx] = torch.where(
+            sampled = selected_log_probs[sampled_idx]
+            selected_log_probs[sampled_idx] = torch.where(
                 torch.isfinite(sampled), sampled, tempered
             )
         return selected_log_probs, log_probs
