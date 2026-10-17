@@ -144,17 +144,38 @@ qualify GPU training, and earlier fixed-reduction results do not qualify the
 native fused path. [Historical logs, CSVs and reports](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/cf8df32ec2424bcc6c42a5486d2fe68213c74294/split-20261015/historical)
 retain their original revisions separately.
 
-Historical complete-Qwen, single-A6000 results at sequence 4096 with norm
-recomputation off save 952.00 MiB (3.01%) for unfused pre-GDR and 952.00 MiB
-(3.04%) for fixed fused pre-GDR. Median runtime changes are +1.58% and +5.80%,
-respectively. These are separate offload comparisons, not a controlled comparison
-between fusion variants or old/new gate kernels. Their runtime sources are
-`4e18562c6bcf894795d23378a8f1699c79e4b797` and
-`2f1ee4f2e3dd6d909d08981338f5879632131139`, respectively. Historical package
-versions are PyTorch 2.11.0+cu130, TE 2.20.2, FLA 0.5.1 and causal-conv1d 1.6.1.
+Complete-Qwen measurements at `87c22d1abae13abf375e8ed4ddfe62301cde87f4`
+use one RTX A6000, sequence 4096, four microbatches, fraction 1, the default
+tensor threshold and norm recomputation off. Each fusion setting has three
+fresh-process pairs, three warmup steps and ten timed optimizer steps. Peak
+allocated memory falls by 952 MiB: 3.01% with unfused pre-GDR and 3.04% with
+native fused pre-GDR. Paired median step-time increases are 1.19% (0.87–1.54%)
+and 1.89% (1.35–2.57%), respectively. Input preparation and state snapshots are
+outside the timing boundary. These compare offload on/off within each fusion
+setting; they do not compare the fusion implementations.
+[Raw samples, device telemetry and commands](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/f35f8532de106bcb49c1d9ae7b5dea512567d1e4/current-head-gpu-20261016/performance)
+retain the executed revision and PyTorch/TE/FLA versions.
+
+At `485cb5fa2ffedaaaa0a1a4d095e43ddd99487c1d`, checkpoint comparisons cover
+six continuous steps versus two steps followed by four in a fresh resumed
+process: disabled control and all four offloaded fusion/norm settings on one
+GPU, plus unfused TP2+SP with norm recomputation. Recorded loss, gradients,
+weights and complete optimizer states are byte-identical in these runs.
+A separate 250-step unfused Qwen run at `87c22d1ab`, sequence 2048, has finite
+loss/gradient norms, a stable 72-buffer pinned pool and stable steady-state GPU
+memory; another job overlaps that run, so its timing is not qualified.
+[Checkpoint and stability evidence](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/34371ca51fa2dffb5c362f1c52c89b1801670226/gdn-followup-20261016)
+includes per-rank logs and state comparisons. The production `megatron` tree is
+identical at these two source revisions; the later update adds checkpoint-tool
+support and documentation.
+
+[Historical measurements and their version table](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/f35f8532de106bcb49c1d9ae7b5dea512567d1e4/current-head-gpu-20261016#current-source-performance)
+retain earlier results, including the fixed-reduction fused implementation at
+`2f1ee4f2e` and unfused measurements at `4e18562c6`. Those results do not qualify
+the restored native fused implementation or establish a cross-version speedup.
 
 Pretrained Qwen CP remains unqualified: the recorded disabled baseline cannot
 select an attention backend for head dimension 256 on A6000. This does not qualify
 new environments or other CP configurations. Local results do not replace
-upstream GPU CI. Checkpoint restart and long-run convergence are outside these
-comparisons.
+upstream GPU CI. The checkpoint checks assume the same data, topology and
+configuration. Repeated local data and finite losses do not establish convergence.
