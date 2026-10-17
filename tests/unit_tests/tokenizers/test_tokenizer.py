@@ -1,7 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import json
-from unittest.mock import MagicMock
+import pickle
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -133,6 +137,291 @@ def test_hf_tokenizer():
     assert tokenizer.tokenize("<TEST_BOS><TEST_EOS>") == [128257, 128256]
     assert tokenizer.detokenize([3, 4, 5]) == "$%&"
     assert tokenizer.vocab_size == 128258
+
+
+@pytest.fixture
+def gigatoken_hf_pair(tmp_path: Path) -> tuple[HuggingFaceTokenizer, HuggingFaceTokenizer]:
+    pytest.importorskip('gigatoken')
+    from tokenizers import (  # type: ignore[import-untyped]
+        Tokenizer,
+        decoders,
+        models,
+        pre_tokenizers,
+        processors,
+        trainers,
+    )
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator(
+        ['Invoice 1234567 café 中文 ١٢٣٤٥٦٧ hello assistant user tool'] * 4,
+        trainers.BpeTrainer(
+            vocab_size=320,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            special_tokens=['<pad>', '<eos>', '<extra>'],
+            show_progress=False,
+        ),
+    )
+    backend.post_processor = processors.TemplateProcessing(
+        single='<extra> $A <eos>',
+        special_tokens=[(t, backend.token_to_id(t)) for t in ('<extra>', '<eos>')],
+    )
+    hf = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        pad_token='<pad>',
+        eos_token='<eos>',
+        model_input_names=['input_ids', 'attention_mask'],
+    )
+    hf.add_special_tokens({'additional_special_tokens': ['<extra>']})
+    hf.add_tokens(['<ordinary>'])
+    hf.chat_template = (
+        '{% for m in messages %}{{ m.role }}:{{ m.content }}<eos>{% endfor %}'
+        '{% if add_generation_prompt %}assistant:{% endif %}'
+    )
+    hf.save_pretrained(tmp_path)
+    baseline = HuggingFaceTokenizer(str(tmp_path), include_special_tokens=False)
+    native = HuggingFaceTokenizer(str(tmp_path), include_special_tokens=False, use_gigatoken=True)
+    return baseline, native
+
+
+def test_gigatoken_user_text_and_special_filtering(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+) -> None:
+    hf, native = gigatoken_hf_pair
+    texts = ['Invoice 1234567', 'x<eos>12345<extra>y', '<ordinary> café 中文 ١٢٣٤٥٦٧']
+    with patch.object(
+        native.tokenizer._split_special_tokenizer.tokenizer,
+        'encode',
+        wraps=native.tokenizer._split_special_tokenizer.tokenizer.encode,
+    ) as encode:
+        for include_special_tokens in (False, True):
+            hf.include_special_tokens = native.include_special_tokens = include_special_tokens
+            for text in texts:
+                assert native.text_to_ids(text) == hf.text_to_ids(text)
+                assert (
+                    native.tokenizer(
+                        text,
+                        add_special_tokens=native.include_special_tokens,
+                        split_special_tokens=True,
+                    ).input_ids
+                    == hf.tokenizer(
+                        text,
+                        add_special_tokens=hf.include_special_tokens,
+                        split_special_tokens=True,
+                    ).input_ids
+                )
+                for remove in (False, True):
+                    ids = hf.text_to_ids(text)
+                    assert native.ids_to_text(ids, remove) == hf.ids_to_text(ids, remove)
+        assert encode.call_count > 0
+
+
+@pytest.mark.parametrize(
+    'character',
+    ['\u0295', '\ua7cf', '\u1acf', '\U00011de0', '\U00016ff4', '\U0002b73a', '\U00033479'],
+)
+def test_gigatoken_unicode_fallback(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer], character: str
+) -> None:
+    hf, native = gigatoken_hf_pair
+    with (
+        patch.object(native.tokenizer, '_gigatoken') as encode,
+        patch.object(native.tokenizer, '_split_special_tokenizer') as split_encode,
+    ):
+        for include in (False, True):
+            hf.include_special_tokens = native.include_special_tokens = include
+            for offset in (0, 15, 16, 31, 32, 63, 64):
+                text = 'x' * offset + f'aa{character}bb 12345{character}6789 <extra><ordinary>'
+                assert native.text_to_ids(text) == hf.text_to_ids(text)
+                assert (
+                    native.tokenizer(
+                        text,
+                        add_special_tokens=native.include_special_tokens,
+                        split_special_tokens=True,
+                    ).input_ids
+                    == hf.tokenizer(
+                        text,
+                        add_special_tokens=hf.include_special_tokens,
+                        split_special_tokens=True,
+                    ).input_ids
+                )
+        encode.assert_not_called()
+        split_encode.assert_not_called()
+
+
+@pytest.mark.parametrize('split_special_tokens', [False, True])
+def test_gigatoken_unicode_batch_fallback(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer], split_special_tokens: bool
+) -> None:
+    hf, native = gigatoken_hf_pair
+    batch = ['Invoice 1234567 café 中文', '12345\U00011de06789 <extra><ordinary>']
+    name = '_split_special_tokenizer' if split_special_tokens else '_gigatoken'
+    with patch.object(native.tokenizer, name) as encode:
+        for values in (batch, tuple(batch)):
+            kwargs = dict(add_special_tokens=False, split_special_tokens=split_special_tokens)
+            assert native.tokenizer(values, **kwargs) == hf.tokenizer(values, **kwargs)
+        encode.assert_not_called()
+
+
+def test_gigatoken_unicode_chat_fallback(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+) -> None:
+    hf, native = gigatoken_hf_pair
+    conversation = [{'role': 'user', 'content': 'Invoice 1234567'}]
+    # The rendered template can introduce an affected character absent from messages.
+    template = '\U00011de0' + hf.tokenizer.chat_template
+    with patch.object(native.tokenizer, '_gigatoken') as encode:
+        assert native.apply_chat_template(
+            conversation, chat_template=template, return_dict=False
+        ) == hf.apply_chat_template(conversation, chat_template=template, return_dict=False)
+        encode.assert_not_called()
+
+
+@pytest.mark.parametrize('text', ['Invoice 1234567', 'café e\u0301 中文 ١٢٣٤٥٦٧ １２３４５ 😀'])
+def test_gigatoken_compatible_unicode_stays_native(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer], text: str
+) -> None:
+    hf, native = gigatoken_hf_pair
+    for split in (False, True):
+        name = '_split_special_tokenizer' if split else '_gigatoken'
+        with patch.object(native.tokenizer, name, wraps=getattr(native.tokenizer, name)) as encode:
+            assert native.tokenizer(text, split_special_tokens=split) == hf.tokenizer(
+                text, split_special_tokens=split
+            )
+            encode.assert_called_once()
+
+
+@pytest.mark.parametrize('batched', [False, True])
+@pytest.mark.parametrize('return_dict', [False, True, None])
+@pytest.mark.parametrize('tensor_type', [None, 'np', 'pt'])
+def test_gigatoken_chat_template_parity(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+    batched: bool,
+    return_dict: bool | None,
+    tensor_type: str | None,
+) -> None:
+    hf, native = gigatoken_hf_pair
+    conversation: list[Any] = [{'role': 'user', 'content': 'Invoice 1234567 <extra> café'}]
+    if batched:
+        conversation = [conversation, [{'role': 'user', 'content': '中文 ١٢٣٤٥٦٧'}]]
+    kwargs = {'tokenize': True, 'add_generation_prompt': True, 'return_tensors': tensor_type}
+    if tensor_type:
+        kwargs['padding'] = True
+    if return_dict is not None:
+        kwargs['return_dict'] = return_dict
+    with patch.object(
+        native.tokenizer.tokenizer, 'encode', wraps=native.tokenizer.tokenizer.encode
+    ) as encode:
+        expected = hf.apply_chat_template(conversation, chat_template=None, **kwargs)
+        actual = native.apply_chat_template(conversation, chat_template=None, **kwargs)
+        if not batched and tensor_type is None:
+            assert encode.call_count > 0
+    if hasattr(expected, 'keys'):
+        assert type(actual) is type(expected)
+        assert actual.keys() == expected.keys()
+        if tensor_type == 'pt':
+            assert actual.to('cpu') is actual
+        for key in expected:
+            if tensor_type:
+                assert actual[key].dtype == expected[key].dtype
+                assert np.array_equal(actual[key], expected[key])
+            else:
+                assert actual[key] == expected[key]
+    elif tensor_type:
+        assert actual.dtype == expected.dtype
+        assert np.array_equal(actual, expected)
+    else:
+        assert actual == expected
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('truncation', [False, True])
+def test_gigatoken_chat_padding_and_truncation(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+    side: str,
+    truncation: bool,
+) -> None:
+    hf, native = gigatoken_hf_pair
+    for tokenizer in (hf.tokenizer, native.tokenizer):
+        tokenizer.padding_side = tokenizer.truncation_side = side
+    messages = [[{'role': 'user', 'content': text}] for text in ('hello', 'Invoice 1234567 café')]
+    kwargs = dict(return_dict=True, padding='max_length', truncation=truncation, max_length=32)
+    assert native.apply_chat_template(
+        messages, chat_template=None, **kwargs
+    ) == hf.apply_chat_template(messages, chat_template=None, **kwargs)
+
+
+def test_gigatoken_chat_rendering_and_assistant_masks(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+) -> None:
+    hf, native = gigatoken_hf_pair
+    conversation = [
+        {'role': 'user', 'content': 'Invoice 1234567'},
+        {'role': 'assistant', 'content': 'café 中文'},
+    ]
+    template = (
+        '{% for m in messages %}{{ m.role }}:'
+        '{% if m.role == "assistant" %}{% generation %}{{ m.content }}{% endgeneration %}'
+        '{% else %}{{ m.content }}{% endif %}<eos>{% endfor %}'
+    )
+    cases: list[dict[str, Any]] = [
+        {'tokenize': False},
+        {'tokenize': True, 'return_dict': False, 'continue_final_message': True},
+        {'tokenize': True, 'return_dict': True, 'return_assistant_tokens_mask': True},
+        {
+            'tokenize': True,
+            'return_dict': True,
+            'tokenizer_kwargs': {'return_offsets_mapping': True},
+        },
+    ]
+    for kwargs in cases:
+        assert native.apply_chat_template(
+            conversation, chat_template=template, **kwargs
+        ) == hf.apply_chat_template(conversation, chat_template=template, **kwargs)
+
+
+def test_gigatoken_serving_worker_serialization(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+) -> None:
+    hf, native = gigatoken_hf_pair
+    text = 'Invoice 1234567 <extra> café'
+    native.tokenizer(
+        text, add_special_tokens=native.include_special_tokens, split_special_tokens=True
+    ).input_ids  # Populate the ordinary-text cache before transfer.
+    native.tokenizer.padding_side = 'left'
+    restored = pickle.loads(pickle.dumps(native))
+    assert restored.tokenizer.padding_side == 'left'
+    assert restored.text_to_ids(text) == hf.text_to_ids(text)
+    assert (
+        restored.tokenizer(
+            text, add_special_tokens=restored.include_special_tokens, split_special_tokens=True
+        ).input_ids
+        == hf.tokenizer(
+            text, add_special_tokens=hf.include_special_tokens, split_special_tokens=True
+        ).input_ids
+    )
+    messages = [{'role': 'user', 'content': text}]
+    assert restored.apply_chat_template(
+        messages, chat_template=None, return_dict=False
+    ) == hf.apply_chat_template(messages, chat_template=None, return_dict=False)
+
+
+def test_gigatoken_streaming_preserves_hf_interface(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
+) -> None:
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
+        HuggingFaceFastIncrementalDetokenizer,
+    )
+
+    hf, native = gigatoken_hf_pair
+    original = HuggingFaceFastIncrementalDetokenizer(SimpleNamespace(_tokenizer=hf), [])
+    fast = HuggingFaceFastIncrementalDetokenizer(SimpleNamespace(_tokenizer=native), [])
+    ids = hf.text_to_ids('Invoice 1234567 café 中文 <extra>')
+    for token in ids:
+        assert fast.update([token]) == original.update([token])
+    assert fast.text == original.text
 
 
 # Uses same local path as test_hf_tokenizer; tests EOS stripping vs keeping in detokenized output (e.g. RL).
