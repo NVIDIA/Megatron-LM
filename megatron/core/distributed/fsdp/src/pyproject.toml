@@ -21,6 +21,7 @@ description = "**Megatron-FSDP** is an NVIDIA-developed PyTorch extension that p
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
 dependencies = ["torch", "einops", "packaging"]
+
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -56,6 +57,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Topic :: Utilities",
 ]
+
+[project.optional-dependencies]
+emerging-optimizers = ["emerging-optimizers>=0.2"]
 
 [project.urls]
 Download = "https://github.com/NVIDIA/Megatron-LM/releases"
