@@ -674,6 +674,17 @@ def get_gpt_decoder_layer_specs(
             enable_hyper_connection=config.enable_hyper_connections,
         )
 
+    if config.mla_latent_cp:
+        # Experimental latent-KV context parallelism: same projections, own core attention.
+        from megatron.core.transformer.experimental_attention_variant.mla_latent_cp import (
+            apply_mla_latent_cp_spec,
+        )
+
+        for layer_spec in (dense_layer_spec, moe_layer_spec):
+            layer_spec.submodules.self_attention = apply_mla_latent_cp_spec(
+                layer_spec.submodules.self_attention
+            )
+
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
     # 0 stands for dense layers, 1 stands for expert layers.
     # For integer N: Creates a pattern with one expert layer every N layers.
