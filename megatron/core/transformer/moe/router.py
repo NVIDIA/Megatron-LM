@@ -937,16 +937,17 @@ class TopKRouter(Router):
                 topk_indices=topk_indices,
             )
 
-        # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
-        # rows before dispatch. Other dispatchers retain their existing fixed-route
-        # assumptions until they support sparse routing maps end to end.
-        use_dropless_hybridep = (
+        # HybridEP consumes the sparse routing map directly, including with a static
+        # expert-rank budget, so exclude padding rows before dispatch: otherwise padding
+        # counts against that budget and can push a rank over it, which costs a dropless
+        # rerun of the step. Per-expert drop-and-pad and other dispatchers retain their
+        # existing fixed-route assumptions.
+        use_sparse_hybridep = (
             self.config.moe_token_dispatcher_type == "flex"
             and self.config.moe_flex_dispatcher_backend == "hybridep"
             and self.config.moe_expert_capacity_factor is None
-            and self.config.moe_expert_rank_capacity_factor is None
         )
-        if padding_mask is not None and use_dropless_hybridep:
+        if padding_mask is not None and use_sparse_hybridep:
             valid_tokens = (~padding_mask).unsqueeze(-1)
             probs = probs * valid_tokens
             if routing_map.dtype == torch.bool:
