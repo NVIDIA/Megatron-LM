@@ -67,6 +67,9 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
         copy_parameter_attributes,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+        sync_model_weights_from_main_weights,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         all_sharding_strategies_in,
         any_sharding_strategy_in,
@@ -744,6 +747,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if config.overlap_moe_expert_parallel_comm:
             register_combined_1f1b_hooks(self.module)
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Load main weights and refresh the buffers used for forward compute."""
+        super().load_state_dict(state_dict, strict=strict)
+        # DCP writes into FP32 main-weight DTensors. BF16 and quantized compute
+        # buffers have separate storage and must be refreshed before the first
+        # resumed forward, just as they are after every optimizer step.
+        sync_model_weights_from_main_weights(self.module.parameters())
 
     @staticmethod
     def _validate_config(

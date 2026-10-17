@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""DCP save/load roundtrip tests for the experimental Megatron-FSDP path."""
+"""DCP save/load roundtrip tests for Megatron-FSDP v2.
+
+Covers the standalone checkpoint helpers and MCore expert-parallel save/load by
+comparing resumed losses with uninterrupted training.
+"""
 
 import math
 from pathlib import Path
@@ -15,6 +19,8 @@ from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_op
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
@@ -29,7 +35,19 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtenso
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
 )
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
+    run_forward_backward_on_microbatches,
+)
+from tests.unit_tests.test_utilities import Utils
 
 
 class _TinyModel(nn.Module):
@@ -465,3 +483,161 @@ def test_metadata_attach_issues_no_collectives(
     attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
 
     assert model_state_dict.keys() == dict(model.named_parameters()).keys()
+
+
+@pytest.mark.parametrize(
+    ("ep_size", "load_path"),
+    [(1, "model"), (2, "model"), (4, "model"), (2, "optimizer"), (2, "reload")],
+    ids=["ep1", "ep2", "ep4", "ep2_optimizer_only", "ep2_reload_model_params"],
+)
+def test_ep_fsdp_checkpoint_roundtrip(tmp_path_dist_ckpt, ep_size, load_path):
+    """MCore checkpoint save/load reproduces uninterrupted BF16 MoE training.
+
+    Use MCore's existing global expert names and optimizer checkpoint format.
+    EP>1 exercises separate dense and expert-DP meshes.
+
+    ``load_path`` selects what runs after DCP has written the checkpoint into the main weights:
+    ``model`` loads through ``FullyShardedDataParallelV2.load_state_dict`` like a normal resume.
+    ``optimizer`` skips it and loads only the optimizer, which is what the GPT->Hybrid
+    ``fsdp_dtensor`` load does. ``reload`` loads no optimizer state and calls
+    ``reload_model_params()``, as the same load does under ``--no-load-optim``. The last two
+    freeze the word embedding, so the refresh must also reach frozen parameter groups.
+    """
+    world_size, rank = Utils.world_size, Utils.rank
+    if world_size % ep_size:
+        pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
+
+    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+
+        def build(seed):
+            torch.manual_seed(seed)
+            model_parallel_cuda_manual_seed(seed)
+            config = TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                num_moe_experts=8,
+                expert_model_parallel_size=ep_size,
+                moe_token_dispatcher_type="alltoall",
+                moe_router_topk=2,
+                moe_aux_loss_coeff=0.0,
+                moe_grouped_gemm=True,
+                moe_ffn_hidden_size=128,
+                add_bias_linear=False,
+                gradient_accumulation_fusion=False,
+                # GPU initialization uses the expert-parallel RNG stream.
+                use_cpu_initialization=False,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                attention_backend=AttnBackend.unfused,
+            )
+            model = HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern="*E",
+                pg_collection=groups,
+            ).cuda()
+            if load_path != "model":
+                model.embedding.word_embeddings.weight.requires_grad_(False)
+            model = FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    megatron_fsdp_version=2,
+                    use_distributed_optimizer=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    megatron_fsdp_main_params_dtype=torch.float32,
+                    megatron_fsdp_main_grads_dtype=torch.bfloat16,
+                    fsdp_all_gather_in_start_param_sync=False,
+                ),
+                module=model,
+                pg_collection=groups,
+            )
+            optimizer = get_megatron_optimizer(
+                OptimizerConfig(
+                    optimizer="adam",
+                    lr=0.001,
+                    weight_decay=0.1,
+                    bf16=True,
+                    params_dtype=torch.bfloat16,
+                    use_distributed_optimizer=False,
+                    clip_grad=0.0,
+                    use_precision_aware_optimizer=True,
+                    exp_avg_dtype=torch.bfloat16,
+                    exp_avg_sq_dtype=torch.bfloat16,
+                ),
+                [model],
+                use_gloo_process_groups=False,
+            )
+            return model, optimizer
+
+        source, source_optimizer = build(seed=123)
+        torch.manual_seed(4321 + rank)
+        ids = torch.randint(0, 128, (2, 8), device=device)
+        pos = torch.arange(8, device=device).repeat(2, 1)
+        target = torch.randn(2, 8, 128, device=device)
+
+        def train(model, optimizer):
+            def forward():
+                output = model(input_ids=ids, position_ids=pos, attention_mask=None)
+                return torch.nn.functional.mse_loss(output.float(), target)
+
+            losses = []
+            for _ in range(5):
+                model.zero_grad_buffer()
+                optimizer.zero_grad()
+                (loss,) = run_forward_backward_on_microbatches(model, forward)
+                success, _, _ = optimizer.step()
+                assert success
+                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+                losses.append(loss)
+            return losses
+
+        def checkpoint_state(model, optimizer, *, is_loading=False, with_optimizer=True):
+            state = {
+                "model": handle_experts_in_state_dict(
+                    model.state_dict_for_save_checkpoint(), model.config.num_moe_experts
+                )
+            }
+            if with_optimizer:
+                state["optimizer"] = optimizer.sharded_state_dict({}, is_loading=is_loading)
+            preprocess_state_dict_for_uneven_dtensor(state)
+            return state
+
+        train(source, source_optimizer)
+        with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_mcore_roundtrip", sync=True) as path:
+            dcp.save(checkpoint_state(source, source_optimizer), checkpoint_id=path)
+            destination, destination_optimizer = build(seed=987)
+            raw_model_state = destination.state_dict_for_save_checkpoint()
+            state = checkpoint_state(
+                destination,
+                destination_optimizer,
+                is_loading=True,
+                with_optimizer=load_path != "reload",
+            )
+            dcp.load(state, checkpoint_id=path)
+            if load_path == "model":
+                destination.load_state_dict(raw_model_state)
+            if load_path == "reload":
+                destination_optimizer.reload_model_params()
+            else:
+                destination_optimizer.load_state_dict(state["optimizer"])
+
+        expected_losses = train(source, source_optimizer)
+        actual_losses = train(destination, destination_optimizer)
+        if load_path == "reload":
+            # Without optimizer state the steps diverge, but the first loss is computed before
+            # any step, from the loaded weights alone.
+            expected_losses, actual_losses = expected_losses[:1], actual_losses[:1]
+        torch.testing.assert_close(
+            torch.stack(actual_losses), torch.stack(expected_losses), rtol=0, atol=0
+        )
+    finally:
+        Utils.destroy_model_parallel()
