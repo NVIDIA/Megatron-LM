@@ -7,6 +7,7 @@ from copy import deepcopy
 
 import pytest
 import torch
+from torch.distributed.distributed_c10d import _world
 
 from megatron.core import dist_checkpointing
 from megatron.core.distributed import DistributedDataParallel
@@ -27,6 +28,7 @@ pytestmark = [pytest.mark.launch_on_gb200, *numerics.pytestmark]
 @pytest.fixture
 def moe_case(monkeypatch):
     # Reuse the existing DDP/DistOpt model and batch setup, without inheriting its tests.
+    existing_groups = set(_world.pg_map)
     monkeypatch.setattr(sys, "argv", list(sys.argv))
     # Set this before setup_method snapshots the environment, so monkeypatch restores
     # the caller's value after teardown_method finishes.
@@ -37,7 +39,19 @@ def moe_case(monkeypatch):
         Utils.initialize_distributed()
         yield case
     finally:
-        case.teardown_method(None)
+        try:
+            case.teardown_method(None)
+        finally:
+            if torch.distributed.is_initialized():
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                # Model-parallel teardown drops MCore references, but PyTorch still
+                # owns the NCCL subgroups from every model setup in this case.
+                # Destroy them in creation order on each rank, preserving WORLD
+                # and any groups that belong to the surrounding test session.
+                for group in list(_world.pg_map):
+                    if group is not torch.distributed.group.WORLD and group not in existing_groups:
+                        torch.distributed.destroy_process_group(group)
 
 
 def _enable_native_glu_fusion(monkeypatch):
