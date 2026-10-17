@@ -4,25 +4,61 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from megatron.core.transformer.experimental_attention_variant.dsa import _unfused_absorbed_dsa_fn
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    _DSASoftmaxValue,
+    _unfused_absorbed_dsa_fn,
+)
 
 
-def test_unfused_absorbed_dsa_keeps_shared_kv_storage():
-    query = torch.randn(7, 2, 3, 8, requires_grad=True)
-    key = torch.randn(19, 2, 1, 8, requires_grad=True)
+@pytest.mark.parametrize("needs_grad", [(True, True), (True, False), (False, True)])
+def test_unfused_absorbed_dsa_softmax_value_derivatives_and_reuse(needs_grad):
+    torch.manual_seed(17)
+    scores = torch.randn(1, 2, 2, 3, dtype=torch.float64, requires_grad=needs_grad[0])
+    value = torch.randn(1, 3, 2, dtype=torch.float64, requires_grad=needs_grad[1])
+    invalid = torch.tensor([[[[True, True, True]], [[False, True, False]]]])
+
+    def calculate(scores, value):
+        private = scores.masked_fill(invalid, float("-inf"))
+        private.masked_fill_(invalid.all(-1, keepdim=True), 0.0)
+        output, probs = _DSASoftmaxValue.apply(private, value, invalid)
+        assert probs.data_ptr() == private.data_ptr()
+        return output, probs
+
+    assert torch.autograd.gradcheck(calculate, (scores, value))
+    assert torch.autograd.gradgradcheck(calculate, (scores, value))
+    output, _ = calculate(scores, value)
+    upstream = torch.randn_like(output[:1, :1]).expand_as(output)
+    original_upstream = upstream.clone()
+    inputs = tuple(x for x in (scores, value) if x.requires_grad)
+    first = torch.autograd.grad(output, inputs, upstream, retain_graph=True)
+    second = torch.autograd.grad(output, inputs, upstream)
+    assert torch.equal(upstream, original_upstream)
+    for a, b in zip(first, second):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_unfused_absorbed_dsa_keeps_shared_kv_storage(dtype):
+    query = torch.randn(7, 2, 3, 8, dtype=dtype, requires_grad=True)
+    key = torch.randn(19, 2, 1, 8, dtype=dtype, requires_grad=True)
     topk = torch.arange(19).expand(2, 7, 19)
     saved_kv_bytes = []
+    probability_storages = set()
 
     def pack(tensor):
         if tensor.ndim == 3 and sorted(tensor.shape[-2:]) == [8, 19]:
             saved_kv_bytes.append(tensor.untyped_storage().nbytes())
+        if tensor.numel() == 2 * 7 * 3 * 19:
+            probability_storages.add(tensor.untyped_storage().data_ptr())
         return tensor
 
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
         output = _unfused_absorbed_dsa_fn(query, key, topk, 8**-0.5, 8)
-    # Neither score nor value matmul should retain a K/V copy per query head.
+    # FP32 score matmul may upcast K, but neither GEMM should save per-head K/V.
     assert saved_kv_bytes
-    assert max(saved_kv_bytes) <= key.numel() * key.element_size()
+    assert max(saved_kv_bytes) <= key.numel() * 4
+    # The value GEMM must not keep a separate BF16 copy of the FP32 probabilities.
+    assert len(probability_storages) == 1
     output.square().sum().backward()
     assert torch.isfinite(query.grad).all() and torch.isfinite(key.grad).all()
 
@@ -58,7 +94,7 @@ def _selected_key_reference(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("mode", ["no_grad", "grad", "checkpoint"])
+@pytest.mark.parametrize("mode", ["no_grad", "grad", "checkpoint", "autocast"])
 @pytest.mark.parametrize("layout", ["causal", "varlen", "additive"])
 def test_unfused_absorbed_dsa_reuses_only_private_buffers(dtype, mode, layout):
     if not torch.cuda.is_available():
@@ -90,7 +126,10 @@ def test_unfused_absorbed_dsa_reuses_only_private_buffers(dtype, mode, layout):
         call_kwargs = {"mask": bias[0]} if bias else kwargs
         return _unfused_absorbed_dsa_fn(q, k, topk, 8**-0.5, 5, **call_kwargs)
 
-    with torch.set_grad_enabled(mode != "no_grad"):
+    with (
+        torch.set_grad_enabled(mode != "no_grad"),
+        torch.autocast("cuda", dtype=torch.bfloat16, enabled=mode == "autocast"),
+    ):
         output = (
             checkpoint(calculate, *inputs, use_reentrant=True)
             if mode == "checkpoint"
@@ -108,7 +147,10 @@ def test_unfused_absorbed_dsa_reuses_only_private_buffers(dtype, mode, layout):
         ends,
         positions,
     )
-    tol = 2e-6 if dtype == torch.float32 else 3e-2
+    tol = 2e-6 if dtype == torch.float32 and mode != "autocast" else 3e-2
+    if mode == "autocast":
+        assert output.dtype == torch.bfloat16
+        reference = reference.to(output.dtype)
     torch.testing.assert_close(output, reference, rtol=tol, atol=tol)
     assert torch.count_nonzero(output[0]) == 0
     for tensor, snapshot in zip(inputs, snapshots):

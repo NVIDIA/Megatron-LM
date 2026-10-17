@@ -70,6 +70,51 @@ def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq
     return layer_number - ((layer_number - skip_topk_offset) % topk_freq)
 
 
+class _DSASoftmaxValue(torch.autograd.Function):
+    """Reuse private, pre-masked scores and the value matmul's score gradient."""
+
+    @staticmethod
+    def forward(ctx, scores, value, invalid_mask):
+        """Overwrite the owned score buffer with probabilities and multiply by V."""
+        probs = torch.softmax(scores, dim=-1, out=scores).masked_fill_(invalid_mask, 0.0)
+        ctx.mark_dirty(scores)
+        output = torch.bmm(probs.to(value.dtype).reshape(value.size(0), -1, value.size(1)), value)
+        ctx.save_for_backward(probs, value, invalid_mask)
+        ctx.set_materialize_grads(False)
+        # Returning this saved intermediate gives double backward its gradient path.
+        return output, probs
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_probs):
+        """Reuse the newly computed probability gradient, never caller gradients."""
+        probs, value, invalid_mask = ctx.saved_tensors
+        grad_scores = grad_value = None
+        if grad_output is not None:
+            if ctx.needs_input_grad[1]:
+                p = probs.to(value.dtype).reshape(value.size(0), -1, value.size(1))
+                grad_value = torch.bmm(p.transpose(1, 2), grad_output)
+                del p
+            if ctx.needs_input_grad[0]:
+                grad_scores = (
+                    torch.bmm(grad_output, value.transpose(1, 2)).to(probs.dtype).view_as(probs)
+                )
+        if ctx.needs_input_grad[0]:
+            if grad_probs is not None:
+                grad_scores = (
+                    grad_probs.clone() if grad_scores is None else grad_scores + grad_probs
+                )
+            if grad_scores is not None:
+                grad_scores.masked_fill_(invalid_mask, 0.0)
+                if torch.is_grad_enabled():
+                    grad_scores = torch._softmax_backward_data(grad_scores, probs, -1, probs.dtype)
+                else:
+                    grad_scores.mul_(probs)
+                    row_sum = grad_scores.sum(-1, keepdim=True)
+                    grad_scores.addcmul_(probs, row_sum, value=-1)
+                grad_scores.masked_fill_(invalid_mask, 0.0)
+        return grad_scores, grad_value, None
+
+
 def _unfused_absorbed_dsa_fn(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -97,20 +142,8 @@ def _unfused_absorbed_dsa_fn(
         device=query.device,
     )
 
-    # Fold query heads into rows rather than broadcasting the shared K/V across
-    # heads. This also avoids per-head K/V gradients that are immediately summed.
-    q = query.permute(1, 0, 2, 3).reshape(b, sq * np, hn)
-    k = key[:, :, 0].permute(1, 2, 0)  # [b,hn,skv]
-    attention_scores = torch.bmm(q.float(), k.float()).view(b, sq, np, skv)
-    if attention_scores.requires_grad:
-        # Give in-place masking a non-view buffer: writing through the bmm view
-        # would make CopySlices backward clone full score-sized gradients.
-        attention_scores = attention_scores * softmax_scale
-    else:
-        attention_scores.mul_(softmax_scale)
-
-    # Sparse + causal/varlen validity mask.
-    index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
+    # Finish mask construction before allocating the full attention scores.
+    index_mask = torch.full((b, sq, skv), float("-inf"), device=query.device)
     dsa_masking.scatter_topk_into_index_mask(index_mask, topk_indices, seq_chunk_size=256)
     index_mask = dsa_masking.apply_sparse_validity_to_index_mask(
         index_mask,
@@ -120,20 +153,39 @@ def _unfused_absorbed_dsa_fn(
         key_positions=key_positions,
     )
 
-    attention_scores.add_(index_mask.unsqueeze(2))
-    valid_index_mask = torch.isfinite(index_mask)
-    del index_mask, row_mask
-    attention_scores = dsa_masking.masked_softmax(
-        attention_scores,
-        valid_index_mask.unsqueeze(2).expand(b, sq, np, skv),
-        dim=-1,
-        reuse_logits=True,
-    )
+    invalid_mask = ~torch.isfinite(index_mask).unsqueeze(2)
+    del row_mask
+    if mask is None:
+        # Causal/varlen sparse masks contain only zero and -inf: the boolean
+        # validity mask is sufficient, so release the float buffer before QK.
+        index_mask = None
+
+    # Fold query heads into rows rather than broadcasting the shared K/V across
+    # heads. This also avoids per-head K/V gradients that are immediately summed.
+    q = query.permute(1, 0, 2, 3).reshape(b, sq * np, hn)
+    k = key[:, :, 0].permute(1, 2, 0)  # [b,hn,skv]
+    attention_scores = torch.bmm(q.float(), k.float())
+    # Reshape this owned contiguous buffer in place. A view would make in-place
+    # masking/softmax incur score-sized CopySlices gradient copies.
+    attention_scores.as_strided_((b, sq, np, skv), (sq * np * skv, np * skv, skv, 1))
+    attention_scores.mul_(softmax_scale)
+    if index_mask is not None:
+        attention_scores.add_(index_mask.unsqueeze(2))
+    del index_mask
+    attention_scores.masked_fill_(invalid_mask, float("-inf"))
+    attention_scores.masked_fill_(invalid_mask.all(-1, keepdim=True), 0.0)
 
     # Latent value is the first v_channels slice of absorbed key cache.
     value = key[:, :, 0, :v_channels].permute(1, 0, 2)  # [b,skv,v]
-    probs = attention_scores.to(value.dtype).reshape(b, sq * np, skv)
-    output = torch.bmm(probs, value).view(b, sq, np, v_channels)
+    if torch.is_autocast_enabled(query.device.type):
+        # Preserve autocast's softmax/GEMM dtype policy and recorded casts.
+        probs = dsa_masking.masked_softmax(
+            attention_scores, (~invalid_mask).expand_as(attention_scores), reuse_logits=True
+        )
+        output = torch.bmm(probs.to(value.dtype).reshape(b, sq * np, skv), value)
+    else:
+        output, _ = _DSASoftmaxValue.apply(attention_scores, value, invalid_mask)
+    output = output.view(b, sq, np, v_channels)
     return output.permute(1, 0, 2, 3).contiguous()
 
 
