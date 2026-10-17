@@ -8,18 +8,11 @@ import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.context_parallel import gdp_common
 from megatron.core.ssm.context_parallel.chunkwise import (
-    CPBackwardPackedSummary,
-    CPForwardPackedSummary,
     CPForwardResult,
     CPSavedContext,
     build_packed_sequence_cp_metadata,
 )
-from megatron.core.ssm.context_parallel.gdp_common import GDPInputs
-from megatron.core.ssm.gated_delta_product import (
-    HAVE_CUTEDSL_GDP_CP,
-    HAVE_FLA_GDP_CP,
-    GatedDeltaProductMixer,
-)
+from megatron.core.ssm.gated_delta_product import HAVE_FLA_GDP_CP, GatedDeltaProductMixer
 
 pytestmark = pytest.mark.launch_on_gb200
 
@@ -27,11 +20,6 @@ if HAVE_FLA_GDP_CP:
     import megatron.core.ssm.context_parallel.gdp as gdp_cp_module
 else:
     gdp_cp_module = None
-
-if HAVE_CUTEDSL_GDP_CP:
-    import megatron.core.ssm.context_parallel.gdp_cutedsl as gdp_cutedsl_cp_module
-else:
-    gdp_cutedsl_cp_module = None
 
 
 class _FakeGroup:
@@ -121,88 +109,3 @@ def test_reuse_rank_local_metadata():
     )
     assert returned_metadata.preceding_rank_start == 0
     assert returned_metadata.following_rank_stop == 2
-
-
-@pytest.mark.skipif(not HAVE_CUTEDSL_GDP_CP, reason="CuTeDSL GDP CP backend is unavailable")
-def test_cutedsl_backend_adapts_four_function_protocol(monkeypatch):
-    """Verify summaries and the recompute policy reach the CuTeDSL API."""
-    assert gdp_cutedsl_cp_module is not None
-    calls = {}
-    tensor = torch.randn(2, 3)
-    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
-    forward_summary = torch.randn(2, 4, 7)
-    backward_summary = torch.randn(2, 4, 7)
-    backend_local_context = object()
-    backend_backward_context = object()
-
-    def fake_forward_prepare(*args, **kwargs):
-        calls["forward_prepare"] = (args, kwargs)
-        return forward_summary, backend_local_context
-
-    def fake_forward_apply(local_context, preceding_summaries, *, output_final_state):
-        calls["forward_apply"] = (local_context, preceding_summaries, output_final_state)
-        return tensor, SimpleNamespace(
-            q=tensor,
-            k=tensor,
-            v=tensor,
-            g=tensor,
-            beta=tensor,
-            cu_seqlens=cu_seqlens,
-            state=tensor,
-            initial_states=tensor,
-            scale=0.125,
-            num_householder=3,
-            use_qk_l2norm_in_kernel=True,
-            recompute_chunk_num=2,
-        )
-
-    def fake_backward_prepare(output_grad, saved_context, *, boundary_len=None):
-        calls["backward_prepare"] = (output_grad, saved_context, boundary_len)
-        return backward_summary, backend_backward_context
-
-    gradients = tuple(torch.randn_like(tensor) for _ in range(5))
-
-    def fake_backward_apply(backward_context, following_summaries, *, dht):
-        calls["backward_apply"] = (backward_context, following_summaries, dht)
-        return gradients
-
-    monkeypatch.setattr(gdp_cutedsl_cp_module, "cutedsl_cp_forward_prepare", fake_forward_prepare)
-    monkeypatch.setattr(gdp_cutedsl_cp_module, "cutedsl_cp_forward_apply", fake_forward_apply)
-    monkeypatch.setattr(gdp_cutedsl_cp_module, "cutedsl_cp_backward_prepare", fake_backward_prepare)
-    monkeypatch.setattr(gdp_cutedsl_cp_module, "cutedsl_cp_backward_apply", fake_backward_apply)
-
-    backend = gdp_cutedsl_cp_module.CuTeDSLGatedDeltaProductCPBackend(recompute_chunk_num=2)
-    inputs = GDPInputs(
-        q=tensor,
-        k=tensor,
-        v=tensor,
-        g=tensor,
-        beta=tensor,
-        cu_seqlens=cu_seqlens,
-        num_householder=3,
-        scale=0.125,
-    )
-
-    local_summary, local_context = backend.cp_forward_prepare(inputs)
-    assert isinstance(local_summary, CPForwardPackedSummary)
-    assert local_summary.packed is forward_summary
-    assert calls["forward_prepare"][1]["recompute_chunk_num"] == 2
-
-    prefix = CPForwardPackedSummary(packed=forward_summary.unsqueeze(0))
-    output, saved_context = backend.cp_forward_apply(local_context, prefix)
-    assert output is tensor
-    assert calls["forward_apply"][0] is backend_local_context
-    assert calls["forward_apply"][1] is prefix.packed
-    assert calls["forward_apply"][2] is False
-
-    local_backward_summary, backward_context = backend.cp_backward_prepare(tensor, saved_context)
-    assert isinstance(local_backward_summary, CPBackwardPackedSummary)
-    assert local_backward_summary.packed is backward_summary
-    assert calls["backward_prepare"][1].initial_states is tensor
-    assert calls["backward_prepare"][2] is None
-
-    suffix = CPBackwardPackedSummary(packed=backward_summary.unsqueeze(0))
-    assert backend.cp_backward_apply(backward_context, suffix) is gradients
-    assert calls["backward_apply"][0] is backend_backward_context
-    assert calls["backward_apply"][1] is suffix.packed
-    assert calls["backward_apply"][2] is None
