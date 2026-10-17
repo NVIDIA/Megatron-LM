@@ -73,6 +73,22 @@ def _sanitize_thd_padding_values(batch: Dict[str, Any], padding_mask: torch.Tens
         batch[key] = tensor.masked_fill(padding_mask, pad_value)
 
 
+def _data_parallel_groups(pg_collection: ProcessGroupCollection):
+    """Return the (DP x CP, DP) groups whose ranks read distinct samples.
+
+    GTP-remat peers read distinct samples, so the data domain is the GTP-remat-inclusive
+    group, as returned by ``parallel_state.get_data_parallel_group()``. The replicate
+    ``dp_cp``/``dp`` groups are used only when the collection does not set the GTP-remat
+    field, which means GTP-remat is off and both groups span the same ranks. A field set
+    to None is returned as None rather than replaced by the replicate group.
+    """
+    groups = vars(pg_collection)
+    return (
+        groups.get('dp_cp_gtp_remat', groups.get('dp_cp')),
+        groups.get('dp_gtp_remat', groups.get('dp')),
+    )
+
+
 class HybridCPDataLoaderWrapper:
     """
     A wrapper class that wraps around an existing data_iterator.
@@ -86,7 +102,9 @@ class HybridCPDataLoaderWrapper:
     Args:
         data_iterator: The original data_iterator to wrap around
         config: The config object containing the max_seqlen_per_dp_cp_rank
-        dp_cp_group: Data parallel context parallel group.
+        pg_collection: The process group collection. The DP and DP x CP groups are its
+            GTP-remat-inclusive ``dp_gtp_remat``/``dp_cp_gtp_remat`` (``dp``/``dp_cp`` when
+            those are not set). Defaults to the global data-parallel groups.
     """
 
     def __init__(
@@ -97,14 +115,13 @@ class HybridCPDataLoaderWrapper:
         if pg_collection is None:
             self.dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
             self.dp_group = parallel_state.get_data_parallel_group()
-            self.tp_group = parallel_state.get_tensor_model_parallel_group()
         else:
-            self.dp_cp_group = pg_collection.dp_cp
-            self.dp_group = pg_collection.dp
-            self.tp_group = pg_collection.tp
-        assert (
-            self.dp_cp_group is not None and self.dp_group is not None and self.tp_group is not None
-        ), "dp_cp_group, dp_group, tp_group must not be None when using hybrid context parallel"
+            self.dp_cp_group, self.dp_group = _data_parallel_groups(pg_collection)
+        if self.dp_cp_group is None or self.dp_group is None:
+            raise ValueError(
+                "HybridCPDataLoaderWrapper: pg_collection must set dp_cp_gtp_remat and "
+                "dp_gtp_remat, or dp_cp and dp when GTP-remat is off"
+            )
 
         self.cp_balancing_scheduler = BalancedCPScheduler(
             max_seq_len_per_rank=self.config.max_seqlen_per_dp_cp_rank, dp_cp_group=self.dp_cp_group
@@ -161,11 +178,9 @@ class HybridCPDataLoaderWrapper:
 
     def _gid_to_src_rank(self, gid: int, offsets: List[int]) -> int:
         dp_src_rank = torch.bucketize(gid, offsets[1:] - 1)
-        # Since the torch.distributed.get_process_group_ranks
-        # provides the global rank, we need to consider TP
-        hdp_rank = (
-            torch.distributed.get_process_group_ranks(self.dp_group)[dp_src_rank]
-            // self.tp_group.size()
+        # get_process_group_ranks returns global ranks; map the source to its DPxCP group rank.
+        hdp_rank = torch.distributed.get_group_rank(
+            self.dp_cp_group, torch.distributed.get_process_group_ranks(self.dp_group)[dp_src_rank]
         )
         return hdp_rank
 
@@ -176,9 +191,7 @@ class HybridCPDataLoaderWrapper:
     #     which fails all_to_all_single split validation when a rank has
     #     nothing to send (reachable here);
     #   * it transports the "original_seq_len"/"padded_seq_len" metadata keys
-    #     with count-based splits, keys the hybrid-CP batch does not carry;
-    #   * its rank mapping applies "% dp_cp_group.size()" for PP support,
-    #     while hybrid CP asserts pipeline_model_parallel_size == 1.
+    #     with count-based splits, keys the hybrid-CP batch does not carry.
     def reroute_samples_to_hdp_ranks(
         self, batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
     ):
@@ -193,9 +206,8 @@ class HybridCPDataLoaderWrapper:
         gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
         hdp_rank = self.dp_cp_group.rank()
         dp_ranks = torch.distributed.get_process_group_ranks(self.dp_group)
-        # Here we actually want to get the DP group's rank within the HDP group,
-        # we need to consider TP
-        dp_ranks = [r // self.tp_group.size() for r in dp_ranks]
+        # Here we actually want to get the DP group's rank within the HDP group.
+        dp_ranks = [torch.distributed.get_group_rank(self.dp_cp_group, r) for r in dp_ranks]
 
         data_keys = batch[0].keys()
 
@@ -681,8 +693,10 @@ def wrap_data_iterator(
     Args:
         data_iterator: The original data_iterator to wrap around
         config: The config object containing the max_seqlen_per_dp_cp_rank
-        dp_cp_group: Data parallel context parallel group.
-        pg_collection: The process group collection.
+        num_microbatches: The number of microbatches to fetch.
+        pg_collection: The process group collection. The DP and DP x CP groups are its
+            GTP-remat-inclusive ``dp_gtp_remat``/``dp_cp_gtp_remat`` (``dp``/``dp_cp`` when
+            those are not set). Defaults to the global parallel groups.
     """
 
     if pg_collection is None:
@@ -691,16 +705,14 @@ def wrap_data_iterator(
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
     else:
-        dp_cp_group = pg_collection.dp_cp
-        dp_group = pg_collection.dp
+        dp_cp_group, dp_group = _data_parallel_groups(pg_collection)
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
-    assert (
-        dp_cp_group is not None
-        and dp_group is not None
-        and tp_group is not None
-        and pp_group is not None
-    ), "dp_cp_group, dp_group, tp_group must not be None when using sequence packing"
+    if dp_cp_group is None or dp_group is None or tp_group is None or pp_group is None:
+        raise ValueError(
+            "wrap_data_iterator: pg_collection must set tp, pp, dp_cp_gtp_remat and "
+            "dp_gtp_remat, or dp_cp and dp instead of the last two when GTP-remat is off"
+        )
 
     dev = torch.cuda.current_device()
     dp_size = dp_group.size()
