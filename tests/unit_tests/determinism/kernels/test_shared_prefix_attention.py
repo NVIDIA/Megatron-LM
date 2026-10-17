@@ -429,12 +429,16 @@ def test_backward_follows_torch_deterministic_algorithms(attention, monkeypatch,
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("kind", sorted(_FORESTS))
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_composed_attention_matches_independent_reference(attention, dtype, kind, deterministic):
+# 100 is not a multiple of 8: FlashAttention pads the head dim, and the backward must too.
+@pytest.mark.parametrize("dim", [64, 100])
+def test_composed_attention_matches_independent_reference(
+    attention, dtype, kind, deterministic, dim
+):
     """Fused error vs fp64 stays within 2x of dense unshared FlashAttention's error."""
     seeded()
     forest = _FORESTS[kind]
-    inputs = _qkv(_total(forest) + 8, dtype)
-    cotangent = torch.randn(inputs[0].shape[0], 1, 8 * 64, device="cuda", dtype=dtype)
+    inputs = _qkv(_total(forest) + 8, dtype, dim=dim)
+    cotangent = torch.randn(inputs[0].shape[0], 1, 8 * dim, device="cuda", dtype=dtype)
     truth = _truth(inputs, forest, cotangent)
 
     def operation(q, k, v):
@@ -454,7 +458,7 @@ def test_composed_attention_matches_independent_reference(attention, dtype, kind
         ("out", "dq", "dk", "dv"), fused_errors, baseline_errors
     ):
         assert fused_error <= 2 * baseline_error, (
-            f"{kind}/{dtype} {name}: fused relative error {fused_error:.3e} exceeds twice "
+            f"{kind}/{dtype}/hn{dim} {name}: fused relative error {fused_error:.3e} exceeds twice "
             f"the dense-branch FlashAttention error {baseline_error:.3e}"
         )
 
