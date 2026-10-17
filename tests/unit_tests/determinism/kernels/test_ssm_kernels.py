@@ -569,8 +569,10 @@ def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
     )
 
 
-def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
+@pytest.mark.parametrize("use_qk_l2norm_in_kernel", [False, True])
+def test_torch_chunk_gated_delta_rule_replays_fwd_bwd(use_qk_l2norm_in_kernel):
     """The path ``--deterministic-mode`` selects for GDN (FLA is not deterministic)."""
+    from megatron.core.ssm.gated_delta_net.common import torch_l2norm
     from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
 
     seeded()
@@ -582,17 +584,19 @@ def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
     beta = torch.rand(B, T, H, device="cuda").requires_grad_(True)
 
     def fn(q, k, v, g, beta):
-        # use_qk_l2norm_in_kernel routes through FLA's l2norm, whose signature differs across
-        # FLA releases; normalise outside so the test only depends on the torch path.
+        # Replay both placements of the deterministic torch-native normalization.
+        if not use_qk_l2norm_in_kernel:
+            q = torch_l2norm(q)
+            k = torch_l2norm(k)
         o, state = torch_chunk_gated_delta_rule(
-            torch.nn.functional.normalize(q, dim=-1),
-            torch.nn.functional.normalize(k, dim=-1),
+            q,
+            k,
             v,
             g,
             beta,
             chunk_size=64,
             output_final_state=True,
-            use_qk_l2norm_in_kernel=False,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
         return o, state
 
