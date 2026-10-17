@@ -136,6 +136,15 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         world_size = get_pg_size(tp_group)
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
+        # Save the shifted-logit sum before the helper exponentiates logits in place.
+        if label_smoothing > 0:
+            global_shifted_logit_sum = (vocab_parallel_logits - logits_max.unsqueeze(dim=-1)).sum(
+                dim=-1
+            )
+            torch.distributed.all_reduce(
+                global_shifted_logit_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+
         target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits = (
             VocabParallelCrossEntropy.calculate_predicted_logits(
                 vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
@@ -155,7 +164,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             exp_logits, predicted_logits, sum_exp_logits
         )
 
-        vocab_size = exp_logits.size(-1)
+        vocab_size = exp_logits.size(-1) * world_size
         if label_smoothing > 0:
             r"""
             We'd like to assign 1 / (K - 1) probability mass to every index that is not the ground truth.
@@ -169,10 +178,8 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             assert 1.0 > label_smoothing > 0.0
             smoothing = label_smoothing * vocab_size / (vocab_size - 1)
 
-            # Exp logits at this point are normalized probabilities.
-            # So we can just take the log to get log-probs.
-            log_probs = torch.log(exp_logits)
-            mean_log_probs = log_probs.mean(dim=-1)
+            # Compute the global mean without taking log of underflowed probabilities.
+            mean_log_probs = global_shifted_logit_sum / vocab_size - torch.log(sum_exp_logits)
             loss = (1.0 - smoothing) * loss - smoothing * mean_log_probs
 
         ctx.label_smoothing, ctx.vocab_size = label_smoothing, vocab_size
