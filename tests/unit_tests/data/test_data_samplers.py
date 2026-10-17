@@ -7,6 +7,7 @@ build_train_valid_test_data_iterators. Nothing between the restore and the first
 the default CPU generator -- except, on the pre-fix code, iterator creation itself.
 """
 
+from collections import Counter
 from types import SimpleNamespace
 
 import torch
@@ -33,6 +34,14 @@ class _Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         return torch.tensor([idx])
+
+
+class _RandomValueDataset(torch.utils.data.Dataset):
+    def __len__(self):
+        return 10
+
+    def __getitem__(self, idx):
+        return idx, torch.rand(1).item()
 
 
 class TestDataLoaderResume:
@@ -83,3 +92,115 @@ class TestDataLoaderResume:
             "building the data iterators moved the CPU RNG off the state load_checkpoint "
             "restored, so the resumed run diverges from the run that saved"
         )
+
+
+def test_cyclic_sampler_no_sharding_preserves_samples_after_dp_change():
+    dataset_size, micro_batch_size, global_batch_size, steps = 250, 2, 16, 32
+
+    def draws(dp_before, dp_after, resume_step):
+        drawn = []
+        for dp, lo, hi in ((dp_before, 0, resume_step), (dp_after, resume_step, steps)):
+            grad_accumulation = global_batch_size // (micro_batch_size * dp)
+            samplers = [
+                data_samplers.MegatronPretrainingRandomSampler(
+                    torch.arange(dataset_size),
+                    total_samples=dataset_size,
+                    consumed_samples=lo * global_batch_size,
+                    micro_batch_size=micro_batch_size,
+                    data_parallel_rank=rank,
+                    data_parallel_size=dp,
+                    data_sharding=False,
+                    global_batch_size=global_batch_size,
+                )
+                for rank in range(dp)
+            ]
+            iterators = [iter(sampler) for sampler in samplers]
+            for _ in range(lo, hi):
+                for rank in range(dp):
+                    for _ in range(grad_accumulation):
+                        try:
+                            drawn.extend(next(iterators[rank]))
+                        except StopIteration:
+                            iterators[rank] = iter(samplers[rank])
+                            drawn.extend(next(iterators[rank]))
+        return Counter(drawn)
+
+    for dp_before, dp_after, resume_step in ((1, 8, 15), (8, 1, 15), (1, 2, 7)):
+        reference = draws(dp_before, dp_before, 0)
+        resumed = draws(dp_before, dp_after, resume_step)
+        assert resumed == reference
+
+
+def test_cyclic_sampler_updates_random_seed_epoch_across_global_batch_boundary():
+    dataset = data_samplers.RandomSeedDataset(_RandomValueDataset(), seed=1234)
+    sampler = data_samplers.MegatronPretrainingRandomSampler(
+        dataset,
+        total_samples=len(dataset),
+        consumed_samples=0,
+        micro_batch_size=2,
+        data_parallel_rank=0,
+        data_parallel_size=1,
+        data_sharding=False,
+        global_batch_size=6,
+    )
+
+    observed = []
+    for batch in sampler:
+        observed.extend(dataset[index] for index in batch)
+
+    expected = []
+    for epoch, offset, count in ((0, 0, 10), (1, 0, 2)):
+        generator = torch.Generator().manual_seed(epoch)
+        permutation = torch.randperm(len(dataset), generator=generator).tolist()
+        for index in permutation[offset : offset + count]:
+            value_generator = torch.Generator().manual_seed(index + dataset.base_seed + epoch)
+            expected.append((index, torch.rand(1, generator=value_generator).item()))
+
+    assert [index for index, _ in observed] == [index for index, _ in expected]
+    torch.testing.assert_close(
+        torch.tensor([value for _, value in observed]),
+        torch.tensor([value for _, value in expected]),
+    )
+    assert dataset.curr_seed == dataset.base_seed + 1
+
+
+def test_cyclic_sampler_uses_running_global_batch_size(monkeypatch):
+    from megatron.core.num_microbatches_calculator import (
+        init_num_microbatches_calculator,
+        unset_num_microbatches_calculator,
+    )
+
+    requested_global_batch_size = 18
+    running_global_batch_size = 16
+    monkeypatch.setattr(
+        data_samplers,
+        'get_args',
+        lambda: SimpleNamespace(
+            dataloader_type='cyclic',
+            micro_batch_size=2,
+            global_batch_size=requested_global_batch_size,
+            data_sharding=False,
+            full_validation=False,
+            num_workers=0,
+            hybrid_context_parallel=False,
+            sequence_packing_scheduler=None,
+            use_varlen_dataset=False,
+            varlen_sbhd_validation=False,
+        ),
+    )
+    monkeypatch.setattr(data_samplers.mpu, 'get_data_parallel_rank', lambda: 0)
+    monkeypatch.setattr(data_samplers.mpu, 'get_data_parallel_world_size', lambda: 4)
+
+    init_num_microbatches_calculator(
+        rank=0,
+        global_batch_size=requested_global_batch_size,
+        micro_batch_size=2,
+        data_parallel_size=4,
+        decrease_batch_size_if_needed=True,
+    )
+    try:
+        loader = data_samplers.build_pretraining_data_loader(torch.arange(250), consumed_samples=0)
+    finally:
+        unset_num_microbatches_calculator()
+
+    assert loader.batch_sampler.global_batch_size == running_global_batch_size
