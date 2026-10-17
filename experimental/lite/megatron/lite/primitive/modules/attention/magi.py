@@ -194,6 +194,22 @@ class MagiDotProductAttention(nn.Module):
         self.softmax_scale = head_dim**-0.5
 
     def forward(self, query, key, value, *, packed_seq_params):
+        fa4_varlen = getattr(packed_seq_params, "fa4_varlen", None)
+        if fa4_varlen is not None:
+            from flash_attn.cute.interface import flash_attn_varlen_func
+
+            cu_seqlens, deterministic = fa4_varlen
+            out = flash_attn_varlen_func(
+                query,
+                key,
+                value.contiguous(),
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                softmax_scale=self.softmax_scale,
+                causal=True,
+                deterministic=deterministic,
+            )
+            return out[0] if isinstance(out, tuple) else out
         runtime_key = getattr(packed_seq_params, "magi_runtime_key", None)
         if runtime_key is None:
             raise ValueError(
