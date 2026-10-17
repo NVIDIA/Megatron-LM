@@ -29,13 +29,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalize
     FsdpOrthogonalizedOptimizer,
     _require_emerging_optimizers,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
-    ParameterLayout,
-)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     get_containing_parameter_group,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.range import intersect_ranges
 
 try:
     from tests.unit_tests.distributed.mfsdp_v2.conftest import DistributedSetup
@@ -285,8 +283,17 @@ def test_step_explicit_boundary_param_bitwise_matches_reference(distributed_setu
     # Assert the single parameter is a boundary parameter on this rank.
     fsdp_group = get_containing_parameter_group(cast(nn.Parameter, model.fc.weight))
     assert fsdp_group is not None
-    layouts = ParameterLayout.from_group(fsdp_group)
-    assert layouts[0].is_boundary(), "BoundaryModel weight must straddle the boundary."
+    buffer = fsdp_group.main_weight
+    tensor_range = buffer.layout.get_tensor_range(0)
+    holders = [
+        rank
+        for rank in mesh.mesh.tolist()
+        if intersect_ranges(
+            tensor_range, buffer.layout.get_rank_range(mesh, buffer.placements, rank)
+        ).numel
+        > 0
+    ]
+    assert len(holders) > 1, "BoundaryModel weight must straddle the boundary."
 
     torch.manual_seed(1234)
     baseline = BoundaryModel(rows, in_features).to(device)

@@ -16,10 +16,8 @@ them to be routed to a separate optimizer.
 
 import contextlib
 import dataclasses
-import inspect
-import warnings
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast, overload, override
 
 import torch
@@ -40,10 +38,11 @@ except (ModuleNotFoundError, ImportError):
     HAVE_EMERGING_OPTIMIZERS = False
 
 from .dbuffer import DBuffer
-from .gather_scatter import gather, scatter, waiting_stream_scope
-from .owner_planning import GroupOwnerLayout, ParameterLayout, assign_owner_work, ns_cost_fn
+from .gather_scatter import gather, scatter
+from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import RowAtomic
+from .range import intersect_ranges
 
 
 def _fsdp_group_of(param: torch.nn.Parameter) -> FsdpParameterGroup:
@@ -77,8 +76,9 @@ class _ActiveGroup:
 
     Attributes:
         fsdp_group: The FSDP parameter group whose active parameters this record is.
-        active: Rank-identical layout of this step's grad-bearing parameters.
+        tensor_indices: Indices of this step's grad-bearing parameters in the DBuffer layout.
         torch_group: The `torch.optim` param group holding the hyperparameters.
+        tensor_to_owner: Participating tensor indices mapped to owner global ranks.
         lr: The learning rate, snapshotted from `torch_group` when this record is
             built, so the whole step applies one consistent value even if the param
             group is adjusted while the step is executing (relevant once the phases
@@ -88,8 +88,9 @@ class _ActiveGroup:
     """
 
     fsdp_group: FsdpParameterGroup
-    active: GroupOwnerLayout
+    tensor_indices: list[int]
     torch_group: dict[str, Any]
+    tensor_to_owner: dict[int, int] = dataclasses.field(default_factory=dict)
     destination: dict[int, torch.Tensor] | None = None
     lr: float = dataclasses.field(init=False)
 
@@ -125,27 +126,16 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             optimization hyperparameters.
         dp_mesh: Device mesh of the FSDP data-parallel group. Every parameter group's
             mesh must be this mesh.
-        num_ns_steps: Newton-Schulz iteration count, used by the owner load-balancing
-            cost heuristic. If `None`, defaults to 1.
     """
 
     def __init__(
-        self,
-        params: ParamsT,
-        inner_optimizer: OrthogonalizedOptimizer,
-        dp_mesh: DeviceMesh,
-        num_ns_steps: int | None = None,
+        self, params: ParamsT, inner_optimizer: OrthogonalizedOptimizer, dp_mesh: DeviceMesh
     ) -> None:
         _require_emerging_optimizers()
 
-        if num_ns_steps is None:
-            num_ns_steps = 1
-        if num_ns_steps < 1:
-            raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}.")
-
+        if dp_mesh.ndim != 1:
+            raise NotImplementedError("Owner gather/scatter requires a 1-D DP mesh.")
         self.dp_mesh = dp_mesh
-        self._num_ns_steps: int = num_ns_steps
-        self._owner_layouts: dict[FsdpParameterGroup, dict[int, ParameterLayout]] = {}
         self._streams: dict[FsdpParameterGroup, torch.cuda.Stream] = {}
 
         # Disable properties while initializing this instance. We'd either have a missing attribute
@@ -263,8 +253,8 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 setattr(cls_, name, descriptor)
 
     def _this_rank(self) -> int:
-        """This rank's index in the DP mesh."""
-        return self.dp_mesh.get_local_rank()
+        """This process's global rank."""
+        return self.dp_mesh.get_rank()
 
     def _device(self) -> torch.device:
         """The DP mesh's device."""
@@ -294,20 +284,6 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         if fsdp_group not in self._streams:
             self._streams[fsdp_group] = torch.cuda.Stream(device=self._device())
         return self._streams[fsdp_group]
-
-    @contextlib.contextmanager
-    def _p2p_scope(self, stream: torch.cuda.Stream | None) -> Iterator[None]:
-        """Run P2P on `stream`, which waits on the caller's stream at entry.
-
-        No-op without CUDA, where everything runs on the caller's current stream. The caller's
-        stream itself is never blocked; the step waits on the group streams before reading the
-        results.
-        """
-        if stream is None:
-            yield
-            return
-        with waiting_stream_scope(stream):
-            yield
 
     def _compute_orthogonalization_inputs(
         self, param: DTensor, grad: DTensor, group: dict[str, Any], lr: float
@@ -339,7 +315,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
 
     def _orthogonalize_active(
         self,
-        active_layout: GroupOwnerLayout,
+        group: _ActiveGroup,
         destination: dict[int, torch.Tensor],
         group_kwargs: dict[str, Any],
     ) -> dict[int, torch.Tensor]:
@@ -354,10 +330,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         """
         this_rank = self._this_rank()
         updates: dict[int, torch.Tensor] = {}
-        for i, layout in active_layout.layouts.items():
-            if active_layout.owners[i] != this_rank:
+        for i, owner in group.tensor_to_owner.items():
+            if owner != this_rank:
                 continue
-            shape = layout.full_shape
+            shape = group.fsdp_group.main_weight.layout.tensor_shapes[i]
             matrix = destination[i].view(shape[0], -1) if len(shape) >= 2 else destination[i]
             with eo_utils.fp32_matmul_precision(self._inner.fp32_matmul_prec):
                 # The kernel ignores the parameter argument, so `None` is fine.
@@ -365,7 +341,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     None,  # ty: ignore[invalid-argument-type]
                     matrix.to(torch.float32),
                     **group_kwargs,
-                )
+                ).contiguous()
         return updates
 
     def _apply_update(self, param: DTensor, update_shard: torch.Tensor, lr: float) -> None:
@@ -421,14 +397,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 fsdp_groups[fsdp_group] = None
                 touched[fsdp_group] = None
             for fsdp_group in fsdp_groups:
-                layouts = self._owner_layouts.get(fsdp_group)
-                if layouts is None:
-                    # Built once per group — layouts are step-independent. Everything
-                    # participates; dimensionalities are a validation concern. The
-                    # owners are assigned per step by the joint balancing below.
-                    layouts = self._owner_layouts[fsdp_group] = ParameterLayout.from_group(
-                        fsdp_group, eligible_fn=lambda _param: True
-                    )
+                layout = fsdp_group.main_weight.layout
                 active_indices = [
                     i
                     for i, fp in enumerate(fsdp_group.fsdp_parameters)
@@ -441,19 +410,15 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 # deadlocked in the gather/scatter P2P. Validate rank-uniformly from
                 # the rank-identical layouts before posting any communication.
                 for i in active_indices:
-                    layout = layouts[i]
-                    if len(layout.full_shape) < 2:
+                    shape = layout.tensor_shapes[i]
+                    if len(shape) < 2:
                         raise ValueError(
                             f"Only 2D or higher-dimensional parameters can be "
                             f"orthogonalized; parameter {i} of {fsdp_group!r} has "
-                            f"shape {tuple(layout.full_shape)}."
+                            f"shape {tuple(shape)}."
                         )
                 # Owners start empty and are assigned by the joint balancing below.
-                active = GroupOwnerLayout(
-                    mesh=fsdp_group.mesh, layouts={i: layouts[i] for i in active_indices}, owners={}
-                )
-                if active.layouts:
-                    actives.append(_ActiveGroup(fsdp_group, active, torch_group))
+                actives.append(_ActiveGroup(fsdp_group, active_indices, torch_group))
 
         # Balance the owner compute jointly across every active group: per-group
         # balancing repeats the same one-sided choice in every group of a group set
@@ -487,57 +452,55 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
     def _balance_owners_jointly(self, actives: list[_ActiveGroup]) -> None:
         """Balance the owner compute jointly across the step's active groups.
 
-        Delegates to `assign_owner_work` with the Newton-Schulz cost estimate,
-        so boundary parameters of different groups compensate one another's imbalance instead of
-        repeating the same one-sided per-group choice. `GroupOwnerLayout` is frozen, but its
-        `owners` mapping is updated in place. Deterministic and rank-identical for the
-        rank-identical `actives`.
+        Each FSDP buffer is counted once, even if its parameters have different optimizer
+        hyperparameters. The allocator estimates work for all matrices in these buffers;
+        only this step's active parameters participate in gather/scatter.
         """
-        owner_dicts = assign_owner_work(
-            [group.active.layouts for group in actives], ns_cost_fn(self._num_ns_steps)
+        fsdp_groups = list(dict.fromkeys(group.fsdp_group for group in actives))
+        owner_dicts = assign_owner_work(group.main_weight for group in fsdp_groups)
+        owners_by_group = dict(zip(fsdp_groups, owner_dicts, strict=True))
+        for group in actives:
+            owners = owners_by_group[group.fsdp_group]
+            group.tensor_to_owner = {i: owners[i] for i in group.tensor_indices}
+
+    def _step_gather(self, group: _ActiveGroup) -> tuple[DBuffer, dict[int, torch.Tensor]]:
+        """Compute local orthogonalization inputs and gather them on the group's stream.
+
+        Returns `(source, destination)`, which the caller keeps alive until its stream
+        has waited for the group stream. The group stream explicitly waits for the
+        caller's input writes before gathering.
+        """
+        buffer = group.fsdp_group.main_weight
+        reference = self.state[self._sharded_dtensor(group.fsdp_group, group.tensor_indices[0])][
+            "momentum_buffer"
+        ]
+        source = DBuffer(
+            buffer.mesh, buffer.placements, buffer.layout, reference.dtype, buffer.device
         )
-        for group, owners in zip(actives, owner_dicts, strict=True):
-            group.active.owners.clear()
-            group.active.owners.update(owners)
-
-    def _step_gather(
-        self, group: _ActiveGroup
-    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
-        """Stage 1 for one group's active parameters: compute the local
-        pre-orthogonalization chunks and post the group's gather.
-
-        The gather's P2P runs on the group's own stream inside a `waiting_stream_scope`, which
-        waits on the caller's stream at entry; the caller's stream itself is never blocked.
-        Returns `(source, destination)`, which the caller must keep referenced until it has
-        ordered its stream behind every group stream; the `destination` half is also recorded
-        on `group` for `_step_apply`.
-        """
-        active = group.active
         this_rank = self._this_rank()
-
-        # Stage 1: local pre-orthogonalization chunks, then post the group's gather.
-        source: dict[int, torch.Tensor] = {}
-        for i in active.layouts:
-            if active.layouts[i].rank_numel(this_rank) == 0:
+        for i in group.tensor_indices:
+            local = source.get_tensor_view(i)
+            if local.numel() == 0:
                 continue
             param = self._sharded_dtensor(group.fsdp_group, i)
             grad = param.grad
             assert isinstance(
                 grad, DTensor
             ), f"Gradient of sharded parameter {i} is not a `DTensor`."
-            source[i] = self._compute_orthogonalization_inputs(param, grad, group.torch_group, group.lr)
-        owned = [i for i in active.layouts if active.owners[i] == this_rank]
-        destination: dict[int, torch.Tensor] = {}
-        if owned:
-            reference = next(iter(source.values()))
-            destination = {
-                i: torch.empty(
-                    active.layouts[i].full_numel(), dtype=reference.dtype, device=reference.device
-                )
-                for i in owned
-            }
-        with self._p2p_scope(self._stream_for(group.fsdp_group)):
-            gather(source, destination, owner_layout=active)
+            inputs = self._compute_orthogonalization_inputs(
+                param, grad, group.torch_group, group.lr
+            )
+            local.copy_(inputs.view(local.shape))
+        destination = {
+            i: torch.empty(source.layout.tensor_shapes[i], dtype=source.dtype, device=source.device)
+            for i, owner in group.tensor_to_owner.items()
+            if owner == this_rank
+        }
+        stream = self._stream_for(group.fsdp_group)
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream(source.device))
+        with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+            gather(source, destination, tensor_to_owner=group.tensor_to_owner)
         return source, destination
 
     def _step_apply(self, group: _ActiveGroup) -> list[Any]:
@@ -550,7 +513,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         Returns the step temporaries, which the caller must keep referenced until it has
         ordered its stream behind every group stream.
         """
-        active = group.active
+        buffer = group.fsdp_group.main_weight
         destination = group.destination
         assert destination is not None, "`_step_gather` must run before `_step_apply`."
         this_rank = self._this_rank()
@@ -559,29 +522,27 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         # Stages 2 and 3, on the group's stream.
         stream = self._stream_for(group.fsdp_group)
         with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
-            updates = self._orthogonalize_active(active, destination, group_kwargs)
+            updates = self._orthogonalize_active(group, destination, group_kwargs)
             # The update dtype matches `_orthogonalize_active`'s fp32 output.
-            scratch = {
-                i: torch.empty(
-                    active.layouts[i].rank_numel(this_rank),
-                    dtype=torch.float32,
-                    device=self._device(),
-                )
-                for i in active.layouts
-                if active.owners[i] != this_rank and active.layouts[i].rank_numel(this_rank) > 0
-            }
-            scatter(updates, scratch, owner_layout=active)
-            for i in active.layouts:
-                layout = active.layouts[i]
-                numel = layout.rank_numel(this_rank)
+            scratch = DBuffer(
+                buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
+            )
+            scatter(updates, scratch, tensor_to_owner=group.tensor_to_owner)
+            local_range = buffer.layout.get_local_range(buffer.mesh, buffer.placements)
+            for i, owner in group.tensor_to_owner.items():
+                tensor_range = buffer.layout.get_tensor_range(i)
+                shard_range = intersect_ranges(tensor_range, local_range)
+                numel = shard_range.numel
                 if numel == 0:
                     continue
-                if active.owners[i] == this_rank:
-                    offset = layout.rank_offset(this_rank)
+                if owner == this_rank:
+                    offset = shard_range.start - tensor_range.start
                     update_shard = updates[i].reshape(-1)[offset : offset + numel]
                 else:
-                    update_shard = scratch[i]
-                self._apply_update(self._sharded_dtensor(group.fsdp_group, i), update_shard, group.lr)
+                    update_shard = scratch.get_tensor_view(i)
+                self._apply_update(
+                    self._sharded_dtensor(group.fsdp_group, i), update_shard, group.lr
+                )
             return [updates, scratch]
 
 
@@ -603,25 +564,7 @@ class FsdpMuon(FsdpOrthogonalizedOptimizer):
         dp_mesh: DeviceMesh,
     ) -> None:
         """Build the FSDP Muon optimizer; see `FsdpOrthogonalizedOptimizer` for the rest."""
-        _require_emerging_optimizers()
-
-        if hasattr(inner_optimizer, "num_ns_steps"):
-            self._num_ns_steps = inner_optimizer.num_ns_steps
-        else:
-            # For older `emerging_optimizers` versions, we use introspection
-            # techniques to get a sensible value for `num_ns_steps`.
-            try:
-                ortho_fn_vars = inspect.getclosurevars(inner_optimizer.scaled_orthogonalize_fn)
-                self._num_ns_steps = ortho_fn_vars.nonlocals["num_ns_steps"]
-            except KeyError:
-                warnings.warn(
-                    "Cannot access Muon closure non-locals; going with "
-                    "`emerging_optimizers.orthogonalized_optimizer.Muon` "
-                    "default `num_ns_steps` for compute cost estimation"
-                )
-                muon_sig = inspect.signature(inner_optimizer)
-                self._num_ns_steps = muon_sig.parameters["num_ns_steps"].default
-        super().__init__(params, inner_optimizer, dp_mesh=dp_mesh, num_ns_steps=self._num_ns_steps)
+        super().__init__(params, inner_optimizer, dp_mesh=dp_mesh)
 
     @override
     def _validate_param_ndims(self, params: Sequence[torch.Tensor]) -> None:
