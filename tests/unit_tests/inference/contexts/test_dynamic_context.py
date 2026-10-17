@@ -2207,6 +2207,87 @@ class TestDynamicContext:
 
         assert "room for 3 durable slots on this pipeline stage" in str(error.value)
 
+    def _get_context_with_attention_only_stage(self, **inference_config_kwargs):
+        """Build a PP=2 context for layout ``M*|**``; stage 1 holds no recurrent layer."""
+        params_dtype = torch.float32
+        if parallel_state.get_pipeline_model_parallel_rank() == 0:
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                [Symbols.MAMBA, Symbols.ATTENTION],
+                (544, 4),
+                (8, 64, 16),
+                params_dtype,
+                params_dtype,
+            )
+        else:
+            mamba_inference_state_config = None
+        return DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=4,
+                kv_channels=64,
+                num_attention_heads=8,
+                pipeline_model_parallel_size=2,
+                tensor_model_parallel_size=1,
+                pipeline_dtype=params_dtype,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                buffer_size_gb=0.1,
+                block_size_tokens=16,
+                max_tokens=1024,
+                unified_memory_level=0,
+                mamba_inference_state_config=mamba_inference_state_config,
+                **inference_config_kwargs,
+            ),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mamba_prefix_cache_rejects_pipeline_stage_without_recurrent_layers(self):
+        """Every stage raises when a Mamba cache budget meets a stage without recurrent layers.
+
+        The recurrent stage would otherwise wait alone in the Mamba cache-capacity
+        collective, and the stages would skip different prompt tokens.
+        """
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            with pytest.raises(ValueError, match="every pipeline stage of a hybrid model"):
+                self._get_context_with_attention_only_stage(
+                    enable_prefix_caching=True, prefix_caching_mamba_gb=0.05
+                )
+        finally:
+            self._restore_model_parallel()
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("enable_prefix_caching", [False, True])
+    def test_pipeline_stage_without_recurrent_layers_initializes(self, enable_prefix_caching):
+        """A stage without recurrent layers initializes without a Mamba cache budget.
+
+        Every stage learns that the pipeline holds recurrent layers, so memory-only prefix
+        caching skips the same (zero) prompt tokens on every stage.
+        """
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            context = self._get_context_with_attention_only_stage(
+                enable_prefix_caching=enable_prefix_caching
+            )
+            rank = parallel_state.get_pipeline_model_parallel_rank()
+            assert context.is_hybrid_model is (rank == 0)
+            assert context.pipeline_has_recurrent_layers
+            assert context.mamba_slot_allocator is None
+
+            pool_size = torch.tensor(
+                [context.kv_block_allocator.pool_size], device="cuda", dtype=torch.long
+            )
+            gathered = [torch.zeros_like(pool_size) for _ in range(2)]
+            torch.distributed.all_gather(
+                gathered, pool_size, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            assert len({t.item() for t in gathered}) == 1
+        finally:
+            self._restore_model_parallel()
+
     @pytest.mark.internal
     @rounder_override(64)
     def test_uneven_decoder_pp_layer_map_matches_get_num_layers_to_build(self):
