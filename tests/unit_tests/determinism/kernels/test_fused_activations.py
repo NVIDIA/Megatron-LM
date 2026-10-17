@@ -10,6 +10,8 @@ reductions in the weighted backward passes (``torch.sum(weights_grad, dim=-1)``)
 only non-elementwise math, so shapes are sized to make those reductions wide.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -25,10 +27,11 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_b
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.transformer.attention import Attention
-from megatron.core.transformer.torch_norm import L2Norm
+from megatron.core.transformer.torch_norm import L2Norm, WrappedTorchNorm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.determinism.kernels.harness import (
     CONTENTION_TOKENS,
+    assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     seeded,
 )
@@ -178,6 +181,25 @@ def test_l2norm_replays_bit_exactly():
     norm = L2Norm(hidden_size=128).cuda()
     x = _act((4096, 2, 32, 128))
     assert_replays_bit_exact(norm, (x,), replays=3, what="L2Norm")
+
+
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+def test_wrapped_torch_norm_gamma_replays(normalization):
+    """Replay outputs and gamma gradients after the constructor marks RMSNorm weights."""
+    seeded()
+    config = SimpleNamespace(
+        normalization=normalization,
+        layernorm_zero_centered_gamma=False,
+        persist_layer_norm=False,
+        sequence_parallel=False,
+        memory_efficient_layer_norm=False,
+    )
+    norm = WrappedTorchNorm(config=config, hidden_size=2048).cuda().to(dtype=DTYPE)
+    assert getattr(norm.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
+    x = _act((4096, 2, 2048))
+    assert_module_replays_bit_exact(
+        norm, (x,), replays=3, contention=True, what=f"WrappedTorchNorm[{normalization}]"
+    )
 
 
 # --- bias + dropout + residual --------------------------------------------------------------
