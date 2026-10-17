@@ -261,7 +261,21 @@ class ModelParallelConfig:
        be synchronized.
     """
 
-    deterministic_mode: bool = False
+    deterministic_mode: bool = field(
+        default=False,
+        metadata={
+            "argparse_meta": {
+                # On by default on the CLI (the dataclass default stays False); opt out with
+                # --disable-deterministic-mode. Stored as args.disable_deterministic_mode and
+                # converted back to ``deterministic_mode`` in core_transformer_config_from_args.
+                "arg_names": ["--disable-deterministic-mode"],
+                "dest": "disable_deterministic_mode",
+                "action": "store_true",
+                "default": False,
+                "help": "Disable deterministic mode (enabled by default on the command line).",
+            }
+        },
+    )
     """If true, code that has deterministic execution will be chosen. This usually
        means slower execution, but is good for debugging and testing. Defaults to False."""
 

@@ -1658,11 +1658,17 @@ def validate_args(args, defaults={}):
         "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
     )
 
+    if getattr(args, 'deterministic_mode_deprecated', False):
+        warn_rank_0(
+            '--deterministic-mode is deprecated and ignored: deterministic mode is now enabled '
+            'by default. Pass --disable-deterministic-mode to turn it off.'
+        )
+
     # Deterministic mode — env vars + config overrides + torch global state.
     # Implementation lives in ``megatron/training/determinism.py`` so the
     # same setup is reachable from tests / profiling scripts that don't go
     # through argparse.
-    if args.deterministic_mode:
+    if not getattr(args, 'disable_deterministic_mode', False):
         from megatron.training.determinism import apply_determinism_to_args
 
         apply_determinism_to_args(args)
@@ -2306,7 +2312,7 @@ def _add_inference_args(parser):
                        action='store_false', dest='offset_sampling_seed_by_dp_rank',
                        default=True,
                        help='Use the same inference sampling seed on every data-parallel rank. '
-                            '--deterministic-mode also uses the same seed on every DP rank.')
+                            'Deterministic mode (on by default) also uses the same seed on every DP rank.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
                        type=str, default='async',
                        choices=['async', 'legacy'],
@@ -2463,6 +2469,12 @@ def _add_network_size_args(parser):
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+    transformer_group.add_argument(
+        '--deterministic-mode', action='store_true', default=False,
+        dest='deterministic_mode_deprecated',
+        help='Deprecated and ignored: deterministic mode is now the default. '
+             'Use --disable-deterministic-mode to turn it off.',
+    )
 
     group = parser.add_argument_group(title='network size')
 

@@ -406,6 +406,7 @@ def core_transformer_config_from_args(args, config_class=None):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+    kw_args['deterministic_mode'] = not getattr(args, 'disable_deterministic_mode', False)
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm

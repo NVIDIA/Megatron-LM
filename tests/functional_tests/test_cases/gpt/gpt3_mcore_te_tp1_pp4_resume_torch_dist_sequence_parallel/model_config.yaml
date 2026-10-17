@@ -41,7 +41,6 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 4
   --sequence-parallel: true
   --ckpt-fully-parallel-load: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-checkpoint-opt_param-scheduler: true

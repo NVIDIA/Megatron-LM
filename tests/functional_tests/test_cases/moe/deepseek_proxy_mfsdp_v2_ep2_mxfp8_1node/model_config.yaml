@@ -123,6 +123,7 @@ MODEL_ARGS:
   --logging-level: 10
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --exit-interval: 50
+  --disable-deterministic-mode: true
 TEST_TYPE: regular
 METRICS:
   - "lm loss"

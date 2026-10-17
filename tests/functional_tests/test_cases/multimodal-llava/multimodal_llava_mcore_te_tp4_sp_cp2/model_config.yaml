@@ -44,7 +44,6 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 1
   --sequence-parallel: true
   --context-parallel-size: 2
-  --deterministic-mode: true
   --attention-softmax-in-fp32: true
   --ckpt-format: torch
   --no-gradient-accumulation-fusion: true

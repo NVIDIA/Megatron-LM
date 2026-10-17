@@ -39,7 +39,6 @@ MODEL_ARGS:
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 2
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-mcore-models: true

@@ -50,5 +50,6 @@ MODEL_ARGS:
   --bf16: true
   --log-memory-to-tensorboard: true
   --use-persistent-ckpt-worker: true
+  --disable-deterministic-mode: true
 TEST_TYPE: frozen-resume
 LAUNCHER: ft_launcher

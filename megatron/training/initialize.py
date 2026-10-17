@@ -141,7 +141,10 @@ def initialize_megatron(
         enable_batch_invariant_mode(backend, collective)
 
     # Before any Triton kernel runs, including the kernel warm-up before model construction.
-    tuning.install(_triton_autotune_config_from_args(args), deterministic=args.deterministic_mode)
+    tuning.install(
+        _triton_autotune_config_from_args(args),
+        deterministic=not getattr(args, 'disable_deterministic_mode', False),
+    )
 
     # torch.distributed initialization
     def finish_mpu_init():
