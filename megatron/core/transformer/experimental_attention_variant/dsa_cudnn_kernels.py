@@ -1823,6 +1823,9 @@ def run_fused_qk_topk_with_loss(
     packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q, packed_max_seqlen_k = (
         _get_packed_thd_metadata(use_local_indexer_varlen, packed_seq_params)
     )
+    # The cuDNN indexer kernel requires the weights tensor to match q's dtype.
+    if weights.dtype != q.dtype:
+        weights = weights.to(dtype=q.dtype)
     return FusedQKTopKWithSparseLossFunc.apply(
         q.contiguous(),
         k.contiguous(),
