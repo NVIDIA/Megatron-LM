@@ -383,6 +383,13 @@ class TEGroupedMLP(MegatronModule):
             and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
             and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
         )
+        # Routed expert inputs are padded to 256 by get_align_size_for_quantization.
+        # Probe once here to keep signature inspection out of the first forward pass.
+        # Older TE versions select fusion through the legacy environment variable instead.
+        self._grouped_linear_kwargs = {}
+        if self._with_fused_impl:
+            if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
+                self._grouped_linear_kwargs["split_alignment"] = 256
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
             self.config.gated_linear_unit
@@ -594,8 +601,7 @@ class TEGroupedMLP(MegatronModule):
             return False
 
         # TE can execute GroupedLinear -> activation -> GroupedLinear without a fused kernel.
-        # Leave CuTeDSL enablement and layout checks to TE's fusion matcher so disabling
-        # NVTE_CUTEDSL_FUSED_GROUPED_MLP does not disable the basic op-fuser path.
+        # Leave CuTeDSL eligibility and layout checks to TE's fusion matcher.
         return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
@@ -669,6 +675,7 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_weight=fc1_single_grouped_weight,
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
+            **self._grouped_linear_kwargs,
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
@@ -778,6 +785,7 @@ class TEGroupedMLP(MegatronModule):
             delay_wgrad_compute=fc2_delay_wgrad_compute,
             # Preserve p * (FC2(x) + bias) after the scaled activation moves p before FC2.
             **fc2_bias_kwargs,
+            **self._grouped_linear_kwargs,
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
