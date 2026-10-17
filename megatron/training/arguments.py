@@ -2740,6 +2740,11 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-split-qkv-per-head', action='store_true',
+                       help='Orthogonalize each Q, gate, K, and V head independently. '
+                       'Uniform head sizes use batched Newton-Schulz and require '
+                       'emerging-optimizers 0.3.0 or newer. By default, '
+                       'Q, gate, K, and V projections are orthogonalized separately')
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
@@ -2765,7 +2770,10 @@ def _add_regularization_args(parser):
                        'depends on the parallelism config; duplicated and distributed both '
                        'orthogonalize the whole matrix and give TP-invariant results; auto '
                        'select between duplicated and distributed mode per-weight for '
-                       'dense weights; layer_sharded assigns each 2D weight one NS home '
+                       'dense weights. For QKV weights, distributed mode applies only to '
+                       'projection splits with complete local query groups and no GTP; '
+                       'other layouts fall back to non-TP NS. layer_sharded assigns each '
+                       '2D weight one NS home '
                        'rank in the (gtp_remat x tp) domain and routes the shards there '
                        'with all_to_all (same math as duplicated, no redundant NS); '
                        'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
