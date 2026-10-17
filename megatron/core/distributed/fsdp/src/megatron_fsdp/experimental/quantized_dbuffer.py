@@ -282,6 +282,10 @@ class QuantizedDBuffer:
             actual = getattr(main_weight, attribute)
             if actual != expected:
                 raise ValueError(f"Expected main_weight {attribute} {expected!r}, got {actual!r}.")
+        assert (
+            self.is_rowwise_allocated and self.is_columnwise_allocated
+        ), "quantize_() requires both rowwise and columnwise planes to be allocated."
+
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
             # TE's MXFP8 quantize kernel writes scale_inv in its padded physical
             # layout (see _pad_rowwise_scale and _pad_columnwise_scale) and stores
