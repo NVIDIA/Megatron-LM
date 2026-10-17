@@ -20,6 +20,26 @@ LowLevelDataset = Union[IndexedDataset, Iterable]
 _PAD_TOKEN_ID = -1
 
 
+def is_out_of_vocab_token_id(token_id: int | None, vocab_size: int | None = None) -> bool:
+    """Check whether a token id cannot be used directly as an embedding index.
+
+    Args:
+        token_id (int | None): The token id to validate.
+        vocab_size (int | None, optional): The tokenizer vocabulary size, if known.
+
+    Returns:
+        bool: True if token_id is negative or greater than or equal to vocab_size.
+            False if token_id is None or a valid non-negative integer within [0, vocab_size).
+    """
+    if token_id is None:
+        return False
+    if token_id < 0:
+        return True
+    if vocab_size is not None and token_id >= vocab_size:
+        return True
+    return False
+
+
 class MegatronDataset(ABC, torch.utils.data.Dataset):
     """The highest level wrapper class from which all dataset classes should inherit
 
@@ -73,6 +93,8 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         # Handle pad token id provided by the tokenizer
         try:
             self._pad_token_id = self.config.tokenizer.pad
+            if self._pad_token_id is None:
+                self._pad_token_id = _PAD_TOKEN_ID
         except Exception:
             self._pad_token_id = _PAD_TOKEN_ID
 
@@ -93,6 +115,10 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
                 _special_tokens_list.append(self.config.tokenizer.eod)
             except (AttributeError, NotImplementedError):
                 pass
+        # Unset special-token ids are not collisions.
+        _special_tokens_list = [
+            token_id for token_id in _special_tokens_list if token_id is not None
+        ]
 
         if self._pad_token_id in _special_tokens_list:
             if self.config.allow_ambiguous_pad_tokens:
