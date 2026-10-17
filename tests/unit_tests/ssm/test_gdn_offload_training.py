@@ -316,7 +316,11 @@ def test_gdn_offload_training(
                     }
                 )
             torch.cuda.synchronize()
-            assert not any(diff(snapshots[0], snapshots[1]))
+            if fused_pre_gdr:
+                # Native gate backward atomically reduces FP32 parameter gradients.
+                torch.testing.assert_close(snapshots[1], snapshots[0], rtol=1e-5, atol=1e-8)
+            else:
+                assert not any(diff(snapshots[0], snapshots[1]))
             assert not manager._is_warmup
             if fraction == 0:
                 assert manager.offload_summary_total_bytes == 0
