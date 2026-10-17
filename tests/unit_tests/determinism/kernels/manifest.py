@@ -156,7 +156,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
-        "test_runtime_cp_attention.py.",
+        "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
+        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
@@ -719,8 +720,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
-        "test_te_wrappers.py. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not "
-        "replayed.",
+        "test_te_wrappers.py. The TE attention replay there also covers the config-derived "
+        "softmax_scale MultiLatentAttention hands to its core attention. The TE FusedMLAQUpProj "
+        "GEMM path and mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
