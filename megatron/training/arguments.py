@@ -1170,12 +1170,9 @@ def validate_args(args, defaults={}):
     # data
     assert args.num_dataset_builder_threads > 0
 
-    # Consumed tokens.
-    args.consumed_train_samples = 0
-    args.skipped_train_samples = 0
-    args.consumed_valid_samples = 0
     if args.rl_use_sequence_packing:
         args.consumed_train_bins = 0
+
 
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
@@ -2354,6 +2351,10 @@ def _add_inference_args(parser):
                             'world. Tagging shards role=prefill|decode enables disaggregated '
                             'inference (prefill hands KV to the decode pool); a dp>1 decode shard '
                             'is several independent decode instances.')
+    group.add_argument('--disagg-kv-transport-backend', type=str, default='nixl',
+                       choices=['nccl', 'nixl'],
+                       help='State transport for native disaggregated inference: '
+                            '"nccl" uses two-sided transfers and "nixl" uses one-sided pulls.')
     return parser
 
 

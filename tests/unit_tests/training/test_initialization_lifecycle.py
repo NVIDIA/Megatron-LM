@@ -560,7 +560,7 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
     args.padded_vocab_size = cli_vocab
     args.tensor_model_parallel_size = 2
     checkpoint_args = Namespace(padded_vocab_size=512)
-    state = {"args": checkpoint_args, "iteration": 17, "checkpoint_version": 3.0}
+    state = {"args": checkpoint_args, "checkpoint_version": 3.0}
     monkeypatch.setattr(
         checkpointing,
         "_load_base_checkpoint",
@@ -568,7 +568,6 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
     )
 
     checkpointing.load_args_from_checkpoint(args)
-    assert args.iteration == 17
     model = adapter(
         args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
     )

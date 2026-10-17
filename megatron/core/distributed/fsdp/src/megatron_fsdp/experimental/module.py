@@ -34,7 +34,12 @@ from .context import FsdpContext
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .parameter_group import (
+    FsdpParameter,
+    FsdpParameterGroup,
+    effective_dtype,
+    get_containing_parameter_group,
+)
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
 
@@ -81,8 +86,14 @@ class FsdpModule:
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
+        grad_accumulation_count: int | None = None,
     ) -> None:
-        """Initialize FSDP runtime state on an already-constructed module."""
+        """Initialize FSDP runtime state on an already-constructed module.
+
+        Args:
+            grad_accumulation_count: Total parameter-gradient callbacks per reduction
+                window. Defaults to one per owned trainable parameter.
+        """
         self._context = context
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
@@ -114,11 +125,9 @@ class FsdpModule:
             )
         self._parameter_groups = tuple(parameter_groups)
         self._trainable_parameter_countdown = Countdown(
-            sum(
-                len(group.fsdp_parameters)
-                for group in self._parameter_groups
-                if group.requires_grad
-            )
+            grad_accumulation_count
+            if grad_accumulation_count is not None
+            else sum(1 for _ in self._trainable_fsdp_parameters())
         )
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``register_hooks`` is
@@ -181,7 +190,7 @@ class FsdpModule:
 
         The hook runs when this module's backward is complete, so it can reshard
         this module's parameters and reduce their gradients. It is invoked once
-        all of this module's trainable parameters have accumulated gradients, or
+        all expected gradient-accumulation callbacks have arrived, or
         via a full-backward hook when the module owns no trainable parameters.
 
         Args:
@@ -230,6 +239,13 @@ class FsdpModule:
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
                     lambda parameter=parameter: grad_hook(parameter)
                 )
+
+    def _trainable_fsdp_parameters(self) -> Iterator[FsdpParameter]:
+        """Iterate this module's trainable parameters in a stable order."""
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            yield from group.fsdp_parameters
 
     @staticmethod
     def _pre_load_state_dict(

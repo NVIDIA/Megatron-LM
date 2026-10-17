@@ -346,7 +346,9 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
-        wandb_config = vars(args)
+        # Private attributes are runtime state rather than configuration and can be large; keep
+        # them out of the wandb config. Copy so the kitchen contents added below stay off args.
+        wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.
