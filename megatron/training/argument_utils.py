@@ -563,11 +563,13 @@ def _default_config_from_args(
         return kwargs
 
 
-def resolve_tokenizer_vocab_size(cfg: PretrainConfigContainer, padded_vocab_size: int | None) -> None:
+def resolve_tokenizer_vocab_size(
+    cfg: PretrainConfigContainer | InferenceConfigContainer, padded_vocab_size: int | None
+) -> None:
     """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
 
     Args:
-        cfg: Previously constructed training configuration. Explicit model
+        cfg: Previously constructed run configuration. Explicit model
             vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
         padded_vocab_size: Final size resolved by tokenizer initialization,
             including any CLI/checkpoint override. None is valid only when the

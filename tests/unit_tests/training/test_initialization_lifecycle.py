@@ -2,10 +2,13 @@
 
 """Tests for config construction before training runtime initialization."""
 
+import logging
+import runpy
 from argparse import ArgumentParser, Namespace
 from contextlib import nullcontext
 from copy import deepcopy
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -615,3 +618,126 @@ def test_vocabulary_resolution_neither_reads_globals_nor_initializes_services(mo
     resolve_tokenizer_vocab_size(cfg, 256)
     assert cfg.tokenizer.padded_vocab_size == 256
     initialize.assert_not_called()
+
+
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("vocabulary", ["tokenizer", "checkpoint", "explicit", "custom"])
+def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
+    monkeypatch, isolated_globals, training, vocabulary
+):
+    """The shared startup owns validation, tokenization, and runtime derivation."""
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.rank = 0
+    args.tokenizer_type = "NullTokenizer"
+    args.vocab_size = 133
+    args.padded_vocab_size = 512 if vocabulary == "checkpoint" else None
+    model = gpt_config_from_args(
+        args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
+    )
+    if vocabulary == "explicit":
+        model.vocab_size = 768
+    elif vocabulary == "custom":
+        model = None
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg.model = model
+    global_vars.set_args(args)
+    global_vars.set_run_config(cfg)
+    events = []
+    finalize = cfg.finalize
+
+    def finalize_inputs():
+        finalize()
+        # Stand in for a centralized derivation: services must see its result.
+        cfg.logger.log_interval = 17
+        events.append("finalize")
+
+    monkeypatch.setattr(cfg, "finalize", finalize_inputs)
+    build = global_vars._build_tokenizer
+
+    def tokenize(received_args):
+        assert events == ["finalize"]
+        assert cfg.logger.log_interval == 17
+        events.append("tokenizer")
+        return build(received_args)
+
+    monkeypatch.setattr(global_vars, "_build_tokenizer", tokenize)
+    expected_vocab = {"tokenizer": 256, "checkpoint": 512, "explicit": 768}
+
+    def writer(received_args):
+        assert received_args is args
+        assert cfg.logger.log_interval == 17
+        if model is not None:
+            assert model.vocab_size == expected_vocab[vocabulary]
+        assert cfg.tokenizer.padded_vocab_size == args.padded_vocab_size
+        events.append("writer")
+
+    monkeypatch.setattr(global_vars, "_set_wandb_writer", writer)
+    monkeypatch.setattr(global_vars, "_set_telemetry", Mock())
+    training_services = Mock(side_effect=lambda args: events.append("training"))
+    monkeypatch.setattr(global_vars, "initialize_training_runtime_services", training_services)
+    monkeypatch.setattr(initialize, "setup_logging", Mock())
+    monkeypatch.setattr(initialize, "initialize_rerun_state_machine", Mock())
+    monkeypatch.setattr(initialize.tuning, "install", Mock())
+
+    initialize.initialize_megatron(
+        allow_no_cuda=True,
+        skip_mpu_initialization=True,
+        training=training,
+        build_tokenizer=vocabulary != "custom",
+    )
+
+    assert events == (
+        ["finalize"]
+        + (["tokenizer"] if vocabulary != "custom" else [])
+        + ["writer"]
+        + (["training"] if training else [])
+    )
+    assert training_services.call_count == int(training)
+    assert (global_vars._GLOBAL_TOKENIZER is None) == (vocabulary == "custom")
+
+
+@pytest.mark.parametrize("bootstrap", [False, True])
+def test_invalid_config_stops_before_runtime_services(monkeypatch, isolated_globals, bootstrap):
+    args = _runtime_args()
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg.profiling.use_nsys_profiler = True
+    cfg.profiling.use_pytorch_profiler = True
+    services = Mock(side_effect=AssertionError("runtime services must not start"))
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
+    monkeypatch.setattr(initialize, "initialize_runtime_services", services)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        if bootstrap:
+            global_vars.set_global_variables(args, cfg)
+        else:
+            global_vars.set_args(args)
+            global_vars.set_run_config(cfg)
+            initialize.initialize_megatron(allow_no_cuda=True)
+    services.assert_not_called()
+
+
+def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_globals):
+    import megatron.training as training_package
+    from megatron.training import argument_utils, utils
+
+    args = Namespace(reset_attention_mask=False, batch_invariant_mode=False)
+    model = Mock()
+    cfg = Mock()
+    monkeypatch.setattr(logging, "basicConfig", Mock())
+    monkeypatch.setattr(arguments, "parse_and_validate_args", Mock(return_value=args))
+    monkeypatch.setattr(utils, "is_hybrid_model", lambda args: False)
+    monkeypatch.setattr(argument_utils, "gpt_config_from_args", Mock(return_value=model))
+    monkeypatch.setattr(argument_utils, "pretrain_cfg_container_from_args", Mock(return_value=cfg))
+    services = Mock(side_effect=AssertionError("entrypoint initialized services before pretrain"))
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
+    pretrain = Mock()
+    monkeypatch.setattr(training_package, "pretrain", pretrain)
+
+    runpy.run_path(str(Path(__file__).resolve().parents[3] / "train_rl.py"), run_name="__main__")
+
+    pretrain.assert_called_once()
+    assert pretrain.call_args.args[0] is cfg
+    assert global_vars.get_run_config() is cfg
+    assert global_vars._GLOBAL_TOKENIZER is None
+    services.assert_not_called()
