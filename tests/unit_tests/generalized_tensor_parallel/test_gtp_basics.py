@@ -32,6 +32,8 @@ Test groups
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != the required world size (4).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -207,6 +209,30 @@ def _worker_grouped_weight_list(rank, world_size, port):
 
 
 class TestWrapModuleParams:
+    @pytest.mark.parametrize('weight_name', ['weight0', 'weight64'])
+    def test_egtp_grouped_gated_fc1_rejects_checkpoint_only(self, weight_name):
+        from megatron.core.transformer.moe.experts import TEGroupedMLP
+
+        model = TEGroupedMLP.__new__(TEGroupedMLP)
+        nn.Module.__init__(model)
+        model.config = SimpleNamespace(gated_linear_unit=True)
+        model.tp_group = parallel_state.get_tensor_model_parallel_group()
+        model.linear_fc1 = nn.Module()
+        weight = GTPShardedParam(torch.ones(4, 4, device="cuda"))
+        weight.group = dist.group.WORLD
+        weight.gtp_replica_group = model.tp_group
+        model.linear_fc1.register_parameter(weight_name, weight)
+
+        # Tagging is also used by training runs that never construct a checkpoint.
+        gtp_module.tag_gtp_params_with_names(model)
+        assert weight._debug_name == f"linear_fc1.{weight_name}"
+        with pytest.raises(NotImplementedError, match="checkpointing EGTP-sharded grouped gated"):
+            model.sharded_state_dict()
+
+        model.config.gated_linear_unit = False
+        state = model.sharded_state_dict(metadata={'dp_cp_group': model.tp_group})
+        assert f"linear_fc1.{weight_name}" in state
+
     def test_linear_weight_replaced(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_linear_param_replaced, 4)
@@ -596,6 +622,11 @@ class TestLatentProjectionChainClassification:
         class _Model:
             def named_parameters(_self):
                 return iter(zip((self.FC1, self.FC2), params))
+
+            def named_modules(_self):
+                # tag_gtp_params_with_names walks modules for gated fc1 weights; this
+                # fixture has bare params only.
+                return iter(())
 
         gtp_module.classify_gtp_remat_chains(
             _Model(), cuda_graph_modules=cuda_graph_modules, cuda_graph_impl=cuda_graph_impl
@@ -2365,8 +2396,6 @@ class TestWgradAccumBatchScheduleGate:
 
     def _tag_output_layer(self, monkeypatch, schedule):
         """Enabled flag for one output_layer param, under the calculator production builds."""
-        from types import SimpleNamespace
-
         from megatron.core import num_microbatches_calculator as nmb
 
         nmb.destroy_num_microbatches_calculator()
@@ -2378,13 +2407,15 @@ class TestWgradAccumBatchScheduleGate:
                 data_parallel_size=1,
                 step_batch_size_schedule=schedule,
             )
-        # The stub stands in for a GTPShardedParam; only the name drives the decision.
-        monkeypatch.setattr(gtp_module, "is_gtp_param", lambda p: True)
-        param = SimpleNamespace()
+        # Use the real module traversal interface; only GTP parameter detection is mocked.
+        model = nn.Module()
+        model.module = nn.Module()
+        model.module.output_layer = nn.Module()
+        param = nn.Parameter(torch.zeros(1))
+        model.module.output_layer.weight = param
+        monkeypatch.setattr(gtp_module, "is_gtp_param", lambda p: p is param)
         try:
-            gtp_module.tag_gtp_params_with_names(
-                SimpleNamespace(named_parameters=lambda: [("module.output_layer.weight", param)])
-            )
+            gtp_module.tag_gtp_params_with_names(model)
         finally:
             nmb.destroy_num_microbatches_calculator()
         return param._wgrad_accum_enabled
