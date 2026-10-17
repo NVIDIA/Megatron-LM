@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import random
 import time
 from collections.abc import Iterator
 from functools import partial
@@ -22,11 +23,12 @@ from typing import Any
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_outplace
+from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import MegatronOptimizer, OptimizerConfig, get_megatron_optimizer
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -37,10 +39,18 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    get_cuda_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import get_attr_wrapped_model, get_batch_on_this_cp_rank, get_model_config
+from megatron.core.utils import (
+    get_attr_wrapped_model,
+    get_batch_on_this_cp_rank,
+    get_model_config,
+    unwrap_model,
+)
 
 
 def _arguments() -> argparse.Namespace:
@@ -49,6 +59,10 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--weights", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True, help="JSONL with a messages field")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--save-checkpoint", type=Path, help="Save native model/Adam/RNG state after the run"
+    )
+    parser.add_argument("--load-checkpoint", type=Path, help="Resume native model/Adam/RNG state")
     parser.add_argument(
         "--dry-run", action="store_true", help="CPU configuration/tokenizer preflight"
     )
@@ -99,6 +113,10 @@ def _arguments() -> argparse.Namespace:
         parser.error("--microbatches must be divisible by --pp when using --vp")
     if not args.dry_run and int(os.environ.get("WORLD_SIZE", "1")) % (args.tp * args.cp * args.pp):
         parser.error("WORLD_SIZE must be divisible by TP * CP * PP")
+    if args.save_checkpoint is not None and args.save_checkpoint.exists():
+        parser.error("--save-checkpoint must name a new directory")
+    if args.load_checkpoint is not None and not args.load_checkpoint.is_dir():
+        parser.error("--load-checkpoint must name an existing checkpoint directory")
     return args
 
 
@@ -245,6 +263,64 @@ def _finalize_grads_and_check_pool(
     assert pool.get_pool_status()["global_stats"]["current_in_use"] == 0
 
 
+def _rng_state() -> dict[str, Any]:
+    """Capture the RNG streams used by native training on this rank."""
+    import numpy as np
+
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state(),
+        "tracker": get_cuda_rng_tracker().get_states(),
+    }
+
+
+def _checkpoint_state(
+    models: list[torch.nn.Module],
+    optimizer: MegatronOptimizer,
+    groups: ProcessGroupCollection,
+    next_step: int,
+    *,
+    is_loading: bool = False,
+) -> dict[str, Any]:
+    """Use Megatron's model/optimizer sharding and rank-local RNG checkpoint objects."""
+    state: dict[str, Any] = {
+        f"model{index}": model.sharded_state_dict(metadata={"dp_cp_group": groups.dp_cp})
+        for index, model in enumerate(unwrap_model(models))
+    }
+    state["optimizer"] = optimizer.sharded_state_dict(state, is_loading=is_loading)
+    state["next_step"] = next_step
+    state["rng"] = ShardedObject(
+        "rng", _rng_state(), (torch.distributed.get_world_size(),), (torch.distributed.get_rank(),)
+    )
+    return state
+
+
+def _load_checkpoint(
+    path: Path,
+    models: list[torch.nn.Module],
+    optimizer: MegatronOptimizer,
+    groups: ProcessGroupCollection,
+) -> int:
+    """Restore native training state; the transient offload manager warms up afresh."""
+    import numpy as np
+
+    state = dist_checkpointing.load(
+        _checkpoint_state(models, optimizer, groups, 0, is_loading=True), str(path)
+    )
+    for index, model in enumerate(unwrap_model(models)):
+        model.load_state_dict(state[f"model{index}"])
+    optimizer.load_state_dict(state["optimizer"])
+    rng = state["rng"]
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch"])
+    torch.cuda.set_rng_state(rng["cuda"])
+    get_cuda_rng_tracker().set_states(rng["tracker"])
+    return state["next_step"]
+
+
 def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> dict[str, Any]:
     """Run native gradient accumulation, finalization and BF16 Adam updates."""
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -279,6 +355,11 @@ def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> 
             use_gloo_process_groups=False,
             pg_collection=groups,
         )
+        first_step = (
+            _load_checkpoint(args.load_checkpoint, models, optimizer, groups)
+            if args.load_checkpoint is not None
+            else 0
+        )
         manager = PipelineOffloadManager.get_instance()
         finalize_grads = (
             partial(_finalize_grads_and_check_pool, pool=manager.cpu_tensor_pool)
@@ -291,7 +372,8 @@ def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> 
             config.finalize_model_grads_func = partial(finalize_grads, pg_collection=groups)
         schedule = get_forward_backward_func(pp_size=args.pp, vp_size=args.vp)
         samples, states = [], []
-        for step in range(args.warmup + args.iterations):
+        for local_step in range(args.warmup + args.iterations):
+            step = first_step + local_step
             batches = _batches(token_ids, args, step, groups)
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
@@ -350,7 +432,7 @@ def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> 
                         "optimizer": dict_list_map_outplace(_fingerprint, optimizer.state_dict()),
                     }
                 )
-            elif step >= args.warmup:
+            elif local_step >= args.warmup:
                 samples.append(
                     {
                         "step": step,
@@ -368,12 +450,21 @@ def _train(args: argparse.Namespace, provider: Any, token_ids: torch.Tensor) -> 
                 grad_norm,
                 offload_status["selected_transfer_bytes"],
             )
+        if args.save_checkpoint is not None:
+            if torch.distributed.get_rank() == 0:
+                args.save_checkpoint.mkdir(parents=True)
+            torch.distributed.barrier()
+            dist_checkpointing.save(
+                _checkpoint_state(models, optimizer, groups, step + 1), str(args.save_checkpoint)
+            )
         return {
             "rank": torch.distributed.get_rank(),
             "gpu": torch.cuda.get_device_name(),
             "samples": samples,
             "states": states,
             "offload_status": offload_status,
+            "first_step": first_step,
+            "next_step": step + 1,
         }
     finally:
         torch.cuda.synchronize()

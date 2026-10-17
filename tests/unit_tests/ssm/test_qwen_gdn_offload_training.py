@@ -3,6 +3,7 @@
 """Validate Qwen training inputs before checkpoint loading or distributed setup."""
 
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -44,3 +45,32 @@ def test_qwen_parallel_input_boundaries(
             _arguments()
         assert raised.value.code == 2
         assert error in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_checkpoint_path_boundaries(
+    existing: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject overwriting a checkpoint or resuming a missing directory before model loading."""
+    path = tmp_path / "checkpoint"
+    if existing:
+        path.mkdir()
+    base = [
+        "qwen-training",
+        "--weights",
+        "weights",
+        "--data",
+        "data",
+        "--output",
+        "out",
+        "--dry-run",
+    ]
+    for flag in ("--save-checkpoint", "--load-checkpoint"):
+        monkeypatch.setattr(sys, "argv", [*base, flag, str(path)])
+        if existing == (flag == "--save-checkpoint"):
+            with pytest.raises(SystemExit) as raised:
+                _arguments()
+            assert raised.value.code == 2
+        else:
+            args = _arguments()
+            assert getattr(args, flag[2:].replace("-", "_")) == path

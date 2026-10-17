@@ -114,6 +114,15 @@ Check zero pinned-buffer ownership before native schedule resets; positive
 fractions must select transfers. The supplied JSONL must contain a `messages`
 field accepted by the local tokenizer's chat template.
 
+To check restart behavior, finish a run with `--save-checkpoint /path/to/new-checkpoint`,
+then start a fresh process with `--load-checkpoint /path/to/new-checkpoint`.
+The tool uses Megatron's distributed checkpointing for model parameters, complete
+optimizer/master-weight state and per-rank RNG state. Token windows continue from
+the saved next-step index. Keep the model, data, topology and other training
+arguments unchanged between runs. The offload manager is transient and learns
+its transfer policy again after restart. Compare the resumed states with the
+corresponding steps of an uninterrupted `--check-state` run.
+
 Exact replay assumes the same per-rank tuning choices; independently autotuned
 configurations do not have a global bitwise-reproducibility guarantee.
 [The recorded cold-cache controls](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/8c5cc72379de4e9ef8d80856973dd64f23cc0dac/gpu-20261016)
