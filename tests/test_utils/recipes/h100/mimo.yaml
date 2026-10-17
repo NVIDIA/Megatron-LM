@@ -81,3 +81,21 @@ products:
       - environment: [dev]
         # Broken: exceeds 1h job timeout in CI
         scope: [mr-github-broken]
+  - test_case: [mimo_hetero_gtp_checkpoint_round_trip]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_h100]
+        n_repeat: [1]
+        time_limit: [1800]
+        artifacts: [null]
+        script:
+          - |-
+            rm -f "${{HOME}}/.netrc"
+            unset RO_API_TOKEN
+            set -euo pipefail
+            cd /opt/megatron-lm
+            export PYTHONPATH="$(pwd):${{PYTHONPATH:-}}"
+
+            uv run --no-sync pytest -s \
+              tests/functional_tests/test_cases/mimo/{test_case}/test_checkpoint_round_trip.py

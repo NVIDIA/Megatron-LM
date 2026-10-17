@@ -129,8 +129,8 @@ def _build_grid(
 ) -> HyperCommGrid:
     """Create a dense grid plus its expert view and the process groups MIMO needs."""
     grid = HyperCommGrid(
-        shape=[spec.tp, spec.gtp_remat, spec.cp, spec.dp, spec.pp],
-        dim_names=["tp", "gtp_remat", "cp", "dp", "pp"],
+        shape=[spec.tp, spec.cp, spec.gtp_remat, spec.dp, spec.pp],
+        dim_names=["tp", "cp", "gtp_remat", "dp", "pp"],
         rank_offset=spec.rank_offset,
         backend="nccl",
     )
@@ -154,12 +154,12 @@ def _build_grid(
         create_pg(["pp"], "pp")
         create_pg(["dp"], "dp")
         create_pg(["dp", "cp"], "dp_cp")
-        create_pg(["gtp_remat", "dp", "cp"], "gtp_remat_dp_cp")
+        create_pg(["cp", "gtp_remat", "dp"], "gtp_remat_dp_cp")
         create_pg(["tp", "cp"], "tp_cp")
         create_pg(["tp", "gtp_remat", "pp"], "mp")
         create_pg(["tp", "gtp_remat", "dp"], "tp_dp")
-        create_pg(["tp", "gtp_remat", "dp", "cp"], "tp_dp_cp")
-        create_pg(["tp", "gtp_remat", "cp", "dp", "pp"], "intra_dist_opt_instance")
+        create_pg(["tp", "cp", "gtp_remat", "dp"], "tp_dp_cp")
+        create_pg(["tp", "cp", "gtp_remat", "dp", "pp"], "intra_dist_opt_instance")
 
         create_pg(["ep"], "ep", view=_EXPERT_VIEW)
         create_pg(["expt_tp"], "ep_tp", view=_EXPERT_VIEW)
@@ -235,14 +235,14 @@ def pg_collection_from_grid(
     pgc.pp = grid.get_pg("pp")
     pgc.dp = grid.get_pg("dp")
     pgc.dp_cp = grid.get_pg(["dp", "cp"])
-    pgc.dp_cp_gtp_remat = grid.get_pg(["gtp_remat", "dp", "cp"])
+    pgc.dp_cp_gtp_remat = grid.get_pg(["cp", "gtp_remat", "dp"])
     pgc.intra_dp_cp = pgc.dp_cp
     pgc.gtp_remat = grid.get_pg("gtp_remat")
     pgc.tp_cp = grid.get_pg(["tp", "cp"])
     pgc.tp_dp = grid.get_pg(["tp", "gtp_remat", "dp"])
-    pgc.tp_dp_cp = grid.get_pg(["tp", "gtp_remat", "dp", "cp"])
+    pgc.tp_dp_cp = grid.get_pg(["tp", "cp", "gtp_remat", "dp"])
     pgc.mp = grid.get_pg(["tp", "gtp_remat", "pp"])
-    pgc.intra_dist_opt = grid.get_pg(["tp", "gtp_remat", "cp", "dp", "pp"])
+    pgc.intra_dist_opt = grid.get_pg(["tp", "cp", "gtp_remat", "dp", "pp"])
     pgc.ep = grid.get_pg("ep", view=_EXPERT_VIEW)
     pgc.expt_tp = grid.get_pg("expt_tp", view=_EXPERT_VIEW)
     pgc.expt_gtp_remat = grid.get_pg("expt_gtp_remat", view=_EXPERT_VIEW)

@@ -8,9 +8,12 @@ from torch.autograd import DeviceType
 from torch.autograd.profiler_util import FunctionEvent
 from torch.profiler import profile as TorchProfiler
 
-# CUPTI names its non-kernel device activities (copy-engine memcpys and memsets) with these
-# prefixes. Only consulted when the installed torch predates ``FunctionEvent.activity_type``.
-_NON_KERNEL_DEVICE_ACTIVITY_PREFIXES = ("Memcpy", "Memset")
+
+class EventGroup(list[FunctionEvent]):
+    """CUDA events linked to one CPU profiler event."""
+
+    def __repr__(self) -> str:
+        return repr([event.name for event in self])
 
 
 def events_overlap(first: FunctionEvent, second: FunctionEvent) -> bool:
@@ -54,36 +57,33 @@ def _linked_correlation_ids(
     return linked
 
 
-def _is_device_kernel(event: FunctionEvent) -> bool:
-    if event.device_type != DeviceType.CUDA:
-        return False
-    activity_type = getattr(event, "activity_type", None)
-    if activity_type is not None:
-        return activity_type == "kernel"
-    return not event.is_user_annotation and not event.name.startswith(
-        _NON_KERNEL_DEVICE_ACTIVITY_PREFIXES
-    )
+def event_groups_overlap(first: EventGroup, second: EventGroup) -> bool:
+    for first_event in first:
+        for second_event in second:
+            if events_overlap(first_event, second_event):
+                return True
+    return False
 
 
-def collect_linked_kernels(
+def collect_linked_event_groups(
     prof: TorchProfiler, cpu_event_name_substring: str
-) -> list[FunctionEvent]:
-    """Collect device kernel events linked to matching CPU op instances.
+) -> list[EventGroup]:
+    """Collect CUDA events grouped by linked CPU event.
 
     Device events are attributed by their launching CPU op rather than searched by their
     own name: device-side names vary across GPU architectures and kernel libraries -- for
     example a matmul kernel is named ``nvjet_``/``cutlass_``/``cublas_``... while its
     CPU op is simply ``aten::mm``.
 
-    Zero-CTA all-gather copy-engine memcpys are not kernels and are intentionally not
-    returned.
+    Each group contains the CUDA events linked to one matching CPU event, including kernels
+    and memcpys.
     """
     # A correlation id is shared by a device event and the leaf runtime op that issued it,
     # not the enclosing matched op, so walk cpu_parent up from each correlated leaf. Id 0
     # is the "no device correlation" sentinel and is skipped.
     events = prof.events()
     linked_correlation_ids = _linked_correlation_ids(prof, events)
-    matching_correlations: set[int] = set()
+    groups_by_correlation: dict[int, EventGroup] = {}
     for event in events:
         correlation_id = linked_correlation_ids[id(event)]
         if event.device_type != DeviceType.CPU or not correlation_id:
@@ -91,20 +91,20 @@ def collect_linked_kernels(
         node = event
         while node is not None:
             if cpu_event_name_substring in node.name:
-                matching_correlations.add(correlation_id)
+                groups_by_correlation[correlation_id] = EventGroup()
                 break
             node = node.cpu_parent
 
-    linked_kernels: list[FunctionEvent] = []
     for event in events:
-        if not _is_device_kernel(event):
+        if event.device_type != DeviceType.CUDA:
             continue
         correlation_id = linked_correlation_ids[id(event)]
         assert (
             correlation_id is not None
-        ), f"Could not recover the linked correlation id of device kernel {event.name!r}"
-        if correlation_id not in matching_correlations:
+        ), f"Could not recover the linked correlation id of device event {event.name!r}"
+        group = groups_by_correlation.get(correlation_id)
+        if group is None:
             continue
-        linked_kernels.append(event)
+        group.append(event)
 
-    return linked_kernels
+    return list(groups_by_correlation.values())

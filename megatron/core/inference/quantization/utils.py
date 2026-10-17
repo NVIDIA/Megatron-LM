@@ -1,10 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Dict, Optional, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.mxfp8_tensor import (
+    MXFP8Backend,
+    MXFP8Tensor,
+    validate_mxfp8_tensor,
+)
+
+if TYPE_CHECKING:
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
 
 try:
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as TEMXFP8Tensor
@@ -50,7 +59,35 @@ def _verify_te_to_mcore_mxfp8_conversion(te_dequantized, fi_quantized: MXFP8Tens
         raise ValueError(f"MXFP8 sanity check failed. Diff norm: {diff_norm}")
 
 
-def quantize_model_to_mxfp8(model: torch.nn.Module, backend: str = "flashinfer") -> None:
+def resolve_mxfp8_backend(
+    inference_grouped_gemm_backend: str | InferenceGroupedGemmBackend,
+) -> MXFP8Backend:
+    """Resolve the MXFP8 quantizer required by an inference grouped-GEMM backend.
+
+    Args:
+        inference_grouped_gemm_backend: The configured backend, either as its raw
+            string value or as the enum produced by ``TransformerConfig``.
+
+    Returns:
+        The MXFP8 quantization backend to use.
+
+    Raises:
+        ValueError: If the grouped-GEMM backend does not support MXFP8.
+    """
+    grouped_gemm_backend = getattr(
+        inference_grouped_gemm_backend, "value", inference_grouped_gemm_backend
+    )
+    if grouped_gemm_backend == "torch":
+        return "triton"
+    if grouped_gemm_backend == "flashinfer":
+        return "flashinfer"
+    raise ValueError(
+        "MXFP8 inference does not support "
+        f"inference_grouped_gemm_backend={grouped_gemm_backend!r}."
+    )
+
+
+def quantize_model_to_mxfp8(model: torch.nn.Module, backend: MXFP8Backend = "flashinfer") -> None:
     """Convert TE MXFP8 weights to mcore MXFP8Tensor format.
 
     Recursively walks the model and replaces each TEMXFP8Tensor parameter
@@ -84,6 +121,11 @@ def quantize_model_to_mxfp8(model: torch.nn.Module, backend: str = "flashinfer")
                 # numerical differences between TE and mcore MXFP8 formats
                 te_dequantized = val.dequantize()
                 mcore_quantized = MXFP8Tensor.from_bf16(te_dequantized, backend=backend)
+                validate_mxfp8_tensor(
+                    mcore_quantized,
+                    expected_backend=backend,
+                    tensor_name=f"quantized MXFP8 parameter {key!r}",
+                )
                 _verify_te_to_mcore_mxfp8_conversion(te_dequantized, mcore_quantized)
                 del model._parameters[key]
                 setattr(model, key, mcore_quantized)
@@ -95,7 +137,7 @@ def quantize_model_to_mxfp8(model: torch.nn.Module, backend: str = "flashinfer")
 
 
 def _should_quantize_param(val: torch.Tensor) -> bool:
-    """Return True if a parameter should be quantized to FlashInfer MXFP8."""
+    """Return True if a parameter should be converted to an MCore MXFP8 tensor."""
     if not val.is_cuda:
         return False
     if HAVE_TE and isinstance(val, TEMXFP8Tensor):
@@ -137,25 +179,29 @@ def collect_mxfp8_param_metadata(
     return metadata
 
 
+@torch.inference_mode(False)
+@torch.no_grad()
 def quantize_params_to_mxfp8(
     model: torch.nn.Module,
     persistent_buffers: Optional[Dict[str, MXFP8Tensor]] = None,
     _prefix: str = "",
-    backend: str = "flashinfer",
+    backend: MXFP8Backend = "flashinfer",
 ) -> Dict[str, MXFP8Tensor]:
-    """Quantize model parameters to MXFP8Tensor format.
+    """Quantize model parameters to mutable MXFP8Tensor storage.
 
     Handles both TEMXFP8Tensor (fp8_param=True) and BF16/FP16 nn.Parameter
     inputs.  When *persistent_buffers* is provided, new quantized values are
     ``copy_()``'d into the existing MXFP8Tensor objects so that CUDA-graph
-    device-pointer captures remain valid.
+    device-pointer captures remain valid.  Persistent buffers are deliberately
+    created outside inference mode so later refits can update them regardless
+    of the caller's execution mode.
 
     Args:
         model: The model whose parameters should be quantized.
         persistent_buffers: If not ``None``, a dict mapping fully-qualified
             parameter names to previously-created ``MXFP8Tensor`` objects.
             Updated in-place and returned.
-        _prefix: Internal recursion prefix – callers should not set this.
+        _prefix: Internal recursion prefix; callers should not set this.
         backend: 'flashinfer' or 'triton' quantization backend.
 
     Returns:
@@ -189,10 +235,14 @@ def quantize_params_to_mxfp8(
 
             if fqn in persistent_buffers:
                 # Subsequent call: copy into existing tensors to preserve addresses
-                new_tensor = MXFP8Tensor.from_bf16(bf16_data, backend=backend)
-                persistent_buffers[fqn].data.copy_(new_tensor.data)
-                persistent_buffers[fqn].scale.copy_(new_tensor.scale)
-                mcore_tensor = persistent_buffers[fqn]
+                persistent_tensor = persistent_buffers[fqn]
+                validate_mxfp8_tensor(
+                    persistent_tensor,
+                    expected_backend=backend,
+                    tensor_name=f"persistent MXFP8 parameter {fqn!r}",
+                )
+                persistent_tensor.copy_(bf16_data)
+                mcore_tensor = persistent_tensor
             else:
                 # First call: create new MXFP8Tensor
                 mcore_tensor = MXFP8Tensor.from_bf16(bf16_data, backend=backend)
@@ -202,6 +252,12 @@ def quantize_params_to_mxfp8(
                     _verify_te_to_mcore_mxfp8_conversion(bf16_data, mcore_tensor)
 
                 persistent_buffers[fqn] = mcore_tensor
+
+            validate_mxfp8_tensor(
+                mcore_tensor,
+                expected_backend=backend,
+                tensor_name=f"quantized MXFP8 parameter {fqn!r}",
+            )
 
             # Replace nn.Parameter with MXFP8Tensor attribute
             del model._parameters[key]

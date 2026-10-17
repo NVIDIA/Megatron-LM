@@ -11,6 +11,7 @@ import torch
 
 from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
@@ -70,11 +71,12 @@ except ImportError:
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TELinear,
+        TENorm,
         TERMSNormDuplicatedLinear,
         te_checkpoint,
     )
 else:
-    TELinear, TERMSNormDuplicatedLinear, te_checkpoint = None, None, None
+    TELinear, TENorm, TERMSNormDuplicatedLinear, te_checkpoint = None, None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -310,6 +312,12 @@ class MoELayer(BaseMoELayer):
                 if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
                 else None
             )
+            linear_gtp_kwargs = {}
+            if linear_cls is TELinear:
+                linear_gtp_kwargs = {
+                    "gtp_remat_group": gtp_remat_group,
+                    "gtp_replica_group": pg_collection.dp_cp,
+                }
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -321,8 +329,14 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
-                gtp_remat_group=gtp_remat_group,
+                **linear_gtp_kwargs,
             )
+            if self.config.moe_use_norm_before_up_proj:
+                self.fc2_norm = TENorm(
+                    config=self.config,
+                    hidden_size=self.config.moe_latent_size,
+                    eps=self.config.layernorm_epsilon,
+                )
             fc2_linear_cls = (
                 TERMSNormDuplicatedLinear
                 if self.config.moe_latent_up_projection_rmsnorm
@@ -331,11 +345,11 @@ class MoELayer(BaseMoELayer):
             fc2_extra_kwargs = (
                 {"tp_group": pg_collection.tp}
                 if fc2_linear_cls is TERMSNormDuplicatedLinear
-                else {"gtp_remat_group": gtp_remat_group}
+                else linear_gtp_kwargs
             )
-            # TODO: When TERMSNormDuplicatedLinear accepts `gtp_remat_group`, carry it into this
-            # wrapper together with its owning TP group; TE tensor-parallel execution remains
-            # local with `tp_size=1`.
+            # TODO: When TERMSNormDuplicatedLinear accepts `gtp_remat_group` /
+            # `gtp_replica_group`, carry them into this wrapper together with its owning TP group;
+            # TE tensor-parallel execution remains local with `tp_size=1`.
             self.fc2_latent_proj = fc2_linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
@@ -349,6 +363,11 @@ class MoELayer(BaseMoELayer):
                 name=(name + ".fc2_latent_proj") if name is not None else None,
                 **fc2_extra_kwargs,
             )
+            if linear_cls is TELinear:
+                # The duplicated operation has no TP execution group. TELinear uses
+                # `_tp_group` only to encode the owning TP replica coordinate in checkpoints.
+                self.fc1_latent_proj._tp_group = pg_collection.tp
+                self.fc2_latent_proj._tp_group = pg_collection.tp
 
         # Megakernel backends replace native dispatch, expert compute, and combine,
         # so only construct a token dispatcher for the native MoE path.
@@ -426,12 +445,11 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
-            if config.inference_grouped_gemm_backend == 'auto':
+            if config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
                 assert HAVE_FLASHINFER, (
-                    "inference_grouped_gemm_backend='auto'"
-                    "requires flashinfer-python. "
+                    "inference_grouped_gemm_backend='flashinfer' requires flashinfer-python. "
                     "Install flashinfer-python or set "
-                    "inference_grouped_gemm_backend to 'torch' or 'te'."
+                    "inference_grouped_gemm_backend to 'torch' or 'vllm'."
                 )
 
                 # Verify that pre-compiled FlashInfer CUTLASS kernels are available
@@ -441,14 +459,14 @@ class MoELayer(BaseMoELayer):
                 from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
                 check_flashinfer_jit_cache_installed()
-            elif config.inference_grouped_gemm_backend == 'torch':
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
                 assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
                     torch, '_grouped_mm'
                 ), (
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
                 )
-            elif config.inference_grouped_gemm_backend == 'vllm':
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
                 assert HAVE_TRITON, (
                     "inference_grouped_gemm_backend='vllm' requires Triton. "
                     "Install triton (pip install triton)."
@@ -733,6 +751,8 @@ class MoELayer(BaseMoELayer):
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
+            if self.config.moe_use_norm_before_up_proj:
+                output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:

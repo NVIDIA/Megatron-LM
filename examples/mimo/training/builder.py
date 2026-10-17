@@ -24,7 +24,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.training.global_vars import get_args
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 
-_LANGUAGE_SEED_OFFSET = 20_000
+_LANGUAGE_SEED_OFFSET = 0
 # Add per-encoder offsets before wiring more than one encoder grid.
 _ENCODER_SEED_OFFSET = 10_000
 
@@ -126,14 +126,25 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         use_layer_wise_param_layout: bool | None = None,
     ) -> list[MimoModel]:
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
+        if use_megatron_fsdp or use_torch_fsdp2:
+            raise NotImplementedError("MIMO training with FSDP/FSDP2 has not been tested yet.")
         if wrap_with_ddp and ddp_config is None:
             raise ValueError("ddp_config is required when wrap_with_ddp is True")
-        # MIMO derives each module's DDP config from args (_ddp_config_from_args), which
-        # keeps the default compact LayerWise layout, so a padded-layout request cannot hold.
-        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
+        # The LayerWise param layout is selected only by ddp_config.use_layer_wise_param_layout
+        # (dev #5388); wrap_active_modules_with_ddp() forwards the caller's ddp_config per role.
+        # Reject an explicit request that disagrees with it before building the model.
+        if (
+            use_layer_wise_distributed_optimizer
+            and use_layer_wise_param_layout is not None
+            and ddp_config is not None
+            and bool(use_layer_wise_param_layout) != bool(ddp_config.use_layer_wise_param_layout)
+        ):
+            configured_layout = "padded" if ddp_config.use_layer_wise_param_layout else "compact"
             raise ValueError(
-                "MIMO uses the compact LayerWise param layout; "
-                "use_layer_wise_param_layout=True is not supported. Leave it as None."
+                f"MIMO uses the {configured_layout} LayerWise param layout selected by "
+                "ddp_config.use_layer_wise_param_layout; "
+                f"use_layer_wise_param_layout={use_layer_wise_param_layout} disagrees with it. "
+                "Set it in ddp_config or leave this argument as None."
             )
 
         topology = self._topology
@@ -168,8 +179,10 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             args,
             mimo_model,
             topology,
-            data_parallel_random_init,
-            use_layer_wise_distributed_optimizer,
+            ddp_config=ddp_config,
+            data_parallel_random_init=data_parallel_random_init,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
         configure_grad_sync(args, mimo_model, topology)
         mimo_model.pg_collection = module_pg

@@ -20,14 +20,15 @@ from dataclasses import dataclass
 from weakref import ReferenceType, ref
 
 import torch
-import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Partial, Replicate
+from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .dbuffer import DBuffer, symmetric_memory_allocation
-from .placement import Partial, Placements, Replicate, changed_mesh_axis
+from .dbuffer import DBuffer
+from .placement import changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -91,7 +92,9 @@ class FsdpParameterGroup:
         owning_module: nn.Module,
         parameters: dict[str, nn.Parameter],
         mesh: DeviceMesh,
-        placements: Placements,
+        model_weight_placements: tuple[Placement, ...],
+        main_grad_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         allgather_stream: torch.cuda.Stream,
         reduce_scatter_stream: torch.cuda.Stream,
@@ -103,8 +106,10 @@ class FsdpParameterGroup:
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
             parameters: Root-module-relative FQNs and their parameters.
-            mesh: Device mesh used for all DBuffer storage in this version.
-            placements: Parameter, gradient, and optimizer placements.
+            mesh: Parent device mesh containing the data-parallel axes.
+            model_weight_placements: Compute-weight buffer placements.
+            main_grad_placements: Main-gradient buffer placements.
+            main_weight_placements: Main-weight buffer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
             allgather_stream: Stream used to allocate model weights when a dtype cast is required.
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
@@ -115,14 +120,13 @@ class FsdpParameterGroup:
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
+        if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
+            raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
             parameter_to_fqns.setdefault(parameter, []).append(fqn)
 
-        model_weight_placements = tuple(placements.parameter)
-        main_grad_placements = tuple(placements.gradient)
-        main_weight_placements = tuple(placements.optimizer)
         self._model_weight_placements = model_weight_placements
         # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
         # is finalized to main_weight's placements after the last microbatch.
@@ -244,7 +248,7 @@ class FsdpParameterGroup:
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
             return nullcontext()
-        return symmetric_memory_allocation(self._symm_mem_pool)
+        return torch.cuda.use_mem_pool(self._symm_mem_pool)
 
     def _set_module_parameter(self, fqns: tuple[str, ...], parameter: nn.Parameter) -> None:
         owning_module = self._owning_module()
@@ -333,7 +337,7 @@ class FsdpParameterGroup:
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
-                placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
+                placements=[Partial("avg")] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,

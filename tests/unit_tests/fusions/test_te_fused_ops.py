@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
+
 import pytest
 import torch
 
@@ -18,6 +20,14 @@ pytestmark = [
 
 def _make_rmsnorm() -> torch.nn.Module:
     return te_ext.TEFusedResidualRMSNorm(normalized_shape=16, dtype=torch.float32, device="cpu")
+
+
+def _make_fused_mlp_shell() -> torch.nn.Module:
+    module = te_ext.TEFusedMLP.__new__(te_ext.TEFusedMLP)
+    torch.nn.Module.__init__(module)
+    module.linear_fc1 = torch.nn.Linear(2, 2)
+    module.linear_fc2 = torch.nn.Linear(2, 2)
+    return module
 
 
 def test_rmsnorm_fused_impl_aliases_source_weight():
@@ -99,3 +109,81 @@ def test_mcore_te_linear_adapter_aliases_source_weight():
 
     assert isinstance(op, te_ext.te.pytorch.ops.BasicLinear)
     assert op.weight is linear.weight
+
+
+def test_fused_mlp_forwards_current_submodule_pre_hooks():
+    module = _make_fused_mlp_shell()
+    fused_impl = torch.nn.Identity()
+
+    # The real training lifecycle lazily constructs the fused implementation while
+    # DDP parameter-gather hooks are disabled for the first iteration.
+    module._register_hooks_on_fused_impl(fused_impl)
+
+    events = []
+
+    def old_hook(submodule, _inputs):
+        events.append(("old", submodule, tuple(submodule.parameters(recurse=False))))
+
+    old_handles = [
+        module.linear_fc1.register_forward_pre_hook(old_hook),
+        module.linear_fc2.register_forward_pre_hook(old_hook),
+    ]
+    module.register_forward_pre_hook(old_hook)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fused_impl(torch.ones(1, 2))
+
+    assert [event[0] for event in events] == ["old", "old"]
+    assert [event[1] for event in events] == [module.linear_fc1, module.linear_fc2]
+    assert events[0][2][0] is module.linear_fc1.weight
+    assert events[1][2][0] is module.linear_fc2.weight
+
+    for handle in old_handles:
+        handle.remove()
+    events.clear()
+
+    def replacement_hook(submodule, _inputs, kwargs):
+        events.append(("replacement", submodule, kwargs))
+
+    module.linear_fc2.register_forward_pre_hook(replacement_hook, with_kwargs=True)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fused_impl(torch.ones(1, 2))
+
+    assert events == [("replacement", module.linear_fc2, {})]
+
+
+def test_fused_mlp_wrapper_hooks_execute_once():
+    module = _make_fused_mlp_shell()
+    fused_impl = torch.nn.Identity()
+    module.forward = lambda inputs: fused_impl(inputs)
+
+    events = []
+    module.register_forward_pre_hook(lambda _module, _inputs: events.append("forward-pre"))
+    module.register_forward_hook(lambda _module, _inputs, _output: events.append("forward-post"))
+    module.register_full_backward_pre_hook(
+        lambda _module, _grad_output: events.append("backward-pre")
+    )
+    module.register_full_backward_hook(
+        lambda _module, _grad_input, _grad_output: events.append("backward-post")
+    )
+    module._register_hooks_on_fused_impl(fused_impl)
+
+    output = module(torch.ones(1, 2, requires_grad=True))
+    output.sum().backward()
+
+    assert events == ["forward-pre", "forward-post", "backward-pre", "backward-post"]
+
+
+def test_fused_mlp_rejects_input_modifying_submodule_hook_added_after_construction():
+    module = _make_fused_mlp_shell()
+    fused_impl = torch.nn.Identity()
+    module._register_hooks_on_fused_impl(fused_impl)
+
+    module.linear_fc1.register_forward_pre_hook(lambda _module, inputs: inputs)
+
+    with pytest.warns(UserWarning, match="pre-forward hook"):
+        with pytest.raises(RuntimeError, match="modifies input tensor"):
+            fused_impl(torch.ones(1, 2))

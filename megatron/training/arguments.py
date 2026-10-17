@@ -496,6 +496,8 @@ def validate_args(args, defaults={}):
     args.data_parallel_size = args.world_size // total_model_size
 
     if args.perform_rl_step:
+        assert args.refit_method != 'nccl_m2n', 'nccl_m2n is unsupported by the built-in RL loop'
+
         # ----------------------------------------------------------------
         # CUDA graphs
         #
@@ -779,11 +781,17 @@ def validate_args(args, defaults={}):
         args.eval_global_batch_size = args.global_batch_size
     if args.eval_micro_batch_size is None:
         args.eval_micro_batch_size = args.micro_batch_size
+    # data_parallel_size is the replicate degree, so multiply the GTP-remat axis back in: evaluate()
+    # divides eval_global_batch_size by the same product to get its microbatch count, and without
+    # gtp_weight_remat_size here that division can silently floor (down to zero microbatches).
     assert (
-        args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0
+        args.eval_global_batch_size
+        % (args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size)
+        == 0
     ), (
         f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by "
         f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
+        f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
     )
 
     if args.perform_rl_step:
@@ -958,6 +966,14 @@ def validate_args(args, defaults={}):
     # validation further down (search for `supported_position_types`). Keeping a
     # second, narrower copy here caused 'mrope' to be rejected before the
     # authoritative check ever ran.
+
+    if args.mtp_hsm and not (args.mtp_num_layers and args.mtp_num_layers >= 2):
+        warn_rank_0(
+            "--mtp-hsm needs at least two MTP layers to mix anything, but "
+            f"--mtp-num-layers is {args.mtp_num_layers}. Disabling Hidden State Mixing.",
+            args.rank,
+        )
+        args.mtp_hsm = False
 
     # Validate MTP args for hybrid vs non-hybrid models
     if args.hybrid_layer_pattern is not None:
@@ -1821,6 +1837,21 @@ def validate_args(args, defaults={}):
                 "buffer via replace_raw_data is unsupported)."
             )
 
+        # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
+        # windows), which contradicts --disable-symmetric-registration.
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+            assert not getattr(args, 'disable_symmetric_registration', False), (
+                "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
+                "cannot be combined with --disable-symmetric-registration."
+            )
+            if getattr(args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False):
+                print_rank_0(
+                    "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
+                    "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
+                    "symmetric reduce-scatters accumulate in fp32 in-switch "
+                    "(NCCL multimem.ld_reduce .acc::f32)."
+                )
+
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
         args.bias_gelu_fusion = False
@@ -1962,6 +1993,18 @@ def validate_args(args, defaults={}):
             f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
             f'must be >= single sequence max length ({args.seq_length})'
         )
+
+    # Scheduler-name validation and variable_seq_lengths live in
+    # ModelParallelConfig.__post_init__; the buffer-size check above stays here
+    # because seq_length is not a core config field.
+    if args.sequence_packing_scheduler is not None:
+        # Packed microbatches carry different numbers of valid tokens, so the
+        # default per-microbatch loss averaging would weight tokens unevenly
+        # depending on how samples happened to be packed (same reasoning as
+        # the dynamic-context-parallel check above).
+        assert (
+            args.calculate_per_token_loss
+        ), 'Sequence packing must be used with --calculate-per-token-loss'
 
     # Data blend checks
     assert (
@@ -2397,6 +2440,10 @@ def validate_args(args, defaults={}):
         assert (
             args.multi_latent_attention
         ), "--mla-down-proj-fusion requires --multi-latent-attention"
+
+    assert (
+        not args.moe_use_norm_before_up_proj or args.moe_latent_size is not None
+    ), "--moe-use-norm-before-up-proj requires --moe-latent-size to be set."
 
     # MoE latent projections
     if args.moe_latent_size is not None:
@@ -3637,9 +3684,14 @@ def _add_regularization_args(parser):
     group.add_argument(
         '--muon-tp-mode',
         type=str,
-        default='blockwise',
-        choices=['blockwise', 'duplicated', 'distributed'],
+        default='duplicated',
+        choices=['blockwise', 'duplicated', 'distributed', 'auto'],
         help='How to perform NS calculation for tensor model parallel weights. '
+        'blockwise orthogonalizes each shard on its own, so the update rule '
+        'depends on the parallelism config; duplicated and distributed both '
+        'orthogonalize the whole matrix and give TP-invariant results; auto '
+        'select between duplicated and distributed mode per-weight for '
+        'dense weights. '
         'For QKV weights, distributed mode applies only to projection splits with '
         'complete local query groups; other layouts fall back to non-TP NS',
     )
@@ -3755,6 +3807,28 @@ def _add_rl_args(parser):
         'G consumes groups as they complete. '
         'B consumes complete trainer batches in submission order. '
         'R is not currently supported.',
+    )
+    group.add_argument(
+        '--rl-durable-rollout-bank',
+        action='store_true',
+        help='Persist completed rollout groups to a durable, write-through '
+        'ledger so they survive a SIGKILL (the SLURM time limit) and are '
+        'restored at restart instead of regenerated. No-op when unset.',
+    )
+    group.add_argument(
+        '--rl-rollout-bank-dir',
+        type=str,
+        default=None,
+        help='Directory for the durable rollout bank (on Lustre). Defaults to '
+        '<save>/rollout_bank so the bank stays coupled to the checkpoint.',
+    )
+    group.add_argument(
+        '--rl-rollout-bank-max-bytes',
+        type=int,
+        default=0,
+        help='Soft cap (bytes) on the rollout bank size; 0 = unbounded. On '
+        'exceed, a warning is logged. Compaction occurs at the next checkpoint '
+        'regardless of the cap and never blocks generation.',
     )
     group.add_argument(
         '--grpo-iterations',
@@ -3933,12 +4007,15 @@ def _add_rl_args(parser):
         '--refit-method',
         type=str,
         default='gloo',
-        choices=['nccl', 'gloo', 'nvshmem'],
+        choices=['nccl', 'nccl_m2n', 'gloo', 'nvshmem', 'nixl'],
         help=(
-            'Method to refit the model weights between training and inference models during RL. '
-            'nccl: use NCCLCopyService to refit using NCCL; '
+            'Method to refit model weights. '
+            'nccl: use NCCLCopyService; '
+            'nccl_m2n: use the official NCCL M2N API from a non-RL '
+            'launcher such as the ReFIT benchmark; '
             'gloo: use GlooCopyService over CPU; '
-            'nvshmem: use NVSHMEMCopyService to refit using the NVSHMEM.'
+            'nvshmem: use NVSHMEMCopyService; '
+            'nixl: use NixlCopyService.'
         ),
     )
     group.add_argument(
@@ -4600,7 +4677,23 @@ def _add_distributed_args(parser):
         dest='disable_symmetric_registration',
         default=False,
         help='Disable symmetric (window) registration for NCCL userbuffer registration.'
-        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.',
+        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set. '
+        'Cannot be combined with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub, which require symmetric windows.',
+    )
+    group.add_argument(
+        '--gtp-remat-nccl-ub',
+        action='store_true',
+        dest='gtp_remat_nccl_ub',
+        default=False,
+        help='Register the wgrad reduce-scatter send buffers with NCCL symmetric '
+        'memory on the GTP group, independent of --use-nccl-ub (which covers the DP group).',
+    )
+    group.add_argument(
+        '--gtp-expert-remat-nccl-ub',
+        action='store_true',
+        dest='gtp_expert_remat_nccl_ub',
+        default=False,
+        help='Like --gtp-remat-nccl-ub but for routed-expert (EGTP) groups.',
     )
     group.add_argument(
         '--fsdp-manual-registration',

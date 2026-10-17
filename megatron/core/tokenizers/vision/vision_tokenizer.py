@@ -24,7 +24,6 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
                 library (str): tokenizer library.
                 class_name (str): name of tokenizer class.
                 class_path (str): path to tokenizer class.
-                model_type (str): type of the model to be used with tokenizer.
         """
 
         super().__init__(path, config, **kwargs)
@@ -135,6 +134,11 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
     def pad(self):
         """Pad token ID."""
         return self._tokenizer.pad
+
+    @property
+    def bos(self):
+        """Beginning of sentence token ID."""
+        return self._tokenizer.bos
 
     @property
     def eod(self):

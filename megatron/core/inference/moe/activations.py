@@ -9,6 +9,11 @@ from unittest.mock import MagicMock
 
 import torch
 
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_COL_BLOCK,
+    MXFP8_SCALE_ROW_BLOCK,
+)
 from megatron.core.utils import null_decorator
 
 try:
@@ -226,7 +231,9 @@ def _squared_relu_quantize_kernel(
                 # Load and apply squared ReLU
                 x = tl.load(input_ptr + row * K + offs, mask=mask, other=0.0).to(tl.float32)
                 relu = tl.maximum(x, 0.0)
-                activated = relu * relu
+                # Match training and unfused inference: squared ReLU is materialized
+                # in BF16 before MXFP8 quantization, which determines the MXFP8 bins.
+                activated = (relu * relu).to(tl.bfloat16).to(tl.float32)
 
                 # Per-group-of-32 quantization
                 x_grouped = tl.reshape(activated, [BLOCK_GROUPS, 32])
@@ -282,18 +289,18 @@ def squared_relu_and_quantize_mxfp8(
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
     M, K = x.shape
-    assert K % 32 == 0
+    assert K % MXFP8_BLOCK_SIZE == 0
 
-    scale_cols = K // 32
-    n_row_blocks = _ceil_div(M, 128)
-    n_col_blocks = _ceil_div(scale_cols, 4)
-    total_scale_bytes = n_row_blocks * n_col_blocks * 512
+    scale_cols = K // MXFP8_BLOCK_SIZE
+    n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
+    n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
+    total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
 
     out_fp8 = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)
 
     BLOCK_K = triton.next_power_of_2(K)
-    BLOCK_GROUPS = BLOCK_K // 32
+    BLOCK_GROUPS = BLOCK_K // MXFP8_BLOCK_SIZE
     NUM_BLOCKS = min(M, 512)
 
     _squared_relu_quantize_kernel[(NUM_BLOCKS,)](
@@ -311,4 +318,6 @@ def squared_relu_and_quantize_mxfp8(
         NUM_BLOCKS=NUM_BLOCKS,
     )
 
-    return MXFP8Tensor(data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), backend="triton")
+    return MXFP8Tensor(
+        data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), dtype=x.dtype, backend="triton"
+    )

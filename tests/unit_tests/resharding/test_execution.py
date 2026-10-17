@@ -33,6 +33,12 @@ class MockCopyService(CopyService):
     def __init__(self):
         self.sends = []  # [(tensor, dest_rank, task_id)]
         self.recvs = []  # [(tensor, src_rank, task_id)]
+        self.plan = None
+        self.transform = None
+
+    def set_plan(self, plan, *, transform=None):
+        self.plan = plan
+        self.transform = transform
 
     def submit_send(self, src_tensor, dest_rank, task_id=None):
         self.sends.append((src_tensor.clone(), dest_rank, task_id))
@@ -49,6 +55,21 @@ class MockCopyService(CopyService):
                 recv_tensor.copy_(src[: recv_tensor.numel()].reshape(recv_tensor.shape))
         self.sends.clear()
         self.recvs.clear()
+
+
+class NativeMockCopyService(MockCopyService):
+    """Service that consumes the whole plan before slice submission."""
+
+    def __init__(self):
+        super().__init__()
+        self.native_calls = []
+
+    def execute_plan(self, plan, src_tensors, dst_tensors, *, transform=None):
+        self.native_calls.append((plan, src_tensors, dst_tensors, transform))
+        return True
+
+    def run(self):
+        raise AssertionError("native plan execution must bypass submit/run")
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +145,8 @@ class TestExecuteReshard:
         service = MockCopyService()
         _run(plan, src_module, dst_module, service)
 
+        assert service.plan is plan
+        assert service.transform is None
         assert torch.equal(
             dict(dst_module.named_parameters())["weight"].data,
             dict(src_module.named_parameters())["weight"].data,
@@ -278,6 +301,22 @@ class TestEdgeCases:
         plan = ReshardPlan(send_ops=[], recv_ops=[])
         service = MockCopyService()
         _run(plan, None, None, service)
+
+    def test_native_service_bypasses_slice_submission(self):
+        src_module = _make_module_with_params({"weight": torch.ones(2, device="cuda")})
+        dst_module = _make_module_with_params({"weight": torch.zeros(2, device="cuda")})
+        full_slice = _full_slice(1)
+        plan = ReshardPlan(
+            send_ops=[_make_transfer_op("weight", 1, True, full_slice, full_slice, task_id=0)],
+            recv_ops=[_make_transfer_op("weight", 0, False, full_slice, full_slice, task_id=0)],
+        )
+        service = NativeMockCopyService()
+
+        _run(plan, src_module, dst_module, service)
+
+        assert len(service.native_calls) == 1
+        assert service.sends == []
+        assert service.recvs == []
 
     def test_missing_param_in_src(self):
         """Send op referencing nonexistent param should be silently skipped."""

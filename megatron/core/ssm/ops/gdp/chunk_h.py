@@ -4,7 +4,7 @@
 # Forked from `fla/ops/gated_delta_product/chunk_deltaproduct_h.py` in
 # flash-linear-attention v0.5.1 (https://github.com/fla-org/flash-linear-attention).
 #
-# Licensed under the MIT license; see the LICENSE file in this directory.
+# Licensed under the MIT license; see the LICENSE file in the repository root.
 
 """Inter-chunk state recurrence for the Gated Delta Product.
 
@@ -28,6 +28,7 @@ from .common import HAVE_TRITON, exp2, prepare_chunk_indices, prepare_chunk_offs
         'USE_G': lambda args: args['g'] is not None,
         'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
         'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
+        'HAS_STATE_INDICES': lambda args: args['state_indices'] is not None,
         'SAVE_NEW_VALUE': lambda args: args['v_new'] is not None,
         'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
     }
@@ -51,6 +52,9 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     h,
     h0,
     ht,
+    state_indices,
+    ht_slot_stride,
+    ht_head_stride,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -63,6 +67,7 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     USE_G: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
+    HAS_STATE_INDICES: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
@@ -101,8 +106,17 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     stride_k = H * K
     if USE_INITIAL_STATE:
         h0 = h0 + i_nh * K * V
+    if HAS_STATE_INDICES:
+        # Dynamic batching: `ht` is the per-request cache, addressed by slot.
+        # A padding request carries -1 and must leave the cache untouched.
+        i_s = tl.load(state_indices + i_n).to(tl.int64)
+    else:
+        i_s = i_n
     if STORE_FINAL_STATE:
-        ht = ht + i_nh * K * V
+        if HAS_STATE_INDICES:
+            ht = ht + i_s * ht_slot_stride + i_h * ht_head_stride
+        else:
+            ht = ht + i_nh * K * V
 
     # load initial state
     if USE_INITIAL_STATE:
@@ -199,7 +213,7 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h4 += tl.dot(b_k, b_v_new)
     # epilogue
-    if STORE_FINAL_STATE:
+    if STORE_FINAL_STATE and i_s >= 0:
         p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
@@ -225,6 +239,9 @@ def chunk_gated_delta_product_fwd_h(
     cu_seqlens: torch.Tensor | None = None,
     num_householder: int = 1,
     chunk_indices: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
+    state: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the inter-chunk state recurrence.
 
@@ -242,6 +259,13 @@ def chunk_gated_delta_product_fwd_h(
         chunk_indices: Chunk descriptors for the *unexpanded* stream. Derived
             from `cu_seqlens // num_householder` when omitted, which
             synchronizes on the device.
+        chunk_offsets: Per-sequence prefix sum of unexpanded chunk counts.
+            Derived from `cu_seqlens` when omitted.
+        state: `[S, H, K, V]` per-request state cache for dynamic batching,
+            written in place at `state_indices` instead of into a dense
+            `final_state`. `-1` slots are skipped.
+        state_indices: `[N]` cache slot per sequence, or `None` for a dense
+            `[N, H, K, V]` final state.
 
     Returns `(h, v_new, final_state)`. `h` holds the state at each unexpanded
     chunk boundary.
@@ -259,10 +283,30 @@ def chunk_gated_delta_product_fwd_h(
     else:
         N = len(cu_seqlens) - 1
         NT = len(chunk_indices)
-        chunk_offsets = prepare_chunk_offsets(cu_seqlens // num_householder, BT)
+        if chunk_offsets is None:
+            chunk_offsets = prepare_chunk_offsets(cu_seqlens // num_householder, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
     h = k.new_empty(B, NT, H, K, V)
-    final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+
+    # Slot indices without a cache to index would leave the slot/head strides at
+    # zero below, aliasing every sequence onto slot 0 while the padding mask still
+    # runs -- wrong results behind well-formed output.
+    assert (
+        state_indices is None or state is not None
+    ), "state_indices requires the state cache it indexes into"
+
+    if state is not None:
+        assert state.shape[1:] == (
+            H,
+            K,
+            V,
+        ), f"state is expected to have shape [num_slots, {H}, {K}, {V}], got {tuple(state.shape)}"
+        assert (
+            state.stride(3) == 1 and state.stride(2) == V
+        ), "the last two dimensions of the state cache must be contiguous"
+        final_state = state
+    else:
+        final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
     v_new = torch.empty_like(u) if save_new_value else None
 
     def grid(meta):
@@ -277,6 +321,9 @@ def chunk_gated_delta_product_fwd_h(
         h=h,
         h0=initial_state,
         ht=final_state,
+        state_indices=state_indices,
+        ht_slot_stride=state.stride(0) if state is not None else 0,
+        ht_head_stride=state.stride(1) if state is not None else 0,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         num_householder=num_householder,

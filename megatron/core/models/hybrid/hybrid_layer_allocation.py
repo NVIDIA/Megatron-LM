@@ -30,6 +30,9 @@ class Symbols:
     VALID_LAYERS = {MAMBA, GDN, KDA, ATTENTION, DS_ATTENTION, MLA, CSA, HCA, WINDOW, MLP, MOE}
     # MLA-based attention layers (incompatible with standard '*' attention in one model).
     MLA_ATTENTION = {MLA, DS_ATTENTION, CSA, HCA, WINDOW}
+    # Softmax-attention layers; these use config.attention_cp_layout, all others (Mamba, GDN, KDA,
+    # MLP, MoE) use config.linear_cp_layout. See HybridStack's ContextParallelLayoutManager.
+    ATTENTION_LAYERS = {ATTENTION, DS_ATTENTION, MLA, CSA, HCA, WINDOW}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:

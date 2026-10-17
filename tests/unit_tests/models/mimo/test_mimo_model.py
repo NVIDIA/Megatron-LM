@@ -211,15 +211,28 @@ class TestMimoModel:
         assert mimo_model.special_token_ids == self.special_token_ids
 
     def test_get_text_embeddings(self):
-        """Test getting text embeddings."""
-        mimo_model = self._make_avlm()
+        """Precomputed text positions must match the mask-based embedding lookup."""
+        mimo_model = self._make_avlm().eval()
         input_ids = self._make_input_ids()
         position_ids = self._make_position_ids()
+        input_ids[0, 3] = self.special_token_ids["images"]
+        input_ids[1, 5] = self.special_token_ids["audio"]
 
-        text_embeddings = mimo_model.get_text_embeddings(
+        text_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for special_token_id in self.special_token_ids.values():
+            text_mask &= input_ids != special_token_id
+        text_token_indices = text_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+
+        mask_embeddings = mimo_model.get_text_embeddings(
             input_ids, position_ids, self.special_token_ids
         )
-        assert text_embeddings.shape == (self.batch_size * self.seq_len, self.hidden_size)
+        indexed_embeddings = mimo_model.get_text_embeddings(
+            input_ids, position_ids, self.special_token_ids, text_token_indices=text_token_indices
+        )
+
+        expected_text_tokens = self.batch_size * self.seq_len - 2
+        assert indexed_embeddings.shape == (expected_text_tokens, self.hidden_size)
+        torch.testing.assert_close(indexed_embeddings, mask_embeddings, rtol=0, atol=0)
 
     def test_get_text_embeddings_handles_3d_position_ids(self):
         """3D mRoPE position_ids ``[rope_dim, B, S]`` must produce the same text
