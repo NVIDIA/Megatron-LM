@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Contiguous packed CSA row ownership, boundary exchange and indexer metadata."""
 
 import math
@@ -268,6 +268,7 @@ def compute_cp_indexer_topk(
     topk_width: int,
     indexer_softmax_scale: float,
     max_seqlen_q: int,
+    deterministic: bool = False,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
     """Return local top-k and its local-Q/full-K packed layout."""
     topk_width = int(topk_width)
@@ -305,6 +306,7 @@ def compute_cp_indexer_topk(
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_kv=int(max_seqlen_kv),
         q_causal_offsets=q_causal_offsets,
+        deterministic=deterministic,
     )
     return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
 
@@ -318,11 +320,9 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
     """
     if config.dsa_kernel_backend != "cudnn":
         raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
-    if config.deterministic_mode:
-        raise NotImplementedError(
-            "Packed DSv4 attention does not yet support deterministic_mode; "
-            "deterministic THD/CP backward is tracked in #7921."
-        )
+    # Deterministic kernel availability and sparse-indexer loss compatibility are
+    # checked by the attention/indexer wrappers. The packed layout contract below
+    # applies to both modes.
     if packed_seq_params.qkv_format != "thd":
         raise ValueError("DSv4 packed attention requires qkv_format='thd'.")
     if cp_group is None:

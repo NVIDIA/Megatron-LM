@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Packed CSA attention, indexer loss and overlapped CP backward.
 
 The caller supplies final physical indices and explicit process groups. SBHD
@@ -127,8 +127,15 @@ class CSASparseAttnFunc(torch.autograd.Function):
         indexer_topk: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
         q_padding_mask: Tensor | None = None,
+        deterministic: bool = False,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
+        if q_padding_mask is not None:
+            # Enforce sink-only padding even when callers supply valid-looking IDs.
+            # Keep caller-owned indices and prefix lengths unchanged.
+            topk_idxs = topk_idxs.masked_fill(q_padding_mask.unsqueeze(-1), -1)
+            if topk_length is not None:
+                topk_length = topk_length.masked_fill(q_padding_mask, 0)
         topk_idxs = torch.nn.functional.pad(
             topk_idxs, (0, -topk_idxs.shape[-1] % get_flash_mla_topk_alignment()), value=-1
         )
@@ -157,6 +164,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
             ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.topk_length = topk_length
+        ctx.deterministic = deterministic
         return out, lse, lse_indexer
 
     @staticmethod
@@ -185,8 +193,9 @@ class CSASparseAttnFunc(torch.autograd.Function):
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=ctx.topk_length,
+            deterministic=ctx.deterministic,
         )
-        return dq, dkv, d_sink, None, None, None, None, None, None
+        return dq, dkv, d_sink, None, None, None, None, None, None, None
 
 
 def csa_sparse_attn(
@@ -198,13 +207,14 @@ def csa_sparse_attn(
     topk_length=None,
     kv_reconstruction_parts=None,
     q_padding_mask=None,
+    deterministic: bool = False,
 ):
     """Run fused attention for flat packed Q/KV and physical indices."""
     if query.ndim != 3 or kv.ndim != 2:
         raise ValueError("Packed CSA requires query [tokens, heads, dim] and KV [tokens, dim].")
-    if topk_length is not None:
-        # Short windows can leave holes before valid compressed keys. The backend
-        # interprets topk_length as a valid prefix, so compact those holes first.
+    if topk_length is not None or deterministic:
+        # Either segment order can leave holes before valid keys. Deterministic
+        # no-grad lowering also uses the training path's compact valid prefix.
         topk_idxs, topk_length = _compact_flat_topk_idxs(topk_idxs)
     out, _, _ = CSASparseAttnFunc.apply(
         query,
@@ -216,6 +226,7 @@ def csa_sparse_attn(
         0,
         kv_reconstruction_parts,
         q_padding_mask,
+        deterministic,
     )
     return out.flatten(1)
 
@@ -303,10 +314,16 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         compressed_kv_reduce_scatter_state: _DeferredReduceScatterState,
         logical_window_width: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None,
+        deterministic: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Run packed attention with positive indexer loss and deferred CP reductions."""
         if loss_coeff <= 0:
             raise ValueError("Use csa_sparse_attn when indexer loss is disabled.")
+        if deterministic and not sparse_loss:
+            raise RuntimeError(
+                "deterministic packed CSA indexer backward requires "
+                "dsa_indexer_use_sparse_loss=True."
+            )
         _ensure_dsa_namespace()
 
         total_q, np_ = query.shape[:2]
@@ -315,7 +332,10 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         indexer_topk = indexer_topk_idxs.shape[-1]
 
         # Preserve the fixed window suffix for the dense teacher before
-        # compacting the complete attention index set.
+        # compacting the complete attention index set. Padding attends only to
+        # the sink, independently of the caller's physical-index contents.
+        if q_padding_mask is not None:
+            topk_idxs = topk_idxs.masked_fill(q_padding_mask.unsqueeze(-1), -1)
         window_topk_idxs = topk_idxs[:, indexer_topk : indexer_topk + int(logical_window_width)]
         topk_idxs, topk_length = _compact_flat_topk_idxs(topk_idxs)
 
@@ -376,18 +396,42 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 calculate_per_token_loss=True,
                 loss_divisor=loss_divisor,
             )
+            bwd_q = q_indexer.view(1, total_q, idx_nh, idx_hd)
+            bwd_w = weights.view(1, total_q, idx_nh)
+            bwd_k = k_indexer.view(1, total_comp, idx_hd)
+            bwd_target = target.view(1, total_q, indexer_topk)
+            bwd_predict = predict.view(1, total_q, indexer_topk)
+            bwd_topk = indexer_topk_idxs_for_loss.view(1, total_q, indexer_topk)
+            det_w = det_k = None
+            if deterministic and any(ctx.needs_input_grad[index] for index in (4, 6, 18)):
+                # Rank-major global compressed IDs are local to this synthetic B=1.
+                # Replace atomic gradients before cuDNN mutates its score operands.
+                det_w, det_k = sbhd._deterministic_sparse_indexer_grads_wk(
+                    bwd_q,
+                    bwd_w,
+                    bwd_k,
+                    bwd_target,
+                    bwd_predict,
+                    bwd_topk,
+                    loss_coeff=loss_coeff,
+                    grad_loss=unit_grad_loss,
+                    sm_scale=indexer_softmax_scale,
+                    compute_grad_w=sbhd._requires_native_deterministic_indexer_grad_w(bwd_q),
+                )
             ig = _DSA.indexer_backward_wrapper(
-                q_indexer.view(1, total_q, idx_nh, idx_hd),
-                weights.view(1, total_q, idx_nh),
-                k_indexer.view(1, total_comp, idx_hd),
-                target.view(1, total_q, indexer_topk),
-                predict.view(1, total_q, indexer_topk),
-                indexer_topk_idxs_for_loss.view(1, total_q, indexer_topk),
+                bwd_q,
+                bwd_w,
+                bwd_k,
+                bwd_target,
+                bwd_predict,
+                bwd_topk,
                 sm_scale=indexer_softmax_scale,
                 loss_coeff=loss_coeff,
                 grad_loss=unit_grad_loss,
                 block_I=128,
             )
+            if det_k is not None:
+                ig = sbhd._override_indexer_grads(ig, det_w, det_k)
         else:
             cu_seqlens_q, cu_seqlens_k, q_causal_offsets = indexer_layout
             max_seqlen_k = max_seqlen_q // ratio
@@ -496,6 +540,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             indexer_rank_map = torch.empty(0, dtype=torch.int32, device=query.device)
 
         ctx.cp_group = cp_group
+        ctx.deterministic = deterministic
         ctx.compressed_kv_start = int(compressed_kv_start)
         ctx.indexer_k_reduce_scatter_state = indexer_k_reduce_scatter_state
         ctx.compressed_kv_reduce_scatter_state = compressed_kv_reduce_scatter_state
@@ -603,6 +648,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=topk_length,
+            deterministic=ctx.deterministic,
         )
         attn_bwd = {"dq": dq, "dkv": dkv, "d_sink": d_sink}
         nvtx_range_pop("dsv4_cp_sparse_attention_backward")
@@ -679,6 +725,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -695,6 +742,7 @@ def indexer_topk(
     max_seqlen_q,
     max_seqlen_kv,
     q_causal_offsets=None,
+    deterministic: bool = False,
 ):
     """Select packed BF16 indexer keys with ratio-causal offsets and sanitized padding."""
     _ensure_dsa_namespace()
@@ -721,7 +769,10 @@ def indexer_topk(
     lengths = packed_layout.build_seq_lens(
         cu_seqlens_q, cu_seqlens_kv, q.shape[0], ratio, q_causal_offsets
     )
-    candidates = _DSA.indexer_top_k_wrapper(
-        scores, lengths, top_k=min(topk, max_seqlen_kv), next_n=1, return_val=False
-    )["indices"]
+    if deterministic:
+        candidates = sbhd._stable_topk_indices(scores, lengths, min(topk, max_seqlen_kv))
+    else:
+        candidates = _DSA.indexer_top_k_wrapper(
+            scores, lengths, top_k=min(topk, max_seqlen_kv), next_n=1, return_val=False
+        )["indices"]
     return packed_layout.sanitize_topk(candidates, scores, lengths, output_width=topk)

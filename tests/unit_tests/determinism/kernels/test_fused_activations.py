@@ -274,3 +274,63 @@ def test_dsv4_q_rms_norm_replays(dtype, layout):
     assert_replays_bit_exact(
         lambda q: _q_rms_norm(q, 1e-6), (q,), replays=3, contention=True, what="_q_rms_norm"
     )
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("layout", ["contiguous", "transposed"])
+@pytest.mark.parametrize("dim", [128, 576])
+def test_dsv4_q_rms_norm_grad_mode_parity(dtype, layout, dim):
+    """Deterministic query norm preserves forward bytes when AOTAutograd saves intermediates."""
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        _q_rms_norm_deterministic,
+    )
+
+    seeded()
+    torch.compiler.reset()
+    try:
+        q = (
+            _act((16, 2, 4, dim), dtype=dtype)
+            if layout == "contiguous"
+            else _act((2, 16, 4, dim), dtype=dtype).transpose(0, 1)
+        )
+        grad = torch.randn_like(q)
+        outputs, gradients = [], []
+        for grad_enabled in (False, True, False, True):
+            with torch.set_grad_enabled(grad_enabled):
+                output = _q_rms_norm_deterministic(q, 1e-5)
+            outputs.append(output.detach().clone())
+            if grad_enabled:
+                (dq,) = torch.autograd.grad(output, q, grad)
+                gradients.append(dq)
+        assert all(torch.isfinite(output).all() for output in outputs)
+        assert all(torch.isfinite(dq).all() for dq in gradients)
+        for output in outputs[1:]:
+            assert torch.equal(
+                outputs[0].contiguous().view(torch.uint8), output.contiguous().view(torch.uint8)
+            ), "grad mode changed deterministic query norm bytes"
+        assert torch.equal(
+            gradients[0].contiguous().view(torch.uint8), gradients[1].contiguous().view(torch.uint8)
+        ), "deterministic query norm gradients changed across replays"
+    finally:
+        torch.compiler.reset()
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("grad_enabled", [False, True])
+def test_dsv4_q_rms_norm_fp32_uses_eager_operators(monkeypatch, grad_enabled):
+    """FP32 must not re-enter the compiler path that differs across grad modes on H100."""
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4,
+    )
+
+    def unexpected_compilation(*args, **kwargs):
+        raise AssertionError("Deterministic FP32 query norm must not use the compiled path")
+
+    monkeypatch.setattr(dsv4, "_q_rms_norm_deterministic_compiled", unexpected_compilation)
+    q = _act((2, 3, 128), dtype=torch.float32)
+    with torch.set_grad_enabled(grad_enabled):
+        actual = dsv4._q_rms_norm_deterministic(q, 1e-5)
+        expected = dsv4._q_rms_norm_impl(q, 1e-5)
+    assert torch.equal(actual, expected)
+    assert actual.requires_grad == grad_enabled

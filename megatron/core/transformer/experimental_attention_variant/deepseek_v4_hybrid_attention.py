@@ -45,10 +45,28 @@ else:
     TEColumnParallelLinear, TELinear, set_save_original_input = (None, None, None)
 
 
-@torch.compile
-def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
-    """Fused RMS normalization for query tensor (no learnable weight)."""
+def _q_rms_norm_impl(q: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMS normalization for query tensor (no learnable weight)."""
     return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+
+
+_q_rms_norm = torch.compile(_q_rms_norm_impl)
+# AOTAutograd saves low-precision intermediates that inference fusion can otherwise keep in
+# FP32. Preserve the eager rounding points in both graphs so toggling grad mode cannot change
+# low-precision deterministic forward bytes. Keep the default compiled path unchanged.
+_q_rms_norm_deterministic_compiled = torch.compile(
+    _q_rms_norm_impl, options={"emulate_precision_casts": True}
+)
+
+
+def _q_rms_norm_deterministic(q: torch.Tensor, eps: float) -> torch.Tensor:
+    """Keep query normalization independent of grad-mode compiler specialization."""
+    if q.dtype == torch.float32:
+        # Precision-cast emulation does not make the FP32 training/inference graphs identical
+        # on all GPUs (H100 still differs). Use the same eager operator sequence in both modes;
+        # the low-precision training path keeps its compiled implementation.
+        return _q_rms_norm_impl(q, eps)
+    return _q_rms_norm_deterministic_compiled(q, eps)
 
 
 @dataclass
@@ -734,7 +752,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            q_norm = _q_rms_norm_deterministic if self.config.deterministic_mode else _q_rms_norm
+            q = q_norm(q, self.config.layernorm_epsilon)
 
             boundary_rows = 0
             if boundary_kv_compressed is not None:
