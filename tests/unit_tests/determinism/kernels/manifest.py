@@ -192,6 +192,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "standalone replay is in test_fused_activations. The DSv4 module tests cover static-spec "
         "construction and optional latent norms around the registered TE / RoPE / CSA kernels.",
     ),
+    KernelEntry(
+        name="dsv4_batched_output_projection",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsv4_batched_linear.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
+        ),
+        kind="dispatch",
+        notes="TE BF16/MXFP8 strided batched GEMM with flat optimizer-visible weights. "
+        "The projection parity test checks repeated main-grad accumulation and three "
+        "bit-exact forward/backward replays under contention when TE provides BatchedLinear.",
+    ),
     # ---------------------------------------------------------------- Megatron Triton fusions
     KernelEntry(
         name="fused_pad_routing_map",
