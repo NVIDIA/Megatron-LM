@@ -71,11 +71,10 @@ def test_masked_softmax_saves_only_one_probability_buffer(reuse_logits):
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
         input_logits = logits.clone() if reuse_logits else logits
         result = masked_softmax(input_logits, valid, reuse_logits=reuse_logits)
-    # Exp and normalization can share the same saved probabilities. An out-of-place
-    # mask between them would retain another full attention-score-sized allocation.
+    # Autograd should retain only one full attention-score-sized probability buffer.
     assert len(storages) == 1
     if reuse_logits:
-        assert input_logits.untyped_storage().data_ptr() in storages
+        assert not torch.equal(input_logits.detach(), logits.detach())
     result.square().sum().backward()
     assert torch.isfinite(logits.grad).all()
 

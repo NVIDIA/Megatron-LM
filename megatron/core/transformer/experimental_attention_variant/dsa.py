@@ -97,13 +97,14 @@ def _unfused_absorbed_dsa_fn(
         device=query.device,
     )
 
-    # [sq,b,np,hn] -> [b,np,sq,hn]
-    q = query.permute(1, 2, 0, 3)
-    # [skv,b,1,hn] -> [b,1,hn,skv]
-    k = key.permute(1, 2, 3, 0)
+    # Fold query heads into rows rather than broadcasting the shared K/V across
+    # heads. This also avoids per-head K/V gradients that are immediately summed.
+    q = query.permute(1, 0, 2, 3).reshape(b, sq * np, hn)
+    k = key[:, :, 0].permute(1, 2, 0)  # [b,hn,skv]
     # Matmul backward saves Q/K, not its output, so this private score buffer
     # can be reused for scaling, masking, and softmax intermediates.
-    attention_scores = torch.matmul(q.float(), k.float()).mul_(softmax_scale)
+    attention_scores = torch.bmm(q.float(), k.float()).view(b, sq, np, skv)
+    attention_scores.mul_(softmax_scale)
 
     # Sparse + causal/varlen validity mask.
     index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
@@ -116,20 +117,21 @@ def _unfused_absorbed_dsa_fn(
         key_positions=key_positions,
     )
 
-    attention_scores.add_(index_mask.unsqueeze(1))
+    attention_scores.add_(index_mask.unsqueeze(2))
     valid_index_mask = torch.isfinite(index_mask)
     del index_mask, row_mask
     attention_scores = dsa_masking.masked_softmax(
         attention_scores,
-        valid_index_mask.unsqueeze(1).expand(b, np, sq, skv),
+        valid_index_mask.unsqueeze(2).expand(b, sq, np, skv),
         dim=-1,
         reuse_logits=True,
     )
 
     # Latent value is the first v_channels slice of absorbed key cache.
-    value = key[..., :v_channels].permute(1, 2, 0, 3)  # [b,1,skv,v]
-    output = torch.matmul(attention_scores.to(value.dtype), value)  # [b,np,sq,v]
-    return output.permute(2, 0, 1, 3).contiguous()
+    value = key[:, :, 0, :v_channels].permute(1, 0, 2)  # [b,skv,v]
+    probs = attention_scores.to(value.dtype).reshape(b, sq * np, skv)
+    output = torch.bmm(probs, value).view(b, sq, np, v_channels)
+    return output.permute(1, 0, 2, 3).contiguous()
 
 
 def _run_sparse_attention(

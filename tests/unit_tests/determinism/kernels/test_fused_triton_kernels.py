@@ -147,6 +147,37 @@ def test_dsa_weights_projection_replays():
     assert outputs["out"].dtype == torch.float32
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_unfused_absorbed_dsa_replays_fwd_bwd(dtype):
+    """Replay shared K/V GEMMs and masked softmax under stream contention."""
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        _unfused_absorbed_dsa_fn,
+    )
+
+    seeded()
+    query = torch.randn(129, 2, 8, 64, device="cuda", dtype=dtype, requires_grad=True)
+    key = torch.randn(1024, 2, 1, 64, device="cuda", dtype=dtype, requires_grad=True)
+    topk = torch.randint(0, 1024, (2, 129, 128), device="cuda")
+    topk[:, 0] = -1
+    starts = torch.zeros(129, device="cuda", dtype=torch.int64)
+    ends = torch.full_like(starts, 1024)
+
+    def attention(q, k):
+        return _unfused_absorbed_dsa_fn(
+            q, k, topk, 64**-0.5, 48, varlen_starts=starts, varlen_ends=ends
+        )
+
+    outputs, _ = assert_replays_bit_exact(
+        attention,
+        (query, key),
+        replays=3,
+        backward=True,
+        contention=True,
+        what="Unfused absorbed DSA",
+    )
+    assert torch.isfinite(outputs["out"]).all()
+
+
 def test_dsa_kpool_chunked_selection_replays(monkeypatch):
     """Replay the fixed-memory KPool score and top-k path across query chunks."""
     from megatron.core.transformer.experimental_attention_variant import dsa

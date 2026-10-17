@@ -716,7 +716,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_indexer_weights_projection",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
-        tests=(K + "test_te_wrappers.py",),
+        tests=(K + "test_te_wrappers.py", K + "test_fused_triton_kernels.py"),
         kind="dispatch",
         notes="Dispatches the non-quantized FP32 indexer projection to TE general_gemm when "
         "supported or FP32 torch.mm otherwise; the replay covers both forward routes and the "
@@ -860,7 +860,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_triton_kernels.py",),
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
-        "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
+        "replay covers the selected GEMM, deterministic torch fallback, chunked KPool top-k, "
+        "and the unfused absorbed-attention shared K/V GEMMs and masked softmax.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

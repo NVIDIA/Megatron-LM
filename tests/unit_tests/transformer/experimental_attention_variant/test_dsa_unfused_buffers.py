@@ -7,6 +7,26 @@ from torch.utils.checkpoint import checkpoint
 from megatron.core.transformer.experimental_attention_variant.dsa import _unfused_absorbed_dsa_fn
 
 
+def test_unfused_absorbed_dsa_keeps_shared_kv_storage():
+    query = torch.randn(7, 2, 3, 8, requires_grad=True)
+    key = torch.randn(19, 2, 1, 8, requires_grad=True)
+    topk = torch.arange(19).expand(2, 7, 19)
+    saved_kv_bytes = []
+
+    def pack(tensor):
+        if tensor.ndim == 3 and sorted(tensor.shape[-2:]) == [8, 19]:
+            saved_kv_bytes.append(tensor.untyped_storage().nbytes())
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        output = _unfused_absorbed_dsa_fn(query, key, topk, 8**-0.5, 8)
+    # Neither score nor value matmul should retain a K/V copy per query head.
+    assert saved_kv_bytes
+    assert max(saved_kv_bytes) <= key.numel() * key.element_size()
+    output.square().sum().backward()
+    assert torch.isfinite(query.grad).all() and torch.isfinite(key.grad).all()
+
+
 def _selected_key_reference(
     query, key, topk, scale, v_channels, layout, mask, starts, ends, positions
 ):

@@ -366,7 +366,7 @@ def masked_softmax(
     With ``reuse_logits=True``, overwrite logits with intermediate values. The
     caller must own a writable buffer whose values are not needed by other
     consumers or by its producing operation's backward. The output can still
-    use separate storage when autograd needs the unnormalized probabilities.
+    use separate storage when autograd needs the probabilities.
     """
     if not logits.is_floating_point():
         raise TypeError("masked_softmax expects a floating-point tensor")
@@ -384,6 +384,13 @@ def masked_softmax(
     else:
         masked_logits = logits.masked_fill(invalid_mask, torch.finfo(logits.dtype).min)
     row_has_valid = valid_mask.any(dim=dim, keepdim=True)
+    if masked_logits.requires_grad and eps <= 1:
+        # A finite nonempty row has sum(exp(x - max(x))) >= 1, so the clamp
+        # is inactive. Native softmax avoids the separate exp/div backward
+        # intermediates. Empty rows need finite inputs for a zero gradient.
+        masked_logits.masked_fill_(invalid_mask, float("-inf"))
+        masked_logits.masked_fill_(~row_has_valid, 0.0)
+        return masked_logits.softmax(dim=dim).masked_fill(invalid_mask, 0.0)
     row_max = masked_logits.max(dim=dim, keepdim=True).values
     row_max = torch.where(row_has_valid, row_max, torch.zeros_like(row_max))
 
