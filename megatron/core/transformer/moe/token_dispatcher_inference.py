@@ -137,6 +137,51 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         )
         self.topk = config.moe_router_topk
 
+    @staticmethod
+    def _packed_row_layout(
+        tensors: tuple[torch.Tensor, ...],
+    ) -> Optional[tuple[list[int], list[int], int]]:
+        """Byte layout that packs each token's rows of several 2-D tensors into one uint8 row.
+
+        Segments are ordered by decreasing element size so each keeps its natural
+        alignment. Returns (order, byte offsets, row bytes), or None when a segment would
+        be misaligned; the caller then gathers the tensors separately.
+        """
+        order = sorted(range(len(tensors)), key=lambda i: -tensors[i].element_size())
+        offsets, row_bytes = [0] * len(tensors), 0
+        for i in order:
+            if tensors[i].dim() != 2 or row_bytes % tensors[i].element_size():
+                return None
+            offsets[i] = row_bytes
+            row_bytes += tensors[i].shape[1] * tensors[i].element_size()
+        if any(row_bytes % t.element_size() for t in tensors):
+            return None
+        return order, offsets, row_bytes
+
+    @staticmethod
+    def _pack_rows(
+        tensors: tuple[torch.Tensor, ...], layout: tuple[list[int], list[int], int]
+    ) -> torch.Tensor:
+        """[tokens, row_bytes] uint8 rows holding every tensor's row for each token."""
+        order, _, row_bytes = layout
+        # Empty tensors can be contiguous while retaining a non-unit last stride.
+        if tensors[0].shape[0] == 0:
+            return tensors[0].new_empty((0, row_bytes), dtype=torch.uint8)
+        return torch.cat([tensors[i].contiguous().view(torch.uint8) for i in order], dim=1)
+
+    @staticmethod
+    def _unpack_rows(
+        packed: torch.Tensor,
+        tensors: tuple[torch.Tensor, ...],
+        layout: tuple[list[int], list[int], int],
+    ) -> List[torch.Tensor]:
+        """Contiguous [rows, *] tensors shaped and typed like ``tensors``, read from ``packed``."""
+        _, offsets, _ = layout
+        return [
+            packed[:, offset : offset + t.shape[1] * t.element_size()].view(t.dtype).contiguous()
+            for t, offset in zip(tensors, offsets)
+        ]
+
     @classmethod
     def allocate_buffers(cls) -> None:
         """Allocate the per-step valid-tokens tensor read by mcore_fused_moe.
@@ -204,8 +249,28 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         if self._runs_metadata_sync:
             self.update_metadata(hidden_states.shape[0])
 
+        # Ordinary inference packs the three tensors into one all-gather.
+        # Keep the original three gathers when batch invariance is enabled.
+        # Packing trades local copies for two fewer communication launches.
+        # The raw collective has no autograd edge, hence the no-grad guard.
+        # Grad mode must agree across ranks. Do not consult requires_grad here:
+        # a detached input on one rank must not change its collective protocol.
+        tensors = (hidden_states, probs, self.routing_map)
+        layout = None
+        if not torch.is_grad_enabled() and not batch_invariant.enabled():
+            layout = self._packed_row_layout(tensors)
+
         if not self.__class__._use_allgather_v:
             # CG path: equal token counts, standard gather.
+            if layout is not None:
+                packed = self._pack_rows(tensors, layout)
+                world = get_pg_size(self.tp_ep_group)
+                gathered = packed.new_empty((world * packed.shape[0], packed.shape[1]))
+                dist.all_gather_into_tensor(gathered, packed, group=self.tp_ep_group)
+                hidden_states, probs, self.routing_map = self._unpack_rows(
+                    gathered, tensors, layout
+                )
+                return hidden_states, probs
             with torch.no_grad():
                 self.routing_map = gather_from_sequence_parallel_region(
                     self.routing_map, group=self.tp_ep_group
@@ -233,11 +298,6 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             dist.all_gather_into_tensor(gathered, padded_tensor, group=self.ep_group)
             return gathered
 
-        hidden_gathered = allgather(pad_to_max(hidden_states))
-        probs_gathered = allgather(pad_to_max(probs))
-        with torch.no_grad():
-            routing_gathered = allgather(pad_to_max(self.routing_map))
-
         def compact(gathered_tensor):
             return torch.cat(
                 [
@@ -246,6 +306,16 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
                 ],
                 dim=0,
             )
+
+        if layout is not None:
+            packed = compact(allgather(pad_to_max(self._pack_rows(tensors, layout))))
+            hidden_states, probs, self.routing_map = self._unpack_rows(packed, tensors, layout)
+            return hidden_states, probs
+
+        hidden_gathered = allgather(pad_to_max(hidden_states))
+        probs_gathered = allgather(pad_to_max(probs))
+        with torch.no_grad():
+            routing_gathered = allgather(pad_to_max(self.routing_map))
 
         hidden_states = compact(hidden_gathered)
         probs = compact(probs_gathered)
