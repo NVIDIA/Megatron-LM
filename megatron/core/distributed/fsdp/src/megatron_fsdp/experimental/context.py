@@ -44,7 +44,7 @@ class FsdpContext:
     """
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
-    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
+    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_events``.
     forward_order: IndexedOrder[nn.Module]
     backward_order: IndexedOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
