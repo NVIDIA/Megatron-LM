@@ -23,7 +23,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     PipelineOffloadManager,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import HAVE_FLA
+from megatron.core.ssm.gated_delta_net import HAVE_FLA, GatedDeltaNet2
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -270,6 +270,79 @@ def test_gdn_zero_fraction_with_growing_sequence(
         result = _run(offloaded, source, offload=True, fraction=0.0, threshold=threshold)
         _assert_step_equal(reference, result)
         off_interface.reset(process_group=torch.distributed.group.WORLD)
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+def test_gdn2_eval_bypasses_offload_manager(
+    gdn_offload_groups: ProcessGroupCollection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evaluation with gradients does not initialize the offload manager."""
+    pytest.importorskip("fla.ops.gdn2")
+    baseline, offloaded = _build_pair(
+        _config(experimental_attention_variant="gdn2"), gdn_offload_groups
+    )
+    baseline.eval()
+    offloaded.eval()
+    source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(PipelineOffloadManager, "OFFLOAD_MGR", None)
+    _assert_step_equal(_run(baseline, source), _run(offloaded, source))
+    assert PipelineOffloadManager.OFFLOAD_MGR is None
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.parametrize("value_heads", [4, 8])
+@pytest.mark.parametrize("frozen_gates", [False, True])
+def test_gdn2_offload_retains_live_sigmoid_gates(
+    gdn_offload_groups: ProcessGroupCollection,
+    value_heads: int,
+    frozen_gates: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip copies of live sigmoid outputs while allowing expanded or frozen gates."""
+    pytest.importorskip("fla.ops.gdn2")
+    config = _config(experimental_attention_variant="gdn2", linear_num_value_heads=value_heads)
+    baseline, offloaded = _build_pair(config, gdn_offload_groups)
+    if frozen_gates:
+        for model in (baseline, offloaded):
+            for layer in model:
+                layer.in_proj.requires_grad_(False)
+                layer.conv1d.requires_grad_(False)
+
+    gate_storages: dict[str, int] = {}
+    copied_gates: list[set[str]] = []
+    run_core = GatedDeltaNet2._run_gated_delta_rule
+    offload_tensor = ChunkOffloadHandler.offload
+
+    def record_gates(
+        layer: GatedDeltaNet2,
+        kernel_inputs: dict[str, torch.Tensor],
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if layer.offload_core_attention:
+            gate_storages.update(
+                {name: kernel_inputs[name].untyped_storage().data_ptr() for name in ("b", "w")}
+            )
+            copied_gates.append(set())
+        return run_core(layer, kernel_inputs, cu_seqlens)
+
+    def record_copy(handler: ChunkOffloadHandler, tensor: torch.Tensor, **kwargs: Any) -> Any:
+        copied_gates[-1].update(
+            name
+            for name, pointer in gate_storages.items()
+            if pointer == tensor.untyped_storage().data_ptr()
+        )
+        return offload_tensor(handler, tensor, **kwargs)
+
+    monkeypatch.setattr(GatedDeltaNet2, "_run_gated_delta_rule", record_gates)
+    monkeypatch.setattr(ChunkOffloadHandler, "offload", record_copy)
+    source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
+    reference = _run(baseline, source, detached_inputs=frozen_gates)
+    result = _run(offloaded, source, offload=True, detached_inputs=frozen_gates)
+    _assert_step_equal(reference, result)
+    assert len(copied_gates) == config.num_layers
+    for names in copied_gates:
+        assert ("w" in names) == frozen_gates
+        assert ("b" in names) == (frozen_gates or value_heads != 4)
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
