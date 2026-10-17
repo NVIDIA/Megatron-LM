@@ -672,14 +672,6 @@ def _z_layout_to_qkvzba_kernel(
     tl.store(d_qkvzba_ptrs, dgate_val, mask=s_mask[:, None])
 
 
-@triton.autotune(
-    configs=_g_beta_autotune_configs(),
-    key=["seq_len", "num_v_heads"],
-    # Each autotune trial atomic-adds partial sums into these accumulators.
-    # Without reset_to_zero the trials would stack on top of one another and
-    # produce values that are ``num_trials`` × the correct result.
-    reset_to_zero=["d_A_log_ptr", "d_dt_bias_ptr"],
-)
 @triton.jit
 def _g_beta_backward_kernel(
     qkvzba_ptr,
@@ -721,8 +713,8 @@ def _g_beta_backward_kernel(
         d_A_log[h]   = Σ_{b,s} d_g[b,s,h] * g[b,s,h]
 
     ``d_alpha`` and ``d_beta_raw`` are written into the matching channel slices
-    of ``d_qkvzba``. ``d_A_log`` and ``d_dt_bias`` are reduced via per-element
-    atomic_add to fp32 buffers; the caller casts those to the parameter dtype.
+    of ``d_qkvzba``. Each program writes its parameter-gradient partial sums
+    to a separate FP32 slot; the caller reduces them in a fixed order.
     """
 
     pid_b = tl.program_id(0)
@@ -802,9 +794,10 @@ def _g_beta_backward_kernel(
     tl.store(d_alpha_ptrs, d_alpha.to(d_qkvzba_ptr.dtype.element_ty), mask=mask)
     tl.store(d_beta_ptrs, d_beta_raw.to(d_qkvzba_ptr.dtype.element_ty), mask=mask)
 
-    # ----- Atomic-add (b, s) partials into per-head accumulators -----
-    tl.atomic_add(d_A_log_ptr + h_offs, d_A_log_partial, mask=h_mask)
-    tl.atomic_add(d_dt_bias_ptr + h_offs, d_dt_bias_partial, mask=h_mask)
+    # ----- Store one partial per (batch, sequence block, head) -----
+    partial_offset = (pid_b * tl.num_programs(1) + pid_s) * num_v_heads + h_offs
+    tl.store(d_A_log_ptr + partial_offset, d_A_log_partial, mask=h_mask)
+    tl.store(d_dt_bias_ptr + partial_offset, d_dt_bias_partial, mask=h_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -996,16 +989,14 @@ def _triton_g_beta_backward(
 
     device = qkvzba.device
 
-    g_beta_grid = lambda meta: (
-        batch,
-        triton.cdiv(seq_len, meta["BLOCK_S"]),
-        triton.cdiv(num_value_heads, meta["BLOCK_H"]),
-    )
+    # Fixed tiles keep both the partial sums and their final reduction repeatable.
+    block_s, block_h = 128, 16
+    sequence_blocks = triton.cdiv(seq_len, block_s)
+    g_beta_grid = (batch, sequence_blocks, triton.cdiv(num_value_heads, block_h))
     with _launch_context(device, stream):
-        d_param_grads = torch.empty((2, num_value_heads), dtype=torch.float32, device=device)
-        d_param_grads.zero_()
-        d_A_log = d_param_grads[0]
-        d_dt_bias = d_param_grads[1]
+        d_param_grads = torch.empty(
+            (2, batch, sequence_blocks, num_value_heads), dtype=torch.float32, device=device
+        )
         _g_beta_backward_kernel[g_beta_grid](
             qkvzba,
             A_log,
@@ -1013,8 +1004,8 @@ def _triton_g_beta_backward(
             d_g,
             d_beta_out,
             d_qkvzba_out,
-            d_A_log,
-            d_dt_bias,
+            d_param_grads[0],
+            d_param_grads[1],
             seq_len,
             num_value_heads,
             beta_channel_offset,
@@ -1028,8 +1019,13 @@ def _triton_g_beta_backward(
             d_beta_out.stride(0),
             d_beta_out.stride(1),
             d_beta_out.stride(2),
+            BLOCK_S=block_s,
+            BLOCK_H=block_h,
+            num_warps=4,
+            num_stages=2,
         )
-    return d_qkvzba_out, d_A_log, d_dt_bias
+        d_param_grads = d_param_grads.sum(dim=(1, 2))
+    return d_qkvzba_out, d_param_grads[0], d_param_grads[1]
 
 
 def _launch_context(device: torch.device, stream: Optional["torch.cuda.Stream"]):
