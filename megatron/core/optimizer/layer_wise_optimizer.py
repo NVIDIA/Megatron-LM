@@ -792,6 +792,29 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     "is_expert_parallel marker against the module's process groups."
                 )
 
+    @torch.no_grad()
+    def reload_model_params(self, state_dict=None):
+        """Reload owned FP32 masters from model parameters or checkpoint tensors.
+
+        Layer-wise optimizers own whole parameters, so checkpoint tensors can be
+        copied directly rather than sliced as in the standard distributed optimizer.
+        Read checkpoint values before any BF16 model-to-master copy to preserve
+        their precision when load_main_params_from_ckpt is enabled.
+        """
+        if state_dict is None:
+            return super().reload_model_params()
+
+        checkpoint_params = self._build_model_param_to_state_dict_param_map(state_dict)
+        for optimizer in self.chained_optimizers:
+            if not isinstance(optimizer, Float16OptimizerWithFloat16Params):
+                optimizer.reload_model_params()
+                continue
+            for model_group, main_group in zip(
+                optimizer.float16_groups, optimizer.fp32_from_float16_groups, strict=True
+            ):
+                for model_param, main_param in zip(model_group, main_group, strict=True):
+                    main_param.copy_(checkpoint_params[model_param])
+
     def shard_params(self, optimizers, full_param_layouts=None):
         """Shard params across ranks according to the computed param layout.
 

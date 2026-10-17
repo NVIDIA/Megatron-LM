@@ -531,6 +531,28 @@ class TestLayerWiseOptimizer:
 
         assert update_successful, "Optimizer step should be successful"
 
+    @pytest.mark.parametrize("use_param_layout", [False, True])
+    def test_reload_model_params_from_checkpoint(self, use_param_layout):
+        model, optimizer, _ = self.create_model_and_optimizer(use_param_layout=use_param_layout)
+        checkpoint = {
+            name: param.detach().float() + 0.001 for name, param in model.named_parameters()
+        }
+        original_model = {name: param.detach().clone() for name, param in model.named_parameters()}
+        by_parameter = {param: checkpoint[name] for name, param in model.named_parameters()}
+
+        optimizer.reload_model_params(checkpoint)
+
+        for child in optimizer.chained_optimizers:
+            for model_group, main_group in zip(
+                child.float16_groups, child.fp32_from_float16_groups, strict=True
+            ):
+                for model_param, main_param in zip(model_group, main_group, strict=True):
+                    torch.testing.assert_close(
+                        main_param, by_parameter[model_param], atol=0, rtol=0
+                    )
+        for name, param in model.named_parameters():
+            torch.testing.assert_close(param, original_model[name], atol=0, rtol=0)
+
     def test_bf16_wrapping(self):
         """Test LayerWiseDistributedOptimizer automatically wraps optimizer with bf16."""
         model, optimizer, pg_collection = self.create_model_and_optimizer()
