@@ -5324,13 +5324,12 @@ def train(
                         param_and_grad_buffer.manual_buffer_registration()
 
         if cfg.rl.perform_rl_step and cfg.rl.rl_use_sequence_packing:
-            iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
             bin_count = (
                 _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             args.consumed_train_bins += bin_count
-        elif samples_seen_in_iteration is not None:
+        if samples_seen_in_iteration is not None:
             iteration_sequences = samples_seen_in_iteration
         else:
             batch_size = (
