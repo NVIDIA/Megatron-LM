@@ -54,12 +54,14 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     _sanitize_tools_for_template,
     _serialize_eos_token_ids,
     _suffix_tokens_after_prefix,
+    _TemplateRenderer,
     _tokenize_with_media_slots_sync,
 )
 from tests.unit_tests.inference.test_endpoints_common import (
     CHAT_BODY,
     CHAT_PATH,
     NOT_A_NUMBER_ERROR,
+    NOT_AN_INT_ERROR,
     ReplyingClient,
     Tokenizer,
     build_app,
@@ -923,8 +925,12 @@ def test_media_tokenization_is_synchronous_so_it_can_be_offloaded_whole():
     executor in one hop, on the thread that owns the private tokenizer copy.
     """
     assert not inspect.iscoroutinefunction(_tokenize_with_media_slots_sync)
-    # And the endpoint must not have kept a direct call that skips the executor.
-    src = inspect.getsource(chat_completions_module.chat_completions)
+    # Executor dispatch is owned by the renderer; the endpoint must not call the sync function
+    # directly, and the renderer must hand it to the executor rather than await it.
+    assert "_tokenize_with_media_slots_sync" not in inspect.getsource(
+        chat_completions_module.chat_completions
+    )
+    src = inspect.getsource(_TemplateRenderer.tokenize)
     assert "_tokenize_with_media_slots_sync" in src
     for line in src.splitlines():
         if "_tokenize_with_media_slots_sync" in line:
@@ -1607,8 +1613,8 @@ _FTP_IMAGE = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png
         pytest.param(
             {"messages": "hi"}, {}, 400, "'messages' must be a list", id="messages-not-a-list"
         ),
-        # A sampling field of the wrong type is a client error when the conversion raises
-        # ValueError; a TypeError (a list where a number is expected) escapes as a 500.
+        # A sampling field of the wrong type is a client error, whether the conversion raises
+        # ValueError or TypeError.
         pytest.param(
             {**CHAT_BODY, "temperature": "hot"},
             {},
@@ -1616,7 +1622,7 @@ _FTP_IMAGE = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png
             NOT_A_NUMBER_ERROR,
             id="temperature-not-a-number",
         ),
-        pytest.param({**CHAT_BODY, "top_k": [1]}, {}, 500, None, id="top-k-list"),
+        pytest.param({**CHAT_BODY, "top_k": [1]}, {}, 400, NOT_AN_INT_ERROR, id="top-k-list"),
         pytest.param(
             {"messages": [{"role": "user", "content": [_FTP_IMAGE]}]},
             {},
@@ -1943,20 +1949,24 @@ async def test_chat_response_format(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("reply_fields", "warns"),
+    ("logprobs", "reply_fields", "warns"),
     [
-        ({}, True),
-        ({"generated_log_probs": [-0.5, -0.25]}, False),
-        ({"payload_offloaded": True}, False),
+        (True, {}, True),
+        (False, {}, False),
+        (True, {"generated_log_probs": [-0.5, -0.25]}, False),
+        (True, {"payload_offloaded": True}, False),
     ],
-    ids=["missing", "present", "offloaded"],
+    ids=["missing", "not-requested", "present", "offloaded"],
 )
-async def test_chat_warns_when_generation_log_probs_are_missing(reply_fields, warns, caplog):
+async def test_chat_warns_when_generation_log_probs_are_missing(
+    logprobs, reply_fields, warns, caplog
+):
     client = ReplyingClient([completed_reply("chat-0", [10, 2], [30, 31], **reply_fields)])
     app = build_app(CHAT_PATH, client)
+    body = {**CHAT_BODY, "logprobs": logprobs}
 
     with caplog.at_level(logging.WARNING):
-        response = await app.test_client().post(CHAT_PATH, json=CHAT_BODY)
+        response = await app.test_client().post(CHAT_PATH, json=body)
 
     assert response.status_code == 200, await response.get_data(as_text=True)
     assert ("Generation log probs is None" in caplog.text) is warns
