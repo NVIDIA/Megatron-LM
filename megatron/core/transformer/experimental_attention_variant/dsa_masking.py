@@ -354,9 +354,20 @@ def masked_softmax_inplace(
 
 
 def masked_softmax(
-    logits: torch.Tensor, valid_mask: torch.Tensor, *, dim: int = -1, eps: float = 1e-10
+    logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    dim: int = -1,
+    eps: float = 1e-10,
+    reuse_logits: bool = False,
 ) -> torch.Tensor:
-    """Convert logits to probabilities while zeroing invalid entries."""
+    """Convert logits to probabilities while zeroing invalid entries.
+
+    With ``reuse_logits=True``, overwrite logits with intermediate values. The
+    caller must own a writable buffer whose values are not needed by other
+    consumers or by its producing operation's backward. The output can still
+    use separate storage when autograd needs the unnormalized probabilities.
+    """
     if not logits.is_floating_point():
         raise TypeError("masked_softmax expects a floating-point tensor")
     if logits.shape != valid_mask.shape:
@@ -368,7 +379,10 @@ def masked_softmax(
         slice(0, 1) if stride == 0 else slice(None) for stride in valid_mask.stride()
     )
     invalid_mask = ~valid_mask[mask_slices]
-    masked_logits = logits.masked_fill(invalid_mask, torch.finfo(logits.dtype).min)
+    if reuse_logits:
+        masked_logits = logits.masked_fill_(invalid_mask, torch.finfo(logits.dtype).min)
+    else:
+        masked_logits = logits.masked_fill(invalid_mask, torch.finfo(logits.dtype).min)
     row_has_valid = valid_mask.any(dim=dim, keepdim=True)
     row_max = masked_logits.max(dim=dim, keepdim=True).values
     row_max = torch.where(row_has_valid, row_max, torch.zeros_like(row_max))

@@ -10,7 +10,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dim", [-1, 1])
 @pytest.mark.parametrize("grad_enabled", [False, True])
-def test_masked_softmax_matches_selected_logits(device, dtype, dim, grad_enabled):
+@pytest.mark.parametrize("reuse_logits", [False, True])
+def test_masked_softmax_matches_selected_logits(device, dtype, dim, grad_enabled, reuse_logits):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     torch.manual_seed(12)
@@ -24,7 +25,8 @@ def test_masked_softmax_matches_selected_logits(device, dtype, dim, grad_enabled
     logits.requires_grad_()
     original = logits.detach().clone()
     with torch.set_grad_enabled(grad_enabled):
-        result = masked_softmax(logits, valid, dim=dim)
+        input_logits = logits.clone() if reuse_logits else logits
+        result = masked_softmax(input_logits, valid, dim=dim, reuse_logits=reuse_logits)
 
     # Independent reference: normalize only selected entries in each row.
     ref_logits = logits.detach().clone().requires_grad_()
@@ -45,6 +47,8 @@ def test_masked_softmax_matches_selected_logits(device, dtype, dim, grad_enabled
     assert torch.count_nonzero(result[~valid]) == 0
     if not grad_enabled:
         assert not result.requires_grad
+        if reuse_logits:
+            assert result.data_ptr() == input_logits.data_ptr()
         return
     upstream = torch.randn_like(result)
     grad = torch.autograd.grad(result, logits, upstream)[0]
@@ -53,7 +57,8 @@ def test_masked_softmax_matches_selected_logits(device, dtype, dim, grad_enabled
     assert torch.count_nonzero(grad[~valid]) == 0
 
 
-def test_masked_softmax_saves_only_one_probability_buffer():
+@pytest.mark.parametrize("reuse_logits", [False, True])
+def test_masked_softmax_saves_only_one_probability_buffer(reuse_logits):
     logits = torch.randn(2, 3, 17, requires_grad=True)
     valid = (torch.rand(2, 1, 17) > 0.4).expand_as(logits)
     storages = set()
@@ -64,10 +69,13 @@ def test_masked_softmax_saves_only_one_probability_buffer():
         return tensor
 
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-        result = masked_softmax(logits, valid)
+        input_logits = logits.clone() if reuse_logits else logits
+        result = masked_softmax(input_logits, valid, reuse_logits=reuse_logits)
     # Exp and normalization can share the same saved probabilities. An out-of-place
     # mask between them would retain another full attention-score-sized allocation.
     assert len(storages) == 1
+    if reuse_logits:
+        assert input_logits.untyped_storage().data_ptr() in storages
     result.square().sum().backward()
     assert torch.isfinite(logits.grad).all()
 
@@ -111,13 +119,14 @@ def test_masked_softmax_preserves_broadcast_mask_storage(mask_shape, transpose, 
 
 
 @pytest.mark.parametrize("eps", [1e-10, 2.0])
-def test_masked_softmax_first_and_second_derivatives(eps):
+@pytest.mark.parametrize("reuse_logits", [False, True])
+def test_masked_softmax_first_and_second_derivatives(eps, reuse_logits):
     torch.manual_seed(3)
     logits = torch.randn(3, 5, dtype=torch.float64, requires_grad=True)
     valid = torch.tensor(
         [[True, False, True, True, False], [False] * 5, [False, True, False, False, False]]
     )
-    fn = lambda x: masked_softmax(x, valid, eps=eps)
+    fn = lambda x: masked_softmax(x.clone(), valid, eps=eps, reuse_logits=reuse_logits)
     assert torch.autograd.gradcheck(fn, (logits,))
     assert torch.autograd.gradgradcheck(fn, (logits,))
 

@@ -101,7 +101,9 @@ def _unfused_absorbed_dsa_fn(
     q = query.permute(1, 2, 0, 3)
     # [skv,b,1,hn] -> [b,1,hn,skv]
     k = key.permute(1, 2, 3, 0)
-    attention_scores = torch.matmul(q.float(), k.float()) * softmax_scale
+    # Matmul backward saves Q/K, not its output, so this private score buffer
+    # can be reused for scaling, masking, and softmax intermediates.
+    attention_scores = torch.matmul(q.float(), k.float()).mul_(softmax_scale)
 
     # Sparse + causal/varlen validity mask.
     index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
@@ -114,10 +116,14 @@ def _unfused_absorbed_dsa_fn(
         key_positions=key_positions,
     )
 
-    attention_scores = attention_scores + index_mask.unsqueeze(1)
+    attention_scores.add_(index_mask.unsqueeze(1))
     valid_index_mask = torch.isfinite(index_mask)
+    del index_mask, row_mask
     attention_scores = dsa_masking.masked_softmax(
-        attention_scores.float(), valid_index_mask.unsqueeze(1).expand(b, np, sq, skv), dim=-1
+        attention_scores,
+        valid_index_mask.unsqueeze(1).expand(b, np, sq, skv),
+        dim=-1,
+        reuse_logits=True,
     )
 
     # Latent value is the first v_channels slice of absorbed key cache.
