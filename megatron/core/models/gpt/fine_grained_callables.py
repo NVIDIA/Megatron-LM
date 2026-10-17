@@ -178,12 +178,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if enable_ncclep and layer.config.moe_ncclep_zero_copy:
             # Insert an identity node as the sole consumer of the dispatch output, so the
             # dispatch-backward gets the symm buffer instead of a non-symm AccumulateGrad clone.
-            # Must stay inside this node's graph segment (before the next node detaches it).
+            # Must stay inside this node's graph segment, before the next node wraps its input.
             dispatched_tokens = StageDispatchBwdGrad.apply(dispatched_tokens, token_dispatcher)
 
-        # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
-        # passed to moe_forward within `layer_state` to avoid the free_input process
-        # of the input tensors.
+        # `dispatched_probs` is needed by the SwiGLU backward, so pass it to
+        # moe_forward through `layer_state` as a separate scheduled dependency.
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
 
