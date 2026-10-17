@@ -1133,20 +1133,22 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
     world_size = dist.get_world_size()
 
+    # PP is the outermost axis in the supported tp-cp-ep-dp-pp rank order.
+    # Keep it separate from stage-local data parallelism.
     mesh = einops.rearrange(
         torch.arange(world_size),
-        "(outer_fsdp_dp fsdp ep tp) -> ep outer_fsdp_dp fsdp tp",
+        "(pp outer_fsdp_dp fsdp ep tp) -> (pp ep) outer_fsdp_dp fsdp tp",
         outer_fsdp_dp=outer_fsdp_dp_group.size(),
+        fsdp=dp_cp_group.size(),
         tp=tp_group.size(),
         ep=ep_size,
     )
 
     mesh_fsdp_ranks = einops.rearrange(
         mesh,
-        'ep outer_fsdp_dp fsdp tp -> (outer_fsdp_dp ep tp) fsdp',
+        'pp_ep outer_fsdp_dp fsdp tp -> (outer_fsdp_dp pp_ep tp) fsdp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
-        ep=ep_size,
     )
     fsdp_group_ranks = dist.get_process_group_ranks(dp_cp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_fsdp_ranks, fsdp_group_ranks), (
@@ -1156,7 +1158,7 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
 
     mesh_tp_ranks = einops.rearrange(
         mesh,
-        'ep outer_fsdp_dp fsdp tp -> (outer_fsdp_dp fsdp ep) tp',
+        'pp_ep outer_fsdp_dp fsdp tp -> (outer_fsdp_dp fsdp pp_ep) tp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
     )
@@ -1168,10 +1170,9 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
 
     mesh_outer_fsdp_dp_ranks = einops.rearrange(
         mesh,
-        'ep outer_fsdp_dp fsdp tp -> (fsdp ep tp) outer_fsdp_dp',
+        'pp_ep outer_fsdp_dp fsdp tp -> (fsdp pp_ep tp) outer_fsdp_dp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
-        ep=ep_size,
     )
     outer_fsdp_dp_group_ranks = dist.get_process_group_ranks(outer_fsdp_dp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(
@@ -1181,9 +1182,13 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
         f"do not match the ranks in the Outer FSDP DP group {outer_fsdp_dp_group_ranks}."
     )
 
-    # Exclude the expert parallel dimension
+    # Select the current pipeline stage and expert-parallel rank.
     rank = dist.get_rank()
-    dp_tp_meshes = [per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()]
+    dp_tp_meshes = [
+        per_stage_ep_mesh
+        for per_stage_ep_mesh in mesh
+        if rank in per_stage_ep_mesh.reshape(-1).tolist()
+    ]
     assert (
         len(dp_tp_meshes) == 1
     ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
@@ -1204,31 +1209,39 @@ def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
 
     tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
     # TODO: Supports configurable (dp, cp, ep, tp) order.
+    # PP is the outermost axis in the supported tp-cp-ep-dp-pp rank order.
+    # Keep it separate from stage-local data parallelism.
     mesh = einops.rearrange(
         torch.arange(world_size),
-        "(dp_cp ep tp) -> ep dp_cp tp",
+        "(pp dp_cp ep tp) -> (pp ep) dp_cp tp",
         dp_cp=dp_cp_group.size(),
         tp=tp_size,
         ep=ep_size,
     )
 
-    mesh_dp_ranks = einops.rearrange(mesh, 'ep dp_cp tp -> (ep tp) dp_cp', dp_cp=dp_cp_group.size())
+    mesh_dp_ranks = einops.rearrange(
+        mesh, 'pp_ep dp_cp tp -> (pp_ep tp) dp_cp', dp_cp=dp_cp_group.size()
+    )
     dp_cp_group_ranks = dist.get_process_group_ranks(dp_cp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_dp_ranks, dp_cp_group_ranks), (
         f"[Megatron-FSDP] Data Parallel ranks in the mesh {mesh_dp_ranks} "
         f"do not match the ranks in the DP group {dp_cp_group_ranks}."
     )
 
-    mesh_tp_ranks = einops.rearrange(mesh, 'ep dp_cp tp -> (dp_cp ep) tp', tp=tp_size)
+    mesh_tp_ranks = einops.rearrange(mesh, 'pp_ep dp_cp tp -> (dp_cp pp_ep) tp', tp=tp_size)
     tp_group_ranks = dist.get_process_group_ranks(tp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_tp_ranks, tp_group_ranks), (
         f"[Megatron-FSDP] Tensor Parallel ranks in the mesh {mesh_tp_ranks} "
         f"do not match the ranks in the TP group {tp_group_ranks}."
     )
 
-    # Exclude the expert parallel dimension
+    # Select the current pipeline stage and expert-parallel rank.
     rank = dist.get_rank()
-    dp_tp_meshes = [per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()]
+    dp_tp_meshes = [
+        per_stage_ep_mesh
+        for per_stage_ep_mesh in mesh
+        if rank in per_stage_ep_mesh.reshape(-1).tolist()
+    ]
     assert (
         len(dp_tp_meshes) == 1
     ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."

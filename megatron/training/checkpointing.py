@@ -83,6 +83,7 @@ try:
         handle_fp8_extra_state_case,
         handle_mla_down_proj_in_state_dict,
         handle_mtp_in_state_dict,
+        handle_pipeline_parallel_in_state_dict,
         handle_swiglu_in_state_dict,
         print_diff_in_state_dicts,
         validate_fsdp_dtensor_model_load,
@@ -1859,9 +1860,12 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     apply(handle_mla_down_proj_in_state_dict)
     if args.num_experts:
         state_dict['model'] = handle_experts_in_state_dict(state_dict['model'], args.num_experts)
-    # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
+    # Rename MTP and pipeline layers to their on-disk names last because the handlers
     # above resolve keys against live module paths, which still use the new name.
     apply(handle_mtp_in_state_dict)
+    # V2 optimizer keys are already global and must not be renamed again.
+    if getattr(args, "megatron_fsdp_version", 1) == 1:
+        apply(handle_pipeline_parallel_in_state_dict)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
