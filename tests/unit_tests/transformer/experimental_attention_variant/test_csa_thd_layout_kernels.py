@@ -587,6 +587,91 @@ def test_projected_compressor_graph_replay_updates_maps_and_backward(ratio):
             assert torch.equal(actual, expected)
 
 
+# 2**31 elements: row offsets computed in 32 bits wrap past this point.
+_INT32_ELEMENT_LIMIT = 2**31
+
+
+def _require_free_cuda_memory(num_bytes: int) -> None:
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < num_bytes:
+        pytest.skip(f"Needs {num_bytes / 2**30:.0f} GiB of free CUDA memory.")
+
+
+def test_compressor_input_compact_addresses_rows_past_int32_element_offsets():
+    """Rows starting past 2**31 elements are copied to and from their own rows.
+
+    DSv4 compacts hidden states with ``row_width == hidden_size``. At hidden 4096,
+    a CP1 prefill of 512K tokens already has rows whose element offset exceeds
+    the signed 32-bit range.
+    """
+    _require_cute_cuda()
+    width, ratio, d_comp = 4096, 4, 8
+    l_local = _INT32_ELEMENT_LIMIT // width + ratio
+    c_cap = ((l_local + d_comp) // ratio + 7) // 8 * 8
+    _require_free_cuda_memory(6 * l_local * width * 2)
+    hidden = torch.randn(l_local, width, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    boundary = torch.zeros(d_comp, width, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    cu = torch.tensor([0, l_local], dtype=torch.int32, device="cuda")
+
+    compact, comp_ids = thd_layout_kernels.CompressorInputCompact.apply(
+        hidden, boundary, cu, 0, ratio, d_comp, c_cap, 1
+    )[:2]
+    n_groups = l_local // ratio
+    assert torch.equal(compact[:l_local], hidden)
+    assert compact[l_local:].count_nonzero() == 0
+    assert torch.equal(
+        comp_ids[:n_groups], torch.arange(n_groups, dtype=torch.int32, device="cuda")
+    )
+    assert bool((comp_ids[n_groups:] == -1).all())
+
+    grad = torch.randn_like(compact)
+    compact.backward(grad)
+    assert torch.equal(hidden.grad, grad[:l_local])
+    assert boundary.grad.count_nonzero() == 0
+
+
+def test_projected_compressor_addresses_rows_past_int32_element_offsets():
+    """Projection compaction and its backward scatter address rows past 2**31 elements."""
+    _require_cute_cuda()
+    width, ratio = 4096, 4
+    l_local = _INT32_ELEMENT_LIMIT // width + ratio
+    _require_free_cuda_memory(10 * l_local * width * 2)
+    cu = torch.tensor([0, l_local], dtype=torch.int32, device="cuda")
+    layout = thd_layout_kernels.build_cp_compressor_layout(cu, 0, l_local, 1, ratio)
+    boundary_rows = layout.boundary_rows
+    # CP1 without a halo: compact row r reads local row r, padding rows read nothing.
+    assert torch.equal(
+        layout.compact_to_source[:l_local],
+        torch.arange(boundary_rows, boundary_rows + l_local, dtype=torch.int32, device="cuda"),
+    )
+    assert bool((layout.compact_to_source[l_local:] == -1).all())
+    local_kv, local_score = (
+        torch.randn(l_local, width, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        for _ in range(2)
+    )
+    boundary_kv, boundary_score = (
+        torch.randn(boundary_rows, width, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        for _ in range(2)
+    )
+
+    compact_kv, compact_score = thd_layout_kernels.CompressorProjectionCompact.apply(
+        local_kv, local_score, boundary_kv, boundary_score, layout
+    )
+    for compact, local in ((compact_kv, local_kv), (compact_score, local_score)):
+        assert torch.equal(compact[:l_local], local)
+        assert compact[l_local:].count_nonzero() == 0
+    del compact
+
+    grads = [torch.randn_like(compact_kv), torch.randn_like(compact_score)]
+    local_kv_grad, local_score_grad, boundary_kv_grad, boundary_score_grad = torch.autograd.grad(
+        (compact_kv, compact_score), (local_kv, local_score, boundary_kv, boundary_score), grads
+    )
+    assert torch.equal(local_kv_grad, grads[0][:l_local])
+    assert torch.equal(local_score_grad, grads[1][:l_local])
+    assert boundary_kv_grad.count_nonzero() == 0
+    assert boundary_score_grad.count_nonzero() == 0
+
+
 def test_build_attention_indices_matches_native():
     _require_cute_cuda()
     cu = _make_e2e_like_cu_seqlens()
