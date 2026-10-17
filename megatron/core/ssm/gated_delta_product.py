@@ -31,6 +31,8 @@ from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic, 
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
+from megatron.core.ssm.ops.gdp import batch_invariant_mixer
+from megatron.core.ssm.ops.gdp.batch_invariant import GDPCache
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support, get_cu_seqlens
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -509,6 +511,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             self.nheads_local_cp = self.nheads_local_tp
             self.ngroups_local_cp = self.ngroups_local_tp
 
+        if self.config.batch_invariant_mode:
+            batch_invariant_mixer.validate_config(self)
+
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states,
@@ -557,13 +562,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             assert (
                 not self.config.gdp_cutedsl_kernel
             ), "gdp_cutedsl_kernel is only supported for training, not inference."
-            # This mixer has neither of MambaMixer's batch-invariance mechanisms:
-            # boundary-chunk state retention on prefill and decode tail replay.
-            # Asserted here rather than in DynamicInferenceContext so callers that
-            # only want batch-invariant attention and GEMMs can still run GDP.
-            assert (
-                not self.config.batch_invariant_mode
-            ), "batch_invariant_mode is not supported for Gated Delta Product layers."
             if inference_context.is_dynamic_batching():
                 ok, reason = check_fla_sequence_packing_support()
                 assert ok, reason
@@ -580,7 +578,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 "Packing is only wired through the training/prefill (chunk) path."
             )
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch_size)
-            if inference_context.seqlen_offset > 0:
+            if inference_context.sequence_len_offset > 0:
                 # The states are updated in place.
                 return self._static_decode(hidden_states, conv_state, ssm_state)
 
@@ -638,6 +636,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         Prefill passes conv_state and ssm_state so the trailing conv window and the final
         recurrent state are cached for the decode steps.
         """
+        if self.config.batch_invariant_mode:
+            return batch_invariant_mixer.chunk_forward(
+                self, hidden_states, conv_state, ssm_state, packed_seq_params
+            )
+
         if packed_seq_params is not None:
             # ``hidden_states`` is [seq_len, batch, dim]; THD requires batch=1.
             _, batch_size, _ = hidden_states.shape
@@ -1150,6 +1153,17 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         Every op here is CUDA-graph safe: no host synchronization, no
         data-dependent shapes, and the state caches are addressed by device-side
         indices rather than gathered and scattered."""
+        if self.config.batch_invariant_mode:
+            return batch_invariant_mixer.decode(
+                self,
+                zVKQba,
+                conv_state,
+                ssm_state,
+                batch_indices,
+                intermediate_conv_state,
+                intermediate_ssm_state,
+            )
+
         assert (intermediate_conv_state is None) == (intermediate_ssm_state is None), (
             "the speculative-decoding conv and SSM snapshot buffers must be passed together; "
             "a rollback needs both halves of the recurrent state"
@@ -1249,6 +1263,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         so need neither a host synchronization nor a data-dependent shape.
         Padding requests are zero-length sequences with a `-1` state slot; they
         produce zero output and touch no state."""
+        if self.config.batch_invariant_mode:
+            return batch_invariant_mixer.packed_prefill(
+                self, zVKQba, conv_state, ssm_state, context
+            )
+
         metadata = context.mamba_metadata
         slot_allocator = context.mamba_slot_allocator
         cu_seqlens = metadata.cu_seqlens
@@ -1264,8 +1283,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             intermediate_ssm_out = slot_allocator.intermediate_ssm_out[gdp_layer_idx]
             intermediate_conv_out = slot_allocator.intermediate_conv_out[gdp_layer_idx]
 
-        # No batch-invariant term, unlike MambaMixer's equivalent flag: `forward`
-        # already rejects batch_invariant_mode for this mixer outright.
+        # The batch-invariant path returns above and rejects prefix caching.
         extract_intermediates = (
             intermediate_ssm_out is not None and metadata.gdp_intermediate_chunk_indices is not None
         )
@@ -1384,6 +1402,19 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         conv_state = torch.zeros(
             batch_size, self.conv1d.weight.shape[0], self.d_conv, device=device, dtype=conv_dtype
         )
+        if self.config.batch_invariant_mode:
+            ssm_state = torch.zeros(
+                batch_size,
+                GDPCache.storage_size(
+                    self.nheads_local_tp,
+                    self.d_state,
+                    self.headdim,
+                    self.config.gdp_batch_invariant_block_size,
+                ),
+                device=device,
+                dtype=torch.float32,
+            )
+            return conv_state, ssm_state
         ssm_dtype = self.in_proj.weight.dtype if dtype is None else dtype
         # ssm_dtype = torch.float32
         ssm_state = torch.zeros(
@@ -1396,9 +1427,18 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         )
         return conv_state, ssm_state
 
-    def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
+    def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
         """Returns the Mamba conv and SSM state shapes per request."""
         conv_states_shape = (self.conv1d.weight.shape[0], self.d_conv)
+        if self.config.batch_invariant_mode:
+            return conv_states_shape, (
+                GDPCache.storage_size(
+                    self.nheads_local_tp,
+                    self.d_state,
+                    self.headdim,
+                    self.config.gdp_batch_invariant_block_size,
+                ),
+            )
         ssm_states_shape = (self.nheads_local_tp, self.d_state, self.headdim)
         return (conv_states_shape, ssm_states_shape)
 
@@ -1429,21 +1469,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             self.layer_number not in inference_context.key_value_memory_dict
             or batch_size != self.cached_batch_size
         ):
-            conv_state = torch.zeros(
-                batch_size,
-                self.conv1d.weight.shape[0],
-                self.d_conv,
-                device=self.conv1d.weight.device,
-                dtype=self.conv1d.weight.dtype,
-            )
-            ssm_state = torch.zeros(
-                batch_size,
-                self.nheads_local_tp,
-                self.d_state,
-                self.headdim,
-                device=self.in_proj.weight.device,
-                dtype=self.in_proj.weight.dtype,
-            )
+            conv_state, ssm_state = self.allocate_inference_cache(batch_size, 0)
             inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
             self.cached_batch_size = batch_size
         else:
