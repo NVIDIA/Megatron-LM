@@ -36,6 +36,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.parametrize("tp", [1, 2], ids=["tp1", "tp2-sp"])
 @pytest.mark.parametrize(
     "variant,fused,recompute_norm,whole_layer,delay",
     [
@@ -53,22 +54,25 @@ def test_gdn_offload_with_te_graphs(
     recompute_norm: bool,
     whole_layer: bool,
     delay: bool,
+    tp: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Compare complete optimizer states after captured backward on changing inputs."""
+    if Utils.world_size < tp:
+        pytest.skip("Requires two GPUs for tensor and sequence parallelism.")
     if variant == "gdn2":
         pytest.importorskip("fla.ops.gdn2")
     if fused:
         pytest.importorskip("causal_conv1d", minversion="1.6.1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-    Utils.initialize_model_parallel()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
     initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
     init_num_microbatches_calculator(
         rank=torch.distributed.get_rank(),
-        global_batch_size=4 * Utils.world_size,
+        global_batch_size=4 * (Utils.world_size // tp),
         micro_batch_size=1,
-        data_parallel_size=Utils.world_size,
+        data_parallel_size=Utils.world_size // tp,
         decrease_batch_size_if_needed=False,
     )
     helper = None
@@ -79,7 +83,15 @@ def test_gdn_offload_with_te_graphs(
             off_interface.reset_instance()
             config = replace(
                 _training_config(
-                    1, False, 1, 1, None, 1.0, recompute_norm, fused_pre_gdr=fused, variant=variant
+                    tp,
+                    tp > 1,
+                    1,
+                    1,
+                    None,
+                    1.0,
+                    recompute_norm,
+                    fused_pre_gdr=fused,
+                    variant=variant,
                 ),
                 fine_grained_activation_offloading=enabled,
                 offload_modules=["gdn_core_attn"] if enabled else [],
@@ -89,7 +101,13 @@ def test_gdn_offload_with_te_graphs(
                 use_te_rng_tracker=True,
                 delay_offload_until_cuda_graph=delay,
             )
-            models, optimizer = _build_training_model(config, groups)
+            # Match native training: DDP's retained AccumulateGrad nodes must use a side stream.
+            current_stream = torch.cuda.current_stream()
+            init_stream = torch.cuda.Stream()
+            init_stream.wait_stream(current_stream)
+            with torch.cuda.stream(init_stream):
+                models, optimizer = _build_training_model(config, groups)
+            current_stream.wait_stream(init_stream)
             manager = PipelineOffloadManager.get_instance()
             pool_checks = []
 
@@ -109,10 +127,9 @@ def test_gdn_offload_with_te_graphs(
                         models, config, 128, 1, optimizers=[optimizer], pg_collection=groups
                     )
                     helper.create_cudagraphs()
-                    helper.cuda_graph_set_manual_hooks()
-                    assert helper._graphs_created
+                    assert helper.graphs_created()
                     assert all(
-                        len(layer.cuda_graphs) == 1
+                        len(layer.cuda_graphs) == helper.num_microbatches
                         for layer in unwrap_model(models[0]).decoder.layers
                     )
                 batches = []
@@ -169,7 +186,7 @@ def test_gdn_offload_with_te_graphs(
             del models, optimizer, states
             torch.cuda.synchronize()
     finally:
-        if helper is not None:
+        if helper is not None and helper.graphs_created():
             helper.delete_cuda_graphs()
         torch.cuda.synchronize()
         off_interface.reset_instance()
