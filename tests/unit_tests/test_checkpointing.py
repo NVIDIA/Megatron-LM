@@ -982,7 +982,9 @@ def test_strict_load_idle_rerun_checkpoint(
         with mock.patch(
             "megatron.training.checkpointing.get_rerun_state_machine", return_value=loaded_machine
         ):
-            iteration, flops = load_checkpoint([loaded_model], None, None, strict=True)
+            iteration, flops = load_checkpoint(
+                [loaded_model], None, None, strict=True, restore_training_state=True
+            )
 
         assert iteration == 123
         assert flops == 456
