@@ -839,6 +839,37 @@ class TEGroupedMLP(MegatronModule):
                 if fine_grained_activation_offloading and output_buffer is None
                 else []
             )
+            # Deterministic mode: TE's op fuser builds its CuTe fused grouped MLP only for the
+            # MXFP8 / NVFP4 recipes, and that fused backward accumulates the routing-prob
+            # gradient (dprob) with atomics inside the cuDNN dactivation epilogue, so the router
+            # gradient is not bit-reproducible (newer TE raises for this on the GLU path). Feed a
+            # unit scale to the fused op and apply the probs on the FC2 output instead: without
+            # an FC2 bias the two placements are the same function, and the prob gradient
+            # becomes an ordinary (deterministic) torch reduction. The BF16 op-fuser path runs
+            # the separate scaled-GLU op, whose scale gradient is already reproducible, so it is
+            # left untouched and its numerics do not change.
+            post_probs = None
+            fused_cute_grouped_mlp = (
+                self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.mxfp8
+            ) or (self.config.fp4 and self.config.fp4_recipe == Fp4Recipe.nvfp4)
+            if getattr(self.config, "deterministic_mode", False) and fused_cute_grouped_mlp:
+                if self.linear_fc2.use_bias:
+                    raise RuntimeError(
+                        "deterministic_mode with the Transformer Engine operation-fuser grouped "
+                        "MLP requires FC2 without bias: the routing probabilities are applied on "
+                        "the FC2 output, which is only exact when FC2 has no bias."
+                    )
+                if output_buffer is not None:
+                    # NCCL-EP zero-copy has the combine read the FC2 output straight out of the
+                    # symmetric buffer the fused op writes; applying the probs afterwards would
+                    # leave that buffer unscaled.
+                    raise RuntimeError(
+                        "deterministic_mode is not supported with moe_ncclep_zero_copy: the "
+                        "routing probabilities are applied on the FC2 output outside the fused "
+                        "op, which cannot target the zero-copy symmetric output buffer."
+                    )
+                post_probs = permuted_probs
+                permuted_probs = torch.ones_like(permuted_probs)
             with stash_context:
                 # NCCL-EP zero-copy: route the fc2 output (fwd combine reads it one-sided) and the
                 # fc1 dgrad (bwd dispatch scatters it one-sided) into caller-provided symm buffers.
@@ -861,6 +892,8 @@ class TEGroupedMLP(MegatronModule):
                     *fc2_extra_inputs,  # FC2 splits and, for bias, its per-token scale
                     **({"op_kwargs": op_kwargs} if op_kwargs else {}),
                 )
+                if post_probs is not None:
+                    output = (output * post_probs.unsqueeze(-1).float()).to(output.dtype)
         output = fused_group_mlp_manager.group_offload(
             output,
             forced_released_tensors=forced_released_tensors,

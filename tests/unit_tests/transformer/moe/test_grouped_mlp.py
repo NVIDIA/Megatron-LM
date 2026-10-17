@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 import megatron.core.transformer.moe.experts as experts_module
 from megatron.core.activations import situlu, squared_relu
+from megatron.core.enums import Fp8Recipe
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
@@ -203,6 +204,64 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
     assert ops[2].scale_bias is False
     assert hasattr(ops, "forward_pre_hook")
     assert hasattr(ops, "forward_post_hook")
+
+
+def test_fused_forward_deterministic_mode_applies_probs_on_fc2_output():
+    """On the MXFP8 / NVFP4 recipes (the only ones TE fuses into its CuTe grouped MLP, whose
+    dprob accumulation uses atomics) deterministic mode feeds a unit scale to the fused op and
+    multiplies the routing probs onto the FC2 output instead; the BF16 path is unchanged."""
+
+    class FakeFusedOps:
+        def __call__(self, hidden_states, fc1_tokens, probs, fc2_tokens):
+            self.probs = probs
+            return hidden_states + 1
+
+    def make_module(fc2_bias, mxfp8=True):
+        module = TEGroupedMLP.__new__(TEGroupedMLP)
+        module.config = SimpleNamespace(
+            fp8=mxfp8,
+            fp8_recipe=Fp8Recipe.mxfp8 if mxfp8 else None,
+            fp4=False,
+            moe_router_padding_for_quantization=False,
+            moe_token_dispatcher_type=None,
+            moe_flex_dispatcher_backend=None,
+            moe_use_grouped_tensor=True,
+            moe_paged_stash=False,
+            delay_offload_until_cuda_graph=False,
+            deterministic_mode=True,
+        )
+        module._use_grouped_tensor = True
+        module.quantization_padding = lambda tensor, token_counts: (tensor, token_counts)
+        module.quantization_unpadding = lambda tensor, token_counts: tensor
+        module._fused_ops = (FakeFusedOps(),)
+        module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias)
+        return module
+
+    hidden_states = torch.zeros(2, 4, dtype=torch.bfloat16)
+    tokens_per_expert = torch.tensor([1, 1])
+    probs = torch.tensor([0.25, 0.5])
+
+    module = make_module(fc2_bias=False)
+    output = module._fused_forward(hidden_states, tokens_per_expert, probs)
+    assert torch.equal(module._fused_ops[0].probs, torch.ones_like(probs))
+    assert output.dtype == hidden_states.dtype
+    torch.testing.assert_close(output.float(), (hidden_states.float() + 1) * probs[:, None])
+
+    # BF16 op fuser: no CuTe fused grouped MLP, the scaled-GLU op's scale gradient is already
+    # reproducible, so the probs reach the fused op unchanged and nothing is post-multiplied.
+    module = make_module(fc2_bias=False, mxfp8=False)
+    output = module._fused_forward(hidden_states, tokens_per_expert, probs)
+    assert torch.equal(module._fused_ops[0].probs, probs)
+    torch.testing.assert_close(output, hidden_states + 1)
+
+    with pytest.raises(RuntimeError, match="FC2 without bias"):
+        make_module(fc2_bias=True)._fused_forward(hidden_states, tokens_per_expert, probs)
+    # NCCL-EP zero-copy hands the fused op a symmetric output buffer that the combine reads
+    # directly; the post-multiply cannot target it, so the combination is rejected.
+    with pytest.raises(RuntimeError, match="zero_copy"):
+        make_module(fc2_bias=False)._fused_forward(
+            hidden_states, tokens_per_expert, probs, output_buffer=torch.empty_like(hidden_states)
+        )
 
 
 @pytest.mark.parametrize("fc2_bias", [False, True], ids=["no_fc2_bias", "fc2_bias"])
