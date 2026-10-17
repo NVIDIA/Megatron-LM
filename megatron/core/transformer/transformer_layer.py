@@ -2211,7 +2211,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.offload_module_in_cuda_graph = False
         cuda_graph_modules = self.config.cuda_graph_modules or []
         if (
-            (not cuda_graph_modules or CudaGraphModule.attn in cuda_graph_modules)
+            self.config.cuda_graph_impl == "transformer_engine"
+            and (not cuda_graph_modules or CudaGraphModule.attn in cuda_graph_modules)
             and "gdn_core_attn" in (self.config.offload_modules or [])
             and getattr(self.self_attention, "offload_core_attention", False)
         ):

@@ -107,6 +107,7 @@ def _training_config(
         offload_modules=["gdn_core_attn"],
         activation_offload_fraction=fraction,
         min_offloaded_tensor_size=1024,
+        cuda_graph_warmup_steps=0,
     )
 
 
