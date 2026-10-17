@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel_layout.graph import cache_packed_gdn_graph_validation
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
 from megatron.core.fp8_utils import is_mxfp8_output_proj_active
@@ -431,6 +432,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
+                rotary_seq_len = self._bound_thd_rotary_seq_len(rotary_seq_len, packed_seq_params)
                 rotary_pos_emb = self.rotary_pos_emb(
                     rotary_seq_len,
                     packed_seq=packed_seq_params is not None
@@ -442,6 +444,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
+                rotary_seq_len = self._bound_thd_rotary_seq_len(rotary_seq_len, packed_seq_params)
                 rotary_pos_emb, _ = self.rotary_pos_emb(
                     rotary_seq_len,
                     packed_seq=packed_seq_params is not None
@@ -596,6 +599,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
             self.cudagraph_manager = CudaGraphManager(config)
 
+    @cache_packed_gdn_graph_validation
     def forward(
         self,
         input_ids: Tensor,

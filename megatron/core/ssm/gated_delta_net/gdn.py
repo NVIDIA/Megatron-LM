@@ -13,6 +13,10 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
+from megatron.core.context_parallel_layout.graph import (
+    captures_packed_gdn_attention,
+    supports_packed_gdn_graph,
+)
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -22,6 +26,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     a2a_cp_to_hp,
     a2a_hp_to_cp,
     build_cp_context,
+    build_graph_cp_context,
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
@@ -64,6 +69,17 @@ class GatedDeltaNet(_GDNBase):
             self.gated_delta_rule = torch_chunk_gated_delta_rule
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
+
+        if (
+            build_graph_cp_context is None
+            and captures_packed_gdn_attention(self.config)
+            and supports_packed_gdn_graph(self.config)
+        ):
+            raise ImportError(
+                "Packed GDN attention CUDA graphs require an FLA build that provides "
+                "fla.ops.cp.graph.build_graph_cp_context. Install such a build, or remove "
+                "'attn' from cuda_graph_modules."
+            )
 
     def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int, int]:
         """Return GDN1 qkv/z/beta/alpha split sizes for a runtime headwise CP size."""
@@ -193,12 +209,14 @@ class GatedDeltaNet(_GDNBase):
             ), "Packed sequence does not support deterministic mode."
 
             # Resolve cu_seqlens with alignment padding handling.
+            graph_safe = getattr(packed_seq_params, 'gdn_graph_safe', False)
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=cp_size_runtime,
+                validated=graph_safe,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -206,8 +224,11 @@ class GatedDeltaNet(_GDNBase):
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
+                validated=graph_safe,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+            # torch.equal reads a device result on the host, which capture forbids; graph-safe
+            # inputs were checked by validate_packed_gdn_graph_inputs.
+            assert graph_safe or torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
@@ -220,7 +241,14 @@ class GatedDeltaNet(_GDNBase):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
-        if cp_size_chunkwise > 1:
+        if (
+            getattr(packed_seq_params, 'gdn_graph_safe', False)
+            and self.config.linear_cp_mode == "chunkwise"
+        ):
+            chunkwise_cp_context = build_graph_cp_context(
+                cu_seqlens_q, cp_group_chunkwise, seq_len_post_headwise, self.conv_kernel_dim
+            )
+        elif cp_size_chunkwise > 1:
             if build_cp_context is None:
                 raise ImportError(
                     "FLA chunkwise context parallelism requires fla.ops.cp.build_cp_context. "
@@ -333,6 +361,17 @@ class GatedDeltaNet(_GDNBase):
             seq_len_post_headwise,
             packed_seq_params,
         )
+        if (
+            getattr(packed_seq_params, 'gdn_graph_safe', False)
+            and self.config.linear_cp_mode == "headwise"
+        ):
+            chunkwise_cp_context = build_graph_cp_context(
+                cu_seqlens_q,
+                None,
+                seq_len_post_headwise,
+                self.conv_kernel_dim,
+                allow_unaligned_sequences=True,
+            )
 
         if self.gdn_pre_gated_delta_rule_fusion:
             if cp_size_chunkwise > 1 and batch > 1:
@@ -488,6 +527,9 @@ class GatedDeltaNet(_GDNBase):
         qkv, gate, beta, alpha = torch.split(
             qkvzba, self._get_feat_dim_split(cp_size_headwise), dim=-1
         )
+        if getattr(packed_seq_params, 'gdn_graph_safe', False):
+            # AOT saves alpha for backward; its projection stride would snapshot the full row span.
+            alpha = alpha.contiguous()
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
 
         nvtx_range_push(suffix="conv1d")

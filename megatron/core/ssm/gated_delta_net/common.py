@@ -57,6 +57,14 @@ try:
 except ImportError:
     build_cp_context = None
 
+# fla.ops.cp.graph builds the fixed-capacity, device-side CP metadata that packed GDN
+# CUDA graphs replay with. Released FLA builds do not provide it yet; GatedDeltaNet
+# checks for None when attention capture is configured.
+try:
+    from fla.ops.cp.graph import build_graph_cp_context
+except ImportError:
+    build_graph_cp_context = None
+
 __all__ = [
     "HAVE_FLA",
     "GatedDeltaNetSubmodules",
@@ -67,6 +75,7 @@ __all__ = [
     "a2a_cp_to_hp",
     "a2a_hp_to_cp",
     "build_cp_context",
+    "build_graph_cp_context",
     "causal_conv1d",
     "chunk_gated_delta_rule",
     "get_parameter_local_cp",
@@ -531,13 +540,26 @@ class _GDNBase(MegatronModule):
         raise NotImplementedError
 
     def _resolve_cu_seqlens(
-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+        self,
+        cu_seqlens_padded,
+        cu_seqlens_actual,
+        total_seq_len,
+        name,
+        cp_size: int = 1,
+        validated: bool = False,
     ) -> torch.Tensor:
-        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
+        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding.
+
+        ``validated`` skips the host-side checks below, which CUDA graph capture forbids, for
+        packed GDN graph inputs that validate_packed_gdn_graph_inputs checks before replay.
+        """
         if cu_seqlens_padded is not None:
             cu_seqlens = cu_seqlens_padded
         else:
             cu_seqlens = cu_seqlens_actual
+
+        if validated:
+            return cu_seqlens
 
         total_cu = cu_seqlens[-1].cpu().item()
         if total_cu != total_seq_len:
@@ -703,6 +725,38 @@ def _build_head_perm_for_split_sections(
         offset += s
 
     return torch.cat(parts, dim=-1).view(-1)
+
+
+class _BijectiveIndexSelect(torch.autograd.Function):
+    """Full permutations can gather their inverse without accumulation in backward.
+
+    Only use with the head/THD permutation builders above; length equality alone
+    does not establish the required bijection.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, dim, indices):
+        """Select along ``dim`` and save the inverse permutation for backward."""
+        assert -tensor.ndim <= dim < tensor.ndim
+        dim %= tensor.ndim
+        assert indices.ndim == 1 and indices.numel() == tensor.shape[dim]
+        inverse = torch.empty_like(indices)
+        inverse.scatter_(0, indices, torch.arange(indices.numel(), device=indices.device))
+        ctx.dim = dim
+        ctx.save_for_backward(inverse)
+        return tensor.index_select(dim, indices)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Gather gradients with the inverse permutation (no accumulation needed)."""
+        (inverse,) = ctx.saved_tensors
+        return grad_output.index_select(ctx.dim, inverse), None, None
+
+
+def _headwise_index_select(tensor, dim, indices, packed_seq_params):
+    if getattr(packed_seq_params, 'gdn_graph_safe', False):
+        return _BijectiveIndexSelect.apply(tensor, dim, indices)
+    return tensor.index_select(dim, indices)
 
 
 ####################
@@ -917,7 +971,7 @@ def a2a_cp_to_hp(
         head_perm = _build_head_perm_for_split_sections(
             in_proj_split_sections, cp_size, qkvzba.device
         )
-        qkvzba = qkvzba.index_select(-1, head_perm)
+        qkvzba = _headwise_index_select(qkvzba, -1, head_perm, packed_seq_params)
 
     thd_cp_a2a_inv = None
     if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -929,7 +983,7 @@ def a2a_cp_to_hp(
             # is equivalent to per-sequence a2a.
             # This also folds the ``_undo_attention_load_balancing`` step.
             thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(cu_seqlens_q, cp_size, seq_len)
-            qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
+            qkvzba = _headwise_index_select(qkvzba, 0, thd_cp_a2a_idx, packed_seq_params)
     else:
         qkvzba = tensor_a2a_cp2hp(qkvzba, seq_dim=0, head_dim=-1, cp_group=cp_group)
 
@@ -960,7 +1014,7 @@ def a2a_hp_to_cp(
     if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
         if cp_size > 1:
             assert thd_cp_a2a_inv is not None
-            norm_out = norm_out.index_select(0, thd_cp_a2a_inv)
+            norm_out = _headwise_index_select(norm_out, 0, thd_cp_a2a_inv, packed_seq_params)
         norm_out = tensor_a2a_hp2cp(
             norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group, redo_attention_load_balancing=False
         )
