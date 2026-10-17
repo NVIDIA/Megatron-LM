@@ -15,7 +15,7 @@ from megatron.core.enums import ModelType
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.training import checkpointing
-from megatron.training.global_vars import get_args, set_args
+from megatron.training.global_vars import get_args, get_train_state, set_args
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -137,7 +137,7 @@ def _setup_model(
     assert not experts.config.bias_activation_fusion
     if load and not restore_optimizer:
         # setup_model_and_optimizer calls the real loader once, including master initialization.
-        assert args.iteration == 1
+        assert get_train_state().iteration == 1
         # Rebuild model storage from the loaded FP32 masters before checking exact rows.
         optimizer.quantize_and_sync_model_params_from_main_params()
     return model, optimizer, scheduler, experts
@@ -171,7 +171,7 @@ def _assert_state_equal(actual, expected, path="state"):
 
 
 def _snapshot_training_state(model, optimizer, scheduler):
-    args = get_args()
+    train_state = get_train_state()
     optimizer_states = []
     for part in getattr(optimizer, "chained_optimizers", [optimizer]):
         assert isinstance(part, DistributedOptimizer)
@@ -190,16 +190,18 @@ def _snapshot_training_state(model, optimizer, scheduler):
         # The common state includes Adam step counts and group LR/WD; parameter
         # state includes each local FP32 master shard and both Adam moments.
         common = part.state_dict()
-        assert all(group["step"] == args.iteration for group in common["optimizer"]["param_groups"])
+        assert all(
+            group["step"] == train_state.iteration for group in common["optimizer"]["param_groups"]
+        )
         optimizer_states.append({"common": common, "masters": masters, "state": states})
-    assert scheduler.num_steps == args.consumed_train_samples
+    assert scheduler.num_steps == train_state.consumed_train_samples
     return _snapshot_state(
         {
             "model": dict(model[0].named_parameters()),
             "optimizer": optimizer_states,
             "scheduler": scheduler.state_dict(),
-            "iteration": args.iteration,
-            "consumed_train_samples": args.consumed_train_samples,
+            "iteration": train_state.iteration,
+            "consumed_train_samples": train_state.consumed_train_samples,
         }
     )
 
@@ -223,9 +225,10 @@ def _train_step(case, model, optimizer, scheduler):
     update_successful, _, _ = optimizer.step()
     assert update_successful
     args = get_args()
+    train_state = get_train_state()
     scheduler.step(increment=args.global_batch_size)
-    args.iteration += 1
-    args.consumed_train_samples += args.global_batch_size
+    train_state.iteration += 1
+    train_state.consumed_train_samples += args.global_batch_size
     return loss.detach().float().cpu()
 
 
