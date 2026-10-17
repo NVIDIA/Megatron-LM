@@ -1562,8 +1562,8 @@ class TransformerConfig(ModelParallelConfig):
     "shortcut_post_norm": offload the input of the shortcut output normalization.
             Requires moe_shortcut_connection=True.
     "gdn_core_attn": offload tensors saved by the FLA GatedDeltaNet recurrence.
-            Requires BF16 GDN and gdn_kernel_backend="fla", with no CUDA graphs
-            or full recomputation.
+            Requires BF16 GDN/GDN2 and gdn_kernel_backend="fla", with no full
+            recomputation. CUDA graphs require the Transformer Engine implementation.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -2731,8 +2731,8 @@ class TransformerConfig(ModelParallelConfig):
                 f'Allowed modules are: {allowed_modules}'
             )
             if "gdn_core_attn" in self.offload_modules:
-                if self.experimental_attention_variant != "gdn":
-                    raise ValueError("gdn_core_attn offloading only supports GDN (gdn).")
+                if self.experimental_attention_variant not in ("gdn", "gdn2"):
+                    raise ValueError("gdn_core_attn offloading only supports GDN (gdn or gdn2).")
                 if not self.bf16 or self.fp8 or self.fp4:
                     raise ValueError("gdn_core_attn offloading requires BF16 without FP8 or FP4.")
                 if self.gdn_kernel_backend != "fla":
@@ -2742,11 +2742,12 @@ class TransformerConfig(ModelParallelConfig):
                         "gdn_core_attn offloading does not support full recomputation."
                     )
                 if (
-                    self.cuda_graph_impl != "none"
+                    self.cuda_graph_impl not in ("none", "transformer_engine")
                     or self.enable_cuda_graph
-                    or self.external_cuda_graph
                 ):
-                    raise ValueError("gdn_core_attn offloading does not yet support CUDA graphs.")
+                    raise ValueError(
+                        "gdn_core_attn offloading only supports Transformer Engine CUDA graphs."
+                    )
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "

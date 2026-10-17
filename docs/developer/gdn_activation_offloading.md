@@ -1,6 +1,6 @@
 # GDN recurrence activation offloading
 
-`gdn_core_attn` offloads tensors saved by the BF16/FLA GatedDeltaNet recurrence.
+`gdn_core_attn` offloads tensors saved by BF16/FLA GatedDeltaNet and GatedDeltaNet2 recurrences.
 It reuses the existing activation-offload manager, streams and pinned-memory pool.
 The option is disabled by default. Projection and convolution/QKV recomputation
 and convolution-input offload are separate scopes proposed in
@@ -21,8 +21,12 @@ The training CLI requires `NVTE_CPU_OFFLOAD_V1=1` with Transformer Engine 2.10
 or newer. Programmatic configurations set `fine_grained_activation_offloading=True`,
 `offload_modules=["gdn_core_attn"]` and `gdn_kernel_backend="fla"`.
 Selective `gdn_norm_out` recomputation and the existing opt-in pre-GDR fusion are
-supported. Configuration rejects GDN2, FP8/FP4, non-BF16 execution, other recurrence
-backends, full-layer recomputation and CUDA graphs.
+supported for GDN. GDN2 supports `gdn_norm_out` recomputation and requires FLA's
+`fla.ops.gdn2` kernel. Configuration rejects FP8/FP4, non-BF16 execution, other
+recurrence backends and full-layer recomputation. CUDA graphs require
+`cuda_graph_impl="transformer_engine"`; attention or whole-layer capture uses the
+existing graph stream/event callbacks. Local and full-iteration graphs remain
+unsupported. `delay_offload_until_cuda_graph` uses the existing replay flush.
 
 The manager's minimum tensor size, offload fraction and last-group margin apply.
 After warmup, fraction zero selects no transfers. Warmup can still copy eligible

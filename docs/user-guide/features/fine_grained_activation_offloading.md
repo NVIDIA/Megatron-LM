@@ -43,7 +43,7 @@ Each scope offloads saved activations to CPU during forward and reloads them bef
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
-| `gdn_core_attn` | Tensors saved inside the FLA GDN recurrence | BF16 GDN only; no full recomputation or CUDA graphs |
+| `gdn_core_attn` | Tensors saved inside the FLA GDN/GDN2 recurrence | BF16 only; no full recomputation; TE CUDA graphs supported |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
 connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the
@@ -53,7 +53,7 @@ replay-owned forward so that replay and offloading do not release the same activ
 
 Use `--fine-grained-activation-offloading --offload-modules gdn_core_attn` with BF16
 GDN (`--experimental-attention-variant gdn`, including the legacy `gated_delta_net`
-alias). This scope captures tensors saved by FLA's chunked gated delta rule, including
+alias), or `--experimental-attention-variant gdn2`. This scope captures tensors saved by FLA's recurrence, including
 Q/K/V and its internal WY representation. It commits the transfer on the recurrence
 output, before the gated output norm, and reloads before recurrence backward.
 
@@ -68,7 +68,10 @@ inputs bypass the offload scope. When Q is frozen, the first differentiable inpu
 anchors the backward prefetch callback.
 
 Initial support requires BF16 without FP8/FP4, the FLA recurrence (not the deterministic
-Torch reference), and no CUDA graphs or full-layer recomputation. GDN2 is not included.
+Torch reference), and no full-layer recomputation. CUDA graphs require
+`--cuda-graph-impl transformer_engine`; the existing graph stream/event integration
+also covers captured GDN recurrence groups. Local and full-iteration graphs are
+not supported by this scope. GDN2 requires FLA's `fla.ops.gdn2` kernel.
 Saved inputs are not force-released: any storage still held by another operation stays
 on GPU. The manager's minimum size, fraction, and last-group margin still apply; a
 single GDN group is kept resident after warmup. Use multiple layers when evaluating

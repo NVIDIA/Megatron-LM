@@ -2206,6 +2206,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
         cuda_graph_modules = self.config.cuda_graph_modules or []
+        if (
+            (not cuda_graph_modules or CudaGraphModule.attn in cuda_graph_modules)
+            and "gdn_core_attn" in (self.config.offload_modules or [])
+            and getattr(self.self_attention, "offload_core_attention", False)
+        ):
+            self.offload_module_in_cuda_graph = True
         if CudaGraphModule.attn in cuda_graph_modules:
             if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
                 self.offload_module_in_cuda_graph = True
