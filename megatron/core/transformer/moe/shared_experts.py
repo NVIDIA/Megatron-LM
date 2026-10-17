@@ -589,17 +589,17 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         """Run the fused shared expert MLP with the same TP comms as the dense MLP path."""
         if self.config.sequence_parallel:
             fc1_input = gather_from_sequence_parallel_region(
-                hidden_states, tensor_parallel_output_grad=True
+                hidden_states, tensor_parallel_output_grad=True, group=self.tp_group
             )
         else:
-            fc1_input = copy_to_tensor_model_parallel_region(hidden_states)
+            fc1_input = copy_to_tensor_model_parallel_region(hidden_states, group=self.tp_group)
 
         fc2_output = self._fused_grouped_swiglu_no_comm(fc1_input)
 
         if self.config.sequence_parallel:
-            output = reduce_scatter_to_sequence_parallel_region(fc2_output)
+            output = reduce_scatter_to_sequence_parallel_region(fc2_output, group=self.tp_group)
         else:
-            output = reduce_from_tensor_model_parallel_region(fc2_output)
+            output = reduce_from_tensor_model_parallel_region(fc2_output, group=self.tp_group)
         return output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

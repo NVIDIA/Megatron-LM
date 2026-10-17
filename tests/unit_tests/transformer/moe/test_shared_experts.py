@@ -1,15 +1,20 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core import parallel_state
 from megatron.core.models.gpt import moe_module_specs
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe import shared_experts as shared_experts_module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
@@ -351,6 +356,111 @@ def test_backward_dw_dispatches_fused_children_and_original_reduce_hooks(monkeyp
     assert call_order == ["fc2", "fc1"]
     assert shared_expert.linear_fc1.reduce_hooks_called
     assert shared_expert.linear_fc2.reduce_hooks_called
+
+
+_GLOBAL_TP_ACCESSORS = (
+    "get_tensor_model_parallel_group",
+    "get_tensor_model_parallel_rank",
+    "get_tensor_model_parallel_world_size",
+    "get_expert_tensor_parallel_group",
+    "get_expert_tensor_parallel_rank",
+    "get_expert_tensor_parallel_world_size",
+)
+
+
+def _forbid_global_tp_accessors(patch):
+    """Make the global tensor-parallel accessors raise, including by-name imports of them."""
+    for name in _GLOBAL_TP_ACCESSORS:
+        original = getattr(parallel_state, name)
+
+        def forbid(*args, _name=name, **kwargs):
+            raise AssertionError(f"read of the global grid: parallel_state.{_name}")
+
+        for module in list(sys.modules.values()):
+            if getattr(module, "__name__", "").startswith("megatron.") and (
+                getattr(module, "__dict__", {}).get(name) is original
+            ):
+                patch.setattr(module, name, forbid)
+
+
+def _swiglu_on_local_shard(self, hidden_states):
+    """Stand-in for the TE grouped kernel: FC1, SwiGLU and FC2 on this rank's weight shard."""
+    gate, up = torch.chunk(F.linear(hidden_states, self.linear_fc1.weight), 2, dim=-1)
+    return F.linear(F.silu(gate) * up, self.linear_fc2.weight)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    Utils.world_size < 2 or Utils.world_size % 2 != 0, reason="needs an even number of ranks"
+)
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_fused_shared_expert_uses_module_tp_group(monkeypatch, sequence_parallel):
+    """The fused path communicates over the module's TP group and matches the unfused path.
+
+    The global grid has TP=1, the module gets its own TP=2 communicator, and the global TP
+    accessors raise while the fused path runs. A collective that resolved the global group would
+    raise or reduce over a single rank.
+    """
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
+        [[rank, rank + 1] for rank in range(0, Utils.world_size, 2)]
+    )
+    try:
+        # gtp_remat=None: no GTP axis, so the linears do not look up the global one.
+        pg_collection = ProcessGroupCollection(tp=tp_group, gtp_remat=None, expt_gtp_remat=None)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            moe_shared_expert_intermediate_size=64,
+            tensor_model_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+            activation_func=F.silu,
+            gated_linear_unit=True,
+            bias_activation_fusion=False,
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+        )
+        submodules = MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear)
+        monkeypatch.setattr(
+            FusedSharedExpertMLP, "_validate_fused_grouped_swiglu", lambda self: None
+        )
+        monkeypatch.setattr(
+            FusedSharedExpertMLP, "_fused_grouped_swiglu_no_comm", _swiglu_on_local_shard
+        )
+
+        torch.manual_seed(123)
+        sequence_length = 8 // tp_group.size() if sequence_parallel else 8
+        hidden_states = torch.randn(
+            (sequence_length, 2, config.hidden_size),
+            device="cuda",
+            generator=torch.Generator(device="cuda").manual_seed(torch.distributed.get_rank()),
+        ).requires_grad_(True)
+        fused_hidden_states = hidden_states.detach().clone().requires_grad_(True)
+
+        unfused = SharedExpertMLP(config, submodules, gate=False, pg_collection=pg_collection)
+        fused = FusedSharedExpertMLP(config, submodules, gate=False, pg_collection=pg_collection)
+        unfused.cuda()
+        fused.cuda()
+        fused.load_state_dict(unfused.state_dict())
+
+        # The unfused reference runs outside the patch: RowParallelLinear looks up the global TP
+        # group even though it does not communicate over it in this configuration.
+        output = unfused(hidden_states)
+        output.square().sum().backward()
+        with monkeypatch.context() as patch:
+            _forbid_global_tp_accessors(patch)
+            fused_output = fused(fused_hidden_states)
+            fused_output.square().sum().backward()
+
+        assert fused_output.shape == hidden_states.shape
+        torch.testing.assert_close(fused_output, output)
+        torch.testing.assert_close(fused_hidden_states.grad, hidden_states.grad)
+        for fused_param, param in zip(fused.parameters(), unfused.parameters()):
+            torch.testing.assert_close(fused_param.grad, param.grad)
+    finally:
+        torch.distributed.destroy_process_group(tp_group)
+        Utils.destroy_model_parallel()
 
 
 class TestSharedExperts:
