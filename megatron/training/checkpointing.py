@@ -4,7 +4,6 @@
 
 import contextlib
 import inspect
-import multiprocessing
 import os
 import random
 import re
@@ -64,7 +63,7 @@ from megatron.training.global_vars import get_run_config, get_tokenizer, get_tra
 from megatron.training.utils.checkpoint_utils import get_checkpoint_train_state_filename
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
-from . import ft_integration, wandb_utils
+from . import ft_integration
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
@@ -124,9 +123,6 @@ _WIDE_RESIDUAL_ARG_DEFAULTS = (
     ('wide_residual_retention_max_forget', 0.10),
 )
 
-# Track deletion processes to prevent zombies
-_deletion_processes = []
-
 
 def _maybe_compact_rollout_bank(iteration):
     """Compact the rollout bank without making checkpointing depend eagerly on RL."""
@@ -142,36 +138,6 @@ def _register_rollout_bank_compaction(async_save_request, iteration):
         _maybe_compact_rollout_bank(iteration)
 
     async_save_request.add_finalize_fn(rollout_bank_finalize_fn)
-
-
-def finalize_deletion_processes(blocking=False):
-    """Clean up deletion processes to prevent zombie processes.
-
-    Args:
-        blocking (bool): If True, waits for all deletion processes to complete.
-                        If False, only joins processes that have already finished.
-
-    Note: Deletion processes are daemon processes (auto-terminate if parent dies),
-    but we still need to join() them to reap zombie processes when they complete normally.
-    The daemon flag and join() serve different purposes:
-    - daemon=True: Auto-terminate if parent process dies abruptly
-    - join(): Reap zombie processes after normal completion
-    """
-    global _deletion_processes
-    finished = []
-    for proc in _deletion_processes:
-        if not proc.is_alive() or blocking:
-            if logger.isEnabledFor(DEBUG):
-                logger.debug(
-                    "Joining deletion process %s (blocking=%s, is_alive=%s)",
-                    proc.pid,
-                    blocking,
-                    proc.is_alive(),
-                )
-            proc.join()
-            finished.append(proc)
-    for proc in finished:
-        _deletion_processes.remove(proc)
 
 
 def set_checkpoint_version(value):
@@ -1242,10 +1208,8 @@ def save_checkpoint(
                 )
 
                 if save_retain_interval is not None:
-                    if (
-                        prev_iteration > 0
-                        and prev_iteration != iteration
-                        and prev_iteration % save_retain_interval != 0
+                    if _should_delete_previous_checkpoint(
+                        prev_iteration, iteration, save_retain_interval
                     ):
                         checkpoint_name = get_checkpoint_name(
                             args.save, iteration=prev_iteration, return_base_dir=True
@@ -1259,33 +1223,11 @@ def save_checkpoint(
                                 f'at {args.save} since it is a symbolic link'
                             )
                         else:
-                            # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
-                            # Use multiprocessing to delete checkpoint in background
-                            if args.async_save:
-                                # Clean up any finished deletion processes before starting a new one
-                                finalize_deletion_processes(blocking=False)
-                                ctx = multiprocessing.get_context('fork')
-                                delete_process = ctx.Process(
-                                    target=_async_delete_checkpoint_impl,
-                                    args=(
-                                        args.save,
-                                        prev_iteration,
-                                        cfg.logger.log_progress,
-                                        True,
-                                        args.async_ckpt_cpu_priority,
-                                        args.async_ckpt_io_priority,
-                                    ),
-                                    daemon=True,
-                                )
-                                delete_process.start()
-                                # Track the process so we can join it later to prevent zombies
-                                _deletion_processes.append(delete_process)
-                            else:
-                                th = threading.Thread(
-                                    target=_async_delete_checkpoint_impl,
-                                    args=(args.save, prev_iteration, cfg.logger.log_progress),
-                                )
-                                th.start()
+                            th = threading.Thread(
+                                target=_async_delete_checkpoint_impl,
+                                args=(args.save, prev_iteration, cfg.logger.log_progress),
+                            )
+                            th.start()
 
         if args.async_save:
             assert async_save_request is not None
@@ -1306,22 +1248,6 @@ def save_checkpoint(
             async_save_request.add_finalize_fn(onelogger_finalize_fn)
         else:
             onelogger_finalize_fn()
-
-    # Additional callback for wandb (last rank)
-    if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized() or is_last_rank()
-    ):
-
-        def wandb_finalize_fn():
-            wandb_utils.on_save_checkpoint_success(
-                checkpoint_name, get_checkpoint_tracker_filename(save_dir), save_dir, iteration
-            )
-
-        if args.async_save:
-            assert async_save_request is not None
-            async_save_request.add_finalize_fn(wandb_finalize_fn)
-        else:
-            wandb_finalize_fn()
 
     # Conversion tools register an inference container, which has no RL section.
     rl_config = getattr(get_run_config(), "rl", None)
@@ -1543,34 +1469,32 @@ def save_tokenizer_assets(
             raise
 
 
+def _should_delete_previous_checkpoint(
+    prev_iteration: int, iteration: int, save_retain_interval: int
+) -> bool:
+    """Return whether checkpoint `prev_iteration` should be deleted after saving checkpoint `iteration`.
+
+    The previous checkpoint is deleted only if it is older than `iteration` and is not
+    kept by `save_retain_interval`. A run restarted from an earlier iteration, or from
+    scratch, can find a newer iteration in the tracker file; such newer checkpoints should
+    not be deleted.
+    """
+    return 0 < prev_iteration < iteration and prev_iteration % save_retain_interval != 0
+
+
 @_disable_gc()
 def _async_delete_checkpoint_impl(
     save_path,
     iteration_to_delete,
     log_progress=False,
-    lower_priority=False,
-    cpu_priority=None,
-    io_priority=None,
 ):
     """Module-level function for async checkpoint deletion.
-
-    This function can be pickled and executed by the async worker process.
-    Note: This is only called from rank 0, so we use regular print() instead of print_rank_0()
-    since torch.distributed won't be initialized in the async worker process.
 
     Args:
         save_path (str): Path to the checkpoints directory
         iteration_to_delete (int): Iteration number of checkpoint to delete
         log_progress (bool): Whether to log progress
-        lower_priority (bool): If True, set process QoS (e.g. nice, ionice) so deletion doesn't contend with training.
-        cpu_priority (int): Nice value for CPU when lower_priority is True (from args.async_ckpt_cpu_priority).
-        io_priority (int): I/O class when lower_priority is True (from args.async_ckpt_io_priority).
     """
-    if lower_priority:
-        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import _set_process_qos
-
-        _set_process_qos(cpu_priority=cpu_priority, io_priority=io_priority)
-
     checkpoint_name = get_checkpoint_name(
         save_path, iteration=iteration_to_delete, return_base_dir=True
     )
@@ -2041,6 +1965,7 @@ def _load_non_persistent_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    checkpoint_group=None,
     gtp_pad_for_alignment=None,
 ):
     """Load the base state_dict from a non-persistent distributed checkpoint.
@@ -2062,6 +1987,7 @@ def _load_non_persistent_base_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
+            checkpoint_group=checkpoint_group,
             gtp_pad_for_alignment=gtp_pad_for_alignment,
         )
     elif args.non_persistent_ckpt_type == 'local':
@@ -2103,6 +2029,7 @@ def _load_global_dist_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    checkpoint_group=None,
     gtp_pad_for_alignment=None,
 ):
     """Load the base state_dict from the given directory containing the global distributed checkpoint"""
@@ -2167,6 +2094,7 @@ def _load_global_dist_base_checkpoint(
         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
         strict=args.dist_ckpt_strictness,
         verify_integrity=args.verify_integrity,
+        process_group=checkpoint_group,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
@@ -2200,6 +2128,7 @@ def _load_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    checkpoint_group=None,
     gpt_compat_layer_maps=None,
     gtp_pad_for_alignment=None,
 ):
@@ -2242,6 +2171,7 @@ def _load_base_checkpoint(
                 checkpointing_context,
                 dp_cp_group=dp_cp_group,
                 expt_dp_group=expt_dp_group,
+                checkpoint_group=checkpoint_group,
                 gtp_pad_for_alignment=gtp_pad_for_alignment,
             )
         else:
@@ -2295,6 +2225,7 @@ def _load_base_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
+            checkpoint_group=checkpoint_group,
             gtp_pad_for_alignment=gtp_pad_for_alignment,
         )
     elif ckpt_format == 'torch':
@@ -2617,7 +2548,7 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
         return False
 
     runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
-    if not vars(ckpt_args):
+    if ckpt_args is None or not vars(ckpt_args):
         # Checkpoints imported by Megatron Bridge may omit training args entirely.
         # Without explicit source-model metadata, keep the regular loading path.
         return None, False
@@ -2690,6 +2621,7 @@ def load_checkpoint(
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     model_sharded_state_dict_modifier: Optional[Callable[[Dict], None]] = None,
     *,
@@ -2711,6 +2643,8 @@ def load_checkpoint(
     dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
     dp_group: Data parallel group (default: None, falls back to mpu API)
     expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
+    checkpoint_group: Ranks that collectively form one complete checkpoint
+        view (default: None, uses the global process group)
     """
     cfg = get_run_config()
     args = get_args()
@@ -2775,6 +2709,12 @@ def load_checkpoint(
             pass  # Not loaded.
         else:
             raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
+
+    if ckpt_format == 'torch' and getattr(args, 'inference_shards', None):
+        raise ValueError(
+            '--inference-shards is incompatible with legacy torch checkpoints; '
+            'convert the checkpoint to torch_dist first'
+        )
 
     if model_sharded_state_dict_modifier is not None and ckpt_format != 'torch_dist':
         raise NotImplementedError(
@@ -3122,6 +3062,7 @@ def load_checkpoint(
         checkpointing_context=checkpointing_context,
         dp_cp_group=dp_cp_group,
         expt_dp_group=expt_dp_group,
+        checkpoint_group=checkpoint_group,
         gpt_compat_layer_maps=gpt_compat_layer_maps,
         gtp_pad_for_alignment=gtp_pad_for_alignment,
         **load_kwargs,
@@ -3506,10 +3447,6 @@ def load_checkpoint(
         f'p {_pp_r + 1}/{_pp_w} ] '
         f'at iteration {iteration}'
     )
-
-    # Additional callback for wandb (last rank)
-    if not torch.distributed.is_initialized() or is_last_rank():
-        wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
 
     torch.cuda.empty_cache()
 

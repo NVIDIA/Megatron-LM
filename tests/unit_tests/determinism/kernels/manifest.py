@@ -318,6 +318,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- MoE
     KernelEntry(
+        name="virtual_expert_planner",
+        sources=("megatron/core/transformer/moe/ops/virtual_expert_triton.py",),
+        tests=(
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/transformer/moe/test_virtual_experts.py",
+        ),
+        kind="triton",
+        notes="Route planning agrees with an independent CPU oracle for EP=1/2/4/8, skew/ties, "
+        "empty and strided inputs. Cached shapes and alignments replay bit-exactly with changing "
+        "routes in CUDA graphs. Production barrier timeouts cover both peer handshake phases "
+        "and missing grid participants; delayed peers complete in eager and graph replay. "
+        "Transport replay checks BF16/MXFP8 weights and FP32/BF16 gradients with scoped allocators.",
+    ),
+    KernelEntry(
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
         tests=(K + "test_moe_kernels.py",),
@@ -328,8 +342,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_router",
         sources=("megatron/core/transformer/moe/router.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/transformer/moe/test_virtual_experts.py",
+        ),
         kind="torch.compile",
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",
@@ -339,7 +357,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
-        notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available.",
+        notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
+        "virtual-expert routing metadata and probability gradients replay under stream contention.",
     ),
     KernelEntry(
         name="moe_experts",
@@ -647,7 +666,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_mamba_mixer",
         sources=("megatron/core/ssm/mamba_mixer.py",),
-        tests=(C + "test_ssm_conv1d.py", K + "test_ssm_kernels.py"),
+        tests=(
+            C + "test_ssm_conv1d.py",
+            K + "test_ssm_kernels.py",
+            "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
+        ),
         kind="dispatch",
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "

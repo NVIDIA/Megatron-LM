@@ -125,6 +125,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.wgrad_store = object()
             self.scale_bias = scale_bias
 
         def need_backward_dw(self):
@@ -396,6 +397,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.wgrad_store = object()
             self.scale_bias = scale_bias
 
         def need_backward_dw(self):
@@ -508,6 +510,7 @@ def _make_fake_te_namespace():
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.wgrad_store = object()
             self.scale_bias = scale_bias
 
         def need_backward_dw(self):
