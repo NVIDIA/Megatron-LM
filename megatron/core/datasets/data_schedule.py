@@ -616,7 +616,10 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Get a batch from data_iterator or create an emtpy batch.
     if is_tp_rank_0:
         assert data_iterator is not None
-        batch = next(data_iterator)
+        # Work on a shallow copy: the per-rank slicing below rebinds the entries in place, and
+        # replay paths (RerunDataIterator, the PagedStashRunner dropless retry) serve the same
+        # dict objects again expecting the pre-slice tensors.
+        batch = dict(next(data_iterator))
         for key in batch_keys:
             assert key in batch, f"{key} is missing in current batch."
     else:

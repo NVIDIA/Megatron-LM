@@ -26,6 +26,7 @@ from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -397,9 +398,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             self._setup_mtp_cuda_graphs()
 
-        # Output
+        # Output. LinearCrossEntropyModule is a ColumnParallelLinear that can also fuse the LM head
+        # with the cross-entropy loss (`--cross-entropy-fusion-impl linear`), as in GPTModel.
         if post_process or self.mtp_process:
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            self.output_layer = LinearCrossEntropyModule(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
@@ -543,7 +545,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
-        # Decoder embedding.
+        # Decoder embedding. Under sequence parallelism the decoder gets the padding mask scattered
+        # along the sequence like its hidden states; the post-process keeps the caller's full-length
+        # mask (the MTP rolls it alongside input_ids / position_ids, and MoE layers re-align it to
+        # their hidden states themselves).
+        decoder_padding_mask = padding_mask
         if decoder_input is not None:
             pass
         elif self.pre_process:
@@ -571,7 +577,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     decoder_input, group=self.pg_collection.tp
                 )
             if padding_mask is not None and self.config.sequence_parallel:
-                padding_mask = (
+                decoder_padding_mask = (
                     tensor_parallel.scatter_to_sequence_parallel_region(
                         padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
                     )
@@ -658,7 +664,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
+            padding_mask=decoder_padding_mask,
             **decoder_extra_block_kwargs,
         )
         # HybridStack.forward returns a single Tensor in the common case, but a 2-tuple
@@ -780,6 +786,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 # then back to [S', B, H] for the output layer.
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+        if (
+            labels is not None
+            and not in_inference_mode
+            and self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == "linear"
+        ):
+            # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are never
+            # materialised, so the loss comes straight out of the output layer and muP's output
+            # scaling is applied to the layer input instead (the layer has no bias).
+            return self.output_layer(
+                self._scale_fused_cross_entropy_input(hidden_states),
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                output_cross_entropy_loss=True,
+                labels=labels,
+            )
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output

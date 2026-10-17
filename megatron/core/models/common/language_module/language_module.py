@@ -342,6 +342,15 @@ class LanguageModule(MegatronModule):
             return logits * self.config.mup_output_mult
         return logits
 
+    def _scale_fused_cross_entropy_input(self, hidden_states: Tensor) -> Tensor:
+        """Apply MuP output scaling for the fused linear + cross-entropy path.
+
+        The fused kernel never materialises the logits, so ``_scale_logits`` cannot be applied
+        to them. The output layer has no bias, so scaling its input by ``mup_output_mult`` yields
+        exactly the logits ``_scale_logits`` would have produced.
+        """
+        return self._scale_logits(hidden_states)
+
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True
           or when use Multi-Token Prediction (MTP).

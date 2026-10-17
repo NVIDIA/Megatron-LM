@@ -1953,8 +1953,13 @@ def process_mtp_loss(
         )
         num_tokens = loss_mask.sum()
         if fuse_linear_cross_entropy:
+            mtp_hidden_states = hidden_states_list[mtp_layer_number + 1]
+            if scale_logits_fn is not None:
+                # The fused kernel never materialises the logits; the output layer has no bias,
+                # so muP's logit scaling is applied to its input instead.
+                mtp_hidden_states = scale_logits_fn(mtp_hidden_states)
             mtp_loss = output_layer(
-                hidden_states_list[mtp_layer_number + 1],
+                mtp_hidden_states,
                 weight=output_weight,
                 runtime_gather_output=runtime_gather_output,
                 output_cross_entropy_loss=True,

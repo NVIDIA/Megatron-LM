@@ -832,3 +832,24 @@ class TestTrainStepReductionThreading:
             torch.testing.assert_close(val.cpu(), expected)
         finally:
             grid.destroy()
+
+
+def test_with_current_cuda_device_sets_device_of_first_cuda_tensor(monkeypatch):
+    """The checkpoint-recompute wrapper makes the first CUDA argument's device current (the
+    autograd worker thread may have no CUDA context yet) and otherwise passes everything through."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: calls.append(device))
+
+    def fn(*args, **kwargs):
+        return args, kwargs
+
+    wrapped = util.with_current_cuda_device(fn)
+    cpu = torch.zeros(1)
+    args, kwargs = wrapped(cpu, 3, flag=True)
+    assert args[0] is cpu and args[1] == 3 and kwargs == {"flag": True}
+    assert calls == []  # no CUDA tensor among the arguments: nothing to set
+    if torch.cuda.is_available():
+        gpu = torch.zeros(1, device=torch.device("cuda", torch.cuda.current_device()))
+        args, _ = wrapped(cpu, gpu, gpu)
+        assert args[1] is gpu
+        assert calls == [gpu.device]  # first CUDA tensor only, once

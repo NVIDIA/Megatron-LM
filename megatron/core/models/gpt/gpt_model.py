@@ -648,13 +648,17 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             padding_mask=padding_mask,
         )
 
+        # Under sequence parallelism the pre-process scatters the padding mask along the sequence
+        # for the decoder (whose hidden states are scattered). The post-process keeps the caller's
+        # full-length mask: the MTP rolls it alongside input_ids / position_ids, and its MoE
+        # layers re-align it to their hidden states themselves.
         (
             decoder_input,
             rotary_pos_emb,
             rotary_pos_cos,
             rotary_pos_sin,
             sequence_len_offset,
-            padding_mask,
+            decoder_padding_mask,
         ) = preproc_output[:6]
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
@@ -675,7 +679,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
+            padding_mask=decoder_padding_mask,
             **decoder_extra_block_kwargs,
         )
         # When mHC + MTP, the decoder returns (contracted, multi-stream).
@@ -888,10 +892,13 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
         else:
+            # Training with labels: the logits are produced (and muP-scaled) below, either by
+            # the fused linear + cross-entropy kernel or by the output layer.
             logits = None
 
-        # Apply MuP output scaling to logits
-        logits = self._scale_logits(logits)
+        if logits is not None:
+            # Apply MuP output scaling to logits
+            logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -919,17 +926,20 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             return logits.transpose(0, 1).contiguous()
 
         output_layer_kwargs = dict(
-            input_=hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            weight=output_weight, runtime_gather_output=runtime_gather_output
         )
         if self.fuse_linear_cross_entropy:
+            # The fused kernel never materialises the logits, so muP's output scaling goes on
+            # the layer input (the layer has no bias).
             loss = self.output_layer(
+                input_=self._scale_fused_cross_entropy_input(hidden_states),
                 output_cross_entropy_loss=self.fuse_linear_cross_entropy,
                 labels=labels,
                 **output_layer_kwargs,
             )
         else:
-            logits, _ = self.output_layer(**output_layer_kwargs)
-            loss = self.compute_language_model_loss(labels, logits)
+            logits, _ = self.output_layer(input_=hidden_states, **output_layer_kwargs)
+            loss = self.compute_language_model_loss(labels, self._scale_logits(logits))
 
         return loss
 
