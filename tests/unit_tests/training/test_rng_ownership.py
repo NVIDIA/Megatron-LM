@@ -268,16 +268,16 @@ def test_checkpoint_policy_retains_current_run_precedence(
 
 
 def test_cached_logits_identity_uses_dataset_seed_not_legacy_args(monkeypatch, run_config):
-    from megatron.training.distillation import utils_logits
+    from megatron.training.distillation import utils
 
     args = Namespace(seed=999, seq_length=32, train_samples=16)
-    monkeypatch.setattr(utils_logits, "get_args", lambda: args)
-    monkeypatch.setattr(utils_logits, "_blend_identifiers", lambda args: {"mock": True})
+    monkeypatch.setattr(utils, "get_args", lambda: args)
+    monkeypatch.setattr(utils, "_blend_identifiers", lambda args: {"mock": True})
     run_config.rng.seed = 123
-    first_hash, first_fields = utils_logits.compute_dataset_hash()
+    first_hash, first_fields = utils.compute_dataset_hash()
     del args.seed
-    assert utils_logits.compute_dataset_hash() == (first_hash, first_fields)
+    assert utils.compute_dataset_hash() == (first_hash, first_fields)
     assert first_fields["seed"] == 123
     run_config.rng.seed = 124
-    second_hash, _ = utils_logits.compute_dataset_hash()
+    second_hash, _ = utils.compute_dataset_hash()
     assert first_hash != second_hash
