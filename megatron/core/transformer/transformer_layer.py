@@ -2060,6 +2060,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         """Helper function to get tensor arguments for TE CUDA graph."""
         cudagraph_args, cudagraph_kwargs = super()._get_te_cuda_graph_replay_args(*args, **kwargs)
+        if "gdn_core_attn" in (self.config.offload_modules or []):
+            # TE shares graph memory pools, so preserve replay order on the caller's stream.
+            cudagraph_kwargs.pop("cuda_graph_stream", None)
+            cudagraph_kwargs.pop("cuda_graph_event", None)
 
         assert (
             len(cudagraph_args) == 1

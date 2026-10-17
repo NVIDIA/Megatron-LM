@@ -25,8 +25,10 @@ supported for GDN. GDN2 supports `gdn_norm_out` recomputation and requires FLA's
 `fla.ops.gdn2` kernel. Configuration rejects FP8/FP4, non-BF16 execution, other
 recurrence backends and full-layer recomputation. CUDA graphs require
 `cuda_graph_impl="transformer_engine"`; attention or whole-layer capture uses the
-existing graph stream/event callbacks. Local and full-iteration graphs remain
-unsupported. `delay_offload_until_cuda_graph` uses the existing replay flush.
+existing transfer stream/event callbacks. Replay stays on the caller's autograd
+stream to preserve the order of layer graphs sharing a memory pool. Local and
+full-iteration graphs remain unsupported.
+`delay_offload_until_cuda_graph` uses the existing replay flush.
 
 The manager's minimum tensor size, offload fraction and last-group margin apply.
 After warmup, fraction zero selects no transfers. Warmup can still copy eligible
