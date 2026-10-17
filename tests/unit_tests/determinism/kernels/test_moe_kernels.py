@@ -8,7 +8,8 @@ and TE-fused), group-limited routing, the load-balancing aux loss (torch and TE-
 the router gating GEMM. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
 deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
 the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
-``fused_a2a.py`` when the dependency and the GPUs are available).
+``fused_a2a.py`` when the dependency and the GPUs are available), and the inference
+``MoELayer`` through FlashInfer per-token NVFP4 experts on Blackwell.
 """
 
 import pytest
@@ -550,6 +551,66 @@ class TestMoEModules:
             what="TEGroupedMLP",
         )
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+    def test_inference_nvfp4_moe_layer_replays(self, gated):
+        """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""
+        from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+        from megatron.core.inference.utils import InferenceMode
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if not HAVE_FLASHINFER_ROUTED_NVFP4 or torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("per-token NVFP4 MoE needs FlashInfer >= 0.7.0 and Blackwell")
+
+        class _InInferenceMode(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, hidden):
+                with InferenceMode.active():
+                    return self.module(hidden)
+
+        self._init(ep=1)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=1024,
+            num_attention_heads=8,
+            num_moe_experts=8,
+            moe_ffn_hidden_size=1024,
+            moe_router_topk=2,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_dtype="fp32",
+            moe_grouped_gemm=True,
+            activation_func=F.silu if gated else squared_relu,
+            gated_linear_unit=gated,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            normalization="RMSNorm",
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_token_dispatcher_type="nccl",
+            inference_moe_nvfp4_recipe="per_token",
+        )
+        NCCLAllGatherDispatcher.allocate_buffers()
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        hidden = torch.randn(512, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), deterministic_algorithms(True):
+            assert_module_replays_bit_exact(
+                _InInferenceMode(layer),
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what="MoELayer[inference, flashinfer per-token NVFP4]",
+            )
+        assert layer.experts._nvfp4_weights is not None
+
     @pytest.mark.skipif(
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
         reason="MXFP8 parameter storage needs Blackwell",
@@ -592,6 +653,98 @@ class TestMoEModules:
         assert_replays_bit_exact(
             build_stacks, weights, backward=False, what="vLLM MXFP8 expert-weight stacking"
         )
+
+    @pytest.mark.skipif(
+        not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
+        reason="MXFP8 parameter storage needs Blackwell",
+    )
+    def test_mxfp8_training_stack_replays(self):
+        """The training value pass re-quantizes TE MXFP8 weights bit-exactly on every forward.
+
+        Unlike the load-time conversion generation uses, this runs every step, so a
+        nondeterministic dequantize or quantize would move the logprobs between two
+        identical forwards.
+        """
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        seeded()
+        quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+        num_experts = 4
+        module = torch.nn.Module()
+        module.num_local_experts = num_experts
+        module.linear_fc1 = torch.nn.Module()
+        for expert in range(num_experts):
+            weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+            setattr(
+                module.linear_fc1,
+                f"weight{expert}",
+                torch.nn.Parameter(quantizer(weight), requires_grad=False),
+            )
+
+        def build_stack(_unused):
+            stack = InferenceGroupedMLP._mxfp8_training_stack(module, "linear_fc1", "triton")
+            return stack.data.view(torch.uint8), stack.scale.view(torch.uint8)
+
+        # The stack is derived from the module's parameters, not from an argument; the
+        # placeholder keeps the harness's call convention.
+        assert_replays_bit_exact(
+            build_stack,
+            (torch.zeros(1, device="cuda"),),
+            backward=False,
+            what="MXFP8 training-stack quantization",
+        )
+
+    @pytest.mark.parametrize("recipe", ["nvfp4-squared_relu", "nvfp4-swiglu"])
+    def test_inference_kernel_value_pass_replays(self, recipe):
+        """``moe_inference_training_forward``: value pass, recompute and backward replay.
+
+        The value pass runs the FlashInfer kernel on weights requantized from the
+        parameters and the backward comes from the TE recompute, so this covers both
+        kernels and the switch between them in one fwd+bwd. NVFP4 only, whose BF16
+        parameters take gradients. EP=1 with the NCCL dispatcher: the NVLS arm depends
+        on a symmetric heap that is process-wide state, which a replay harness cannot
+        reset.
+        """
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            disable_batch_invariant_mode,
+            enable_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+        )
+        from tests.unit_tests.inference.test_inference_training_forward import (
+            _build_layer,
+            _config,
+            _hidden,
+            _skip_unless_supported,
+        )
+
+        if torch.cuda.get_device_capability()[0] != 10:
+            pytest.skip("FlashInfer per-token NVFP4 MoE needs SM100/SM103")
+        _skip_unless_supported(recipe)
+        self._init(ep=1)
+        InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
+        enable_batch_invariant_mode(backend="te_native")
+        try:
+            seeded()
+            config = _config(
+                recipe,
+                expert_model_parallel_size=1,
+                inference_moe_token_dispatcher_type="nccl",
+                moe_inference_training_forward=True,
+            )
+            layer = _build_layer(config)
+            hidden = _hidden(config, seed=1, tokens=512).requires_grad_()
+            with deterministic_algorithms(True):
+                assert_module_replays_bit_exact(
+                    layer, (hidden,), replays=3, contention=True, what=f"value pass[{recipe}]"
+                )
+        finally:
+            disable_batch_invariant_mode()
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize("op_fuser", [False, True], ids=["unfused", "op-fuser-mxfp8"])

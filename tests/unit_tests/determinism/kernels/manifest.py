@@ -339,14 +339,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
-        notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available.",
+        notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; the FlashInfer per-token NVFP4 value pass (moe_inference_training_forward) with recompute backward.",
     ),
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert; the MXFP8 training-stack quantization of the FlashInfer value pass.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -730,6 +730,24 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MXFP8Tensor dispatches the Megatron quantize kernel (replayed: "
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
         "flashinfer on Blackwell and are not replayed in CI.",
+    ),
+    KernelEntry(
+        name="inference_flashinfer_nvfp4_moe",
+        sources=("megatron/core/inference/moe/flashinfer_nvfp4.py",),
+        tests=(
+            K + "test_inference_kernels.py",
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/inference/test_flashinfer_nvfp4.py",
+        ),
+        kind="dispatch",
+        training_path=False,
+        notes="FlashInfer nvfp4_quantize (per-expert weights and per-token activations) feeding "
+        "CuteDslMoEWrapper (Relu2 or SwiGLU; two-stage finalize under deterministic algorithms or "
+        "batch_invariant_mode). The quantizer and the MoE are replayed in "
+        "test_inference_kernels.py (MoELayer level in "
+        "test_inference_nvfp4_moe_layer_replays) and checked for batch invariance across batch "
+        "sizes in test_flashinfer_nvfp4_moe_is_batch_invariant; all need FlashInfer >= 0.7.0 "
+        "on Blackwell.",
     ),
     KernelEntry(
         name="inference_request_seed_sampling",

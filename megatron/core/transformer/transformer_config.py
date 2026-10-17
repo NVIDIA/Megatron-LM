@@ -1444,6 +1444,42 @@ class TransformerConfig(ModelParallelConfig):
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
 
+    moe_inference_training_forward: bool = False
+    """Run the training MoE forward through generation's FlashInfer expert kernel,
+    keeping TE for the backward.
+
+    For train/generation parity in RL, not throughput. The FlashInfer routed MXFP8
+    and per-token NVFP4 kernels are batch invariant but do not match TE training:
+    they fuse the activation and the FC2-input quantization into the FC1 epilogue,
+    apply the routing probabilities after FC2, and accumulate in their own order.
+    Running the kernel itself in the value pass makes the forward equal to
+    generation's by construction.
+
+    The value pass saves no intermediates, so the backward comes from the MoE-layer
+    recompute pass, which runs the ordinary TE path. Gradients are therefore TE's
+    while the value is the inference kernel's: the value is quantized the way
+    generation quantizes it, and the gradient is that of the TE recompute, a
+    straight-through estimator. That is a training-recipe decision, which is why
+    this is opt-in rather than a default.
+
+    Requires transformer_impl='inference_optimized', inference_grouped_gemm_backend=
+    'flashinfer' with fp8_recipe='mxfp8' or inference_moe_nvfp4_recipe,
+    batch_invariant_mode, and selective recompute of 'moe'. The torch and vLLM
+    kernels need no value pass: under batch_invariant_mode they already match TE
+    training."""
+
+    moe_inference_training_max_tokens_per_rank: Optional[int] = None
+    """Upper bound on the tokens one rank feeds a moe_inference_training_forward pass.
+
+    Only read with the NVLS dispatcher. It gathers through symmetric-memory
+    buffers, which are allocated once and cannot grow, so they have to be sized
+    for the largest pass before the first one runs. Left unset, they are sized
+    from the first pass the layer sees, which is only right if that pass is the
+    largest -- a log-prob microbatch padded to 512 tokens and a later one padded
+    to 576 is enough to break it. Set it from the microbatch bound (log-prob
+    batch size times max sequence length). It acts as a floor, so a larger first
+    pass still wins."""
+
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
@@ -1451,12 +1487,31 @@ class TransformerConfig(ModelParallelConfig):
     True to disable fusion and use separate kernel launches (useful for debugging)."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
-    """Optional fixed token-row capacity for FlashInfer routed MXFP8 MoE.
+    """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
+    NVFP4 MoE (inference_moe_nvfp4_recipe).
 
     Decode-only dynamic-inference graphs use this fixed prefix when their
     host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
     and oversized decode graphs retain the full dispatcher buffer. Requires
     the NVLS inference dispatcher and EP > 1.
+    """
+
+    inference_moe_nvfp4_recipe: Optional[Literal['per_token']] = None
+    """NVFP4 recipe for routed experts during inference; None keeps them in BF16.
+    Options:
+    - 'per_token': NVFP4 weights x NVFP4 activations with one FP32 scale per token.
+
+    BF16 expert weights are quantized to NVFP4 (one FP32 global scale per expert)
+    when the MoE layer first runs and requantized in place by
+    refresh_flashinfer_nvfp4_weights() when they change; 'per_token' quantizes
+    activations online, so no calibration is required. Uses the
+    FlashInfer CuTe DSL grouped GEMMs (requires nvidia-cutlass-dsl) and requires
+    transformer_impl='inference_optimized', inference_grouped_gemm_backend='flashinfer',
+    non-gated squared-ReLU or gated SiLU (SwiGLU) experts without GLU clamping, offset or
+    interleaving, BF16 expert parameters, and FlashInfer >= 0.7.0 on
+    Blackwell (SM100/SM103). The BF16 expert weights stay resident as the refit
+    destination alongside the padded NVFP4 copy. Supports batch_invariant_mode (with
+    the NVLS dispatcher when EP > 1), like FlashInfer MXFP8.
     """
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
@@ -2064,6 +2119,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
+        if self.inference_moe_nvfp4_recipe is not None and (
+            self.transformer_impl != "inference_optimized" or self.num_moe_experts is None
+        ):
+            raise ValueError(
+                "inference_moe_nvfp4_recipe requires transformer_impl='inference_optimized' "
+                "and an MoE model (num_moe_experts set)."
+            )
+
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
             self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
                 self.inference_grouped_gemm_backend
@@ -2087,15 +2150,54 @@ class TransformerConfig(ModelParallelConfig):
                     "to avoid costly dtype conversions during decode."
                 )
 
+            if self.inference_moe_nvfp4_recipe is not None:
+                if self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER:
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe requires "
+                        "inference_grouped_gemm_backend='flashinfer', got "
+                        f"'{self.inference_grouped_gemm_backend}'."
+                    )
+                if self.activation_func != (F.silu if self.gated_linear_unit else squared_relu):
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe supports only non-gated squared-ReLU or "
+                        "gated SiLU (SwiGLU) experts. Set activation_func=squared_relu with "
+                        "gated_linear_unit=False, or activation_func=F.silu with "
+                        "gated_linear_unit=True."
+                    )
+                if self.activation_func_tanh_clamp_scale is not None:
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe does not support "
+                        "activation_func_tanh_clamp_scale: the FlashInfer per-token NVFP4 "
+                        "kernels only implement unclamped Relu2 and SwiGLU."
+                    )
+                if self.gated_linear_unit and (
+                    self.activation_func_clamp_value is not None
+                    or self.glu_linear_offset != 0.0
+                    or self.moe_mlp_glu_interleave_size is not None
+                ):
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe supports only plain SwiGLU: "
+                        "activation_func_clamp_value, glu_linear_offset and "
+                        "moe_mlp_glu_interleave_size must be unset."
+                    )
+                if self.fp8 or self.fp4_param:
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe quantizes BF16 expert weights and "
+                        "cannot be combined with FP8 inference or fp4_param."
+                    )
+
             # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vLLM
-            # grouped-GEMM backends.
-            if self.gated_linear_unit and self.inference_grouped_gemm_backend not in (
-                InferenceGroupedGemmBackend.TORCH,
-                InferenceGroupedGemmBackend.VLLM,
+            # grouped-GEMM backends, and SwiGLU by FlashInfer per-token NVFP4.
+            if (
+                self.gated_linear_unit
+                and self.inference_grouped_gemm_backend
+                not in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
+                and self.inference_moe_nvfp4_recipe is None
             ):
                 raise ValueError(
                     "--transformer-impl='inference_optimized' supports gated linear units "
                     "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
+                    "or with inference_moe_nvfp4_recipe, "
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
@@ -2127,14 +2229,14 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 if (
                     self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
-                    or not mxfp8_enabled
+                    or not (mxfp8_enabled or self.inference_moe_nvfp4_recipe is not None)
                     or self.inference_moe_token_dispatcher_type != "nvls"
                     or self.expert_model_parallel_size <= 1
                 ):
                     raise ValueError(
                         "inference_flashinfer_mxfp8_token_capacity requires "
                         "inference_grouped_gemm_backend='flashinfer', FP8 enabled with "
-                        "fp8_recipe='mxfp8', "
+                        "fp8_recipe='mxfp8' or inference_moe_nvfp4_recipe, "
                         "inference_moe_token_dispatcher_type='nvls' and "
                         "expert_model_parallel_size > 1"
                     )
@@ -2152,11 +2254,13 @@ class TransformerConfig(ModelParallelConfig):
                 if (
                     self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
                     and not mxfp8_enabled
+                    and self.inference_moe_nvfp4_recipe is None
                 ):
                     raise ValueError(
                         "batch_invariant_mode currently supports the FlashInfer grouped-GEMM "
-                        "backend only for an MXFP8 model configuration. Selectively BF16 "
-                        "expert layers within that configuration remain supported."
+                        "backend only for an MXFP8 model configuration or "
+                        "inference_moe_nvfp4_recipe. Selectively BF16 expert layers within "
+                        "an MXFP8 configuration remain supported."
                     )
                 if (
                     self.expert_model_parallel_size > 1
@@ -2166,6 +2270,114 @@ class TransformerConfig(ModelParallelConfig):
                         "batch_invariant_mode with inference-optimized MoE and expert "
                         "parallelism requires inference_moe_token_dispatcher_type='nvls'."
                     )
+
+        if self.moe_inference_training_forward:
+            # Checked before the backend so a non-inference_optimized config gets
+            # the message that actually applies to it.
+            if self.transformer_impl != 'inference_optimized':
+                raise ValueError(
+                    "moe_inference_training_forward requires "
+                    "transformer_impl='inference_optimized', which is what builds the "
+                    f"inference-capable expert module; got '{self.transformer_impl}'."
+                )
+            # inference_grouped_gemm_backend is only converted from str to enum
+            # above when the inference-optimized branch runs, so accept either.
+            backend = self.inference_grouped_gemm_backend
+            if isinstance(backend, InferenceGroupedGemmBackend):
+                backend = backend.value
+            # Torch and vLLM need no value pass: under batch_invariant_mode their
+            # kernels already match TE training bitwise. FlashInfer's routed kernels
+            # do not, and cannot be made to by aligning the training path by hand.
+            if backend != InferenceGroupedGemmBackend.FLASHINFER.value:
+                raise ValueError(
+                    "moe_inference_training_forward supports only "
+                    f"inference_grouped_gemm_backend='flashinfer'; got '{backend}'. "
+                    "The torch and vLLM kernels already match TE training under "
+                    "batch_invariant_mode."
+                )
+            if (
+                not (bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8)
+                and self.inference_moe_nvfp4_recipe is None
+            ):
+                raise ValueError(
+                    "moe_inference_training_forward requires FlashInfer routed MXFP8 "
+                    "(fp8_recipe='mxfp8') or per-token NVFP4 (inference_moe_nvfp4_recipe). "
+                    "The FlashInfer BF16 kernel is not batch invariant."
+                )
+            # Generation and the value pass launch the kernel on different token
+            # counts, and the non-invariant NVFP4 finalize sums routes with atomics.
+            if not self.batch_invariant_mode:
+                raise ValueError(
+                    "moe_inference_training_forward requires batch_invariant_mode, so "
+                    "that a token's output does not depend on how many tokens share the "
+                    "kernel launch."
+                )
+            # The value pass saves no intermediates, so there is nothing to build a
+            # backward from unless the layer is recomputed.
+            if self.recompute_granularity != 'selective' or (
+                self.recompute_modules is not None and 'moe' not in self.recompute_modules
+            ):
+                raise ValueError(
+                    "moe_inference_training_forward requires "
+                    "recompute_granularity='selective' with 'moe' in recompute_modules: "
+                    "the value pass stores no activations, so the backward must come "
+                    "from a recompute pass."
+                )
+            # MoELayer.moe_layer_recompute additionally excludes local CUDA graphs, so
+            # this combination would run the value pass with no recompute behind it
+            # and leave the experts without a backward graph.
+            if self.cuda_graph_impl == 'local':
+                raise ValueError(
+                    "moe_inference_training_forward is incompatible with "
+                    "cuda_graph_impl='local', which disables MoE-layer recompute."
+                )
+            # The value/recompute switch lives in MoELayer.forward. The overlapped
+            # 1F1B schedule calls the layer's stages directly and never reaches it,
+            # so it would silently run the TE path on both passes.
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_inference_training_forward is incompatible with "
+                    "overlap_moe_expert_parallel_comm: the overlapped schedule does "
+                    "not go through MoELayer.forward, where the value pass is chosen."
+                )
+            # Parity requires generation and the training value pass to route each
+            # token to the same experts. InferenceTopKRouter only takes its
+            # inference path while InferenceMode is active, so the value pass runs
+            # the training router. Both reach the same selection function with the
+            # same arguments, but the training router applies these first, and each
+            # of them changes which experts are picked. Rejected rather than
+            # tolerated because the loss of parity is otherwise silent.
+            balancing = self.moe_router_load_balancing_type
+            balancing = balancing if isinstance(balancing, list) else [balancing]
+            unsupported = {"sinkhorn", "quantile_balancing"}.intersection(balancing)
+            if unsupported:
+                raise ValueError(
+                    f"moe_inference_training_forward does not support "
+                    f"moe_router_load_balancing_type={sorted(unsupported)}: generation "
+                    "routes with plain top-k, so the training forward would select "
+                    "different experts."
+                )
+            if self.moe_input_jitter_eps is not None:
+                raise ValueError(
+                    "moe_inference_training_forward is incompatible with "
+                    "moe_input_jitter_eps: jitter perturbs the router input in "
+                    "training only, so the two forwards would route differently."
+                )
+            if self.moe_router_force_load_balancing or self.moe_router_force_biased is not None:
+                raise ValueError(
+                    "moe_inference_training_forward is incompatible with "
+                    "moe_router_force_load_balancing / moe_router_force_biased, which "
+                    "overwrite the training router's logits."
+                )
+            # moe_expert_capacity_factor would also break parity, but it needs no
+            # check here: this path requires transformer_impl='inference_optimized',
+            # which already rejects it as non-dropless above.
+
+        if (
+            self.moe_inference_training_max_tokens_per_rank is not None
+            and self.moe_inference_training_max_tokens_per_rank <= 0
+        ):
+            raise ValueError("moe_inference_training_max_tokens_per_rank must be positive.")
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
