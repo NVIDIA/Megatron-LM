@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 from functools import partial
-from typing import List, Dict
+from typing import Dict, List
 
 # Add megatron to the path.
 sys.path.append(
@@ -21,33 +21,33 @@ from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
-from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
-from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
-from megatron.inference.text_generation.api import generate_and_post_process
-from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest, VLMInferenceRequest
-from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
-    VLMTextGenerationController,
-)
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
-from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, is_last_rank
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
+    VLMTextGenerationController,
+)
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.inference.text_generation.api import generate_and_post_process
+from megatron.inference.text_generation.forward_step import ForwardStep
+from megatron.training import get_args, get_model, get_tokenizer, is_last_rank, print_rank_0
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.initialize import initialize_megatron
 from megatron.training.global_vars import (
     get_run_config,
     initialize_runtime_services,
     set_run_config,
 )
-from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.initialize import initialize_megatron
 
 
 def is_first_rank():
@@ -740,14 +740,6 @@ def run_eval(config, iteration=None):
         with open(config.output_path + "-scores.txt", "a") as f:
             f.write(f"{config.task} {config.dataset} at iteration={iteration} SPDocVQA accuracy: {score}\n")
 
-    elif config.task == "RealworldQA":
-        from evaluation.evaluate_realworldqa import realworldqa_eval
-        avg_acc = realworldqa_eval(config.output_path)
-
-        score = {"RealworldQA accuracy": avg_acc}
-        with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} at iteration={iteration} RealworldQA accuracy: {score}\n")
-
     elif config.task == "AI2D":
         from evaluation.evaluate_ai2d import ai2d_eval
         avg_acc = ai2d_eval(config.output_path)
@@ -757,20 +749,12 @@ def run_eval(config, iteration=None):
             f.write(f"{config.task} {config.dataset} at iteration={iteration} AI2D accuracy: {score}\n")
 
     elif config.task == "MMMU":
-        from evaluation.evaluate_mmmu import convert_to_mmmu_format
-        from examples.multimodal.evaluation.mmmu_utils import mmmu_main_eval
-        result_file = convert_to_mmmu_format(config.output_path)
-        result = json.load(open(result_file))
-        mmmu_results = mmmu_main_eval(result, {"answer_dict": config.gt_path})
-        with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.split} at iteration={iteration} :\n")
-            for cat, cat_val in mmmu_results.items():
-                if 'Overall' in cat:
-                    cat = cat.replace("Overall-", "")
-                    print(f'{cat}: {cat_val["acc"] * 100:.2f}')
-                    f.write(f'{cat}: {cat_val["acc"] * 100:.2f}\n')
+        from evaluation.evaluate_mmmu import mmmu_eval
+        avg_acc = mmmu_eval(config.output_path, config.gt_path)
 
-        score = {"MMMU val accuracy": mmmu_results['Overall']['acc']}
+        score = {"MMMU val accuracy": avg_acc / 100.0}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.split} at iteration={iteration} MMMU accuracy: {score}\n")
     elif config.task == 'captioning':
         from evaluation.evaluate_coco import coco_captioning_eval
         cider_score = coco_captioning_eval(config.output_path, config.gt_path)
@@ -778,27 +762,6 @@ def run_eval(config, iteration=None):
 
         with open(config.output_path + "-scores.txt", "a") as f:
             f.write(f"{config.task} {config.dataset} CIDEr scores at iteration={iteration}: {cider_score}\n")
-    elif config.task == 'MotionBench':
-        from evaluation.evaluate_video_motionbench import motionbench_eval
-        avg_acc = motionbench_eval(config.output_path)
-
-        score = {f"MotionBench accuracy": avg_acc}
-        with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {score}\n")
-    elif config.task == 'PhysGameBench':
-        from evaluation.evaluate_video_phys_game_bench import phys_game_bench_eval
-        avg_acc_dict = phys_game_bench_eval(config.output_path)
-
-        score = {f"PhysGame Total accuracy": avg_acc_dict['Physgame-Total-Acc']}
-        with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n")
-    elif config.task == "MVBench":
-        from evaluation.evaluate_video_mvbench import mvbench_eval
-        avg_acc_dict = mvbench_eval(config.output_path)
-
-        score = {f"MVBench accuracy": avg_acc_dict['total-acc']}
-        with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n")
     elif config.task == "inference":
         score = {"Inference accuracy:": None}
         pass
