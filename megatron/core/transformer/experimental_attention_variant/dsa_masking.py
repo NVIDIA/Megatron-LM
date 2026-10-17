@@ -353,6 +353,35 @@ def masked_softmax_inplace(
     return logits
 
 
+class _MaskedSoftmax(torch.autograd.Function):
+    """Save the returned probabilities and use one private backward workspace."""
+
+    @staticmethod
+    def forward(ctx, logits, invalid_mask, dim):
+        """Normalize pre-masked logits and save the masked output itself."""
+        probs = logits.softmax(dim=dim).masked_fill_(invalid_mask, 0.0)
+        ctx.save_for_backward(probs, invalid_mask)
+        ctx.dim = dim
+        return probs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Reuse a private workspace while preserving higher-order derivatives."""
+        probs, invalid_mask = ctx.saved_tensors
+        # The caller may reuse grad_output, including an expanded/aliased tensor.
+        grad = grad_output.masked_fill(invalid_mask, 0.0)
+        if torch.is_grad_enabled():
+            grad = torch._softmax_backward_data(grad, probs, ctx.dim, probs.dtype)
+        else:
+            grad.mul_(probs)
+            accum_dtype = (
+                torch.float32 if probs.dtype in (torch.float16, torch.bfloat16) else probs.dtype
+            )
+            row_sum = grad.sum(dim=ctx.dim, keepdim=True, dtype=accum_dtype)
+            grad.addcmul_(probs, row_sum, value=-1)
+        return grad.masked_fill_(invalid_mask, 0.0), None, None
+
+
 def masked_softmax(
     logits: torch.Tensor,
     valid_mask: torch.Tensor,
@@ -379,18 +408,18 @@ def masked_softmax(
         slice(0, 1) if stride == 0 else slice(None) for stride in valid_mask.stride()
     )
     invalid_mask = ~valid_mask[mask_slices]
+    native_softmax = torch.is_grad_enabled() and logits.requires_grad and eps <= 1
+    fill_value = float("-inf") if native_softmax else torch.finfo(logits.dtype).min
     if reuse_logits:
-        masked_logits = logits.masked_fill_(invalid_mask, torch.finfo(logits.dtype).min)
+        masked_logits = logits.masked_fill_(invalid_mask, fill_value)
     else:
-        masked_logits = logits.masked_fill(invalid_mask, torch.finfo(logits.dtype).min)
-    row_has_valid = valid_mask.any(dim=dim, keepdim=True)
-    if masked_logits.requires_grad and eps <= 1:
+        masked_logits = logits.masked_fill(invalid_mask, fill_value)
+    if native_softmax:
         # A finite nonempty row has sum(exp(x - max(x))) >= 1, so the clamp
-        # is inactive. Native softmax avoids the separate exp/div backward
-        # intermediates. Empty rows need finite inputs for a zero gradient.
-        masked_logits.masked_fill_(invalid_mask, float("-inf"))
-        masked_logits.masked_fill_(~row_has_valid, 0.0)
-        return masked_logits.softmax(dim=dim).masked_fill(invalid_mask, 0.0)
+        # is inactive. Empty rows need finite inputs for a zero gradient.
+        masked_logits.masked_fill_(invalid_mask.all(dim=dim, keepdim=True), 0.0)
+        return _MaskedSoftmax.apply(masked_logits, invalid_mask, dim)
+    row_has_valid = valid_mask.any(dim=dim, keepdim=True)
     row_max = masked_logits.max(dim=dim, keepdim=True).values
     row_max = torch.where(row_has_valid, row_max, torch.zeros_like(row_max))
 

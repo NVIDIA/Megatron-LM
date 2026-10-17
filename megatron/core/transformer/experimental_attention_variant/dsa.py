@@ -101,10 +101,13 @@ def _unfused_absorbed_dsa_fn(
     # heads. This also avoids per-head K/V gradients that are immediately summed.
     q = query.permute(1, 0, 2, 3).reshape(b, sq * np, hn)
     k = key[:, :, 0].permute(1, 2, 0)  # [b,hn,skv]
-    # Matmul backward saves Q/K, not its output, so this private score buffer
-    # can be reused for scaling, masking, and softmax intermediates.
     attention_scores = torch.bmm(q.float(), k.float()).view(b, sq, np, skv)
-    attention_scores.mul_(softmax_scale)
+    if attention_scores.requires_grad:
+        # Give in-place masking a non-view buffer: writing through the bmm view
+        # would make CopySlices backward clone full score-sized gradients.
+        attention_scores = attention_scores * softmax_scale
+    else:
+        attention_scores.mul_(softmax_scale)
 
     # Sparse + causal/varlen validity mask.
     index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)

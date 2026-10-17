@@ -50,8 +50,10 @@ def test_masked_softmax_matches_selected_logits(device, dtype, dim, grad_enabled
         if reuse_logits:
             assert result.data_ptr() == input_logits.data_ptr()
         return
-    upstream = torch.randn_like(result)
+    upstream = torch.randn_like(result[:1]).expand_as(result)
+    original_upstream = upstream.clone()
     grad = torch.autograd.grad(result, logits, upstream)[0]
+    assert torch.equal(upstream, original_upstream)
     ref_grad = torch.autograd.grad(reference, ref_logits, upstream)[0]
     torch.testing.assert_close(grad, ref_grad, rtol=tol, atol=tol)
     assert torch.count_nonzero(grad[~valid]) == 0
@@ -71,8 +73,8 @@ def test_masked_softmax_saves_only_one_probability_buffer(reuse_logits):
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
         input_logits = logits.clone() if reuse_logits else logits
         result = masked_softmax(input_logits, valid, reuse_logits=reuse_logits)
-    # Autograd should retain only one full attention-score-sized probability buffer.
-    assert len(storages) == 1
+    # Backward must save the returned probabilities, not a separate unmasked copy.
+    assert storages == {result.untyped_storage().data_ptr()}
     if reuse_logits:
         assert not torch.equal(input_logits.detach(), logits.detach())
     result.square().sum().backward()
@@ -130,8 +132,17 @@ def test_masked_softmax_first_and_second_derivatives(eps, reuse_logits):
     assert torch.autograd.gradgradcheck(fn, (logits,))
 
 
-def test_masked_softmax_keeps_invalid_entries_zero_for_nonfinite_rows():
-    logits = torch.tensor([[float("inf"), 1.0, 0.0], [float("nan"), 2.0, 3.0]])
-    valid = torch.tensor([[True, True, False], [False, False, False]])
+@pytest.mark.parametrize("grad_enabled", [False, True])
+def test_masked_softmax_keeps_invalid_entries_zero_for_nonfinite_rows(grad_enabled):
+    logits = torch.tensor(
+        [[float("inf"), 1.0, 0.0], [float("nan"), 2.0, 3.0], [1.0, 2.0, 3.0]],
+        requires_grad=grad_enabled,
+    )
+    valid = torch.tensor([[True, True, False], [False, False, False], [True, True, False]])
     result = masked_softmax(logits, valid)
     assert torch.count_nonzero(result[~valid]) == 0
+    if grad_enabled:
+        upstream = torch.randn_like(result).masked_fill_(~valid, float("nan"))
+        grad = torch.autograd.grad(result, logits, upstream)[0]
+        assert torch.count_nonzero(grad[~valid]) == 0
+        assert torch.isfinite(grad[2]).all()
