@@ -161,7 +161,7 @@ def test_gdn_offload_with_te_graphs(
                     name: p.main_grad.detach().clone() for name, p in models[0].named_parameters()
                 }
                 success, grad_norm, _ = optimizer.step()
-                assert success and grad_norm > 0
+                assert success and grad_norm > 0, (variant, enabled, step)
                 states.append(
                     {
                         "losses": losses,
