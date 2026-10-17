@@ -537,6 +537,7 @@ def model_parallel_cuda_manual_seed(
     force_reset_rng: bool = False,
     gtp_remat_world_size: Optional[int] = None,
     egtp_remat_world_size: Optional[int] = None,
+    pp_rank: int = 0,
 ):
     """Initialize model parallel cuda seed.
 
@@ -554,6 +555,8 @@ def model_parallel_cuda_manual_seed(
     expert-parallel-seed: This state is only used for the expert layer of MoE models.
     It is different among expert-tensor and expert-model parallel GPUs, and the same
     across expert-data parallel groups.
+    pp_rank is the pipeline rank of a caller that already offsets seed per pipeline stage.
+    It keeps the expert-parallel state different across pipeline stages as well.
     """
     if tp_rank is None:
         tp_rank = get_tensor_model_parallel_rank()
@@ -586,7 +589,9 @@ def model_parallel_cuda_manual_seed(
     # and model parallel state.
     _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
 
-    expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
+    # A per-stage seed offset from the caller (100 * pp_rank in _set_random_seed) aliases with
+    # the 100 * ep_rank stride, so pp_rank gets its own stride, above the remat strides below.
+    expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank + (1 << 24) * pp_rank
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
     # GTP_remat weight-init states: shards are initialized per-rank (GTP-agnostic init), so peers
