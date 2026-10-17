@@ -225,6 +225,8 @@ def test_gdn_offload_training(
     """Match losses, accumulated gradients, updated weights and Adam states on every rank."""
     if Utils.world_size % (tp * cp * pp):
         pytest.skip("This topology requires a world size divisible by TP * CP * PP.")
+    if variant == "gdn2":
+        pytest.importorskip("fla.ops.gdn2")
     if fused_pre_gdr:
         pytest.importorskip("causal_conv1d", minversion="1.6.1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")

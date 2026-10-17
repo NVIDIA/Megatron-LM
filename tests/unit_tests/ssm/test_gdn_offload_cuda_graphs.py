@@ -25,7 +25,7 @@ from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.utils import unwrap_model
+from megatron.core.utils import is_te_min_version, is_torch_min_version, unwrap_model
 from tests.unit_tests.ssm.test_gdn_offload_training import (
     _build_training_model,
     _forward_step,
@@ -36,6 +36,10 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.skipif(
+    not is_torch_min_version("2.9.0a0") or not is_te_min_version("2.14.0"),
+    reason="CUDA graph offloading requires PyTorch >= 2.9 and TE >= 2.14.",
+)
 @pytest.mark.parametrize("tp,pp", [(1, 1), (2, 1), (1, 2)], ids=["tp1", "tp2-sp", "pp2"])
 @pytest.mark.parametrize(
     "variant,fused,recompute_norm,whole_layer,delay,fraction",
