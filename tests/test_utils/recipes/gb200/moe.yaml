@@ -233,3 +233,11 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_gb200]
+
+  # #7400: eager BF16 cuBLAS grouped GEMM with MFSDP v2 + HybridEP.
+  # Requires 8 GPUs; GitHub runners only provide one 4-GPU node.
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_hybridep]
+    products:
+      - environment: [dev]
+        scope: [mr, nightly]
+        platforms: [dgx_gb200]
