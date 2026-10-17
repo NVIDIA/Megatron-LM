@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
+from megatron.core.activations import scaled_silu, situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -217,6 +217,9 @@ class MLP(MegatronModule):
         # Use moe_latent_size only for routed experts. 'is_expert' is false for
         # shared_experts.
         use_latent_size = (self.config.moe_latent_size is not None) and is_expert
+        self.sigmoid_input_scale = (
+            self.config.moe_latent_sigmoid_input_scale if use_latent_size else 1.0
+        )
 
         self.linear_fc1 = submodules.linear_fc1(
             self.input_size if not use_latent_size else not_none(self.config.moe_latent_size),
@@ -234,7 +237,11 @@ class MLP(MegatronModule):
             name=(name + ".linear_fc1") if name is not None else None,
         )
 
-        if self.config.use_te_activation_func and not (submodules.activation_func is None):
+        if (
+            self.config.use_te_activation_func
+            and self.sigmoid_input_scale == 1.0
+            and submodules.activation_func is not None
+        ):
             self.activation_func = apply_module(submodules.activation_func(config=self.config))
         else:
             self.activation_func = self.config.activation_func
@@ -266,7 +273,7 @@ class MLP(MegatronModule):
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
-        if self.config.use_te_activation_func:
+        if self.config.use_te_activation_func and self.sigmoid_input_scale == 1.0:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
             intermediate_parallel = self.activation_func(intermediate_parallel)
@@ -286,6 +293,7 @@ class MLP(MegatronModule):
                         self.config.activation_func_clamp_value,
                         gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
                         linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
+                        sigmoid_input_scale=self.sigmoid_input_scale,
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
@@ -320,6 +328,7 @@ class MLP(MegatronModule):
                         self.config.activation_func_clamp_value,
                         gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
                         linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
+                        sigmoid_input_scale=self.sigmoid_input_scale,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
@@ -334,6 +343,7 @@ class MLP(MegatronModule):
                         tanh_clamp_scale,
                         self.config.activation_func_tanh_clamp_scale_linear,
                         self.config.glu_linear_offset,
+                        sigmoid_input_scale=self.sigmoid_input_scale,
                     )
                 else:
 
@@ -342,9 +352,12 @@ class MLP(MegatronModule):
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
                             x_linear = x_linear.clamp(min=-val, max=val)
-                        return self.config.activation_func(x_glu) * (
-                            x_linear + self.config.glu_linear_offset
+                        gate = (
+                            scaled_silu(x_glu, self.sigmoid_input_scale)
+                            if self.sigmoid_input_scale != 1.0
+                            else self.config.activation_func(x_glu)
                         )
+                        return gate * (x_linear + self.config.glu_linear_offset)
 
                     intermediate_parallel = glu(intermediate_parallel)
             else:

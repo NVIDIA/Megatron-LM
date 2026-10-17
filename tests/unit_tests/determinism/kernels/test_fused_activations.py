@@ -52,6 +52,36 @@ def _weights(rows):
 # --- gated / weighted MLP fusions ----------------------------------------------------------
 
 GATED_CASES = {
+    "sigmoid_scaled_swiglu": lambda: (
+        lambda x, b: bias_swiglu_impl(x, b, sigmoid_input_scale=1.7),
+        (_act((TOKENS, 2 * FFN)), _act((2 * FFN,))),
+    ),
+    "sigmoid_scaled_clamped_swiglu": lambda: (
+        lambda x, b: bias_swiglu_impl(x, b, clamp_value=7.0, sigmoid_input_scale=1.7),
+        (_act((TOKENS, 2 * FFN)), None),
+    ),
+    "sigmoid_scaled_weighted_swiglu": lambda: (
+        lambda x, b, w: weighted_bias_swiglu_impl(x, b, w, sigmoid_input_scale=1.7),
+        (_act((TOKENS, 2 * FFN)), None, _weights(TOKENS)),
+    ),
+    "sigmoid_scaled_weighted_clamped_swiglu": lambda: (
+        lambda x, b, w: weighted_bias_swiglu_impl(
+            x, b, w, clamp_value=7.0, sigmoid_input_scale=1.7
+        ),
+        (_act((TOKENS, 2 * FFN)), None, _weights(TOKENS)),
+    ),
+    "sigmoid_scaled_situ_glu": lambda: (
+        lambda x, b: bias_swiglu_impl(
+            x, b, gate_clamp_scale=10.0, linear_clamp_scale=3.0, sigmoid_input_scale=1.7
+        ),
+        (_act((TOKENS, 2 * FFN)), _act((2 * FFN,))),
+    ),
+    "sigmoid_scaled_weighted_situ_glu": lambda: (
+        lambda x, b, w: weighted_bias_swiglu_impl(
+            x, b, w, gate_clamp_scale=10.0, linear_clamp_scale=3.0, sigmoid_input_scale=1.7
+        ),
+        (_act((TOKENS, 2 * FFN)), None, _weights(TOKENS)),
+    ),
     "bias_swiglu": lambda: (bias_swiglu_impl, (_act((TOKENS, 2 * FFN)), _act((2 * FFN,)))),
     "swiglu_no_bias": lambda: (bias_swiglu_impl, (_act((TOKENS, 2 * FFN)), None)),
     "clamped_swiglu": lambda: (
@@ -140,6 +170,9 @@ def test_clamped_swiglu_boundaries_replay_bit_exactly(weighted):
 # --- plain compiled activations -----------------------------------------------------------
 
 ACTIVATION_CASES = {
+    "sigmoid_scaled_silu": lambda x: activations.scaled_silu(x, 1.7),
+    "sigmoid_scaled_situ": lambda x: activations.situ(x, 5.0, 1.7),
+    "sigmoid_scaled_situ_glu": lambda x: activations.situ_glu(x, 5.0, 3.0, sigmoid_input_scale=1.7),
     "squared_relu": lambda x: activations.squared_relu(x),
     "quick_gelu": lambda x: activations.quick_gelu(x),
     "fast_gelu": lambda x: activations.fast_gelu(x),

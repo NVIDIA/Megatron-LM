@@ -275,6 +275,81 @@ After establishing a working parallel configuration, profile your training to id
 
 ## Feature Documentation
 
+### Latent MoE Projection and Sigmoid Scaling
+
+Latent MoE projects routed tokens from `hidden_size` to `moe_latent_size` before expert
+dispatch and projects the combined expert output back to `hidden_size`. Shared experts
+and the router operate at the full model width.
+
+Enable `--moe-latent-projection-scaling` together with `--moe-latent-size` to multiply
+the hidden-to-latent projection output by `sqrt(hidden_size / moe_latent_size)`.
+The latent-to-hidden projection remains unscaled unless the independent
+`--moe-latent-up-projection-scaling` flag is enabled:
+
+```text
+scale = sqrt(hidden_size / moe_latent_size)
+latent_input = fc1_latent_proj(hidden_states)
+if moe_latent_projection_scaling:
+    latent_input = scale * latent_input
+latent_output = combine(routed_experts(latent_input))
+if moe_use_norm_before_up_proj:
+    latent_output = fc2_norm(latent_output)
+output = fc2_latent_proj(latent_output)
+if moe_latent_up_projection_scaling:
+    output = scale * output
+output = output + shared_expert_output
+```
+
+For `hidden_size=7168` and `moe_latent_size=3584`, each enabled gain is `sqrt(2)`.
+The down-projection gain changes expert inputs; the up-projection gain changes routed
+branch output amplitude. Each scales projection biases when present. Router inputs,
+shared expert outputs, activation definitions, weight initialization, and checkpoint
+tensor shapes are unchanged. Gains are applied in the common preprocessing and
+postprocessing paths used by training and inference.
+
+Both flags are disabled by default. When resuming or serving a checkpoint trained with
+these options, enable the same flags again to reproduce that checkpoint's computation.
+The up-projection gain is generally unnecessary if its initializer already uses
+`1/sqrt(moe_latent_size)`, with any additional depth factor. With a fixed weight std
+based on `hidden_size`, it can compensate for the smaller up-projection fan-in.
+Normalization before the up-projection normalizes its input; it does not compensate
+for the subsequent matrix's weight scale. The up-projection gain cannot change the
+expert nonlinearity's input scale, because it is applied after the experts.
+
+This is an architecture experiment: fan-in-aware expert initialization can also
+compensate for a smaller latent dimension. Neither end-to-end variance preservation
+nor a training-quality improvement is assumed. Compare down/up scaling independently
+with the same initialization, both with and without `--moe-use-norm-before-up-proj`,
+and measure activation RMS, gradients, loss, and throughput.
+
+The independent `--moe-latent-sigmoid-input-scale KAPPA` option defaults to `1.0`.
+It changes only routed latent experts' sigmoid argument:
+
+```text
+SwiGLU(gate, linear) = gate * sigmoid(kappa * gate) * linear
+SiTU(gate, linear) = s * tanh(gate / s) * sigmoid(kappa * gate) * linear
+```
+
+Both projection gains can remain disabled, or be enabled independently of `kappa`.
+The gate's multiplicative factor and the linear branch retain their original inputs;
+SiTU tanh arguments and any linear-branch tanh clamp stay unchanged. Dense/shared
+experts and routing are unaffected.
+For example, `--moe-latent-size 3584 --moe-latent-sigmoid-input-scale 1.41421356237`
+adjusts sigmoid sensitivity without enabling either projection gain. The scale must
+be finite; non-unit values require latent MoE with gated SiLU. Reuse the same scale
+when loading a checkpoint to reproduce its computation.
+
+The fused custom backward includes the `kappa` chain-rule factor and uses the same
+sigmoid scale for the router-probability gradient in weighted fusions. TE native
+activations fall back to the standard activation path for non-unit scales. The TE op fuser cannot express this
+option; disable `--use-transformer-engine-op-fuser` and use `--bias-activation-fusion`
+for the custom fused activation instead.
+Inference-optimized MoE kernels reject non-unit scales; use standard grouped or
+sequential experts instead. CPU reference comparisons verify the activation math;
+GPU compiler replay, distributed training, and quality ablations remain separate
+validation. Compare sigmoid scaling and projection gains independently, and record
+both activation saturation and routed-branch RMS alongside loss.
+
 ### Router and Load Balancing
 
 Routers determine which expert(s) handle each token. A lightweight MLP scores every token and applies `softmax` or `sigmoid` to compute routing probabilities. The router then selects the top-K experts for each token.

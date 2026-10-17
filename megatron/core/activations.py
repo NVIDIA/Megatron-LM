@@ -8,6 +8,14 @@ from megatron.core.jit import jit_fuser
 
 
 @jit_fuser
+def scaled_silu(x: torch.Tensor, sigmoid_input_scale: float = 1.0) -> torch.Tensor:
+    """SiLU with an independently scaled sigmoid argument and unchanged linear factor."""
+    if sigmoid_input_scale == 1.0:
+        return F.silu(x)
+    return x * torch.sigmoid(sigmoid_input_scale * x)
+
+
+@jit_fuser
 def squared_relu(x: torch.Tensor) -> torch.Tensor:
     """Squared ReLU activation"""
     return torch.pow(F.relu(x), 2)
@@ -20,9 +28,11 @@ def tanh_soft_clamp(x: torch.Tensor, scale: float) -> torch.Tensor:
 
 
 @jit_fuser
-def situ(x: torch.Tensor, scale: float) -> torch.Tensor:
-    """Sigmoid-Tanh Unit from Kimi K3: ``s * tanh(x / s) * sigmoid(x)``"""
-    return tanh_soft_clamp(x, scale) * torch.sigmoid(x)
+def situ(x: torch.Tensor, scale: float, sigmoid_input_scale: float = 1.0) -> torch.Tensor:
+    """Sigmoid-Tanh Unit from Kimi K3: ``s * tanh(x / s) * sigmoid(kappa * x)``"""
+    return tanh_soft_clamp(x, scale) * torch.sigmoid(
+        x if sigmoid_input_scale == 1.0 else sigmoid_input_scale * x
+    )
 
 
 @jit_fuser
@@ -31,12 +41,13 @@ def situ_glu(
     gate_scale: float,
     linear_scale: Optional[float] = None,
     linear_offset: float = 0.0,
+    sigmoid_input_scale: float = 1.0,
 ) -> torch.Tensor:
-    """SiTU-GLU: ``situ(x_gate, gate_scale) * (x_linear + linear_offset)``."""
+    """SiTU-GLU: ``situ(x_gate, gate_scale, sigmoid_input_scale) * (x_linear + linear_offset)``."""
     x_gate, x_linear = torch.chunk(x, 2, dim=-1)
     if linear_scale is not None:
         x_linear = tanh_soft_clamp(x_linear, linear_scale)
-    return situ(x_gate, gate_scale) * (x_linear + linear_offset)
+    return situ(x_gate, gate_scale, sigmoid_input_scale) * (x_linear + linear_offset)
 
 
 @jit_fuser
