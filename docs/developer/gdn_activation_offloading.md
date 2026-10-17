@@ -45,10 +45,8 @@ completes before FLA backward reads its saved tensors. The integration does not
 force-release inputs or break their storage aliases. The output norm and its
 optional recomputation checkpoint remain outside the scope.
 
-Shared manager/scheduler lifecycle and transfer-ordering fixes are reviewed
-separately from this integration in PR #8243. This feature preserves the upstream
-pre-GDR kernels, including their autotuning and atomic parameter-gradient
-reductions. The separate repeatability change in PR #8244 is not a dependency.
+The integration preserves the existing pre-GDR kernels, including their
+autotuning and atomic parameter-gradient reductions.
 
 ## Reproduce profiling and training checks
 
@@ -130,30 +128,14 @@ provide no throughput or convergence qualification.
 
 ## Results and evidence provenance
 
-Training evidence must identify the exact source commit, launcher commands,
-per-rank outputs and exit codes. CPU configuration, manifest and documentation
-checks do not qualify GPU training. PR descriptions identify the tested revisions;
-historical results do not qualify later source changes. Results recorded with
-the fixed gate reduction from PR #8244 do not qualify the restored upstream fused
-path.
+Evidence must identify the executed source commit, launcher commands, per-rank
+outputs and exit codes. [The pinned validation bundle](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/6ca000df1d21df1fe042be13f008bd900de1f9b4/restore-upstream-gate-20261016)
+contains the restored-kernel checks and their source identities. CPU checks do not
+qualify GPU training, and earlier fixed-reduction results do not qualify the
+native fused path. [Historical logs, CSVs and reports](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/cf8df32ec2424bcc6c42a5486d2fe68213c74294/split-20261015/historical)
+retain their original revisions separately.
 
-Historical evidence remains useful with its original source identity:
-
-| Recorded workload | Result | Source |
-| --- | --- | --- |
-| Post-rebase two-rank regressions | 104 passed per rank | `b22c9f7251a480529a4815c8c5fe0ece64734c03` |
-| Post-rebase native training, two ranks | 72 passed and 24 four-rank skips per rank | `b22c9f7251a480529a4815c8c5fe0ece64734c03` |
-| Post-rebase Qwen TP=2/SP | 24 matching complete recorded rank-step states | `b22c9f7251a480529a4815c8c5fe0ece64734c03` |
-| Pre-rebase native training, four ranks | 96 passed, zero skipped per rank | Checkout `5176d49bb0bdd885f6f69575fa8c39295c22b2bb` |
-| Pre-rebase Qwen TP=2/SP/PP=2 | 192 matching comparison states, plus 12 control states | Checkouts `c8ceb3b8a7067827aa6246affa8413c6bf04b9cc` / `f83613e7fa4e3e34731faef1ba579b4cdea2e65f` |
-
-[The pinned post-rebase bundle](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/8d63bdf2b746a664efedc28977cf31de04e66bfe)
-contains original rank logs, Qwen fingerprints, commands, SHA-256 checksums and a
-CPU-only verifier. It does not attest to the split revisions.
-[Historical CSVs and detailed experiment reports](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/gdn-offload-split-20261015/split-20261015/historical)
-are archived separately from the source documentation.
-
-Representative complete-Qwen, single-A6000 results at sequence 4096 with norm
+Historical complete-Qwen, single-A6000 results at sequence 4096 with norm
 recomputation off save 952.00 MiB (3.01%) for unfused pre-GDR and 952.00 MiB
 (3.04%) for fixed fused pre-GDR. Median runtime changes are +1.58% and +5.80%,
 respectively. These are separate offload comparisons, not a controlled comparison
