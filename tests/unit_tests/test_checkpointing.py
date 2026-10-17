@@ -27,6 +27,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _maybe_setup_gpt_to_hybrid_load,
     check_checkpoint_args,
     get_checkpoint_tracker_filename,
     get_checkpoint_version,
@@ -43,6 +44,33 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.usefixtures("run_config")
+
+
+@pytest.mark.parametrize("ckpt_args", [None, SimpleNamespace()])
+def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
+    """Missing checkpoint args do not identify a model-only checkpoint as GPT."""
+
+    args = SimpleNamespace(hybrid_layer_pattern="M*E")
+    assert _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, [object()]) == (None, False)
+
+
+@pytest.mark.parametrize("auto_detect", [False, True])
+def test_inference_shards_reject_legacy_checkpoint(create_ckpt_load_args, monkeypatch, auto_detect):
+    from megatron.training import checkpointing
+
+    args = create_ckpt_load_args
+    args.load = "unused"
+    args.ckpt_format = "torch_dist" if auto_detect else "torch"
+    args.auto_detect_ckpt_format = auto_detect
+    args.inference_shards = "tp=1,role=prefill+tp=1,role=decode"
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        mock.Mock(return_value=({}, "unused", False, CheckpointType.LEGACY)),
+    )
+    with pytest.raises(ValueError, match="incompatible with legacy torch checkpoints"):
+        load_checkpoint([], None, None)
 
 
 class MockModel(MegatronModule):

@@ -29,15 +29,45 @@ if not is_mxfp8_available():
     pytest.skip("MXFP8 quantization is not available.", allow_module_level=True)
 
 
-def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
-    """Quantized tensor views match TE's data and scales."""
+@pytest.mark.parametrize(
+    "placements",
+    [
+        pytest.param((BlockAtomic(32),), id="shard"),
+        pytest.param((Replicate(), BlockAtomic(32)), id="replicate_shard"),
+        pytest.param((BlockAtomic(32), BlockAtomic(32)), id="shard_shard"),
+    ],
+)
+@pytest.mark.parametrize(
+    "make_shapes",
+    [
+        pytest.param(lambda num_ranks: [(128, 128), (128, 128), (64, 64), (32, 64)], id="mixed"),
+        # One 32-row tensor per layout chunk, so every shard ends with a 32-row tensor.
+        # TE's quantize kernel writes scales for whole 64-row chunks, so compact scale
+        # views would be written beyond: https://github.com/NVIDIA/TransformerEngine/issues/3689
+        pytest.param(lambda num_ranks: [(32, 128)] * num_ranks, id="short_tensors"),
+    ],
+)
+def test_quantized_dbuffer_quantization_matches_te(distributed_setup, placements, make_shapes):
+    """Quantizing a sharded view matches TE and writes only this rank's shard.
+
+    The view is taken from a replicated buffer filled with a canary, so any write
+    outside this rank's shard lands in memory the test owns and is detected.
+    """
     device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
-    quantized = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
-    main_weight = DBuffer(
-        mesh, [BlockAtomic(32)], quantized.rowwise_data.layout, torch.float32, device
-    )
+    world_size = distributed_setup.world_size
+    if len(placements) == 1:
+        mesh = init_device_mesh(device.type, (world_size,))
+    else:
+        if world_size < 4 or world_size % 2:
+            pytest.skip("Two-dimensional placements require an even world size of at least 4.")
+        mesh = init_device_mesh(device.type, (2, world_size // 2))
+    shapes = make_shapes(mesh.size())
+    canary = 0xAA
+    replicated = QuantizedDBuffer.empty(mesh, [Replicate()] * mesh.ndim, shapes, device)
+    for plane in replicated.planes:
+        plane.local_buffer.fill_(canary)
+    quantized = replicated.view(placements)
+    main_weight = DBuffer(mesh, placements, quantized.rowwise_data.layout, torch.float32, device)
     torch.manual_seed(1234 + distributed_setup.rank)
     main_weight.local_buffer.normal_()
     quantized.quantize_(main_weight)
@@ -62,6 +92,11 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
             torch.testing.assert_close(
                 actual, expected[: actual.shape[0], : actual.shape[1]], rtol=0, atol=0
             )
+
+    # Restore the canary in this rank's shard; anything else that changed was written outside it.
+    for plane in quantized.planes:
+        plane.local_buffer.fill_(canary)
+    assert all(plane.local_buffer.eq(canary).all() for plane in replicated.planes)
 
 
 def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup):

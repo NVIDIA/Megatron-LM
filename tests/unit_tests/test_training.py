@@ -3,11 +3,13 @@
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
+from megatron.training import training
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
@@ -77,6 +79,47 @@ def test_indexer_logging_counts_only_active_legacy_ratios():
     )
 
     assert _get_indexer_logging_layer_counts(args) == (3, 2)
+
+
+@pytest.mark.parametrize("fsdp2", [False, True])
+@pytest.mark.parametrize("megatron_fsdp", [False, True])
+def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2, megatron_fsdp):
+    args = SimpleNamespace(
+        skip_train=False,
+        freeze_all_layers=False,
+        freeze_base_model_for_mtp=False,
+        use_torch_fsdp2=not fsdp2,
+        use_megatron_fsdp=not megatron_fsdp,
+    )
+    run_config.dist.use_torch_fsdp2 = fsdp2
+    run_config.ddp = (
+        training.TorchFullyShardedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
+        if fsdp2
+        else training.DistributedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
+    )
+    builder = Mock()
+    run_config.model = SimpleNamespace(get_builder_cls=lambda: Mock(return_value=builder))
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
+    monkeypatch.setattr(training, "_add_model_freeze_pre_wrap_hook", Mock())
+    monkeypatch.setattr("megatron.training.utils.start_memory_history_recording", Mock())
+    # A passed training container must not be replaced by the global container.
+    monkeypatch.setattr(training, "get_run_config", Mock(side_effect=AssertionError("global read")))
+
+    class ReachedBuilder(Exception):
+        pass
+
+    builder.build_distributed_models.side_effect = ReachedBuilder
+    with pytest.raises(ReachedBuilder):
+        training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
+    kwargs = builder.build_distributed_models.call_args.kwargs
+    assert kwargs["ddp_config"] is run_config.ddp
+    assert kwargs["use_torch_fsdp2"] is fsdp2
+    # Forward both flags unchanged, including the pair rejected by the builder.
+    assert kwargs["use_megatron_fsdp"] is megatron_fsdp
 
 
 def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():

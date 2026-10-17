@@ -1398,8 +1398,25 @@ class TestPretrainContainerFromArgsStructure:
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
-        mock_ddp.assert_called_once_with(args)
+        mock_ddp.assert_called_once_with(args, use_torch_fsdp2=False)
         assert result.ddp is mock_ddp_instance
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_distributed_cli_flags_keep_their_config_owners(self, monkeypatch, enabled):
+        parser = ArgumentParser()
+        add_megatron_arguments(parser)
+        args = parser.parse_args(["--use-megatron-fsdp", "--fake-process-group"] if enabled else [])
+        monkeypatch.setattr(
+            "megatron.training.training.get_megatron_optimizer_config",
+            lambda args: (OptimizerConfig(), {}),
+        )
+
+        cfg = pretrain_cfg_container_from_args(args)
+
+        assert args.use_megatron_fsdp is enabled
+        assert cfg.ddp.use_megatron_fsdp is enabled
+        assert cfg.dist.fake_process_group is enabled
+        assert not hasattr(cfg.dist, "use_megatron_fsdp")
 
 
 class TestCheckpointConfigMapping:

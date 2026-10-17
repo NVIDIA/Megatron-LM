@@ -10,6 +10,8 @@ spec:
   gpus: 4
   n_repeat: 5
   platforms: dgx_gb200
+  training_script_path: pretrain_gpt.py
+  inference_shards: ""
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -48,6 +50,7 @@ spec:
 
     NAME=$(echo {test_case}_{environment} | sed 's/dgx_gb200/dgx_a100/g')
     export GPUS_PER_NODE={gpus}
+    export INFERENCE_SHARDS='{inference_shards}'
 
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
@@ -56,7 +59,7 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts/"
-        "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
+        "TRAINING_SCRIPT_PATH={training_script_path}"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
@@ -73,6 +76,14 @@ spec:
     exit $exit_code
 
 products:
+  - test_case: [gpt_grpo_disagg_nccl_1node]
+    products:
+      - training_script_path: [train_rl.py]
+        inference_shards: ["tp=2,role=prefill+tp=1,dp=2,role=decode"]
+        n_repeat: [1]
+        environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_1node]
     products:
       - environment: [dev]
