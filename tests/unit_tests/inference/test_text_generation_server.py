@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import inspect
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
         def __init__(self, _name):
             self.config = {}
             self.blueprints = []
+            self.asgi_app = object()
             apps.append(self)
 
         def register_blueprint(self, blueprint):
@@ -108,6 +110,167 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
     assert clients[0].stopped is True
 
 
+def _recorder():
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    return sent, send
+
+
+@pytest.mark.asyncio
+async def test_inflight_limit_rejects_requests_over_count():
+    release = asyncio.Event()
+    entered = []
+
+    async def app(scope, receive, send):
+        entered.append(scope["type"])
+        await release.wait()
+
+    limited = text_generation_server._InflightHTTPLimit(
+        app, max_inflight_requests=2, max_inflight_bytes=100, max_request_content_size=100
+    )
+
+    async def call(scope_type="http"):
+        sent, send = _recorder()
+        scope = {
+            "type": scope_type,
+            "http_version": "1.1",
+            "method": "POST",
+            "headers": [(b"content-length", b"1")],
+        }
+        await limited(scope, None, send)
+        return sent
+
+    in_flight = [asyncio.create_task(call()) for _ in range(2)]
+    while len(entered) < 2:
+        await asyncio.sleep(0)
+
+    rejected = await call()
+    assert rejected[0]["status"] == 503
+    assert (b"retry-after", b"1") in rejected[0]["headers"]
+    assert len(entered) == 2, "the rejected request must not reach the app"
+
+    # Lifespan and other non-HTTP scopes are never counted or rejected.
+    lifespan = asyncio.create_task(call("lifespan"))
+    while len(entered) < 3:
+        await asyncio.sleep(0)
+
+    release.set()
+    await asyncio.gather(*in_flight, lifespan)
+    assert limited.inflight == 0
+    assert await call() == [], "slots must be freed once requests finish"
+
+
+def _body(*chunks):
+    messages = [
+        {"type": "http.request", "body": c, "more_body": i < len(chunks) - 1}
+        for i, c in enumerate(chunks)
+    ]
+
+    async def receive():
+        return messages.pop(0)
+
+    return receive
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [],
+        [(b"transfer-encoding", b"chunked")],
+        # h11 frames by Transfer-Encoding, so the declared length is not trusted.
+        [(b"content-length", b"1"), (b"transfer-encoding", b"chunked")],
+    ],
+)
+async def test_inflight_limit_counts_received_bytes(headers):
+    received = []
+
+    async def app(scope, receive, send):
+        while (message := await receive())["type"] == "http.request":
+            received.append(message["body"])
+            if not message.get("more_body"):
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b""})
+                return
+
+    limited = text_generation_server._InflightHTTPLimit(
+        app, max_inflight_requests=10, max_inflight_bytes=10, max_request_content_size=100
+    )
+    scope = {"type": "http", "headers": headers}
+
+    sent, send = _recorder()
+    await limited(scope, _body(b"x" * 6, b"x" * 6), send)
+    assert received == [b"x" * 6], "the chunk crossing the budget must not reach the app"
+    assert [m.get("status") for m in sent] == [503, None]
+    assert limited.inflight_bytes == 0 and limited.inflight == 0
+
+    received.clear()
+    sent, send = _recorder()
+    await limited(scope, _body(b"x" * 5, b"x" * 5), send)
+    assert sent[0]["status"] == 200, "a payload within budget is unaffected"
+    assert limited.inflight_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_inflight_limit_counts_bytes_across_requests():
+    release = asyncio.Event()
+    entered = []
+
+    async def app(scope, receive, send):
+        await receive()
+        entered.append(True)
+        await release.wait()
+
+    limited = text_generation_server._InflightHTTPLimit(
+        app, max_inflight_requests=10, max_inflight_bytes=10, max_request_content_size=10
+    )
+
+    holding = asyncio.create_task(limited({"type": "http", "headers": []}, _body(b"x" * 10), None))
+    while not entered:
+        await asyncio.sleep(0)
+    assert limited.inflight_bytes == 10
+
+    sent, send = _recorder()
+    await limited({"type": "http", "headers": []}, _body(b"x"), send)
+    assert sent[0]["status"] == 503, "a full byte budget rejects new requests"
+    assert len(entered) == 1
+
+    release.set()
+    await holding
+    assert limited.inflight_bytes == 0 and limited.inflight == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("chunks", "expected_status"), [((5, 5), 200), ((6, 5), 413)])
+async def test_inflight_limit_rejects_request_over_maximum(chunks, expected_status):
+    received = []
+
+    async def app(scope, receive, send):
+        while (message := await receive())["type"] == "http.request":
+            received.append(message["body"])
+            if not message.get("more_body"):
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b""})
+                return
+
+    limited = text_generation_server._InflightHTTPLimit(
+        app, max_inflight_requests=10, max_inflight_bytes=100, max_request_content_size=10
+    )
+    sent, send = _recorder()
+    # The declared length is not trusted; only received bytes count.
+    scope = {"type": "http", "headers": [(b"content-length", b"1")]}
+    await limited(scope, _body(*(b"x" * n for n in chunks)), send)
+
+    assert sent[0]["status"] == expected_status
+    if expected_status == 413:
+        assert received == [b"x" * 6], "the chunk crossing the maximum must not reach the app"
+        assert (b"retry-after", b"1") not in sent[0]["headers"]
+    assert limited.inflight == 0 and limited.inflight_bytes == 0
+
+
 def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):
     processes = []
 
@@ -159,6 +322,27 @@ def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):
     )
     assert worker_call.arguments["multimodal_prompt_config"] is prompt_config
     assert processes[0].daemon is True
+
+
+@pytest.mark.parametrize(
+    ("limits", "message"),
+    [
+        ({"max_inflight_requests": 0}, "max_inflight_requests"),
+        ({"max_inflight_bytes": 2**30 - 1}, "max_inflight_bytes"),
+    ],
+)
+def test_start_server_rejects_invalid_inflight_limits(monkeypatch, limits, message):
+    monkeypatch.setattr(text_generation_server, "_SERVER_PROCESSES", [])
+    monkeypatch.setattr(
+        text_generation_server,
+        "_SERVER_PROCESS_CONTEXT",
+        SimpleNamespace(Process=lambda **_kwargs: pytest.fail("must not start a replica")),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        text_generation_server.start_text_gen_server(
+            "coordinator:1234", tokenizer=object(), rank=0, server_port=8080, **limits
+        )
 
 
 def test_start_server_rejects_socket_without_real_port(monkeypatch):
