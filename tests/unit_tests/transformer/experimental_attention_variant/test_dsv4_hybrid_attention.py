@@ -364,17 +364,13 @@ def test_config_accepts_hybrid_model_ratio_tail():
 
 def test_hybrid_stack_spec_uses_static_ratio_agnostic_specs():
     """C/H/W use static norm/no-norm specs; layer configs provide their ratios."""
-    from megatron.core.models.hybrid.hybrid_layer_specs import (
-        hybrid_dsv4_stack_spec,
-        hybrid_stack_spec,
-    )
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
         DSv4HybridSelfAttention,
     )
     from megatron.core.transformer.spec_utils import ModuleSpec
 
-    assert isinstance(hybrid_dsv4_stack_spec, ModuleSpec)
-    assert hybrid_dsv4_stack_spec is hybrid_stack_spec
+    assert isinstance(hybrid_stack_spec, ModuleSpec)
     attention = hybrid_stack_spec.submodules.csa_layer.submodules.self_attention
     assert attention.module is DSv4HybridSelfAttention
     assert "compress_ratio" not in attention.params
@@ -387,10 +383,49 @@ def test_hybrid_stack_spec_uses_static_ratio_agnostic_specs():
     assert normalized.submodules.kv_layernorm is not IdentityOp
 
 
+@pytest.mark.parametrize("qk_layernorm", [False, True])
+def test_dev_hybrid_factory_preserves_static_stack_and_config_semantics(qk_layernorm):
+    from megatron.core.models.hybrid.hybrid_layer_specs import (
+        hybrid_dsv4_stack_spec,
+        hybrid_stack_spec,
+    )
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    original_dsa = hybrid_stack_spec.submodules.dsa_layer
+    original_csa = hybrid_stack_spec.submodules.csa_layer
+    stack_spec = hybrid_dsv4_stack_spec(_make_config(qk_layernorm=qk_layernorm))
+    assert isinstance(stack_spec, ModuleSpec)
+    assert stack_spec is not hybrid_stack_spec
+    assert hybrid_stack_spec.submodules.dsa_layer is original_dsa
+    assert hybrid_stack_spec.submodules.csa_layer is original_csa
+    assert "compress_ratio" not in original_csa.submodules.self_attention.params
+
+    for layer_name, ratio in (
+        ("dsa_layer", None),
+        ("csa_layer", 4),
+        ("hca_layer", 128),
+        ("window_layer", 0),
+    ):
+        attention = getattr(stack_spec.submodules, layer_name).submodules.self_attention
+        assert attention.module is DSv4HybridSelfAttention
+        if ratio is None:
+            assert "compress_ratio" not in attention.params
+        else:
+            assert attention.params["compress_ratio"] == ratio
+        assert (attention.submodules.q_layernorm is IdentityOp) is (not qk_layernorm)
+        assert (attention.submodules.kv_layernorm is IdentityOp) is (not qk_layernorm)
+
+
 @pytest.mark.parametrize("variant", [None, "dsa"])
-@pytest.mark.parametrize("entrypoint", ["hybrid_stack", "attention"])
+@pytest.mark.parametrize("entrypoint", ["hybrid_stack", "dev_hybrid_factory", "attention"])
 def test_dsv4_construction_rejects_incompatible_variant_before_backend_work(variant, entrypoint):
-    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
+    from megatron.core.models.hybrid.hybrid_layer_specs import (
+        hybrid_dsv4_stack_spec,
+        hybrid_stack_spec,
+    )
     from megatron.core.transformer.attention import Attention
     from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
         DSv4HybridSelfAttention,
@@ -402,9 +437,14 @@ def test_dsv4_construction_rejects_incompatible_variant_before_backend_work(vari
         patch.object(Attention, "__init__", return_value=None) as attention_init,
         pytest.raises(ValueError, match="DSv4 attention requires.*dsv4_hybrid"),
     ):
-        if entrypoint == "hybrid_stack":
+        if entrypoint != "attention":
+            stack_spec = (
+                hybrid_dsv4_stack_spec(config)
+                if entrypoint == "dev_hybrid_factory"
+                else hybrid_stack_spec
+            )
             build_module(
-                hybrid_dsv4_stack_spec.submodules.csa_layer.submodules.self_attention,
+                stack_spec.submodules.csa_layer.submodules.self_attention,
                 config=config,
                 layer_number=1,
                 pg_collection=ProcessGroupCollection(),

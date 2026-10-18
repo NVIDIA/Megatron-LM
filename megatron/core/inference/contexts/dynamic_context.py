@@ -1009,8 +1009,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 log_lines += [
                     f"  Mamba prefix cache:",
                     f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
-                    f"    slots:                 {durable_slots}",
-                    f"    scratch:               {get_mem_size_str(scratch_bytes)}",
+                    f"    extraction_scratch:    {scratch_slots} slots "
+                    f"({get_mem_size_str(scratch_bytes)})",
+                    f"    durable_slots:         {durable_slots} "
+                    f"({get_mem_size_str(durable_slots * mamba_bytes_per_req)})",
                     f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
                 ]
 
@@ -2012,7 +2014,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 f"to at least {(scratch_bytes + per_slot_bytes) / 1024**3:.4g} GB, or "
                 f"reduce max_tokens."
             )
-            return
 
         self.mamba_slot_allocator = MambaSlotAllocator(
             context=self,
@@ -2028,9 +2029,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         logging.info(
-            "Mamba prefix cache: %d slots (%.3f GB), per-slot %.1f KB",
+            "Mamba prefix cache: %d durable slots (%.3f GB) + %d scratch slots "
+            "(%.3f GB) = %.3f GB total within %.3f GB budget, per-slot %.1f KB",
             max_slots,
             max_slots * per_slot_bytes / 1024**3,
+            scratch_slots,
+            scratch_bytes / 1024**3,
+            (max_slots + scratch_slots) * per_slot_bytes / 1024**3,
+            mamba_gb,
             per_slot_bytes / 1024,
         )
 

@@ -464,7 +464,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/experts.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads; real BF16 SwiGLU/SiTU op-fuser replay without recompute and explicit unfused checkpoint replay, with fused-recompute rejection checked.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -490,7 +490,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_batch_invariant_unpermute",
         sources=("megatron/core/transformer/moe/batch_invariant.py",),
-        tests=("tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
+            "tests/unit_tests/transformer/moe/test_batch_invariant_unpermute.py",
+        ),
         kind="torch-op",
     ),
     KernelEntry(

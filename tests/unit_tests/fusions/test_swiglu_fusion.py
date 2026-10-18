@@ -175,6 +175,7 @@ def test_clamped_weighted_bias_swiglu(input_dtype):
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_clamped_bias_swiglu_impl(input_dtype, with_bias):
+    """``bias_swiglu_impl`` (with and without bias) must respect clamp_value."""
     clamp_value = 10.0
 
     if input_dtype == torch.float32:
@@ -184,6 +185,7 @@ def test_clamped_bias_swiglu_impl(input_dtype, with_bias):
     else:
         raise ValueError(f"Invalid input dtype: {input_dtype}")
 
+    # Use a large input range so the clamp actually triggers in many positions.
     x = (torch.randn(16, 64, dtype=input_dtype, device="cuda") * 5.0).requires_grad_(True)
     bias = (
         torch.randn(64, dtype=input_dtype, device="cuda").requires_grad_(True)
@@ -192,6 +194,10 @@ def test_clamped_bias_swiglu_impl(input_dtype, with_bias):
     )
     bwd_input = torch.randn(16, 32, dtype=input_dtype, device="cuda")
 
+    # Reference: manual clamp + silu in fp32 then cast back, mirroring ``clamped_swiglu``.
+    # Cast BEFORE the bias-add so the addition happens in fp32 (matches the fused
+    # kernel's internal accumulation); a bf16-precision bias-add can flip clamp
+    # saturation near the boundary and yield 0 grad where fp32 sees a finite slope.
     x_fp32 = x.to(torch.float32)
     x_effective = x_fp32 + bias.to(torch.float32) if with_bias else x_fp32
     y_1, y_2 = torch.chunk(x_effective, 2, -1)
@@ -220,6 +226,7 @@ def test_clamped_bias_swiglu_impl(input_dtype, with_bias):
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_bias_swiglu_impl_clamp_none_matches_unclamped(input_dtype, with_bias):
+    """``clamp_value=None`` (default) must match the legacy unclamped behavior."""
     if input_dtype == torch.float32:
         tols = dict(rtol=1.0e-6, atol=1.0e-6)
     else:

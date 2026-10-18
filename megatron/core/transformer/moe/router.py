@@ -43,8 +43,6 @@ logger = logging.getLogger(__name__)
 
 _HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
 
-_HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
-
 
 @dataclass(frozen=True)
 class _AuxLossGroupConfig:

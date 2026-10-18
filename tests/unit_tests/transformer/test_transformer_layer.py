@@ -1045,6 +1045,7 @@ class TestMHCWithCudaGraphDevFeatures:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _reset_cudagraph_state()
 
     def _create_mhc_layer(self, hidden_size=64, num_streams=4, **extra_config):
         config = _make_mhc_config(hidden_size=hidden_size, num_streams=num_streams, **extra_config)
@@ -1849,6 +1850,7 @@ def test_moe_router_synchronizes_host_outputs_and_reuses_event():
 )
 class TestTransformerLayerCudaGraphManagers:
     def setup_method(self, method):
+        _reset_cudagraph_state()
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)

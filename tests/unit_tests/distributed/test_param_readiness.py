@@ -94,6 +94,20 @@ class TestBucketParamReadiness:
         assert bucket_group.finished == [False]
         assert bucket_group.param_gather_dispatched
 
+    def test_cuda_graph_capture_defers_publication(self, monkeypatch):
+        ddp = _fake_ddp()
+        bucket_group = _FakeBucketGroup()
+        ready_callback = _BucketParamReadyCallback(ddp, bucket_group)
+        capturing = [True]
+        monkeypatch.setattr(ddp_module, "is_graph_capturing", lambda: capturing[0])
+
+        ready_callback()
+        assert bucket_group.finished == []
+
+        capturing[0] = False
+        ready_callback()
+        assert bucket_group.finished == [False]
+
     def test_publishes_once_then_is_idempotent(self):
         ddp = _fake_ddp()
         bucket_group = _FakeBucketGroup()

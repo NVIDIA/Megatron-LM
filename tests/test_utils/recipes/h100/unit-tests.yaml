@@ -171,6 +171,14 @@ products:
         time_limit: [1800]
   # Keep DSv4/DSA compilation and parity checks out of the general transformer
   # bucket's 30-minute budget. More-specific graph/kernel buckets retain ownership.
+  - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_csa_fused_sparse_attention_dev.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+
   - test_case: [tests/unit_tests/transformer/experimental_attention_variant/**/*.py]
     products:
       - environment: [lts, dev]
@@ -180,9 +188,14 @@ products:
         time_limit: [1800]
   # Bound communicator/thread state in the general transformer pytest process.
   # Keep the complete graph and THD workloads in their own latest-suite buckets.
-  - test_case:
-      - tests/unit_tests/transformer/test_cuda_graphs.py
-      - tests/unit_tests/transformer/test_thd_correctness.py
+  - test_case: [tests/unit_tests/transformer/test_cuda_graphs.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/test_thd_correctness.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -340,6 +353,15 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # Keep the complete early-wgrad backend/recompute/update matrix in its own process.
+  # Preserve every case without adding it to the already large general MoE bucket.
+  - test_case: [tests/unit_tests/transformer/moe/test_early_wgrad.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/transformer/moe/**/*.py]
     products:
       - environment: [lts, dev]
@@ -370,9 +392,49 @@ products:
         time_limit: [1800]
   # Isolate the full training/recompute matrices to bound per-bucket runtime
   # and accumulated process-group/allocator state.
-  - test_case:
-      - tests/unit_tests/a2a_overlap/test_fsdp_1f1b_overlap.py
-      - tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py
+  - test_case: [tests/unit_tests/a2a_overlap/test_fsdp_1f1b_overlap.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_layers_1_2.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_layers_1_1.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_padding.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_recompute_uniform.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_recompute_block.py]
     products:
       - environment: [lts, dev]
         tag: [latest]

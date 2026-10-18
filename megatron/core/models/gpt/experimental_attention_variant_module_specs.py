@@ -76,10 +76,12 @@ def get_gated_delta_net_module_spec(
             metainfo={"fuse_input_layernorm": False},
         )
     else:
+        # gdn2 reuses the GDN submodules and spec structure with the GatedDeltaNet2 module.
+        gdn_module = (
+            GatedDeltaNet2 if config.experimental_attention_variant == "gdn2" else GatedDeltaNet
+        )
         attention = ModuleSpec(
-            module=(
-                GatedDeltaNet2 if config.experimental_attention_variant == "gdn2" else GatedDeltaNet
-            ),
+            module=gdn_module,
             submodules=GatedDeltaNetSubmodules(
                 in_proj=backend.column_parallel_layer_norm_linear(),
                 out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),

@@ -114,6 +114,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     # without consuming a draw.
     loader_generator = torch.Generator()
     loader_generator.manual_seed(torch.initial_seed())
+    if args.sequence_packing_scheduler is not None and args.num_workers > 0 and not is_eval:
+        # Keep a full next global batch in flight for packing schedulers.
+        items_per_step = args.global_batch_size // (
+            micro_batch_size * mpu.get_data_parallel_world_size()
+        )
+        extra_kwargs["prefetch_factor"] = max(2, -(-items_per_step // args.num_workers))
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,

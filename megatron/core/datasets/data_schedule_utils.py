@@ -714,9 +714,26 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
         dp_group: The data parallel group.
 
     Returns:
-        batch: The batch.
-        global_id_seqlens: The global sequence lengths.
-        global_ids_this_rank: The global IDs locally present on this rank.
+        batch (List[Dict[str, torch.Tensor]]): The sub-samples pulled from this rank's
+            ``data_iterator`` over ``num_microbatches`` steps, flattened and unpacked
+            (see :func:`_unpack_batch`). Every dict carries ``tokens`` / ``labels`` /
+            ``loss_mask`` / ``position_ids`` plus the ``original_seq_len`` and
+            ``padded_seq_len`` scalars used for scheduling.
+        global_id_seqlens (List[Tuple[int, int]]): ``(global_id, padded_seq_len)`` for
+            every sub-sample in the DP group, ordered by DP rank and then by local
+            index. Identical on all ranks; this is the scheduler's input.
+        global_ids_this_rank (torch.Tensor): int32 CUDA tensor holding the global IDs of
+            the sub-samples loaded by this rank, i.e. ``batch[i]`` has global ID
+            ``global_ids_this_rank[i]``.
+        offsets (torch.Tensor): int32 CPU tensor of shape ``[dp_size + 1]`` with the
+            exclusive prefix sum of the per-rank sub-sample counts, so DP rank ``r`` owns
+            global IDs ``offsets[r]:offsets[r + 1]``. Used by
+            :func:`reroute_samples_to_dcp_ranks` to map a global ID back to its source
+            rank.
+        seqlens_gathered (List[int]): Padded sequence length of every sub-sample in the
+            DP group, indexed by global ID (``seqlens_gathered[gid]`` equals
+            ``global_id_seqlens[gid][1]``). Handy for global-batch token counts such as
+            the FLOPs accounting.
     """
 
     batch_list = [next(data_iterator) for _ in range(num_microbatches)]

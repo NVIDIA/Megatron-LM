@@ -338,7 +338,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.num_residual_streams = config.num_residual_streams
         self.mhc_num_residual_streams = config.mhc_num_residual_streams
         self.mhc_recompute_enabled = (
-            config.enable_mhc_connections
+            config.enable_hyper_connections
             and config.recompute_granularity == 'selective'
             and 'mhc' in config.recompute_modules
         )

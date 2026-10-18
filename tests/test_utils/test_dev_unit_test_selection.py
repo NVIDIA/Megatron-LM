@@ -19,6 +19,28 @@ SPEC.loader.exec_module(finder)
 
 
 @pytest.mark.parametrize("platform", ["h100", "gb200"])
+def test_ci_parser_preserves_every_declared_unit_bucket(platform):
+    recipe_path = ROOT / f"tests/test_utils/recipes/{platform}/unit-tests.yaml"
+    recipe = yaml.safe_load(recipe_path.read_text())
+    expected = Counter(bucket for entry in recipe["products"] for bucket in entry["test_case"])
+    parser_spec = importlib.util.spec_from_file_location(
+        "unit_bucket_recipe_parser", ROOT / "tests/test_utils/python_scripts/recipe_parser.py"
+    )
+    recipe_parser = importlib.util.module_from_spec(parser_spec)
+    parser_spec.loader.exec_module(recipe_parser)
+
+    workloads = recipe_parser.load_and_flatten(str(recipe_path))
+    actual = Counter(
+        workload.spec["test_case"]
+        for workload in workloads
+        if workload.spec["environment"] == "dev"
+        and workload.spec["tag"] == "latest"
+        and workload.spec["scope"] == "unit-tests"
+    )
+    assert actual == expected
+
+
+@pytest.mark.parametrize("platform", ["h100", "gb200"])
 def test_every_unit_file_has_exactly_one_platform_bucket(monkeypatch, capsys, platform):
     monkeypatch.chdir(ROOT)
     recipe = yaml.safe_load(

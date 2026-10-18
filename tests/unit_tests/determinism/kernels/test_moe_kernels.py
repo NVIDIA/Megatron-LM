@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.activations import squared_relu
+from megatron.core.activations import situlu, squared_relu
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
@@ -516,6 +516,74 @@ class TestMoEModules:
             contention=True,
             what="TEGroupedMLP",
         )
+
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.14.0"), reason="TE grouped op fuser unavailable"
+    )
+    @pytest.mark.parametrize("activation_recompute", [False, True])
+    @pytest.mark.parametrize("activation_func", [F.silu, situlu], ids=["swiglu", "situ-glu"])
+    def test_te_grouped_mlp_glu_recompute_contract_replays(
+        self, activation_recompute, activation_func
+    ):
+        """Replay supported BF16 paths and reject unsupported fused GLU recompute early."""
+        from transformer_engine.pytorch import ops as te_ops
+
+        op_name = "ScaledSiTUGLU" if activation_func is situlu else "ScaledSwiGLU"
+        if not activation_recompute and not hasattr(te_ops, op_name):
+            pytest.skip(f"Installed TE lacks {op_name}")
+        self._init()
+        seeded()
+        config_kwargs = dict(
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_moe_experts=2,
+            # Exercise TE op fusion or the checkpointed torch activation, not bias fusion.
+            bias_activation_fusion=False,
+            use_cpu_initialization=False,
+            gradient_accumulation_fusion=False,
+            activation_func=activation_func,
+            recompute_granularity="selective" if activation_recompute else None,
+            recompute_modules=["moe_act"] if activation_recompute else [],
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=2, moe_grouped_gemm=True)
+        factory = get_submodules(spec.submodules.mlp).experts
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        if activation_recompute:
+            unsupported_config = _moe_config(use_transformer_engine_op_fuser=True, **config_kwargs)
+            with pytest.raises(AssertionError, match="Fused GroupedMLP is not supported"):
+                factory(num_local_experts=2, config=unsupported_config, pg_collection=pg_collection)
+        config = _moe_config(
+            use_transformer_engine_op_fuser=not activation_recompute, **config_kwargs
+        )
+        experts = factory(num_local_experts=2, config=config, pg_collection=pg_collection).cuda()
+        assert isinstance(experts, TEGroupedMLP)
+        assert experts._with_fused_impl is (not activation_recompute)
+        assert experts.activation_recompute is activation_recompute
+        params = dict(experts.named_parameters())
+        assert params and all(param.dtype == torch.bfloat16 for param in params.values())
+        tokens_per_expert = torch.tensor(
+            [32, 64], device="cpu" if activation_recompute else "cuda", dtype=torch.int64
+        )
+        hidden = torch.randn(96, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs = torch.rand(96, device="cuda", requires_grad=True)
+        with deterministic_algorithms(True):
+            outputs, grads = assert_module_replays_bit_exact(
+                experts,
+                (hidden, tokens_per_expert, probs),
+                replays=3,
+                contention=True,
+                what=f"TE grouped MLP[{op_name}, unfused_recompute={activation_recompute}]",
+            )
+        if activation_recompute:
+            assert experts._fused_ops is None
+            assert experts.activation_checkpoint is not None
+        else:
+            assert experts._fused_ops is not None and len(experts._fused_ops) == 1
+            assert isinstance(experts._fused_ops[0], te_ops.Sequential)
+        assert {f"chunk0.{name}" for name in params} <= grads.keys()
+        assert {"in[0]", "in[2]"} <= grads.keys(), "input and router-probability gradients required"
+        for tensor in (*outputs.values(), *grads.values()):
+            assert torch.isfinite(tensor).all()
 
     @pytest.mark.skipif(
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,

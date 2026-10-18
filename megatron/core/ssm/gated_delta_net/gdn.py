@@ -690,7 +690,21 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                     chunkwise_cp_context,
                 )
 
-            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+            if self.config.fp8 or self.config.fp4:
+                # Import here to avoid a circular dependency.
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                out, out_bias = te_checkpoint(
+                    _checkpointed_compute,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                )
+            else:
+                out, out_bias = tensor_parallel.checkpoint(
+                    _checkpointed_compute, False, hidden_states
+                )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,

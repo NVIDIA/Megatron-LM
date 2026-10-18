@@ -378,6 +378,9 @@ class TransformerConfig(ModelParallelConfig):
     """Type of experimental attention variant to use.
 
     ``gdn`` and ``kda`` select Gated DeltaNet and Kimi Delta Attention, respectively.
+    ``gdn2`` selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
+    channel-wise decay, erase and write gates; it requires flash-linear-attention >= 0.5.1.
+    Both gdn and gdn2 also select the layer built for the hybrid layer pattern symbol 'G'.
     ``gated_delta_net`` is a deprecated compatibility alias for ``gdn`` and is normalized in
     ``__post_init__`` with a ``DeprecationWarning``.
     """
@@ -420,6 +423,15 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
     """Precision used only by the fused compact DSA indexer forward and Top-K."""
+
+    dsa_compact_indexer_workspace_sharing: bool = True
+    """Under CUDA graphs the fused compact DSA indexer keeps a persistent workspace per static
+    geometry (MXFP8 q/k quantization destinations, packed scales, candidate offsets) that has to be
+    prepared outside capture. When True, every CSA layer built from this config shares one such
+    workspace per geometry and balanced-indexer slot instead of owning its own copy: the layers of
+    a graph run serially on one stream and nothing in the workspace outlives the indexer dispatch
+    that fills it, so sharing only removes duplicates (one workspace per layer costs ~7 GiB per
+    rank on DSv4 at 16K tokens). False restores per-layer workspaces."""
 
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] | None = None
     """Optional fused DSA kernel backend.
@@ -775,8 +787,11 @@ class TransformerConfig(ModelParallelConfig):
             out_proj). Requires a GDN-family experimental attention variant or a hybrid model.
     "gdn_norm_out": recompute gated output normalization and layout restoration for
             Gated DeltaNet-family layers, including GatedDeltaNet and KDA.
-    "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use
-    output-discarding checkpointing,
+    "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
+    preprocessing.
+    "gdp_qkv": recompute the GatedDeltaProduct causal conv and QKV preparation.
+    "moe_act", "layernorm", "mla_up_proj", "mhc", "gdn_norm_out", "gdp_in_proj", and
+    "gdp_qkv" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
     "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
@@ -1115,12 +1130,6 @@ class TransformerConfig(ModelParallelConfig):
     Required when ``moe_num_hash_layers > 0``."""
 
     use_grouped_gemm_for_dense_mlp: bool = False
-    """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
-    ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
-    Requires ``use_te_op_fuser=True`` and SwiGLU activation.
-    """
-
-    use_grouped_gemm_for_dense_mlp: bool = False
     """Alias of ``dense_grouped_gemm``. Use GroupedLinear(num_groups=1) for dense MLP to
     trigger the ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
@@ -1209,9 +1218,12 @@ class TransformerConfig(ModelParallelConfig):
     will be dropped. The default is None."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens
-    exceeding this budget will be dropped. None means no token will be dropped.
-    The default is None."""
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank, i.e. the
+    per-rank token budget. None means no token will be dropped. The default is None.
+    With the 'hybridep' backend, tokens exceeding this budget are dropped. With the 'ncclep'
+    backend, setting it selects static shapes (fixed receive buffer, CUDA-graph capturable) and
+    leaving it None selects eager mode (receive buffer sized per step from the received-token
+    count)."""
 
     moe_pad_expert_input_to_capacity: bool = False
     """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match
@@ -1523,34 +1535,26 @@ class TransformerConfig(ModelParallelConfig):
     """Initial value of Gating Factor (alpha in paper)."""
 
     use_fused_mhc: bool = False
-    """Use unified fused kernels for mHC operations.
+    """Use fused kernels for mHC operations when supported.
 
-    When True, attempts to replace the reference mHC modules (SinkhornKnopp,
-    H_aggregate, H_post_bda, ProjRms) with fused/autograd implementations for
-    better performance on supported GPUs.  Backend selection is internal and
-    op-specific: Triton for Sinkhorn and H_post_bda backward when available,
-    cuTile for the remaining fused kernels when available, then native torch
-    fallback. If every mHC operation uses the native torch fallback,
-    use_fused_mhc remains enabled and a rank-0 warning is emitted. The all-native
-    fallback is functionally equivalent, but may not provide fused backend
-    performance benefits.
+    With the default ``auto`` backend policy, selection is operation-specific
+    and unavailable accelerated implementations fall back to native torch.
+    Set ``mhc_fused_backend`` to request an explicit backend policy.
     """
 
     mhc_recompute_layer_num: Optional[int] = None
-    """Number of layers in each mHC recompute group.
+    """Number of layers per MHC recompute block.
 
-    Layers are grouped in their local transformer-block order. The last layer in each group leaves
-    its final MLP BDA output uncheckpointed and closes the current ``MHCCheckpointManager``; a new
-    manager is created for the next group.
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new CheckpointWithoutOutputManager is created for subsequent layers
 
-    In the standard forward path, the group-ending layer registers a unified recompute hook on its
-    MLP BDA output. In the fine-grained expert-parallel overlap schedule, the group outputs are
-    discarded explicitly and a compute-stream schedule node replays the group before its backward
-    computation.
+    If None, all layers in the transformer block share a single recompute block.
 
-    If ``None``, all local layers in the transformer block share one recompute group. The value must
-    be a positive integer when set.
-    """
+    Must be a positive integer when set."""
 
     mhc_recompute_attn_cuda_graph_split: bool = False
     """Opt into the attention-only Transformer Engine CUDA Graph split for mHC recompute.
@@ -1588,20 +1592,6 @@ class TransformerConfig(ModelParallelConfig):
     mhc_num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
-    mhc_sinkhorn_iterations: int = 20
-    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
-
-    mhc_init_gating_factor: float = 0.01
-    """Initial value of Gating Factor (alpha in paper)."""
-
-    use_fused_mhc: bool = False
-    """Use fused kernels for mHC operations when supported.
-
-    With the default ``auto`` backend policy, selection is operation-specific
-    and unavailable accelerated implementations fall back to native torch.
-    Set ``mhc_fused_backend`` to request an explicit backend policy.
-    """
-
     mhc_fused_backend: Literal["auto", "native", "triton", "cutile"] = "auto"
     """Backend policy for fused mHC operations.
 
@@ -1610,20 +1600,6 @@ class TransformerConfig(ModelParallelConfig):
     never select a different accelerated backend. Operations without an
     implementation in the selected backend retain their native implementation.
     """
-
-    mhc_recompute_layer_num: Optional[int] = None
-    """Number of layers per MHC recompute block.
-
-    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
-    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
-    layer in the transformer block) will:
-    - NOT checkpoint its final MLP BDA
-    - Register the unified recompute hook on its MLP BDA output
-    - A new CheckpointWithoutOutputManager is created for subsequent layers
-
-    If None, all layers in the transformer block share a single recompute block.
-
-    Must be a positive integer when set."""
 
     ####################
     # Wide Residual Configuration
@@ -2393,6 +2369,12 @@ class TransformerConfig(ModelParallelConfig):
                         "cp_partition_mode='contiguous' is incompatible with "
                         "GDN-family linear_cp_mode='headwise'."
                     )
+                if self.experimental_attention_variant == "gdn2":
+                    # GDN2 always runs headwise CP; see linear_cp_mode.
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is incompatible with "
+                        "experimental_attention_variant='gdn2', which supports only headwise CP."
+                    )
             elif self.cp_partition_mode == "zigzag":
                 if self.experimental_attention_variant == "dsv4_hybrid":
                     raise ValueError(
@@ -2561,6 +2543,12 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if has_context_parallelism:
+                if self.experimental_attention_variant == "gdn2" and self.dynamic_context_parallel:
+                    raise ValueError(
+                        "experimental_attention_variant='gdn2' does not support "
+                        "dynamic_context_parallel=True: GDN2 shards heads over the static CP "
+                        "group and does not follow the per-microbatch CP group."
+                    )
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
@@ -2569,17 +2557,22 @@ class TransformerConfig(ModelParallelConfig):
                         "chunk numerics."
                     )
             # Check tensor parallelism compatibility. Headwise CP splits linear-attention heads
-            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank.
+            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank. GDN2 has no
+            # chunkwise path and always splits its heads across CP ranks.
             linear_head_parallel_size = self.tensor_model_parallel_size
-            if self.context_parallel_size > 1 and self.linear_cp_mode == "headwise":
+            if self.context_parallel_size > 1 and (
+                self.linear_cp_mode == "headwise" or self.experimental_attention_variant == "gdn2"
+            ):
                 linear_head_parallel_size *= self.context_parallel_size
             assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
-                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
+                f"and {self.experimental_attention_variant=}."
             )
             assert self.linear_num_value_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_value_heads=} must be a multiple of "
-                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
+                f"and {self.experimental_attention_variant=}."
             )
         if self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)

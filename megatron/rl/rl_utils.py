@@ -913,6 +913,14 @@ def colocated_inference(
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
                     ]
+                    # In deterministic mode, sort rollouts by problem_id for consistent ordering
+                    # regardless of completion order due to system timing jitter.
+                    if torch.are_deterministic_algorithms_enabled():
+                        rollouts.sort(
+                            key=lambda group: (
+                                group[0].problem_id if group and group[0].problem_id else ""
+                            )
+                        )
                     if not cfg.rl.rl_partial_rollouts:
                         _ROLLOUT_PIPELINE.assert_no_inflight_rollouts()
                     # Record consumption for every group handed to the trainer. On a
@@ -2147,6 +2155,7 @@ def maybe_log_training_metrics(
         payload = [pipeline_metrics]
         dist.broadcast_object_list(payload, src=0)
         pipeline_metrics = payload[0]
+
     if not wandb_writer:
         return
 

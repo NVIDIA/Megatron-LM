@@ -783,6 +783,7 @@ def _install_fake_te_ops_modules(
     ops = ModuleType("transformer_engine.pytorch.ops")
     ops.GroupedLinear = fake_te.pytorch.GroupedLinear
     ops.ScaledSwiGLU = fake_te.pytorch.ops.ScaledSwiGLU
+    ops.ScaledSiTUGLU = fake_te.pytorch.ops.ScaledSiTUGLU
     if include_clamped_qgeglu:
         ops.ScaledClampedQGeGLU = fake_te.pytorch.ops.ScaledClampedQGeGLU
     if include_scaled_srelu:
@@ -858,13 +859,13 @@ def test_make_fused_ops_selects_scaled_situ_glu(monkeypatch):
 
 @pytest.mark.parametrize(
     ("activation_func", "activation_func_clamp_value", "expected"),
-    [(F.silu, None, True), (F.silu, 7.0, True), (situlu, None, False), (quick_gelu, None, True)],
+    [(F.silu, None, False), (F.silu, 7.0, False), (situlu, None, False), (quick_gelu, None, False)],
     ids=("swiglu", "clamped-swiglu", "situ-glu", "quick-geglu"),
 )
 def test_is_fused_impl_supported_checks_scaled_glu_activation_recompute_capability(
     monkeypatch, activation_func, activation_func_clamp_value, expected
 ):
-    """Accept recompute only when the selected TE scaled GLU op exposes its control."""
+    """A named recompute keyword does not imply that a TE scaled GLU implements it."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
@@ -878,9 +879,83 @@ def test_is_fused_impl_supported_checks_scaled_glu_activation_recompute_capabili
         activation_func_clamp_value=activation_func_clamp_value,
         gated_linear_unit=True,
     )
+    assert module._is_fused_impl_supported() is True
     module.activation_recompute = True
 
     assert module._is_fused_impl_supported() is expected
+
+
+@pytest.mark.parametrize(
+    ("activation_func", "clamp", "op_name"),
+    [
+        (F.silu, None, "ScaledSwiGLU"),
+        (F.silu, 7.0, "ScaledClampedQGeGLU"),
+        (situlu, None, "ScaledSiTUGLU"),
+        (quick_gelu, None, "ScaledClampedQGeGLU"),
+    ],
+    ids=("swiglu", "clamped-swiglu", "situ-glu", "quick-geglu"),
+)
+def test_scaled_glu_without_recompute_control_rejects_fused_checkpointing(
+    monkeypatch, activation_func, clamp, op_name
+):
+    class LegacyScaledGLU(torch.nn.Module):
+        def __init__(self, glu_interleave_size):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    setattr(fake_te.pytorch.ops, op_name, LegacyScaledGLU)
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear,
+        activation_func=activation_func,
+        activation_func_clamp_value=clamp,
+        gated_linear_unit=True,
+    )
+
+    assert module._is_fused_impl_supported() is True
+    module.activation_recompute = True
+    assert module._is_fused_impl_supported() is False
+
+
+def test_situ_glu_reserved_recompute_control_is_not_a_support_signal(monkeypatch):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+
+    class ReservedRecomputeSiTUGLU(fake_te.pytorch.ops.ScaledSiTUGLU):
+        def __init__(self, glu_interleave_size, *, beta1, beta2, activation_recompute_in_mlp=False):
+            super().__init__(glu_interleave_size, beta1=beta1, beta2=beta2)
+            if activation_recompute_in_mlp:
+                raise ValueError("SiTU-GLU does not support activation recomputation")
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
+
+    fake_te.pytorch.ops.ScaledSiTUGLU = ReservedRecomputeSiTUGLU
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear, activation_func=situlu, gated_linear_unit=True
+    )
+
+    assert module._is_fused_impl_supported() is True
+    for linear in (module.linear_fc1, module.linear_fc2):
+        linear.weight0 = torch.nn.Parameter(torch.ones(linear.out_features, linear.in_features))
+        linear.weight1 = torch.nn.Parameter(torch.ones(linear.out_features, linear.in_features))
+
+    activation = module._make_fused_ops()[1]
+    assert isinstance(activation, ReservedRecomputeSiTUGLU)
+    assert activation.activation_recompute_in_mlp is False
+    assert activation.beta1 == 4.0
+    assert activation.beta2 == 25.0
+
+    module.activation_recompute = True
+    assert module._is_fused_impl_supported() is False
+    # The factory still forwards the control; the support gate must stop real callers first.
+    with pytest.raises(ValueError, match="does not support activation recomputation"):
+        module._make_fused_ops()
 
 
 def test_is_fused_impl_supported_allows_te_ops_without_cutedsl(monkeypatch):

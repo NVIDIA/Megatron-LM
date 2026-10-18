@@ -543,25 +543,6 @@ def compute_cp_indexer_topk(
     return topk, logical_indexer_layout, compact_predict
 
 
-def _thd_cp_position_ids(
-    cu_seqlens_padded: torch.Tensor, global_start: int, local_rows: int
-) -> torch.Tensor:
-    """Map a consecutive CP row interval to positions within packed sequences."""
-    global_rows = torch.arange(
-        int(global_start),
-        int(global_start) + int(local_rows),
-        dtype=cu_seqlens_padded.dtype,
-        device=cu_seqlens_padded.device,
-    )
-    sequence_ids = torch.bucketize(
-        global_rows, cu_seqlens_padded[1:], out_int32=True, right=True
-    ).clamp_max(cu_seqlens_padded.shape[0] - 2)
-    sequence_starts = cu_seqlens_padded[sequence_ids]
-    sequence_ends = cu_seqlens_padded[sequence_ids + 1]
-    valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
-    return torch.where(valid_rows, global_rows - sequence_starts, 0)
-
-
 def validate_packed_inputs(packed_seq_params, config, cp_group):
     """Validate the static packed contract without modifying any process group.
 

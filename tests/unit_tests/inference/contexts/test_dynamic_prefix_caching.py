@@ -1962,8 +1962,11 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         assert mixed_slots[0] == pre_slot
         assert msa3.free_count == free_before3 - 2  # only 2 new
 
-        # Eviction: exhaust free pool, verify eviction fires and returns valid slots
-        ctx4 = self._mctx(prefix_caching_mamba_gb=0.001)
+        # Eviction: exhaust free pool, verify eviction fires and returns valid slots.
+        # Budget must cover the CUDA-graph extraction scratch (3 * max_requests
+        # slots) plus the durable cache; a budget too small to fit the scratch now
+        # raises (see test_mamba_cache_budget_too_small_raises).
+        ctx4 = self._mctx(prefix_caching_mamba_gb=0.01)
         msa4 = ctx4.mamba_slot_allocator
         total_slots = msa4.max_slots
         ctx4.add_request(self._req(ctx4, self._prompt(bs * 4)))

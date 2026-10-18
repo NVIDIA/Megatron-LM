@@ -2,6 +2,7 @@
 
 import pytest
 import torch.nn.functional as F
+from torch._inductor import config as inductor_config
 
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
@@ -10,6 +11,16 @@ from megatron.core.ssm.gated_delta_net import HAVE_FLA, HAVE_FLA_GDN2
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.ssm.gated_delta_net_test_cases import GatedDeltaNetModuleTestCases
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
+
+
+@pytest.fixture(scope="module", autouse=True)
+def synchronous_inductor_compilation():
+    """Keep GDN2 shape-matrix compilation in-process."""
+    # Late THD shapes can stall an Inductor compiler-worker future on one rank,
+    # leaving peers waiting in collectives. Compile synchronously without
+    # disabling torch.compile or changing the numerical checks.
+    with inductor_config.patch(compile_threads=1):
+        yield
 
 
 @pytest.mark.parametrize("use_gdn2", [True], ids=["gdn2"])

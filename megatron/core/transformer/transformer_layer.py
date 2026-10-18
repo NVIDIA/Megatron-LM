@@ -1456,7 +1456,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         Picks between the recompute (te_checkpoint / tensor_parallel.checkpoint),
         chunked-prefill, and direct-call paths. Shared by both
         :class:`TransformerLayer` and :class:`HyperConnectionTransformerLayer` so
-        the MLP-call branching stays in one place.
+        the MLP-call branching stays in one place. ``input_ids`` (hash-based routing)
+        and ``packed_seq_params`` are forwarded to MoE layers only.
 
         Returns:
             ``mlp_output_with_bias``: tuple of (mlp_output, mlp_bias).
@@ -2814,19 +2815,23 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 
-        hidden_states, context = self._forward_attention(
-            *args, mhc_recompute_manager=mhc_recompute_manager, **kwargs
-        )
+        with _otel_managed_span(
+            'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
+        ):
+            hidden_states, context = self._forward_attention(
+                *args, mhc_recompute_manager=mhc_recompute_manager, **kwargs
+            )
 
-        output = self._forward_mlp(
-            hidden_states,
-            kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
-            input_ids=kwargs.get("input_ids", None),
-            packed_seq_params=kwargs.get("packed_seq_params", None),
-            mhc_recompute_manager=mhc_recompute_manager,
-        )
-        return output, context
+            with _otel_managed_span('layer', 'megatron.layer.mlp'):
+                output = self._forward_mlp(
+                    hidden_states,
+                    kwargs.get("inference_context", None),
+                    padding_mask=kwargs.get("padding_mask", None),
+                    input_ids=kwargs.get("input_ids", None),
+                    packed_seq_params=kwargs.get("packed_seq_params", None),
+                    mhc_recompute_manager=mhc_recompute_manager,
+                )
+            return output, context
 
     def _forward_mhc_attention_cuda_graph_consumer(
         self,

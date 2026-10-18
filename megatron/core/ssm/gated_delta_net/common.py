@@ -514,12 +514,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         Prepare all gated delta rule kernel inputs.
 
         Fuses split, reshape, L2 norm, decay/gate activations, repeat_interleave, and
-        contiguous operations. ``gate_feats`` holds the in_proj sections after qkv
-        and gate, which ``_compute_gates`` turns into the decay and gating tensors.
+        contiguous operations. ``gate_feats`` holds the variant-specific in_proj
+        sections, which ``_compute_gates`` turns into the decay and gating tensors.
 
         Returns:
             (dict[str, Tensor]): Kernel inputs keyed by kernel argument name (``q``,
-            ``k``, ``v``, ``g``, and ``beta``), and the output
+            ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
         cp_size = self.cp_size if cp_size_headwise is None else cp_size_headwise
@@ -571,18 +571,19 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         *gate_feats: tuple[torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
-        Compute the log-decay ``g`` and remaining kernel inputs.
+        Compute the log-decay ``g`` and the variant-specific kernel inputs.
 
         Args:
             A_log_local_cp: CP-local slice of ``A_log``.
             dt_bias_local_cp: CP-local slice of ``dt_bias``.
             batch: Batch size.
             seq_len: Sequence length.
-            gate_feats: The in_proj output sections after the qkv and output-gate sections.
+            gate_feats: The variant-specific in_proj output sections (everything after
+                the qkv and output-gate sections, in ``feat_dim_split`` order).
 
         Returns:
             (tuple[Tensor, dict[str, Tensor]]): The log-decay ``g`` and a dict of the
-            remaining kernel inputs keyed by kernel argument name.
+            remaining variant-specific kernel inputs keyed by kernel argument name.
         """
         raise NotImplementedError
 

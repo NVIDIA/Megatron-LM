@@ -68,7 +68,7 @@ def _require_fused():
 # Eager reference: verbatim replica of the region of ``Compressor._forward_thd``
 # (non-pre-grouped THD path) that the fused dispatch replaces, from the projection
 # outputs (kv, score) to the pre-RMSNorm pooled output. ``mode`` selects the
-# numerics: "upstream" reproduces the current eager code exactly (softmax weights
+# numerics: "upstream" preserves the historical eager control (softmax weights
 # rounded to bf16, bf16 multiply); "fp32" keeps all intermediates fp32 with a
 # single final bf16 rounding (the fused kernels' numerics). The overlap-window
 # transform is the real upstream implementation.

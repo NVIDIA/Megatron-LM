@@ -355,6 +355,8 @@ class HyperConnectionModule(MegatronModule):
 
     def _init_weights(self) -> None:
         """Initialize weights for stable training."""
+        # Honor the mcore convention: skip weight init when the caller will load a
+        # checkpoint over these parameters anyway (e.g. meta-device construction).
         if self.config.perform_initialization:
             nn.init.xavier_uniform_(self.mapping_proj.weight)
 

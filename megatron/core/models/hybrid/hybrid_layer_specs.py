@@ -669,5 +669,55 @@ mamba_inference_stack_spec = hybrid_inference_stack_spec
 gdp_stack_spec = gated_delta_product_stack_spec
 gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
 
-# Preserve the existing --spec import path; C/H/W use the standard static stack spec.
-hybrid_dsv4_stack_spec = hybrid_stack_spec
+
+def hybrid_dsv4_stack_spec(config):
+    """Config-aware hybrid stack spec whose ``D`` (DS_ATTENTION) layer runs the DSv4
+    ``CompressedSparseAttention`` (CSA/HCA + ``CSAIndexer``), identical to the GPT
+    ``dsv4_hybrid`` path, instead of the legacy ``DSAttention``.
+
+    The default ``hybrid_stack_spec`` wires the ``D`` layer to ``AbsorbedMLASelfAttention +
+    DSAttention`` (DS3.2-style sparse attention with no CSA/HCA compression). To run real
+    DSv4 on HybridModel — and to be numerically equivalent to a GPT ``dsv4_hybrid``
+    attention layer — we reuse GPT's own ``get_dsv4_hybrid_module_spec_for_backend``
+    (which is config-aware, e.g. picks the qk-layernorm form from ``config``) so the two
+    model paths build the *same* attention module. Selected via
+    ``--spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_dsv4_stack_spec``;
+    ``hybrid_builder`` invokes this function with ``config`` when the spec is callable.
+    """
+    import dataclasses
+
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        _get_backend_spec_provider,
+        get_dsv4_hybrid_module_spec_for_backend,
+    )
+
+    backend = _get_backend_spec_provider(config)
+    dsv4_attention = get_dsv4_hybrid_module_spec_for_backend(config, backend)
+
+    def _wrap_dsv4_layer(compress_ratio=None):
+        # Wrap the DSv4 attention in a hybrid TransformerLayer. When compress_ratio is given
+        # (the 'C'/'H'/'W' layer symbols), bake it into the attention params so the layer uses a
+        # fixed CSA(4)/HCA(128)/window-only(0) ratio regardless of csa_compress_ratios; otherwise
+        # the layer reads its ratio from config.csa_compress_ratios (array-driven 'D' / GPT-parity
+        # path). compress_ratio=0 builds neither the compressor nor the top-k indexer, so the
+        # 'W' layer reuses the entire CSA/HCA code path as pure sliding-window attention.
+        attn = dsv4_attention
+        if compress_ratio is not None:
+            attn = dataclasses.replace(
+                dsv4_attention, params={**dsv4_attention.params, "compress_ratio": compress_ratio}
+            )
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm, self_attention=attn, self_attn_bda=get_bias_dropout_add
+            ),
+        )
+
+    submodules = dataclasses.replace(
+        hybrid_stack_spec.submodules,
+        dsa_layer=_wrap_dsv4_layer(),  # 'D': array-driven (or window) DSv4 attention
+        csa_layer=_wrap_dsv4_layer(compress_ratio=4),  # 'C': CSA
+        hca_layer=_wrap_dsv4_layer(compress_ratio=128),  # 'H': HCA
+        window_layer=_wrap_dsv4_layer(compress_ratio=0),  # 'W': sliding-window-only
+    )
+    return ModuleSpec(module=HybridStack, submodules=submodules)

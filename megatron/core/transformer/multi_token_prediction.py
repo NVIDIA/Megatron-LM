@@ -2627,8 +2627,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 name=(name + ".eh_proj") if name is not None else None,
             )
-            self.e_proj = None
-            self.h_proj = None
             # eh_proj's input all-gather reuses the shared "tp" symmetric buffer right
             # after the preceding layer's all-gather (the fused rs-add-norm-ag terminates
             # with one, as does the previous MTP step's output all-gather), so it must
@@ -2636,6 +2634,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             # this all-gather; other eh_proj impls have no such buffer to guard.
             if is_inference_column_parallel_linear(self.eh_proj):
                 self.eh_proj.set_barrier_before_all_gather(True)
+            self.e_proj = None
+            self.h_proj = None
 
         # Build inner layers: two possible paths
         # 1. Hybrid path: use HybridStack for hybrid pattern support

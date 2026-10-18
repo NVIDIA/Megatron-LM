@@ -18,6 +18,45 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teac
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA adapter padding requires a GPU")
+@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+def test_sparse_teacher_pads_topk_and_restores_logical_width(monkeypatch, layout):
+    query = torch.randn(3, 2, 8, device="cuda")
+    key = torch.randn(4, 8, device="cuda")
+    lse = torch.zeros(3, 2, device="cuda")
+    indices = torch.tensor([[0, 1, -1], [1, 2, 3], [-1, -1, -1]], device="cuda", dtype=torch.int32)
+    expected_indices = indices.clone()
+    seen = {}
+
+    def score(q, k, denominator, topk, scale, **kwargs):
+        del q, k, denominator, scale
+        seen['indices'] = topk.clone()
+        seen['global'] = kwargs['topk_indices_global']
+        return {'target': torch.arange(8, device="cuda").float().expand(1, 3, 8)}
+
+    monkeypatch.setattr(fused_csa, '_ensure_dsa_namespace', lambda: None)
+    monkeypatch.setattr(
+        fused_csa, '_DSA', SimpleNamespace(sparse_attn_score_recompute_wrapper=score)
+    )
+    monkeypatch.setattr(fused_csa, '_get_score_recompute_topk_alignment', lambda: 8)
+    if layout == "sbhd":
+        query, key, lse, indices = (tensor.unsqueeze(0) for tensor in (query, key, lse, indices))
+    target = fused_csa._compute_attn_target(
+        query, key, lse, indices, 0.5, 2, topk_indices_global=layout == "thd"
+    )
+
+    assert seen['indices'].shape == (1, 3, 8)
+    assert torch.equal(seen['indices'][0, :, :3], expected_indices)
+    assert torch.all(seen['indices'][..., 3:] == -1)
+    assert seen['global'] == (layout == "thd")
+    assert torch.equal(indices.reshape(3, 3), expected_indices)
+    expected = torch.arange(3, device="cuda").float().expand(3, 3)
+    if layout == "sbhd":
+        expected = expected.unsqueeze(0)
+    assert torch.equal(target, expected)
+    assert target.is_contiguous()
+
+
 def test_local_to_global_flat_preserves_sbhd_row_order_and_invalid_entries():
     local = torch.tensor([[[0, -1], [2, 3], [4, -1]], [[1, 2], [0, -1], [3, 4]]], dtype=torch.int64)
 

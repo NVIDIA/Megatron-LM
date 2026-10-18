@@ -3593,8 +3593,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Each TP rank writes one row, but block graphs retain a max-token-sized
         # allocation. Poisoning the tail mirrors stale data from an earlier replay.
-        context.mtp_decoder_hidden_states = torch.full((8, 1, 32), -1.0, device='cuda')
-        context.mtp_decoder_hidden_states[0] = parallel_state.get_tensor_model_parallel_rank()
+        hidden_states_cache = torch.full((8, 1, 32), -1.0, device='cuda')
+        hidden_states_cache[0] = parallel_state.get_tensor_model_parallel_rank()
+        context.mtp_decoder_hidden_states = hidden_states_cache
 
         gathered_inputs = []
 
@@ -3824,6 +3825,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.active_request_metadata["top_k"][:active_request_count] = 1
         ctx.active_request_metadata["top_p"][:active_request_count] = 0.0
 
+        # A missing context buffer would bypass MTP and look like unavailable NVLS below.
+        assert ctx.mtp_decoder_hidden_states is not None
         ctrl._compute_serial_mtp_and_sample()
 
     def _collect_symm_collective_trace(self):

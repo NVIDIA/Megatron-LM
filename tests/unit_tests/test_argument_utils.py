@@ -76,6 +76,18 @@ def test_tokenizer_checkpoint_assets_flag_populates_args_and_config(flag):
     assert _default_config_from_args(CheckpointConfig, args).save_tokenizer_assets is (flag is None)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_muon_syrk_cli_flag_reaches_optimizer_config_kwargs(enabled):
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args(["--muon-use-syrk"] if enabled else [])
+
+    assert args.muon_use_syrk is enabled
+    # Validate the config mapping before validate_args converts unrelated dtype flags.
+    config_kwargs = _default_config_from_args(OptimizerConfig, args, return_instance=False)
+    assert config_kwargs["muon_use_syrk"] is enabled
+
+
 def _minimal_training_args(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--freeze-base-model-for-mtp'])
     args = parse_args()

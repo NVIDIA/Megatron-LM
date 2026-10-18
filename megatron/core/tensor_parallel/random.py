@@ -778,9 +778,11 @@ _Ts = TypeVarTuple('_Ts')
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
-    This function is adapted from torch.utils.checkpoint with two main changes:
+    This function is adapted from torch.utils.checkpoint with three main changes:
     1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`
     2) the states in the model parallel tracker are also properly tracked/set/reset.
+    3) the FP8 autocast state active at the forward is recorded and re-entered for the
+       recompute, which backward() runs outside the caller's autocast.
     """
 
     # pylint: disable=missing-function-docstring
@@ -800,7 +802,18 @@ class CheckpointFunction(torch.autograd.Function):
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
 
-        with torch.no_grad():
+        # Record the FP8 autocast state: backward() recomputes outside the caller's fp8_autocast,
+        # so the recompute has to re-enter the same state (as CheckpointWithoutOutput and TE's
+        # checkpoint do). Otherwise a TE module in the region recomputes in BF16 while its forward
+        # ran in FP8, or dequantizes FP8 parameters and loses their wgrad-fusion ``main_grad``.
+        ctx.fp8 = bool(HAVE_TE and FP8GlobalStateManager.is_fp8_enabled())
+        ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if ctx.fp8 else None
+        fwd_ctx = (
+            activation_recompute_forward(activation_recompute=True, recompute_phase=False)
+            if ctx.fp8
+            else contextlib.nullcontext()
+        )
+        with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
 
         # Divide hidden states across model parallel group and only keep
@@ -840,9 +853,17 @@ class CheckpointFunction(torch.autograd.Function):
             # Set the states to what it used to be before the forward pass.
             _set_all_rng_states(*ctx.rng_states)
 
-            # Compute the forward pass.
+            # Compute the forward pass under the FP8 state recorded in forward().
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad(), suspend_tensor_observations():
+            if ctx.fp8:
+                recompute_ctx = activation_recompute_forward(
+                    activation_recompute=True, recompute_phase=True
+                )
+                fp8_ctx = fp8_autocast(enabled=True, fp8_recipe=ctx.fp8_recipe)
+            else:
+                recompute_ctx = contextlib.nullcontext()
+                fp8_ctx = contextlib.nullcontext()
+            with torch.enable_grad(), fp8_ctx, recompute_ctx, suspend_tensor_observations():
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -1071,8 +1092,8 @@ class MHCCheckpointManager:
                 for output in ckpt.outputs:
                     ckpt.output_slot.validate_output(output)
                 continue
-            for output in ckpt.outputs:
-                output.untyped_storage().resize_(0)
+            # Honor retain_input_tensors: outputs aliasing checkpoint inputs keep storage.
+            ckpt._discard_outputs()
         self._outputs_discarded = True
 
     def recompute_until(self, phase) -> None:
@@ -1208,7 +1229,8 @@ class CheckpointWithoutOutput(object):
                          producer and consumed at its captured address.
             recompute_phase: Earliest explicit backward barrier that needs this
                              checkpoint. Defaults to the conservative first phase.
-            retain_input_tensors: Retain outputs that share checkpoint input storage.
+            retain_input_tensors: Whether outputs sharing storage with checkpoint inputs
+                                  should be retained when discarding outputs.
         """
         from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot, MHCRecomputePhase
 

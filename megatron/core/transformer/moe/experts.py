@@ -532,24 +532,30 @@ class TEGroupedMLP(MegatronModule):
             and not self.config.gated_linear_unit
         )
         if not (use_glu_fusion or use_srelu_fusion):
-            return False
+            return _unsupported(
+                f"unsupported activation {_activation_name()} "
+                f"(gated_linear_unit={self.config.gated_linear_unit}, "
+                f"use_fused_weighted_squared_relu={self.config.use_fused_weighted_squared_relu})"
+            )
+        # TE scaled GLUs expose a reserved recompute keyword but reject True at construction.
+        # Keep the dev support boundary; non-gated SReLU recompute is independent.
+        if use_glu_fusion and self.activation_recompute:
+            return _unsupported(
+                "Transformer Engine scaled GLU ops do not support activation recompute"
+            )
         if self.config.activation_func_tanh_clamp_scale is not None:
-            # Only non-gated squared ReLU can be soft-clamped on the fused path, and only when TE
-            # provides ScaledTanhSReLU. A clamped gated activation is SiTU-GLU, which the fused GLU
-            # path does not implement. Returning False selects the unfused (clamped) path.
+            # Soft-clamped gated activations require the unfused SiTU-GLU path.
             if not use_srelu_fusion or not _te_supports_scaled_tanh_srelu():
-                return False
-        if self.config.activation_func is situlu:
+                return _unsupported("soft clamp requires ScaledTanhSReLU")
+        if self.config.activation_func == situlu:
             if not hasattr(te_ops, "ScaledSiTUGLU"):
                 return _unsupported("SiTU-GLU needs ScaledSiTUGLU")
         elif self.config.activation_func == F.silu:
             if self.config.activation_func_clamp_value is not None:
                 if not is_te_min_version("2.17.0.dev0"):
-                    return False
-                try:
-                    from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
-                except ImportError:
-                    return False
+                    return _unsupported("clamped SwiGLU needs TE >= 2.17.0.dev0")
+                if not hasattr(te_ops, "ScaledClampedQGeGLU"):
+                    return _unsupported("clamped SwiGLU needs ScaledClampedQGeGLU")
         elif self.config.activation_func == quick_gelu:
             if not hasattr(te_ops, "ScaledClampedQGeGLU"):
                 return _unsupported("quick_gelu needs TE >= 2.15")

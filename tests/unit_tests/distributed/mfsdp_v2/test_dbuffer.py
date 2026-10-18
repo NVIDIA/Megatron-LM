@@ -19,6 +19,13 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement imp
     TensorAtomic,
 )
 
+# These tests assert torch.distributed._symmetric_memory.is_symm_mem_tensor directly, which
+# PyTorch builds such as dev's 2.12 pre-release do not provide.
+requires_symm_mem_detector = pytest.mark.skipif(
+    not hasattr(symm_mem, "is_symm_mem_tensor"),
+    reason="This PyTorch build lacks torch.distributed._symmetric_memory.is_symm_mem_tensor.",
+)
+
 
 def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
     return [
@@ -489,7 +496,7 @@ def test_partial_reduce_scatter_to_row_atomic_average_without_symm_mem_detector(
     """Ordinary AVG remains available when PyTorch lacks the symmetric-memory detector."""
     device, world_size = distributed_setup.device, distributed_setup.world_size
     mesh = init_device_mesh(device.type, (world_size,))
-    monkeypatch.delattr(symm_mem, "is_symm_mem_tensor")
+    monkeypatch.delattr(symm_mem, "is_symm_mem_tensor", raising=False)
     rank_scale = float(distributed_setup.rank + 1)
     partial_buffer = DBuffer.distribute_tensors(
         [torch.full((5, 3), rank_scale, dtype=torch.float32, device=device)], mesh, [Partial("avg")]
@@ -501,6 +508,7 @@ def test_partial_reduce_scatter_to_row_atomic_average_without_symm_mem_detector(
     _assert_dbuffer_local_tensors_close(replicated_buffer, [expected])
 
 
+@requires_symm_mem_detector
 def test_symmetric_memory_partial_reduce_scatter_to_row_atomic_average(distributed_setup):
     """Symmetric-memory reduce-scatter preserves AVG semantics."""
     device, world_size = distributed_setup.device, distributed_setup.world_size
@@ -527,6 +535,7 @@ def test_symmetric_memory_partial_reduce_scatter_to_row_atomic_average(distribut
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
 
 
+@requires_symm_mem_detector
 def test_symmetric_memory_partial_reduce_scatter_to_row_atomic_sum(distributed_setup):
     """Symmetric-memory reduce-scatter preserves explicit SUM semantics."""
     device, world_size = distributed_setup.device, distributed_setup.world_size

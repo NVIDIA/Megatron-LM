@@ -4,7 +4,7 @@ import logging
 import os
 import warnings
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -65,6 +65,20 @@ _HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
      num_local_tokens: S/TP*B
      num_global_tokens: num_local_tokens*TP*EP
 """
+
+
+def _record_current_stream(*tensors: Optional[torch.Tensor]) -> None:
+    """Keep CUDA tensors alive until the work already queued on the current stream has used them.
+
+    Routing tensors are allocated on the compute stream, but under the EP A2A overlap schedule the
+    combine reads them on the communication stream; releasing their last reference there without
+    ``record_stream`` hands the storage back to the compute stream while the read is in flight.
+    On the allocating stream this is a no-op.
+    """
+    stream = torch.cuda.current_stream()
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+            tensor.record_stream(stream)
 
 
 class MoETokenDispatcher:
@@ -664,11 +678,30 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         shapes). ``dispatch_preprocess`` reassigns all of these unconditionally, so
         the backward-time recompute repopulates them before combine runs; clearing
         them after the initial forward only frees the across-gap metadata."""
+        self._release_routing_tensors()
+        self.hidden_shape = None
+        self.hidden_shape_before_permute = None
+
+    def _release_routing_tensors(self) -> None:
+        """Drop the routing tensors cached by ``dispatch_preprocess`` for ``combine_postprocess``.
+
+        ``probs`` carries the router's autograd graph back to the layer input. Kept until the
+        layer's next forward, it holds that graph, and under full recompute the checkpointed
+        layer input with its gradient, across the rest of the step. Shapes are left alone:
+        CUDA graph replay of the preprocess restores only tensor attributes. The tensors are
+        recorded on the current stream first, because the EP A2A overlap schedule runs the
+        combine on the communication stream.
+        """
+        _record_current_stream(
+            self.probs,
+            self.routing_map,
+            self.reversed_local_input_permutation_mapping,
+            self.batch_invariant_inverse_permutation_mapping,
+        )
         self.probs = None
         self.routing_map = None
         self.reversed_local_input_permutation_mapping = None
-        self.hidden_shape = None
-        self.hidden_shape_before_permute = None
+        self.batch_invariant_inverse_permutation_mapping = None
 
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
@@ -946,6 +979,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             drop_and_pad=self.drop_and_pad,
             batch_invariant_inverse_map=self.batch_invariant_inverse_permutation_mapping,
         )
+        # The combine was the last reader of this forward's routing tensors.
+        self._release_routing_tensors()
 
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
@@ -1042,6 +1077,19 @@ class _DispatchManager(ABC):
         "reversed_mapping_for_combine",
         "pad_offsets",
     )
+
+    def release_router_probs(self) -> None:
+        """Drop the router probabilities cached for this forward once combine has read them.
+
+        ``token_probs`` and ``dispatched_probs`` carry the router's autograd graph back to the
+        layer input. Other routing metadata stays: HybridEP drop-and-pad keeps a static
+        ``tokens_per_expert`` that only ``setup_metadata`` writes and CUDA graph replay skips.
+        """
+        _record_current_stream(
+            getattr(self, "token_probs", None), getattr(self, "dispatched_probs", None)
+        )
+        self.token_probs = None
+        self.dispatched_probs = None
 
     def reset_transient_forward_state(self) -> None:
         """Release the transient per-forward routing metadata cached on the manager.
@@ -2289,6 +2337,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         probs: Optional[torch.Tensor] = None,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        dispatch_backward_callback: Callable[[], None] | None = None,
     ):
         """
         Execute fused permutation and AlltoAll communication.
@@ -2303,6 +2352,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             probs (torch.Tensor): Routing probabilities (unused in current implementation)
             async_finish (bool): Whether to use asynchronous communication completion
             allocate_on_comm_stream (bool): Whether to allocate buffers on communication stream
+            dispatch_backward_callback (Callable, optional): Submit independent work after
+                dispatch backward, before its input gradient joins the shared-expert branch.
 
         Returns:
             A tuple of dispatched tokens and probabilities.
@@ -2312,6 +2363,13 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         dispatched_hidden_states = self._comm_manager.dispatch(
             hidden_states, async_finish, allocate_on_comm_stream
         )
+        if dispatch_backward_callback is not None and dispatched_hidden_states.grad_fn is not None:
+            # Managers return the dispatch Function's output directly. Its post-hook
+            # submits wgrad before autograd proceeds to the shared-input gradient merge.
+            def launch_wgrad(grad_inputs, grad_outputs):
+                dispatch_backward_callback()
+
+            dispatched_hidden_states.grad_fn.register_hook(launch_wgrad)
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states, wait_current_stream=False)
             self.shared_experts.linear_fc1_forward_and_act(dispatched_hidden_states)
@@ -2383,6 +2441,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
+        # The combine was the last reader of this forward's router probabilities.
+        self._comm_manager.release_router_probs()
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(hidden_states)
             self.shared_experts.post_forward_comm()

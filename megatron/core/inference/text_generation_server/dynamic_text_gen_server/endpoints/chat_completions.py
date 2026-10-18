@@ -19,12 +19,6 @@ _MEDIA_FETCH_TIMEOUT_S = 5.0
 _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 
 
-def _get_non_none(obj, key, default):
-    """Return the request value, using the default for absent or null fields."""
-    value = obj.get(key)
-    return default if value is None else value
-
-
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
@@ -122,6 +116,12 @@ def _get_field(obj, key, default=None):
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _get_non_none(obj, key, default):
+    """Returns the value from the object or default if the key is missing or None."""
+    val = obj.get(key)
+    return default if val is None else val
 
 
 def _try_parse_jsonish(value):

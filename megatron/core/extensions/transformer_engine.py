@@ -1094,9 +1094,17 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         return op
 
     def _make_te_ops_activation(
-        activation_func: Callable, gated_linear_unit: bool, cache_quantized_input: bool
+        activation_func: Callable,
+        gated_linear_unit: bool,
+        cache_quantized_input: bool,
+        situ_glu_beta1: Optional[float] = None,
+        situ_glu_beta2: Optional[float] = None,
     ) -> te.pytorch.ops.FusibleOperation:
-        """Construct a TE activation op."""
+        """Construct a TE activation op.
+
+        ``situ_glu_beta1``/``situ_glu_beta2`` are only used for SiTU-GLU
+        (``activation_func=situlu``, ``gated_linear_unit=True``).
+        """
         op_type = None
         if (activation_func, gated_linear_unit) == (F.gelu, False):
             op_type = te.pytorch.ops.GELU
@@ -1112,6 +1120,12 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             op_type = te.pytorch.ops.ReLU
         elif (activation_func, gated_linear_unit) == (F.relu, True):
             op_type = te.pytorch.ops.ReGLU
+        elif (activation_func, gated_linear_unit) == (situlu, True):
+            op_type = getattr(te.pytorch.ops, "SiTUGLU", None)
+            if op_type is None:
+                raise RuntimeError(
+                    "SiTU-GLU requires Transformer Engine with " "pytorch.ops.SiTUGLU support."
+                )
 
         if op_type is None:
             raise NotImplementedError(
@@ -1121,6 +1135,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             )
 
         kwargs = {}
+        if activation_func is situlu:
+            kwargs.update(beta1=situ_glu_beta1, beta2=situ_glu_beta2)
         if is_te_min_version("2.3"):
             kwargs["cache_quantized_input"] = cache_quantized_input
         return op_type(**kwargs)
@@ -3513,6 +3529,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 self.activation_func,
                 self.config.gated_linear_unit,
                 self.config.activation_func_fp8_input_store,
+                situ_glu_beta1=self.config.situ_glu_beta1,
+                situ_glu_beta2=self.config.situ_glu_beta2,
             )
             fused_impl.append(op)
 

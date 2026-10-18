@@ -28,7 +28,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from ..utils import HAVE_TE
-from .dbuffer import DBuffer
+from .dbuffer import DBuffer, symmetric_memory_allocation
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .placement import BlockAtomic, RowAtomic, TensorAtomic
@@ -412,7 +412,7 @@ class FsdpParameterGroup:
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
             return nullcontext()
-        return torch.cuda.use_mem_pool(self._symm_mem_pool)
+        return symmetric_memory_allocation(self._symm_mem_pool)
 
     def _set_module_parameter(self, fqns: tuple[str, ...], parameter: nn.Parameter) -> None:
         owning_module = self._owning_module()

@@ -420,8 +420,9 @@ def _apply_rotary_pos_emb_thd(
         freq_pos = local_pos.to(torch.int64)
 
     if max_seqlen is None:
-        # Legacy callers retain exact packed-frequency semantics. Modern training
-        # callers supply max_seqlen and avoid this host synchronization.
+        # Backward compatibility for callers that predate ``max_seqlen``. This retains
+        # the old packed-frequency semantics at the cost of a GPU-to-CPU sync. Updated
+        # training paths pass ``max_seqlen`` and stay CUDA-graph safe.
         exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) == int(cu_seqlens[-1].item())
     else:
         exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
