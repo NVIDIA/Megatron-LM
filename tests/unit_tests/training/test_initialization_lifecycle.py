@@ -717,13 +717,18 @@ def test_invalid_config_stops_before_runtime_services(monkeypatch, isolated_glob
     services.assert_not_called()
 
 
-def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_globals):
+def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_globals, run_config):
     import megatron.training as training_package
+    from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
     from megatron.training import argument_utils, utils
 
     args = Namespace(reset_attention_mask=False, batch_invariant_mode=False)
     model = Mock()
-    cfg = Mock()
+    # The real RL callback derives its rollout interval from these batch values.
+    cfg = run_config
+    cfg.train.micro_batch_size = 1
+    cfg.train.global_batch_size = 8
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     monkeypatch.setattr(logging, "basicConfig", Mock())
     monkeypatch.setattr(arguments, "parse_and_validate_args", Mock(return_value=args))
     monkeypatch.setattr(utils, "is_hybrid_model", lambda args: False)
@@ -738,6 +743,8 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_gl
 
     pretrain.assert_called_once()
     assert pretrain.call_args.args[0] is cfg
+    callbacks = pretrain.call_args.kwargs["callbacks"]
+    assert [type(callback) for callback in callbacks] == [RLLoggingCallback, RLCheckpointCallback]
     assert global_vars.get_run_config() is cfg
     assert global_vars._GLOBAL_TOKENIZER is None
     services.assert_not_called()
