@@ -11,7 +11,7 @@ import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.indexed_dataset import IndexedDataset
+from megatron.core.datasets.indexed_dataset import DType, IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
@@ -126,10 +126,13 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
                 "--hybrid-context-parallel (SBHD mode is not packed)."
             )
 
+        # Ask the writer's own rule rather than restating it: preprocessing picks the
+        # .bin dtype with DType.optimal_dtype, and the two used to disagree for a vocab
+        # size between 65500 and 65536, where the file is int32 and this said uint16.
         self.token_dtype_code = (
             None
             if self.tokenizer.vocab_size is None
-            else (4 if self.tokenizer.vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8)
+            else DType.code_from_dtype(DType.optimal_dtype(self.tokenizer.vocab_size))
         )
         if self.sequences_per_dataset is not None:
             assert (
