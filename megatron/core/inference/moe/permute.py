@@ -544,6 +544,7 @@ def unpermute_tokens(
     valid_tokens: torch.Tensor,
     out: torch.Tensor = None,
     batch_invariant_inverse_map: torch.Tensor = None,
+    ep_invariant_limbs: int = 0,
 ) -> torch.Tensor:
     """Unpermute expert outputs back to original token order.
 
@@ -564,6 +565,9 @@ def unpermute_tokens(
         out: optional pre-allocated [num_tokens, hidden_dim] fp32 output buffer.
             Pass a symmetric memory tensor to scatter directly into it, avoiding
             a separate copy before RSV. If None, a local buffer is allocated.
+        ep_invariant_limbs: batch-invariant mode only (``moe_ep_invariant_combine``):
+            1 writes a [num_tokens, 2 * hidden_dim] fp64 limb partial, 2 the final
+            fp32 rows of a single EP rank (see ``unpermute_tokens_in_expert_order``).
     """
     output_size, hidden_dim = expert_output.shape
 
@@ -578,9 +582,10 @@ def unpermute_tokens(
         # rows for tokens with no local expert contribution. Rows beyond
         # valid_tokens are not read by the graphed RSV combine.
         return batch_invariant.unpermute_tokens_in_expert_order(
-            expert_output, batch_invariant_inverse_map, valid_tokens, out
+            expert_output, batch_invariant_inverse_map, valid_tokens, out, ep_invariant_limbs
         )
 
+    assert not ep_invariant_limbs, "moe_ep_invariant_combine requires batch-invariant mode"
     assert (
         permuted_probs is not None and permuted_probs.dtype == torch.float32
     ), "permuted_probs must be fp32"

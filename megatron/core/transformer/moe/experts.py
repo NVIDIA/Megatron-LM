@@ -1599,6 +1599,20 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
+        out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+        limbs = 0
+        if self.config.moe_ep_invariant_combine:
+            # EP > 1: fp64 limb partial into the (limb-sized) RSV buffer, summed exactly
+            # by token_combine; EP 1: the final fp32 rows.
+            limbs = 1 if self.ep_group.size() > 1 else 2
+            if limbs == 1:
+                out = (
+                    NVLSAllGatherVDispatcher._get_rsv_limb_tensor()
+                    if self._nvls_dispatcher
+                    else None
+                )
+            else:
+                out = None
         output = mcore_fused_moe(
             hidden_states,
             probs,
@@ -1610,8 +1624,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
             routing_map=routing_map,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
-            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
+            out=out,
             activation_clamp_scale=self._activation_clamp_scale,
+            ep_invariant_limbs=limbs,
         )
         return output, None
 

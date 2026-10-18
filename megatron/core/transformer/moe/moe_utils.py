@@ -526,6 +526,7 @@ def unpermute(
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
     batch_invariant_inverse_map: Optional[torch.Tensor] = None,
+    ep_invariant_combine: bool = False,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -554,6 +555,9 @@ def unpermute(
         batch_invariant_inverse_map (torch.Tensor, optional): Fixed-shape
             `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
             global expert id. Used by batch-invariant CUDA graph paths.
+        ep_invariant_combine (bool, optional): Under batch-invariant mode, sum each
+            token's expert rows through exact fixed-point limbs so the result does
+            not depend on the expert-parallel size (``moe_ep_invariant_combine``).
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
@@ -588,6 +592,7 @@ def unpermute(
             probs=probs,
             num_experts=routing_map.size(1),
             inverse_map=batch_invariant_inverse_map,
+            ep_invariant=ep_invariant_combine,
         )
 
     _, hidden = restore_shape

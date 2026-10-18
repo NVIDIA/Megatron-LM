@@ -20,6 +20,7 @@ from megatron.core.tensor_parallel import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe.ep_invariant_combine import finalize_with_grad, limb_partial
 from megatron.core.transformer.moe.fused_a2a import (
     HAVE_HYBRIDEP_DENSE_ROUTING,
     HYBRIDEP_TOKEN_ALIGNMENT,
@@ -358,6 +359,15 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         original sequence positions, preparing them for the subsequent reduction scatter
         operation that will aggregate results across ranks.
         """
+        if self.config.moe_ep_invariant_combine:
+            # Exact fp64 limb partial of this rank's experts per gathered token; the
+            # reduce-scatter in token_combine sums the limbs exactly (any order).
+            self.combine_dtype = hidden_states.dtype
+            return limb_partial(
+                hidden_states,
+                self.reversed_local_input_permutation_mapping,
+                self.hidden_shape_before_permute[0],
+            )
         unpermuted_local_hidden = unpermute(
             hidden_states,
             self.reversed_local_input_permutation_mapping,
@@ -375,6 +385,12 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         originally held them. This completes the expert processing
         communication pattern and prepares tokens for final unpermutation.
         """
+        if self.config.moe_ep_invariant_combine:
+            if self.tp_size > 1 or self.ep_size > 1:
+                hidden_states = reduce_scatter_to_sequence_parallel_region(
+                    hidden_states, group=self.tp_ep_group
+                )
+            return finalize_with_grad(hidden_states).to(self.combine_dtype)
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
             hidden_states = reduce_scatter_to_sequence_parallel_region(
@@ -911,6 +927,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
             batch_invariant_inverse_map=self.batch_invariant_inverse_permutation_mapping,
+            ep_invariant_combine=self.config.moe_ep_invariant_combine,
         )
 
         # Reshape the output tensor

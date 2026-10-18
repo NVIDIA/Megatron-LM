@@ -416,14 +416,133 @@ def ordered_reduce_scatter_v(
 
 
 @triton.jit
+def _ep_invariant_limbs(v):
+    """fp32 values -> (hi, lo) fp64 integer limbs (moe/ep_invariant_combine.to_limbs)."""
+    v64 = v.to(tl.float64)
+    finite = tl.abs(v64) < float("inf")
+    big = tl.abs(v64) >= 140737488355328.0  # HI_LIMIT = 2^47
+    sat = tl.where(v64 < 0, -140737488355328.0, 140737488355328.0)
+    hi = tl.where(big, sat, libdevice.floor(v64))
+    lo = tl.where(big, 0.0, libdevice.rint((v64 - hi) * 281474976710656.0))  # 2^48
+    hi = tl.where(finite, hi, v64)
+    lo = tl.where(finite, lo, 0.0)
+    return hi, lo
+
+
+@triton.jit
+def _ep_invariant_finalize(hi, lo):
+    """Exact limb sums -> fp32 (moe/ep_invariant_combine.finalize)."""
+    hi = hi.to(tl.float64)
+    b = lo.to(tl.float64) * 3.552713678800501e-15  # 2^-48
+    s = hi + b
+    bb = s - hi
+    err = (hi - (s - bb)) + (b - bb)
+    bits = s.to(tl.int64, bitcast=True)
+    nudge = (err != 0.0) & ((bits & 1) == 0)
+    up = (err > 0.0) == (s > 0.0)
+    bits = tl.where(nudge, tl.where(up, bits + 1, bits - 1), bits)
+    s = bits.to(tl.float64, bitcast=True)
+    return tl.where(tl.abs(hi) < float("inf"), s, hi).to(tl.float32)
+
+
+@triton.jit
+def _limbs_reduce_scatter_v_kernel(
+    local_ptr,
+    buffer_ptrs_dev,
+    signal_pad_ptrs,
+    local_tokens,
+    rank_token_offset_ptr,
+    ep_max_tokens_ptr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    """Sum every rank's [hi | lo] fp64 limb rows of this rank's tokens, then finalize."""
+    pid = tl.program_id(axis=0)
+
+    ep_max_tokens = tl.load(ep_max_tokens_ptr)
+    if pid >= ep_max_tokens:
+        return
+
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=False,
+        hasSubsequentMemAccess=True,
+    )
+    sync_threads()
+
+    tid = tl.arange(0, BLOCK_SIZE)
+    rank_token_offset = tl.load(rank_token_offset_ptr)
+    buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
+
+    for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
+        global_token = (rank_token_offset + token_offset).to(tl.int64)
+        for channel_offset in range(0, HIDDEN_SIZE, BLOCK_SIZE):
+            offsets = channel_offset + tid
+            mask = offsets < HIDDEN_SIZE
+            acc_hi = tl.zeros([BLOCK_SIZE], dtype=tl.float64)
+            acc_lo = tl.zeros([BLOCK_SIZE], dtype=tl.float64)
+            # Integer sums below 2^53: exact, so the rank order does not matter.
+            for src_rank in tl.range(0, WORLD_SIZE):
+                peer = tl.load(buffer_ptrs + src_rank).to(tl.pointer_type(tl.float64))
+                row = peer + global_token * (2 * HIDDEN_SIZE)
+                acc_hi += tl.load(row + offsets, mask=mask, other=0.0)
+                acc_lo += tl.load(row + HIDDEN_SIZE + offsets, mask=mask, other=0.0)
+            tl.store(
+                local_ptr + token_offset * HIDDEN_SIZE + offsets,
+                _ep_invariant_finalize(acc_hi, acc_lo),
+                mask=mask,
+            )
+
+
+def limbs_reduce_scatter_v(
+    output_tensor: torch.Tensor,
+    symm_mem_hdl: _SymmetricMemory,
+    rank_token_offset: torch.Tensor,
+    ep_max_tokens: torch.Tensor,
+    per_rank_max_tokens: int,
+    **kwargs,
+) -> torch.Tensor:
+    """EP-invariant combine: fp32 rows of this rank's tokens from every rank's limb partial.
+
+    Each rank's symmetric buffer holds [global_max, 2 * hidden] fp64 limbs (hi | lo)
+    at offset 0 (``moe_ep_invariant_combine``).
+    """
+    assert HAVE_TRITON, "Triton is required for limbs_reduce_scatter_v."
+    assert output_tensor.ndim == 2 and output_tensor.dtype == torch.float32
+    hidden_size = output_tensor.shape[1]
+    block_size = min(triton.next_power_of_2(hidden_size), 1024)
+    num_blocks = min(per_rank_max_tokens, kwargs.get("max_num_blocks", 128))
+    _limbs_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
+        output_tensor,
+        symm_mem_hdl.buffer_ptrs_dev,
+        symm_mem_hdl.signal_pad_ptrs_dev,
+        local_tokens=output_tensor.shape[0],
+        rank_token_offset_ptr=rank_token_offset,
+        ep_max_tokens_ptr=ep_max_tokens,
+        HIDDEN_SIZE=hidden_size,
+        BLOCK_SIZE=block_size,
+        RANK=symm_mem_hdl.rank,
+        WORLD_SIZE=symm_mem_hdl.world_size,
+        num_warps=max(1, block_size // 32),
+    )
+    return output_tensor
+
+
+@triton.jit
 def _unpermute_tokens_in_expert_order_kernel(
     expert_out_ptr,  # [output_size, hidden_dim] bf16 expert outputs
     inverse_map_ptr,  # [num_tokens, num_local_experts] permuted row or -1
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens
-    output_ptr,  # [num_tokens, hidden_dim] fp32 output buffer
+    output_ptr,  # [num_tokens, hidden_dim] fp32, or [num_tokens, 2 * hidden_dim] fp64 limbs
     hidden_dim,
     num_local_experts: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    LIMBS: tl.constexpr,  # 0: fp64 sum -> fp32; 1: fp64 limb partial; 2: limbs -> fp32
 ):
     """Token-local batch-invariant unpermute.
 
@@ -431,6 +550,8 @@ def _unpermute_tokens_in_expert_order_kernel(
     accumulated by increasing local expert id, avoiding atomic-add order, in fp64
     and rounded once to the fp32 rank partial, as training's batch-invariant
     unpermute does. An fp32 accumulator drops small contributions next to a large one.
+    With LIMBS (moe_ep_invariant_combine) the rows are summed as exact fixed-point
+    limbs instead, which makes the cross-rank combine independent of the EP size.
     """
     tok = tl.program_id(0)
     block_h = tl.program_id(1)
@@ -439,17 +560,33 @@ def _unpermute_tokens_in_expert_order_kernel(
     mask_h = offsets < hidden_dim
 
     acc = tl.zeros([BLOCK_H], dtype=tl.float64)
+    acc_lo = tl.zeros([BLOCK_H], dtype=tl.float64)
     if tok < valid_tokens:
         tok_i64 = tok.to(tl.int64)
         for lid in tl.range(0, num_local_experts):
             pos = tl.load(inverse_map_ptr + tok_i64 * num_local_experts + lid)
             if pos >= 0:
                 pos_i64 = pos.to(tl.int64)
-                vals = tl.load(expert_out_ptr + pos_i64 * hidden_dim + offsets, mask=mask_h).to(
-                    tl.float64
-                )
-                acc += vals
-        tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc.to(tl.float32), mask=mask_h)
+                vals = tl.load(expert_out_ptr + pos_i64 * hidden_dim + offsets, mask=mask_h)
+                if LIMBS == 0:
+                    acc += vals.to(tl.float64)
+                else:
+                    hi, lo = _ep_invariant_limbs(vals.to(tl.float32))
+                    acc += hi
+                    acc_lo += lo
+        if LIMBS == 0:
+            tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc.to(tl.float32), mask=mask_h)
+        elif LIMBS == 1:
+            tl.store(output_ptr + tok_i64 * 2 * hidden_dim + offsets, acc, mask=mask_h)
+            tl.store(
+                output_ptr + tok_i64 * 2 * hidden_dim + hidden_dim + offsets, acc_lo, mask=mask_h
+            )
+        else:
+            tl.store(
+                output_ptr + tok_i64 * hidden_dim + offsets,
+                _ep_invariant_finalize(acc, acc_lo),
+                mask=mask_h,
+            )
 
 
 def unpermute_tokens_in_expert_order(
@@ -457,12 +594,24 @@ def unpermute_tokens_in_expert_order(
     inverse_map: torch.Tensor,
     valid_tokens: torch.Tensor,
     out: Optional[torch.Tensor],
+    ep_invariant_limbs: int = 0,
 ) -> torch.Tensor:
-    """Reduce local expert contributions token-by-token in fixed expert order."""
+    """Reduce local expert contributions token-by-token in fixed expert order.
+
+    ``ep_invariant_limbs`` (``moe_ep_invariant_combine``): 1 returns this rank's
+    [num_tokens, 2 * hidden] fp64 limb partial for the cross-rank sum; 2 (a single
+    EP rank) returns the final fp32 rows.
+    """
     _, hidden_dim = expert_output.shape
     num_tokens, num_local_experts = inverse_map.shape
     if out is None:
-        out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
+        limb_partial = ep_invariant_limbs == 1
+        out = torch.empty(
+            num_tokens,
+            2 * hidden_dim if limb_partial else hidden_dim,
+            dtype=torch.float64 if limb_partial else torch.float32,
+            device=expert_output.device,
+        )
 
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     grid = (num_tokens, triton.cdiv(hidden_dim, BLOCK_H))
@@ -474,5 +623,6 @@ def unpermute_tokens_in_expert_order(
         hidden_dim,
         num_local_experts,
         BLOCK_H=BLOCK_H,
+        LIMBS=ep_invariant_limbs,
     )
     return out

@@ -1405,6 +1405,14 @@ class TransformerConfig(ModelParallelConfig):
     at large NVLink domains; software paths that must match it bitwise should
     accumulate in fp64."""
 
+    moe_ep_invariant_combine: bool = False
+    """Under batch_invariant_mode, combine each token's expert outputs through exact
+    fixed-point fp64 limbs (moe/ep_invariant_combine.py) instead of per-EP-rank fp32
+    partials, so MoE outputs are bitwise identical at every expert-parallel size
+    (e.g. training and inference with different EP). Covers the training AllToAll and
+    AllGather combines and the inference NVLS combine of the 'torch' grouped-GEMM
+    backend. The engine combine moves 16 bytes per element instead of 4."""
+
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
 
@@ -4000,6 +4008,21 @@ class TransformerConfig(ModelParallelConfig):
                 "flash_attention_version must be one of 2, 3, or 4, got "
                 f"{self.flash_attention_version}"
             )
+
+        if self.moe_ep_invariant_combine:
+            if not self.batch_invariant_mode:
+                raise ValueError("moe_ep_invariant_combine requires batch_invariant_mode=True.")
+            if self.num_moe_experts:
+                from megatron.core.transformer.moe.ep_invariant_combine import check_topk
+
+                check_topk(self.moe_router_topk)
+            if self.transformer_impl == "inference_optimized" and (
+                self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TORCH
+            ):
+                raise ValueError(
+                    "moe_ep_invariant_combine supports inference_grouped_gemm_backend="
+                    "'torch' for inference-optimized MoE."
+                )
 
         if self.batch_invariant_mode:
             from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
