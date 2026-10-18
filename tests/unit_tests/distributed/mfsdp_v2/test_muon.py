@@ -25,7 +25,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.range import 
 pytest.importorskip("emerging_optimizers")
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import muon
 
 
 def _placements():
@@ -56,7 +56,14 @@ class TinyModel(nn.Module):
 
 def _parameter_groups(params):
     return [
-        {"params": [params["block1.0.weight"], params["block2.0.weight"]], "lr": 0.05},
+        {
+            "params": [
+                params["block1.0.weight"],
+                params["block2.0.weight"],
+                params["block2.3.bias"],
+            ],
+            "lr": 0.05,
+        },
         {
             "params": [params["block1.2.weight"], params["block2.2.weight"]],
             "lr": 0.02,
@@ -94,7 +101,7 @@ def _reference_shard(param, full):
         ),
     ],
 )
-def test_muon_matches_reference(distributed_setup, dtype, nesterov, kernel_options):
+def test_muon_matches_reference(distributed_setup, monkeypatch, dtype, nesterov, kernel_options):
     """Match weights and momentum over steps, including a checkpoint round trip."""
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
@@ -114,8 +121,23 @@ def test_muon_matches_reference(distributed_setup, dtype, nesterov, kernel_optio
         fully_shard(model.block2, mesh=mesh, placements=_placements())
     params = dict(model.named_parameters())
     kwargs = dict(momentum=0.9, nesterov=nesterov, **kernel_options)
-    optimizer = FsdpMuon(_parameter_groups(params), dp_mesh=mesh, **kwargs)
-    reference_optimizer = Muon(_parameter_groups(reference_params), weight_decay=0.0, **kwargs)
+    owner_assignment_calls = []
+    assign_owner_work = muon.assign_owner_work
+
+    def record_owner_assignment(buffers):
+        buffers = list(buffers)
+        owner_assignment_calls.append(buffers)
+        return assign_owner_work(buffers)
+
+    monkeypatch.setattr(muon, "assign_owner_work", record_owner_assignment)
+    optimizer = muon.FsdpMuon(_parameter_groups(params), dp_mesh=mesh, **kwargs)
+    assert len(owner_assignment_calls) == 1
+    assert len(owner_assignment_calls[0]) == 2
+    # Upstream Muon requires matrix-only input; FsdpMuon skips the supplied bias.
+    reference_groups = _parameter_groups(reference_params)
+    for group in reference_groups:
+        group["params"] = [param for param in group["params"] if param.ndim == 2]
+    reference_optimizer = Muon(reference_groups, weight_decay=0.0, **kwargs)
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
     fully_shard_optimizer(other_optimizer)
@@ -146,14 +168,18 @@ def test_muon_matches_reference(distributed_setup, dtype, nesterov, kernel_optio
         actual.sum().backward()
         expected.sum().backward()
         if step == 1:
-            # A previously active matrix can skip a step without losing its momentum.
-            params["block1.2.weight"].grad = None
-            reference.block1[2].weight.grad = None
+            # A whole buffer can skip a step without losing momentum or replanning.
+            for name in ("block1.0.weight", "block1.2.weight"):
+                params[name].grad = None
+                reference.get_parameter(name).grad = None
         for name, param in reference.named_parameters():
             reference_params[name].grad = None if param.grad is None else param.grad.float().clone()
 
         excluded_before = [params[n].to_local().clone() for n in excluded_names]
         optimizer.step()
+        # Reuse the assignments computed during construction, including after reload.
+        assert len(owner_assignment_calls) == (1 if step == 0 else 2)
+        assert len(owner_assignment_calls[-1]) == 2
         for name, before in zip(excluded_names, excluded_before):
             torch.testing.assert_close(params[name].to_local(), before, atol=0, rtol=0)
             assert params[name] not in optimizer.state
@@ -184,5 +210,5 @@ def test_muon_matches_reference(distributed_setup, dtype, nesterov, kernel_optio
                 param.copy_(reference_params[name])
         if step == 0:
             state = copy.deepcopy(optimizer.state_dict())
-            optimizer = FsdpMuon(_parameter_groups(params), dp_mesh=mesh, **kwargs)
+            optimizer = muon.FsdpMuon(_parameter_groups(params), dp_mesh=mesh, **kwargs)
             optimizer.load_state_dict(state)

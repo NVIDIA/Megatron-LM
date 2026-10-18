@@ -11,13 +11,15 @@ from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import ParamsT
 
 try:
-    from emerging_optimizers import utils as eo_utils
-    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
+    import emerging_optimizers  # pylint: disable=unused-import
 except ImportError as error:
     raise ImportError(
         "FsdpMuon requires Emerging-Optimizers. "
         "Install it with `pip install 'megatron-fsdp[emerging-optimizers]'`."
     ) from error
+
+from emerging_optimizers import utils as eo_utils
+from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
 from .dbuffer import DBuffer
 from .gather_scatter import gather, scatter
@@ -27,25 +29,19 @@ from .placement import RowAtomic
 from .range import intersect_ranges
 
 
-def _fsdp_group_of(param: torch.nn.Parameter) -> FsdpParameterGroup:
-    group = get_containing_parameter_group(param)
-    if group is None:
-        raise ValueError("FsdpMuon requires parameters sharded by MFSDP v2.")
-    return group
-
-
 class FsdpMuon(Muon):
     """Muon for 2-D parameters on a one-dimensional, all-RowAtomic DP mesh.
 
-    Momentum remains sharded. Each step balances orthogonalization across the buffers,
-    then gathers, orthogonalizes, scatters, and applies one buffer's updates at a time
-    on the caller's CUDA stream. Full matrices exist only on their assigned owners.
+    Momentum remains sharded. Owner assignments balance orthogonalization across a
+    fixed set of buffers and are computed during initialization. Each step
+    gathers, orthogonalizes, scatters, and applies one buffer's updates at a time on
+    the caller's CUDA stream. Full matrices exist only on their assigned owners.
     Parameters and optimizer groups must have the same order on every DP rank, and
     ranks must agree on which parameters have gradients.
 
-    Pass only the matrices to optimize with Muon; use a separate optimizer for other
-    parameters, including biases, norms, embeddings, and output projections. This
-    optimizer refreshes its FSDP model weights itself, so it does not need
+    Non-2D parameters are skipped. Use a separate optimizer for them and for matrices
+    you exclude from Muon, such as embeddings and output projections. This optimizer
+    refreshes its FSDP model weights itself, so it does not need
     ``fully_shard_optimizer``. Quantized buffers and tensor parallelism are unsupported.
     Weight decay defaults to zero; nonzero decay is unsupported.
 
@@ -63,18 +59,38 @@ class FsdpMuon(Muon):
         kwargs.setdefault("weight_decay", 0.0)
         super().__init__(params, **kwargs)
         self.dp_mesh = dp_mesh
+        self._validate_param_groups()
+
+        # Preserve discovery order: communication must be posted identically on every rank.
+        self._fsdp_groups: list[FsdpParameterGroup] = []
+        seen = set()
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.ndim != 2:
+                    continue
+                fsdp_group = get_containing_parameter_group(param)
+                assert fsdp_group is not None
+                if fsdp_group not in seen:
+                    seen.add(fsdp_group)
+                    self._fsdp_groups.append(fsdp_group)
+        self._owner_maps = assign_owner_work(group.main_weight for group in self._fsdp_groups)
+
+    def _validate_param_groups(self) -> None:
+        """Validate optimizer parameters and the FSDP buffers that contain them."""
         seen = set()
         for group in self.param_groups:
             if group["weight_decay"] != 0:
                 raise NotImplementedError("FsdpMuon does not support nonzero weight decay yet.")
             for param in group["params"]:
                 if param.ndim != 2:
-                    raise ValueError("FsdpMuon only supports 2-D parameters.")
-                fsdp_group = _fsdp_group_of(param)
+                    continue
+                fsdp_group = get_containing_parameter_group(param)
+                if fsdp_group is None:
+                    raise ValueError("FsdpMuon requires parameters sharded by MFSDP v2.")
                 if fsdp_group in seen:
                     continue
                 seen.add(fsdp_group)
-                if fsdp_group.mesh is not dp_mesh:
+                if fsdp_group.mesh is not self.dp_mesh:
                     raise ValueError("FsdpMuon parameters must use the optimizer's dp_mesh.")
                 for buffer in (
                     fsdp_group.main_weight,
@@ -92,27 +108,26 @@ class FsdpMuon(Muon):
         if closure is not None:
             raise ValueError("closure is not supported")
 
-        # Preserve discovery order: communication must be posted identically on every rank.
-        active: dict[FsdpParameterGroup, dict[torch.nn.Parameter, dict[str, Any]]] = {}
-        for group in self.param_groups:
+        param_to_group_index: dict[torch.nn.Parameter, int] = {}
+        for group_index, group in enumerate(self.param_groups):
             if group["weight_decay"] != 0:
                 raise NotImplementedError("FsdpMuon does not support nonzero weight decay yet.")
             for param in group["params"]:
-                if param.grad is not None:
-                    state = self.state[param]
-                    if not state:
-                        state["momentum_buffer"] = torch.zeros_like(param)
-                    active.setdefault(_fsdp_group_of(param), {})[param] = group
+                if param.ndim != 2 or param.grad is None:
+                    continue
+                state = self.state[param]
+                if not state:
+                    state["momentum_buffer"] = torch.zeros_like(param)
+                param_to_group_index[param] = group_index
 
-        # Count each buffer once, even when it contains multiple optimizer groups.
-        # The planner estimates all matrices' work; only active parameters communicate.
-        owner_maps = assign_owner_work(group.main_weight for group in active)
-        for (fsdp_group, param_groups), owners in zip(active.items(), owner_maps, strict=True):
+        for fsdp_group, owners in zip(self._fsdp_groups, self._owner_maps, strict=True):
             groups_by_index = {
-                i: param_groups[fp.sharded]
+                i: self.param_groups[param_to_group_index[fp.sharded]]
                 for i, fp in enumerate(fsdp_group.fsdp_parameters)
-                if fp.sharded in param_groups
+                if fp.sharded in param_to_group_index
             }
+            if not groups_by_index:
+                continue
             self._step_group(fsdp_group, groups_by_index, {i: owners[i] for i in groups_by_index})
             fsdp_group.sync_model_weight_from_main_weight()
 
