@@ -1020,27 +1020,37 @@ def _kpool_topk_from_score_chunks(
     pool_token_base: torch.Tensor,
     sk: int,
     use_relu: bool,
+    query_start: int = 0,
+    query_end: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute KPool scores and selection in query chunks.
 
     KPool selection is discrete and runs under ``no_grad``. Only the fixed-width pool IDs
     are retained, not the full ``[batch, query, pool]`` score tensor.
+
+    Only query rows ``[query_start, query_end)`` are scored, so the result is
+    ``[batch, query_end - query_start, index_topk // pool_size]``. Each row's selection
+    depends only on that row and the keys, so it is the same as the matching rows of a
+    call that scores every query.
     """
     sq, batch, n_heads, _ = q.shape
+    if query_end is None:
+        query_end = sq
+    num_rows = query_end - query_start
     num_pools = k_pooled.size(0)
     budget = index_topk // pool_size
-    pool_topk = torch.full((batch, sq, budget), -1, dtype=torch.int64, device=q.device)
-    if sq == 0 or budget == 0 or num_pools == 0:
+    pool_topk = torch.full((batch, num_rows, budget), -1, dtype=torch.int64, device=q.device)
+    if num_rows == 0 or budget == 0 or num_pools == 0:
         return pool_topk
 
     bytes_per_token = batch * n_heads * num_pools * 4
-    chunk_size = min(sq, max(1, _KPOOL_SCORE_CHUNK_BYTES // max(1, bytes_per_token)))
+    chunk_size = min(num_rows, max(1, _KPOOL_SCORE_CHUNK_BYTES // max(1, bytes_per_token)))
     select_k = min(budget, num_pools)
     k_fp32 = k_pooled.float()
     pool_exists_mask = pool_exists.view(1, 1, -1) if pool_exists is not None else None
 
-    for start in range(0, sq, chunk_size):
-        end = min(start + chunk_size, sq)
+    for start in range(query_start, query_end, chunk_size):
+        end = min(start + chunk_size, query_end)
         scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
         if use_relu:
             scores.relu_()
@@ -1062,9 +1072,52 @@ def _kpool_topk_from_score_chunks(
 
         topk_scores, topk_indices = score_chunk.topk(select_k, dim=-1)
         topk_indices.masked_fill_(topk_scores == float('-inf'), -1)
-        pool_topk[:, start:end, :select_k] = topk_indices
+        pool_topk[:, start - query_start : end - query_start, :select_k] = topk_indices
 
     return pool_topk
+
+
+def _kpool_query_shard_bounds(sq: int, shard_size: int, shard_rank: int) -> Tuple[int, int, int]:
+    """Return ``(query_start, query_end, rows_per_shard)`` for one rank's contiguous query slice.
+
+    Every shard owns ``ceil(sq / shard_size)`` rows except that trailing shards are clipped
+    at ``sq`` (and can be empty when ``sq < shard_size``).
+    """
+    rows_per_shard = -(-sq // shard_size)
+    query_start = min(sq, shard_rank * rows_per_shard)
+    query_end = min(sq, query_start + rows_per_shard)
+    return query_start, query_end, rows_per_shard
+
+
+def _all_gather_kpool_query_shards(
+    local_pool_topk: torch.Tensor,
+    sq: int,
+    rows_per_shard: int,
+    group: torch.distributed.ProcessGroup,
+) -> torch.Tensor:
+    """All-gather per-rank KPool selections into the full ``[batch, sq, budget]`` tensor.
+
+    Args:
+        local_pool_topk: This rank's ``[batch, rows, budget]`` pool IDs, ``rows <= rows_per_shard``.
+        sq: Total number of query rows.
+        rows_per_shard: Rows owned by every shard before clipping at ``sq``.
+        group: Process group the query rows are split across, in rank order.
+
+    Returns:
+        ``[batch, sq, budget]`` int64 pool IDs, -1 for unused slots.
+    """
+    group_size = group.size()
+    batch, local_rows, budget = local_pool_topk.shape
+    # Pool IDs fit in int32, which halves the all-gather volume.
+    local = local_pool_topk.to(torch.int32)
+    if local_rows < rows_per_shard:
+        local = torch.nn.functional.pad(local, (0, 0, 0, rows_per_shard - local_rows), value=-1)
+    gathered = torch.empty(
+        (group_size * batch, rows_per_shard, budget), dtype=torch.int32, device=local.device
+    )
+    torch.distributed.all_gather_into_tensor(gathered, local.contiguous(), group=group)
+    gathered = gathered.view(group_size, batch, rows_per_shard, budget).transpose(0, 1)
+    return gathered.reshape(batch, group_size * rows_per_shard, budget)[:, :sq].to(torch.int64)
 
 
 def _mask_topk_tokens_with_token_mask(
@@ -1099,6 +1152,7 @@ def fused_qk_topk_kpool(
     fp8_indexer: bool = False,
     rotate_activation_enabled: bool = False,
     return_index_scores: bool = True,
+    query_shard_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Select complete causal pools and append each query's incomplete tail.
 
@@ -1107,7 +1161,16 @@ def fused_qk_topk_kpool(
     coordinates. Output indices are [batch, queries, index_topk + pool_size - 1]
     when always_select_tail is enabled, with -1 for unused slots.
     Set return_index_scores=False to select in query chunks without retaining scores.
+
+    query_shard_group splits the O(queries * pools) scoring across a process group whose
+    ranks all hold identical inputs (e.g. the tensor-parallel group, whose ranks see the
+    same gathered sequence). Each rank scores and selects pools only for its contiguous
+    slice of query rows; the int32 pool IDs are then all-gathered. Every rank returns the
+    same indices as an unsharded call. Requires return_index_scores=False.
     """
+    shard_size = query_shard_group.size() if query_shard_group is not None else 1
+    if shard_size > 1 and return_index_scores:
+        raise ValueError("query_shard_group requires return_index_scores=False.")
     sk = k.size(0)
 
     # Packed pools restart at each document boundary.
@@ -1178,6 +1241,9 @@ def fused_qk_topk_kpool(
         if mask is not None:
             assert mask.dtype == torch.float32, "mask dtype must be float32"
         index_scores = None
+        query_start, query_end, rows_per_shard = _kpool_query_shard_bounds(
+            q.size(0), shard_size, query_shard_group.rank() if shard_size > 1 else 0
+        )
         pool_topk = _kpool_topk_from_score_chunks(
             q=q,
             k_pooled=k_pooled,
@@ -1192,7 +1258,13 @@ def fused_qk_topk_kpool(
             pool_token_base=pool_token_base,
             sk=sk,
             use_relu=use_relu,
+            query_start=query_start,
+            query_end=query_end,
         )
+        if shard_size > 1:
+            pool_topk = _all_gather_kpool_query_shards(
+                pool_topk, q.size(0), rows_per_shard, query_shard_group
+            )
 
     # Expand [batch * queries, pools] to a fixed token budget.
     rows = pool_topk.shape[0] * pool_topk.shape[1]
@@ -2369,6 +2441,13 @@ class DSAIndexer(MegatronModule):
                 fp8_indexer=self.index_kpool_use_quantization,
                 rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
                 return_index_scores=return_index_scores,
+                query_shard_group=(
+                    self.pg_collection.tp
+                    if self.config.dsa_indexer_kpool_shard_queries_across_tp
+                    and not return_index_scores
+                    and get_pg_size(self.pg_collection.tp) > 1
+                    else None
+                ),
             )
             self._kpool_gate_score = None
         else:
@@ -3220,6 +3299,15 @@ class DSAttention(MegatronModule):
             # Get top-k indices
             # ===================================
             if _is_kpool:
+                # Every TP rank holds the same full-sequence indexer inputs unless the query
+                # rows are already sequence-local, so the TP group can split the query rows.
+                kpool_query_shard_group = (
+                    tp_group
+                    if self.config.dsa_indexer_kpool_shard_queries_across_tp
+                    and tp_size > 1
+                    and not sequence_parallel_query_is_local
+                    else None
+                )
                 # KPool selection is discrete and does not need an autograd graph.
                 with torch.no_grad():
                     _index_scores, topk_indices = fused_qk_topk_kpool(
@@ -3240,6 +3328,7 @@ class DSAttention(MegatronModule):
                         fp8_indexer=self.indexer.index_kpool_use_quantization,
                         rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
                         return_index_scores=False,
+                        query_shard_group=kpool_query_shard_group,
                     )
                     del _index_scores
                     self.indexer._kpool_gate_score = None
