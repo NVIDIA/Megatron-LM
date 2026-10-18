@@ -17,9 +17,3 @@ from tests.unit_tests.ssm.gated_delta_net_test_cases import GatedDeltaNetModuleT
 @pytest.mark.internal
 class TestGatedDeltaNet(GatedDeltaNetModuleTestCases):
     """GDN2 module correctness across the original parallel layouts."""
-
-    # Recurring THD stalls in TP1/CP1 and TP2/CP2; see #7742.
-    @pytest.mark.flaky_in_dev
-    def test_gpu_forward_thd_correctness(self):
-        """Keep the shared THD assertions with a GDN2-only development quarantine."""
-        super().test_gpu_forward_thd_correctness()
