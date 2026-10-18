@@ -35,6 +35,18 @@ def pytest_configure(config):
     os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
+    # tests/unit_tests/__init__.py turns off the Inductor compile-pool quiesce before
+    # torch is imported (pytorch/pytorch#200848). Fail loudly if an import reordering defeats that.
+    if os.environ.get("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL") == "0":
+        import torch._inductor.config as inductor_config
+
+        if hasattr(inductor_config, "quiesce_async_compile_pool"):
+            assert inductor_config.quiesce_async_compile_pool is False, (
+                "TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL=0 was applied after "
+                "torch._inductor.config was imported; set it earlier so the compile sidecar "
+                "never re-forks its workers."
+            )
+
 
 def pytest_addoption(parser):
     """
