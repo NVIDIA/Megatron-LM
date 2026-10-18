@@ -7,6 +7,8 @@ This module owns state that exists only for local CUDA-graph capture and replay:
 * capture-local ownership of asynchronous GTP communication;
 * persistent wgrad ring buffers whose lifetime may cross graph boundaries;
 * routing graph-owned allocations into the shared CUDA-graph memory pool.
+
+The ring allocation helpers also serve persistent eager wgrads.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import logging
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Self
 
 import torch
 
@@ -76,6 +78,21 @@ class GraphWgradRingSlot:
     ready_event: torch.cuda.Event
     key: tuple
     index: int
+
+    @classmethod
+    def allocate(cls, param, *, key: tuple, index: int = 0) -> Self:
+        """Allocate padded persistent storage; the caller records its initial ready event."""
+        symm = is_gtp_symm_pool_registered(param.group)
+        with gtp_symm_pool_ctx(param.group) if symm else nullcontext():
+            tensor = torch.empty(
+                param._unsharded_shape_padded,
+                dtype=param.main_grad.dtype,
+                device=param.device,
+                memory_format=torch.contiguous_format,
+            )
+        if param.pad_length > 0:
+            tensor.narrow(0, param._unsharded_shape[0], param.pad_length).zero_()
+        return cls(tensor=tensor, ready_event=torch.cuda.Event(external=True), key=key, index=index)
 
 
 @dataclass
@@ -216,6 +233,35 @@ def track_gtp_capture_comms():
 _GRAPH_WGRAD_RINGS: dict[tuple, list[GraphWgradRingSlot]] = {}
 
 
+def wgrad_ring_key(param, stream_key: Callable[[str, object], tuple]) -> tuple:
+    """Keep scheduling domains, grouped FC roles, experts and padding layouts distinct."""
+    return (
+        stream_key(param.chain_id, param.group),
+        param.chain_id,
+        param._unsharded_shape,
+        param._unsharded_shape_padded,
+        param.main_grad.dtype,
+        param.expert_idx,
+    )
+
+
+def allocate_wgrad_ring(
+    matching_params: list, *, key: tuple, ring_size: int, slot_type: type[GraphWgradRingSlot]
+) -> list[GraphWgradRingSlot]:
+    """Allocate bounded stable storage for either mode; callers bind writers to slots."""
+    slot_count = min(ring_size, len(matching_params))
+    exemplar = matching_params[0]
+    assert all(p.group is exemplar.group for p in matching_params), (
+        "GTP wgrad ring slots are allocated from the exemplar's symmetric pool, so "
+        "every param sharing a ring key must share its process group"
+    )
+    slots = [slot_type.allocate(exemplar, key=key, index=i) for i in range(slot_count)]
+    # Publish the allocation's zero padding before a writer on another stream can use it.
+    for slot in slots:
+        slot.ready_event.record()
+    return slots
+
+
 def allocate_graph_wgrad_rings(
     params: Iterable,
     *,
@@ -250,13 +296,7 @@ def allocate_graph_wgrad_rings(
                 raise RuntimeError(
                     "GTP wgrad rings must be initialized after DDP creates param.main_grad"
                 )
-            key = (
-                stream_key(param.chain_id, param.group),
-                param._unsharded_shape,
-                param._unsharded_shape_padded,
-                param.main_grad.dtype,
-                param.expert_idx,
-            )
+            key = wgrad_ring_key(param, stream_key)
             params_by_key[key].append(param)
 
     # Symm-RS: GRAPHED chains send their persistent ring slot directly, so allocating the
@@ -267,38 +307,15 @@ def allocate_graph_wgrad_rings(
     buffer_count = 0
     new_slots = []
     for key, matching_params in params_by_key.items():
-        slot_count = min(ring_size, len(matching_params))
-        slots = []
-        exemplar = matching_params[0]
-        assert all(p.group is exemplar.group for p in matching_params), (
-            "GTP wgrad ring slots are allocated from the exemplar's symmetric pool, so "
-            "every param sharing a ring key must share its process group"
+        slots = allocate_wgrad_ring(
+            matching_params, key=key, ring_size=ring_size, slot_type=GraphWgradRingSlot
         )
-        symm = is_gtp_symm_pool_registered(exemplar.group)
-        for slot_index in range(slot_count):
-            with gtp_symm_pool_ctx(exemplar.group) if symm else nullcontext():
-                tensor = torch.empty(
-                    exemplar._unsharded_shape_padded,
-                    dtype=exemplar.main_grad.dtype,
-                    device=exemplar.device,
-                    memory_format=torch.contiguous_format,
-                )
-            if exemplar.pad_length > 0:
-                tensor.narrow(0, exemplar._unsharded_shape[0], exemplar.pad_length).zero_()
-            slot = GraphWgradRingSlot(
-                tensor=tensor,
-                ready_event=torch.cuda.Event(external=True),
-                key=key,
-                index=slot_index,
-            )
-            slots.append(slot)
-            new_slots.append(slot)
-            total_bytes += tensor.numel() * tensor.element_size()
-            buffer_count += 1
-
+        new_slots.extend(slots)
+        total_bytes += sum(slot.tensor.numel() * slot.tensor.element_size() for slot in slots)
+        buffer_count += len(slots)
         _GRAPH_WGRAD_RINGS[key] = slots
         for param_index, param in enumerate(matching_params):
-            slot = slots[param_index % slot_count]
+            slot = slots[param_index % len(slots)]
             param._gtp_graph_wgrad_ring_slot = slot
             if param.pad_length > 0:
                 param._gtp_graph_wgrad_ring_view = slot.tensor.narrow(
@@ -307,10 +324,7 @@ def allocate_graph_wgrad_rings(
             else:
                 param._gtp_graph_wgrad_ring_view = slot.tensor
 
-    # Initially every slot is available. Later generations are recorded on the RS stream after NCCL
-    # has finished reading the slot.
-    for slot in new_slots:
-        slot.ready_event.record()
+    # Complete initial readiness events before capture/replay may wait on them.
     if new_slots:
         torch.cuda.current_stream().synchronize()
 

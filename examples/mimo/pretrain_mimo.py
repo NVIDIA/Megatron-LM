@@ -94,7 +94,7 @@ def main() -> None:
     model_cfg = MimoBuildConfig()
     cfg = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(cfg)
-    initialize_runtime_services(args, build_tokenizer=False)
+    initialize_runtime_services(args, build_tokenizer=False, training=True)
     provider = resolve_provider(args)
 
     prefetch_loader = None
@@ -103,7 +103,7 @@ def main() -> None:
     # generic over any number of encoder grids in the topology.
     encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
     specs = build_module_grid_specs(args, args.world_size, encoder_name)
-    topology = create_topology(specs, args.high_priority_stream_groups)
+    topology = create_topology(specs, cfg.dist.high_priority_stream_groups)
 
     communicator = provider.build_communicator(args, topology)
 

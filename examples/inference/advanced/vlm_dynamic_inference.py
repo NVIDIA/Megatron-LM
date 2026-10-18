@@ -150,6 +150,11 @@ def _print_resolved_args(title, args):
 
 
 _MIMO_LANGUAGE_MODEL_PREFIX = 'language_model.module.module.'
+# A checkpoint saved without training args (e.g. by Megatron-Bridge) stores LLaVAModel's own key
+# names, so the MIMO checkpoint model loads it with every prefix mapped to itself.
+_LLAVA_CHECKPOINT_PREFIX_MAP = {
+    prefix: prefix for prefix in ('language_model.', 'vision_model.', 'vision_projection.')
+}
 # Captures (modality submodule prefix, encoder name) from a MIMO vision encoder key.
 _MIMO_ENCODER_KEY = re.compile(r'(modality_submodules\.[^.]+\.(?:module\.)*)encoders\.([^.]+)\.')
 # Training-only buffers that checkpoints may carry but inference models never build.
@@ -167,15 +172,23 @@ _ENCODER_REGISTRY_ATTRS = {
 }
 
 
-def _checkpoint_tensor_keys(args):
-    """Return the tensor keys of the checkpoint iteration that --load resolves to."""
+def _loaded_checkpoint_dir(args):
+    """Return the checkpoint iteration directory that --load resolves to.
+
+    Without --ckpt-step this reads the tracker file, which all-reduces across ranks, so every
+    rank must call it.
+    """
     if args.ckpt_step is not None:
         release = False
     else:
         _, release = read_metadata(get_checkpoint_tracker_filename(args.load))
-    checkpoint_dir = get_checkpoint_name(
-        args.load, get_loaded_iteration(), release, return_base_dir=True
-    )
+    return get_checkpoint_name(args.load, get_loaded_iteration(), release, return_base_dir=True)
+
+
+def _checkpoint_tensor_keys(args, checkpoint_dir=None):
+    """Return the tensor keys of the checkpoint iteration that --load resolves to."""
+    if checkpoint_dir is None:
+        checkpoint_dir = _loaded_checkpoint_dir(args)
     return dist_checkpointing.load_tensors_metadata(checkpoint_dir).keys()
 
 
@@ -317,6 +330,7 @@ def _check_mimo_checkpoint_fully_loaded(args, model):
     assert requested is not None, "the model has not built a sharded state dict for the load"
     gathered = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(gathered, sorted(requested))
+    checkpoint_dir = _loaded_checkpoint_dir(args)
 
     unloaded = []
     if torch.distributed.get_rank() == 0:
@@ -324,7 +338,7 @@ def _check_mimo_checkpoint_fully_loaded(args, model):
         checkpoint_prefixes = tuple(args.mimo_checkpoint_prefix_map.values())
         unloaded = sorted(
             key
-            for key in _checkpoint_tensor_keys(args)
+            for key in _checkpoint_tensor_keys(args, checkpoint_dir)
             if key.startswith(checkpoint_prefixes)
             and not key.endswith(_TRAINING_ONLY_CHECKPOINT_SUFFIXES)
             # Factories (e.g. fused in_proj) expand into sub-keys of the requested key.
@@ -346,7 +360,9 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     """Peek at the checkpoint's saved training args to detect VLM vs GPT.
 
     Returns True if the checkpoint was trained as a VLM (has
-    ``language_model_type``, or is a MIMO checkpoint), False otherwise. As a side-effect, copies
+    ``language_model_type``, or is a MIMO checkpoint), False otherwise. A checkpoint saved
+    without training args (e.g. by Megatron-Bridge) is a VLM when --vision-model-type is passed;
+    its architecture then comes entirely from the command line. As a side-effect, copies
     VLM-specific args from the checkpoint into the current args namespace
     so the multimodal model_provider can access them, and records resolution
     provenance on ``args._vlm_arg_resolution`` for the diagnostic dump.
@@ -358,7 +374,15 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     user_passed_attrs = user_passed_attrs or set()
     result = load_args_from_checkpoint(args)
     if not isinstance(result, tuple):
-        return False
+        if 'vision_model_type' not in user_passed_attrs:
+            return False
+        # No saved args may also mean no checkpoint at all; fail now rather than after every rank
+        # builds the full model.
+        if args.load is None or not os.path.isfile(get_checkpoint_tracker_filename(args.load)):
+            raise ValueError(f'No checkpoint found at --load {args.load}')
+        args.mimo_checkpoint_prefix_map = _LLAVA_CHECKPOINT_PREFIX_MAP
+        _resolve_mimo_vision_args(args, None, user_passed_attrs)
+        return True
 
     _, checkpoint_args = result
     # MIMO training records its module-grid layout (--mimo-llm-*), and its checkpoints nest each

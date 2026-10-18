@@ -3,7 +3,9 @@
 """Tests for config construction before training runtime initialization."""
 
 from argparse import ArgumentParser, Namespace
+from contextlib import nullcontext
 from copy import deepcopy
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,13 +13,14 @@ import pytest
 
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
-from megatron.training import arguments, global_vars
+from megatron.training import arguments, global_vars, initialize
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
     inference_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
+from megatron.training.config import DistributedInitConfig
 from megatron.training.config.training_config import TokenizerConfig
 
 
@@ -44,6 +47,148 @@ def _runtime_args():
         exit_signal_handler_for_training=False,
         disable_jit_fuser=False,
     )
+
+
+@pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
+@pytest.mark.parametrize(
+    "overrides", [None, "overlap.yaml", {"qkv_fprop": {"method": "ring_exchange"}}]
+)
+def test_tp_user_buffer_overrides_reach_model_config(adapter, overrides):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.tp_comm_overlap_cfg = overrides
+    config = adapter(
+        args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
+    )
+    assert config.tp_comm_overlap_cfg == overrides
+
+
+@pytest.mark.parametrize("te_version", ["1.8.0", "1.9.0", "2.7.0"])
+@pytest.mark.parametrize("fp8,bf16_layers", [(None, 0), ("hybrid", 0), ("hybrid", 1)])
+@pytest.mark.parametrize("override_source", ["none", "dict", "file"])
+def test_tp_user_buffers_use_config_and_explicit_batch_shape(
+    monkeypatch, tmp_path, te_version, fp8, bf16_layers, override_source
+):
+    from transformer_engine.pytorch import module as te_module
+
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=128,
+        num_attention_heads=8,
+        tensor_model_parallel_size=2,
+        context_parallel_size=2,
+        fp8=fp8,
+        fp8_recipe="tensorwise",
+        first_last_layers_bf16=bool(bf16_layers),
+        num_layers_at_start_in_bf16=bf16_layers,
+        tp_comm_bootstrap_backend="gloo",
+    )
+    overrides = {"qkv_fprop": {"method": "ring_exchange"}}
+    source = overrides if override_source == "dict" else None
+    if override_source == "file":
+        path = tmp_path / "overlap.yaml"
+        path.write_text("qkv_fprop:\n  method: ring_exchange\n")
+        source = str(path)
+    initialize_ub, create_group = Mock(), Mock()
+    modes = SimpleNamespace(NONE="none", FP8="fp8")
+    monkeypatch.setattr(te_module.base, "initialize_ub", initialize_ub)
+    monkeypatch.setattr(te_module.base, "UserBufferQuantizationMode", modes, raising=False)
+    monkeypatch.setattr(initialize, "create_group", create_group)
+    monkeypatch.setattr(
+        initialize, "get_args", Mock(side_effect=AssertionError("global args read"))
+    )
+    monkeypatch.setattr(initialize, "get_te_version", lambda: te_version)
+    monkeypatch.setattr(
+        initialize,
+        "is_te_min_version",
+        lambda minimum: tuple(map(int, te_version.split(".")))
+        >= tuple(map(int, minimum.split("."))),
+    )
+    warning = (
+        pytest.warns(UserWarning, match="supports only MPI")
+        if te_version == "1.8.0"
+        else nullcontext()
+    )
+    with warning:
+        initialize._initialize_tp_communicators(
+            config, sequence_length=96, micro_batch_size=3, tp_comm_overlap_cfg=source
+        )
+    expected = dict(shape=[144, 128], tp_size=2, ub_cfgs={} if source is None else overrides)
+    if te_version == "2.7.0":
+        expected["quantization_modes"] = [modes.FP8 if fp8 else modes.NONE]
+        if bf16_layers:
+            expected["quantization_modes"].append(modes.NONE)
+    else:
+        expected["use_fp8"] = fp8 is not None
+    if te_version == "1.8.0":
+        create_group.assert_called_once_with(backend="mpi", group_desc="TP_BOOTSTRAP_GROUP_MPI")
+    else:
+        expected["bootstrap_backend"] = "gloo"
+        create_group.assert_not_called()
+    initialize_ub.assert_called_once_with(**expected)
+
+
+def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_config):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.rank, args.world_size = 0, 4
+    # These topology values are normally resolved by validate_args.
+    args.gtp_weight_remat_size = args.expert_gtp_weight_remat_size = 1
+    args.gtp_remat_num_sequence_shards = 1
+    args.virtual_pipeline_model_parallel_size = None
+    args.expert_tensor_parallel_size = 1
+    original_args = vars(args).copy()
+    # Keep the legacy defaults different so an accidental args read is detected.
+    run_config.dist = DistributedInitConfig(
+        distributed_backend="gloo",
+        distributed_timeout_minutes=37,
+        local_rank=1,
+        use_sharp=True,
+        sharp_enabled_group="dp_replica",
+        use_gloo_process_groups=False,
+        high_priority_stream_groups=["tp"],
+        use_tp_pp_dp_mapping=True,
+        nccl_communicator_config_path="owned.yaml",
+    )
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(initialize, "print_rank_0", Mock())
+    monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 2)
+    set_device = Mock()
+    monkeypatch.setattr(initialize.torch.cuda, "set_device", set_device)
+    monkeypatch.setattr(initialize.torch.distributed, "is_initialized", lambda: False)
+    init_pg, init_mpu = Mock(), Mock()
+    monkeypatch.setattr(initialize.torch.distributed, "init_process_group", init_pg)
+    monkeypatch.setattr(initialize.inprocess_restart, "maybe_force_nccl_backend_init", Mock())
+    monkeypatch.setattr(initialize.mpu, "model_parallel_is_initialized", lambda: False)
+    monkeypatch.setattr(initialize.mpu, "initialize_model_parallel", init_mpu)
+    for name in (
+        "get_tensor_model_parallel_world_size",
+        "get_pipeline_model_parallel_world_size",
+        "get_gtp_weight_remat_world_size",
+    ):
+        monkeypatch.setattr(initialize.mpu, name, lambda: 1)
+    for name in ("TORCH_FR_DUMP_TEMP_FILE", "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    store = object()
+
+    initialize._initialize_distributed(None, None, store)
+
+    set_device.assert_called_once_with(1)
+    init_pg.assert_called_once_with(
+        backend="gloo", store=store, world_size=4, rank=0, timeout=timedelta(minutes=37)
+    )
+    kwargs = init_mpu.call_args.kwargs
+    assert kwargs["distributed_timeout_minutes"] == 37
+    assert kwargs["nccl_communicator_config_path"] == "owned.yaml"
+    assert kwargs["order"] == "tp-cp-ep-pp-dp"
+    assert kwargs["high_priority_stream_groups"] == ["tp"]
+    assert kwargs["use_sharp"] is True
+    assert kwargs["gtp_remat_num_sequence_shards"] == 1
+    assert kwargs["sharp_enabled_group"] == "dp_replica"
+    assert kwargs["create_gloo_process_groups"] is False
+    assert vars(args) == original_args
 
 
 @pytest.mark.parametrize("experimental", [False, True])
@@ -97,7 +242,7 @@ def test_explicit_inference_bootstrap_preserves_sparse_args(monkeypatch, isolate
     assert cfg.checkpoint.fully_parallel_save is (True if aliases is None else aliases)
     assert cfg.checkpoint.fully_parallel_load is bool(aliases)
     assert cfg.profiling.use_nsys_profiler is bool(aliases)
-    initialize.assert_called_once_with(args, build_tokenizer=True)
+    initialize.assert_called_once_with(args, build_tokenizer=True, training=True)
     with pytest.raises(AssertionError, match="already initialized"):
         global_vars.set_global_variables(args, cfg)
 
@@ -117,7 +262,7 @@ def test_explicit_training_bootstrap_preserves_config(monkeypatch, isolated_glob
     assert global_vars.get_run_config() is cfg
     assert global_vars.get_run_config().train.train_iters == 7
     assert global_vars.get_run_config().logger.log_interval == 3
-    initialize.assert_called_once_with(args, build_tokenizer=False)
+    initialize.assert_called_once_with(args, build_tokenizer=False, training=True)
 
 
 def test_bootstrap_rejects_registered_config_before_setting_args(monkeypatch, isolated_globals):
@@ -230,8 +375,9 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
         "_set_telemetry",
     ):
 
-        def record(received_args, service=name):
+        def record(received_args, service=name, **kwargs):
             assert received_args is args
+            assert kwargs == ({"include_training": True} if service == "_set_telemetry" else {})
             calls.append(service)
 
         monkeypatch.setattr(global_vars, name, record)
@@ -248,18 +394,18 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
     if use_bootstrap:
         global_vars.set_global_variables(args, cfg)
     else:
-        global_vars.initialize_runtime_services(args)
+        global_vars.initialize_runtime_services(args, training=True)
     assert isinstance(global_vars.get_train_state(), global_vars.TrainState)
     assert calls == [
-        "microbatches",
         "_build_tokenizer",
-        "_set_tensorboard_writer",
         "_set_wandb_writer",
+        "_set_telemetry",
+        "microbatches",
+        "_set_tensorboard_writer",
         "_set_one_logger",
         "_set_adlr_autoresume",
         "_set_timers",
         "_set_energy_monitor",
-        "_set_telemetry",
         "_set_train_state",
     ]
     microbatches.assert_called_once_with(
@@ -411,7 +557,7 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
     args.padded_vocab_size = cli_vocab
     args.tensor_model_parallel_size = 2
     checkpoint_args = Namespace(padded_vocab_size=512)
-    state = {"args": checkpoint_args, "iteration": 17, "checkpoint_version": 3.0}
+    state = {"args": checkpoint_args, "checkpoint_version": 3.0}
     monkeypatch.setattr(
         checkpointing,
         "_load_base_checkpoint",
@@ -419,7 +565,6 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
     )
 
     checkpointing.load_args_from_checkpoint(args)
-    assert args.iteration == 17
     model = adapter(
         args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
     )

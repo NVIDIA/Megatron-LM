@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import inspect
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -112,21 +113,38 @@ class LanguageModule(MegatronModule):
         return False
 
     # pylint: disable=line-too-long
-    def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
+    def compute_language_model_loss(
+        self, labels: Tensor, logits: Tensor, return_argmax: bool = False
+    ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
         """Computes the language model loss (Cross entropy across vocabulary)
 
         Args:
             labels (Tensor): The labels of dimension [batch size, seq length]
             logits (Tensor): The final logits returned by the output layer of the transformer model
+            return_argmax (bool): Also return the argmax of the logits over the full vocabulary,
+                [seq length, batch size], when the cross entropy finds it in the same pass (TE's
+                fused cross entropy), else None.
 
         Returns:
-            Tensor: Loss tensor of dimensions [batch size, sequence_length]
+            Tensor: Loss tensor of dimensions [batch size, sequence_length], with return_argmax
+            as a tuple with the argmax.
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
-        loss = self.vocab_parallel_cross_entropy(logits, labels, self.tp_group)
+        argmax = None
+        if return_argmax and (
+            "return_argmax" in inspect.signature(self.vocab_parallel_cross_entropy).parameters
+        ):
+            loss, argmax = self.vocab_parallel_cross_entropy(
+                logits, labels, self.tp_group, return_argmax=True
+            )
+        else:
+            loss = self.vocab_parallel_cross_entropy(logits, labels, self.tp_group)
         # [s b] => [b, s]
-        return loss.transpose(0, 1).contiguous()
+        loss = loss.transpose(0, 1).contiguous()
+        if return_argmax:
+            return loss, argmax
+        return loss
 
     def setup_embeddings_and_output_layer(self) -> None:
         """Sets up embedding layer in first stage and output layer in last stage.

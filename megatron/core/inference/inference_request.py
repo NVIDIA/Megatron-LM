@@ -562,6 +562,8 @@ class InferenceRequest:
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
+    # Set by the engine at termination, preserved across serialization/merging.
+    finish_reason: Optional[str] = None
     tpot: List[float] = field(default_factory=list)
 
     def __post_init__(self):
@@ -1014,7 +1016,10 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
-        return [getattr(sp, field) for field, _ in self.get_metadata_types()]
+        return [
+            -1 if field == "seed" and sp.seed is None else getattr(sp, field)
+            for field, _ in self.get_metadata_types()
+        ]
 
     @staticmethod
     def get_metadata_types() -> List[Tuple[str, torch.dtype]]:
@@ -1033,6 +1038,7 @@ class DynamicInferenceRequest(InferenceRequest):
             ("return_log_probs", torch.bool),
             ("skip_prompt_log_probs", torch.bool),
             ("top_n_logprobs", torch.int32),
+            ("seed", torch.int64),
         ]
 
     def add_event(
@@ -1322,6 +1328,7 @@ class DynamicInferenceRequestRecord:
             ttft=ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
+            finish_reason=self.requests[-1].finish_reason,
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
