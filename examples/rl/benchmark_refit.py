@@ -250,7 +250,7 @@ def benchmark_collocated():
         pp_size=dst_pp,
         ep_size=dst_ep,
         expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
     )
 
     dst_config = core_transformer_config_from_args(args)
@@ -343,7 +343,7 @@ def benchmark_non_collocated():
         pp_size=dst_pp,
         ep_size=dst_ep,
         expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
         rank_offset=src_world,
     )
     torch.distributed.barrier()
