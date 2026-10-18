@@ -670,9 +670,10 @@ class HyperConnectionModule(MegatronModule):
         """
         s, b, nC = x.shape
         C = nC // n
-        # Average all streams
+        # Average all streams. Accumulate the reduction in fp32 (then downcast to
+        # the input dtype) to avoid bf16 accumulation drift in the final contracted stream.
         x_streams = x.view(s, b, n, C)
-        contracted = x_streams.mean(dim=2)
+        contracted = x_streams.float().mean(dim=2).to(x.dtype)
         return contracted
 
     # ==================== Fused kernel placeholder ====================

@@ -845,8 +845,11 @@ class HybridStack(MegatronModule):
                 )
             else:
                 n = self.config.mhc_num_residual_streams
-                hidden_states = hidden_states.unflatten(-1, (n, self.config.hidden_size)).mean(
-                    dim=-2
+                hidden_states = (
+                    hidden_states.unflatten(-1, (n, self.config.hidden_size))
+                    .float()
+                    .mean(dim=-2)
+                    .to(hidden_states.dtype)
                 )
 
         # Final layer norm.
