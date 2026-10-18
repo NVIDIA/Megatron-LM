@@ -619,9 +619,10 @@ class TestRLUtils:
             use_distributed_optimizer=True,
             fp8="hybrid",
             fp8_recipe="mxfp8",
-            reuse_grad_buf_for_mxfp8_param_ag=True,
         )
         cfg = pretrain_cfg_container_from_args(args)
+        # Global setup validates the config, so introduce the invalid combination afterward.
+        cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
         with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
             cfg.validate()
         assert not cfg.ddp.grad_buffer_offload

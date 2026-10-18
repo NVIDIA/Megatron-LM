@@ -155,6 +155,7 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(
     run_config.dist.lazy_mpu_init = lazy
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     for name in (
+        "initialize_runtime_services",
         "setup_logging",
         "initialize_rerun_state_machine",
         "_initialize_distributed",
