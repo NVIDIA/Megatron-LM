@@ -70,6 +70,12 @@ from megatron.training.utils.checkpoint_utils import (
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
+from .ckpt.glu_checkpointing import (
+    prepare_glu_checkpoint_for_load,
+    prepare_glu_checkpoint_for_save,
+    validate_glu_checkpoint_backend,
+    validate_glu_optimizer_layout,
+)
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
@@ -127,22 +133,6 @@ _WIDE_RESIDUAL_ARG_DEFAULTS = (
     ('wide_residual_retention_init', 0.999),
     ('wide_residual_retention_max_forget', 0.10),
 )
-
-
-def _maybe_compact_rollout_bank(iteration):
-    """Compact the rollout bank without making checkpointing depend eagerly on RL."""
-    from megatron.rl.rl_utils import maybe_compact_rollout_bank
-
-    maybe_compact_rollout_bank(iteration)
-
-
-def _register_rollout_bank_compaction(async_save_request, iteration):
-    """Compact the rollout bank after an asynchronous checkpoint becomes durable."""
-
-    def rollout_bank_finalize_fn(iteration=iteration):
-        _maybe_compact_rollout_bank(iteration)
-
-    async_save_request.add_finalize_fn(rollout_bank_finalize_fn)
 
 
 def set_checkpoint_version(value):
@@ -666,6 +656,7 @@ def save_checkpoint(
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    on_saved: Optional[Callable[[], None]] = None,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -690,6 +681,8 @@ def save_checkpoint(
         expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
         cp_group: Context-parallel group for dataloader saving. Falls back to the MPU group
             when available. Callers using CP without global MPU initialization must pass it.
+        on_saved: Called once the checkpoint is durable: after the barrier of a synchronous
+            save, as a finalize function of an asynchronous one.
     """
     start_ckpt = time()
     args = get_args()
@@ -866,6 +859,8 @@ def save_checkpoint(
                 rerun_state=rerun_state,
             )
 
+        validate_glu_checkpoint_backend(args, ckpt_format=ckpt_format)
+        state_dict = prepare_glu_checkpoint_for_save(state_dict, args)
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -1258,9 +1253,6 @@ def save_checkpoint(
         else:
             onelogger_finalize_fn()
 
-    # Conversion tools register an inference container, which has no RL section.
-    rl_config = getattr(get_run_config(), "rl", None)
-    durable_rollout_bank = rl_config is not None and rl_config.rl_durable_rollout_bank
     if args.async_save:
         # Schedule logits flush AFTER the checkpoint request so the persistent
         # worker processes checkpoint preload first (unblocking the main
@@ -1302,14 +1294,8 @@ def save_checkpoint(
                 finalize_fns=logits_finalize_fns,
             )
 
-        if (
-            durable_rollout_bank
-            and async_save_request is not None
-            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
-        ):
-            # Compact the bank once this async checkpoint becomes durable, so the
-            # bank's compacted-through T tracks the model checkpoint. Rank-0 only.
-            _register_rollout_bank_compaction(async_save_request, iteration)
+        if on_saved is not None and async_save_request is not None:
+            async_save_request.add_finalize_fn(on_saved)
         if async_save_request is not None:
             schedule_async_save(async_save_request)
         if logits_saver is not None:
@@ -1328,12 +1314,8 @@ def save_checkpoint(
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-        # Durable rollout bank: compact at the checkpoint boundary so the bank's
-        # compacted-through T tracks this (now durable) checkpoint. Only on sync
-        # saves; async saves compact in their durability finalize callback above.
-        # Rank-0 no-op otherwise.
-        if durable_rollout_bank:
-            _maybe_compact_rollout_bank(iteration)
+        if on_saved is not None:
+            on_saved()
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
 
@@ -2763,6 +2745,24 @@ def load_checkpoint(
     )
     gpt_compat_load_optim = gpt_compat_load_optim and not release and restore_training_state
 
+    def validate_glu_layout(checkpoint_state, is_release):
+        validate_glu_checkpoint_backend(
+            args, ckpt_format=ckpt_format, skip_load_to_model_and_opt=skip_load_to_model_and_opt
+        )
+        loading_optimizer = (
+            optimizer is not None
+            and not getattr(optimizer, 'is_stub_optimizer', False)
+            and not is_release
+            and (not args.finetune or gpt_compat_load_optim)
+            and not args.no_load_optim
+            and not getattr(checkpoint_state.get('args'), 'no_save_optim', False)
+        )
+        validate_glu_optimizer_layout(checkpoint_state, args, loading_optimizer=loading_optimizer)
+
+    if state_dict is not None:
+        # Check common metadata before DCP can write into model/optimizer storage.
+        validate_glu_layout(state_dict, release)
+
     if ckpt_format == 'torch_dist':
         if not hasattr(ckpt_args, 'tensor_model_parallel_size'):
             print_rank_0('WARNING: TP size not found in checkpoint args, using 1 as default.')
@@ -3086,6 +3086,11 @@ def load_checkpoint(
     if state_dict is None:
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
+
+    # Legacy checkpoints are first read here. Convert the state dict itself so
+    # --load-main-params-from-ckpt observes the same rows as model.load_state_dict.
+    validate_glu_layout(state_dict, release)
+    state_dict = prepare_glu_checkpoint_for_load(state_dict, args)
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
