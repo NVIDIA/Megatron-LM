@@ -564,6 +564,30 @@ def _simplified_index_scores(
     )
 
 
+def _simplified_decode_topk(
+    scores: torch.Tensor,
+    context_lengths: torch.Tensor,
+    topk: int,
+    *,
+    batch_invariant_mode: bool = False,
+) -> torch.Tensor:
+    """Select decode tokens, using stable tie breaking only in batch-invariant mode.
+
+    torch.topk does not fix the order or membership of tied scores when the
+    batch's padded context width changes. A stable order also fixes the sparse
+    attention kernel's floating-point accumulation order for each request.
+    """
+    if batch_invariant_mode:
+        indices = scores.argsort(dim=-1, descending=True, stable=True)[:, :topk].to(torch.int32)
+        indices.masked_fill_(indices >= context_lengths[:, None], -1)
+    else:
+        indices = scores.topk(min(topk, scores.size(-1)), dim=-1).indices.to(torch.int32)
+    # Keep the attention kernel's shared-memory capacity fixed for short contexts.
+    if indices.size(1) < topk:
+        indices = F.pad(indices, (0, topk - indices.size(1)), value=-1)
+    return indices.contiguous()
+
+
 def _simplified_qk_topk_naive(
     q_index: torch.Tensor,
     main_key: torch.Tensor,
@@ -826,15 +850,12 @@ class DSGQACoreAttention(MegatronModule):
                 kv_lengths[:num_decode_requests].to(torch.int32).contiguous(),
                 out=decode_scores,
             )
-            decode_topk = decode_scores.topk(
-                min(self.indexer.index_topk, max_context_length), dim=-1
-            ).indices.to(torch.int32)
-            # Keep the attention kernel's shared-memory capacity fixed even
-            # while short requests grow toward the configured routing top-k.
-            if decode_topk.size(1) < self.indexer.index_topk:
-                decode_topk = F.pad(
-                    decode_topk, (0, self.indexer.index_topk - decode_topk.size(1)), value=-1
-                )
+            decode_topk = _simplified_decode_topk(
+                decode_scores,
+                kv_lengths[:num_decode_requests],
+                self.indexer.index_topk,
+                batch_invariant_mode=self.config.batch_invariant_mode,
+            )
             decode_output = value_cache.new_empty(
                 (num_decode_requests, num_query_heads, value_cache.size(-1))
             )
