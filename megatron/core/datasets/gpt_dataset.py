@@ -14,7 +14,7 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
-from megatron.core.datasets.utils import Split
+from megatron.core.datasets.utils import Split, save_index_cache
 from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.tokenizers import MegatronTokenizerBase
 from megatron.core.utils import log_single_rank
@@ -637,12 +637,15 @@ class GPTDataset(MegatronDataset):
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
-                # Write the description
-                with open(path_to_description, "wt") as writer:
-                    writer.write(self.unique_description)
-                numpy.save(path_to_document_index, document_index, allow_pickle=True)
-                numpy.save(path_to_sample_index, sample_index, allow_pickle=True)
-                numpy.save(path_to_shuffle_index, shuffle_index, allow_pickle=True)
+                save_index_cache(
+                    path_to_description,
+                    self.unique_description,
+                    {
+                        path_to_document_index: document_index,
+                        path_to_sample_index: sample_index,
+                        path_to_shuffle_index: shuffle_index,
+                    },
+                )
             else:
                 log_single_rank(
                     logger,
