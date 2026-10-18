@@ -5,10 +5,17 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.distributed import (
+    DistributedDataParallel,
+    DistributedDataParallelConfig,
+    finalize_model_grads,
+)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_module_spec,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-from megatron.core.ssm.gated_delta_net import HAVE_FLA
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net import HAVE_FLA, HAVE_FLA_GDN2
 from megatron.core.ssm.gated_delta_net.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
@@ -79,6 +86,104 @@ def test_parallel_gated_delta_net_correctness(
         micro_batch_size=4,
         sequence_packing=sequence_packing,
     )
+
+
+@pytest.mark.parametrize("variant", ["gated_delta_net", "gdn2"])
+@pytest.mark.parametrize(("tp", "sp"), [(2, False), (4, False), (2, True), (4, True)])
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+def test_gdn_out_norm_grad_is_summed_across_tp(variant, tp, sp):
+    """The replicated out_norm weight must get the full-head gradient on every TP rank.
+
+    Each TP rank owns a slice of the value heads that out_norm scales, so its backward only
+    accumulates a partial gradient. After finalize_model_grads, the gradient must be the sum of
+    the partials over the TP group, identical on every TP rank, with and without sequence
+    parallelism.
+    """
+    if variant == "gdn2" and not HAVE_FLA_GDN2:
+        pytest.skip("FLA with GDN2 support is not installed.")
+    if Utils.world_size % tp != 0:
+        pytest.skip(f"world size {Utils.world_size} is not divisible by tp={tp}")
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+    try:
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        dp_group = parallel_state.get_data_parallel_group()
+        config = TransformerConfig(
+            hidden_size=128,
+            linear_conv_kernel_dim=2,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+            num_layers=1,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            num_attention_heads=8,
+            activation_func=F.silu,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=sp,
+            experimental_attention_variant=variant,
+            linear_attention_freq=[1],
+            transformer_impl="transformer_engine",
+        )
+        gdn_spec = get_experimental_attention_variant_module_spec(config=config)
+        gdn = gdn_spec.module(
+            config,
+            submodules=gdn_spec.submodules,
+            layer_number=1,
+            pg_collection=ProcessGroupCollection(
+                tp=tp_group, cp=parallel_state.get_context_parallel_group()
+            ),
+        ).cuda()
+        model = DistributedDataParallel(
+            config, DistributedDataParallelConfig(grad_reduce_in_fp32=True), gdn
+        )
+
+        # The same full-sequence input and loss weights on every rank.
+        seq_length, micro_batch_size = 64, 2
+        torch.manual_seed(0)
+        shape = (seq_length, micro_batch_size, config.hidden_size)
+        hidden_states = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        loss_weights = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        if sp:
+            local_seq_length = seq_length // tp
+            local_slice = slice(
+                tp_group.rank() * local_seq_length, (tp_group.rank() + 1) * local_seq_length
+            )
+            hidden_states = hidden_states[local_slice]
+            loss_weights = loss_weights[local_slice]
+
+        model.zero_grad_buffer()
+        output, _ = model(hidden_states.requires_grad_(), attention_mask=None)
+        (output.float() * loss_weights.float()).sum().backward()
+
+        params = list(gdn.out_norm.parameters())
+        assert params, "out_norm has no parameters"
+        # Before finalize_model_grads, main_grad holds this rank's partial (own-heads) gradient.
+        expected = []
+        for param in params:
+            grad = param.main_grad.detach().clone()
+            torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+            torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.AVG, group=dp_group)
+            expected.append(grad)
+
+        finalize_model_grads([model])
+
+        for param, expected_grad in zip(params, expected):
+            grad = param.main_grad.detach()
+            gathered = [torch.empty_like(grad) for _ in range(tp)]
+            torch.distributed.all_gather(gathered, grad.contiguous(), group=tp_group)
+            for rank, other in enumerate(gathered):
+                assert torch.equal(
+                    other, gathered[0]
+                ), f"out_norm main_grad differs between TP rank 0 and TP rank {rank}"
+            torch.testing.assert_close(grad, expected_grad)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("cp_size", [2, 4], scope="class")

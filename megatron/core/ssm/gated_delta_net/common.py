@@ -301,6 +301,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
+        # The out_norm weight is replicated on every TP rank but scales TP-split value heads,
+        # so each rank's backward only accumulates the gradient of its own heads. Without
+        # sequence parallelism nothing else sums it across TP; mark it for that sum.
+        if self.tp_size > 1 and not self.config.sequence_parallel:
+            for param in self.out_norm.parameters():
+                setattr(param, "sum_gradients_across_tp_domain", True)
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
         if self.config.recompute_granularity == "selective":
