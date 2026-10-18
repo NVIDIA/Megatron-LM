@@ -47,21 +47,26 @@ class FsdpMuon(Muon):
     parameters, including biases, norms, embeddings, and output projections. This
     optimizer refreshes its FSDP model weights itself, so it does not need
     ``fully_shard_optimizer``. Quantized buffers and tensor parallelism are unsupported.
+    Weight decay defaults to zero; nonzero decay is unsupported.
 
     Args:
         params: FSDP-sharded parameters or optimizer parameter-group dictionaries.
         dp_mesh: The one-dimensional device mesh used to shard these parameters.
         **kwargs: Hyperparameters accepted by Emerging Optimizers' ``Muon``, including
-            ``lr``, ``momentum``, ``weight_decay``, and ``nesterov``.
+            ``lr``, ``momentum``, and ``nesterov``. ``weight_decay`` must be zero,
+            including in optimizer parameter-group dictionaries.
     """
 
     def __init__(self, params: ParamsT, dp_mesh: DeviceMesh, **kwargs: Any) -> None:
         if dp_mesh.ndim != 1:
             raise NotImplementedError("FsdpMuon requires a one-dimensional DP mesh.")
+        kwargs.setdefault("weight_decay", 0.0)
         super().__init__(params, **kwargs)
         self.dp_mesh = dp_mesh
         seen = set()
         for group in self.param_groups:
+            if group["weight_decay"] != 0:
+                raise NotImplementedError("FsdpMuon does not support nonzero weight decay yet.")
             for param in group["params"]:
                 if param.ndim != 2:
                     raise ValueError("FsdpMuon only supports 2-D parameters.")
@@ -90,9 +95,13 @@ class FsdpMuon(Muon):
         # Preserve discovery order: communication must be posted identically on every rank.
         active: dict[FsdpParameterGroup, dict[torch.nn.Parameter, dict[str, Any]]] = {}
         for group in self.param_groups:
-            self._init_group(group)
+            if group["weight_decay"] != 0:
+                raise NotImplementedError("FsdpMuon does not support nonzero weight decay yet.")
             for param in group["params"]:
                 if param.grad is not None:
+                    state = self.state[param]
+                    if not state:
+                        state["momentum_buffer"] = torch.zeros_like(param)
                     active.setdefault(_fsdp_group_of(param), {})[param] = group
 
         # Count each buffer once, even when it contains multiple optimizer groups.
@@ -122,10 +131,8 @@ class FsdpMuon(Muon):
             local = source.get_tensor_view(i)
             if local.numel() == 0:
                 continue
-            weight = param.to_local()
             momentum = self.state[param]["momentum_buffer"].to_local()
             grad = param.grad.to_local().to(momentum.dtype).reshape(momentum.shape)
-            self._apply_weight_decay_inplace(weight, grad, group["lr"], group["weight_decay"])
             momentum.lerp_(grad, 1 - group["momentum"])
             inputs = grad.lerp(momentum, group["momentum"]) if self.nesterov else momentum
             local.copy_(inputs.reshape(local.shape))

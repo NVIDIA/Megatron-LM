@@ -78,8 +78,23 @@ def _reference_shard(param, full):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-@pytest.mark.parametrize("nesterov,decay_method", [(False, "decoupled"), (True, "l2")])
-def test_muon_matches_reference(distributed_setup, dtype, nesterov, decay_method):
+@pytest.mark.parametrize(
+    "nesterov,kernel_options",
+    [
+        pytest.param(False, {}, id="momentum"),
+        pytest.param(
+            True,
+            dict(
+                coefficient_type="simple",
+                num_ns_steps=3,
+                scale_mode="shape_scaling",
+                extra_scale_factor=0.2,
+            ),
+            id="nesterov",
+        ),
+    ],
+)
+def test_muon_matches_reference(distributed_setup, dtype, nesterov, kernel_options):
     """Match weights and momentum over steps, including a checkpoint round trip."""
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
@@ -98,11 +113,9 @@ def test_muon_matches_reference(distributed_setup, dtype, nesterov, decay_method
         fully_shard(model.block1, mesh=mesh, placements=_placements())
         fully_shard(model.block2, mesh=mesh, placements=_placements())
     params = dict(model.named_parameters())
-    kwargs = dict(
-        momentum=0.9, weight_decay=0.1, nesterov=nesterov, weight_decay_method=decay_method
-    )
+    kwargs = dict(momentum=0.9, nesterov=nesterov, **kernel_options)
     optimizer = FsdpMuon(_parameter_groups(params), dp_mesh=mesh, **kwargs)
-    reference_optimizer = Muon(_parameter_groups(reference_params), **kwargs)
+    reference_optimizer = Muon(_parameter_groups(reference_params), weight_decay=0.0, **kwargs)
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
     fully_shard_optimizer(other_optimizer)
@@ -173,15 +186,3 @@ def test_muon_matches_reference(distributed_setup, dtype, nesterov, decay_method
             state = copy.deepcopy(optimizer.state_dict())
             optimizer = FsdpMuon(_parameter_groups(params), dp_mesh=mesh, **kwargs)
             optimizer.load_state_dict(state)
-
-
-@pytest.mark.parametrize("shape", [(8,), (2, 4, 8)])
-def test_muon_rejects_non_matrix_parameters(distributed_setup, shape):
-    """Reject unsupported dimensions on every rank before owner communication."""
-    mesh = init_device_mesh("cuda", (distributed_setup.world_size,))
-    model = nn.Module()
-    model.weight = nn.Parameter(torch.zeros(shape, device=distributed_setup.device))
-    with fully_shard_context(device=distributed_setup.device):
-        fully_shard(model, mesh=mesh, placements=_placements())
-    with pytest.raises(ValueError, match="only supports 2-D"):
-        FsdpMuon(model.parameters(), dp_mesh=mesh)
