@@ -637,6 +637,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- inference (single GPU)
     KernelEntry(
+        name="simplified_dsa_decode",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_decode_kernel.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa.py",
+        ),
+        tests=(K + "test_dsa_gqa_decode.py",),
+        kind="cutedsl",
+        training_path=False,
+        notes="Paged BF16 indexer and sparse attention: byte-exact CUDA Graph replay with "
+        "updated inputs and launch-time streams; stable routing gated by batch_invariant_mode.",
+    ),
+    KernelEntry(
         name="inference_kv_cache_tensor_ops",
         sources=(
             "megatron/core/inference/contexts/attention_context/triton/tensor_ops.py",
