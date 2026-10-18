@@ -231,6 +231,7 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
     module.quantization_padding = lambda tensor, token_counts: (tensor, token_counts)
     module.quantization_unpadding = lambda tensor, token_counts: tensor
     module._fused_ops = None
+    module.linear_fc1 = SimpleNamespace()
     module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias)
     fused_ops = FakeFusedOps()
     module._make_fused_ops = lambda: fused_ops
@@ -1488,6 +1489,167 @@ class TestTEGroupedMLP:
         else:
             assert not experts._with_fused_impl
 
+    @staticmethod
+    def _mxfp8_override_recipe(pattern):
+        """A te-precision-config recipe keeping `pattern` quantized, but with MXFP8."""
+        return RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "mxfp8": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {"fp8_quantization_recipe": "mxfp8"},
+                    }
+                },
+                "matchers": {
+                    "experts_mxfp8": {
+                        "type": "glob",
+                        "enabled": True,
+                        "pattern": pattern,
+                        "config": "mxfp8",
+                    }
+                },
+            }
+        )
+
+    def _build_quantized_override_layer(self, quant_recipe, *, hidden, ffn):
+        """Op-fuser MoE layer on the production (fused weighted squared-ReLU) expert path.
+
+        Dims satisfy MXFP8/NVFP4 alignment; the unary activation forms the CuTeDSL fused op
+        without the 32-wide GLU interleave the GLU variant would need.
+        """
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden,
+            ffn_hidden_size=ffn,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=False,
+            activation_func=squared_relu,
+            use_fused_weighted_squared_relu=True,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            quant_recipe=quant_recipe,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        # The override is resolved by module path, so the layer needs its name populated.
+        layer = MoELayer(tf_config, submodules, name="mlp")
+        layer = Float16Module(layer.config, layer).module
+        return layer.cuda()
+
+    def _skip_unless_quantized_override_testable(self, monkeypatch):
+        try:
+            import transformer_engine.pytorch as te
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+        for probe in (te.is_mxfp8_available, te.is_nvfp4_available):
+            available, reason = probe(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+        # _is_fused_impl_supported() needs this for the GLU fused kernel.
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_gpu_quantized_precision_override_runs_fused_with_module_recipe(self, monkeypatch):
+        """An MXFP8 override under a global NVFP4 recipe keeps the experts fused *and* in MXFP8.
+
+        The TE op fuser builds its quantizers from the ambient autocast, so without the module's
+        own autocast around the fused call these experts would silently run NVFP4 (and crash in
+        backward under GTP). ``_fused_quant_context`` must therefore present the module recipe,
+        and the layer must produce exactly what a plain global-MXFP8 run of the same weights
+        produces.
+        """
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling, NVFP4BlockScaling
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        self._skip_unless_quantized_override_testable(monkeypatch)
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+        hidden, ffn = 128, 256
+
+        overridden = self._build_quantized_override_layer(
+            self._mxfp8_override_recipe("*experts*"), hidden=hidden, ffn=ffn
+        )
+        reference = self._build_quantized_override_layer(None, hidden=hidden, ffn=ffn)
+        self._copy_params(dst=reference, src=overridden)
+        for layer in (overridden, reference):
+            assert isinstance(layer.experts, TEGroupedMLP)
+            assert layer.experts._with_fused_impl, "a quantized override must keep fusion"
+
+        # The module context is a no-op without an override, and presents the module's MXFP8
+        # recipe inside a global NVFP4 autocast with one.
+        from contextlib import nullcontext
+
+        assert isinstance(reference.experts._fused_quant_context(), nullcontext)
+        with te.fp8_autocast(enabled=True, fp8_recipe=NVFP4BlockScaling()):
+            assert isinstance(FP8GlobalStateManager.get_fp8_recipe(), NVFP4BlockScaling)
+            with overridden.experts._fused_quant_context():
+                assert isinstance(FP8GlobalStateManager.get_fp8_recipe(), MXFP8BlockScaling)
+            assert isinstance(FP8GlobalStateManager.get_fp8_recipe(), NVFP4BlockScaling)
+
+        torch.manual_seed(1234)
+        hidden_states = torch.randn((64, 2, hidden), dtype=torch.bfloat16, device="cuda")
+
+        def run(layer, recipe):
+            x = hidden_states.clone().requires_grad_(True)
+            with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                out, _ = layer(x)
+            out.float().sum().backward()
+            grads = [p.grad.detach().clone() for p in layer.experts.parameters()]
+            return out.detach(), x.grad.detach(), grads
+
+        # Overridden experts under a *global NVFP4* autocast ...
+        out, dx, grads = run(overridden, NVFP4BlockScaling())
+        # ... must equal the same weights under a plain global MXFP8 autocast.
+        ref_out, ref_dx, ref_grads = run(reference, MXFP8BlockScaling())
+        for layer in (overridden, reference):
+            self._assert_fused_op_selected(layer.experts, prefix="GroupedMLP_CuTeGEMM")
+        # The overridden fused op quantized with MXFP8, not the ambient NVFP4.
+        from transformer_engine.pytorch import MXFP8Quantizer
+
+        (sequential,) = overridden.experts._fused_ops
+        fused_op = sequential._module_groups[0]._forward_ops[0][0]
+        for fc in (fused_op.basic_ops[0], fused_op.basic_ops[-1]):
+            assert isinstance(fc.get_quantizer("forward", 1), MXFP8Quantizer)
+        torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
+        torch.testing.assert_close(dx, ref_dx, rtol=0, atol=0)
+        for got, want in zip(grads, ref_grads):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_gpu_quantized_precision_override_must_cover_fc1_and_fc2(self, monkeypatch):
+        """Fusion spans fc1 and fc2, so a quantized override matching only one of them is an error."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import NVFP4BlockScaling
+
+        self._skip_unless_quantized_override_testable(monkeypatch)
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        layer = self._build_quantized_override_layer(
+            self._mxfp8_override_recipe("*linear_fc2"), hidden=128, ffn=256
+        )
+        assert layer.experts._with_fused_impl  # both still "quantized", so fusion stays on
+        x = torch.randn((64, 2, 128), dtype=torch.bfloat16, device="cuda")
+        with te.fp8_autocast(enabled=True, fp8_recipe=NVFP4BlockScaling()):
+            with pytest.raises(RuntimeError, match="same quantization override"):
+                layer(x)
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize(
@@ -2056,7 +2218,7 @@ class TestTEGroupedMLP:
         return hidden, probs, tokens_per_expert
 
     @staticmethod
-    def _assert_fused_op_selected(experts):
+    def _assert_fused_op_selected(experts, prefix="GroupedMLP_CuTeGEMMUnary"):
         """When the cuDSL kernel is unavailable TE computes the same numbers on its basic-op
         path, so the op type has to be checked directly (after the lazy first forward)."""
         (sequential,) = experts._fused_ops
@@ -2065,7 +2227,7 @@ class TestTEGroupedMLP:
             for group in sequential._module_groups
             for entry in group._forward_ops
         ]
-        assert "GroupedMLP_CuTeGEMMUnary" in selected, selected
+        assert any(name.startswith(prefix) for name in selected), selected
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

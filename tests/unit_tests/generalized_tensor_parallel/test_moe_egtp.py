@@ -468,6 +468,163 @@ def _worker_egtp_precision_override_backward(
         ps.initialize_model_parallel()
 
 
+def _mxfp8_override_recipe(pattern):
+    """A te-precision-config recipe keeping `pattern` quantized, but with MXFP8."""
+    from megatron.core.quantization.quant_config import RecipeConfig
+
+    return RecipeConfig.from_config_dict(
+        {
+            "configs": {
+                "mxfp8": {
+                    "transformer_engine_config_type": "TEQuantizationParams",
+                    "training_recipe": {"fp8_quantization_recipe": "mxfp8"},
+                }
+            },
+            "matchers": {
+                "mxfp8": {"type": "glob", "enabled": True, "pattern": pattern, "config": "mxfp8"}
+            },
+        }
+    )
+
+
+def _te_fused_grouped_mlp_quantizes_gathered_bf16() -> bool:
+    """Whether TE's fused grouped MLP quantizes a distributed weight it re-gathers as BF16.
+
+    A capability probe rather than a version check: the fix landed with the helper below and is
+    not tied to a TE release yet. Without it, EGTP_remat-sharded experts under a quantized
+    override raise AttributeError on ``_columnwise_data`` in the fused backward.
+    """
+    try:
+        from transformer_engine.pytorch.ops.fused import grouped_mlp
+    except ImportError:
+        return False
+    return hasattr(grouped_mlp, "_quantize_unquantized_weights")
+
+
+def _worker_egtp_quantized_precision_override_backward(rank, world_size, port, egtp_remat_size):
+    """EGTP_remat experts kept *fused* by an MXFP8 override under a global NVFP4 recipe.
+
+    Production repro: MTP experts routed to MXFP8 by ``--te-precision-config-file`` while the
+    run is NVFP4. Unlike a bf16 override, a quantized override keeps ``_with_fused_impl`` True,
+    so the fused call must (a) enter the module's MXFP8 autocast rather than inherit NVFP4 and
+    (b) with EGTP_remat sharding, have TE quantize the BF16 shards it re-gathers in backward
+    (the override creates no native-quantized params). Pre-fix this raised AttributeError in
+    the fused backward: ``_amax_columnwise`` without (a), ``_columnwise_data`` without (b).
+    Once TE has (b), missing (a) no longer crashes but silently runs NVFP4, hence the quantizer
+    assertion below. ``egtp_remat_size=1`` is the unsharded control.
+    """
+    from transformer_engine.common.recipe import NVFP4BlockScaling
+    from transformer_engine.pytorch import MXFP8Quantizer
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.activations import squared_relu
+    from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    HIDDEN, FFN, NUM_EXPERTS, SEQ = 512, 256, 4, 16
+    dtype = torch.bfloat16
+    name = "mtp.layers.0.mlp"
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=1,
+        expert_gtp_remat_size=egtp_remat_size,
+    )
+    model_parallel_cuda_manual_seed(42)
+
+    config = TransformerConfig(
+        num_attention_heads=8,
+        num_layers=1,
+        hidden_size=HIDDEN,
+        num_moe_experts=NUM_EXPERTS,
+        moe_router_topk=2,
+        moe_ffn_hidden_size=FFN,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        moe_aux_loss_coeff=0.0,
+        moe_router_load_balancing_type="none",
+        add_bias_linear=False,
+        # Production expert path (fused weighted squared-ReLU): forms the CuTeDSL fused op
+        # without the 32-wide GLU interleave the GLU variant would need.
+        gated_linear_unit=False,
+        activation_func=squared_relu,
+        use_fused_weighted_squared_relu=True,
+        bias_activation_fusion=False,
+        params_dtype=dtype,
+        bf16=True,
+        hidden_dropout=0.0,
+        bias_dropout_fusion=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        use_transformer_engine_op_fuser=True,
+        gradient_accumulation_fusion=True,
+        quant_recipe=_mxfp8_override_recipe("*mtp.layers.*"),
+    )
+
+    moe_pg = get_default_pg_collection()
+    moe_pg.expt_gtp_remat = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['expt_gtp_remat']
+    ).expt_gtp_remat
+    assert moe_pg.expt_gtp_remat.size() == egtp_remat_size
+
+    moe_spec = get_moe_module_spec(use_te=True, num_experts=NUM_EXPERTS, moe_grouped_gemm=True)
+    layer = moe_spec(config, layer_number=1, pg_collection=moe_pg, name=name).cuda()
+
+    try:
+        experts = layer.experts
+        assert isinstance(experts, TEGroupedMLP)
+        # A quantized override keeps the op-fuser path, unlike the bf16 one.
+        assert experts._with_fused_impl
+        sharded = any(isinstance(p, GTPShardedParam) for p in experts.parameters())
+        assert sharded == (egtp_remat_size > 1)
+
+        for p in experts.parameters():
+            if p.requires_grad and not hasattr(p, "main_grad"):
+                p.main_grad = torch.zeros_like(p.data, dtype=torch.float32)
+
+        x = torch.randn((SEQ, 1, HIDDEN), dtype=dtype, device="cuda", requires_grad=True)
+        with fp8_autocast(enabled=True, fp8_recipe=NVFP4BlockScaling()):
+            output, _ = layer(x)
+        # The CuTeDSL fused op must actually have formed (after the lazy first forward); the
+        # basic-op fallback would not exercise the fused weight plumbing this test is about.
+        (sequential,) = experts._fused_ops
+        selected = [
+            type(entry[0] if isinstance(entry, (tuple, list)) else entry).__name__
+            for group in sequential._module_groups
+            for entry in group._forward_ops
+        ]
+        assert any(name.startswith("GroupedMLP_CuTeGEMM") for name in selected), selected
+        # ... and it quantized with the module's MXFP8 recipe, not the ambient NVFP4 one. With a
+        # TE that quantizes re-gathered BF16 shards, inheriting NVFP4 here would not crash; it
+        # would silently run these experts in the wrong precision.
+        fused_op = next(
+            entry[0] if isinstance(entry, (tuple, list)) else entry
+            for group in sequential._module_groups
+            for entry in group._forward_ops
+            if type(entry[0] if isinstance(entry, (tuple, list)) else entry).__name__.startswith(
+                "GroupedMLP_CuTeGEMM"
+            )
+        )
+        for fc in (fused_op.basic_ops[0], fused_op.basic_ops[-1]):
+            assert isinstance(fc.get_quantizer("forward", 1), MXFP8Quantizer), type(
+                fc.get_quantizer("forward", 1)
+            )
+        output.float().mean().backward()
+
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        assert any(
+            p.main_grad.abs().sum() > 0 for p in experts.parameters() if hasattr(p, "main_grad")
+        ), "no expert wgrad reached main_grad"
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 class TestMoEEGTPCorrectness:
     def test_moe_egtp_loss_trajectory_matches_baseline(self):
         """EP=2+EGTP_remat=2 MoE per-step losses match EP=4 baseline: atol=rtol=1e-5; MXFP8"""
@@ -503,3 +660,23 @@ class TestMoEEGTPPrecisionOverride:
             pytest.skip("Requires at least 4 CUDA devices")
         monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
         _run_distributed(_worker_egtp_precision_override_backward, 4, 2, True)
+
+    @pytest.mark.parametrize("egtp_remat_size", (1, 2))
+    def test_egtp_quantized_precision_override_backward(self, monkeypatch, egtp_remat_size):
+        """MXFP8 override under global NVFP4 keeps experts fused and survives backward with EGTP_remat."""
+        import transformer_engine.pytorch as te
+
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires at least 4 CUDA devices")
+        for probe in (te.is_mxfp8_available, te.is_nvfp4_available):
+            available, reason = probe(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+        if egtp_remat_size > 1 and not _te_fused_grouped_mlp_quantizes_gathered_bf16():
+            pytest.skip(
+                "Sharded experts under a quantized override need a TE whose fused grouped MLP "
+                "quantizes re-gathered BF16 weights (ops/fused/grouped_mlp.py "
+                "_quantize_unquantized_weights)"
+            )
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        _run_distributed(_worker_egtp_quantized_precision_override_backward, 4, egtp_remat_size)
