@@ -22,14 +22,17 @@ try:
     import cutlass
     import cutlass.cute as cute
     import cutlass.utils as utils
-    from cutlass.cute.runtime import from_dlpack
+    from cuda.bindings import driver as cuda
+    from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
     HAVE_CUTEDSL = True
 except ImportError:
     cutlass = None
     cute = None
     utils = None
+    cuda = None
     from_dlpack = None
+    make_fake_stream = None
     HAVE_CUTEDSL = False
 
 
@@ -112,6 +115,7 @@ if HAVE_CUTEDSL:
             context_lengths,
             output,
             index_head_dim: cutlass.Constexpr,
+            stream: cuda.CUstream,
         ):
             self.score_kernel(
                 query, key_cache, block_table, context_lengths, output, index_head_dim
@@ -122,6 +126,7 @@ if HAVE_CUTEDSL:
                     1,
                 ),
                 block=(THREADS, 1, 1),
+                stream=stream,
             )
 
     @cute.jit
@@ -140,7 +145,10 @@ if HAVE_CUTEDSL:
         if thread == 0:
             scratch[0] = block_value
         cute.arch.barrier()
-        return scratch[0]
+        result = scratch[0]
+        # Every warp must consume the max before the sum reduction reuses scratch.
+        cute.arch.barrier()
+        return result
 
     @cute.jit
     def _block_reduce_sum(value: cutlass.Float32, scratch: cute.Tensor, thread: cutlass.Int32):
@@ -317,6 +325,7 @@ if HAVE_CUTEDSL:
             value_head_dim: cutlass.Constexpr,
             topk_width: cutlass.Constexpr,
             softmax_scale: cutlass.Constexpr,
+            stream: cuda.CUstream,
         ):
             self.attention_kernel(
                 query,
@@ -332,7 +341,11 @@ if HAVE_CUTEDSL:
                 value_head_dim,
                 topk_width,
                 softmax_scale,
-            ).launch(grid=(self.batch_size, num_query_heads, 1), block=(ATTENTION_THREADS, 1, 1))
+            ).launch(
+                grid=(self.batch_size, num_query_heads, 1),
+                block=(ATTENTION_THREADS, 1, 1),
+                stream=stream,
+            )
 
 
 _COMPILED: dict[tuple, object] = {}
@@ -415,6 +428,9 @@ def _compile(
             from_dlpack(context_lengths, assumed_align=4, enable_tvm_ffi=True),
             dynamic_output,
             index_head_dim,
+            # Resolve the caller's current stream on every invocation, including
+            # graph capture; do not bake the warmup stream into the cached launch.
+            make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
         _COMPILED[key] = compiled
@@ -568,6 +584,7 @@ def _compile_attention(
             value_head_dim,
             topk_width,
             float(softmax_scale),
+            make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
         _ATTENTION_COMPILED[key] = compiled
