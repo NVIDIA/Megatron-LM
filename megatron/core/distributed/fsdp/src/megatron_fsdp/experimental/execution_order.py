@@ -15,11 +15,8 @@
 """Weakly held construction or recorded module execution sequences."""
 
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Generic, TypeVar, cast
+from typing import Generic, TypeVar
 from weakref import ref
-
-if TYPE_CHECKING:
-    from .module import FsdpModule
 
 T = TypeVar("T")
 
@@ -61,21 +58,9 @@ class ExecutionOrder(Generic[T]):
         self._position += 1
         return item
 
-    def prefetch(self, prefetch_size: int | None = None) -> Iterator[T]:
-        """Yield successors without advancing execution.
-
-        None selects one occurrence; otherwise select occurrences until their
-        parameter count reaches the budget or the order ends. Zero disables
-        prefetch. Repeated modules retain their place in the sequence.
-        """
-        prefetched_size = 0
-        for index in range(self._position, len(self._items)):
-            if prefetch_size is not None and prefetched_size >= prefetch_size:
-                return
-            item = self._items[index]()
-            if item is None:
-                return
-            yield item
-            if prefetch_size is None:
-                return
-            prefetched_size += cast("FsdpModule", item).num_parameter_elements
+    def next_item(self, offset: int = 1) -> T | None:
+        """Look ahead from the last consumed occurrence without moving the cursor."""
+        next_index = self._position - 1 + offset
+        if next_index < 0 or next_index >= len(self._items):
+            return None
+        return self._items[next_index]()

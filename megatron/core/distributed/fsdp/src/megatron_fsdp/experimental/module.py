@@ -335,8 +335,20 @@ class FsdpModule:
         module = cast(nn.Module, self)
         if order.advance() is not module:
             raise RuntimeError("FSDP module calls diverged from the static prefetch order.")
-        for next_module in order.prefetch(prefetch_size):
-            cast(FsdpModule, next_module)._unshard_parameter_groups()
+        next_module = order.next_item()
+        if prefetch_size is None:
+            if next_module is not None:
+                cast(FsdpModule, next_module)._unshard_parameter_groups()
+            return
+
+        prefetched_size = 0
+        offset = 1
+        while next_module is not None and prefetched_size < prefetch_size:
+            fsdp_module = cast(FsdpModule, next_module)
+            fsdp_module._unshard_parameter_groups()
+            prefetched_size += fsdp_module.num_parameter_elements
+            offset += 1
+            next_module = order.next_item(offset)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
