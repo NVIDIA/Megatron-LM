@@ -145,6 +145,10 @@ workload rather than generalizing from any single comparison.
 > selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
 > default, or `multimem`) selects the cross-rank expert-combine reduction.
 >
+> With MLA latent caching, batch-invariant mode uses unabsorbed attention for both
+> decode-only and mixed prefill/decode batches. Expanding the cached latents on
+> each decode step can increase runtime and temporary memory use.
+>
 > Both dense and MoE models are supported. Batch-invariant MoE supports BF16 and
 > MXFP8 squared-ReLU/SwiGLU experts, requires unfused permute/unpermute, and under
 > `--transformer-impl inference_optimized` requires
