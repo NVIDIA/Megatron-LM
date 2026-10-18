@@ -403,8 +403,7 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         # Persistent ledger of per-request metadata (e.g. staleness stats).
         self.request_ledger = {}
-        self.sequences_this_iteration_on_rank = 0
-        self.latest_batch_num_sequences = 0
+        self.consumed_train_bins = 0
         # Durable rollout-bank state (rank 0 only). Recovered groups live on the
         # rollout agent, which treats them as per-environment producers.
         self.rollout_bank = None
@@ -426,17 +425,11 @@ class RLRuntimeState:
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
-        self.sequences_this_iteration_on_rank = 0
         self.last_collection_iteration = iteration
         self.tokens_per_sec = None
         self.compute_tokens_per_sec = None
         self.actual_tokens_per_sec = None
         self.packing_efficiency = None
-
-    def increment_sequences(self, count):
-        """Increment the sequence counter."""
-        self.sequences_this_iteration_on_rank += count
-        self.latest_batch_num_sequences = count
 
 
 # Global runtime state instance
@@ -3334,16 +3327,6 @@ def rl_inference_interface_shutdown():
     import os
     os._exit(0)
 
-
-def get_iteration_sequence_count(args):
-    """Get the total number of sequences processed in this iteration across all ranks."""
-    runtime_state = get_rl_runtime_state()
-    sequences_tensor = torch.tensor(
-        runtime_state.sequences_this_iteration_on_rank, device='cuda', dtype=torch.long
-    )
-    if torch.distributed.is_initialized():
-        torch.distributed.all_reduce(sequences_tensor, group=mpu.get_data_parallel_group())
-    return int(sequences_tensor.item())
 
 def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) -> torch.Tensor:
     """Pad each element of a list of tensors to the length required.
