@@ -49,7 +49,7 @@ We have a useful Claude tool that will send a Slack DM with context to the assig
 
 ### Launch CI
 
-Community contributors are unable to launch CI. If there is a basic merge conflict or lint errror, 
+Community contributors are unable to launch CI. If there is a basic merge conflict or lint error,
 it is acceptable to fix it and re-launch CI (to reduce iteration time).
 
 ### Approvals and Merging
