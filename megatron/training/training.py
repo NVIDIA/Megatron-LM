@@ -218,12 +218,6 @@ from .utils import (
 try:
     from megatron.rl import rl_utils
     from megatron.rl.inference.disagg import build_disagg_inference_model
-    from megatron.rl.rl_profiling import (
-        RL_LOGGABLE_TIMER_NAMES,
-        initialize_rl_profiler,
-        log_iteration_profile,
-        shutdown_rl_profiler,
-    )
 
     has_rl_utils = True
 except ImportError:
@@ -2101,30 +2095,6 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
-    # Initialize RL profiler if enabled
-    if cfg_container.rl.rl_profile:
-        # Determine output directory: use rl_profile_dir, or save/profiles, or ./profiles
-        profile_dir = cfg_container.rl.rl_profile_dir
-        if profile_dir is None:
-            if args.save:
-                profile_dir = os.path.join(args.save, 'profiles')
-            else:
-                profile_dir = './profiles'
-
-        # Generate run ID from job name or timestamp
-        run_id = os.getenv("SLURM_JOB_ID", None)
-        if run_id is None:
-            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        initialize_rl_profiler(
-            output_dir=profile_dir,
-            run_id=run_id,
-            enabled=True,
-            log_to_wandb=(wandb_writer is not None),
-            log_to_tensorboard=(get_tensorboard_writer() is not None),
-        )
-        print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
-
     # OTel: megatron.startup deliberately stays open into train() -- its
     # preamble (weight-hash check, sniff test, cuda-graph setup) is init, not
     # the loop, so it should parent to startup. train() ends startup and starts
@@ -2181,7 +2151,8 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator
+                train_data_iterator=train_data_iterator,
+                callback_manager=callback_manager,
             )
 
         one_logger and one_logger.log_metrics(
@@ -3749,10 +3720,6 @@ def training_log(
             'backward-send-backward-recv',
             'forward-backward-send-forward-backward-recv',
         ])
-    # Add timers from RL loop if needed.
-    if cfg.rl.perform_rl_step:
-        timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
-
     # Count independent sequences; weight-sharding ranks may share a sequence through CP.
     batch_size = (
         args.micro_batch_size
@@ -3791,13 +3758,6 @@ def training_log(
         writer.add_scalar('batch-size vs samples', batch_size, train_state.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
-        # Log bins for packed mode
-        if has_rl_utils and cfg.rl.rl_use_sequence_packing:
-            packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(args)
-            for metric_name, metric_value in packing_metrics.items():
-                writer.add_scalar(metric_name, metric_value, iteration)
-            if wandb_writer and packing_metrics:
-                wandb_writer.log(packing_metrics, iteration)
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key], train_state.consumed_train_samples)
@@ -3830,11 +3790,6 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if cfg.rl.perform_rl_step:
-            grpo_collection_iteration = iteration // (cfg.rl.grpo_iterations * (cfg.rl.grpo_samples_per_iteration // args.global_batch_size))
-            writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
-            if wandb_writer:
-                wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
         if cfg.logger.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -3852,6 +3807,8 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+        callback_manager.callback_context.batch_size = batch_size
+        callback_manager.trigger("on_tensorboard_log")
     # Log MoE metrics.
     moe_log_string = ""
     if args.num_experts is not None:
@@ -4002,8 +3959,6 @@ def training_log(
             )
         else:
             log_string += ' consumed samples: {:12d} |'.format(train_state.consumed_train_samples)
-        if has_rl_utils and cfg.rl.rl_use_sequence_packing:
-            log_string += rl_utils.get_sequence_packing_log_info(args)
         if train_state.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(train_state.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
@@ -4075,12 +4030,6 @@ def training_log(
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
 
-        # RL token throughput metrics.
-        if cfg.rl.perform_rl_step:
-            log_string += rl_utils.log_rl_throughput_metrics(
-                args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
-            )
-
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
@@ -4089,6 +4038,9 @@ def training_log(
         log_fragments: list[str] = []
         callback_manager.callback_context.log_fragments = log_fragments
         callback_manager.callback_context.timers_to_log = timers_to_log
+        callback_manager.callback_context.batch_size = batch_size
+        callback_manager.callback_context.elapsed_time_per_iteration = elapsed_time_per_iteration
+        callback_manager.callback_context.throughput = throughput if cfg.logger.log_throughput else None
         callback_manager.trigger("on_log")
         log_string += "".join(log_fragments)
         print_rank_last(log_string)
@@ -4137,19 +4089,6 @@ def training_log(
                 f'(after {iteration} iterations)',
                 process_group=pg_collection.dp if pg_collection is not None else None,
             )
-        # Log RL profiling data if enabled (must be before timers.log which resets timers).
-        # Token throughput metrics are read from RLRuntimeState automatically.
-        if cfg.rl.rl_profile:
-            log_iteration_profile(
-                iteration=iteration,
-                timers=timers,
-                elapsed_time_ms=elapsed_time_per_iteration * 1000.0,
-                throughput_tflops=throughput if cfg.logger.log_throughput else None,
-                global_batch_size=batch_size,
-                wandb_writer=wandb_writer,
-                tb_writer=writer,
-            )
-
         # Write timers to wandb, don't reset the counts.
         if cfg.logger.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=cfg.logger.log_interval, reset=False)
@@ -4251,6 +4190,12 @@ def force_param_sync(model_chunks, optimizer=None) -> None:
         model_chunk.start_param_sync(force_sync=True)
 
 
+def _notify_checkpoint_saved(callback_manager, iteration):
+    """Fire on_checkpoint_saved for the checkpoint of ``iteration`` once it is durable."""
+    callback_manager.callback_context.durable_iteration = iteration
+    callback_manager.trigger("on_checkpoint_saved")
+
+
 def save_checkpoint_and_time(
     iteration,
     model,
@@ -4260,11 +4205,17 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
+    callback_manager=None,
 ):
+    callback_manager = normalize_callbacks(callback_manager)
     cfg = get_run_config()
     args = get_args()
     timers = get_timers()
     energy_monitor = get_energy_monitor()
+
+    on_saved = None
+    if callback_manager.has_callbacks("on_checkpoint_saved"):
+        on_saved = functools.partial(_notify_checkpoint_saved, callback_manager, iteration)
 
     # OTel: single goodput span parenting ALL exposed (main-thread) checkpoint
     # cost -- the total wall-clock the training loop is blocked on the checkpoint:
@@ -4348,6 +4299,7 @@ def save_checkpoint_and_time(
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
                 cp_group=cp_group,
+                on_saved=on_saved,
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
@@ -4511,6 +4463,7 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
+    callback_manager=None,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
@@ -4532,6 +4485,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    callback_manager=callback_manager,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
@@ -4547,6 +4501,7 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
+            callback_manager=callback_manager,
         )
         saved_checkpoint = True
 
@@ -4564,6 +4519,7 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
+            callback_manager=callback_manager,
         )
         saved_checkpoint = True
 
@@ -4589,6 +4545,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    callback_manager=callback_manager,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
@@ -4611,6 +4568,7 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                callback_manager=callback_manager,
             )
         print_datetime(f'exiting program at iteration {iteration}')
 
@@ -5114,6 +5072,7 @@ def train(
                         train_state.num_floating_point_operations_so_far,
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
+                        callback_manager=callback_manager,
                     )
                     print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Checkpoint saved, "
                                  "exiting so the run can be relaunched at the new batch size.")
@@ -5263,6 +5222,7 @@ def train(
                 train_state.num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                callback_manager=callback_manager,
             )
         if should_exit:
             break
@@ -5323,12 +5283,6 @@ def train(
                     if param_and_grad_buffer is not None:
                         param_and_grad_buffer.manual_buffer_registration()
 
-        if cfg.rl.perform_rl_step and cfg.rl.rl_use_sequence_packing:
-            # Track bins separately for packed mode
-            bin_count = (
-                _dp_world_size() * args.micro_batch_size * get_num_microbatches()
-            )
-            args.consumed_train_bins += bin_count
         if samples_seen_in_iteration is not None:
             iteration_sequences = samples_seen_in_iteration
         else:
@@ -5525,6 +5479,7 @@ def train(
             train_state.num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
+            callback_manager=callback_manager,
         )
         if should_exit:
             break
@@ -5568,10 +5523,6 @@ def train(
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
-
-    # Shutdown RL profiler and export summary
-    if cfg.rl.rl_profile:
-        shutdown_rl_profiler()
 
     callback_manager.trigger("on_train_end")
 

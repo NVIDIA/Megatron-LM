@@ -403,6 +403,7 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         # Persistent ledger of per-request metadata (e.g. staleness stats).
         self.request_ledger = {}
+        self.consumed_train_bins = 0
         # Durable rollout-bank state (rank 0 only). Recovered groups live on the
         # rollout agent, which treats them as per-environment producers.
         self.rollout_bank = None
