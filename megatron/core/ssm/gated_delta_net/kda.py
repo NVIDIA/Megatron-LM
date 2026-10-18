@@ -128,8 +128,7 @@ class KimiDeltaAttention(_GDNBase):
         mark_keep_in_fp32(self.dt_bias)
         mark_keep_in_fp32(self.A_log)
 
-        # Preserve the dev direct-gate path; low-rank gates are precomputed in FP32.
-        self.use_gate_in_kernel = not self.two_stage_gates
+        # Low-rank gates are precomputed in FP32.
         if self.two_stage_gates:
             for prefix, head_dim, output_dim in (
                 ("f", self.key_head_dim, self.qk_dim),
@@ -540,9 +539,8 @@ class KimiDeltaAttention(_GDNBase):
             gate=gate,
         )
         kernel_inputs = {"q": query, "k": key, "v": value, "g": raw_g, "beta": beta}
-        if self.use_gate_in_kernel:
-            kernel_inputs["A_log"] = A_log
-            kernel_inputs["dt_bias"] = dt_bias
+        kernel_inputs["A_log"] = A_log
+        kernel_inputs["dt_bias"] = dt_bias
         nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
@@ -551,10 +549,9 @@ class KimiDeltaAttention(_GDNBase):
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=self.two_stage_gates and self.use_qk_l2norm,
-            use_gate_in_kernel=self.use_gate_in_kernel,
+            use_gate_in_kernel=True,
             safe_gate=self.config.kda_safe_gate,
             lower_bound=self.config.kda_lower_bound,
-            state_v_first=self.two_stage_gates,
             cu_seqlens=cu_seqlens_q,
             cp_context=chunkwise_cp_context,
         )
@@ -752,14 +749,6 @@ class KimiDeltaAttention(_GDNBase):
             num_key_heads = A_log_local_cp.numel()
             raw_g = raw_g.reshape(batch, seq_len, num_key_heads, self.key_head_dim)
             beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
-            from fla.ops.kda.gate import fused_kda_gate
-
-            raw_g = fused_kda_gate(
-                raw_g,
-                A_log_local_cp.contiguous(),
-                dt_bias=dt_bias_local_cp.contiguous(),
-                lower_bound=self.config.kda_lower_bound if self.config.kda_safe_gate else None,
-            )
             return (
                 query.contiguous(),
                 key.contiguous(),
