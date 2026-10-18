@@ -167,11 +167,16 @@ def test_muon_matches_reference(distributed_setup, monkeypatch, dtype, nesterov,
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         actual.sum().backward()
         expected.sum().backward()
+        skipped_names = ()
         if step == 1:
             # A whole buffer can skip a step without losing momentum or replanning.
-            for name in ("block1.0.weight", "block1.2.weight"):
-                params[name].grad = None
-                reference.get_parameter(name).grad = None
+            skipped_names = ("block1.0.weight", "block1.2.weight")
+        elif step == 2:
+            # The remaining matrix in block2 must still use its own optimizer group.
+            skipped_names = ("block2.0.weight",)
+        for name in skipped_names:
+            params[name].grad = None
+            reference.get_parameter(name).grad = None
         for name, param in reference.named_parameters():
             reference_params[name].grad = None if param.grad is None else param.grad.float().clone()
 

@@ -26,7 +26,6 @@ from .gather_scatter import gather, scatter
 from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import RowAtomic
-from .range import intersect_ranges
 
 
 class FsdpMuon(Muon):
@@ -53,6 +52,9 @@ class FsdpMuon(Muon):
             including in optimizer parameter-group dictionaries.
     """
 
+    _fsdp_groups: list[FsdpParameterGroup]
+    _owner_maps: list[dict[int, int]]
+
     def __init__(self, params: ParamsT, dp_mesh: DeviceMesh, **kwargs: Any) -> None:
         if dp_mesh.ndim != 1:
             raise NotImplementedError("FsdpMuon requires a one-dimensional DP mesh.")
@@ -62,7 +64,7 @@ class FsdpMuon(Muon):
         self._validate_param_groups()
 
         # Preserve discovery order: communication must be posted identically on every rank.
-        self._fsdp_groups: list[FsdpParameterGroup] = []
+        self._fsdp_groups = []
         seen = set()
         for group in self.param_groups:
             for param in group["params"]:
@@ -121,70 +123,72 @@ class FsdpMuon(Muon):
                 param_to_group_index[param] = group_index
 
         for fsdp_group, owners in zip(self._fsdp_groups, self._owner_maps, strict=True):
-            groups_by_index = {
-                i: self.param_groups[param_to_group_index[fp.sharded]]
+            group_indices = {
+                i: param_to_group_index[fp.sharded]
                 for i, fp in enumerate(fsdp_group.fsdp_parameters)
                 if fp.sharded in param_to_group_index
             }
-            if not groups_by_index:
+            if not group_indices:
                 continue
-            self._step_group(fsdp_group, groups_by_index, {i: owners[i] for i in groups_by_index})
+            self._step_group(fsdp_group, group_indices, {i: owners[i] for i in group_indices})
             fsdp_group.sync_model_weight_from_main_weight()
 
     def _step_group(
         self,
         fsdp_group: FsdpParameterGroup,
-        groups_by_index: dict[int, dict[str, Any]],
+        group_indices: dict[int, int],
         tensor_to_owner: dict[int, int],
     ) -> None:
-        """Gather momentum inputs, compute full updates on owners, and apply local shards."""
+        """Update a buffer using a tensor-index-to-optimizer-group-index mapping."""
         buffer = fsdp_group.main_weight
-        source = DBuffer(buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device)
-        for i, group in groups_by_index.items():
+
+        # Compute the local momentum inputs.
+        inputs = DBuffer(buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device)
+        for i, group_index in group_indices.items():
+            group = self.param_groups[group_index]
             param = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
             assert isinstance(param.grad, DTensor)
-            local = source.get_tensor_view(i)
+            local = inputs.get_tensor_view(i)
             if local.numel() == 0:
                 continue
             momentum = self.state[param]["momentum_buffer"].to_local()
             grad = param.grad.to_local().to(momentum.dtype).reshape(momentum.shape)
             momentum.lerp_(grad, 1 - group["momentum"])
-            inputs = grad.lerp(momentum, group["momentum"]) if self.nesterov else momentum
-            local.copy_(inputs.reshape(local.shape))
+            update = grad.lerp(momentum, group["momentum"]) if self.nesterov else momentum
+            local.copy_(update.reshape(local.shape))
 
+        # Gather and orthogonalize full matrices on their owners.
         this_rank = self.dp_mesh.get_rank()
-        full_inputs = {
-            i: torch.empty(buffer.layout.tensor_shapes[i], dtype=source.dtype, device=source.device)
+        full_updates = {
+            i: torch.empty(buffer.layout.tensor_shapes[i], dtype=buffer.dtype, device=buffer.device)
             for i, owner in tensor_to_owner.items()
             if owner == this_rank
         }
-        gather(source, full_inputs, tensor_to_owner=tensor_to_owner)
-        updates = {}
+        gather(inputs, full_updates, tensor_to_owner=tensor_to_owner)
         with eo_utils.fp32_matmul_precision(self.fp32_matmul_prec):
-            for i, inputs in full_inputs.items():
+            for i, update in full_updates.items():
                 param = fsdp_group.fsdp_parameters[i].sharded
-                kwargs = {k: v for k, v in groups_by_index[i].items() if k != "params"}
-                updates[i] = self.orthogonalize(param, inputs.float(), **kwargs).contiguous()
+                group = self.param_groups[group_indices[i]]
+                kwargs = {k: v for k, v in group.items() if k != "params"}
+                full_updates[i] = self.orthogonalize(param, update.float(), **kwargs).contiguous()
 
-        scratch = DBuffer(
+        # Scatter updates and apply each local shard.
+        local_updates = DBuffer(
             buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
         )
-        scatter(updates, scratch, tensor_to_owner=tensor_to_owner)
-        local_range = buffer.layout.get_local_range(buffer.mesh, buffer.placements)
-        for i, owner in tensor_to_owner.items():
-            tensor_range = buffer.layout.get_tensor_range(i)
-            shard_range = intersect_ranges(tensor_range, local_range)
-            if shard_range.numel == 0:
-                continue
-            if owner == this_rank:
-                # Scatter writes only remote-owned shards; owners keep their full result.
-                offset = shard_range.start - tensor_range.start
-                update = updates[i].view(-1).narrow(0, offset, shard_range.numel)
-            else:
-                update = scratch.get_tensor_view(i)
+        scatter(full_updates, local_updates, tensor_to_owner=tensor_to_owner)
+        for i, group_index in group_indices.items():
             param = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
             weight = param.to_local()
+            if weight.numel() == 0:
+                continue
+            if i in full_updates:
+                # Scatter writes only remote-owned shards; owners keep their full result.
+                offset = max(buffer.offset - buffer.layout.get_tensor_range(i).start, 0)
+                update = full_updates[i].view(-1).narrow(0, offset, weight.numel())
+            else:
+                update = local_updates.get_tensor_view(i)
             update = update.reshape(weight.shape).to(weight.dtype)
             self.pre_weight_update_fn_inplace(weight, update)
-            weight.add_(update, alpha=-groups_by_index[i]["lr"])
+            weight.add_(update, alpha=-self.param_groups[group_index]["lr"])
             self.post_weight_update_fn_inplace(weight)
