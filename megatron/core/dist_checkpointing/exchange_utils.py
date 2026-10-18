@@ -2,6 +2,7 @@
 
 """Utilities for exchanging data between ranks."""
 
+import hashlib
 import logging
 import os
 import pickle
@@ -179,7 +180,8 @@ def distribute_shards_to_ranks(
 PG_DIST_CACHE_FILE_PREFIX = "pg_dist"
 
 # Process-global in-memory cache of the per-group distributions, keyed by the
-# resolved cache file path (which uniquely identifies a (cache dir, group) pair).
+# resolved cache file path (which uniquely identifies a (cache dir, group) pair,
+# because the file name is derived from the group's ordered global ranks).
 # Each entry holds the full {ignore_groups: ShardDistribution} map, so a single
 # entry serves both the save and load variants. This memoization makes
 # `determine_main_replica_uniform_distribution` idempotent within a job:
@@ -299,16 +301,23 @@ def _pg_dist_cache_file_path(
 ) -> str:
     """Returns the cache file path holding the distributions for a given group.
 
-    The file is keyed by the minimum global rank of the parallelization group.
+    The file is keyed by a SHA-256 digest of the group's ordered global ranks.
     Decision rationale:
-      * Parallelization groups partition the world, so ``min(global ranks)`` is
-        a unique, collision-free identifier of each group.
+      * The distribution depends on the group's exact membership and rank order,
+        so the key must identify both. ``min(global ranks)`` alone is not
+        unique: distinct groups can share a minimum rank (for example a
+        data-parallel group over ranks [0, 1, 2, 3] and an expert-data-parallel
+        group over [0, 2]), and they would then read or overwrite each other's
+        distributions.
       * It is computed from purely local metadata
         (``get_process_group_ranks``), so the filename is derivable without any
         collective — essential for the zero-communication read path.
       * Every member of a group maps to the same file (one file per group rather
         than one per rank): far fewer files at scale and a single read per rank,
         with duplicate reads absorbed by the FS page cache.
+
+    Cache files written under the earlier ``pg_dist_<min rank>.pkl`` naming are
+    not read; regenerate them with ``--ckpt-pg-tensors-cache-create``.
 
     Args:
         cache_path (str): directory holding the cache files.
@@ -318,7 +327,8 @@ def _pg_dist_cache_file_path(
         str: absolute-or-relative path of the group's cache file.
     """
     ranks = torch.distributed.get_process_group_ranks(parallelization_group)
-    return os.path.join(cache_path, f"{PG_DIST_CACHE_FILE_PREFIX}_{min(ranks)}.pkl")
+    group_key = hashlib.sha256(",".join(map(str, ranks)).encode("ascii")).hexdigest()
+    return os.path.join(cache_path, f"{PG_DIST_CACHE_FILE_PREFIX}_{group_key}.pkl")
 
 
 def _load_pg_dist_cache(cache_file: str) -> Dict[bool, ShardDistribution]:

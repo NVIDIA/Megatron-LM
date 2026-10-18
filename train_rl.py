@@ -14,6 +14,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
+from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
     get_logprobs,
@@ -90,6 +91,7 @@ def loss_func(
     entropy_term: torch.Tensor,
     truncated_from_above: torch.Tensor,
     truncated_from_below: torch.Tensor,
+    num_sequences: int,
     output_tensor: torch.Tensor,
 ):
     """Loss function.
@@ -101,13 +103,14 @@ def loss_func(
         entropy (torch.Tensor): Current policy entropy on the trajectories. Used for logging.
         truncated_from_above(torch.Tensor): A boolean mask that tells whether the ratios were truncated from above. Used for logging.
         truncated_from_below(torch.Tensor): A boolean mask that tells whether the ratios were truncated from below. Used for logging.
+        num_sequences (int): Number of sequences in this microbatch; reported as `_samples_seen`.
         output_tensor (torch.Tensor): The tensor with the losses
 
     Returns:
         the loss scalar for this micro-batch
         the number of non-padded tokens in this microbatch
         a dict containing reporting metrics on the loss and number of tokens across
-            the data parallel ranks
+            the data parallel ranks, and the `_samples_seen` count
     """
     args = get_args()
 
@@ -179,12 +182,8 @@ def loss_func(
         'rl/entropy_term': reporting_entropy,
         'rl/truncated_from_above': reporting_truncated_from_above,
         'rl/truncated_from_below': reporting_truncated_from_below,
+        '_samples_seen': torch.tensor(num_sequences, device=device),
     }
-
-    # Add metadata about number of sequences processed in this batch
-    # This is crucial for correct sample counting with sequence packing
-    # Note: This information needs to be determined in forward_step where we have access to the batch data
-    # The loss_func doesn't have direct access to this information
 
     return (loss[0].clone(), total_tokens.int(), output_dict)
 
@@ -224,7 +223,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             packed_seq_params,
         ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, cfg.rl.rl_inference_logprobs_is_correction)
 
-        runtime_state.increment_sequences(len(seq_indices))
+        num_sequences = len(seq_indices)
     else:
         # Extract unpacked data
         (
@@ -252,7 +251,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             inference_logprobs.cuda() if cfg.rl.rl_inference_logprobs_is_correction else None
         )
 
-        runtime_state.increment_sequences(tokens.shape[0])
+        num_sequences = tokens.shape[0]
 
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
@@ -333,6 +332,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         entropy_term,
         truncated_from_above,
         truncated_from_below,
+        num_sequences,
     )
 
 
@@ -437,4 +437,13 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         partial(model_provider, _model_builder),
+        callbacks=[
+            RLLoggingCallback(
+                full_config.rl,
+                micro_batch_size=full_config.train.micro_batch_size,
+                global_batch_size=full_config.train.global_batch_size,
+                save_dir=full_config.checkpoint.save,
+            ),
+            RLCheckpointCallback(),
+        ],
     )

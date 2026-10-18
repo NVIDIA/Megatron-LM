@@ -47,9 +47,9 @@ except ImportError:
 
 from megatron.core import parallel_state as mpu
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
-from megatron.training import get_args
-from megatron.training.utils import get_blend_and_blend_per_split
+from megatron.training import get_args, get_train_state
 from megatron.training.global_vars import get_run_config
+from megatron.training.utils import get_blend_and_blend_per_split
 
 logger = logging.getLogger(__name__)
 
@@ -225,12 +225,8 @@ def storage_glob_with_caching(root: str, name_pattern: str, cached: bool = True)
 
 
 def get_current_iteration() -> int:
-    """Return the current training iteration from ``get_args()``."""
-    args = get_args()
-    iteration = getattr(args, 'curr_iteration', None)
-    if iteration is None:
-        iteration = getattr(args, 'iteration')
-    return iteration
+    """Return the current iteration from the global TrainState."""
+    return get_train_state().iteration
 
 
 def is_packed_sequence_run() -> bool:
