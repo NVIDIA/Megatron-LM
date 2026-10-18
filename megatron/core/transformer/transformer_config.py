@@ -617,6 +617,12 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    fused_qkv_rope_fp8_attention: bool = False
+    """If set, let TransformerEngine fuse the RoPE of the single QKV tensor with the FP8
+    current-scaling quantization of Q/K/V inside core attention (falls back to the regular fused
+    RoPE whenever attention does not run FP8 current-scaling fused attention). Requires
+    fused_single_qkv_rope and is disabled for checkpointed or offloaded core attention."""
+
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
@@ -3272,6 +3278,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.fused_single_qkv_rope:
             if self.attention_output_gate:
                 raise ValueError("fused_single_qkv_rope does not support gated attention for now.")
+
+        if self.fused_qkv_rope_fp8_attention and not self.fused_single_qkv_rope:
+            raise ValueError("fused_qkv_rope_fp8_attention requires fused_single_qkv_rope.")
 
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
