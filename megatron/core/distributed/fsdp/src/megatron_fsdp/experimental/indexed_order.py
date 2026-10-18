@@ -80,8 +80,8 @@ class IndexedOrder(Generic[T]):
             raise RuntimeError("FSDP module calls diverged from the recorded prefetch order.")
         self._position = (self._position + 1) % len(self._items)
 
-    def next_item(self, item: T, offset: int = 1) -> T | None:
-        """Return the live successor ``offset`` positions after ``item``, if any.
+    def lookahead(self, item: T) -> Iterator[T]:
+        """Yield successors after ``item`` without advancing execution.
 
         Recorded orders use the occurrence consumed by ``advance``. Looking
         ahead for prefetch does not advance the demand-call cursor.
@@ -91,7 +91,8 @@ class IndexedOrder(Generic[T]):
             if self._position is None
             else (self._position - 1) % len(self._items)
         )
-        next_index = index + offset
-        if next_index >= len(self._items):
-            return None
-        return self._items[next_index]()
+        for next_index in range(index + 1, len(self._items)):
+            next_item = self._items[next_index]()
+            if next_item is None:
+                return
+            yield next_item

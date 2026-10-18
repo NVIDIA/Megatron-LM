@@ -52,7 +52,26 @@ def test_prefetch_replays_occurrences(budget):
     with pytest.raises(RuntimeError, match='diverged'):
         order.advance(third)
     order.advance(first)
-    assert order.next_item(first) is second
+    assert list(order.lookahead(first)) == [second, first, third]
+
+
+@pytest.mark.parametrize('recorded', [False, True])
+def test_lookahead_preserves_execution_progress(recorded):
+    """Static and recorded lookahead preserve demand progress and occurrence order."""
+    first, second, third = nn.Module(), nn.Module(), nn.Module()
+    sequence = [first, second, first, third] if recorded else [first, second, third]
+    if recorded:
+        order = IndexedOrder(sequence)
+    else:
+        order = IndexedOrder()
+        for module in sequence:
+            order.append(module)
+    for _ in range(2):
+        for index, module in enumerate(sequence):
+            order.advance(module)
+            assert list(order.lookahead(module)) == sequence[index + 1 :]
+            assert list(order.lookahead(module)) == sequence[index + 1 :]
+            assert list(order) == sequence
 
 
 def test_shared_module_recording_matches_dense_training(distributed_setup):
