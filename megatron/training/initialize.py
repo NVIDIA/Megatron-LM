@@ -428,6 +428,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
+        if args.deterministic_mode:
+            from megatron.training.determinism import assert_nccl_algo_still_empty
+
+            assert_nccl_algo_still_empty()
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
