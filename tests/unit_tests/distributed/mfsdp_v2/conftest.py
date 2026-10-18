@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+import gc
 import os
 from collections.abc import Iterator
 
@@ -19,6 +20,25 @@ class DistributedSetup:
     rank: int
     world_size: int
     device: torch.device
+
+
+def _release_symmetric_memory_pools() -> None:
+    """Drop the cached symmetric-memory pools so the next test starts from an empty pool.
+
+    symm_mem.get_mem_pool() caches one pool per device for the whole process, and
+    symmetric-memory rendezvous is cached per allocation. A later test could then
+    reuse, on some ranks only, a segment rendezvoused by an earlier test, so only
+    the ranks with fresh segments would enter the registration collective and hang.
+    """
+    pools = getattr(symm_mem, "_symm_mem_pools", None)
+    if not pools:
+        return
+    # Free the test's symmetric-memory tensors, then the pools. A MemPool releases its
+    # segments when its last reference goes away.
+    gc.collect()
+    torch.cuda.synchronize()
+    pools.clear()
+    gc.collect()
 
 
 @pytest.fixture(scope="function")
@@ -54,6 +74,9 @@ def distributed_setup() -> Iterator[DistributedSetup]:
         if device.type == "cuda":
             # Pass the device explicitly to suppress PyTorch's NCCL barrier warning.
             dist.barrier(device_ids=[device.index])
+            # Release while the test's communicators still exist, so NCCL can
+            # deregister the pools' windows before their groups are destroyed.
+            _release_symmetric_memory_pools()
         else:
             dist.barrier()
 
