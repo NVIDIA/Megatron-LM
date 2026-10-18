@@ -587,6 +587,41 @@ FP8 training provides benefits across all three performance walls:
 > **Note**: For blockwise and MXFP8 recipes with current scaling, training loss curves show negligible difference compared to BF16 baselines.
 
 
+### GLU Checkpoint Layout
+
+`--moe-mlp-glu-interleave-size 32` makes routed expert activations interpret FC1
+channels as alternating blocks of 32 gate and 32 up channels. Native Megatron-LM
+converts contiguous checkpoint FC1 weights and biases into that runtime layout
+before loading the model and initializing FP32 master weights. Both indexed
+per-expert weights and single grouped weights are supported. Shared experts use
+their separate `--moe-shared-expert-glu-interleave-size` setting when
+`--use-grouped-gemm-for-shared-expert` is enabled.
+
+GLU interleaving is unsupported with FP32 model parameters and is rejected during
+configuration validation. BF16 and FP16 model parameters remain supported,
+including when the optimizer uses FP32 master weights.
+
+GLU interleaving also requires GTP weight sharding to be disabled for the affected
+FC1: routed experts require `expert_gtp_weight_remat_size=1`, and grouped shared
+experts require `gtp_weight_remat_size=1`. Configuration validation rejects these
+combinations even when optimizer state is not loaded. GTP on other modules and
+ordinary TP/ETP remain allowed.
+
+For `torch` and `torch_dist` checkpoints, model weights are saved in contiguous
+`[all gate | all up]` layout. Optimizer master weights and moments retain their
+runtime layout, described by the existing saved configuration. GLU conversion
+does not add checkpoint fields or layout metadata. Full optimizer resume
+requires the same interleave sizes and the same ETP size for routed experts
+(TP size for shared experts). To change those settings, load model weights with
+`--finetune` or `--no-load-optim` and initialize a new optimizer. This also applies
+when enabling interleaving on a checkpoint saved with a contiguous optimizer.
+
+Model weights are always interpreted as contiguous, regardless of the interleave
+settings in the saved configuration. Legacy checkpoints with interleaved model
+weights must be converted to contiguous layout before loading; their source
+layout is not detected automatically. In-place FSDP loading and
+`torch_dcp` / `fsdp_dtensor` formats are not supported by this conversion.
+
 ### CUDA Graph
 CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are three implementations:
 

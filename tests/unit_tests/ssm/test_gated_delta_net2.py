@@ -24,6 +24,12 @@ from tests.unit_tests.transformer.test_attention import _test_parallel_attention
 class TestGatedDeltaNet(GatedDeltaNetModuleTestCases):
     """GDN2 module correctness across the original parallel layouts."""
 
+    # Recurring THD stalls in TP1/CP1 and TP2/CP2; see #7742.
+    @pytest.mark.flaky_in_dev
+    def test_gpu_forward_thd_correctness(self):
+        """Keep the shared THD assertions with a GDN2-only development quarantine."""
+        super().test_gpu_forward_thd_correctness()
+
 
 # Intermittent compilation/teardown hangs (#7742).
 @pytest.mark.flaky_in_dev

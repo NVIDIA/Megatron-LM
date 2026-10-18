@@ -172,16 +172,19 @@ def test_timers_use_owned_settings(monkeypatch, run_config):
 def test_finetune_reuses_registered_config(monkeypatch, run_config):
     import torch
 
+    from megatron.training.state import TrainState
     from tasks import finetune_utils
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
-    args.epochs, args.iteration = 0, 1
+    args.epochs = 0
+    train_state = TrainState(iteration=1)
     args.main_grads_dtype = args.main_params_dtype = torch.float32
     args.exp_avg_dtype = args.exp_avg_sq_dtype = torch.float32
     timers = Mock()
     monkeypatch.setattr(global_vars, '_GLOBAL_ARGS', args)
+    monkeypatch.setattr(global_vars, '_GLOBAL_TRAIN_STATE', train_state)
     monkeypatch.setattr(global_vars, '_GLOBAL_TIMERS', None)
     monkeypatch.setattr(global_vars, 'Timers', Mock(return_value=timers))
     global_vars._set_timers(args)
@@ -201,10 +204,13 @@ def test_finetune_reuses_registered_config(monkeypatch, run_config):
 
 def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
     from megatron.training import initialize
+    from megatron.training.state import TrainState
 
-    args = Namespace(iteration=13, log_interval=99, run_workload_inspector_server=False)
+    args = Namespace(log_interval=99, run_workload_inspector_server=False)
+    train_state = TrainState(iteration=13)
     writer = Mock()
     monkeypatch.setattr(initialize, 'get_args', lambda: args)
+    monkeypatch.setattr(initialize, 'get_train_state', lambda: train_state)
     monkeypatch.setattr(initialize, 'get_tensorboard_writer', lambda: writer)
     monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', None)
     write_args_to_tensorboard()
@@ -361,12 +367,13 @@ def test_attention_metric_logging_reads_model_config(
     from megatron.core.transformer import TransformerConfig
     from megatron.training import training
     from megatron.training.models import GPTModelConfig
+    from megatron.training.state import TrainState
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args(['--micro-batch-size', '1'])
     args.data_parallel_size = args.world_size = args.gtp_weight_remat_size = 1
-    args.consumed_train_samples = args.skipped_train_samples = 0
+    train_state = TrainState()
     args.dsa_indexer_loss_coeff = None
     args.log_max_attention_logit = not enabled
     transformer = TransformerConfig(
@@ -376,6 +383,7 @@ def test_attention_metric_logging_reads_model_config(
     run_config.logger = LoggerConfig(log_interval=100, tensorboard_log_interval=1)
     writer = Mock()
     monkeypatch.setattr(training, 'get_args', lambda: args)
+    monkeypatch.setattr(training, 'get_train_state', lambda: train_state)
     monkeypatch.setattr(training, 'get_timers', Mock())
     monkeypatch.setattr(training, 'get_tensorboard_writer', lambda: writer)
     monkeypatch.setattr(training, 'get_num_microbatches', lambda: 1)
