@@ -156,6 +156,23 @@ def test_dsa_stack_spec_uses_dsa_grouped_self_attention():
     assert attention_module is DSGroupedSelfAttention
 
 
+def test_dsa_stack_spec_declares_the_dsa_core_and_indexer():
+    """The composition has to be readable from the spec, not only after construction."""
+    self_attention = dsa_stack_spec.submodules.attention_layer.submodules.self_attention
+    core_attention = self_attention.submodules.core_attention
+    assert core_attention.module is DSGQACoreAttention
+    assert core_attention.submodules.indexer.module is SimplifiedDSGQAIndexer
+
+
+def test_dsa_stack_spec_keeps_upstreams_dense_core_for_warmup():
+    """The warmup core is captured from the base stack, not named, so it tracks upstream."""
+    upstream = hybrid_stack_spec.submodules.attention_layer.submodules.self_attention
+    core_attention = (
+        dsa_stack_spec.submodules.attention_layer.submodules.self_attention.submodules.core_attention
+    )
+    assert core_attention.submodules.dense_core_attention == upstream.submodules.core_attention
+
+
 def test_dsa_stack_spec_does_not_mutate_upstream_hybrid_spec():
     """The spec is derived by deep copy; upstream's shared spec must be untouched."""
     upstream_module = hybrid_stack_spec.submodules.attention_layer.submodules.self_attention.module

@@ -1,6 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import copy
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -8,7 +7,6 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
@@ -18,7 +16,7 @@ from megatron.core.models.common.embeddings import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -530,6 +528,17 @@ class DSGQACoreAttention(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(config=config)
+        # Asserted here, not in transformer_config: the config cannot tell which attention class
+        # a spec will build.
+        assert config.experimental_attention_variant == "dsa", (
+            "DSGQACoreAttention is wired in by the DSA layer specs; got "
+            f"experimental_attention_variant={config.experimental_attention_variant!r}."
+        )
+        assert config.dsa_indexer_mode == 'simplified', (
+            "DSGQACoreAttention implements only the simplified indexer; got "
+            f"dsa_indexer_mode={config.dsa_indexer_mode!r}. The standard DeepSeek indexer "
+            "remains available for DSA over MLA."
+        )
         self.layer_number = layer_number
         self.indexer = build_module(submodules.indexer, config=config, pg_collection=pg_collection)
         self.dense_core_attention = None
@@ -831,50 +840,9 @@ class DSGQACoreAttention(MegatronModule):
 class DSGroupedSelfAttention(SelfAttention):
     """Self-attention that swaps in token-level DSA for grouped-query attention."""
 
-    def __init__(
-        self,
-        config: TransformerConfig,
-        submodules: SelfAttentionSubmodules,
-        layer_number: int,
-        attn_mask_type: AttnMaskType = AttnMaskType.padding,
-        cp_comm_type: str | None = None,
-        pg_collection: ProcessGroupCollection | None = None,
-        pp_layer_offset: Optional[int] = None,
-        # Upstream's TransformerLayer now passes a module instance name top-down.
-        name: str | None = None,
-    ):
-        if config.experimental_attention_variant == "dsa":
-            # Asserted here, not in transformer_config: the config cannot tell which attention class
-            # a spec will build.
-            assert config.dsa_indexer_mode == 'simplified', (
-                "DSGroupedSelfAttention implements only the simplified indexer; got "
-                f"dsa_indexer_mode={config.dsa_indexer_mode!r}. The standard DeepSeek indexer "
-                "remains available for DSA over MLA."
-            )
-            submodules = copy.copy(submodules)
-            dense_core_attention = submodules.core_attention
-            indexer_spec = ModuleSpec(
-                module=SimplifiedDSGQAIndexer,
-                submodules=SimplifiedDSGQAIndexerSubmodules(
-                    linear_q=ModuleSpec(module=TELinear), linear_k=ModuleSpec(module=TELinear)
-                ),
-            )
-            submodules.core_attention = ModuleSpec(
-                module=DSGQACoreAttention,
-                submodules=DSGQAAttentionSubmodules(
-                    indexer=indexer_spec, dense_core_attention=dense_core_attention
-                ),
-            )
-        super().__init__(
-            config=config,
-            submodules=submodules,
-            layer_number=layer_number,
-            attn_mask_type=attn_mask_type,
-            cp_comm_type=cp_comm_type,
-            pg_collection=pg_collection,
-            pp_layer_offset=pp_layer_offset,
-            name=name,
-        )
+    # The DSA core attention and its indexer are declared in dsa_layer_specs.py rather than
+    # assembled here, so the composition is readable from the spec alone. This class adds only
+    # the indexer's extra forward inputs; construction is SelfAttention's unchanged.
 
     def _use_indexer_rope(
         self, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin
