@@ -2,8 +2,8 @@
 """Deployment MoE/mHC/head on the native Lite model lifecycle.
 
 Ratio-zero attention uses native BI projections and sparse FlashMLA. Compressed
-attention still uses Core and is explicitly provisional; receipts distinguish
-the two providers until each target path has its own parity evidence.
+attention calls native producers with shared Lite owners; ratio-two parity
+remains pending until its own module gate completes.
 """
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -47,7 +47,7 @@ class Block(DS41Block):
 
 class DeepseekV41Model(NativeModel):
     deployment_providers = {
-        'attention': 'ratio0 native BI + sparse FlashMLA; ratio>0 Core provisional; NOT_TARGET_PARITY',
+        'attention': 'native BI SWA + ratio2 compressor/indexer + sparse FlashMLA; ratio2 parity pending',
         'engram': 'Lite frozen-host native FP8 owner; Core projections provisional',
         'moe': 'R1 nonfused MegaMoE + Core native groups/owners/collectives',
         'mhc': 'native BI caller-stream pre + materialized post; parity unverified',

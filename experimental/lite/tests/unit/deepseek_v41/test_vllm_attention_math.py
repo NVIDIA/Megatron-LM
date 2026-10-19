@@ -18,3 +18,19 @@ def test_rotary_vjp_is_transpose_for_query_and_shared_kv():
         expected = _rotate(grad, positions, cache, inverse=True)
         torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
         torch.testing.assert_close(y[..., :4], x[..., :4], rtol=0, atol=0)
+
+
+def test_ratio_two_geometry_and_open_group_adjoint():
+    from megatron.lite.model.deepseek_v41.vllm.compressed import metadata, pool_vjp
+
+    m = metadata(147, 2, 'cpu')
+    assert m.lengths.tolist() == [73]
+    assert m.slots[::2].eq(-1).all()
+    assert m.slots[1::2].tolist() == list(range(73))
+    assert m.table.tolist() == [[0, 1]]
+    raw = torch.arange(5 * 1024, dtype=torch.float32).reshape(5, 1024) / 4096
+    weight = torch.ones(512)
+    dx, dw = pool_vjp(raw, weight, 2, torch.ones(5, 512), 1e-20)
+    assert torch.isfinite(dx).all() and torch.isfinite(dw).all()
+    assert dx[-1].eq(0).all() and dx[:-1].count_nonzero()
+    assert dw.count_nonzero()

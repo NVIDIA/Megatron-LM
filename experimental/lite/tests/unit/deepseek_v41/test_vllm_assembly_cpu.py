@@ -30,7 +30,6 @@ def test_attention_provider_keeps_compressed_gap_explicit_and_native_lifecycle()
     from megatron.lite.model.deepseek_v41.vllm.attention import SWAAttention
 
     assert issubclass(SWAAttention, DS41SelfAttention)
-    assert 'ratio>0 Core provisional' in DeepseekV41Model.deployment_providers['attention']
-    assert 'NOT_TARGET_PARITY' in DeepseekV41Model.deployment_providers['attention']
+    assert 'ratio2 parity pending' in DeepseekV41Model.deployment_providers['attention']
     assert DeepseekV41Model.set_input_tensor is NativeModel.set_input_tensor
     assert DeepseekV41Model.forward is NativeModel.forward

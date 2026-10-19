@@ -177,7 +177,7 @@ class _InverseRoPE(torch.autograd.Function):
         return _rotate(grad.reshape(ctx.shape), positions, cache), None, None, None
 
 
-def swa_forward(attention, hidden, positions, rope_cache, *, observe=None):
+def swa_forward(attention, hidden, positions, rope_cache, *, observe=None, source=None):
     """One complete ratio-zero document, including native weight quantization."""
     emit = observe or (lambda name, value: None)
     x = hidden.reshape(-1, hidden.shape[-1])
@@ -208,9 +208,22 @@ def swa_forward(attention, hidden, positions, rope_cache, *, observe=None):
     rows = x.shape[0]
     cu = torch.tensor([0, rows], device=x.device, dtype=torch.int32)
     lengths = torch.tensor([rows], device=x.device, dtype=torch.int32)
+    ratio, offset = 0, 0
     topk = torch.empty((rows, 0), device=x.device, dtype=torch.int32)
+    if source is not None:
+        compressed, topk, ratio = source(x, qr, qa)
+        offset = compressed.shape[0]
+        kv = torch.cat((compressed, kv), 0)
     indices, lens = combine_topk_swa_indices(
-        topk, cu, lengths, lengths, attention.config.csa_window_size, 0, 0, rows, 0
+        topk,
+        cu,
+        lengths,
+        lengths,
+        attention.config.csa_window_size,
+        ratio,
+        topk.shape[1],
+        rows + offset,
+        offset,
     )
     emit('swa_indices', indices)
     sink = attention.core_attention.native.attn_sink
@@ -276,12 +289,6 @@ from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfA
 
 class SWAAttention(DS41SelfAttention):
     def forward(self, hidden_states, attention_mask=None, *, packed_seq_params=None, **kwargs):
-        if self._dsv4_compress_ratio != 0:
-            # Explicit remaining convergence work: compressed attention is not
-            # silently relabelled as the deployment provider.
-            return super().forward(
-                hidden_states, attention_mask, packed_seq_params=packed_seq_params, **kwargs
-            )
         if self.pg_collection.cp.size() != 1:
             raise NotImplementedError('Deployment SWA CP exchange is not yet validated')
         if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
@@ -310,17 +317,32 @@ class SWAAttention(DS41SelfAttention):
                     head_dim=r.head_dim,
                     rope_head_dim=r.qk_rope_head_dim,
                     max_position_embeddings=r.max_position_embeddings,
-                    compress_ratio=0,
+                    compress_ratio=self._dsv4_compress_ratio,
                 ).cos_sin_cache
         cu = packed_seq_params.cu_seqlens_q_padded
         if cu is None:
             cu = packed_seq_params.cu_seqlens_q
         boundaries = cu.tolist()
         pieces = []
-        for lo, hi in zip(boundaries, boundaries[1:]):
+        for document, (lo, hi) in enumerate(zip(boundaries, boundaries[1:])):
             if hi > lo:
                 positions = torch.arange(hi - lo, device=hidden_states.device, dtype=torch.int64)
+
+                def sources(x, qr, qa):
+                    from .compressed import source
+
+                    decoded, topk = source(
+                        self, x, qr, qa, self._deployment_rope, document, lambda name, value: None
+                    )
+                    return decoded, topk, self._dsv4_compress_ratio
+
                 pieces.append(
-                    swa_forward(self, hidden_states[lo:hi], positions, self._deployment_rope)
+                    swa_forward(
+                        self,
+                        hidden_states[lo:hi],
+                        positions,
+                        self._deployment_rope,
+                        source=sources if self._dsv4_compress_ratio else None,
+                    )
                 )
         return torch.cat(pieces, 0) if pieces else hidden_states * 0, None
