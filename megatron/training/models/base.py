@@ -196,7 +196,8 @@ class ModelConfig:
         """Deserialize config from dictionary.
 
         Uses _target_ to determine the correct class to instantiate.
-        The builder is restored from _builder_ or from the class's ClassVar.
+        The serialized _builder_ value is accepted for compatibility but ignored. The
+        class selected by _target_ determines the builder through its ClassVar.
 
         Args:
             data: Dictionary with _target_ and config fields
@@ -232,10 +233,7 @@ class ModelConfig:
 
             return config_cls(**filtered_data)
 
-        result = _from_dict(data)
-        result.builder = data["_builder_"]
-
-        return result
+        return _from_dict(data)
 
 
 ModelT = TypeVar("ModelT", bound=MegatronModule)
@@ -313,6 +311,8 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        device: Any | None = None,
+        checkpoint: Any | None = None,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -329,6 +329,8 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
             use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
                 controls whether to compute and supply a shard-aligned param layout to DDP.
+            device: Explicit model placement requested by the run configuration.
+            checkpoint: Run-owned checkpoint configuration available to pre-wrap hooks.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,

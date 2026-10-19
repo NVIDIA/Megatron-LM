@@ -49,16 +49,22 @@ class ConfigContainerBase:
 
     def build_models(self, pg_collection, **kwargs):
         """Build the declared model with run-owned checkpoint and execution settings."""
-        self.validate()
         if self.model is None:
             raise ValueError("A model config is required to build models.")
         settings = {}
-        if self.model_build.device is not None:
-            settings["device"] = self.model_build.device
-        if self.model_build.wrap_with_ddp is not None:
-            settings["wrap_with_ddp"] = self.model_build.wrap_with_ddp
-        if not self.model_build.mixed_precision:
-            settings["mixed_precision_wrapper"] = None
+        model_build = getattr(self, "model_build", None)
+        if model_build is not None:
+            dist = getattr(self, "dist", None)
+            if model_build.device is not None and (
+                dist is not None and (dist.use_torch_fsdp2 or dist.use_megatron_fsdp)
+            ):
+                raise ValueError("Explicit device placement conflicts with FSDP-managed placement.")
+            if model_build.device is not None:
+                settings["device"] = model_build.device
+            if model_build.wrap_with_ddp is not None:
+                settings["wrap_with_ddp"] = model_build.wrap_with_ddp
+            if not model_build.mixed_precision:
+                settings["mixed_precision_wrapper"] = None
         for key, value in settings.items():
             if key in kwargs and kwargs[key] != value:
                 raise ValueError(f"Build argument {key} conflicts with model_build configuration.")
@@ -288,7 +294,6 @@ class ConfigContainerBase:
 class PretrainConfigContainer(ConfigContainerBase):
     """Top-level container holding all configuration objects."""
 
-    model_build: ModelBuildConfig = field(default_factory=ModelBuildConfig)
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     model: HybridModelConfig | GPTModelConfig

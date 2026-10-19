@@ -241,10 +241,10 @@ class TestModelConfigFromDict:
         assert cfg.value == 55
         assert cfg.name == "reconstructed"
 
-    def test_builder_restored(self):
+    def test_serialized_builder_ignored(self):
         d = self._dummy_dict(_builder_="fake.builder.string")
         cfg = ModelConfig.from_dict(d)
-        assert cfg.builder == "fake.builder.string"
+        assert cfg.builder == DummyModelConfig.builder
 
     def test_ignores_unknown_fields(self):
         d = self._dummy_dict(unknown_field="should_be_ignored", another_unknown=123)

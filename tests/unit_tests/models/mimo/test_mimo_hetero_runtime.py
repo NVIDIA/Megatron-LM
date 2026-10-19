@@ -230,6 +230,7 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
         data_parallel_random_init=True,
         use_layer_wise_distributed_optimizer=True,
         use_layer_wise_param_layout=False,
+        checkpoint=mocker.Mock(),
     ) == [model]
 
     torch_device.assert_called_once_with("meta")
@@ -287,6 +288,15 @@ def test_builder_rejects_untested_fsdp_modes(mocker, fsdp_kwarg):
         builder.build_distributed_models(
             mocker.Mock(), ddp_config=DistributedDataParallelConfig(), **{fsdp_kwarg: True}
         )
+
+
+def test_builder_rejects_explicit_device_placement(mocker):
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
+
+    with pytest.raises(NotImplementedError, match="device placement"):
+        builder.build_distributed_models(mocker.Mock(), device="cpu")
 
 
 def test_resolve_role_rejects_colocated_or_zero_active_roles(mocker):

@@ -40,7 +40,11 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
     assert restored.model.get_builder_cls() is (HybridModelBuilder if hybrid else GPTModelBuilder)
     assert restored.checkpoint.load == "/student"
     assert restored.model.transformations == model.transformations
-    assert restored.model_build == cfg.model_build
+    if training:
+        assert "model_build" not in cfg.to_dict()
+        assert not hasattr(restored, "model_build")
+    else:
+        assert restored.model_build == cfg.model_build
     assert not hasattr(restored.model.transformations, "load")
     if kd:
         assert (
@@ -61,8 +65,12 @@ def test_tokenizer_finalizes_same_model_used_for_build():
     model = cfg.model
     model.vocab_size = None
     resolve_tokenizer_vocab_size(cfg, 32768)
-    with patch.object(GPTModelBuilder, "build_distributed_models") as build:
+    with (
+        patch.object(cfg, "validate") as validate,
+        patch.object(GPTModelBuilder, "build_distributed_models") as build,
+    ):
         cfg.build_models(Mock())
+    validate.assert_not_called()
     assert cfg.model is model
     assert model.vocab_size == 32768
     assert model.should_pad_vocab is False
@@ -103,14 +111,12 @@ def test_build_policy_conflict_is_rejected():
         cfg.build_models(Mock(), device="cuda")
 
 
-def test_unknown_builder_is_not_imported():
-    from megatron.training.config.instantiate_utils import InstantiationException
-
+def test_serialized_builder_is_ignored():
     cfg = mc.modelopt_inference_config_from_args(_make_args())
     data = cfg.to_dict()
     data["model"]["_builder_"] = "os.system"
-    with pytest.raises(InstantiationException, match="allowlist"):
-        InferenceConfigContainer.from_dict(data)
+    restored = InferenceConfigContainer.from_dict(data)
+    assert restored.model.get_builder_cls() is GPTModelBuilder
 
 
 def test_teacher_inherits_configured_student_format():
