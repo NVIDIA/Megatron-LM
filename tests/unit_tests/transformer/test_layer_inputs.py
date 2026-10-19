@@ -383,7 +383,10 @@ def test_pre_core_binding_owns_metadata_and_preserves_stage_state(cls, mode):
     assert state[-1] is connection_state
     kwargs = core.forward_pre_attn_and_core_attn.call_args.kwargs
     assert kwargs["packed_seq_params"] is packed
-    assert kwargs["packed_sequence_cp_metadata"] is (metadata if mode == "chunkwise" else None)
+    if cls is MambaLayer:
+        assert kwargs["packed_sequence_cp_metadata"] is (metadata if mode == "chunkwise" else None)
+    else:
+        assert "packed_sequence_cp_metadata" not in kwargs
     prepare = module._prepare_mixer_state if cls is MambaLayer else module._run_input_layernorm
     assert prepare.call_args.kwargs["residual_stream_recompute_context"] is recompute
 
@@ -773,7 +776,7 @@ def test_mhc_fallback_accepts_native_layer_inputs_and_preserves_gradients(call_s
 
 
 @pytest.mark.parametrize("hash_routing", [False, True])
-def test_mhc_fast_path_filters_ids_when_bypassing_the_inner_adapter(hash_routing):
+def test_mhc_fast_path_leaves_routing_input_selection_to_the_core(hash_routing):
     x = torch.randn(3, 2, 4)
     inner = bare(TransformerLayer)
     inner.config = SimpleNamespace(bias_dropout_fusion=False)
@@ -787,9 +790,7 @@ def test_mhc_fast_path_filters_ids_when_bypassing_the_inner_adapter(hash_routing
     wrapper = mock_mhc_boundary(inner, x)
     ids = torch.ones(2, 3, dtype=torch.long)
     wrapper(x, LayerInputs(input_ids=ids))
-    assert inner._forward_mlp_output_with_bias.call_args.kwargs["input_ids"] is (
-        ids if hash_routing else None
-    )
+    assert inner._forward_mlp_output_with_bias.call_args.kwargs["input_ids"] is ids
 
 
 @pytest.mark.parametrize("updates_context", [False, True])
@@ -1025,6 +1026,8 @@ def test_shared_binding_surrounds_graph_dispatch_without_recursion(mode, output_
 @pytest.mark.parametrize("cls", [TransformerLayer, MambaLayer])
 def test_graph_argument_keys_match_bound_skeleton_contract(cls):
     module = bare(cls)
+    if cls is MambaLayer:
+        module.config = SimpleNamespace(linear_cp_mode="headwise")
     x = torch.randn(2, 4)
     module.cudagraph_manager = Mock(return_value=(x, LayerAddends()) if cls is TransformerLayer else x)
     module(x, LayerInputs(rotary_pos_emb=object(), rotary_pos_cos_sin=object()))
@@ -1173,6 +1176,8 @@ def test_te_capture_and_replay_use_legacy_tensors_and_manual_hooks():
 )
 def test_complete_layer_output_preserves_context_separately_from_bias(cls):
     module = bare(cls)
+    if cls is MambaLayer:
+        module.config = SimpleNamespace(linear_cp_mode="headwise")
     x, context = torch.randn(2, 4), torch.randn(2, 4)
     if cls in (MambaLayer, HybridStack):
         legacy_output = x
@@ -1243,19 +1248,61 @@ def test_stack_preserves_mhc_stream_in_named_addends():
 
 @pytest.mark.parametrize("with_context", [False, True])
 @pytest.mark.parametrize("partial", [False, True])
-def test_transformer_shared_te_capture_preserves_context(with_context, partial):
+def test_transformer_te_capture_preserves_raw_intermediates(with_context, partial):
     module = bare(TransformerLayer)
+    module.config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router] if partial else [],
+    )
+    module.cuda_graphs = []
+    module.is_moe_layer = partial
+    module.offload_module_in_cuda_graph = False
     x = torch.randn(2, 4)
     context = torch.randn(3, 4) if with_context else None
-    captured = (x, torch.randn(2, 4), torch.randn(2, 4)) if partial else (x,)
-    if context is not None:
-        captured += (context,)
-    module._call_with_bound_args = Mock(return_value=captured)
-    module._should_call_local_cudagraph = Mock(return_value=False)
-    module._should_call_te_cudagraph = Mock(return_value=True)
+    intermediates = (x, torch.randn(2, 4), torch.randn(2, 4)) if partial else (x,)
+    module._forward_attention = Mock(return_value=(x, context))
+    module._forward_mlp = Mock(return_value=intermediates if partial else x)
+
+    # TE's capture helper invokes the module with explicit tensor arguments.
+    with patch("megatron.core.transformer.cuda_graphs.is_graph_capturing", return_value=True):
+        captured = module(x, context=context)
+    expected = intermediates + ((context,) if with_context else ())
+    assert len(captured) == len(expected)
+    assert all(actual is wanted for actual, wanted in zip(captured, expected))
+
+
+@pytest.mark.parametrize("with_context", [False, True])
+@pytest.mark.parametrize("partial", [False, True])
+def test_transformer_te_replay_returns_named_layer_outputs(with_context, partial):
+    module = bare(TransformerLayer)
+    module.config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=[CudaGraphModule.attn] if partial else [],
+        delay_offload_until_cuda_graph=False,
+        overlap_moe_expert_parallel_comm=False,
+        fine_grained_activation_offloading=False,
+    )
+    module.is_moe_layer = False
+    module.cuda_graph_manual_hooks = [(Mock(), ())]
+    module._te_cuda_graph_padding_mask = Mock(return_value=None)
+    # Use the tensor argument preparation without importing TE in this mocked check.
+    module._get_te_cuda_graph_replay_args = (
+        GraphableMegatronModule._get_te_cuda_graph_replay_args.__get__(module)
+    )
+    x, completed = torch.randn(2, 4), torch.randn(2, 4)
+    context = torch.randn(3, 4) if with_context else None
+    captured = (x,) + ((context,) if with_context else ())
+    module.cuda_graphs = [Mock(return_value=captured)]
+    module._forward_mlp = Mock(return_value=completed)
+
     output, addends = module(x, LayerInputs(context=context))
-    assert output is x
+    assert output is (completed if partial else x)
     assert addends.bias is None and addends.context is context
+    module.cuda_graph_manual_hooks[0][0].assert_called_once_with()
+    if partial:
+        module._forward_mlp.assert_called_once_with(x, padding_mask=None, input_ids=None)
+    else:
+        module._forward_mlp.assert_not_called()
 
 
 @pytest.mark.parametrize("output_kind", ["tensor", "singleton", "bias", "none", "addends"])

@@ -229,7 +229,6 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
     block = ShortcutMoEBlock(
         attn_layer, moe_layer, overlap_a2a=False, attn_local_idx=4, moe_local_idx=5
     )
-    monkeypatch.setattr(attn_layer, "uses_packed_sequence_cp_metadata", lambda: uses_cp_metadata)
     calls = []
     observed = {}
     attn_context, moe_context = (
@@ -249,9 +248,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
             return hidden_states + layer_idx
 
     @bind_layer_stage_inputs(
-        include_if={
-            "packed_sequence_cp_metadata": lambda module: module.uses_packed_sequence_cp_metadata()
-        }
+        include_if={"packed_sequence_cp_metadata": lambda module: uses_cp_metadata}
     )
     def attn_forward(
         self,

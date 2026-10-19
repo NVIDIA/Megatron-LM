@@ -215,7 +215,7 @@ class TestWideResidualMTPAndMIMO:
             )
         loss.mean().backward()
 
-        decoder_input = decoder_forward.call_args.kwargs["hidden_states"]
+        decoder_input = decoder_forward.call_args.args[0]
         assert decoder_input.shape == (4, 2, config.hidden_size)
         expected_decoder_dtype = (
             torch.float32 if config.fp32_residual_connection else config.params_dtype
@@ -289,7 +289,7 @@ class TestWideResidualMTPAndMIMO:
             )
         loss.mean().backward()
 
-        decoder_input = decoder_forward.call_args.kwargs["hidden_states"]
+        decoder_input = decoder_forward.call_args.args[0]
         mtp_stack = model.language_model.mtp.layers[0].mtp_model_layer
         assert decoder_input.dtype == torch.float32
         assert second_shortcut_input_dtypes

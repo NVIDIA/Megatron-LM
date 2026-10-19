@@ -148,10 +148,6 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             and self.mixer.supports_two_stage_attention()
         )
 
-    def uses_packed_sequence_cp_metadata(self) -> bool:
-        """Only chunkwise mixers consume the stack's packed-sequence CP metadata."""
-        return self.config.linear_cp_mode == "chunkwise"
-
     def _prepare_mixer_input(self, hidden_states: Tensor) -> Tensor:
         """Convert a branch input to parameter precision and normalize it."""
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
@@ -194,17 +190,13 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
     @bind_layer_stage_inputs(
         include_if={
-            "packed_sequence_cp_metadata": lambda module: module.uses_packed_sequence_cp_metadata()
+            "packed_sequence_cp_metadata": lambda layer: layer.config.linear_cp_mode == "chunkwise"
         }
     )
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
-        rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
-        sequence_len_offset: Optional[int] = None,  # Not used in MambaLayer
-        padding_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
@@ -216,10 +208,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         Args:
             hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
                 b is batch size, and h is hidden size.
-            attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
             inference_context (BaseInferenceContext, optional): Must be ``None`` because two-stage
                 mixer execution is training-only.
-            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
 
         Returns:
             Core SSM result and residual, followed by connection state for a connected layer.
@@ -275,8 +265,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
     @bind_layer_inputs(
         include_if={
-            "packed_sequence_cp_metadata": lambda module: module.uses_packed_sequence_cp_metadata()
-        },
+            "packed_sequence_cp_metadata": lambda layer: layer.config.linear_cp_mode == "chunkwise"
+        }
     )
     def forward(
         self,

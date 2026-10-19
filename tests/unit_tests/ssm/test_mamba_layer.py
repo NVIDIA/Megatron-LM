@@ -184,12 +184,11 @@ class TestMambaLayer:
         write = Mock(return_value=split_output)
         monkeypatch.setattr(layer, "_apply_mixer_update", write)
         recompute_context = object()
-        assert (
-            layer.forward_post_core_attn(
-                *stage_state, residual_stream_recompute_context=recompute_context
-            )
-            is split_output
+        output, addends = layer.forward_post_core_attn(
+            *stage_state, residual_stream_recompute_context=recompute_context
         )
+        assert output is split_output
+        assert addends.bias is None
         assert write.call_args.args[1] is stage_state[1]
         assert write.call_args.args[2] is stage_state[2]
         assert write.call_args.kwargs["recompute_context"] is recompute_context

@@ -504,6 +504,10 @@ Transformer and Mamba pre-core stages accept `(hidden_states, inputs)` through
 selects declared arguments. It leaves the intermediate state opaque: pass the entire
 result to `forward_post_core_attn`.
 
+Unused attention/rotary/padding arguments have been removed from Mamba's pre-core
+signature; shared callers can continue supplying them in `LayerInputs`, and the
+binding selects only the arguments the stage consumes.
+
 Completed Transformer and Mamba split stages return `(hidden_states, addends)`.
 Their `forward_post_core_attn` methods use `@bind_layer_outputs` to normalize the
 implementation's natural output; Transformer declares `addend="context"`.
@@ -519,8 +523,9 @@ supply those fields, and the binding ignores them.
 
 Stack and recompute callers pass available CP metadata in `LayerInputs` without
 inspecting layer types. Mamba's binding consumes it only in chunkwise mode.
-The pre-core stage binding uses the layer's `uses_packed_sequence_cp_metadata()`
-policy too; shortcut orchestration does not select metadata for individual layer types.
+Mamba's pre-core binding applies the same chunkwise-only policy. Transformer pre-core
+stages do not declare CP metadata and ignore it in shared calls. Shortcut orchestration
+does not select metadata for individual layer types.
 
 Mamba's mixer and Transformer's self-attention and MLP/MoE calls use shared inputs.
 Dense MLP bindings ignore routing fields; MoE bindings select the fields they consume.
@@ -540,8 +545,11 @@ modules dispatch through `_call_with_bound_args`; per-call setup that must run
 after binding and before graph selection belongs at that boundary. The existing
 skeleton bindings omit non-hash token IDs and absent optional recompute/context
 arguments. Mamba's graph arguments also omit its unused attention mask and rotary
-embeddings. TE capture/replay and the vision graph wrapper retain their existing
-behavior; the shared binding also normalizes results from layer-owned execution callbacks.
+embeddings. TE capture uses explicit tensor arguments and preserves its flat
+intermediate outputs. TE replay completes the layer and constructs `LayerAddends`
+at its own output boundary; the shared binding does not inspect graph dispatch or
+interpret capture intermediates. EP-overlap replay retains its scheduler-specific
+intermediate outputs. The vision graph wrapper is unchanged.
 
 ### Validate before scaling up
 

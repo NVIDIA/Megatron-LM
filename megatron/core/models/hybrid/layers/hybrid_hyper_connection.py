@@ -11,12 +11,7 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import (
-    LayerAddends,
-    LayerInputs,
-    bind_layer_inputs,
-    wants_input_ids,
-)
+from megatron.core.transformer.layer_interface import LayerAddends, LayerInputs, bind_layer_inputs
 from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
@@ -163,8 +158,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             sequence_len_offset,
             packed_seq_params,
             padding_mask,
-            # This path bypasses the inner LayerInputs adapter, which normally filters IDs.
-            input_ids if wants_input_ids(self.inner_layer) else None,
+            input_ids,
             mhc_recompute_manager,
         )
 

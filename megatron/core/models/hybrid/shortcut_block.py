@@ -356,7 +356,7 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
                 mlp_state,
                 residual_stream_recompute_context=recompute_context,
             )
-        return output
+        return output[0] if isinstance(output, tuple) else output
 
     def _launch_dispatch(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, async_op: bool = False

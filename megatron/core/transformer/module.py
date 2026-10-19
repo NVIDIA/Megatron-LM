@@ -31,18 +31,12 @@ class TwoStageAttentionLayer:
         """Return whether this module instance supports two-stage execution."""
         return True
 
-    def uses_packed_sequence_cp_metadata(self) -> bool:
-        """Whether split-stage execution consumes chunkwise packed-sequence metadata."""
-        return False
-
     def layer_inputs_forward_pre_attn_and_core_attn(self, hidden_states, inputs: LayerInputs):
         """Bind stage inputs without interpreting the state saved for the post-core stage."""
         stage = self.forward_pre_attn_and_core_attn
         return stage._layer_input_binding(self, stage, hidden_states, inputs)
 
-    def forward_pre_attn_and_core_attn(
-        self, *args: Any, packed_sequence_cp_metadata: Any = None, **kwargs: Any
-    ) -> Any:
+    def forward_pre_attn_and_core_attn(self, *args: Any, **kwargs: Any) -> Any:
         """Run the pre-attention and core-attention stage."""
         raise NotImplementedError
 

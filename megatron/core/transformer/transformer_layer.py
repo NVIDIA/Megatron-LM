@@ -875,23 +875,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         output, addends = self.self_attention(hidden_states, inputs)
         return output, addends.bias
 
-    @bind_layer_stage_inputs(
-        include_if={
-            "packed_sequence_cp_metadata": lambda module: module.uses_packed_sequence_cp_metadata()
-        }
-    )
+    @bind_layer_stage_inputs
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
-        *,
-        packed_sequence_cp_metadata=None,
     ):
         """Run the training path through pre-attention and core attention."""
         assert self.supports_two_stage_attention()
@@ -908,7 +901,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 rotary_pos_emb=rotary_pos_emb,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
-                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
             )
         nvtx_range_pop(suffix="self_attention")
 
@@ -1144,10 +1136,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         return hidden_states, context
 
     def layer_inputs_forward(self, hidden_states, inputs, *, _call=None):
-        """Omit absent optional inputs and bind completed layer outputs."""
+        """Omit absent optional inputs before hooks and graph dispatch."""
         call = self._call_with_bound_args if _call is None else _call
 
-        def call_with_addends(*args, **kwargs):
+        def call_with_optional_inputs(*args, **kwargs):
             for name in (
                 "context",
                 "context_mask",
@@ -1160,20 +1152,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             ):
                 if kwargs.get(name) is None:
                     kwargs.pop(name, None)
-            result = call(*args, **kwargs)
-            if not isinstance(result, tuple) or (
-                len(result) == 2 and isinstance(result[1], LayerAddends)
-            ):
-                return result
-            if (
-                not self._should_call_local_cudagraph(*args, **kwargs)
-                and self._should_call_te_cudagraph(*args, **kwargs)
-            ):
-                context = result[-1] if kwargs.get("context") is not None else None
-                return result[0], LayerAddends(context=context)
-            return result
+            return call(*args, **kwargs)
 
-        return super().layer_inputs_forward(hidden_states, inputs, _call=call_with_addends)
+        return super().layer_inputs_forward(hidden_states, inputs, _call=call_with_optional_inputs)
 
     @bind_layer_inputs(
         # Only hash routers reserve a token-ID input in the legacy CUDA graph.
@@ -1928,6 +1909,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         1. In some conditions CUDA graph cannot cover the entire layer. The `cuda_graph_modules`
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
+
+        TE invokes capture with explicit tensor arguments, not LayerInputs. Keep
+        every captured intermediate in the flat tensor tuple; replay completes
+        the layer and returns named LayerAddends at its output boundary.
         """
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
@@ -2147,6 +2132,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 padding_mask=kwargs.get("padding_mask"),
                 input_ids=kwargs.get("input_ids", None),
             )
+        # Only completed layer results use the shared output interface. The EP
+        # overlap paths above return intermediates to their own scheduler.
         return output, LayerAddends(context=context)
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
