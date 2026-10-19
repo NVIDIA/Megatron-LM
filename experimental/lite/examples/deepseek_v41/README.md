@@ -85,7 +85,7 @@ from megatron.lite.runtime.contracts import ParallelConfig, RuntimeConfig
 backend = MegatronLiteConfig(
     model_name="deepseek_v41", impl="lite", hf_path="/path/to/model",
     parallel=ParallelConfig(ep=4),
-    impl_cfg={"token_map": compressed_token_map, "optimizer": "muon"},
+    impl_cfg={"token_map": compressed_token_map, "optimizer": "adam"},
 )
 runtime = create_runtime(RuntimeConfig(backend="mlite", backend_cfg=backend))
 handle = runtime.build_model()
