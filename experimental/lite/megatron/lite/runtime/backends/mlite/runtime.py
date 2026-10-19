@@ -36,6 +36,10 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
     impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
     impl_cfg_kwargs["parallel"] = rt_cfg.parallel
+    if "initialize_weights" in init_fields:
+        impl_cfg_kwargs.setdefault(
+            "initialize_weights", not (rt_cfg.load_hf_weights and rt_cfg.hf_path)
+        )
     if (
         "attention_backend_override" in init_fields
         and impl_cfg_kwargs.get("attention_backend_override") is None

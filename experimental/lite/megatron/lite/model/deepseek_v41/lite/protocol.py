@@ -23,6 +23,7 @@ class ImplConfig:
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     hf_path: str = ""
+    initialize_weights: bool = True
     token_map: object = None
     trainable_engram: bool = False
     shard_engram: bool = True
