@@ -80,9 +80,10 @@ class NgramHash(nn.Module):
         if cu_seqlens is not None:
             if b != 1:
                 raise ValueError("THD packing requires B=1")
-            from megatron.lite.primitive.utils import packed_seq
-
-            for begin, end in packed_seq.packed_sequence_ranges(cu_seqlens, length):
+            bounds = cu_seqlens.tolist()
+            if bounds[0] != 0 or bounds[-1] != length:
+                raise ValueError("cu_seqlens must cover the packed sequence")
+            for begin, end in zip(bounds[:-1], bounds[1:]):
                 starts[:, begin:end] = begin
         blocked = torch.zeros_like(positions, dtype=torch.bool)
         history = []
