@@ -571,7 +571,7 @@ A future MR will add an opt-in wgrad-before-dgrad schedule on `_Linear` / `_Laye
 
 When a GTP_remat-sharded module is in `--recompute-modules` (e.g. `shared_experts`), its forward is **re-run during backward** to regenerate activations. That recompute-forward must all-gather each weight **rowwise** again — a *third* gather lifecycle, concurrent with the in-flight **columnwise** dgrad gather of the *same* weight. Since both share one `GTPShardedParam`, the recompute path gets its **own** prefetch slot (`_recompute_prefetch_handle` / `_recompute_ag_event`) so it never clobbers the dgrad lifecycle's `state` / `_prefetch_handle` / `ag_event`, and its **own** buffer ticket (`_ag_ticket_recompute`) with a parity of its own. Reusing `_ag_ticket_fwd` is unsafe twice over: a fwd prefetch may still be in flight in that buffer, and the fwd parity is decided against `prev_w` — a different neighbour. Without its own parity, consecutive recompute nodes share one buffer and the one-ahead prefetch overwrites the weight still being read: silent wrong activations, then NaN.
 
-The recompute weights form a **separate** linked list (`_recompute_next`), **self-populated** on the first backward from the weights actually re-gathered while `in_fp8_activation_recompute_phase()` is true — membership is *observed*, not configured (no tagging, so it tracks exactly what each checkpointed module re-gathers). Each recompute-forward consume prefetches the next recompute weight, so every gather **except the global-first** overlaps preceding recompute / dgrad / wgrad compute:
+The recompute weights form a **separate** linked list (`_recompute_next`), **self-populated** on the first backward from the weights actually re-gathered while `in_activation_recompute_phase()` is true — membership is *observed*, not configured (no tagging, so it tracks exactly what each checkpointed module re-gathers). Each recompute-forward consume prefetches the next recompute weight, so every gather **except the global-first** overlaps preceding recompute / dgrad / wgrad compute:
 
 ```
 recompute-fwd of shared_experts  (per layer: GEMM fc1 → SReLU → GEMM fc2, then dgrad+wgrad)
@@ -585,7 +585,21 @@ recompute-fwd of shared_experts  (per layer: GEMM fc1 → SReLU → GEMM fc2, th
 
 `AG(fc2)` is issued at `fc1`'s consume (overlaps GEMM fc1 + SReLU); `AG(fc1')` for the next layer is issued at `fc2`'s consume, so it overlaps the **whole** layer's `dgrad + wgrad` window. The cross-layer link is what hides every region head except the very first.
 
+Native MCore `checkpoint` and `CheckpointWithoutOutput` mark their recomputed forward with a
+context-local flag. GTP combines this marker with TE's recompute-phase flag. In particular, a
+BF16 native checkpoint does not enter TE's FP8 metadata bookkeeping: without its own marker,
+GTP would treat the replay as ordinary forward and could read a buffer reused by backward
+prefetch. The native marker covers only the recomputed callable and is restored on exit,
+including nested recomputation and exceptions.
+
 Under **full-iteration CUDA graphs** the recompute-forward is captured; `wait_async_comms(GRAPHED)` drains the recompute handle too (sets `_recompute_already_drained`) so the captured consumer skips its cross-graph wait — the same producer-drain pattern as the fwd/bwd chains.
+
+A drained handoff marker certifies only the gather that produced its event. A recompute tail
+can leave an unused prefetch that the backward fence drains; its marker can survive until a
+later forward issues another gather for the same parameter. A pending Work handle therefore
+always takes precedence over that marker: both ordinary and recompute consumers drain the
+current handle and refresh the event before reading the buffer. Waiting only on the old event
+can expose a partially written weight, as seen in Kimi-K3's output projection on the second step.
 
 > **When *not* to recompute a GTP_remat weight.** Recompute on a GTP_remat-sharded weight adds this extra rowwise gather. For MLP-like blocks at short context (`SeqLen ≤ 2 × HiddenSize`), GTP_remat-sharding the weight saves *more* memory than recomputing its activations, so the better trade is to keep such modules GTP_remat-sharded and **out** of `--recompute-modules` (offload their activations if needed) — avoiding the third gather entirely. Build the recompute chain only for modules that genuinely need both.
 
@@ -998,7 +1012,7 @@ done
 
 | Test file | What it guards |
 |-----------|----------------|
-| `test_gtp_basics.py` | Core GTP_remat shard/gather, cache ownership, wgrad ring, DDP bucket alignment, the `num_zeros` padding correction (§3.7), and TE's recompute-phase flag (dtype-agnostic, relied on by the readiness gate in §3.2). |
+| `test_gtp_basics.py` | Core GTP_remat shard/gather, cache ownership, wgrad ring, DDP bucket alignment, the `num_zeros` padding correction (§3.7), and the TE/native recompute-phase flags (including both native checkpoint APIs under BF16, §3.2). |
 | `test_attention_gtp.py` | GTP_remat on attention linears, loss parity vs no-GTP_remat. |
 | `test_mamba_gtp.py` | GTP_remat on Mamba projection weights. |
 | `test_tp_gtp.py` | GTP_remat composed with tensor parallelism (`tp_group × gtp_remat_group`). |

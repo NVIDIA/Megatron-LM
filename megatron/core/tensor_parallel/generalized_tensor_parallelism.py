@@ -106,9 +106,13 @@ except (ImportError, ModuleNotFoundError):
     nvtx_range_pop = nvtx_range_push = round_up_to_nearest_multiple = MagicMock()
     HAVE_TE = False
 
-# TE's name says fp8, but the flag it returns is set for BF16 activation recompute too (the
-# FP8-gated helper is `is_fp8_activation_recompute_enabled`). Alias it so call sites read right.
-in_activation_recompute_phase = in_fp8_activation_recompute_phase
+
+def in_activation_recompute_phase() -> bool:
+    """Recognize both native MCore and TE activation recomputation, including BF16."""
+    from megatron.core.tensor_parallel.random import is_activation_recomputing
+
+    # Native BF16 checkpoints do not set TE's marker or manage its FP8 metadata queue.
+    return is_activation_recomputing() or in_fp8_activation_recompute_phase()
 
 
 class GTPChain(str, Enum):
@@ -1644,16 +1648,16 @@ class GTPShardedParam(torch.nn.Parameter):
                     "cache.get() would return stale data. Check the chain's "
                     "_need_weight_prefetch flag and issuer's prefetch logic."
                 )
-        # This handoff marker is specific to CUDA graphs: capture-side wait_async_comms drains
-        # the producer's Work handle and sets it. In eager execution, the consumer drains the
-        # handle directly instead.
+        # A producer graph or the backward fence can drain a gather and record its event.
+        # Its handoff marker certifies only that gather, not a newer pending Work handle.
         _was_drained = getattr(self, "_already_ag_drained", False)
         if _was_drained:
             # The producer consumed the Work handle and recorded ag_event. Clear the host-side
             # handoff marker, but retain the event wait that orders this consumer after the AG.
             self._already_ag_drained = False
-        else:
-            # Intra-graph or eager consume: drain inline.
+        if not _was_drained or self._prefetch_handle is not None:
+            # An unused prefetch can leave a marker from an earlier iteration. A new handle
+            # must be drained and its event refreshed before this buffer can be consumed.
             self._wait_param_gather()
         self.ag_event.wait()
 
@@ -1694,11 +1698,13 @@ class GTPShardedParam(torch.nn.Parameter):
         # Recompute-chain analogue of _get_prefetched_weight (state-neutral; reads the
         # rowwise gather via the _recompute_* slot).
         # CUDA-graph handoff marker equivalent to _already_ag_drained for recompute AGs.
-        if self._recompute_already_drained:
+        was_drained = self._recompute_already_drained
+        if was_drained:
             # The producer consumed the Work handle and recorded _recompute_ag_event. Clear the
             # host-side handoff marker, but retain the event wait that orders this consumer.
             self._recompute_already_drained = False
-        else:
+        if not was_drained or self._recompute_prefetch_handle is not None:
+            # The marker may describe an earlier gather, not the pending handle.
             self._wait_recompute_param_gather()
         self._recompute_ag_event.wait()
 
