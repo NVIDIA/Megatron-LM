@@ -224,14 +224,16 @@ class AVLMTaskEncoder(
                 features.append(mel_features)
                 feature_lengths.append(mel)
                 token_counts.append(num_tokens)
-            if len(features) == 1:
-                processed_audios = features[0]
-                audios_seq_lengths = torch.tensor(token_counts[0])
-                audios_feature_lengths = torch.tensor(feature_lengths[0])
-            else:
+            # Flag on keeps a clip axis for K=1 so stack_or_cat can cat variable K.
+            # Flag off stays rank-2 so a batch still stacks to [B, 80, T].
+            if all_clips:
                 processed_audios = torch.stack(features, dim=0)
                 audios_seq_lengths = torch.tensor(token_counts)
                 audios_feature_lengths = torch.tensor(feature_lengths)
+            else:
+                processed_audios = features[0]
+                audios_seq_lengths = torch.tensor(token_counts[0])
+                audios_feature_lengths = torch.tensor(feature_lengths[0])
             processed_prompt = expand_audio_placeholders(prompt, token_counts)
         else:
             processed_audios = None
