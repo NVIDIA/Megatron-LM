@@ -518,8 +518,8 @@ def _apply_yarn_config_from_args(config, args) -> None:
     etc.) with no default, so the attributes must exist whenever
     ``position_embedding_type == 'yarn'``. The CLI exposes some of these without a
     ``yarn_`` prefix (``--rotary-scaling-factor``, ``--mscale``, ``--mscale-all-dim``),
-    so the mapping is explicit. Pre-existing values on ``config`` (e.g. from YAML or a
-    ModelOpt GPT-OSS builder) are preserved. Defaults mirror ``YarnRotaryEmbedding``.
+    so the mapping is explicit. Pre-existing values on ``config`` (e.g. from YAML) are
+    preserved. Defaults mirror ``YarnRotaryEmbedding``.
     """
     if getattr(args, 'position_embedding_type', None) != 'yarn':
         return

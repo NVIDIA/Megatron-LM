@@ -143,7 +143,6 @@ MODEL_ARGS=(
     --position-embedding-type rope
     --rotary-base 10000
     --no-bias-gelu-fusion
-    --export-force-local-attention
     --no-bias-dropout-fusion
     --quick-geglu
     --glu-linear-offset 1.0

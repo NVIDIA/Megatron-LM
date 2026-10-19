@@ -11,7 +11,7 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
-from megatron.training.config.container import InferenceConfigContainer, PretrainConfigContainer
+from megatron.training.config.container import InferenceConfigContainer
 from megatron.training.config.instantiate_utils import InstantiationMode
 from megatron.training.models.gpt import GPTModelBuilder
 from megatron.training.models.hybrid import HybridModelBuilder
@@ -19,17 +19,45 @@ from tests.unit_tests.post_training.test_modelopt_model_config import _make_args
 
 
 @pytest.mark.parametrize(
-    "option",
-    [
-        {"export_te_mcore_model": True},
-        {"export_kd_teacher_load": "/teacher"},
-        {"qad_train_target": "base"},
-    ],
+    "option", [{"modelopt_enabled": True}, {"export_kd_teacher_load": "/teacher"}]
 )
 def test_modelopt_config_selection_from_explicit_options(option):
     args = _make_args(**option)
     args.load = None
+    original_args = vars(args).copy()
     assert modelopt_utils.should_use_modelopt_config(args)
+    assert vars(args) == original_args
+
+
+@pytest.mark.parametrize(
+    "option,flag",
+    [
+        ({"qad_train_target": "base"}, "--qad-train-target"),
+        ({"lsq_scale_lr": 1e-4}, "--lsq-scale-lr"),
+        ({"export_kd_cfg": "/kd.yaml"}, "--export-kd-cfg"),
+    ],
+)
+def test_modelopt_refinement_without_modelopt_run_is_rejected(option, flag):
+    args = _make_args(**option)
+    args.load = None
+    with pytest.raises(ValueError, match=flag):
+        modelopt_utils.should_use_modelopt_config(args)
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        {"export_te_mcore_model": True},
+        {"export_default_te_spec": True},
+        {"qk_l2_norm": True},
+        {"enable_gpt_oss": True},
+        {"export_offline_model": True},
+    ],
+)
+def test_options_outside_modelopt_do_not_select_it(option):
+    args = _make_args(**option)
+    args.load = None
+    assert not modelopt_utils.should_use_modelopt_config(args)
 
 
 def test_modelopt_config_selection_from_checkpoint():
@@ -46,15 +74,6 @@ def test_plain_run_does_not_select_modelopt_config():
     args = _make_args()
     args.load = None
     assert not modelopt_utils.should_use_modelopt_config(args)
-
-
-def test_legacy_modelopt_enable_flag_is_only_a_deprecated_input():
-    args = _make_args(modelopt_enabled=True)
-    args.load = None
-    original_args = vars(args).copy()
-    with pytest.warns(DeprecationWarning, match="modelopt-enabled is deprecated"):
-        assert modelopt_utils.should_use_modelopt_config(args)
-    assert vars(args) == original_args
 
 
 @pytest.mark.parametrize("hybrid", [False, True])

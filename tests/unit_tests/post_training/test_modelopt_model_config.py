@@ -189,20 +189,23 @@ class TestModelOptModelConfigFromArgs:
         )
 
     def test_transformer_config_tweaks(self):
-        args = _make_args(
-            export_qk_l2_norm=True,
-            export_moe_apply_probs_on_input=True,
-            export_offline_model=True,
-            enable_gpt_oss=True,
-        )
+        args = _make_args(export_offline_model=True)
+
+        config = mc.modelopt_model_config_from_args(args)
+
+        assert config.transformer.num_layers == 0
+        assert config.transformer.original_num_layers == 2
+
+    def test_architecture_options_come_from_core_arguments(self):
+        # The --export- spellings are deprecated aliases of the core flags.
+        args = _make_args(["--export-qk-l2-norm", "--enable-gpt-oss"])
 
         config = mc.modelopt_model_config_from_args(args)
 
         assert config.transformer.qk_l2_norm is True
-        assert config.transformer.moe_apply_probs_on_input is True
-        assert config.transformer.num_layers == 0
-        assert config.transformer.original_num_layers == 2
+        assert config.position_embedding_type == "yarn"
         assert config.transformer.yarn_rotary_scaling_factor == 32.0
+        assert config.transformer.yarn_correction_range_round_to_int is False
 
     def test_rejects_custom_spec(self):
         args = _make_args()

@@ -132,16 +132,18 @@ def add_modelopt_args(parser):
         'use the base learning rate.',
     )
 
-    # Special model architecture option
+    # Deprecated aliases of the core architecture arguments
     group.add_argument(
         '--export-qk-l2-norm',
         action="store_true",
-        help='Use Llama-4 L2Norm instead of normal LayerNorm/RMSNorm for QK normalization.',
+        dest="qk_l2_norm",
+        help='Deprecated alias for --qk-l2-norm.',
     )
     group.add_argument(
         '--export-moe-apply-probs-on-input',
         action="store_true",
-        help='Use Llama-4 expert scaling on input instead of output.',
+        dest="moe_apply_probs_on_input",
+        help='Deprecated alias for --moe-apply-probs-on-input.',
     )
 
     # Speculative decoding
@@ -151,20 +153,11 @@ def add_modelopt_args(parser):
         help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',
     )
 
-    # Global state
     group.add_argument(
         '--modelopt-enabled',
         action="store_true",
-        help='Deprecated compatibility override. ModelOpt configuration is inferred from the '
-        'checkpoint and ModelOpt-specific options.',
-    )
-
-    # GPT-OSS YaRN RoPE support
-    group.add_argument(
-        '--enable-gpt-oss',
-        action="store_true",
-        help='Enable GPT-OSS mode with YaRN RoPE configuration. When enabled, automatically '
-             'configures all YaRN parameters with GPT-OSS defaults.',
+        help='Build the ModelOpt model even when the checkpoint has no ModelOpt state and no '
+        'distillation teacher is given (both of which enable it automatically).',
     )
 
     return parser

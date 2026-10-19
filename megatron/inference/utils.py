@@ -180,7 +180,8 @@ def get_model_for_inference(
     declared_modelopt = (
         cfg is not None and cfg.model is not None and cfg.model.transformations is not None
     )
-    if declared_modelopt:
+    requested_modelopt = pg_collection is not None and getattr(args, "modelopt_enabled", False)
+    if declared_modelopt or requested_modelopt:
         # The ModelOpt model config is translated with the global parallel sizes.
         if pg_collection is not None:
             raise ValueError(

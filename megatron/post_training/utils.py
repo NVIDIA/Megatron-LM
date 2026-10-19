@@ -2,7 +2,6 @@
 
 import inspect
 import os
-import warnings
 
 import modelopt
 import modelopt.torch.quantization as mtq
@@ -25,47 +24,51 @@ def is_distillation_model(model) -> bool:
 def should_use_modelopt_config(args) -> bool:
     """Return whether CLI inputs require the ModelOpt-aware model configuration.
 
-    ``--modelopt-enabled`` remains a deprecated compatibility input, but the result is
-    no longer written back to ``args`` or consulted after the run config is created.
+    ModelOpt is used when ``--modelopt-enabled`` is set, for a checkpoint with ModelOpt
+    state, or for distillation. Without one of these, layer-spec options are ignored and
+    training options that need a ModelOpt model raise.
     """
-    if getattr(args, "modelopt_enabled", False):
-        warnings.warn(
-            "--modelopt-enabled is deprecated; ModelOpt configuration is now inferred "
-            "from the checkpoint and ModelOpt-specific options.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return True
-
     from megatron.post_training.checkpointing import has_modelopt_state
     from megatron.training import print_rank_0
 
+    if getattr(args, "modelopt_enabled", False):
+        return True
     if args.load is not None and has_modelopt_state(args.load):
         print_rank_0("ModelOpt checkpoint detected")
         return True
+    if getattr(args, "export_kd_teacher_load", None) is not None:
+        return True
 
-    nondefault_options = (
-        getattr(args, "export_model_type", None) is not None,
-        getattr(args, "export_legacy_megatron", False),
-        getattr(args, "export_te_mcore_model", False),
-        getattr(args, "export_default_te_spec", False),
-        getattr(args, "export_force_local_attention", False),
-        getattr(args, "export_kv_cache_quant", "none") != "none",
-        getattr(args, "export_real_quant_cfg", "None") != "None",
-        getattr(args, "export_quant_cfg", None) is not None,
-        getattr(args, "export_kd_teacher_load", None) is not None,
-        getattr(args, "export_kd_teacher_model_config", None) is not None,
-        getattr(args, "export_kd_teacher_ckpt_format", None) is not None,
-        getattr(args, "export_kd_cfg", None) is not None,
-        getattr(args, "qad_train_target", None) is not None,
-        getattr(args, "freeze_base_for_mtp", False),
-        getattr(args, "lsq_scale_lr", None) is not None,
-        getattr(args, "export_qk_l2_norm", False),
-        getattr(args, "export_moe_apply_probs_on_input", False),
-        getattr(args, "export_offline_model", False),
-        getattr(args, "enable_gpt_oss", False),
-    )
-    return any(nondefault_options)
+    spec_options = {
+        "--export-te-mcore-model": getattr(args, "export_te_mcore_model", False),
+        "--export-default-te-spec": getattr(args, "export_default_te_spec", False),
+        "--export-force-local-attention": getattr(args, "export_force_local_attention", False),
+        "--export-real-quant-cfg": getattr(args, "export_real_quant_cfg", "None") != "None",
+    }
+    ignored = [flag for flag, is_set in spec_options.items() if is_set]
+    if ignored:
+        print_rank_0(
+            f"WARNING: ignoring {', '.join(ignored)}: not a ModelOpt run (no ModelOpt "
+            "checkpoint, teacher, or --modelopt-enabled)."
+        )
+
+    refinements = {
+        "--export-kd-teacher-model-config": getattr(args, "export_kd_teacher_model_config", None)
+        is not None,
+        "--export-kd-teacher-ckpt-format": getattr(args, "export_kd_teacher_ckpt_format", None)
+        is not None,
+        "--export-kd-cfg": getattr(args, "export_kd_cfg", None) is not None,
+        "--qad-train-target": getattr(args, "qad_train_target", None) is not None,
+        "--freeze-base-for-mtp": getattr(args, "freeze_base_for_mtp", False),
+        "--lsq-scale-lr": getattr(args, "lsq_scale_lr", None) is not None,
+    }
+    misplaced = [flag for flag, is_set in refinements.items() if is_set]
+    if misplaced:
+        raise ValueError(
+            f"{', '.join(misplaced)} only apply to ModelOpt runs, which need a checkpoint "
+            "with ModelOpt state, --export-kd-teacher-load, or --modelopt-enabled."
+        )
+    return False
 
 
 def modelopt_version_higher_than(target_version: str):

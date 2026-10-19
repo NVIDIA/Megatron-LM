@@ -241,25 +241,6 @@ def modelopt_model_config_from_args(
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
     transformer_config = core_transformer_config_from_args(args)
 
-    # Handle GPT-OSS mode with YaRN RoPE configuration
-    if getattr(args, "enable_gpt_oss", False):
-        print_rank_0("GPT-OSS mode enabled: Configuring YaRN RoPE parameters")
-
-        # Set GPT-OSS YaRN values directly on the config
-        # These defaults are based on Huggingface GPT-OSS configurations
-        transformer_config.position_embedding_type = "yarn"
-        transformer_config.yarn_rotary_scaling_factor = 32.0
-        transformer_config.yarn_original_max_position_embeddings = 131072
-        transformer_config.yarn_beta_fast = 32.0
-        transformer_config.yarn_beta_slow = 1.0
-        transformer_config.yarn_mscale = 1.0
-        transformer_config.yarn_mscale_all_dim = 0.0
-        transformer_config.yarn_correction_range_round_to_int = False
-
-    # Llama-4 Scout/Maverick support
-    transformer_config.qk_l2_norm = args.export_qk_l2_norm
-    transformer_config.moe_apply_probs_on_input = args.export_moe_apply_probs_on_input
-
     if model_type == "gpt":
         if args.export_offline_model:
             # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
