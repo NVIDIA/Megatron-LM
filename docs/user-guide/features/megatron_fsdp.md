@@ -138,6 +138,47 @@ optimizer.load_state_dict(ckpt["optimizer"])
 
 > ℹ️ `fully_shard` is an _**experimental**_ API. Please check back for updates as we fine-tune our user experience! For more examples using `fully_shard` for Megatron-FSDP, refer to our suite of unit tests: [`tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py`](../../../tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py)
 
+### Experimental v2 reduce-scatter reuse
+
+The v2 `fully_shard` API accepts a per-module
+`SchedulePolicy(reduce_scatter_interval=k)`. The default `k=1` reduces after
+every completed module backward. Larger values accumulate local gradients across
+up to `k` completed backwards before one reduction. For example:
+
+```python
+from megatron_fsdp.experimental import (
+    SchedulePolicy, fully_shard, fully_shard_context, microbatch,
+)
+
+with fully_shard_context() as context:
+    fully_shard(module, mesh=mesh, placements=placements,
+                schedule_policy=SchedulePolicy(reduce_scatter_interval=2))
+for index, batch in enumerate(batches):
+    with microbatch(context, is_last=index == len(batches) - 1):
+        loss_fn(module(batch)).backward()
+optimizer.step()
+```
+
+For `m` microbatches this reduces the inner reduce-scatter count per parameter
+group from `m` to `ceil(m/k)`; HSDP/HFSDP still finalize the outer reduction once
+on the last microbatch. Parameter all-gathers are unchanged. The policy retains
+one full, padded gradient buffer per enabled trainable parameter group in
+`main_grads_dtype`, then casts to `grad_comm_dtype` only when reducing. Memory
+overhead is bounded by the sum of those full buffers, plus transient communication
+buffers. Enable it selectively for modules whose full gradients fit in memory.
+
+All data-parallel ranks must use identical policies and backward order. Gradients
+are incomplete between reductions: mark the last backward of every participating
+module with `microbatch(context, is_last=True)` before gradient clipping, stepping,
+checkpointing, or zeroing gradients. `finish_grad_sync()` only waits for already
+submitted reductions; it does not flush an incomplete window. The interval counts
+completed FSDP backwards, independently of `grad_accumulation_count`, which counts
+parameter-gradient callbacks needed to complete one backward. A full-iteration
+CUDA graph must include the complete accumulation window and its final reduction;
+capturing one non-final microbatch and replaying it cannot advance Python counters.
+Accumulation changes floating-point addition order, so results need not be bitwise
+identical to reducing every microbatch. This API does not add a training CLI flag.
+
 ### 🤖 Megatron-LM
 
 Megatron-FSDP is deeply integrated into Megatron-Core. To enable FSDP (where optimizer states, gradients, and compute parameters are sharded) in Megatron, use the following arguments:

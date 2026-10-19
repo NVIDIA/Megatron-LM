@@ -491,7 +491,7 @@ class FsdpParameterGroup:
         # so keep the shared storage-release path.
         self._unsharded_model_weight.release_storage()
 
-    def allocate_partial_grad_buffer(self) -> DBuffer:
+    def allocate_partial_grad_buffer(self, *, dtype: torch.dtype | None = None) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
 
@@ -505,15 +505,21 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
-                dtype=self.grad_comm_dtype,
+                dtype=dtype or self.grad_comm_dtype,
                 device=grads[0].device,
             )
 
-    def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
-        """Pack full local gradients into an existing reduce-scatter input buffer."""
+    def copy_gradients_to_partial_buffer(
+        self, partial_grad: DBuffer, *, accumulate: bool = False
+    ) -> None:
+        """Copy or add full local gradients into a reduce-scatter input buffer."""
         # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
+            gradient_view = partial_grad.get_tensor_view(index)
+            if accumulate:
+                gradient_view.add_(fsdp_parameter.unsharded.grad)
+            else:
+                gradient_view.copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:

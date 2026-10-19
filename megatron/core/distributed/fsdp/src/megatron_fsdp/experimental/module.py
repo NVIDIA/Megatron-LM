@@ -32,6 +32,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
+from .dbuffer import DBuffer
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
@@ -98,6 +99,8 @@ class FsdpModule:
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
+        self._pending_gradients: dict[FsdpParameterGroup, DBuffer] = {}
+        self._gradient_reduce_count = 0
         owned_parameters = _collect_owned_parameters(self)
         if grad_scale <= 0:
             raise ValueError(f"grad_scale must be positive, got {grad_scale}.")
@@ -434,27 +437,47 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
-        """Pack gradients and immediately launch their reduce-scatters."""
+        """Accumulate local gradients and reduce at the configured window boundary."""
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             reduce_scatter_stream = context.reduce_scatter_stream
             current_stream = context.current_stream()
+            interval = self._schedule_policy.reduce_scatter_interval
+            self._gradient_reduce_count += 1
+            reduce_now = context.is_last_microbatch or self._gradient_reduce_count >= interval
 
             for group in self._parameter_groups:
                 if not group.requires_grad:
                     continue
 
-                with torch.cuda.stream(reduce_scatter_stream):
-                    partial_grad = group.allocate_partial_grad_buffer()
+                partial_grad = self._pending_gradients.pop(group, None)
+                accumulate = partial_grad is not None
+                if partial_grad is None:
+                    with torch.cuda.stream(reduce_scatter_stream):
+                        if interval == 1:
+                            partial_grad = group.allocate_partial_grad_buffer()
+                        else:
+                            assert group.main_grad is not None
+                            partial_grad = group.allocate_partial_grad_buffer(
+                                dtype=group.main_grad.dtype
+                            )
 
                 current_stream.wait_stream(reduce_scatter_stream)
-                group.copy_gradients_to_partial_buffer(partial_grad)
+                group.copy_gradients_to_partial_buffer(partial_grad, accumulate=accumulate)
 
                 reduce_scatter_stream.wait_stream(current_stream)
-                with torch.cuda.stream(reduce_scatter_stream):
-                    group.reduce_partial_gradients(
-                        partial_grad, is_last_microbatch=self.context.is_last_microbatch
-                    )
+                if reduce_now:
+                    with torch.cuda.stream(reduce_scatter_stream):
+                        with group._symmetric_memory_context():
+                            communication_grad = partial_grad.cast(group.grad_comm_dtype)
+                        group.reduce_partial_gradients(
+                            communication_grad, is_last_microbatch=context.is_last_microbatch
+                        )
+                else:
+                    self._pending_gradients[group] = partial_grad
+
+            if reduce_now:
+                self._gradient_reduce_count = 0
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
