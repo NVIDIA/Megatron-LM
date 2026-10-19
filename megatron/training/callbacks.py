@@ -33,7 +33,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-
 if TYPE_CHECKING:
     import torch
     from megatron.core.optimizer import MegatronOptimizer
@@ -52,6 +51,8 @@ VALID_EVENTS: frozenset[str] = frozenset(
         "on_train_step_start",
         "on_train_step_end",
         "on_log",
+        "on_tensorboard_log",
+        "on_checkpoint_saved",
         "on_train_end",
         "on_eval_start",
         "on_eval_step_start",
@@ -83,6 +84,10 @@ class CallbackContext:
         total_loss_dict: Aggregated eval losses. Available in on_eval_end.
         timers_to_log: Mutable timer-name list; append to include extra timers. In on_log.
         log_fragments: Mutable list; append strings to extend the stdout log line. In on_log.
+        batch_size: Global batch size of that iteration. In on_log and on_tensorboard_log.
+        elapsed_time_per_iteration: Seconds per iteration over the log interval. In on_log.
+        throughput: TFLOP/s per GPU over the log interval, or None when not logged. In on_log.
+        durable_iteration: Iteration of the durable checkpoint. In on_checkpoint_saved.
     """
 
     model: list[MegatronModule] | None
@@ -99,6 +104,10 @@ class CallbackContext:
 
     timers_to_log: list[str] | None = None
     log_fragments: list[str] | None = None
+    batch_size: int | None = None
+    elapsed_time_per_iteration: float | None = None
+    throughput: float | None = None
+    durable_iteration: int | None = None
 
 
 class Callback:
@@ -148,6 +157,14 @@ class Callback:
 
     def on_log(self, context: CallbackContext) -> None:
         """Called during periodic logging (respects --log-interval)."""
+        pass
+
+    def on_tensorboard_log(self, context: CallbackContext) -> None:
+        """Called on the ranks that own a TensorBoard writer, at --tensorboard-log-interval."""
+        pass
+
+    def on_checkpoint_saved(self, context: CallbackContext) -> None:
+        """Called once a checkpoint is durable (after async finalization for async saves)."""
         pass
 
     def on_train_end(self, context: CallbackContext) -> None:
