@@ -43,10 +43,7 @@ def validate_build(
     if type(context_parallel_size) is not int or context_parallel_size < 1:
         raise ValueError("Context parallel size must be a positive integer")
     policies = layer_sources(config)
-    if context_parallel_size > 1 and any(p.candidate for p in policies):
-        raise NotImplementedError(
-            "DS4.1 CP support is incomplete: candidate layers CP>1 await an upstream "
-            "candidate-column injection point in Core CompressedSparseAttention._forward_thd_cp "
-            "(dev 7b150acf). Use CP1 or a candidate-free layer prefix; see the DS4.1 README."
-        )
+    ratios = config.compress_ratios or ([0, 0] + [2] * 18 + [1] * 20)
+    if any(p.candidate and ratios[i] != 1 for i, p in enumerate(policies)):
+        raise ValueError("DS4.1 candidate policy requires the ratio-one model path")
     return policies

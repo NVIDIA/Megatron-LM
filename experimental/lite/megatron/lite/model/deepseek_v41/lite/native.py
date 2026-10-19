@@ -24,14 +24,15 @@ def core_config(
     validate_build(release, context_parallel_size=parallel.cp)
     if parallel.tp != 1 or parallel.etp not in (None, 1):
         raise ValueError("DS4.1 native Hybrid attention requires TP=ETP=1")
-    return MLATransformerConfig(
+    release.cp_size = parallel.cp
+    config = MLATransformerConfig(
         num_layers=release.num_hidden_layers,
         hidden_size=release.hidden_size,
         num_attention_heads=release.num_attention_heads,
         num_query_groups=1,
         ffn_hidden_size=release.moe_intermediate_size,
         tensor_model_parallel_size=1,
-        context_parallel_size=parallel.cp,
+        context_parallel_size=1,
         cp_partition_mode="contiguous",
         sequence_packing_scheduler="dp_balanced",
         pipeline_model_parallel_size=parallel.pp,
@@ -101,9 +102,27 @@ def core_config(
         bias_dropout_fusion=False,
     )
 
+    # DS4.1 composes components directly, not the stock DSv4 model selector.
+    # Real CP belongs to release.cp_size / runtime groups and PackedSeqParams;
+    # Core's config declares CP1. See the source-guard/MRO/rope contracts.
+    config.ds41_candidate_blocks = release.candidate_topk_blocks
+    config.ds41_candidate_block_size = release.candidate_block_size
+    return config
 
-def core_groups(state):
+
+def validate_runtime_cp(release, group, params=None):
+    if group is None or group.size() != release.cp_size:
+        raise ValueError("DS4.1 configured CP size differs from runtime process group")
+    if params is not None:
+        if params.qkv_format != "thd" or params.cp_partition_mode != "contiguous":
+            raise ValueError("DS4.1 runtime CP requires contiguous packed THD")
+        if params.cp_group is not group:
+            raise ValueError("DS4.1 PackedSeqParams CP group differs from model group")
+
+
+def core_groups(state, release):
     """Use the caller's existing groups; never create duplicate collectives here."""
+    validate_runtime_cp(release, state.cp_group)
     return ProcessGroupCollection(
         tp=state.tp_group,
         cp=state.cp_group,

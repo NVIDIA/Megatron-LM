@@ -14,12 +14,9 @@ def test_candidate_free_prefix(cp):
     assert not any(p.candidate for p in policies)
 
 
-def test_candidate_cp_rejected_before_allocation():
-    with pytest.raises(NotImplementedError, match="upstream candidate-column injection"):
-        validate_build(DeepseekV41Config(), context_parallel_size=2)
-    policies = validate_build(DeepseekV41Config(), context_parallel_size=1)
+def test_ratio_one_candidate_cp_policy_allowed():
+    policies = validate_build(DeepseekV41Config(), context_parallel_size=2)
     assert policies[20].candidate and policies[-1].candidate
-    assert policies[39].kv == 20 and policies[39].index == 36
 
 
 def test_release_text_config_and_overrides():
@@ -61,7 +58,7 @@ def test_native_core_configuration_is_bf16_and_keeps_literal_ratios():
     assert config.csa_compress_ratios == [0, 0, 2, 2]
     assert config.qk_head_dim + config.qk_pos_emb_head_dim == 512
     assert config.dsa_indexer_head_dim == 128 and config.dsa_indexer_n_heads == 32
-    assert config.num_moe_experts == 384 and config.context_parallel_size == 2
+    assert config.num_moe_experts == 384 and config.context_parallel_size == 1
     assert config.fp8 is None and config.fp4 is None
     assert not config.deterministic_mode and not config.moe_router_fusion
     assert config.moe_router_score_function == "sqrtsoftplus"
@@ -83,3 +80,57 @@ def test_native_recompute_rejected_before_core_build(overrides):
 
     with pytest.raises(ValueError, match="must use KVSourceState.checkpoint"):
         core_config(DeepseekV41Config(num_hidden_layers=4), ParallelConfig(), **overrides)
+
+
+def test_runtime_cp_is_explicit_and_checked_against_model_and_packed_params():
+    from types import SimpleNamespace
+
+    from megatron.lite.model.deepseek_v41.lite.native import validate_runtime_cp
+
+    release = DeepseekV41Config(cp_size=2)
+    group = SimpleNamespace(size=lambda: 2)
+    params = SimpleNamespace(qkv_format="thd", cp_partition_mode="contiguous", cp_group=group)
+    validate_runtime_cp(release, group, params)
+    with pytest.raises(ValueError, match="configured CP size"):
+        validate_runtime_cp(release, SimpleNamespace(size=lambda: 1))
+    params.cp_group = object()
+    with pytest.raises(ValueError, match="differs from model group"):
+        validate_runtime_cp(release, group, params)
+
+
+def test_native_cp_config_readers_are_unreachable_from_ds41_attention():
+    import ast
+    import inspect
+
+    from megatron.core.models.common.embeddings import rotary_pos_embedding
+    from megatron.core.transformer import multi_latent_attention
+    from megatron.core.transformer.experimental_attention_variant import (
+        csa,
+        deepseek_v4_hybrid_attention,
+    )
+    from megatron.lite.model.deepseek_v41.lite import attention, compressor, ratio_one
+    from megatron.lite.model.deepseek_v41.lite.attention import DS41SelfAttention
+
+    assert multi_latent_attention.MultiLatentAttention not in DS41SelfAttention.__mro__
+    expected = {("rotary_pos_embedding", 302), ("multi_latent_attention", 1014)}
+    found = set()
+    for module in (rotary_pos_embedding, multi_latent_attention, csa, deepseek_v4_hybrid_attention):
+        for node in ast.walk(ast.parse(inspect.getsource(module))):
+            if isinstance(node, ast.Attribute) and node.attr in {
+                "context_parallel_size",
+                "cp_partition_mode",
+            }:
+                # Only config fields: PackedSeqParams.cp_partition_mode is the
+                # supported runtime contract, not the unused Core config.
+                value = ast.unparse(node.value)
+                if value.endswith("config"):
+                    found.add((module.__name__.rsplit(".", 1)[-1], node.lineno))
+    assert found == expected
+    for module in (attention, ratio_one, compressor):
+        tree = ast.parse(inspect.getsource(module))
+        assert not any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "get_rotary_seq_len"
+            for n in ast.walk(tree)
+        )

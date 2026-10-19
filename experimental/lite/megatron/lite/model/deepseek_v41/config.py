@@ -7,6 +7,7 @@ from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 
 @dataclass
 class DeepseekV41Config(DeepseekV4Config):
+    cp_size: int = 1
     hidden_size: int = 5120
     moe_intermediate_size: int = 2304
     num_hidden_layers: int = 40
