@@ -21,7 +21,8 @@ def unpack_scales(packed, groups):
 
 
 def dequantize_activation(codes, scale):
-    return (codes.float().reshape(*scale.shape, -1) * scale.unsqueeze(-1)).reshape(codes.shape)
+    width = codes.shape[-1] // scale.shape[-1]
+    return (codes.float().reshape(*scale.shape, width) * scale.unsqueeze(-1)).reshape(codes.shape)
 
 
 def quantize_activation(x):
