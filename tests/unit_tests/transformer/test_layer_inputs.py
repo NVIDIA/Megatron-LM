@@ -30,6 +30,7 @@ from megatron.core.transformer.cuda_graphs import (
     _CudaGraphRunner,
     _GraphStatus,
 )
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
@@ -350,24 +351,129 @@ def test_mamba_binding_owns_cp_metadata_selection(mode, has_metadata):
     }
 
 
+@pytest.mark.parametrize(
+    ("cls", "mode"),
+    [(TransformerLayer, "headwise"), (MambaLayer, "headwise"), (MambaLayer, "chunkwise")],
+)
+def test_pre_core_binding_owns_metadata_and_preserves_stage_state(cls, mode):
+    module = bare(cls)
+    module.config = SimpleNamespace(linear_cp_mode=mode)
+    x, residual, intermediate = (torch.randn(2, 4) for _ in range(3))
+    metadata, packed, recompute, connection_state = (object() for _ in range(4))
+    core = Mock()
+    core.forward_pre_attn_and_core_attn.return_value = intermediate
+    if cls is MambaLayer:
+        module.mixer = core
+        module._prepare_mixer_state = Mock(return_value=(x, residual, connection_state, None))
+    else:
+        module.self_attention = core
+        module.supports_two_stage_attention = Mock(return_value=True)
+        module._run_input_layernorm = Mock(return_value=(x, residual, connection_state))
+
+    state = module.forward_pre_attn_and_core_attn(
+        x,
+        LayerInputs(
+            packed_seq_params=packed,
+            packed_sequence_cp_metadata=metadata,
+            residual_stream_recompute_context=recompute,
+        ),
+    )
+    assert state[0] is intermediate
+    assert state[1] is residual
+    assert state[-1] is connection_state
+    kwargs = core.forward_pre_attn_and_core_attn.call_args.kwargs
+    assert kwargs["packed_seq_params"] is packed
+    assert kwargs["packed_sequence_cp_metadata"] is (metadata if mode == "chunkwise" else None)
+    prepare = module._prepare_mixer_state if cls is MambaLayer else module._run_input_layernorm
+    assert prepare.call_args.kwargs["residual_stream_recompute_context"] is recompute
+
+
+@pytest.mark.parametrize("chunks", [1, 2])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_mlp_shared_binding_preserves_bias_and_checkpoint_tensor_boundary(
+    monkeypatch, chunks, recompute
+):
+    class Core(MegatronModule):
+        def __init__(self):
+            super().__init__(config=None)
+            self.bias = nn.Parameter(torch.ones(4))
+            self.calls = []
+
+        @bind_layer_inputs(input_transform=lambda module, x: x * 2)
+        def forward(self, hidden_states, padding_mask=None, input_ids=None, packed_seq_params=None):
+            self.calls.append((hidden_states.shape, padding_mask, input_ids, packed_seq_params))
+            return hidden_states.square(), self.bias
+
+    def tensor_checkpoint(function, distribute_saved_activations, *args):
+        output = checkpoint(function, *args, use_reentrant=False)
+        assert isinstance(output[0], torch.Tensor)
+        assert isinstance(output[1], torch.Tensor)
+        return output
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_layer.tensor_parallel.checkpoint", tensor_checkpoint
+    )
+    core = Core()
+    layer = bare(TransformerLayer)
+    layer.mlp = core
+    layer.is_moe_layer = True
+    layer.recompute_mlp = recompute
+    layer.config = SimpleNamespace(
+        cuda_graph_impl="none",
+        mlp_chunks_for_prefill=1,
+        mlp_chunks_for_training=chunks,
+        transformer_impl="local",
+        inference_fuse_tp_communication=False,
+        fp8=False,
+        fp4=False,
+    )
+    x = torch.randn(4, 2, 4, requires_grad=True)
+    ids = torch.arange(8).reshape(2, 4)
+    mask = ids % 2 == 0
+    packed = object()
+    output, bias = layer._run_mlp(x, x, mask, None, input_ids=ids, packed_seq_params=packed)
+    assert bias is core.bias
+    torch.testing.assert_close(output, (x * 2).square())
+    expected_chunks = 1 if recompute else chunks
+    assert len(core.calls) == expected_chunks
+    for index, (shape, seen_mask, seen_ids, seen_packed) in enumerate(core.calls):
+        assert shape[0] == 4 // expected_chunks
+        assert torch.equal(seen_mask, mask.chunk(expected_chunks, dim=1)[index])
+        assert torch.equal(seen_ids, ids.chunk(expected_chunks, dim=1)[index])
+        assert seen_packed is packed
+    (output + bias).sum().backward()
+    torch.testing.assert_close(x.grad, 8 * x)
+    torch.testing.assert_close(core.bias.grad, torch.full_like(core.bias, 8))
+
+
+def test_mlp_te_partial_capture_preserves_intermediate_outputs(monkeypatch):
+    layer = bare(TransformerLayer)
+    layer.is_moe_layer = True
+    layer.recompute_mlp = False
+    layer.config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=[CudaGraphModule.moe_router],
+        mlp_chunks_for_prefill=1,
+        mlp_chunks_for_training=1,
+        inference_fuse_tp_communication=False,
+    )
+    x = torch.randn(2, 4)
+    intermediates = (x, x + 1, x + 2, None)
+    layer.mlp = nn.Module()
+    layer.mlp.forward = Mock(return_value=intermediates)
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_layer.is_graph_capturing", lambda: True
+    )
+    assert layer._run_mlp(x, x, None, None) is intermediates
+
+
 def test_shortcut_atomic_call_accepts_any_layer_with_shared_inputs():
     x = torch.randn(2, 4)
     layer = Mock(return_value=(x, LayerAddends()))
     unit = SimpleNamespace(compute_layer=layer)
-    assert (
-        ShortcutMoEBlock._forward_compute_atomic(
-            unit,
-            x,
-            attention_mask=None,
-            inference_context=None,
-            rotary_pos_emb=None,
-            sequence_len_offset=None,
-            packed_seq_params=None,
-            padding_mask=None,
-        )
-        is x
-    )
-    assert isinstance(layer.call_args.args[1], LayerInputs)
+    inputs = LayerInputs(packed_sequence_cp_metadata=object())
+    assert ShortcutMoEBlock._forward_compute_atomic(unit, x, inputs) is x
+    assert layer.call_args.args == (x, inputs)
 
 
 @pytest.mark.parametrize("config_cls", [MambaLayerConfig, GDNLayerConfig, TransformerConfig])

@@ -36,6 +36,7 @@ from megatron.core.transformer.layer_interface import (
     LayerInputs,
     bind_layer_inputs,
     bind_layer_outputs,
+    bind_layer_stage_inputs,
     wants_input_ids,
 )
 from megatron.core.transformer.mlp import MLP
@@ -704,17 +705,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             self._set_proj_residual(residual)
 
         nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
+        attention_output_with_bias = self._run_self_attention(
             input_layernorm_output,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
+            LayerInputs(
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            ),
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -839,17 +842,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
-            attention_output_with_bias = self.self_attention(
+            attention_output_with_bias = self._run_self_attention(
                 input_layernorm_output,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                rotary_pos_cos_sin=rotary_pos_cos_sin,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
+                LayerInputs(
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                ),
             )
         nvtx_range_pop(suffix="self_attention")
 
@@ -863,6 +868,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             residual_stream_recompute_context=residual_stream_recompute_context,
         )
 
+    def _run_self_attention(self, hidden_states, inputs: LayerInputs):
+        """Run a shared attention core and expose only its bias to residual fusion."""
+        if isinstance(self.self_attention, IdentityOp):
+            return self.self_attention(hidden_states)
+        output, addends = self.self_attention(hidden_states, inputs)
+        return output, addends.bias
+
+    @bind_layer_stage_inputs(
+        include_if={
+            "packed_sequence_cp_metadata": lambda module: module.uses_packed_sequence_cp_metadata()
+        }
+    )
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
@@ -1489,49 +1506,71 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             ``mlp_output_with_bias``: tuple of (mlp_output, mlp_bias).
         """
         nvtx_range_push(suffix="mlp")
+        # Disabled branches retain the tensor-only contract of their identity BDA.
+        if isinstance(self.mlp, IdentityOp):
+            output = self.mlp(pre_mlp_layernorm_output)
+            nvtx_range_pop(suffix="mlp")
+            return output
+
+        def run_mlp(hidden_states, padding_mask=None, input_ids=None):
+            # TE partial capture exports intermediate tensors, not a completed layer result.
+            if (
+                self.is_moe_layer
+                and self.config.cuda_graph_impl == "transformer_engine"
+                and self.training
+                and is_graph_capturing()
+                and CudaGraphModule.moe_router in self.config.cuda_graph_modules
+            ):
+                return apply_module(self.mlp)(
+                    hidden_states,
+                    padding_mask=padding_mask,
+                    input_ids=input_ids,
+                    packed_seq_params=packed_seq_params,
+                )
+            output, addends = self.mlp(
+                hidden_states,
+                LayerInputs(
+                    padding_mask=padding_mask,
+                    input_ids=input_ids,
+                    packed_seq_params=packed_seq_params,
+                ),
+            )
+            # Checkpoint autograd and residual fusion consume tensors, not auxiliary state.
+            return output, addends.bias
+
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
         should_chunk_mlp_for_prefill = (
             self.config.mlp_chunks_for_prefill > 1
             and inference_context is not None
             and not inference_context.is_decode_only()
-            and not isinstance(self.mlp, IdentityOp)
             and not self.config.transformer_impl == "inference_optimized"
         )
         should_chunk_mlp_for_training = (
             self.config.mlp_chunks_for_training > 1
             and inference_context is None
             and self.training
-            and not isinstance(self.mlp, IdentityOp)
         )
 
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
-        moe_kwargs = {}
-        if self.is_moe_layer and input_ids is not None:
-            moe_kwargs["input_ids"] = input_ids
-        if self.is_moe_layer:
-            moe_kwargs["packed_seq_params"] = packed_seq_params
-
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
                 # import here to avoid circular import
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 mlp_output_with_bias = te_checkpoint(
-                    apply_module(self.mlp),
+                    run_mlp,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
                     padding_mask=padding_mask,
-                    **moe_kwargs,
+                    input_ids=input_ids,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(
-                        apply_module(self.mlp), padding_mask=padding_mask, **moe_kwargs
-                    ),
+                    functools.partial(run_mlp, padding_mask=padding_mask, input_ids=input_ids),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -1554,7 +1593,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
             input_id_chunks = (
                 input_ids.chunk(num_chunks, dim=1)
-                if self.is_moe_layer and input_ids is not None
+                if input_ids is not None
                 else (None,) * num_chunks
             )
 
@@ -1563,15 +1602,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             for chunk, padding_mask_chunk, input_id_chunk in zip(
                 chunks, padding_mask_chunks, input_id_chunks
             ):
-                chunk_moe_kwargs = {}
-                if input_id_chunk is not None:
-                    chunk_moe_kwargs["input_ids"] = input_id_chunk
-                if self.is_moe_layer:
-                    chunk_moe_kwargs["packed_seq_params"] = packed_seq_params
                 outputs.append(
-                    apply_module(self.mlp)(
-                        chunk, padding_mask=padding_mask_chunk, **chunk_moe_kwargs
-                    )
+                    run_mlp(chunk, padding_mask=padding_mask_chunk, input_ids=input_id_chunk)
                 )
 
             # Aggregate chunk outputs
@@ -1585,8 +1617,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
-            mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
+            mlp_output_with_bias = run_mlp(
+                pre_mlp_layernorm_output, padding_mask=padding_mask, input_ids=input_ids
             )
 
         nvtx_range_pop(suffix="mlp")

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import contextmanager
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -14,7 +14,12 @@ from megatron.core.models.hybrid.shortcut_block import (
     group_layers_into_shortcut_blocks,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.layer_interface import LayerAddends, LayerExecutionContext, LayerInputs
+from megatron.core.transformer.layer_interface import (
+    LayerAddends,
+    LayerExecutionContext,
+    LayerInputs,
+    bind_layer_stage_inputs,
+)
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -60,7 +65,7 @@ class _FakeCompute(torch.nn.Module, TwoStageAttentionLayer):
     def supports_two_stage_attention(self) -> bool:
         return self.supports_two_stage
 
-    def forward_pre_attn_and_core_attn(self, hidden_states, **kwargs):
+    def forward_pre_attn_and_core_attn(self, hidden_states, inputs):
         return (hidden_states,)
 
     def forward_post_core_attn(self, hidden_states, **kwargs):
@@ -243,14 +248,21 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
             calls.append(("finalize", layer_idx))
             return hidden_states + layer_idx
 
-    def attn_forward(hidden_states, packed_seq_params=None, **kwargs):
+    @bind_layer_stage_inputs(
+        include_if={
+            "packed_sequence_cp_metadata": lambda module: module.uses_packed_sequence_cp_metadata()
+        }
+    )
+    def attn_forward(
+        self,
+        hidden_states,
+        packed_seq_params=None,
+        packed_sequence_cp_metadata=None,
+        residual_stream_recompute_context=None,
+    ):
         observed["attn_packed"] = packed_seq_params
-        observed["packed_sequence_cp_metadata"] = kwargs.get("packed_sequence_cp_metadata")
-        assert {
-            key: value
-            for key, value in kwargs.items()
-            if key == "residual_stream_recompute_context"
-        } == expected_layer_kwargs
+        observed["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
+        assert residual_stream_recompute_context is attn_context
         return (hidden_states,)
 
     def attn_post(hidden_states, **kwargs):
@@ -284,7 +296,9 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
     def quant_context_factory(*_args):
         yield
 
-    monkeypatch.setattr(attn_layer, "forward_pre_attn_and_core_attn", attn_forward)
+    monkeypatch.setattr(
+        attn_layer, "forward_pre_attn_and_core_attn", MethodType(attn_forward, attn_layer)
+    )
     monkeypatch.setattr(attn_layer, "forward_post_core_attn", attn_post)
     monkeypatch.setattr(block, "_moe_router_preprocess", route)
     monkeypatch.setattr(block, "_launch_dispatch", lambda hidden, probs, **_: (hidden, probs))
@@ -502,7 +516,7 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.input_scale = torch.nn.Parameter(torch.tensor(2.0))
             self.output_scale = torch.nn.Parameter(torch.tensor(3.0))
 
-        def forward_pre_attn_and_core_attn(self, hidden_states, **kwargs):
+        def forward_pre_attn_and_core_attn(self, hidden_states, inputs):
             assert_quant_layer(0)
             return hidden_states * self.input_scale, hidden_states
 

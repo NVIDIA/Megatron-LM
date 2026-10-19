@@ -18,7 +18,11 @@ from megatron.core.models.hybrid.hybrid_model import (
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import LayerAddends, bind_layer_inputs, wants_input_ids
+from megatron.core.transformer.layer_interface import (
+    LayerAddends,
+    bind_layer_inputs,
+    wants_input_ids,
+)
 from megatron.core.transformer.moe import router as router_module
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import (
@@ -27,7 +31,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import copy_signature
+from megatron.core.typed_torch import copy_signature
 
 
 class RecordingTransformerLayer(TransformerLayer):
@@ -139,9 +143,9 @@ class RecordingMoE(torch.nn.Module):
         super().__init__()
         self.calls = []
 
-    def forward(self, hidden_states, padding_mask=None, input_ids=None, packed_seq_params=None):
-        self.calls.append((padding_mask, input_ids))
-        return hidden_states, None
+    def forward(self, hidden_states, inputs):
+        self.calls.append((inputs.padding_mask, inputs.input_ids))
+        return hidden_states, LayerAddends()
 
 
 class SizeOneGroup:
@@ -401,6 +405,7 @@ def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
     moe = RecordingMoE()
     layer = SimpleNamespace(
         config=SimpleNamespace(
+            cuda_graph_impl="none",
             mlp_chunks_for_prefill=1,
             mlp_chunks_for_training=2,
             transformer_impl="local",

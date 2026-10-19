@@ -498,11 +498,18 @@ must supply it too. The block selects the contexts for both layers of its pair.
 Shortcut scheduling arguments are supplied only through this context. Its
 implementation returns a tensor; the shared helper supplies empty addends.
 
-Completed Transformer and Mamba split stages also return `(hidden_states, addends)`.
+Transformer and Mamba pre-core stages accept `(hidden_states, inputs)` through
+`@bind_layer_stage_inputs`. Calls go through the overridable
+`layer_inputs_forward_pre_attn_and_core_attn` method, whose default implementation
+selects declared arguments. It leaves the intermediate state opaque: pass the entire
+result to `forward_post_core_attn`.
+
+Completed Transformer and Mamba split stages return `(hidden_states, addends)`.
 Their `forward_post_core_attn` methods use `@bind_layer_outputs` to normalize the
 implementation's natural output; Transformer declares `addend="context"`.
-Shortcut consumes this pair directly. Core projection stages retain their internal
-`(output, bias)` contract for residual fusion.
+Shortcut uses the same input container for atomic and split-stage execution and
+consumes the completed output pair directly. Core projection stages retain their
+internal `(output, bias)` contract for residual fusion.
 
 TransformerBlock invokes layers through `LayerInputs`, including the optional mHC
 manager. Cross-attention uses the same interface and reads auxiliary context from
@@ -512,11 +519,18 @@ supply those fields, and the binding ignores them.
 
 Stack and recompute callers pass available CP metadata in `LayerInputs` without
 inspecting layer types. Mamba's binding consumes it only in chunkwise mode.
-Split-stage layers declare `uses_packed_sequence_cp_metadata()` so shortcut
-execution applies the same policy when it bypasses the shared forward binding.
+The pre-core stage binding uses the layer's `uses_packed_sequence_cp_metadata()`
+policy too; shortcut orchestration does not select metadata for individual layer types.
+
+Mamba's mixer and Transformer's self-attention and MLP/MoE calls use shared inputs.
+Dense MLP bindings ignore routing fields; MoE bindings select the fields they consume.
+Chunked MLP execution slices token IDs and padding masks alongside hidden states.
+Checkpoint and residual-fusion boundaries extract `addends.bias` and retain tensor
+outputs. TE partial MoE capture keeps its existing flat intermediate-output contract.
 
 `MoESubmodules.pre_norm` is available for core input normalization and defaults
-to `IdentityOp`; the MoE binding applies it only for shared calls.
+to `IdentityOp`; the MoE binding applies it only for shared calls, including ordinary
+Transformer MLP execution and each MLP chunk.
 
 `MegatronModule` binds shared inputs before module hooks and CUDA-graph selection.
 Hooks see the ordinary forward arguments and legacy result; output conversion

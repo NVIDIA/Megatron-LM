@@ -10,6 +10,8 @@ from torch import nn
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import bind_layer_inputs
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -56,22 +58,24 @@ def _process_groups() -> ProcessGroupCollection:
     return ProcessGroupCollection()
 
 
-class _ActiveBranch(nn.Module):
+class _ActiveBranch(MegatronModule):
     def __init__(self, *args, **kwargs):
-        super().__init__()
+        super().__init__(config=None)
         del args, kwargs
 
+    @bind_layer_inputs
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return hidden_states
 
 
-class _AdditiveAttention(nn.Module):
+class _AdditiveAttention(MegatronModule):
     def __init__(self, *args, **kwargs):
-        super().__init__()
+        super().__init__(config=None)
         del args, kwargs
         self.last_hidden_size = None
 
+    @bind_layer_inputs
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         self.last_hidden_size = hidden_states.shape[-1]
@@ -81,35 +85,38 @@ class _AdditiveAttention(nn.Module):
         return 2.0 * hidden_states, bias
 
 
-class _AdditiveMLP(nn.Module):
+class _AdditiveMLP(MegatronModule):
     def __init__(self, *args, **kwargs):
-        super().__init__()
+        super().__init__(config=None)
         del args, kwargs
         self.last_hidden_size = None
 
+    @bind_layer_inputs
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         self.last_hidden_size = hidden_states.shape[-1]
         return 3.0 * hidden_states, None
 
 
-class _ParameterizedAttention(nn.Module):
+class _ParameterizedAttention(MegatronModule):
     def __init__(self, *args, **kwargs):
-        super().__init__()
+        super().__init__(config=None)
         del args, kwargs
         self.scale = nn.Parameter(torch.randn(()))
 
+    @bind_layer_inputs
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return self.scale * hidden_states, None
 
 
-class _ParameterizedMLP(nn.Module):
+class _ParameterizedMLP(MegatronModule):
     def __init__(self, *args, **kwargs):
-        super().__init__()
+        super().__init__(config=None)
         del args, kwargs
         self.scale = nn.Parameter(torch.randn(()))
 
+    @bind_layer_inputs
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return self.scale * hidden_states, None

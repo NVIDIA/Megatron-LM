@@ -31,8 +31,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.layer_interface import bind_layer_inputs
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.typed_torch import copy_signature
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -285,6 +287,8 @@ class _DSGQACoreAttention(DSAttention):
 class _DSGroupedSelfAttention(SelfAttention):
     """Self-attention layer that executes the production DSA core on GQA tensors."""
 
+    @bind_layer_inputs
+    @copy_signature(SelfAttention.forward)
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
         self.core_attention.set_hidden_states(hidden_states)
         try:

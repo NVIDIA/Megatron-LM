@@ -17,12 +17,13 @@ from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import ModelType
-from megatron.core.transformer.layer_interface import LayerAddends
+from megatron.core.transformer.layer_interface import LayerAddends, bind_layer_inputs
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
+from megatron.core.typed_torch import copy_signature
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -117,6 +118,9 @@ class TestParallelTransformerBlock:
             return target_func(*args_list, **kwargs)
 
         class MockSelfAttentionWithDualRope(SelfAttention):
+
+            @bind_layer_inputs
+            @copy_signature(SelfAttention.forward)
             def forward(self, *args, **kwargs):
                 """Switch to either local or global RoPE embedding before forward."""
 

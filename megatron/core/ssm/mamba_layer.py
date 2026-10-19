@@ -25,7 +25,12 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import bind_layer_inputs, bind_layer_outputs
+from megatron.core.transformer.layer_interface import (
+    LayerInputs,
+    bind_layer_inputs,
+    bind_layer_outputs,
+    bind_layer_stage_inputs,
+)
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -187,6 +192,11 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         return self._apply_mixer_bda(mixer_out_with_bias, residual)
 
+    @bind_layer_stage_inputs(
+        include_if={
+            "packed_sequence_cp_metadata": lambda module: module.uses_packed_sequence_cp_metadata()
+        }
+    )
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
@@ -318,22 +328,20 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
-                if packed_sequence_cp_metadata is None:
-                    mixer_out_with_bias = self.mixer(
-                        hidden_states,
-                        inference_context=inference_context,
-                        packed_seq_params=packed_seq_params,
-                    )
-                else:
-                    mixer_out_with_bias = self.mixer(
-                        hidden_states,
+                mixer_output, addends = self.mixer(
+                    hidden_states,
+                    LayerInputs(
                         inference_context=inference_context,
                         packed_seq_params=packed_seq_params,
                         packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                    )
+                    ),
+                )
 
             hidden_states = self._apply_mixer_update(
-                mixer_out_with_bias, residual, connection_state, recompute_context=recompute_context
+                (mixer_output, addends.bias),
+                residual,
+                connection_state,
+                recompute_context=recompute_context,
             )
 
             return hidden_states

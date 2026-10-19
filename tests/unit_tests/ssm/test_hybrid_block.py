@@ -1107,7 +1107,7 @@ class TestHybridBlock:
 
             model_parallel_cuda_manual_seed(123)
             stage_one_state = layer.forward_pre_attn_and_core_attn(
-                hidden_states, attention_mask=attention_mask, packed_sequence_cp_metadata=None
+                hidden_states, LayerInputs(attention_mask=attention_mask)
             )
             two_stage_output = layer.forward_post_core_attn(*stage_one_state)
 

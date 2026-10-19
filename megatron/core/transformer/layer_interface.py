@@ -213,6 +213,32 @@ def bind_layer_inputs(
             input_transform=input_transform,
         )
 
+    bind = _make_layer_input_binding(
+        legacy_forward, aliases=aliases, include_if=include_if, input_transform=input_transform
+    )
+
+    def invoke(module, call, hidden_states, inputs, *, hidden_as_keyword=False):
+        return _normalize_layer_output(
+            bind(module, call, hidden_states, inputs, hidden_as_keyword=hidden_as_keyword)
+        )
+
+    @wraps(legacy_forward)
+    def forward(self, *args, **kwargs):
+        shared_inputs = _parse_layer_inputs(args, kwargs)
+        if shared_inputs is None:
+            return legacy_forward(self, *args, **kwargs)
+        return self.layer_inputs_forward(
+            *shared_inputs, _call=lambda *a, **kw: legacy_forward(self, *a, **kw)
+        )
+
+    forward._layer_input_binding = invoke
+    return forward
+
+
+def _make_layer_input_binding(
+    legacy_forward, *, aliases=None, include_if=None, input_transform=None
+):
+    """Prepare argument selection once for a full forward or an opaque split stage."""
     parameters = list(inspect.signature(legacy_forward).parameters.values())[1:]
     if not parameters or parameters[0].kind not in (
         inspect.Parameter.POSITIONAL_ONLY,
@@ -268,16 +294,24 @@ def bind_layer_inputs(
             result = call(**bound)
         else:
             result = call(hidden_states, **bound)
-        return _normalize_layer_output(result)
+        return result
 
-    @wraps(legacy_forward)
+    return invoke
+
+
+@experimental_api
+def bind_layer_stage_inputs(stage=None, *, include_if=None):
+    """Bind shared inputs to a pre-core stage while preserving its opaque return state."""
+    if stage is None:
+        return lambda method: bind_layer_stage_inputs(method, include_if=include_if)
+    bind = _make_layer_input_binding(stage, include_if=include_if)
+
+    @wraps(stage)
     def forward(self, *args, **kwargs):
         shared_inputs = _parse_layer_inputs(args, kwargs)
         if shared_inputs is None:
-            return legacy_forward(self, *args, **kwargs)
-        return self.layer_inputs_forward(
-            *shared_inputs, _call=lambda *a, **kw: legacy_forward(self, *a, **kw)
-        )
+            return stage(self, *args, **kwargs)
+        return self.layer_inputs_forward_pre_attn_and_core_attn(*shared_inputs)
 
-    forward._layer_input_binding = invoke
+    forward._layer_input_binding = bind
     return forward

@@ -402,32 +402,12 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
         combined_output.record_stream(torch.cuda.current_stream())
         return combined_output
 
-    def _forward_compute_atomic(
-        self,
-        hidden_states,
-        *,
-        attention_mask,
-        inference_context,
-        rotary_pos_emb,
-        sequence_len_offset,
-        packed_seq_params,
-        padding_mask,
-    ):
+    def _forward_compute_atomic(self, hidden_states, inputs: LayerInputs):
         """Run the paired layer's ordinary forward, which updates its KV cache or recurrent state.
 
         Uses the same per-layer arguments as HybridStack.forward passes to unpaired layers.
         """
-        hidden_states, addends = self.compute_layer(
-            hidden_states,
-            LayerInputs(
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-            ),
-        )
+        hidden_states, addends = self.compute_layer(hidden_states, inputs)
         assert addends.bias is None, "Shortcut blocks require complete residual layers"
         return hidden_states
 
@@ -463,13 +443,6 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
                 raise ValueError("Shortcut replay requires both physical layer indices.")
             attn_recompute_context = plan[self.attn_local_idx]
             moe_recompute_context = plan[self.moe_local_idx]
-
-        # Split-stage calls bypass the shared forward binder.
-        if (
-            packed_sequence_cp_metadata is not None
-            and not self.compute_layer.uses_packed_sequence_cp_metadata()
-        ):
-            packed_sequence_cp_metadata = None
 
         select_token_dispatcher = getattr(self.moe_layer.mlp, "select_token_dispatcher", None)
         if select_token_dispatcher is not None:
@@ -524,32 +497,21 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
 
         # Launch the input and attn of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
+            compute_inputs = LayerInputs(
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                residual_stream_recompute_context=attn_recompute_context,
+            )
             if inference:
-                attn_layer_output = self._forward_compute_atomic(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                    rotary_pos_emb=rotary_pos_emb,
-                    sequence_len_offset=sequence_len_offset,
-                    packed_seq_params=packed_seq_params,
-                    padding_mask=padding_mask,
-                )
-            elif attn_recompute_context is None:
-                paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                    packed_seq_params=packed_seq_params,
-                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                )
+                attn_layer_output = self._forward_compute_atomic(hidden_states, compute_inputs)
             else:
                 paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                    packed_seq_params=packed_seq_params,
-                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                    residual_stream_recompute_context=attn_recompute_context,
+                    hidden_states, compute_inputs
                 )
 
         # Launch the dispatch, experts, and combine
