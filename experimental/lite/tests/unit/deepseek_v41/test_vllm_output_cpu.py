@@ -33,5 +33,6 @@ def test_native_output_delegation_and_masked_lp():
         output['loss'].backward()
         assert torch.isfinite(logits.grad).all() and logits.grad[1].count_nonzero() == 0
         model.layout.has_head = False
-        assert 'logits' in model(torch.tensor([0, 1]), labels=labels)
+        call.return_value = {'hidden_states': logits}
+        assert model(torch.tensor([0, 1]), labels=labels) is call.return_value
         assert call.call_args.kwargs['labels'] is labels
