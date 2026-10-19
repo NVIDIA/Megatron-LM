@@ -59,13 +59,6 @@ class TestDistillationConfigFromArgs:
             kd_cfg="/cfg/kd.yaml",
         )
 
-    @pytest.mark.parametrize("flag", ["manual_gc", "tp_comm_overlap"])
-    def test_rejects_incompatible_flags(self, flag):
-        args = _make_args(export_kd_teacher_load="/ckpt/teacher")
-        setattr(args, flag, True)
-        with pytest.raises(AssertionError, match="incompatible"):
-            mc.distillation_config_from_args(args)
-
 
 class TestModelOptModelConfigFromArgs:
     def test_gpt_uses_stock_builder_and_modelopt_spec(self):
@@ -368,8 +361,10 @@ class TestKdConvertHook:
             pipeline_dtype=None,
         )
         setattr(teacher, attr, 2)
+        student = self._student_config()
+        student.distillation.teacher_model = GPTModelConfig(transformer=teacher, vocab_size=32000)
         with pytest.raises(ValueError, match=f"same {attr}"):
-            self._run(self._student_config(), teacher, [Mock()])
+            student.distillation.validate(student)
 
     def test_rejects_multiple_model_chunks(self):
         with pytest.raises(ValueError, match="virtual pipeline"):

@@ -23,7 +23,6 @@ from megatron.training import get_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.config.utils import legacy_checkpoint_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0
@@ -143,8 +142,7 @@ if __name__ == "__main__":
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
     elif cfg.checkpoint.load is not None:
-        with legacy_checkpoint_args():
-            load_checkpoint(model, None, None)
+        load_checkpoint(model, None, None)
 
     if args.algorithm == "eagle3":
         mtsp_config = ALGO_TO_CONFIG[args.algorithm]

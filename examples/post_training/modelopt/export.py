@@ -20,7 +20,6 @@ from megatron.training import get_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.config.utils import legacy_checkpoint_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 
@@ -95,8 +94,7 @@ if __name__ == "__main__":
     unwrapped_model = unwrap_model(model)[0]
 
     if cfg.checkpoint.load is not None and Path(cfg.checkpoint.load).is_dir():
-        with legacy_checkpoint_args():
-            load_checkpoint(model, None, None)
+        load_checkpoint(model, None, None)
     else:
         raise ValueError(f"Invalid load checkpoint directory: {cfg.checkpoint.load}")
 

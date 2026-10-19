@@ -167,11 +167,8 @@ def main(model_type: str = "gpt"):
                 pg_collection=pg_collection, wrap_with_ddp=False
             )
 
-    from megatron.training.config.utils import legacy_checkpoint_args
-
     if cfg.checkpoint.load is not None:
-        with legacy_checkpoint_args():
-            _ = load_checkpoint(model, None, None, strict=False)
+        _ = load_checkpoint(model, None, None, strict=False)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]

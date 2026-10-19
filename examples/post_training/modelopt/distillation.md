@@ -129,12 +129,9 @@ specs. Container validation checks KD compatibility and placement conflicts
 before construction.
 
 Megatron is still migrating from CLI arguments. Unmigrated runtime services
-continue using `get_args()`. At runtime, `legacy_checkpoint_args()` reads
-`get_run_config().checkpoint` and temporarily supplies the run-owned student load path/format to the legacy
-checkpoint loader and restores the arguments on success or failure.
-Teacher loading uses the corresponding scoped adapter. Other legacy checkpoint
-options remain in args until that API is migrated.
+continue using `get_args()`; `load_checkpoint` still reads the load path and
+format from args, which are the values the run config's `checkpoint` is built
+from. The pre-wrap restore hook reads them from `cfg.checkpoint`.
 
 Builders and configuration validation keep explicit inputs so independent configs can
-be built and tested without installing global state. The checkpoint adapter also
-accepts explicit args/config for those callers.
+be built and tested without installing global state.

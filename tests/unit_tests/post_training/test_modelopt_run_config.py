@@ -97,32 +97,6 @@ def test_direct_training_config_rejects_manual_gc(tmp_path):
         cfg.validate()
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_legacy_checkpoint_boundary_restores_args(fail):
-    from argparse import Namespace
-
-    from megatron.training.config.training_config import CheckpointConfig
-    from megatron.training.config.utils import legacy_checkpoint_args
-
-    args = Namespace(load="/old", ckpt_format="torch", unmigrated_setting=True)
-    original = vars(args).copy()
-
-    def load():
-        with legacy_checkpoint_args(args, CheckpointConfig(load="/new", ckpt_format="torch_dist")):
-            assert args.load == "/new"
-            assert args.ckpt_format == "torch_dist"
-            assert args.unmigrated_setting is True
-            if fail:
-                raise RuntimeError("load failed")
-
-    if fail:
-        with pytest.raises(RuntimeError, match="load failed"):
-            load()
-    else:
-        load()
-    assert vars(args) == original
-
-
 def test_build_policy_conflict_is_rejected():
     cfg = mc.modelopt_inference_config_from_args(_make_args(), device="cpu")
     with pytest.raises(ValueError, match="conflicts"):
@@ -190,8 +164,8 @@ def test_inference_uses_config_without_cli_enable_flag():
 
     args = Namespace(
         modelopt_enabled=False,
-        load="/stale",
-        ckpt_format="torch",
+        load="/configured",
+        ckpt_format="torch_dist",
         inference_ckpt_non_strict=False,
         checkpoint_model_prefix="",
         transformer_impl="transformer_engine",
@@ -211,38 +185,10 @@ def test_inference_uses_config_without_cli_enable_flag():
         patch.object(
             utils,
             "load_checkpoint",
-            side_effect=lambda **kw: loaded.append((args.load, args.ckpt_format)),
+            side_effect=lambda **kw: loaded.append(kw["ddp_model"]),
         ),
     ):
         assert utils.get_model_for_inference() is stage
     legacy_builder.assert_not_called()
     cfg.build_models.assert_called_once()
-    assert loaded == [("/configured", "torch_dist")]
-    assert (args.load, args.ckpt_format) == ("/stale", "torch")
-
-
-@pytest.mark.parametrize("fail", [False, True])
-def test_checkpoint_adapter_uses_active_run(fail):
-    from argparse import Namespace
-
-    from megatron.training.config.utils import legacy_checkpoint_args
-
-    args = Namespace(load="/old", ckpt_format="torch")
-    cfg = Namespace(checkpoint=Namespace(load="/active", ckpt_format="torch_dist"))
-
-    def load():
-        with legacy_checkpoint_args():
-            assert (args.load, args.ckpt_format) == ("/active", "torch_dist")
-            if fail:
-                raise RuntimeError("load failed")
-
-    with (
-        patch("megatron.training.global_vars.get_args", return_value=args),
-        patch("megatron.training.global_vars.get_run_config", return_value=cfg),
-    ):
-        if fail:
-            with pytest.raises(RuntimeError, match="load failed"):
-                load()
-        else:
-            load()
-    assert vars(args) == {"load": "/old", "ckpt_format": "torch"}
+    assert loaded == [[stage]]

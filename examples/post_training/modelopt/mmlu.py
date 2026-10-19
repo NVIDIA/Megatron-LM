@@ -30,7 +30,6 @@ from megatron.training import get_args, initialize_megatron
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.config.utils import legacy_checkpoint_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
 
@@ -117,8 +116,7 @@ if __name__ == "__main__":
     tokenizer = get_hf_tokenizer()
 
     if cfg.checkpoint.load is not None:
-        with legacy_checkpoint_args():
-            load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
+        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
     # Fold the scalars into weight for speedup.

@@ -33,26 +33,12 @@ logger = logging.getLogger(__name__)
 
 
 def distillation_config_from_args(args: Namespace) -> DistillationConfig | None:
-    """Build the ``DistillationConfig`` from ``--export-kd-*``, or ``None`` if KD is not enabled."""
+    """Build the ``DistillationConfig`` from ``--export-kd-*``, or ``None`` if KD is not enabled.
+
+    Incompatible settings are rejected by ``DistillationConfig.validate`` and the run container.
+    """
     if not getattr(args, "export_kd_teacher_load", None):
         return None
-
-    # NOTE: Unknown memory leak occuring per fwd-bwd pass if model
-    # is converted to a `modelopt.torch.opt.DynamicModule`.
-    # Argument `--manual-gc` can result in an eventual OOM.
-    assert (
-        not args.manual_gc
-    ), "ModelOpt Distillation currently incompatible with `--manual-gc` option."
-    assert (
-        not args.tp_comm_overlap
-    ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
-    assert (
-        args.cross_entropy_fusion_impl != "te"
-    ), "ModelOpt Distillation currently incompatible with TransformerEngine Cross-Entropy implementation."
-    if args.pipeline_model_parallel_size > 1:
-        assert (
-            args.virtual_pipeline_model_parallel_size is None
-        ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
     return DistillationConfig(
         teacher_load=args.export_kd_teacher_load,

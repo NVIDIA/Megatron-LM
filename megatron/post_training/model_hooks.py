@@ -247,7 +247,6 @@ def kd_convert_hook(student_model_config, te_mcore_model: bool) -> PreWrapHook:
         if len(models) != 1:
             raise ValueError("ModelOpt KD does not support virtual pipeline parallelism.")
 
-        distillation.validate(student_model_config)
         teacher_transformer = distillation.teacher_model.transformer
 
         converted = []

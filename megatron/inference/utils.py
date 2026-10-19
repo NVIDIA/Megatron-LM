@@ -143,7 +143,6 @@ def _warn_on_unloaded_checkpoint_tensors(args: Namespace, requested_keys: set) -
 def get_model_for_inference() -> MegatronModule:
     """Initialize model and load checkpoint for inference."""
 
-    from megatron.training.config.utils import legacy_checkpoint_args
     from megatron.training.global_vars import get_run_config
 
     args = get_args()
@@ -161,21 +160,18 @@ def get_model_for_inference() -> MegatronModule:
             pg_collection=pg_collection, wrap_with_ddp=False
         )
 
-    # Checkpoint loading still uses legacy args; location/format belong to the run.
-    checkpoint = cfg.checkpoint
-    assert checkpoint.load is not None
+    assert cfg.checkpoint.load is not None
     requested_keys = set()
     args.exit_on_missing_checkpoint = True
-    with legacy_checkpoint_args(args, checkpoint):
-        load_checkpoint(
-            ddp_model=model,
-            optimizer=None,
-            opt_param_scheduler=None,
-            strict=not args.inference_ckpt_non_strict,
-            model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
-        )
-        if requested_keys:
-            _warn_on_unloaded_checkpoint_tensors(args, requested_keys)
+    load_checkpoint(
+        ddp_model=model,
+        optimizer=None,
+        opt_param_scheduler=None,
+        strict=not args.inference_ckpt_non_strict,
+        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
+    )
+    if requested_keys:
+        _warn_on_unloaded_checkpoint_tensors(args, requested_keys)
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"

@@ -272,6 +272,9 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         if config.transformations is not None or config.distillation is not None:
             from megatron.post_training.model_hooks import modelopt_pre_wrap_hook
 
+            # Also covers callers that build without a run container.
+            config.validate()
+
             return modelopt_pre_wrap_hook(config, checkpoint)
         return compose_hooks(config.pre_wrap_hooks)
 

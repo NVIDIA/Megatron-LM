@@ -73,7 +73,6 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from model_provider import model_provider
 
 try:
     from megatron.post_training.arguments import add_modelopt_args

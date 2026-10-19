@@ -3096,21 +3096,14 @@ def setup_model_and_optimizer(
             optimizer.reload_model_params()
         print_rank_0(f'Upcycled checkpoint saved to {args.save}')
 
-    checkpoint_config = getattr(cfg_container, "checkpoint", None)
-    load_dir = checkpoint_config.load if checkpoint_config is not None else args.load
     if (
-        load_dir is not None or args.pretrained_checkpoint is not None
+        args.load is not None or args.pretrained_checkpoint is not None
     ) and not args.moe_use_upcycling:
         one_logger and one_logger.log_metrics(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
-        from megatron.training.config.utils import legacy_checkpoint_args
-
-        with (
-            _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load', is_goodput_span=True),
-            legacy_checkpoint_args(args, checkpoint_config),
-        ):
+        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load', is_goodput_span=True):
 
             ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
             args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(

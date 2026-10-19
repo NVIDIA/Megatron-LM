@@ -18,7 +18,6 @@ from megatron.post_training.model_config import modelopt_inference_config_from_a
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.config.utils import legacy_checkpoint_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
 
@@ -62,8 +61,7 @@ if __name__ == "__main__":
     tokenizer = get_tokenizer()
     model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
 
-    with legacy_checkpoint_args():
-        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
+    load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
     print_rank_0("Done loading checkpoint")
 
     unwrapped_model = unwrap_model(model)[0]
