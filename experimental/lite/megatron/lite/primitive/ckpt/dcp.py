@@ -19,6 +19,11 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.distributed.checkpoint as dcp  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
+from torch.distributed._shard.metadata import ShardMetadata  # pyright: ignore[reportMissingImports]
+from torch.distributed._shard.sharded_tensor import (  # pyright: ignore[reportMissingImports]
+    Shard,
+    ShardedTensor,
+)
 from torch.distributed.device_mesh import DeviceMesh  # pyright: ignore[reportMissingImports]
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
@@ -29,6 +34,57 @@ from megatron.lite.primitive.protocols import (
     default_expert_classifier,
     default_placement_fn,
 )
+
+
+def _buffer_state(model, prefix):
+    """Alias persistent buffers as byte planes, with global offsets for row shards.
+
+    A persistent buffer the model updates in training (a router's load-balancing
+    bias) is training state, and placement-based parameters do not carry it. A
+    module whose rows are sharded over a group (``module.lookup`` with ``group``
+    and ``boundaries``, e.g. a frozen Engram table) keeps each rank's rows at
+    their global offset: a plain tensor would let DCP keep one rank's copy.
+    """
+    result = {}
+    for path, module in model.named_modules():
+        lookup = getattr(module, "lookup", None)
+        sharded = getattr(lookup, "group", None) is not None
+        buffers = [
+            (name, value)
+            for name, value in module.named_buffers(recurse=False)
+            if name not in module._non_persistent_buffers_set
+        ]
+        if buffers and sharded:
+            cuts = getattr(lookup, "boundaries", ())
+            if not cuts:
+                raise ValueError("Checkpoint requires explicit row shard metadata")
+            size, rank = dist.get_world_size(lookup.group), dist.get_rank(lookup.group)
+            if len(cuts) != size + 1 or cuts[0] != 0 or any(a > b for a, b in zip(cuts, cuts[1:])):
+                raise ValueError("Invalid checkpoint row shard boundaries")
+            start, end = cuts[rank : rank + 2]
+        for name, value in buffers:
+            if isinstance(value, DTensor) or not value.is_contiguous():
+                raise ValueError("Checkpoint requires contiguous plain buffers")
+            key = ".".join(part for part in (prefix, path, name) if part)
+            if not sharded:
+                result[key] = value.detach().reshape(-1).view(torch.uint8)
+                continue
+            if value.ndim != 2 or value.shape[0] != end - start:
+                raise ValueError("Buffer rows do not match row shard metadata")
+            # Preserve the global row coordinate, as MCore ShardedTensor does.
+            byte_rows = value.detach().view(torch.uint8)
+            shards = []
+            if end > start:
+                metadata = ShardMetadata(
+                    shard_offsets=[start, 0],
+                    shard_sizes=list(byte_rows.shape),
+                    placement=f"rank:{dist.get_rank()}/{byte_rows.device}",
+                )
+                shards.append(Shard(byte_rows, metadata))
+            result[key] = ShardedTensor._init_from_local_shards(
+                shards, cuts[-1], byte_rows.shape[1], process_group=lookup.group
+            )
+    return result
 
 
 def save_training_checkpoint(
@@ -81,6 +137,7 @@ def save_training_checkpoint(
     model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if save_model:
+        state_dict.update(_buffer_state(model, model_prefix))
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
@@ -143,6 +200,16 @@ def load_training_checkpoint(
     model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if load_model:
+        # Buffers load in place through their byte-plane aliases.
+        buffers = _buffer_state(model, model_prefix)
+        saved = dcp.FileSystemReader(ckpt_path).read_metadata().state_dict_metadata
+        missing = sorted(key for key in buffers if key not in saved)
+        if missing:
+            log_rank0(
+                f"Checkpoint {ckpt_path} has no state for {len(missing)} buffers "
+                f"(saved before buffers were checkpointed), e.g. {missing[0]}"
+            )
+        state_dict.update({k: v for k, v in buffers.items() if k in saved})
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
