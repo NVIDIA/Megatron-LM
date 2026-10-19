@@ -315,8 +315,8 @@ class TestFusedPreGatedDeltaRule:
                 qkvzba[start:end],
                 batch=1,
                 seq_len=end - start,
-                cp_size=gdn.cp_size,
-                cp_group=gdn.pg_collection.cp,
+                cp_size_headwise=gdn.cp_size,
+                cp_group_headwise=gdn.pg_collection.cp,
             )
             for output_list, output in zip(segment_outputs, outputs):
                 output_list.append(output)

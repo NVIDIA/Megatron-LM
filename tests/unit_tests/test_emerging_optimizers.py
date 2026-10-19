@@ -635,6 +635,8 @@ def test_muon_entry_dispatches_on_layer_sharding_flag():
     assert lsh_kwargs["tp_mode"] == "duplicated"
     assert "gtp_remat_group" in lsh_kwargs
     assert eo_mod._muon_config_to_cls(_dispatch_cfg(True)) is LayerShardedMuon
+    accepted = set(inspect.signature(LayerShardedMuon.__init__).parameters)
+    assert not set(lsh_kwargs) - accepted
 
     plain_kwargs = eo_mod._muon_registry_config_to_kwargs(
         _dispatch_cfg(False), [_DispatchChunk()], pg_collection=None
@@ -642,6 +644,15 @@ def test_muon_entry_dispatches_on_layer_sharding_flag():
     assert "gtp_remat_group" not in plain_kwargs
     assert "is_qkv_fn" in plain_kwargs
     assert eo_mod._muon_config_to_cls(_dispatch_cfg(False)) is eo_mod.TensorParallelMuon
+
+
+def test_layer_sharded_muon_registry_rejects_per_head_split_qkv():
+    """A parent-only option must not be silently dropped for direct registry callers."""
+    config = _dispatch_cfg(True)
+    config.muon_split_qkv = True
+    config.muon_split_qkv_per_head = True
+    with pytest.raises(ValueError, match="LayerShardedMuon.*per-head split-QKV"):
+        eo_mod._muon_registry_config_to_kwargs(config, [_DispatchChunk()], pg_collection=None)
 
 
 def test_muon_entry_registered_with_dispatcher():

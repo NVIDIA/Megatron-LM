@@ -1081,6 +1081,10 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
         return kwargs
     # LayerShardedMuon: its own muon-prefixed kwargs (ns_batch_size, concurrent_groups, ...).
     kwargs.update(_kwargs_from_config(cls, "muon", config))
+    # The layer-sharded path requires unsplit QKV. Do not leak the parent's
+    # per-head option into a constructor that deliberately does not support it.
+    if kwargs.pop("split_qkv_per_head", False):
+        raise ValueError("LayerShardedMuon does not implement per-head split-QKV.")
     # 'layer_sharded' selected the class; it is not a TensorParallelMuon mode, so the
     # delegated (empty-homes fallback) path runs the bitwise reference mode instead.
     kwargs["tp_mode"] = "duplicated"

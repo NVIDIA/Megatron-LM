@@ -144,6 +144,7 @@ def _run_pair(extra, label):
             muon_tp_mode="layer_sharded",
             **common,
         )
+        assert loss_dup.shape == loss_lsh.shape == (common["num_steps"],)
         assert harness.layer_sharded_instances >= 1, "no LayerShardedMuon was constructed"
         assert harness.wired_groups > 0, "the layer-wise wiring assigned no NS homes"
         assert harness.two_d_groups == harness.wired_groups, (

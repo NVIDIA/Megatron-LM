@@ -21,7 +21,9 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -31,6 +33,79 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_mhc_mtp_preserves_multistream_on_pipeline_stages():
+    """Dev's PP path must pass pre-contraction streams to the real MTP block."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            mtp_num_layers=1,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        first_stage = pg_collection.pp.rank() == 0
+        layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True)
+        mtp_spec = get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=True)
+        model = GPTModel(
+            config,
+            layer_spec,
+            vocab_size=128,
+            max_sequence_length=16,
+            pre_process=first_stage,
+            post_process=not first_stage,
+            share_embeddings_and_output_weights=False,
+            mtp_block_spec=mtp_spec,
+            pg_collection=pg_collection,
+        ).cuda()
+        tokens = torch.arange(32, device="cuda").reshape(2, 16)
+        positions = torch.arange(16, device="cuda").expand_as(tokens)
+        multistream_shape = (16, 2, config.num_residual_streams * config.hidden_size)
+        captured = {}
+        pipeline_input = None
+        if not first_stage:
+            pipeline_input = torch.randn(
+                multistream_shape, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            model.set_input_tensor(pipeline_input)
+
+            def capture_mtp_input(module, args, kwargs):
+                captured["contracted"] = kwargs["hidden_states"].shape
+                captured["multistream"] = kwargs["mhc_multistream"].shape
+
+            model.mtp.register_forward_pre_hook(capture_mtp_input, with_kwargs=True)
+
+        output = model(tokens, positions, attention_mask=None, labels=tokens)
+        assert torch.isfinite(output).all()
+        if first_stage:
+            assert output.shape == multistream_shape
+        else:
+            assert output.shape == tokens.shape
+            assert captured["contracted"] == (16, 2, config.hidden_size)
+            assert captured["multistream"] == multistream_shape
+        output.float().square().mean().backward()
+        if pipeline_input is not None:
+            assert pipeline_input.grad is not None
+            assert torch.isfinite(pipeline_input.grad).all()
+            assert torch.count_nonzero(pipeline_input.grad) > 0
+            mtp_grads = [p.grad for p in model.mtp.parameters() if p.grad is not None]
+            assert mtp_grads
+            assert all(torch.isfinite(grad).all() for grad in mtp_grads)
+            assert any(torch.count_nonzero(grad) > 0 for grad in mtp_grads)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class TestGPTModel:

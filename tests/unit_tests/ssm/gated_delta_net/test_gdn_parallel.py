@@ -5,6 +5,7 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._inductor import config as inductor_config
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -32,6 +33,15 @@ except ImportError:
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-multi-rank-gpu-enable
 # NVLS doesn't support one single GPU to be shared by multiple ranks, so disable this in test
 os.environ.update({"NCCL_NVLS_ENABLE": "0"})
+
+
+@pytest.fixture(scope="module", autouse=True)
+def synchronous_inductor_compilation():
+    """Keep this distributed shape matrix's compilation in-process."""
+    # A rank waiting on a compiler-worker future can leave peers in collectives.
+    # Keep torch.compile and all numerical checks enabled, and restore the setting.
+    with inductor_config.patch(compile_threads=1):
+        yield
 
 
 def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[torch.Tensor]:

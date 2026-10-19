@@ -658,6 +658,7 @@ class TestGTPFp8ParamGather:
                 **common,
             )
 
+            assert loss_target.shape == loss_reference.shape == (common["num_steps"],)
             local_trajectories = torch.stack((loss_target, loss_reference)).cuda()
             gathered_trajectories = [
                 torch.empty_like(local_trajectories)

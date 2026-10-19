@@ -520,9 +520,7 @@ class GatedDeltaNetModuleTestCases(GatedDeltaNetTestBase):
             "fused_streamed_pre_gated_delta_rule",
             side_effect=fake_fused_streamed_pre_gated_delta_rule,
         ):
-            gdn._fused_streamed_pre_gated_delta_rule(
-                qkvzba, cp_size_headwise=cp_size_headwise, cp_group_headwise=gdn.pg_collection.cp
-            )
+            gdn._fused_streamed_pre_gated_delta_rule(qkvzba, cp_group_headwise=gdn.pg_collection.cp)
 
         assert captured["qkvzba"] is qkvzba
         assert captured["conv1d_weight"].shape == (

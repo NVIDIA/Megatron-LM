@@ -4239,7 +4239,6 @@ def setup_model_and_optimizer(
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
-                use_layer_wise_param_layout=cfg.optimizer.use_layer_wise_param_layout,
             )
         else:
             assert (

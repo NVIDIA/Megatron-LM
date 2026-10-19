@@ -252,7 +252,6 @@ class TestFP8Param:
         # Test-only knob: not a model arg, so pop before create_test_args (which asserts every
         # kwarg is a real arg attribute).
         save_at_steps_kw = kwargs.pop("save_at_steps", ())
-        num_steps = kwargs.pop("num_steps", 100)
         args = self.create_test_args(
             tp_size,
             recipe,
@@ -594,6 +593,7 @@ class TestFP8Param:
             **common,
         )
         reference = self._run_test_helper(1, recipe, fp8_param_gather=True, **common)
+        assert offloaded.shape == reference.shape == (common["num_steps"],)
         torch.testing.assert_close(offloaded, reference, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
@@ -623,6 +623,7 @@ class TestFP8Param:
             **common,
         )
         reference = self._run_test_helper(1, "mxfp8", fp8_param_gather=True, **common)
+        assert offloaded.shape == reference.shape == (common["num_steps"],)
         torch.testing.assert_close(offloaded, reference, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
