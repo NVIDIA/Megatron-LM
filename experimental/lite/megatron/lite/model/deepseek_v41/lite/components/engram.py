@@ -38,11 +38,11 @@ def prime_buckets(layer_ids, max_ngram_size, heads, vocab_size):
 
 class DS41Engram(Engram):
     def __init__(self, release, config, layer, table_group, *, frozen=True):
+        if not frozen:
+            raise NotImplementedError("DS4.1 Engram tables are frozen host FP8; not trainable")
         position = release.engram_layer_ids.index(layer)
         rows = release.engram_num_embeddings[position]
-        table = ShardedFrozenTable(
-            rows, release.engram_head_dim, config, table_group, frozen=frozen
-        )
+        table = ShardedFrozenTable(rows, release.engram_head_dim, table_group)
         width = (
             (release.engram_max_ngram_size - 1) * release.engram_n_heads * release.engram_head_dim
         )

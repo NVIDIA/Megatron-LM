@@ -1,11 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Generic gated table masking and real two-device row-sharded lookup."""
+"""Gated table masking and the host FP8 row-sharded table: decode and checkpoint bytes."""
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.lite.primitive.modules.engram import Engram, ShardedFrozenTable
 
 
@@ -16,20 +17,55 @@ def test_engram_masked_rows_pass_the_residual_through():
     assert torch.equal(out[1], hidden[1]) and not torch.equal(out[0], hidden[0])
 
 
-def _gather_worker(rank, store):
+def _worker(rank, root):
+    from megatron.core import dist_checkpointing
+    from megatron.lite.model.deepseek_v41.lite.checkpoint import attach_checkpoint_metadata
+
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method=f"file://{store}", rank=rank, world_size=2)
-    ranks = dict(tp_rank=0, ep_rank=0, etp_rank=0, gtp_remat_rank=0, egtp_remat_rank=0)
-    model_parallel_cuda_manual_seed(915, **ranks, gtp_remat_world_size=1, egtp_remat_world_size=1)
-    config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
-    table = ShardedFrozenTable(5, 8, config, dist.group.WORLD)  # 6 padded rows, 3 per rank
-    full = torch.arange(48.0, device="cuda").reshape(6, 8).to(table.weight.dtype)
-    table.weight.copy_(full[3 * rank : 3 * rank + 3])
-    ids = torch.tensor([[0, 4], [2, 3], [1, 0]], device="cuda")[rank:]  # 3 and 2 query rows
-    assert torch.equal(table(ids), full[ids])
+    store = f"file://{root}/store"
+    dist.init_process_group("cpu:gloo,cuda:nccl", init_method=store, rank=rank, world_size=2)
+    group, torch_rng = dist.group.WORLD, torch.manual_seed(rank)
+    before = torch.cuda.memory_allocated()
+    table = ShardedFrozenTable(5000, 256, group)  # 2500 rows of FP8 + E8M0 scale per rank
+    weight, scale = table.embedding.weight, table.embedding.scale
+    assert weight.device.type == "cpu" and weight.is_pinned() and scale.is_pinned()
+    assert torch.cuda.memory_allocated() == before and not list(table.parameters())
+    table.cuda()  # device moves leave the host FP8 bytes in place
+    assert table.embedding.weight is weight and weight.dtype == torch.float8_e4m3fn
+    full = [torch.empty_like(weight.view(torch.uint8)).cuda() for _ in range(2)]
+    dist.all_gather(full, weight.view(torch.uint8).cuda())
+    scales = [torch.empty_like(scale.view(torch.uint8)).cuda() for _ in range(2)]
+    dist.all_gather(scales, scale.view(torch.uint8).cuda())
+    full, scales = (torch.cat(t).view(d) for t, d in ((full, weight.dtype), (scales, scale.dtype)))
+    ids = torch.tensor([[0, 4999], [2500, 3], [1, 2499]], device="cuda")[rank:]  # 3 and 2 rows
+    # The official decode: FP32 product per 32-wide block, then BF16.
+    expected = full[ids].float().unflatten(-1, (-1, 32)) * scales[ids].float().unsqueeze(-1)
+    assert torch.equal(table(ids), expected.flatten(-2).to(torch.bfloat16))
+    module = torch.nn.Module()
+    module.embed, ps = table, SimpleNamespace(dp_cp_rank=rank, dp_cp_group=group)
+    attach_checkpoint_metadata([module], ps)
+    for name in ("new", "old"):
+        Path(root, name).mkdir(exist_ok=True)
+    dist_checkpointing.save(module.sharded_state_dict(), f"{root}/new")
+    saved = weight.clone(), scale.clone()
+    weight.view(torch.uint8).zero_(), scale.view(torch.uint8).zero_()
+    dist_checkpointing.load(module.sharded_state_dict(), f"{root}/new")
+    assert all(
+        torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+        for a, b in zip((weight, scale), saved)
+    )
+    old = torch.nn.Module()  # the previous schema: a BF16 table and no scale
+    old.embed = torch.nn.Module()
+    old.embed.embedding = torch.nn.Module()
+    old.embed.embedding.lookup = table.embedding.lookup
+    old.embed.embedding.register_buffer("weight", weight.to(torch.bfloat16))
+    attach_checkpoint_metadata([old], ps)
+    dist_checkpointing.save(old.sharded_state_dict(), f"{root}/old")
+    with pytest.raises(Exception):
+        dist_checkpointing.load(module.sharded_state_dict(), f"{root}/old")
     dist.destroy_process_group()
 
 
 @pytest.mark.gpus(2, min_architecture="blackwell")
-def test_sharded_engram_table_matches_a_single_table_lookup(tmp_path):
-    torch.multiprocessing.spawn(_gather_worker, args=(f"{tmp_path}/store",), nprocs=2)
+def test_host_fp8_table_matches_the_official_decode_and_checkpoints_its_bytes(tmp_path):
+    torch.multiprocessing.spawn(_worker, args=(str(tmp_path),), nprocs=2)

@@ -1,14 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """N-gram hashing and gated row-sharded lookup with caller-supplied policies."""
-import copy
+import weakref
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
-from megatron.core.tensor_parallel.mappings import async_gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    async_gather_from_sequence_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+)
 
 
 class NgramHash(nn.Module):
@@ -102,45 +105,72 @@ class Engram(nn.Module):
 
 
 class ShardedFrozenTable(nn.Module):
-    """Core row-sharded embedding with a persistent BF16 buffer, not a parameter.
+    """Frozen row-sharded FP8 table (E4M3 rows, E8M0 scale per 32) in pinned host memory.
 
-    The Core embedding group can span data/context ranks with different query
-    IDs. Native mappings first give every participant identical padded IDs;
-    Core's embedding then performs its ordinary row-shard reduction. No custom
-    collective or all-to-all implementation is introduced.
+    Each rank keeps its equal row shard on the host. A lookup gathers every rank's IDs
+    through Core's mapping, copies only the owned requested rows to the device, decodes
+    them to BF16, zeroes the others and sums over the group (zeros are exact). Device
+    or dtype moves of the module leave the stored bytes on the host.
     """
 
-    def __init__(self, rows, width, config, group, *, frozen=True):
+    def __init__(self, rows, width, group, *, block=32):
         super().__init__()
-        self.group, self.rows = group, rows
-        padded_rows = ((rows + group.size() - 1) // group.size()) * group.size()
-        cfg = copy.copy(config)
-        cfg.use_cpu_initialization = False
-        self.embedding = VocabParallelEmbedding(
-            padded_rows, width, config=cfg, init_method=cfg.init_method, tp_group=group
-        )
-        shard_rows = padded_rows // group.size()
-        self.embedding.lookup = SimpleNamespace(
-            group=group, boundaries=tuple(i * shard_rows for i in range(group.size() + 1))
-        )
-        if frozen:
-            value = self.embedding.weight.detach()
-            self.embedding._parameters.pop("weight")
-            self.embedding.register_buffer("weight", value, persistent=True)
+        if width % block:
+            raise ValueError("FP8 table width must be a multiple of its scale block")
+        self.group, self.rows, self.block = group, rows, block
+        shard = -(-rows // group.size())
+        self.embedding = nn.Module()  # holds the persistent byte buffers and row metadata
+        bounds = tuple(i * shard for i in range(group.size() + 1))
+        self.embedding.lookup = SimpleNamespace(group=group, boundaries=bounds)
+        value = (torch.randn(shard, width) * 0.02).to(torch.float8_e4m3fn)
+        scale = torch.full((shard, width // block), 127, dtype=torch.uint8)  # 2**0
+        self.embedding.register_buffer("weight", _host_copy(value))
+        self.embedding.register_buffer("scale", _host_copy(scale.view(torch.float8_e8m0fnu)))
+
+    def _apply(self, fn, recurse=True):
+        return self  # the frozen FP8 bytes stay on the host
 
     @property
     def weight(self):
         return self.embedding.weight
 
     def forward(self, ids):
-        rows = ids.shape[0]
-        if self.group.size() == 1:
-            return self.embedding(ids)
-        sizes = async_gather_from_sequence_parallel_region(
-            ids.new_tensor([rows]), group=self.group
-        ).wait()
-        maximum = int(sizes.max())
-        padded = F.pad(ids, (0, 0, 0, maximum - rows))
-        all_ids = async_gather_from_sequence_parallel_region(padded, group=self.group).wait()
-        value = self.embedding(all_ids)
-        return value[self.group.rank() * maximum : self.group.rank() * maximum + rows]
+        rows, size = ids.shape[0], self.group.size()
+        if size > 1:  # every rank's IDs, padded to a common row count
+            sizes = async_gather_from_sequence_parallel_region(
+                ids.new_tensor([rows]), group=self.group
+            )
+            maximum = int(sizes.wait().max())
+            padded = F.pad(ids, (0, 0, 0, maximum - rows))
+            ids = async_gather_from_sequence_parallel_region(padded, group=self.group).wait()
+        begin, end = self.embedding.lookup.boundaries[self.group.rank() : self.group.rank() + 2]
+        local = ids - begin
+        owned = (local >= 0) & (local < end - begin)
+        picked = local[owned].cpu()
+        values = self.embedding.weight[picked].to(ids.device)
+        scales = self.embedding.scale[picked].to(ids.device)
+        decoded = values.float().unflatten(-1, (-1, self.block)) * scales.float().unsqueeze(-1)
+        out = torch.zeros(*ids.shape, values.shape[-1], dtype=torch.bfloat16, device=ids.device)
+        out[owned] = decoded.flatten(-2).to(torch.bfloat16)
+        if size > 1:
+            out = reduce_from_tensor_model_parallel_region(out, self.group)
+            out = out[self.group.rank() * maximum : self.group.rank() * maximum + rows]
+        return out
+
+
+def _host_copy(tensor):
+    """Exact-size host copy, page-locked in place when CUDA is available.
+
+    pin_memory=True goes through the caching host allocator, which rounds each block
+    up to a power of two; register a plain allocation instead (as vLLM does).
+    """
+    nbytes = tensor.numel() * tensor.element_size()
+    owner = np.empty(max(nbytes, 1), dtype=np.uint8)
+    out = torch.from_numpy(owner)[:nbytes].view(tensor.dtype).view(tensor.shape)
+    out.copy_(tensor)
+    if torch.cuda.is_available() and nbytes:
+        pointer, cudart = owner.ctypes.data, torch.cuda.cudart()
+        if int(cudart.cudaHostRegister(pointer, nbytes, 0)) != 0:
+            raise RuntimeError("cudaHostRegister failed for an Engram table")
+        weakref.finalize(owner, cudart.cudaHostUnregister, pointer)
+    return out
