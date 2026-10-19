@@ -26,7 +26,9 @@ def can_admit_prefilled_decode(context, input_token_count: int) -> bool:
     """Return whether an imported request can enter the live decode batch."""
 
     if context.num_prefill_requests != 0 or context.chunked_prefill_request_id != -1:
-        raise RuntimeError("A decode-only engine cannot execute prefill requests")
+        # An evicted decode may be recomputing locally. Do not mix imported
+        # decode rows into its prefill batch; retry once recomputation finishes.
+        return False
     if context.total_request_count >= context.max_requests:
         return False
     if context.active_token_count + input_token_count > context.max_tokens:
