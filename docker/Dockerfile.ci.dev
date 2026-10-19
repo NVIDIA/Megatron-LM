@@ -88,6 +88,32 @@ RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_n
     esac
 EOF
 
+ARG CUBLAS_VERSION=13.8.1.7
+RUN bash -euxo pipefail <<"EOF"
+    # cuBLAS 13.8.1 includes the grouped GEMM correctness fix.
+    case "${TARGETARCH}" in
+        amd64)
+            CUBLAS_ARCH=x86_64
+            ;;
+        arm64)
+            CUBLAS_ARCH=sbsa
+            ;;
+        *) echo "Unsupported TARGETARCH for cuBLAS: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    CUBLAS_ARCHIVE="libcublas-linux-${CUBLAS_ARCH}-${CUBLAS_VERSION}_cuda13-archive"
+    CUBLAS_TMP=$(mktemp -d)
+    curl -fLSs --retry 3 -o "${CUBLAS_TMP}/cublas.tar.xz" \
+        "https://developer.download.nvidia.com/compute/cublas/redist/libcublas/linux-${CUBLAS_ARCH}/${CUBLAS_ARCHIVE}.tar.xz"
+    tar -xJf "${CUBLAS_TMP}/cublas.tar.xz" -C "${CUBLAS_TMP}"
+    # Replace the toolkit copies so existing linker paths pick up both cuBLAS and cuBLASLt.
+    CUDA_ROOT="${CUDA_HOME:-/usr/local/cuda}"
+    cp -a "${CUBLAS_TMP}/${CUBLAS_ARCHIVE}/include/." "${CUDA_ROOT}/include/"
+    cp -a "${CUBLAS_TMP}/${CUBLAS_ARCHIVE}/lib/." "${CUDA_ROOT}/lib64/"
+    install -Dm644 "${CUBLAS_TMP}/${CUBLAS_ARCHIVE}/LICENSE" "${CUDA_ROOT}/doc/cublas/LICENSE"
+    ldconfig
+    rm -rf "${CUBLAS_TMP}"
+EOF
+
 COPY pyproject.toml uv.lock /workspace/
 COPY docker/patches/mamba-cxx20.patch /workspace/mamba-cxx20.patch
 COPY megatron/core/__init__.py /workspace/megatron/core/
@@ -97,6 +123,10 @@ COPY megatron/rl/__init__.py /workspace/megatron/rl/
 ARG IMAGE_TYPE=dev
 ENV IMAGE_TYPE=${IMAGE_TYPE}
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
+# cuDNN Frontend is replaced after the sync below with this ref of NVIDIA/cudnn-frontend
+# (feat/1.29.0-megatron). Docker-only: outside pyproject.toml and uv.lock. Set empty to keep the
+# locked PyPI wheel. Skipped for the LTS image.
+ARG CUDNN_FRONTEND_GIT_REF=8924d4b41fd678ba1b98cd7f98bb78b222637573
 # Preserve Ampere support unless a caller selects narrower TE build targets.
 ARG NVTE_CUDA_ARCHS="80;90;100"
 # TE compiles each source's GPU targets one after another by default (nvcc --threads 1), so
@@ -185,6 +215,10 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
     rm -rf "${MAMBA_BUILD_DIR}"
     trap - EXIT
 
+    if [ -n "$CUDNN_FRONTEND_GIT_REF" ] && [ "$IMAGE_TYPE" != "lts" ]; then
+        uv pip install --no-deps --reinstall \
+            "nvidia-cudnn-frontend @ git+https://github.com/NVIDIA/cudnn-frontend.git@${CUDNN_FRONTEND_GIT_REF}"
+    fi
 EOF
 
 # Reuse the wheel without copying a second archive into the final image.
