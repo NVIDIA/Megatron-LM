@@ -351,6 +351,14 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 
+    def layer_inputs_forward(self, hidden_states, inputs, **kwargs):
+        """Reject unsupported chunkwise CP metadata before executing a GDN core."""
+        if inputs.packed_sequence_cp_metadata is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support packed-sequence chunkwise CP metadata."
+            )
+        return super().layer_inputs_forward(hidden_states, inputs, **kwargs)
+
     @bind_layer_inputs
     def forward(
         self,
@@ -361,7 +369,6 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-        packed_sequence_cp_metadata=None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run a GDN variant's recurrence followed by its output projection."""
@@ -372,7 +379,6 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             inference_params=inference_params,
-            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
             **kwargs,
         )
         return self.forward_post_core_attn(norm_out)

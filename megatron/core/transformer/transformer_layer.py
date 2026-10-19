@@ -9,8 +9,6 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
-from megatron.core.transformer.layer_interface import LayerAddends, bind_layer_inputs, wants_input_ids
-
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 
@@ -33,6 +31,13 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
+from megatron.core.transformer.layer_interface import (
+    LayerAddends,
+    LayerInputs,
+    bind_layer_inputs,
+    bind_layer_outputs,
+    wants_input_ids,
+)
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import (
@@ -892,6 +897,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return attention_intermediate, residual, context, attn_state
 
+    @bind_layer_outputs(addend="context")
     def forward_post_core_attn(
         self,
         attention_intermediate: Tensor,
@@ -1094,58 +1100,65 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         else:
             residual = hidden_states
 
+        if isinstance(self.cross_attention, IdentityOp):
+            return pre_cross_attn_layernorm_output, context
+
         if self.config.fp32_residual_connection:
             residual = residual.float()
-        attention_output_with_bias = self.cross_attention(
+        attention_output, addends = self.cross_attention(
             pre_cross_attn_layernorm_output,
-            attention_mask=context_mask,
-            key_value_states=context,
-            inference_context=inference_context,
+            LayerInputs(
+                context=context,
+                context_mask=context_mask,
+                inference_context=inference_context,
+            ),
         )
 
-        if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
-            context = attention_output_with_bias["context"]
+        if addends.context is not None:
+            context = addends.context
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
+                (attention_output, addends.bias), residual, self.hidden_dropout
             )
 
         return hidden_states, context
 
     def layer_inputs_forward(self, hidden_states, inputs, *, _call=None):
-        """Keep TE's partial-capture tensors inside its graph boundary."""
-        if _call is None:
+        """Omit absent optional inputs and bind completed layer outputs."""
+        call = self._call_with_bound_args if _call is None else _call
 
-            def _call(*args, **kwargs):
-                result = self._call_with_bound_args(*args, **kwargs)
-                if not isinstance(result, tuple) or (
-                    len(result) == 2 and isinstance(result[1], LayerAddends)
-                ):
-                    return result
-                if (
-                    not self._should_call_local_cudagraph(*args, **kwargs)
-                    and self._should_call_te_cudagraph(*args, **kwargs)
-                ):
-                    context = result[-1] if kwargs.get("context") is not None else None
-                    return result[0], LayerAddends(context=context)
+        def call_with_addends(*args, **kwargs):
+            for name in (
+                "context",
+                "context_mask",
+                "rotary_pos_cos",
+                "rotary_pos_sin",
+                "rotary_pos_cos_sin",
+                "attention_bias",
+                "residual_stream_recompute_context",
+                "input_ids",
+            ):
+                if kwargs.get(name) is None:
+                    kwargs.pop(name, None)
+            result = call(*args, **kwargs)
+            if not isinstance(result, tuple) or (
+                len(result) == 2 and isinstance(result[1], LayerAddends)
+            ):
                 return result
+            if (
+                not self._should_call_local_cudagraph(*args, **kwargs)
+                and self._should_call_te_cudagraph(*args, **kwargs)
+            ):
+                context = result[-1] if kwargs.get("context") is not None else None
+                return result[0], LayerAddends(context=context)
+            return result
 
-        return super().layer_inputs_forward(hidden_states, inputs, _call=_call)
+        return super().layer_inputs_forward(hidden_states, inputs, _call=call_with_addends)
 
     @bind_layer_inputs(
-        exclude=("rotary_pos_cos_sin",),
-        omit_none=(
-            "context",
-            "context_mask",
-            "rotary_pos_cos",
-            "rotary_pos_sin",
-            "attention_bias",
-            "residual_stream_recompute_context",
-            "input_ids",
-        ),
         # Only hash routers reserve a token-ID input in the legacy CUDA graph.
         include_if={"input_ids": wants_input_ids},
     )
@@ -2361,6 +2374,19 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # _run_input_layernorm, _apply_self_attn_bda_step, _pre_mlp_layernorm_and_residual, and
         # _apply_mlp_bda_step — do not delete; appears unused only at the class level.
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
+
+    def layer_inputs_forward(self, hidden_states, inputs, *, _call=None):
+        """Bind the mHC manager outside the tensor-only execution arguments."""
+        call = self._call_with_bound_args if _call is None else _call
+
+        def call_with_manager(*args, **kwargs):
+            if _call is None:
+                kwargs["mhc_recompute_manager"] = inputs.mhc_recompute_manager
+            else:
+                self._mhc_recompute_manager = inputs.mhc_recompute_manager
+            return call(*args, **kwargs)
+
+        return super().layer_inputs_forward(hidden_states, inputs, _call=call_with_manager)
 
     def _call_with_bound_args(self, *args, **kwargs):
         # Pull the manager off kwargs before the graph dispatch hands them to the

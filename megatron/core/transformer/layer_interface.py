@@ -99,6 +99,36 @@ register_pytree_node(
 LayerOutput = tuple[Tensor, LayerAddends]
 
 
+def _normalize_layer_output(result, *, addend="bias") -> LayerOutput:
+    """Name a raw auxiliary output, preserving already-bound outputs."""
+    if isinstance(result, Tensor):
+        return result, LayerAddends()
+    hidden_states, addends = result
+    if not isinstance(addends, LayerAddends):
+        return hidden_states, LayerAddends(**{addend: addends})
+    return result
+
+
+@experimental_api
+def bind_layer_outputs(forward=None, *, addend="bias"):
+    """Normalize a completed split-stage layer's natural return value.
+
+    Unlike ``bind_layer_inputs``, this decorator preserves the method's arguments
+    and always binds its output. Use ``addend="context"`` for a stage that returns
+    hidden states and cross-attention context. Tensor-only stages need no options.
+    """
+    if addend not in {field.name for field in fields(LayerAddends)}:
+        raise ValueError(f"Unknown layer addend: {addend}")
+    if forward is None:
+        return lambda method: bind_layer_outputs(method, addend=addend)
+
+    @wraps(forward)
+    def bound(*args, **kwargs):
+        return _normalize_layer_output(forward(*args, **kwargs), addend=addend)
+
+    return bound
+
+
 @experimental_api
 @runtime_checkable
 class LayerInterface(Protocol):
@@ -151,8 +181,6 @@ def bind_layer_inputs(
     legacy_forward=None,
     *,
     aliases=None,
-    omit_none=(),
-    exclude=(),
     include_if=None,
     input_transform=None,
 ):
@@ -163,9 +191,8 @@ def bind_layer_inputs(
     ``copy_signature`` beneath this decorator for forwarding-only methods.
 
     ``aliases`` maps forward parameter names to input field names, including
-    explicitly forwarded kwargs. ``exclude`` skips unused parameters, while
-    ``omit_none`` preserves legacy graph argument sets. ``include_if`` maps
-    parameter names to predicates on the module.
+    explicitly forwarded kwargs. ``include_if`` maps parameter names to predicates
+    on the module. Layers that omit arguments customize ``layer_inputs_forward``.
     ``input_transform(module, hidden_states)`` expresses shared-call-only normalization.
     Implementations may return a tensor or ``(hidden_states, LayerAddends)``.
     Tensor results receive empty addends. Existing core ``(hidden_states, bias)``
@@ -182,8 +209,6 @@ def bind_layer_inputs(
         return lambda forward: bind_layer_inputs(
             forward,
             aliases=aliases,
-            omit_none=omit_none,
-            exclude=exclude,
             include_if=include_if,
             input_transform=input_transform,
         )
@@ -198,7 +223,6 @@ def bind_layer_inputs(
     field_names = {field.name for field in fields(LayerInputs)}
     aliases = dict(aliases or {})
     include_if = dict(include_if or {})
-    omit_none, exclude = frozenset(omit_none), frozenset(exclude)
     named = {
         parameter.name: parameter
         for parameter in parameters[1:]
@@ -217,26 +241,24 @@ def bind_layer_inputs(
     mapping = {
         name: aliases.get(name, name)
         for name in dict.fromkeys((*named, *aliases))
-        if name not in exclude and aliases.get(name, name) in field_names
+        if aliases.get(name, name) in field_names
     }
-    if not (set(omit_none) | set(include_if)) <= mapping.keys():
+    if not set(include_if) <= mapping.keys():
         raise ValueError("LayerInputs policies must name bound forward parameters")
-    if not exclude <= named.keys():
-        raise ValueError("LayerInputs exclusions must name forward parameters")
     for name, parameter in named.items():
         if name in mapping and parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
             raise TypeError("LayerInputs fields must be keyword-capable parameters")
         if parameter.default is inspect.Parameter.empty and name not in mapping:
             raise ValueError(f"Required parameter {name} has no LayerInputs binding")
     binding = tuple(
-        (name, source, name in omit_none, include_if.get(name)) for name, source in mapping.items()
+        (name, source, include_if.get(name)) for name, source in mapping.items()
     )
 
     def invoke(module, call, hidden_states, inputs, *, hidden_as_keyword=False):
         bound = {}
-        for name, source, skip_none, predicate in binding:
+        for name, source, predicate in binding:
             value = getattr(inputs, source)
-            if (skip_none and value is None) or (predicate is not None and not predicate(module)):
+            if predicate is not None and not predicate(module):
                 continue
             bound[name] = value
         if input_transform is not None:
@@ -246,12 +268,7 @@ def bind_layer_inputs(
             result = call(**bound)
         else:
             result = call(hidden_states, **bound)
-        if isinstance(result, Tensor):
-            return result, LayerAddends()
-        hidden_states, addends = result
-        if not isinstance(addends, LayerAddends):
-            return hidden_states, LayerAddends(bias=addends)
-        return result
+        return _normalize_layer_output(result)
 
     @wraps(legacy_forward)
     def forward(self, *args, **kwargs):

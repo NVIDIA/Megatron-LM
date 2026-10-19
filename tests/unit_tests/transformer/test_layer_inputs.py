@@ -308,7 +308,7 @@ def test_skeleton_adapters_preserve_recompute_and_mhc_state():
             assert kwargs['input_ids'] is inputs.input_ids
     wrapper = bare(HyperConnectionHybridLayer)
     wrapper.inner_layer = SimpleNamespace()
-    wrapper._call_with_bound_args = Mock(return_value=(x, LayerAddends()))
+    wrapper._call_with_bound_args = Mock(return_value=(x, None))
     assert wrapper(x, LayerInputs(mhc_recompute_manager=manager)) == (x, LayerAddends())
     assert wrapper._call_with_bound_args.call_args.kwargs['mhc_recompute_manager'] is manager
     with pytest.raises(TypeError, match='mhc'):
@@ -618,12 +618,14 @@ def mock_mhc_boundary(inner, x):
     return wrapper
 
 
-@pytest.mark.parametrize("shared_call", [False, True])
-def test_mhc_fallback_accepts_native_layer_inputs_and_preserves_gradients(shared_call):
+@pytest.mark.parametrize("call_style", ["legacy", "shared", "direct_forward"])
+def test_mhc_fallback_accepts_native_layer_inputs_and_preserves_gradients(call_style):
+    context = torch.randn(3, 2, 4)
+
     class NativeLayer(nn.Module):
         def forward(self, x, inputs):
             self.inputs = inputs
-            return x + x.sin(), LayerAddends()
+            return x + x.sin(), LayerAddends(context=context)
 
     inner = NativeLayer()
     x = torch.randn(3, 2, 4, requires_grad=True)
@@ -638,11 +640,13 @@ def test_mhc_fallback_accepts_native_layer_inputs_and_preserves_gradients(shared
         padding_mask=object(),
         input_ids=object(),
     )
-    if shared_call:
-        output, addends = wrapper(x, inputs)
+    if call_style != "legacy":
+        call = wrapper.forward if call_style == "direct_forward" else wrapper
+        output, addends = call(x, inputs)
         assert addends.bias is None
+        assert addends.context is context
     else:
-        output, addends = wrapper(
+        output, output_context = wrapper(
             x,
             attention_mask=inputs.attention_mask,
             inference_context=inputs.inference_context,
@@ -653,7 +657,7 @@ def test_mhc_fallback_accepts_native_layer_inputs_and_preserves_gradients(shared
             packed_sequence_cp_metadata=inputs.packed_sequence_cp_metadata,
             input_ids=inputs.input_ids,
         )
-        assert addends.context is None
+        assert output_context is context
     assert inner.inputs == inputs
     reference = x.detach().clone().requires_grad_(True)
     expected = reference + ((reference + reference.sin()) - reference)
@@ -682,7 +686,8 @@ def test_mhc_fast_path_filters_ids_when_bypassing_the_inner_adapter(hash_routing
     )
 
 
-def test_cross_attention_binds_context_and_preserves_bias():
+@pytest.mark.parametrize("updates_context", [False, True])
+def test_cross_attention_binds_context_and_preserves_bias(updates_context):
     from megatron.core.transformer.attention import CrossAttention
 
     module = bare(CrossAttention)
@@ -695,6 +700,23 @@ def test_cross_attention_binds_context_and_preserves_bias():
     assert kwargs["key_value_states"] is context
     assert kwargs["attention_mask"] is mask
 
+    updated_context = torch.randn_like(context) if updates_context else None
+    module.forward_post_core_attn.return_value = (x, LayerAddends(bias=bias, context=updated_context))
+    layer = bare(TransformerLayer)
+    layer.config = SimpleNamespace(fp32_residual_connection=False, bias_dropout_fusion=False)
+    layer.hidden_dropout = 0.0
+    layer.pre_cross_attn_layernorm = IdentityOp()
+    layer._pre_cross_attn_layernorm_returns_residual = False
+    layer.cross_attention = module
+    layer.bias_dropout_add_exec_handler = torch.enable_grad
+    bda = Mock(side_effect=lambda pair, residual, dropout: residual + pair[0] + pair[1])
+    layer.cross_attn_bda = Mock(return_value=bda)
+
+    output, output_context = layer._run_cross_attention(x, context, mask, None)
+    assert_bit_exact(output, {}, x + x + bias, {})
+    assert output_context is (updated_context if updates_context else context)
+    assert bda.call_args.args[0][1] is bias
+
 
 def test_mamba_mixer_rejects_chunkwise_metadata():
     with pytest.raises(NotImplementedError, match="packed-sequence chunkwise CP metadata"):
@@ -702,9 +724,14 @@ def test_mamba_mixer_rejects_chunkwise_metadata():
 
 
 @pytest.mark.parametrize("cls", [GatedDeltaNet, GatedDeltaNet2])
-def test_gdn_cores_preserve_chunkwise_metadata_rejection(cls):
-    with pytest.raises(AssertionError, match="packed-sequence chunkwise CP metadata"):
-        bare(cls)(torch.randn(2, 4), LayerInputs(packed_sequence_cp_metadata=object()))
+@pytest.mark.parametrize("direct_forward", [False, True])
+def test_gdn_cores_preserve_chunkwise_metadata_rejection(cls, direct_forward):
+    module = bare(cls)
+    module._call_with_bound_args = Mock()
+    call = module.forward if direct_forward else module
+    with pytest.raises(NotImplementedError, match="packed-sequence chunkwise CP metadata"):
+        call(torch.randn(2, 4), LayerInputs(packed_sequence_cp_metadata=object()))
+    module._call_with_bound_args.assert_not_called()
 
 
 class ExplicitSignatureLayer(MegatronModule):
@@ -810,7 +837,7 @@ def test_adapter_validates_declarations_and_requires_a_forwarding_schema():
     with pytest.raises(ValueError, match="Required parameter"):
         bind_layer_inputs(lambda self, x, required: x)
     with pytest.raises(ValueError, match="policies"):
-        bind_layer_inputs(lambda self, x: x, omit_none=("attention_mask",))
+        bind_layer_inputs(lambda self, x: x, include_if={"attention_mask": lambda module: True})
     with pytest.raises(ValueError, match="alias"):
         bind_layer_inputs(lambda self, x, **kwargs: x, aliases={"x": "attention_mask"})
 
@@ -890,16 +917,22 @@ def test_shared_binding_surrounds_graph_dispatch_without_recursion(mode, output_
 
 
 @pytest.mark.parametrize("cls", [TransformerLayer, MambaLayer])
-def test_graph_argument_keys_match_legacy_skeleton_contract(cls):
+def test_graph_argument_keys_match_bound_skeleton_contract(cls):
     module = bare(cls)
     x = torch.randn(2, 4)
     module.cudagraph_manager = Mock(return_value=(x, LayerAddends()) if cls is TransformerLayer else x)
     module(x, LayerInputs(rotary_pos_emb=object(), rotary_pos_cos_sin=object()))
     _, args, kwargs = module.cudagraph_manager.call_args.args
     assert args == ()
-    expected = {"hidden_states", "attention_mask", "inference_context", "packed_seq_params"}
+    expected = {"hidden_states", "inference_context", "packed_seq_params"}
     if cls is TransformerLayer:
-        expected |= {"rotary_pos_emb", "sequence_len_offset", "padding_mask"}
+        expected |= {
+            "attention_mask",
+            "rotary_pos_emb",
+            "rotary_pos_cos_sin",
+            "sequence_len_offset",
+            "padding_mask",
+        }
     assert set(kwargs) == expected
 
 
@@ -978,8 +1011,19 @@ def test_mhc_per_call_setup_runs_before_graph_dispatch():
 
     module.cudagraph_manager = Mock(side_effect=graph)
     assert module(hidden_states=x, mhc_recompute_manager=manager) == (x, LayerAddends())
+    assert module(x, LayerInputs(mhc_recompute_manager=manager)) == (x, LayerAddends())
     assert module(x, LayerInputs()) == (x, LayerAddends())
-    assert seen == [manager, None]
+    assert seen == [manager, manager, None]
+
+    def direct_forward(*args, **kwargs):
+        assert module._mhc_recompute_manager is manager
+        assert "mhc_recompute_manager" not in kwargs
+        return x, LayerAddends()
+
+    module.layer_inputs_forward(
+        x, LayerInputs(mhc_recompute_manager=manager), _call=direct_forward
+    )
+    assert seen == [manager, manager, None]
 
 
 def test_te_capture_and_replay_use_legacy_tensors_and_manual_hooks():
@@ -1024,9 +1068,12 @@ def test_te_capture_and_replay_use_legacy_tensors_and_manual_hooks():
 def test_complete_layer_output_preserves_context_separately_from_bias(cls):
     module = bare(cls)
     x, context = torch.randn(2, 4), torch.randn(2, 4)
-    legacy_output = (
-        x if cls in (MambaLayer, HybridStack) else (x, LayerAddends(context=context))
-    )
+    if cls in (MambaLayer, HybridStack):
+        legacy_output = x
+    elif cls is HyperConnectionHybridLayer:
+        legacy_output = (x, context)
+    else:
+        legacy_output = (x, LayerAddends(context=context))
     module._call_with_bound_args = Mock(return_value=legacy_output)
     result = module(x, LayerInputs())
     assert isinstance(result, tuple) and len(result) == 2

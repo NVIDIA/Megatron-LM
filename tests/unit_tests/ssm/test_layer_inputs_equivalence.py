@@ -212,9 +212,7 @@ class TestLayerInputsEquivalence:
                 output, addends = layer(value, LayerInputs(residual_stream_recompute_context=context))
                 assert addends.bias is None
             else:
-                output = layer(
-                    value, attention_mask=None, residual_stream_recompute_context=context
-                )
+                output = layer(value, residual_stream_recompute_context=context)
                 if symbol != "M":
                     output = output[0]
             context.finalize(output)
@@ -275,7 +273,7 @@ class TestLayerInputsEquivalence:
                         assert addends.bias is None
                     else:
                         kwargs = {"sequence_len_offset": sequence_offset} if symbol == "*" else {}
-                        output = layer(x, attention_mask=None, inference_context=context, **kwargs)
+                        output = layer(x, inference_context=context, **kwargs)
                         if symbol != "M":
                             output = output[0]
                     outputs.append(output.detach().clone())
@@ -309,7 +307,7 @@ def check_equivalence(symbol, test_core, *, stack_spec=hybrid_stack_spec, **conf
     def legacy(value):
         output = (
             module(value)
-            if test_core and symbol in ("M", "-", "E")
+            if symbol == "M" or (test_core and symbol in ("-", "E"))
             else module(value, attention_mask=mask)
         )
         if test_core:

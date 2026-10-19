@@ -30,6 +30,7 @@ from megatron.core.transformer.hyper_connection import (
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
 )
+from megatron.core.transformer.layer_interface import LayerInputs
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -730,30 +731,26 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             mhc_is_last_in_recompute_block[l_no]
                         )
 
-                    # Only thread mhc_recompute_manager when the layer is mHC and a
-                    # manager actually exists. Plain TransformerLayer (and its
-                    # MoETransformerLayer subclass) doesn't accept this kwarg, and
-                    # its CUDA-graph machinery rejects unrecognized non-tensor kwargs.
-                    extra_layer_kwargs = (
-                        {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
-                    )
                     with self.offload_context, inner_quantization_context:
                         hidden_states, addends = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            rotary_pos_cos=rotary_pos_cos,
-                            rotary_pos_sin=rotary_pos_sin,
-                            rotary_pos_cos_sin=rotary_pos_cos_sin,
-                            attention_bias=attention_bias,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                            sequence_len_offset=sequence_len_offset,
-                            padding_mask=padding_mask,
-                            **extra_layer_kwargs,
+                            hidden_states,
+                            LayerInputs(
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
+                                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                                attention_bias=attention_bias,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                                sequence_len_offset=sequence_len_offset,
+                                padding_mask=padding_mask,
+                                mhc_recompute_manager=mhc_manager,
+                            ),
                         )
+                        assert addends.bias is None, "TransformerBlock requires complete layers"
                         context = addends.context
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(

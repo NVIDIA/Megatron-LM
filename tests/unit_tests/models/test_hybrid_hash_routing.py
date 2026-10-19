@@ -45,7 +45,7 @@ class RecordingTransformerLayer(TransformerLayer):
         if cuda_graph_impl == "transformer_engine":
             self.cuda_graphs = [object()]
 
-    @bind_layer_inputs(omit_none=("input_ids",), include_if={"input_ids": wants_input_ids})
+    @bind_layer_inputs(include_if={"input_ids": wants_input_ids})
     @copy_signature(TransformerLayer.forward)
     def forward(self, hidden_states, **kwargs):
         self.calls.append(kwargs)
@@ -110,16 +110,12 @@ class RecordingNonTransformerLayer(MambaLayer):
         self.layer_number = layer_number
         self.num_calls = 0
 
-    @bind_layer_inputs(
-        exclude=("rotary_pos_emb",),
-        omit_none=("packed_sequence_cp_metadata", "residual_stream_recompute_context"),
-    )
+    @bind_layer_inputs
     def forward(
         self,
         hidden_states,
         attention_mask=None,
         inference_context=None,
-        rotary_pos_emb=None,
         residual_stream_recompute_context=None,
         *,
         packed_seq_params=None,

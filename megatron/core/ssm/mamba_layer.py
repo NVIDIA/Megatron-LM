@@ -11,8 +11,6 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
-from megatron.core.transformer.layer_interface import bind_layer_inputs
-
 try:
     from nemo.lens.helpers import managed_span as _otel_managed_span
 except ImportError:
@@ -27,6 +25,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import bind_layer_inputs, bind_layer_outputs
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -233,6 +232,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             return ssm_output, residual
         return ssm_output, residual, connection_state
 
+    @bind_layer_outputs
     def forward_post_core_attn(
         self,
         ssm_output: Tensor,
@@ -251,9 +251,19 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         return None
 
+    def layer_inputs_forward(self, hidden_states, inputs, *, _call=None):
+        """Omit absent optional state before hooks and graph dispatch."""
+        call = self._call_with_bound_args if _call is None else _call
+
+        def call_with_optional_state(*args, **kwargs):
+            for name in ("packed_sequence_cp_metadata", "residual_stream_recompute_context"):
+                if kwargs.get(name) is None:
+                    kwargs.pop(name, None)
+            return call(*args, **kwargs)
+
+        return super().layer_inputs_forward(hidden_states, inputs, _call=call_with_optional_state)
+
     @bind_layer_inputs(
-        exclude=("rotary_pos_emb",),  # Unused by this skeleton, including its CUDA graphs.
-        omit_none=("packed_sequence_cp_metadata", "residual_stream_recompute_context"),
         include_if={
             "packed_sequence_cp_metadata": lambda module: module.uses_packed_sequence_cp_metadata()
         },
@@ -261,9 +271,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
-        rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -279,10 +287,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         Args:
             hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
                 b is batch size, and h is hidden size.
-            attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
             inference_context (BaseInferenceContext, optional): Parameters for inference-time
                 optimizations.
-            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             packed_sequence_cp_metadata (PackedSequenceCPMetadata, optional): Rank-local
                 packed-sequence metadata for chunkwise CP.
             residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
@@ -381,7 +387,6 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             return True
         elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
-            and kwargs.get('attention_mask') is None
             and kwargs.get('inference_context') is not None
             and not self.config.cuda_graph_modules  # empty-list = per-layer CUDA graphs
         ):

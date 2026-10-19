@@ -356,7 +356,7 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
                 mlp_state,
                 residual_stream_recompute_context=recompute_context,
             )
-        return output[0] if isinstance(output, tuple) else output
+        return output
 
     def _launch_dispatch(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, async_op: bool = False
@@ -576,13 +576,14 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
         if not inference:
             with quant_context_factory(attn_config, self.attn_layer_idx):
                 if attn_recompute_context is None:
-                    attn_layer_output = self.compute_layer.forward_post_core_attn(*paired_state)
+                    attn_layer_output, addends = self.compute_layer.forward_post_core_attn(
+                        *paired_state
+                    )
                 else:
-                    attn_layer_output = self.compute_layer.forward_post_core_attn(
+                    attn_layer_output, addends = self.compute_layer.forward_post_core_attn(
                         *paired_state, residual_stream_recompute_context=attn_recompute_context
                     )
-                if isinstance(attn_layer_output, tuple):
-                    attn_layer_output = attn_layer_output[0]
+                assert addends.bias is None, "Shortcut blocks require complete residual layers"
 
         if cp_layout_state is not None:
             attn_layer_output, moe_packed_seq_params = cp_layout_state.prepare_layer(

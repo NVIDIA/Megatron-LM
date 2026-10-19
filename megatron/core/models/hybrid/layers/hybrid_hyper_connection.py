@@ -122,14 +122,20 @@ class HyperConnectionHybridLayer(MegatronModule):
             layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
-    def layer_inputs_forward(self, hidden_states, inputs, **kwargs):
-        """Reject residual-stream replay before executing the mHC boundary."""
+    def layer_inputs_forward(self, hidden_states, inputs, *, _call=None):
+        """Validate shared inputs and expose the raw context as named addends."""
         if inputs.residual_stream_recompute_context is not None:
             raise TypeError(
                 "HyperConnectionHybridLayer does not support residual_stream recomputation; "
                 "select 'mhc' in recompute_modules and configure mhc_recompute_layer_num instead."
             )
-        return super().layer_inputs_forward(hidden_states, inputs, **kwargs)
+        call = self._call_with_bound_args if _call is None else _call
+
+        def call_with_addends(*args, **kwargs):
+            output, context = call(*args, **kwargs)
+            return output, LayerAddends(context=context)
+
+        return super().layer_inputs_forward(hidden_states, inputs, _call=call_with_addends)
 
     @bind_layer_inputs
     def forward(
@@ -144,7 +150,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
         mhc_recompute_manager=None,
         input_ids: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, LayerAddends]:
+    ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
         aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
@@ -215,4 +221,4 @@ class HyperConnectionHybridLayer(MegatronModule):
             and hidden_states.dtype != self.config.params_dtype
         ):
             hidden_states = hidden_states.to(self.config.params_dtype)
-        return hidden_states, LayerAddends(context=context)
+        return hidden_states, context

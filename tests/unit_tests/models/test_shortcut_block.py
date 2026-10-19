@@ -64,7 +64,7 @@ class _FakeCompute(torch.nn.Module, TwoStageAttentionLayer):
         return (hidden_states,)
 
     def forward_post_core_attn(self, hidden_states, **kwargs):
-        return hidden_states
+        return hidden_states, LayerAddends()
 
 
 class _FakeMLP(torch.nn.Module):
@@ -255,7 +255,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
 
     def attn_post(hidden_states, **kwargs):
         assert kwargs == expected_layer_kwargs
-        return hidden_states
+        return hidden_states, LayerAddends()
 
     def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
         assert recompute_context is attn_context
@@ -508,7 +508,7 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
 
         def forward_post_core_attn(self, projected, residual, **kwargs):
             assert_quant_layer(0)
-            return projected * self.output_scale
+            return projected * self.output_scale, LayerAddends()
 
     class FakeMLP(torch.nn.Module):
         def __init__(self):

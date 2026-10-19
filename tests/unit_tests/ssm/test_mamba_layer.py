@@ -13,6 +13,7 @@ from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.layer_interface import LayerInputs
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.test_utilities import Utils
@@ -106,10 +107,11 @@ class TestMambaLayer:
             ((inference_context, padding_mask), {}),
             ((), dict(inference_context=inference_context, padding_mask=padding_mask)),
         ):
-            assert (
-                self.layer.forward_post_core_attn(ssm_output, residual, *args, **kwargs)
-                is projected
+            output, addends = self.layer.forward_post_core_attn(
+                ssm_output, residual, *args, **kwargs
             )
+            assert output is projected
+            assert addends.bias is None
             project.assert_called_with(ssm_output)
             write.assert_called_with(mixer_output, residual)
 
@@ -163,7 +165,8 @@ class TestMambaLayer:
         split_input = hidden_states.detach().clone().requires_grad_(True)
         stage_state = layer.forward_pre_attn_and_core_attn(split_input)
         assert len(stage_state) == 3
-        split_output = layer.forward_post_core_attn(*stage_state)
+        split_output, addends = layer.forward_post_core_attn(*stage_state)
+        assert addends.bias is None
         split_output.float().square().mean().backward()
         split_grads = {
             name: param.grad for name, param in layer.named_parameters() if param.grad is not None
@@ -203,7 +206,8 @@ class TestMambaLayer:
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         )
         attention_mask = attention_mask.cuda()
-        output = layer(hidden_states, attention_mask=attention_mask)
+        output, addends = layer(hidden_states, LayerInputs(attention_mask=attention_mask))
+        assert addends.bias is None
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == layer.config.hidden_size

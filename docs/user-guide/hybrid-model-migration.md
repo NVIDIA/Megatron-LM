@@ -428,7 +428,28 @@ validation also runs during replay. Forward `**kwargs` to preserve direct
 `forward(..., LayerInputs)` calls, which supply a private execution callback to
 bypass hooks and graph dispatch. Ordinary explicit-argument calls bypass the
 override. The binding decorator is named `bind_layer_inputs`; it no longer
-accepts `reject=` policies.
+accepts `reject=`, `exclude=`, or `omit_none=` policies.
+
+Argument omission also belongs in this override. Wrap the execution callback to
+remove bound keywords before hooks or graph dispatch, while preserving the direct
+`forward` path:
+
+```python
+def layer_inputs_forward(self, hidden_states, inputs, *, _call=None):
+    call = self._call_with_bound_args if _call is None else _call
+
+    def call_with_selected_args(*args, **kwargs):
+        kwargs.pop("unused_argument", None)  # Always exclude this argument.
+        if kwargs.get("context") is None:
+            kwargs.pop("context", None)  # Keep forward's default when context is absent.
+        return call(*args, **kwargs)
+
+    return super().layer_inputs_forward(hidden_states, inputs, _call=call_with_selected_args)
+```
+
+Transformer and Mamba use this pattern for their optional arguments. The decorator
+only maps declared fields, applies aliases and conditional inclusion, and normalizes
+the result; it no longer owns omission policies.
 
 The container and layer forwards both use `packed_sequence_cp_metadata`, so
 this field binds directly by name. For differently named legacy parameters,
@@ -454,9 +475,11 @@ hidden_states, addends = layer(hidden_states, inputs)
 context = addends.context
 ```
 
-Complete Transformer and mHC layers now return `LayerAddends(context=context)`
-even for explicit-argument calls; callers formerly unpacking `(output, context)`
-must read `.context`. HybridStack returns its optional MTP stream in
+Complete Transformer layers return `LayerAddends(context=context)` even for
+explicit-argument calls; callers formerly unpacking `(output, context)` must read
+`.context`. The mHC implementation returns `(output, context)`; its
+`layer_inputs_forward` override wraps that context in `LayerAddends` for shared calls.
+HybridStack returns its optional MTP stream in
 `LayerAddends(mhc_multistream=...)`. Output-selection adapters are no longer needed.
 
 CrossAttention accepts shared inputs: `context` binds to `key_value_states`, and
@@ -475,6 +498,18 @@ must supply it too. The block selects the contexts for both layers of its pair.
 Shortcut scheduling arguments are supplied only through this context. Its
 implementation returns a tensor; the shared helper supplies empty addends.
 
+Completed Transformer and Mamba split stages also return `(hidden_states, addends)`.
+Their `forward_post_core_attn` methods use `@bind_layer_outputs` to normalize the
+implementation's natural output; Transformer declares `addend="context"`.
+Shortcut consumes this pair directly. Core projection stages retain their internal
+`(output, bias)` contract for residual fusion.
+
+TransformerBlock invokes layers through `LayerInputs`, including the optional mHC
+manager. Cross-attention uses the same interface and reads auxiliary context from
+`addends.context`. Mamba's ordinary `forward` no longer accepts the unused
+`attention_mask` or `rotary_pos_emb` arguments; callers with shared inputs can still
+supply those fields, and the binding ignores them.
+
 Stack and recompute callers pass available CP metadata in `LayerInputs` without
 inspecting layer types. Mamba's binding consumes it only in chunkwise mode.
 Split-stage layers declare `uses_packed_sequence_cp_metadata()` so shortcut
@@ -489,8 +524,10 @@ happens after execution or graph replay. Direct `.forward(...)` calls also accep
 the container, but bypass module hooks and graph selection as usual. Graphable
 modules dispatch through `_call_with_bound_args`; per-call setup that must run
 after binding and before graph selection belongs at that boundary. The existing
-skeleton bindings preserve their graph argument sets, including omission of
-non-hash token IDs and absent optional recompute/context arguments.
+skeleton bindings omit non-hash token IDs and absent optional recompute/context
+arguments. Mamba's graph arguments also omit its unused attention mask and rotary
+embeddings. TE capture/replay and the vision graph wrapper retain their existing
+behavior; the shared binding also normalizes results from layer-owned execution callbacks.
 
 ### Validate before scaling up
 

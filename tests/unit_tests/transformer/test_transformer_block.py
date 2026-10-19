@@ -17,6 +17,7 @@ from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.layer_interface import LayerAddends
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
@@ -33,8 +34,8 @@ class _ResidualObservationLayer(torch.nn.Module, BaseTransformerLayer):
         self.config = config
         self.layer_number = layer_number
 
-    def forward(self, hidden_states, **kwargs):
-        return hidden_states + 1, None
+    def forward(self, hidden_states, inputs):
+        return hidden_states + 1, LayerAddends(context=inputs.context)
 
 
 class TestParallelTransformerBlock:
