@@ -191,7 +191,11 @@ class SSMDynamicInferenceMixin:
     # Shared orchestration.
     # ------------------------------------------------------------------
     def ssm_dynamic_inference(
-        self, hidden_states: torch.Tensor, context: DynamicInferenceContext
+        self,
+        hidden_states: torch.Tensor,
+        context: DynamicInferenceContext,
+        *,
+        inference_input_is_normalized: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Execute one dynamic inference step for a linear-attention mixer.
 
@@ -217,7 +221,11 @@ class SSMDynamicInferenceMixin:
         prefill_req_count = padded_dims.prefill_req_count
 
         # Input projection over the full packed batch.
-        zxBCdt, _ = self.in_proj(hidden_states)
+        input_projection = self.in_proj
+        if inference_input_is_normalized:
+            zxBCdt, _ = input_projection.forward_normalized(hidden_states)
+        else:
+            zxBCdt, _ = input_projection(hidden_states)
 
         y_decode = None
         y_prefill = None

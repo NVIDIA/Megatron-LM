@@ -484,9 +484,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         ssm_state=None,
         packed_seq_params=None,
         inference_mode=False,
+        inference_input_is_normalized=False,
     ):
         """Run Mamba through its normalized SSM output, before output projection."""
-        zxBCdt, _ = self.in_proj(hidden_states)
+        if inference_input_is_normalized:
+            zxBCdt, _ = self.in_proj.forward_normalized(hidden_states)
+        else:
+            zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
@@ -530,16 +534,22 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        inference_input_is_normalized: bool = False,
     ):
         """Run the input projection/SSM phase followed by the output projection."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
         in_inference_mode = InferenceMode.is_active()
+        projection_kwargs = (
+            {"inference_input_is_normalized": True} if inference_input_is_normalized else {}
+        )
 
         _, batch, _ = hidden_states.shape
         conv_state, ssm_state = None, None
         if in_inference_mode and inference_context is not None:
             if inference_context.is_dynamic_batching():
-                return self.ssm_dynamic_inference(hidden_states, inference_context)
+                return self.ssm_dynamic_inference(
+                    hidden_states, inference_context, **projection_kwargs
+                )
 
             assert inference_context.is_static_batching()
             assert not self.config.batch_invariant_mode, (
@@ -550,7 +560,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
             if inference_context.seqlen_offset > 0:
                 # The states are updated in place.
-                return self._static_decode(hidden_states, conv_state, ssm_state)
+                return self._static_decode(
+                    hidden_states, conv_state, ssm_state, **projection_kwargs
+                )
 
         y = self._mamba_chunk(
             hidden_states,
@@ -558,6 +570,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             ssm_state=ssm_state,
             packed_seq_params=packed_seq_params,
             inference_mode=in_inference_mode,
+            **projection_kwargs,
         )
         return self.out_proj(y)
 
@@ -571,14 +584,17 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
     # dynamic inference interface defined by `SSMDynamicInferenceMixin`.
     # ==================================================================
     def _static_decode(
-        self, hidden_states, conv_state, ssm_state
+        self, hidden_states, conv_state, ssm_state, *, inference_input_is_normalized=False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Single-token static-batching decode step (updates state in place)."""
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
 
         # (1, b, d_model) -> (1, b, proj_dim)
-        zxBCdt, _ = self.in_proj(hidden_states)
+        if inference_input_is_normalized:
+            zxBCdt, _ = self.in_proj.forward_normalized(hidden_states)
+        else:
+            zxBCdt, _ = self.in_proj(hidden_states)
 
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inference decode"
 

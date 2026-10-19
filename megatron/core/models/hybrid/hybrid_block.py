@@ -28,6 +28,9 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.hybrid.layers.inference_residual_norm import (
+    build_inference_residual_norm_plan,
+)
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
@@ -420,6 +423,9 @@ class HybridStack(MegatronModule):
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
+        self._inference_residual_norm_plan = build_inference_residual_norm_plan(
+            self.layers, self.config, getattr(self, "final_norm", None)
+        )
 
     def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:
         """Return physical layer indices that must share one residual replay block."""
@@ -627,6 +633,26 @@ class HybridStack(MegatronModule):
             )
         else:
             sequence_len_offset = None
+
+        residual_norm_plan = self._inference_residual_norm_plan
+        if residual_norm_plan is not None and residual_norm_plan.can_run(
+            hidden_states,
+            training=self.training,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+        ):
+            hidden_states = residual_norm_plan.forward(
+                hidden_states,
+                inference_context=inference_context,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+            )
+            return make_viewless_tensor(
+                inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+            )
 
         # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
         # otherwise do nothing extra at the outer level
