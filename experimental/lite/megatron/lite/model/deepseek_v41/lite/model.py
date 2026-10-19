@@ -125,9 +125,6 @@ class DeepseekV41Model(MegatronModule):
                 self.engrams[str(index)] = DS41Engram(
                     release, config, index, table_group, frozen=not impl.trainable_engram
                 )
-                self.engrams[str(index)].q_weight.use_muon = False
-                self.engrams[str(index)].k_weight.use_muon = False
-                self.engrams[str(index)].embed.weight.use_muon = False
         if self.engrams:
             self.hash = NgramHash(
                 token_map,

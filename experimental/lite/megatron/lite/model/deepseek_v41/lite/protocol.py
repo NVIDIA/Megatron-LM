@@ -28,7 +28,7 @@ class ImplConfig:
     shard_engram: bool = True
     recompute: object = None
     pipeline_split_layer: object = None
-    optimizer: str | None = "muon"
+    optimizer: str | None = "adam"
     optimizer_config: object = None
     attention_backend_override: str | None = None
     router_aux_loss_coef: float = 0.0
@@ -62,8 +62,12 @@ def _validate(model_cfg, impl):
         or impl.dtype not in (torch.bfloat16, "bfloat16", "bf16")
     ):
         raise ValueError("DS4.1 standard training supports BF16 execution only")
-    if impl.optimizer not in (None, "muon", "adam", "dist_opt"):
+    if impl.optimizer not in (None, "adam", "dist_opt"):
         raise ValueError(f"Unsupported DS4.1 optimizer: {impl.optimizer}")
+    options = impl.optimizer_config
+    options = dict(options) if isinstance(options, Mapping) else vars(options) if options else {}
+    if options.get("optimizer", "adam") not in ("adam", "dist_opt"):
+        raise ValueError("DS4.1 supports only the native Adam distributed optimizer")
     if impl.parallel.vpp != 1 or impl.parallel.tp != 1 or impl.parallel.etp not in (None, 1):
         raise ValueError("DS4.1 supports TP=ETP=VPP=1")
     if impl.router_aux_loss_coef not in (None, 0):
@@ -94,23 +98,16 @@ def _optimizer(chunks, cfg, impl, ps):
     values = dict(values) if isinstance(values, Mapping) else dict(vars(values)) if values else {}
     if values.pop("segmented_host", False):
         raise ValueError("DS4.1 native Core optimizer does not support segmented_host")
-    aliases = {"ns_steps": "muon_num_ns_steps", "coefficient_type": "muon_coefficient_type"}
-    core = {
-        aliases.get(k, k): values.pop(k)
-        for k in list(values)
-        if k in aliases or k.startswith("muon_")
-    }
-    values.setdefault("optimizer", "muon" if impl.optimizer == "muon" else "adam")
+    if values.get("optimizer", "adam") not in ("adam", "dist_opt"):
+        raise ValueError("DS4.1 supports only the native Adam distributed optimizer")
+    values["optimizer"] = "adam"
     values.setdefault("lr", 1e-5)
     values.setdefault("weight_decay", 0.0)
     values.setdefault("clip_grad", 1.0)
-    core.setdefault("muon_num_ns_steps", 2)
-    core.setdefault("muon_split_mla_qkv", False)
     engine = SimpleNamespace(
         parallel=impl.parallel,
         optimizer=SimpleNamespace(**values),
         deterministic=False,
-        override_optimizer_config=core,
         # Runtime permits a variable number of microbatches; finish native
         # reductions once after accumulation, rather than learning a fixed
         # per-parameter readiness count from the first batch.
