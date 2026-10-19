@@ -142,14 +142,23 @@ def test_tokenizer_finalizes_same_model_used_for_build():
     build.assert_called_once()
 
 
-@pytest.mark.parametrize("field", ["use_torch_fsdp2", "use_megatron_fsdp"])
-def test_rejects_placement_conflict_before_build(field):
+def test_rejects_placement_conflict_before_build():
     cfg = mc.modelopt_inference_config_from_args(_make_args(), device="cpu")
-    setattr(cfg.dist, field, True)
+    cfg.dist.use_torch_fsdp2 = True
     with patch.object(GPTModelBuilder, "build_distributed_models") as build:
         with pytest.raises(ValueError, match="FSDP"):
             cfg.build_models(Mock())
     build.assert_not_called()
+
+
+def test_build_models_reads_fsdp_from_owning_sections():
+    args = _make_args()
+    cfg = pretrain_cfg_container_from_args(args, mc.modelopt_model_config_from_args(args))
+    cfg.ddp.use_megatron_fsdp = True
+    with patch.object(GPTModelBuilder, "build_distributed_models") as build:
+        cfg.build_models(Mock())
+    assert build.call_args.kwargs["use_megatron_fsdp"] is True
+    assert build.call_args.kwargs["use_torch_fsdp2"] is False
 
 
 @pytest.mark.parametrize(

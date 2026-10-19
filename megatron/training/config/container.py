@@ -50,18 +50,29 @@ class ConfigContainerBase:
 
     _finalized: bool = field(default=False, init=False, repr=False, compare=False)
 
+    def _fsdp_flags(self) -> dict[str, bool]:
+        """FSDP settings: Torch FSDP2 from ``dist``, Megatron FSDP from ``ddp`` (training only)."""
+        dist = getattr(self, "dist", None)
+        ddp = getattr(self, "ddp", None)
+        return {
+            "use_megatron_fsdp": ddp is not None and ddp.use_megatron_fsdp,
+            "use_torch_fsdp2": dist is not None and dist.use_torch_fsdp2,
+        }
+
+    def _check_placement(self) -> None:
+        model_build = getattr(self, "model_build", None)
+        if model_build is not None and model_build.device is not None:
+            if any(self._fsdp_flags().values()):
+                raise ValueError("Explicit device placement conflicts with FSDP-managed placement.")
+
     def build_models(self, pg_collection, **kwargs):
         """Build the declared model with run-owned checkpoint and execution settings."""
         if self.model is None:
             raise ValueError("A model config is required to build models.")
+        self._check_placement()
         settings = {}
         model_build = getattr(self, "model_build", None)
         if model_build is not None:
-            dist = getattr(self, "dist", None)
-            if model_build.device is not None and (
-                dist is not None and (dist.use_torch_fsdp2 or dist.use_megatron_fsdp)
-            ):
-                raise ValueError("Explicit device placement conflicts with FSDP-managed placement.")
             if model_build.device is not None:
                 settings["device"] = model_build.device
             if model_build.wrap_with_ddp is not None:
@@ -77,18 +88,14 @@ class ConfigContainerBase:
                 raise ValueError(f"Set container.{key} instead of passing a {key} override.")
         kwargs["checkpoint"] = self.checkpoint
         kwargs["distillation"] = getattr(self, "distillation", None)
-        kwargs.setdefault("use_megatron_fsdp", self.dist.use_megatron_fsdp)
-        kwargs.setdefault("use_torch_fsdp2", self.dist.use_torch_fsdp2)
+        for key, value in self._fsdp_flags().items():
+            kwargs.setdefault(key, value)
         builder = self.model.get_builder_cls()(self.model)
         return builder.build_distributed_models(pg_collection=pg_collection, **kwargs)
 
     def validate(self) -> None:
         """Check sub-configs without mutation; callers may validate repeatedly."""
-        dist = getattr(self, "dist", None)
-        model_build = getattr(self, "model_build", None)
-        if model_build is not None and model_build.device is not None and dist is not None:
-            if dist.use_torch_fsdp2 or dist.use_megatron_fsdp:
-                raise ValueError("Explicit device placement conflicts with FSDP-managed placement.")
+        self._check_placement()
         distillation = getattr(self, "distillation", None)
         if distillation is not None:
             model = getattr(self, "model", None)
