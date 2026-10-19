@@ -735,7 +735,7 @@ class CachedLogitsKDLoss:
         Args:
             student_logits: ``(seq_len, batch, local_vocab_size)`` – raw
                 (pre-softmax) student logits from this TP rank's vocab shard.
-            iteration: Training iteration.  Defaults to ``args.curr_iteration``.
+            iteration: Training iteration.  Defaults to ``get_train_state().iteration``.
             microbatch_idx: Microbatch index within the current iteration.
                 Defaults to an auto-incremented counter that resets on each
                 new iteration.

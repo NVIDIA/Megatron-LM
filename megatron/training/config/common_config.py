@@ -110,6 +110,11 @@ class DistributedInitConfig:
     distributed_backend: Literal["nccl", "gloo"] = "nccl"
     """Which backend to use for distributed training."""
 
+    fake_process_group: bool = False
+    """Initialize fake process groups and skip all distributed communication operations.
+    This allows profiling distributed training memory usage with a single GPU.
+    Set WORLD_SIZE and RANK to the desired distributed scale."""
+
     distributed_timeout_minutes: int = 10
     """Timeout minutes for torch.distributed."""
 
@@ -124,9 +129,6 @@ class DistributedInitConfig:
     lazy_mpu_init: bool = False
     """If set to True, initialize_megatron() skips DDP initialization and returns function to complete it instead.
     Also turns on --use-cpu-initialization flag. This is for external DDP manager."""
-
-    use_megatron_fsdp: bool = False
-    """Use Megatron's Fully Sharded Data Parallel. Cannot be used together with use_torch_fsdp2."""
 
     use_torch_fsdp2: bool = False
     """Use the torch FSDP2 implementation. FSDP2 is not currently working with Pipeline Parallel.
