@@ -416,7 +416,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/experts.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert; the "
+        "InferenceGroupedMLP FlashInfer MXFP8 path is replayed on Blackwell with FlashInfer.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -669,6 +670,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/sigmoid_topk.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/moe/fused_moe.py",
+            "megatron/core/inference/moe/flashinfer_bf16.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
         tests=(K + "test_inference_kernels.py",),
@@ -829,7 +831,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
         "flashinfer on Blackwell. The clamped CUTLASS BF16/MXFP8 adapters are replayed "
         "by test_flashinfer_clamped_relu2_replays with top-k=1, including CUDA graphs; "
-        "the default atomic top-k finalize and routed backend are not covered by that test.",
+        "the default atomic top-k finalize and routed backend are not covered by that test. "
+        "flashinfer_mxfp8.py's valid-token-gated row kernels are replayed in "
+        "test_mxfp8_quantize_replays[routed-rows] and test_flashinfer_row_kernels_replay.",
     ),
     KernelEntry(
         name="inference_flashinfer_nvfp4_moe",
