@@ -9,11 +9,16 @@ forked, differentiably, into every completion branch, including at CP>1 through
 sequence-to-head collectives. ``NRL_SP_MAMBA_IMPL`` selects the implementation; the default,
 ``ragged_state_fork``, uses the ragged forest kernels in :mod:`megatron.core.ssm.mamba_ragged`.
 
+The layer runs through its normal module call: a per-call :class:`MambaSharedPrefixCall` on its
+``MambaMixer`` makes ``MambaMixer.forward`` run the shared-prefix scan, and ``MambaLayer.forward``
+keeps the norm, residual and bias-dropout-add, so module hooks fire as on the dense path.
+
 :func:`validate_mamba_layer_shared_prefix` rejects unsupported layers; callers run it for every
 Mamba layer before any layer executes.
 """
 
 import os
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -31,7 +36,6 @@ from megatron.core.ssm.mamba_mixer import (
     causal_conv1d_fn,
     mamba_chunk_scan_combined,
 )
-from megatron.core.typed_torch import apply_module
 
 
 def _mamba_state_dtype_kwargs(mixer: MambaMixer) -> dict:
@@ -299,16 +303,28 @@ def _scan_mamba_shared_prefix_root(
     )
 
 
-def _forward_mamba_layer_shared_prefix_cp_impl(
-    layer: MambaLayer,
-    hidden_states: Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
-    *,
-    replay_prefix: bool,
-    packed_recurrence: bool = False,
-    ragged_state_fork: bool = False,
-) -> Tensor:
-    """Run a TP/SP/CP Mamba star with state-fork or uninterrupted-replay prefix handling.
+@dataclass
+class MambaSharedPrefixCall:
+    """One shared-prefix request that ``MambaMixer.forward`` serves in place of its dense scan.
+
+    :func:`forward_mamba_layer_shared_prefix` attaches it to ``MambaMixer._shared_prefix_call``
+    for a single ``MambaLayer`` call. ``consumed`` records that the mixer served it.
+    """
+
+    layout: SharedPrefixLayout | SharedPrefixForestLayout
+    replay_prefix: bool = False
+    packed_recurrence: bool = False
+    ragged_state_fork: bool = False
+    consumed: bool = False
+
+
+def forward_mamba_mixer_shared_prefix(
+    mixer: MambaMixer, hidden_states: Tensor, call: MambaSharedPrefixCall
+) -> tuple[Tensor, Tensor | None]:
+    """Run the mixer half of a TP/SP/CP Mamba star: input projection, scan, gated norm, output.
+
+    ``MambaMixer.forward`` calls this when ``call`` is attached; ``MambaLayer.forward`` applies
+    the pre-norm, residual and bias-dropout-add around it exactly as on the dense path.
 
     The input projection first gathers sequence-parallel TP shards, then the CP adapter converts
     local zigzag sequence shards into one canonical global sequence with TP/CP-local channels.
@@ -317,12 +333,11 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
     repeats the full projected prefix per branch. The packed result returns through the inverse CP
     transform and TP output-projection reduce-scatter.
     """
-    mixer = layer.mixer
+    call.consumed = True
+    layout = call.layout
     cp = mixer.cp
 
-    residual = hidden_states.float() if layer.config.fp32_residual_connection else hidden_states
-    normalized = apply_module(layer.norm)(hidden_states.to(dtype=layer.config.params_dtype))
-    projected, _ = mixer.in_proj(normalized)
+    projected, _ = mixer.in_proj(hidden_states)
     # Input SP gather: [physical/(TP*C), 1, hidden] -> [physical/C, 1, projection/TP].
     # Gated RMSNorm runs after the inverse CP transform, in this same local
     # token/channel order. The scan does not use z, so keep it here instead of
@@ -337,15 +352,11 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
             f"{layout.total_len}"
         )
 
-    if ragged_state_fork:
-        if replay_prefix or packed_recurrence:
-            raise ValueError("Ragged state forking cannot use prefix replay")
+    if call.ragged_state_fork:
         from megatron.core.ssm.mamba_ragged import scan_mamba_ragged_forest
 
         packed_y = scan_mamba_ragged_forest(mixer, projected, layout)
-    elif packed_recurrence:
-        if replay_prefix:
-            raise ValueError("Packed recurrence and per-root replay are separate modes")
+    elif call.packed_recurrence:
         # Keep optional convolution/scan dependencies lazy for non-Mamba models.
         from megatron.core.ssm.mamba_forest_replay import scan_mamba_forest_replay
 
@@ -358,19 +369,57 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
                 end = physical_len
             pieces.append(
                 _scan_mamba_shared_prefix_root(
-                    mixer, projected[offset:end], root, replay_prefix=replay_prefix
+                    mixer, projected[offset:end], root, replay_prefix=call.replay_prefix
                 )
             )
         packed_y = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
     # Canonical channel shards -> local zigzag sequence shards with full channels.
     packed_y = cp.post_conv_ssm(packed_y)
     packed_y = mixer.norm(packed_y, local_z)
-    packed_output, output_bias = mixer.out_proj(packed_y)
+    return mixer.out_proj(packed_y)
 
-    with layer.bias_dropout_add_exec_handler():
-        return layer.mamba_bda(training=layer.training, fused=layer.config.bias_dropout_fusion)(
-            (packed_output, output_bias), residual, layer.hidden_dropout
+
+def _forward_mamba_layer_shared_prefix_cp_impl(
+    layer: MambaLayer,
+    hidden_states: Tensor,
+    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    *,
+    replay_prefix: bool,
+    packed_recurrence: bool = False,
+    ragged_state_fork: bool = False,
+) -> Tensor:
+    """Run one Mamba star through ``MambaLayer.__call__`` and ``MambaMixer.__call__``.
+
+    The request rides on ``MambaMixer._shared_prefix_call`` for this one call, so the layer and
+    mixer module hooks (Megatron FSDP unshard, prefetch and reshard, per-module parameter
+    gathers) run as on the dense path. :func:`forward_mamba_mixer_shared_prefix` does the mixer
+    half.
+    """
+    if ragged_state_fork and (replay_prefix or packed_recurrence):
+        raise ValueError("Ragged state forking cannot use prefix replay")
+    if packed_recurrence and replay_prefix:
+        raise ValueError("Packed recurrence and per-root replay are separate modes")
+    mixer = layer.mixer
+    if getattr(mixer, "_shared_prefix_call", None) is not None:
+        raise RuntimeError("nested shared-prefix Mamba dispatch is not supported")
+    call = MambaSharedPrefixCall(
+        layout,
+        replay_prefix=replay_prefix,
+        packed_recurrence=packed_recurrence,
+        ragged_state_fork=ragged_state_fork,
+    )
+    mixer._shared_prefix_call = call
+    try:
+        output = layer(hidden_states=hidden_states, attention_mask=None)
+    finally:
+        del mixer._shared_prefix_call
+    # A mixer or layer forward that never reads the request would silently run dense Mamba.
+    if not call.consumed:
+        raise RuntimeError(
+            f"{type(layer).__name__} with {type(mixer).__name__} ignored the shared-prefix "
+            "request; its forward must dispatch MambaMixer._shared_prefix_call"
         )
+    return output[0] if isinstance(output, tuple) else output
 
 
 def _forward_mamba_layer_shared_prefix_cp_state_fork(
