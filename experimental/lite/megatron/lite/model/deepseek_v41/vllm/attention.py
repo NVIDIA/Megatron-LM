@@ -232,3 +232,95 @@ def swa_forward(attention, hidden, positions, rope_cache, *, observe=None):
     result = linear(z.flatten(1), attention.linear_proj.weight, fp8=True).bfloat16()
     emit('wo_b', result)
     return result.reshape_as(hidden)
+
+
+def build_attention(config, index, context):
+    """Reuse the native allocation/spec and replace only the attention forward."""
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELinear,
+        TERowParallelLinear,
+    )
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttentionSubmodules,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.lite.model.deepseek_v41.lite.components.assembly import (
+        DS41AttentionSources,
+        ModelNorm,
+    )
+
+    attention = SWAAttention(
+        config,
+        DSv4HybridSelfAttentionSubmodules(
+            q_layernorm=ModelNorm,
+            kv_layernorm=ModelNorm,
+            linear_q_down_proj=TELinear,
+            linear_q_up_proj=TEColumnParallelLinear,
+            linear_kv_proj=TEColumnParallelLinear,
+            core_attention=ModuleSpec(DS41AttentionSources, params={'context': context}),
+            linear_proj=TERowParallelLinear,
+        ),
+        index + 1,
+        attn_mask_type=AttnMaskType.causal,
+        pg_collection=context.groups,
+        compress_ratio=config.csa_compress_ratios[index],
+    )
+    attention.release = context.release
+    return attention
+
+
+from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
+
+
+class SWAAttention(DS41SelfAttention):
+    def forward(self, hidden_states, attention_mask=None, *, packed_seq_params=None, **kwargs):
+        if self._dsv4_compress_ratio != 0:
+            # Explicit remaining convergence work: compressed attention is not
+            # silently relabelled as the deployment provider.
+            return super().forward(
+                hidden_states, attention_mask, packed_seq_params=packed_seq_params, **kwargs
+            )
+        if self.pg_collection.cp.size() != 1:
+            raise NotImplementedError('Deployment SWA CP exchange is not yet validated')
+        if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
+            raise ValueError('Deployment SWA requires native packed THD metadata')
+        if not hasattr(self, '_deployment_rope'):
+            from types import SimpleNamespace
+
+            from vllm.config import VllmConfig, set_current_vllm_config
+            from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
+
+            r = self.release
+            hf = SimpleNamespace(
+                rope_theta=r.rope_theta,
+                compress_rope_theta=r.compress_rope_theta,
+                rope_parameters={
+                    'rope_type': 'yarn',
+                    'factor': r.rotary_scaling_factor,
+                    'original_max_position_embeddings': r.original_max_position_embeddings,
+                    'beta_fast': r.beta_fast,
+                    'beta_slow': r.beta_slow,
+                },
+            )
+            with set_current_vllm_config(VllmConfig()), torch.device(hidden_states.device):
+                self._deployment_rope = build_deepseek_v4_rope(
+                    hf,
+                    head_dim=r.head_dim,
+                    rope_head_dim=r.qk_rope_head_dim,
+                    max_position_embeddings=r.max_position_embeddings,
+                    compress_ratio=0,
+                ).cos_sin_cache
+        cu = packed_seq_params.cu_seqlens_q_padded
+        if cu is None:
+            cu = packed_seq_params.cu_seqlens_q
+        boundaries = cu.tolist()
+        pieces = []
+        for lo, hi in zip(boundaries, boundaries[1:]):
+            if hi > lo:
+                positions = torch.arange(hi - lo, device=hidden_states.device, dtype=torch.int64)
+                pieces.append(
+                    swa_forward(self, hidden_states[lo:hi], positions, self._deployment_rope)
+                )
+        return torch.cat(pieces, 0) if pieces else hidden_states * 0, None

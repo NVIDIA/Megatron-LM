@@ -1,15 +1,16 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Deployment MoE/mHC/head on the native Lite model lifecycle.
 
-Attention currently inherits Core BF16 execution, explicitly a convergence
-baseline rather than target sparse-FlashMLA parity. End-to-end receipts must
-report this provider until its direct target-kernel adapter is validated.
+Ratio-zero attention uses native BI projections and sparse FlashMLA. Compressed
+attention still uses Core and is explicitly provisional; receipts distinguish
+the two providers until each target path has its own parity evidence.
 """
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.lite.model.deepseek_v41.lite.components.block import DS41Block
 from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model as NativeModel
 
+from .attention import build_attention
 from .head import head_logits
 from .mhc import joint, post_mix
 from .moe import MegaMoE
@@ -46,12 +47,15 @@ class Block(DS41Block):
 
 class DeepseekV41Model(NativeModel):
     deployment_providers = {
-        'attention': 'Core BF16 provisional; NOT_TARGET_PARITY',
+        'attention': 'ratio0 native BI + sparse FlashMLA; ratio>0 Core provisional; NOT_TARGET_PARITY',
         'engram': 'Lite frozen-host native FP8 owner; Core projections provisional',
         'moe': 'R1 nonfused MegaMoE + Core native groups/owners/collectives',
         'mhc': 'native BI caller-stream pre + materialized post; parity unverified',
         'head': 'native BI BF16 GEMM + Core cross entropy; parity unverified',
     }
+
+    def _build_attention(self, config, index):
+        return build_attention(config, index, self.context)
 
     def _build_mlp(self, config, release, index):
         spec = get_mlp_module_spec(
