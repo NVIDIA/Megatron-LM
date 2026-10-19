@@ -156,7 +156,7 @@ def _graphness_suffix(graphed: bool) -> str:
 
 
 def _chain_is_grouped(chain_id: str) -> bool:
-    """True for the per-role grouped-expert chains (``_GTP_REMAT_GROUPED_FC1`` / ``_FC2``)."""
+    """True for the separate grouped-expert FC1 and FC2 chains."""
     return chain_id.startswith(_GTP_REMAT_GROUPED_PREFIX)
 
 
@@ -2804,7 +2804,8 @@ def wait_async_comms(
 
     Args:
         chain_id: If specified, only drain params on this chain.
-        graphed_only: Drain all captured chains, including per-role grouped experts.
+        graphed_only: Drain all captured chains, including separate grouped-expert
+            FC1 and FC2 chains.
         skip_rs:  Drain AG only; leave RS in flight.
         finalize_after_drain: After RS drain, also accumulate wgrad into
                  main_grad. Runs main_grad.add_ on rs_stream (right after
