@@ -564,12 +564,19 @@ class TestGroupedExpertChainClassification:
         # Distinct from the general ungraphed chain's stream.
         assert gtp_module._stream_key(c1, group) != gtp_module._stream_key("GTP_ungraphed", group)
 
-    def test_graphed_moe_keeps_grouped_in_plain_graphed_chain(self):
-        # When MoE is captured, grouped weights stay in the plain GRAPHED chain so the
-        # cross-graph drain wait_async_comms(GRAPHED) still targets them by exact chain id.
-        gtp_module.set_cuda_graph_modules({"moe"}, cuda_graph_impl="local")
-        assert gtp_module._classify_param_chain(self.FC1) == "GTP_graphed"
-        assert gtp_module._classify_param_chain(self.FC2) == "GTP_graphed"
+    @pytest.mark.parametrize("impl,scope", [("local", {"moe"}), ("local", []), ("full_iteration", [])])
+    def test_graphed_moe_splits_fc1_fc2_into_own_chains(self, impl, scope):
+        gtp_module.set_cuda_graph_modules(scope, cuda_graph_impl=impl)
+        c1 = gtp_module._classify_param_chain(self.FC1)
+        c2 = gtp_module._classify_param_chain(self.FC2)
+        assert c1 == "GTP_remat_grouped_fc1_graphed"
+        assert c2 == "GTP_remat_grouped_fc2_graphed"
+        assert c1 in gtp_module.get_graphed_chain_ids()
+        assert c2 in gtp_module.get_graphed_chain_ids()
+        assert gtp_module._stream_key(c1, None) == gtp_module._stream_key(c2, None)
+        assert gtp_module._stream_key(c1, None) != gtp_module._stream_key(
+            "GTP_remat_grouped_fc1_ungraphed", None
+        )
 
     def test_graphness_helpers(self):
         # "ungraphed" is the eager suffix; everything else is captured.

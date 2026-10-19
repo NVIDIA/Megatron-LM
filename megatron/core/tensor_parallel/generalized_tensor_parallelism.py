@@ -141,6 +141,15 @@ _GTP_REMAT_GROUPED_FC1 = f"{_GTP_REMAT_GROUPED_PREFIX}fc1"
 _GTP_REMAT_GROUPED_FC2 = f"{_GTP_REMAT_GROUPED_PREFIX}fc2"
 
 
+def get_graphed_chain_ids() -> tuple[str, ...]:
+    """Return captured chains whose streams must join a local CUDA graph."""
+    return (
+        GTPChain.GRAPHED.value,
+        f"{_GTP_REMAT_GROUPED_FC1}_graphed",
+        f"{_GTP_REMAT_GROUPED_FC2}_graphed",
+    )
+
+
 def _graphness_suffix(graphed: bool) -> str:
     """Chain-id suffix encoding the CUDA-graph capture axis."""
     return "graphed" if graphed else "ungraphed"
@@ -209,18 +218,13 @@ def _classify_param_chain(param_name: str) -> str:
     # shared experts never fall in here).
     if ".mlp.experts." in n:
         graphed = _FULL_ITERATION or bool(_CUDA_GRAPH_MODULES and "moe" in _CUDA_GRAPH_MODULES)
-        # The grouped split is an EAGER-only optimization: when MoE is captured, keep grouped
-        # weights in the plain GRAPHED chain so the cross-graph drain — wait_async_comms(
-        # GTPChain.GRAPHED.value) in cuda_graphs.py — still targets them by exact chain id.
-        if graphed:
-            return G
-        eager = _graphness_suffix(False)
+        suffix = _graphness_suffix(graphed)
         if ".linear_fc1." in n:
-            return f"{_GTP_REMAT_GROUPED_FC1}_{eager}"
+            return f"{_GTP_REMAT_GROUPED_FC1}_{suffix}"
         if ".linear_fc2." in n:
-            return f"{_GTP_REMAT_GROUPED_FC2}_{eager}"
+            return f"{_GTP_REMAT_GROUPED_FC2}_{suffix}"
         # Unknown grouped role (e.g. single fused weight): keep it in the general chain.
-        return U
+        return G if graphed else U
 
     if _FULL_ITERATION:
         return G
@@ -435,7 +439,7 @@ def initialize_graph_wgrad_rings() -> None:
         full_iteration=_FULL_ITERATION,
         async_reduction=GTP_CONFIG.async_reduction,
         ring_size=GTP_CONFIG.graph_wgrad_ring_size,
-        graphed_chain_id=GTPChain.GRAPHED.value,
+        chain_is_graphed=_chain_is_graphed,
         stream_key=_stream_key,
     )
 
@@ -2738,7 +2742,7 @@ class GTPWeightCache:
             return
         # Independently replayed graphs may overlap, so a captured RS output must not be recycled
         # into another fixed-address ticket.
-        if slot.chain_id == GTPChain.GRAPHED.value and slot.reduce_scatter:
+        if _chain_is_graphed(slot.chain_id) and slot.reduce_scatter:
             return
         # Use identity check — tensor == tensor returns a multi-element bool tensor
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
@@ -2766,6 +2770,8 @@ def wait_async_comms(
     skip_rs: bool = False,
     finalize_after_drain: bool = False,
     params: Optional[List[GTPShardedParam]] = None,
+    *,
+    graphed_only: bool = False,
 ):
     """Drain in-flight GTP asynchronous communication.
 
@@ -2780,6 +2786,7 @@ def wait_async_comms(
 
     Args:
         chain_id: If specified, only drain params on this chain.
+        graphed_only: Drain all captured chains, including per-role grouped experts.
         skip_rs:  Drain AG only; leave RS in flight.
         finalize_after_drain: After RS drain, also accumulate wgrad into
                  main_grad. Runs main_grad.add_ on rs_stream (right after
@@ -2796,6 +2803,8 @@ def wait_async_comms(
     """
     comm_params = list(_inflight_comm_params) if params is None else params
     for param in comm_params:
+        if graphed_only and not _chain_is_graphed(param.chain_id):
+            continue
         if (
             chain_id is not None
             and getattr(param, "chain_id", GTPChain.UNGRAPHED.value) != chain_id
