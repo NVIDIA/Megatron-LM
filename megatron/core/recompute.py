@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import List, Optional, Set, Tuple, Union
 
 from torch import Tensor
@@ -9,9 +10,8 @@ from megatron.core.context_parallel import ContextParallelLayoutState
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_observation import observe_layer_residuals
-from megatron.core.transformer.layer_interface import LayerInputs
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.module import MegatronModule
 
 if HAVE_TE:
@@ -23,19 +23,12 @@ else:
 def checkpointed_forward(
     self: MegatronModule,
     hidden_states: Tensor,
-    attention_mask: Tensor,
-    context: Optional[Tensor],
-    context_mask: Optional[Tensor],
-    rotary_pos_emb: Tensor,
-    attention_bias: Optional[Tensor],
-    packed_seq_params: PackedSeqParams,
+    aux_inputs: LayerAuxInputs,
+    *,
     use_inner_quantization_context: bool,
-    padding_mask: Optional[Tensor] = None,
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
-    packed_sequence_cp_metadata: object | None = None,
-    input_ids: Optional[Tensor] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -47,8 +40,8 @@ def checkpointed_forward(
             pipeline stage. Used to convert local layer indices to
             global indices when checking extract_layer_indices.
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
-        packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
-        input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        aux_inputs (LayerAuxInputs): Auxiliary layer inputs, including packed-sequence CP metadata
+            and token IDs. Checkpointed tensors are restored into this container on replay.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -57,6 +50,19 @@ def checkpointed_forward(
     if extract_layer_indices is None:
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
+
+    context = aux_inputs.context
+    rotary_pos_emb = aux_inputs.rotary_pos_emb
+    # Keep checkpointed activations out of the metadata captured by the closure.
+    static_aux_inputs = replace(
+        aux_inputs,
+        attention_mask=None,
+        context=None,
+        context_mask=None,
+        rotary_pos_emb=None,
+        padding_mask=None,
+        input_ids=None,
+    )
 
     # Wrap non-dual RoPE to tuple to unify custom_forward interface.
     is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
@@ -80,15 +86,24 @@ def checkpointed_forward(
                 else rotary_pos_emb_global
             )
 
+            aux_inputs = replace(
+                static_aux_inputs,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+            )
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
-                layer_packed_seq_params = packed_seq_params
                 if cp_layout_state is not None:
                     hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                         index, hidden_states
                     )
+                    aux_inputs = replace(aux_inputs, packed_seq_params=layer_packed_seq_params)
                 # Keep both residuals in the layer's layout, inside the CP conversions.
                 residual_accumulator = hidden_states
 
@@ -109,22 +124,10 @@ def checkpointed_forward(
                     inner_quantization_context = nullcontext()
 
                 with inner_quantization_context:
-                    hidden_states, addends = layer(
-                        hidden_states,
-                        LayerInputs(
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            attention_bias=attention_bias,
-                            packed_seq_params=layer_packed_seq_params,
-                            padding_mask=padding_mask,
-                            input_ids=input_ids,
-                            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                        ),
-                    )
-                    assert addends.bias is None, "Recompute requires complete residual layers"
-                    context = addends.context
+                    hidden_states, aux_outputs = layer(hidden_states, aux_inputs)
+                    assert aux_outputs.bias is None, "Recompute requires complete residual layers"
+                    context = aux_outputs.context
+                    aux_inputs = replace(aux_inputs, context=context)
 
                 observe_layer_residuals(layer, residual_accumulator, hidden_states)
                 if cp_layout_state is not None:
@@ -139,12 +142,12 @@ def checkpointed_forward(
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
         args = (
             hidden_states,
-            attention_mask,
+            aux_inputs.attention_mask,
             context,
-            context_mask,
+            aux_inputs.context_mask,
             *rotary_pos_emb,
-            padding_mask,
-            input_ids,
+            aux_inputs.padding_mask,
+            aux_inputs.input_ids,
         )
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,

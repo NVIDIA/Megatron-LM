@@ -11,7 +11,7 @@ from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConn
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.layer_interface import bind_layer_inputs
+from megatron.core.transformer.layer_interface import LayerAuxInputs, bind_layer_interface
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
@@ -29,7 +29,7 @@ class _DummyHybridLayer(MegatronModule):
         self.proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.seen_hidden_shapes = []
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(
         self,
         hidden_states,
@@ -210,7 +210,7 @@ class TestHybridStackMHC:
         for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             assert getattr(stack, name).grad is not None
 
-    def test_selective_mhc_strips_input_ids_from_non_hash_layers(self, monkeypatch):
+    def test_selective_mhc_passes_routing_inputs_to_inner_helpers(self, monkeypatch):
         config = _get_config(
             num_layers=2,
             recompute_granularity="selective",
@@ -223,31 +223,9 @@ class TestHybridStackMHC:
         seen_input_ids = []
         original = HyperConnectionHybridLayer._call_inner_transformer_layer_without_local_bda
 
-        def record_input_ids(
-            layer,
-            hidden_states,
-            attention_mask,
-            inference_context,
-            rotary_pos_emb,
-            sequence_len_offset,
-            packed_seq_params,
-            padding_mask,
-            input_ids=None,
-            mhc_recompute_manager=None,
-        ):
-            seen_input_ids.append(input_ids)
-            return original(
-                layer,
-                hidden_states,
-                attention_mask,
-                inference_context,
-                rotary_pos_emb,
-                sequence_len_offset,
-                packed_seq_params,
-                padding_mask,
-                input_ids,
-                mhc_recompute_manager,
-            )
+        def record_input_ids(layer, hidden_states, aux_inputs):
+            seen_input_ids.append(aux_inputs.input_ids)
+            return original(layer, hidden_states, aux_inputs)
 
         monkeypatch.setattr(
             HyperConnectionHybridLayer,
@@ -259,7 +237,7 @@ class TestHybridStackMHC:
         output.float().sum().backward()
 
         assert len(seen_input_ids) == 2
-        assert all(captured is None for captured in seen_input_ids)
+        assert all(captured is input_ids for captured in seen_input_ids)
 
     def test_fused_bf16_forward_backward(self):
         config = _get_config(
@@ -432,10 +410,10 @@ class TestHybridStackMHC:
         monkeypatch.setattr(layer.hyper_connection, "forward", fake_hyper_connection_forward)
         monkeypatch.setattr(layer.hyper_connection, "fused_h_res_h_post_bda", fake_bda)
 
-        output, _ = layer(hidden_states, attention_mask=None, mhc_recompute_manager=manager)
+        output, _ = layer(hidden_states, LayerAuxInputs(mhc_recompute_manager=manager))
         assert output is hidden_states
         assert seen_managers == [None]
 
         manager.is_last_layer_in_recompute_block = False
-        layer(hidden_states, attention_mask=None, mhc_recompute_manager=manager)
+        layer(hidden_states, LayerAuxInputs(mhc_recompute_manager=manager))
         assert seen_managers[-1] is manager

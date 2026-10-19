@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Set, Union, cast
 
 import torch
@@ -30,7 +30,7 @@ from megatron.core.transformer.hyper_connection import (
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
 )
-from megatron.core.transformer.layer_interface import LayerInputs
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -683,20 +683,24 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_mhc_recompute=use_mhc_recompute,
         )
 
+        base_aux_inputs = LayerAuxInputs(
+            attention_mask=attention_mask,
+            context=context,
+            context_mask=context_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+
         with rng_context, outer_quantization_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 checkpointed_result = checkpointed_forward(
                     self,
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    context=context,
-                    context_mask=context_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                    attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
+                    hidden_states,
+                    base_aux_inputs,
                     use_inner_quantization_context=use_inner_quantization_context,
-                    padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
                 )
@@ -708,6 +712,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
+                base_aux_inputs = replace(
+                    base_aux_inputs,
+                    inference_context=inference_context,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
+                    sequence_len_offset=sequence_len_offset,
+                )
                 for l_no, layer in enumerate(self.layers):
                     residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
@@ -732,26 +744,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         )
 
                     with self.offload_context, inner_quantization_context:
-                        hidden_states, addends = layer(
-                            hidden_states,
-                            LayerInputs(
-                                attention_mask=attention_mask,
-                                context=context,
-                                context_mask=context_mask,
-                                rotary_pos_emb=rotary_pos_emb,
-                                rotary_pos_cos=rotary_pos_cos,
-                                rotary_pos_sin=rotary_pos_sin,
-                                rotary_pos_cos_sin=rotary_pos_cos_sin,
-                                attention_bias=attention_bias,
-                                inference_context=inference_context,
-                                packed_seq_params=packed_seq_params,
-                                sequence_len_offset=sequence_len_offset,
-                                padding_mask=padding_mask,
-                                mhc_recompute_manager=mhc_manager,
-                            ),
+                        aux_inputs = replace(
+                            base_aux_inputs, context=context, mhc_recompute_manager=mhc_manager
                         )
-                        assert addends.bias is None, "TransformerBlock requires complete layers"
-                        context = addends.context
+                        hidden_states, aux_outputs = layer(hidden_states, aux_inputs)
+                        assert aux_outputs.bias is None, "TransformerBlock requires complete layers"
+                        context = aux_outputs.context
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,

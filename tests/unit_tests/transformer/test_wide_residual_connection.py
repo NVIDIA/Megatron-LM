@@ -10,7 +10,7 @@ from torch import nn
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import bind_layer_inputs
+from megatron.core.transformer.layer_interface import bind_layer_interface
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
@@ -63,7 +63,7 @@ class _ActiveBranch(MegatronModule):
         super().__init__(config=None)
         del args, kwargs
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return hidden_states
@@ -75,7 +75,7 @@ class _AdditiveAttention(MegatronModule):
         del args, kwargs
         self.last_hidden_size = None
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         self.last_hidden_size = hidden_states.shape[-1]
@@ -91,7 +91,7 @@ class _AdditiveMLP(MegatronModule):
         del args, kwargs
         self.last_hidden_size = None
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         self.last_hidden_size = hidden_states.shape[-1]
@@ -104,7 +104,7 @@ class _ParameterizedAttention(MegatronModule):
         del args, kwargs
         self.scale = nn.Parameter(torch.randn(()))
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return self.scale * hidden_states, None
@@ -116,7 +116,7 @@ class _ParameterizedMLP(MegatronModule):
         del args, kwargs
         self.scale = nn.Parameter(torch.randn(()))
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return self.scale * hidden_states, None
@@ -768,9 +768,9 @@ class TestWideResidualLayerIntegration:
         )
         hidden_states = torch.randn(2, 3, config.hidden_size, requires_grad=True)
 
-        output, addends = layer(hidden_states=hidden_states, attention_mask=None)
+        output, aux_outputs = layer(hidden_states=hidden_states, attention_mask=None)
 
-        assert addends.context is None
+        assert aux_outputs.context is None
         assert type(layer) is TransformerLayer
         assert not hasattr(layer, "residual_connection_self_attn")
         assert not hasattr(layer, "residual_connection_mlp")
@@ -855,10 +855,10 @@ class TestWideResidualLayerIntegration:
         base = torch.randn(2, 3, config.hidden_size, requires_grad=True)
         residual_stream = expand_wide_residual_stream(base, 3)
 
-        output, addends = layer(hidden_states=residual_stream, attention_mask=None)
+        output, aux_outputs = layer(hidden_states=residual_stream, attention_mask=None)
 
         expected = expand_wide_residual_stream(12.0 * base + 4.0, 3)
-        assert addends.context is None
+        assert aux_outputs.context is None
         assert output.shape[-1] == 3 * config.hidden_size
         assert torch.allclose(output, expected)
         assert layer.self_attention.last_hidden_size == config.hidden_size

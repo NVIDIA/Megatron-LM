@@ -49,7 +49,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.layer_interface import bind_layer_inputs
+from megatron.core.transformer.layer_interface import bind_layer_interface
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import is_first_microbatch_tracked
 from megatron.core.transformer.torch_norm import LayerNormInterface
@@ -3281,7 +3281,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             return fused_impl
 
-        @bind_layer_inputs
+        @bind_layer_interface
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
 
@@ -3495,7 +3495,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             )
             self._register_forward_pre_hooks_on_fused_impl(self._norm_seq[0], fc1_submodules)
 
-        @bind_layer_inputs
+        @bind_layer_interface
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 

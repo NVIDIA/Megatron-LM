@@ -28,7 +28,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     l2norm,
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
-from megatron.core.transformer.layer_interface import bind_layer_inputs
+from megatron.core.transformer.layer_interface import bind_layer_interface
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
@@ -282,7 +282,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         return norm_out
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(
         self,
         hidden_states: torch.Tensor,

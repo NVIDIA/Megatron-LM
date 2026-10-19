@@ -17,6 +17,7 @@ device-memory pressure from enabling Shortcut-MoE.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Sequence
 
 import torch
@@ -27,10 +28,9 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as Layer
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
-    LayerExecutionContext,
-    LayerInputs,
+    LayerAuxInputs,
     LayerInterface,
-    bind_layer_inputs,
+    bind_layer_interface,
 )
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
@@ -402,29 +402,17 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
         combined_output.record_stream(torch.cuda.current_stream())
         return combined_output
 
-    def _forward_compute_atomic(self, hidden_states, inputs: LayerInputs):
+    def _forward_compute_atomic(self, hidden_states, aux_inputs: LayerAuxInputs):
         """Run the paired layer's ordinary forward, which updates its KV cache or recurrent state.
 
         Uses the same per-layer arguments as HybridStack.forward passes to unpaired layers.
         """
-        hidden_states, addends = self.compute_layer(hidden_states, inputs)
-        assert addends.bias is None, "Shortcut blocks require complete residual layers"
+        hidden_states, aux_outputs = self.compute_layer(hidden_states, aux_inputs)
+        assert aux_outputs.bias is None, "Shortcut blocks require complete residual layers"
         return hidden_states
 
-    @bind_layer_inputs
-    def forward(
-        self,
-        hidden_states,
-        attention_mask,
-        inference_context,
-        rotary_pos_emb,
-        sequence_len_offset,
-        packed_seq_params,
-        padding_mask,
-        packed_sequence_cp_metadata=None,
-        *,
-        execution_context: LayerExecutionContext,
-    ):
+    @bind_layer_interface
+    def forward(self, hidden_states, aux_inputs: LayerAuxInputs):
         """Run the eager schedule with each physical layer's quantization context.
 
         In inference the paired layer runs its ordinary forward instead of the two-stage split,
@@ -432,6 +420,10 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
         stream.
         """
 
+        execution_context = aux_inputs.execution_context
+        inference_context = aux_inputs.inference_context
+        packed_seq_params = aux_inputs.packed_seq_params
+        padding_mask = aux_inputs.padding_mask
         if execution_context is None:
             raise ValueError("Shortcut execution requires a LayerExecutionContext.")
         quant_context_factory = execution_context.quant_context_factory
@@ -497,21 +489,17 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
 
         # Launch the input and attn of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
-            compute_inputs = LayerInputs(
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                sequence_len_offset=sequence_len_offset,
+            compute_aux_inputs = replace(
+                aux_inputs,
                 packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 residual_stream_recompute_context=attn_recompute_context,
+                execution_context=None,
             )
             if inference:
-                attn_layer_output = self._forward_compute_atomic(hidden_states, compute_inputs)
+                attn_layer_output = self._forward_compute_atomic(hidden_states, compute_aux_inputs)
             else:
                 paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
-                    hidden_states, compute_inputs
+                    hidden_states, compute_aux_inputs
                 )
 
         # Launch the dispatch, experts, and combine
@@ -538,14 +526,14 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
         if not inference:
             with quant_context_factory(attn_config, self.attn_layer_idx):
                 if attn_recompute_context is None:
-                    attn_layer_output, addends = self.compute_layer.forward_post_core_attn(
+                    attn_layer_output, aux_outputs = self.compute_layer.forward_post_core_attn(
                         *paired_state
                     )
                 else:
-                    attn_layer_output, addends = self.compute_layer.forward_post_core_attn(
+                    attn_layer_output, aux_outputs = self.compute_layer.forward_post_core_attn(
                         *paired_state, residual_stream_recompute_context=attn_recompute_context
                     )
-                assert addends.bias is None, "Shortcut blocks require complete residual layers"
+                assert aux_outputs.bias is None, "Shortcut blocks require complete residual layers"
 
         if cp_layout_state is not None:
             attn_layer_output, moe_packed_seq_params = cp_layout_state.prepare_layer(

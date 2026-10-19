@@ -27,7 +27,7 @@ from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import bind_layer_inputs
+from megatron.core.transformer.layer_interface import bind_layer_interface
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -158,7 +158,7 @@ class _TransformerBranch(MegatronModule):
         del args, kwargs
         self.projection = nn.Linear(config.hidden_size, config.hidden_size)
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return F.gelu(self.projection(hidden_states)), None
@@ -206,7 +206,7 @@ class _OffloadedQKVBranch(_TransformerBranch):
         )
         self.input_offload_exclusions: list[bool] = []
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         self.input_offload_exclusions.append(bool(getattr(hidden_states, "_do_not_offload", False)))

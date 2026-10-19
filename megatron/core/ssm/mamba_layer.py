@@ -26,10 +26,10 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
-    LayerInputs,
+    LayerAuxInputs,
     bind_layer_inputs,
+    bind_layer_interface,
     bind_layer_outputs,
-    bind_layer_stage_inputs,
 )
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
@@ -188,11 +188,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         return self._apply_mixer_bda(mixer_out_with_bias, residual)
 
-    @bind_layer_stage_inputs(
-        include_if={
-            "packed_sequence_cp_metadata": lambda layer: layer.config.linear_cp_mode == "chunkwise"
-        }
-    )
+    @bind_layer_inputs
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
@@ -226,7 +222,11 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         ssm_output = self.mixer.forward_pre_attn_and_core_attn(
             hidden_states,
             packed_seq_params=packed_seq_params,
-            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+            packed_sequence_cp_metadata=(
+                packed_sequence_cp_metadata
+                if getattr(self.mixer, "chunkwise_context_parallel", False)
+                else None
+            ),
         )
         if connection_state is None:
             return ssm_output, residual
@@ -251,7 +251,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         return None
 
-    def layer_inputs_forward(self, hidden_states, inputs, *, _call=None):
+    def layer_aux_inputs_forward(self, hidden_states, aux_inputs, *, _call=None):
         """Omit absent optional state before hooks and graph dispatch."""
         call = self._call_with_bound_args if _call is None else _call
 
@@ -261,13 +261,11 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                     kwargs.pop(name, None)
             return call(*args, **kwargs)
 
-        return super().layer_inputs_forward(hidden_states, inputs, _call=call_with_optional_state)
+        return super().layer_aux_inputs_forward(
+            hidden_states, aux_inputs, _call=call_with_optional_state
+        )
 
-    @bind_layer_inputs(
-        include_if={
-            "packed_sequence_cp_metadata": lambda layer: layer.config.linear_cp_mode == "chunkwise"
-        }
-    )
+    @bind_layer_interface
     def forward(
         self,
         hidden_states: Tensor,
@@ -318,17 +316,21 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
-                mixer_output, addends = self.mixer(
+                mixer_output, aux_outputs = self.mixer(
                     hidden_states,
-                    LayerInputs(
+                    LayerAuxInputs(
                         inference_context=inference_context,
                         packed_seq_params=packed_seq_params,
-                        packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                        packed_sequence_cp_metadata=(
+                            packed_sequence_cp_metadata
+                            if getattr(self.mixer, "chunkwise_context_parallel", False)
+                            else None
+                        ),
                     ),
                 )
 
             hidden_states = self._apply_mixer_update(
-                (mixer_output, addends.bias),
+                (mixer_output, aux_outputs.bias),
                 residual,
                 connection_state,
                 recompute_context=recompute_context,

@@ -24,7 +24,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.layer_interface import LayerAddends, LayerInputs
+from megatron.core.transformer.layer_interface import LayerAuxInputs, LayerAuxOutputs
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -85,8 +85,8 @@ def make_stack(symbol, *, stack_spec=hybrid_stack_spec, **config_kwargs):
 
 def apply_output_bias(output):
     assert isinstance(output, tuple) and len(output) == 2
-    hidden_states, addends = output
-    bias = addends.bias if isinstance(addends, LayerAddends) else addends
+    hidden_states, aux_outputs = output
+    bias = aux_outputs.bias if isinstance(aux_outputs, LayerAuxOutputs) else aux_outputs
     assert isinstance(hidden_states, torch.Tensor)
     assert bias is None or isinstance(bias, torch.Tensor)
     return hidden_states if bias is None else hidden_states + bias
@@ -118,7 +118,7 @@ def assert_forward_backward(module, x, legacy_call, inputs_call):
     assert_bit_exact(expected, expected_grads, actual, actual_grads)
 
 
-class TestLayerInputsEquivalence:
+class TestLayerAuxInputsEquivalence:
     def setup_method(self):
         Utils.initialize_model_parallel(1, 1)
 
@@ -188,8 +188,8 @@ class TestLayerInputsEquivalence:
         x = torch.randn(64, 2, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
         def adapted(value):
-            output, addends = core(value, LayerInputs())
-            assert addends.bias is None
+            output, aux_outputs = core(value, LayerAuxInputs())
+            assert aux_outputs.bias is None
             return output
 
         assert_forward_backward(core, x, lambda value: core(core.pre_norm(value))[0], adapted)
@@ -209,8 +209,10 @@ class TestLayerInputsEquivalence:
         def run(value, shared):
             context = ResidualStreamRecomputeContext(CheckpointWithoutOutputManager(), True)
             if shared:
-                output, addends = layer(value, LayerInputs(residual_stream_recompute_context=context))
-                assert addends.bias is None
+                output, aux_outputs = layer(
+                    value, LayerAuxInputs(residual_stream_recompute_context=context)
+                )
+                assert aux_outputs.bias is None
             else:
                 output = layer(value, residual_stream_recompute_context=context)
                 if symbol != "M":
@@ -239,10 +241,12 @@ class TestLayerInputsEquivalence:
             manager = CheckpointWithoutOutputManager()
             manager.is_last_layer_in_recompute_block = True
             if shared:
-                output, addends = layer(value, LayerInputs(mhc_recompute_manager=manager))
-                assert addends.bias is None
+                output, aux_outputs = layer(value, LayerAuxInputs(mhc_recompute_manager=manager))
+                assert aux_outputs.bias is None
             else:
-                output = layer(value, attention_mask=None, mhc_recompute_manager=manager)[0]
+                output = layer.forward.__wrapped__(
+                    layer, value, LayerAuxInputs(mhc_recompute_manager=manager)
+                )[0]
             manager.discard_all_outputs_and_register_unified_recompute(output)
             return output
 
@@ -264,13 +268,13 @@ class TestLayerInputsEquivalence:
                         context.enable_decode_mode()
                     sequence_offset = torch.full((2,), offset, device="cuda", dtype=torch.int32)
                     if shared:
-                        output, addends = layer(
+                        output, aux_outputs = layer(
                             x,
-                            LayerInputs(
+                            LayerAuxInputs(
                                 inference_context=context, sequence_len_offset=sequence_offset
                             ),
                         )
-                        assert addends.bias is None
+                        assert aux_outputs.bias is None
                     else:
                         kwargs = {"sequence_len_offset": sequence_offset} if symbol == "*" else {}
                         output = layer(x, inference_context=context, **kwargs)
@@ -316,7 +320,7 @@ def check_equivalence(symbol, test_core, *, stack_spec=hybrid_stack_spec, **conf
         return output if symbol == "M" else output[0]
 
     def adapted(value):
-        output = module(value, LayerInputs(attention_mask=mask))
+        output = module(value, LayerAuxInputs(attention_mask=mask))
         if not test_core:
             assert output[1].bias is None
         return apply_output_bias(output)
@@ -324,7 +328,7 @@ def check_equivalence(symbol, test_core, *, stack_spec=hybrid_stack_spec, **conf
     assert_forward_backward(module, x, legacy, adapted)
 
 
-class TestLayerInputsCudaGraphs:
+class TestLayerAuxInputsCudaGraphs:
     def setup_method(self):
         from megatron.core.tensor_parallel.random import initialize_rng_tracker
 
@@ -376,7 +380,7 @@ class TestLayerInputsCudaGraphs:
 
 
 @pytest.mark.internal
-class TestLayerInputsNVLS:
+class TestLayerAuxInputsNVLS:
     def setup_method(self):
         if Utils.world_size < 2 or Utils.world_size & (Utils.world_size - 1):
             pytest.skip("NVLS communication requires a power-of-two world size >= 2")
@@ -431,8 +435,8 @@ class TestLayerInputsNVLS:
                 legacy, bias = core(x)
                 assert bias is None
                 legacy = legacy.detach().clone()
-                output, addends = core(x, LayerInputs(inference_context=context))
-                assert addends.bias is None
+                output, aux_outputs = core(x, LayerAuxInputs(inference_context=context))
+                assert aux_outputs.bias is None
                 assert_bit_exact(legacy, {}, output, {})
                 assert core.token_dispatcher is core._inference_token_dispatcher
                 assert core.token_dispatcher._shared_expert_output is None

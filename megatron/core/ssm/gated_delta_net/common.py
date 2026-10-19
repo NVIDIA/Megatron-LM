@@ -31,7 +31,7 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import LayerInterface, bind_layer_inputs
+from megatron.core.transformer.layer_interface import LayerInterface, bind_layer_interface
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
@@ -351,15 +351,15 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 
-    def layer_inputs_forward(self, hidden_states, inputs, **kwargs):
+    def layer_aux_inputs_forward(self, hidden_states, aux_inputs, **kwargs):
         """Reject unsupported chunkwise CP metadata before executing a GDN core."""
-        if inputs.packed_sequence_cp_metadata is not None:
+        if aux_inputs.packed_sequence_cp_metadata is not None:
             raise NotImplementedError(
                 f"{type(self).__name__} does not support packed-sequence chunkwise CP metadata."
             )
-        return super().layer_inputs_forward(hidden_states, inputs, **kwargs)
+        return super().layer_aux_inputs_forward(hidden_states, aux_inputs, **kwargs)
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(
         self,
         hidden_states: torch.Tensor,

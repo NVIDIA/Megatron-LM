@@ -854,25 +854,8 @@ class TestMultiTokenPredictionLayer:
         def fake_embedding(input_ids, position_ids):
             return torch.zeros(seq_len, batch_size, config.hidden_size, dtype=hidden_states.dtype)
 
-        def fake_proj_and_transformer_layer(
-            self,
-            hidden_states,
-            decoder_input,
-            attention_mask=None,
-            padding_mask=None,
-            context=None,
-            context_mask=None,
-            rotary_pos_emb=None,
-            rotary_pos_cos=None,
-            rotary_pos_sin=None,
-            attention_bias=None,
-            inference_params=None,
-            packed_seq_params=None,
-            sequence_len_offset=None,
-            packed_seq_params_by_layout=None,
-            cp_layout_plan=None,
-        ):
-            seen["padding_mask"] = padding_mask
+        def fake_proj_and_transformer_layer(self, hidden_states, aux_inputs, *, decoder_input):
+            seen["padding_mask"] = aux_inputs.padding_mask
             return hidden_states
 
         monkeypatch.setattr(
@@ -3358,12 +3341,13 @@ class TestMultiTokenPredictionHybrid:
                 hidden_states,
             )
 
-        def inner_forward(_self, **kwargs):
+        def inner_forward(_self, states, aux_inputs, *, decoder_input):
             calls["inner"] += 1
-            assert kwargs["hidden_states"] is hidden_states
+            assert states is hidden_states
+            assert aux_inputs.padding_mask is padding_mask
             return hidden_states + 1
 
-        def outer_forward(_self, **_kwargs):
+        def outer_forward(_self, states, inputs, *, decoder_input):
             calls["outer"] += 1
             raise AssertionError("Hybrid MTP must not use the outer checkpoint")
 

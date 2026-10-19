@@ -7,7 +7,7 @@
 
 import warnings
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -46,10 +46,10 @@ from megatron.core.transformer.hyper_connection import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
-    LayerAddends,
+    LayerAuxInputs,
+    LayerAuxOutputs,
     LayerExecutionContext,
-    LayerInputs,
-    bind_layer_inputs,
+    bind_layer_interface,
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute import (
@@ -538,7 +538,7 @@ class HybridStack(MegatronModule):
         if manager is not None and is_block_end:
             manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -688,24 +688,31 @@ class HybridStack(MegatronModule):
             residual_stream_recompute_plan=residual_stream_recompute_plan,
         )
 
+        base_aux_inputs = LayerAuxInputs(
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+        )
+
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
                     self,
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    context=None,
-                    context_mask=None,
-                    rotary_pos_emb=rotary_pos_emb,
-                    attention_bias=None,
-                    packed_seq_params=packed_seq_params,
-                    padding_mask=padding_mask,
-                    input_ids=input_ids,
+                    hidden_states,
+                    base_aux_inputs,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
-                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
+                base_aux_inputs = replace(
+                    base_aux_inputs,
+                    inference_context=inference_context,
+                    sequence_len_offset=sequence_len_offset,
+                    execution_context=execution_context,
+                )
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
                     zip(
                         self._execution_layer_indices,
@@ -746,21 +753,16 @@ class HybridStack(MegatronModule):
                     # Observe ordinary layers inside their CP layout conversions.
                     residual_accumulator = hidden_states
                     with inner_quant_context:
-                        layer_inputs = LayerInputs(
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            rotary_pos_emb=rotary_pos_emb,
-                            sequence_len_offset=sequence_len_offset,
+                        aux_inputs = replace(
+                            base_aux_inputs,
                             packed_seq_params=layer_packed_seq_params,
-                            padding_mask=padding_mask,
-                            input_ids=input_ids,
-                            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                             residual_stream_recompute_context=residual_stream_recompute_context,
                             mhc_recompute_manager=mhc_manager,
-                            execution_context=execution_context,
                         )
-                        hidden_states, addends = layer(hidden_states, layer_inputs)
-                        assert addends.bias is None, "HybridStack requires complete residual layers"
+                        hidden_states, aux_outputs = layer(hidden_states, aux_inputs)
+                        assert (
+                            aux_outputs.bias is None
+                        ), "HybridStack requires complete residual layers"
 
                     if not is_shortcut:
                         observe_layer_residuals(layer, residual_accumulator, hidden_states)
@@ -804,7 +806,7 @@ class HybridStack(MegatronModule):
         )
 
         if mhc_multistream is not None:
-            return hidden_states, LayerAddends(mhc_multistream=mhc_multistream)
+            return hidden_states, LayerAuxOutputs(mhc_multistream=mhc_multistream)
         return hidden_states
 
     def sharded_state_dict(

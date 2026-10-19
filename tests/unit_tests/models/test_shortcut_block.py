@@ -15,10 +15,10 @@ from megatron.core.models.hybrid.shortcut_block import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.layer_interface import (
-    LayerAddends,
+    LayerAuxInputs,
+    LayerAuxOutputs,
     LayerExecutionContext,
-    LayerInputs,
-    bind_layer_stage_inputs,
+    bind_layer_inputs,
 )
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
@@ -65,11 +65,11 @@ class _FakeCompute(torch.nn.Module, TwoStageAttentionLayer):
     def supports_two_stage_attention(self) -> bool:
         return self.supports_two_stage
 
-    def forward_pre_attn_and_core_attn(self, hidden_states, inputs):
+    def forward_pre_attn_and_core_attn(self, hidden_states, aux_inputs):
         return (hidden_states,)
 
     def forward_post_core_attn(self, hidden_states, **kwargs):
-        return hidden_states, LayerAddends()
+        return hidden_states, LayerAuxOutputs()
 
 
 class _FakeMLP(torch.nn.Module):
@@ -247,9 +247,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
             calls.append(("finalize", layer_idx))
             return hidden_states + layer_idx
 
-    @bind_layer_stage_inputs(
-        include_if={"packed_sequence_cp_metadata": lambda module: uses_cp_metadata}
-    )
+    @bind_layer_inputs
     def attn_forward(
         self,
         hidden_states,
@@ -258,13 +256,15 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
         residual_stream_recompute_context=None,
     ):
         observed["attn_packed"] = packed_seq_params
-        observed["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
+        observed["packed_sequence_cp_metadata"] = (
+            packed_sequence_cp_metadata if uses_cp_metadata else None
+        )
         assert residual_stream_recompute_context is attn_context
         return (hidden_states,)
 
     def attn_post(hidden_states, **kwargs):
         assert kwargs == expected_layer_kwargs
-        return hidden_states, LayerAddends()
+        return hidden_states, LayerAuxOutputs()
 
     def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
         assert recompute_context is attn_context
@@ -308,9 +308,9 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
 
     packed_sequence_cp_metadata = object()
     hidden_states = torch.zeros(2, 1, config.hidden_size)
-    output, addends = block(
+    output, aux_outputs = block(
         hidden_states,
-        LayerInputs(
+        LayerAuxInputs(
             packed_seq_params="packed-input",
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
             execution_context=LayerExecutionContext(
@@ -320,7 +320,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
             ),
         ),
     )
-    assert addends.bias is None
+    assert aux_outputs.bias is None
 
     assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
     assert observed == {
@@ -346,9 +346,9 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     inference_context = object()
     observed = {}
 
-    def compute_forward(hidden_states, inputs):
-        observed["compute_context"] = inputs.inference_context
-        return hidden_states + 1, LayerAddends()
+    def compute_forward(hidden_states, aux_inputs):
+        observed["compute_context"] = aux_inputs.inference_context
+        return hidden_states + 1, LayerAuxOutputs()
 
     def two_stage(*_args, **_kwargs):
         raise AssertionError("inference must not use the two-stage training path")
@@ -388,14 +388,14 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     hidden_states = torch.zeros(2, 1, config.hidden_size)
     InferenceMode.set_active()
     try:
-        output, addends = block(
+        output, aux_outputs = block(
             hidden_states,
-            LayerInputs(
+            LayerAuxInputs(
                 inference_context=inference_context,
                 execution_context=LayerExecutionContext(quant_context_factory),
             ),
         )
-        assert addends.bias is None
+        assert aux_outputs.bias is None
     finally:
         InferenceMode.unset_active()
 
@@ -513,13 +513,13 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.input_scale = torch.nn.Parameter(torch.tensor(2.0))
             self.output_scale = torch.nn.Parameter(torch.tensor(3.0))
 
-        def forward_pre_attn_and_core_attn(self, hidden_states, inputs):
+        def forward_pre_attn_and_core_attn(self, hidden_states, aux_inputs):
             assert_quant_layer(0)
             return hidden_states * self.input_scale, hidden_states
 
         def forward_post_core_attn(self, projected, residual, **kwargs):
             assert_quant_layer(0)
-            return projected * self.output_scale, LayerAddends()
+            return projected * self.output_scale, LayerAuxOutputs()
 
     class FakeMLP(torch.nn.Module):
         def __init__(self):
@@ -612,11 +612,11 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             monkeypatch.setattr(block, "_wait_combine", lambda combined_output: combined_output)
 
         hidden_states = torch.arange(1.0, 5.0, requires_grad=True)
-        output, addends = block(
+        output, aux_outputs = block(
             hidden_states,
-            LayerInputs(execution_context=LayerExecutionContext(quant_context_factory)),
+            LayerAuxInputs(execution_context=LayerExecutionContext(quant_context_factory)),
         )
-        assert addends.bias is None
+        assert aux_outputs.bias is None
         output.sum().backward()
         gradients = {
             name: parameter.grad.detach().clone()
@@ -717,11 +717,11 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
     def quant_context_factory(*_args):
         yield
 
-    output, addends = block(
+    output, aux_outputs = block(
         hidden_states,
-        LayerInputs(execution_context=LayerExecutionContext(quant_context_factory)),
+        LayerAuxInputs(execution_context=LayerExecutionContext(quant_context_factory)),
     )
-    assert addends.bias is None
+    assert aux_outputs.bias is None
     output.sum().backward()
 
     assert calls["checkpoint_input"] is hidden_states

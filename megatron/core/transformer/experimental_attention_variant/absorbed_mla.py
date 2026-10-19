@@ -35,7 +35,7 @@ from megatron.core.tensor_parallel.mappings import (
 )
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.layer_interface import bind_layer_inputs
+from megatron.core.transformer.layer_interface import bind_layer_interface
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -801,7 +801,7 @@ class AbsorbedMLASelfAttention(Attention):
 
         return hidden_states
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(
         self,
         hidden_states,

@@ -34,7 +34,7 @@ from megatron.core.tensor_parallel.inference_layers import (
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
-from megatron.core.transformer.layer_interface import LayerInputs
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -1728,22 +1728,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         return hidden_states
 
     def _proj_and_transformer_layer(
-        self,
-        hidden_states: Tensor,
-        decoder_input: Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-        context_mask: Optional[torch.Tensor] = None,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
-        rotary_pos_cos: Optional[torch.Tensor] = None,
-        rotary_pos_sin: Optional[torch.Tensor] = None,
-        attention_bias: Optional[torch.Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[torch.Tensor] = None,
-        packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
-        cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        self, hidden_states: Tensor, aux_inputs: LayerAuxInputs, *, decoder_input: Tensor
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
@@ -1775,26 +1760,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
             # can be triggered correctly.
             with transformer_layer_quantization_context:
-                hidden_states, addends = self.mtp_model_layer(
-                    hidden_states,
-                    LayerInputs(
-                        attention_mask=attention_mask,
-                        padding_mask=padding_mask,
-                        context=context,
-                        context_mask=context_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        rotary_pos_cos=rotary_pos_cos,
-                        rotary_pos_sin=rotary_pos_sin,
-                        attention_bias=attention_bias,
-                        inference_context=inference_params,
-                        packed_seq_params=packed_seq_params,
-                        sequence_len_offset=sequence_len_offset,
-                        packed_seq_params_by_layout=packed_seq_params_by_layout,
-                        cp_layout_plan=cp_layout_plan,
-                    ),
-                )
+                hidden_states, aux_outputs = self.mtp_model_layer(hidden_states, aux_inputs)
 
-                assert addends.bias is None, "MTP requires complete residual layers"
+                assert aux_outputs.bias is None, "MTP requires complete residual layers"
 
         if not self.mhc_enabled:
             hidden_states = self._postprocess(hidden_states)
@@ -1860,35 +1828,22 @@ class MultiTokenPredictionLayer(MegatronModule):
             inp=hidden_states, requires_grad=False, keep_graph=False
         )
         hidden_states = self._proj_and_transformer_layer(
-            hidden_states=hidden_states,
+            hidden_states,
+            LayerAuxInputs(
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                inference_context=inference_context,
+            ),
             decoder_input=decoder_input,
-            attention_mask=attention_mask,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            inference_params=inference_context,
         )
         return hidden_states
 
     def _checkpointed_forward(
-        self,
-        hidden_states: Tensor,
-        decoder_input: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        padding_mask: Optional[Tensor] = None,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
-        packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
-        cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        self, hidden_states: Tensor, aux_inputs: LayerAuxInputs, *, decoder_input: Tensor
     ):
         """Forward a legacy GPT MTP layer with activation recomputation.
 
@@ -1907,34 +1862,30 @@ class MultiTokenPredictionLayer(MegatronModule):
             self.mtp_layer_pattern is None
         ), "Hybrid MTP delegates full activation recomputation to its nested HybridStack."
 
-        def custom_forward(
+        checkpoint_fields = (
+            "attention_mask",
+            "padding_mask",
+            "context",
+            "context_mask",
+            "rotary_pos_emb",
+            "rotary_pos_cos",
+            "rotary_pos_sin",
+            "sequence_len_offset",
+        )
+        # Capture metadata only; replay must use the tensors restored by checkpoint.
+        static_aux_inputs = replace(aux_inputs, **dict.fromkeys(checkpoint_fields))
+        checkpoint_args = (
             hidden_states,
             decoder_input,
-            attention_mask,
-            padding_mask,
-            context,
-            context_mask,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-        ):
+            *(getattr(aux_inputs, name) for name in checkpoint_fields),
+        )
+
+        def custom_forward(hidden_states, decoder_input, *tensors):
+            replay_aux_inputs = replace(
+                static_aux_inputs, **dict(zip(checkpoint_fields, tensors, strict=True))
+            )
             return self._proj_and_transformer_layer(
-                hidden_states=hidden_states,
-                decoder_input=decoder_input,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
+                hidden_states, replay_aux_inputs, decoder_input=decoder_input
             )
 
         # Decide the outer quantization context, matching
@@ -1969,16 +1920,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
-                    hidden_states,
-                    decoder_input,
-                    attention_mask,
-                    padding_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    sequence_len_offset,
+                    *checkpoint_args,
                 )
             else:
                 # tensor_parallel.checkpoint stashes args via autograd's
@@ -1986,18 +1928,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 # Pass tensor / ``None`` args positionally and capture the
                 # non-tensor objects via the ``custom_forward`` closure.
                 return tensor_parallel.checkpoint(
-                    custom_forward,
-                    self.config.distribute_saved_activations,
-                    hidden_states,
-                    decoder_input,
-                    attention_mask,
-                    padding_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    sequence_len_offset,
+                    custom_forward, self.config.distribute_saved_activations, *checkpoint_args
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -2015,21 +1946,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 "recompute_method == 'block' is not supported for MTP yet." " Skipping recompute."
             )
             outputs = self._proj_and_transformer_layer(
-                hidden_states=hidden_states,
-                decoder_input=decoder_input,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
+                hidden_states, aux_inputs, decoder_input=decoder_input
             )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -2105,6 +2022,22 @@ class MultiTokenPredictionLayer(MegatronModule):
                 decoder_input=decoder_input, hidden_states=hidden_states
             )
 
+        aux_inputs = LayerAuxInputs(
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            context=context,
+            context_mask=context_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            attention_bias=attention_bias,
+            inference_context=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            packed_seq_params_by_layout=packed_seq_params_by_layout,
+            cp_layout_plan=cp_layout_plan,
+        )
+
         # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
         # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
         # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
@@ -2115,39 +2048,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         if use_outer_recompute:
             hidden_states = self._checkpointed_forward(
-                hidden_states=hidden_states,
-                decoder_input=decoder_input,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
+                hidden_states, aux_inputs, decoder_input=decoder_input
             )
         else:
             hidden_states = self._proj_and_transformer_layer(
-                hidden_states=hidden_states,
-                decoder_input=decoder_input,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
+                hidden_states, aux_inputs, decoder_input=decoder_input
             )
 
         return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask

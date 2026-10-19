@@ -37,7 +37,7 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
     AbsorbedMLASelfAttention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
-from megatron.core.transformer.layer_interface import LayerAddends, LayerInputs
+from megatron.core.transformer.layer_interface import LayerAuxInputs, LayerAuxOutputs
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
@@ -1103,11 +1103,11 @@ class TestHybridBlock:
 
         with torch.no_grad():
             model_parallel_cuda_manual_seed(123)
-            atomic_output = layer(hidden_states, LayerInputs(attention_mask=attention_mask))
+            atomic_output = layer(hidden_states, LayerAuxInputs(attention_mask=attention_mask))
 
             model_parallel_cuda_manual_seed(123)
             stage_one_state = layer.forward_pre_attn_and_core_attn(
-                hidden_states, LayerInputs(attention_mask=attention_mask)
+                hidden_states, LayerAuxInputs(attention_mask=attention_mask)
             )
             two_stage_output = layer.forward_post_core_attn(*stage_one_state)
 
@@ -1119,7 +1119,7 @@ class TestHybridBlock:
                     assert_bitwise_equal(actual_item, expected_item)
             elif actual is None:
                 assert expected is None
-            elif isinstance(actual, LayerAddends):
+            elif isinstance(actual, LayerAuxOutputs):
                 assert_bitwise_equal(actual.bias, expected.bias)
                 assert_bitwise_equal(actual.context, expected.context)
                 assert_bitwise_equal(actual.mhc_multistream, expected.mhc_multistream)

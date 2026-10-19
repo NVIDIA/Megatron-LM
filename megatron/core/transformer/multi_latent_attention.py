@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, NoReturn, Optional, Union
 import torch
 import torch.nn.functional as F
 
-from megatron.core.transformer.layer_interface import bind_layer_inputs
+from megatron.core.transformer.layer_interface import bind_layer_interface
 
 try:
     from einops import rearrange
@@ -359,7 +359,7 @@ class MultiLatentAttention(Attention):
 
         return _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim)
 
-    @bind_layer_inputs
+    @bind_layer_interface
     def forward(
         self,
         hidden_states: torch.Tensor,
