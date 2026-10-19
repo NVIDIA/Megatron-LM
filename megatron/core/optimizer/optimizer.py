@@ -1369,6 +1369,16 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             )
         ]
 
+        # Local factory metadata is extracted separately by DCP, which compacts lists.
+        # Preserve indices only for factory-backed masters; ordinary checkpoints retain lists.
+        from ..dist_checkpointing.mapping import ShardedTensorFactory
+
+        masters = state_dict['fp32_from_fp16_params']
+        if any(isinstance(param, ShardedTensorFactory) for group in masters for param in group):
+            state_dict['fp32_from_fp16_params'] = {
+                group_index: dict(enumerate(group)) for group_index, group in enumerate(masters)
+            }
+
         step = self._extract_common_per_param_step(state_dict['optimizer'])
 
         # Convert regular optimizer state
@@ -1423,9 +1433,26 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         fp32_from_float16_params_key = 'fp32_from_fp16_params'
         if fp32_from_float16_params_key not in state_dict:
             fp32_from_float16_params_key = 'fp32_from_fp16'
-        for current_group, saved_group in zip(
-            self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key]
-        ):
+        saved_groups = state_dict[fp32_from_float16_params_key]
+        if isinstance(saved_groups, dict):
+            expected_groups = set(range(len(self.fp32_from_float16_groups)))
+            if set(saved_groups) != expected_groups:
+                raise ValueError("Checkpoint FP32 master group indices do not match the optimizer")
+            ordered_groups = []
+            for group_index, current_group in enumerate(self.fp32_from_float16_groups):
+                saved_group = saved_groups[group_index]
+                if isinstance(saved_group, dict):
+                    if set(saved_group) != set(range(len(current_group))):
+                        raise ValueError(
+                            "Checkpoint FP32 master parameter indices do not match the optimizer"
+                        )
+                    saved_group = [saved_group[index] for index in range(len(current_group))]
+                elif len(saved_group) != len(current_group):
+                    raise ValueError("Checkpoint FP32 master count does not match the optimizer")
+                # Older LayerWise checkpoints indexed only the groups, with lists inside.
+                ordered_groups.append(saved_group)
+            saved_groups = ordered_groups
+        for current_group, saved_group in zip(self.fp32_from_float16_groups, saved_groups):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
 

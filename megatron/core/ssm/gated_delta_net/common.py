@@ -12,6 +12,7 @@ from typing import Optional, Protocol, Union
 import torch
 import torch.nn as nn
 
+from megatron.core.dist_checkpointing.gtp import attach_optimizer_factory, split_gtp_projection
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -583,18 +584,20 @@ class _GDNBase(MegatronModule):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
+        key = f'{prefix}in_proj.weight'
+        weight = self.in_proj.weight
+        entry = sharded_state_dict[key]
+        factory = split_gtp_projection(
+            entry, weight, list(self.in_proj_split_sections), self.in_proj_split_names, tp_group
         )
-
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-            list(self.in_proj_split_sections),
-            self.in_proj_split_names,
-            0,
-        )
+        if factory is None:
+            factory = attach_optimizer_factory(
+                _split_tensor_factory(
+                    entry, list(self.in_proj_split_sections), self.in_proj_split_names, 0
+                ),
+                weight,
+            )
+        sharded_state_dict[key] = factory
 
         conv_layer_name_list = ["conv1d.weight"]
         assert (
