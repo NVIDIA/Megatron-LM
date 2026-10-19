@@ -493,8 +493,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/fusions/fused_pre_gated_delta_rule.py",),
         tests=(K + "test_gdn_gate_backward.py",),
         kind="triton",
-        notes="Gate backward uses fixed tiles and ordered FP32 parameter-gradient reduction; "
-        "replay compares input and FP32 parameter gradients before the caller's BF16 cast.",
+        notes="Gate backward retains autotuned atomics by default; deterministic execution "
+        "selects a tile through the shared policy and reduces independent FP32 partials. "
+        "Replay checks both policy-selected tiles before the caller's BF16 cast.",
     ),
     KernelEntry(
         name="gdn_gated_output_norm_fusion",

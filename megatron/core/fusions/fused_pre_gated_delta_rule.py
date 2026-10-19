@@ -24,6 +24,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from megatron.core.tuning import autotune_configs, use_deterministic_mode
+
 try:
     from causal_conv1d.cpp_functions import causal_conv1d_bwd_function
 except ImportError:
@@ -672,6 +674,14 @@ def _z_layout_to_qkvzba_kernel(
     tl.store(d_qkvzba_ptrs, dgate_val, mask=s_mask[:, None])
 
 
+@triton.autotune(
+    configs=_g_beta_autotune_configs(),
+    key=["seq_len", "num_v_heads"],
+    # Each autotune trial atomic-adds partial sums into these accumulators.
+    # Without reset_to_zero the trials would stack on top of one another and
+    # produce values that are ``num_trials`` × the correct result.
+    reset_to_zero=["d_A_log_ptr", "d_dt_bias_ptr"],
+)
 @triton.jit
 def _g_beta_backward_kernel(
     qkvzba_ptr,
@@ -697,6 +707,7 @@ def _g_beta_backward_kernel(
     d_beta_h_stride,
     BLOCK_S: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    DETERMINISTIC: tl.constexpr,
 ):
     """Backward for ``_compute_g_and_beta_kernel``.
 
@@ -713,8 +724,8 @@ def _g_beta_backward_kernel(
         d_A_log[h]   = Σ_{b,s} d_g[b,s,h] * g[b,s,h]
 
     ``d_alpha`` and ``d_beta_raw`` are written into the matching channel slices
-    of ``d_qkvzba``. Each program writes its parameter-gradient partial sums
-    to a separate FP32 slot; the caller reduces them in a fixed order.
+    of ``d_qkvzba``. Parameter gradients use atomic accumulation by default.
+    Deterministic execution writes separate FP32 partials for the caller to reduce.
     """
 
     pid_b = tl.program_id(0)
@@ -794,10 +805,13 @@ def _g_beta_backward_kernel(
     tl.store(d_alpha_ptrs, d_alpha.to(d_qkvzba_ptr.dtype.element_ty), mask=mask)
     tl.store(d_beta_ptrs, d_beta_raw.to(d_qkvzba_ptr.dtype.element_ty), mask=mask)
 
-    # ----- Store one partial per (batch, sequence block, head) -----
-    partial_offset = (pid_b * tl.num_programs(1) + pid_s) * num_v_heads + h_offs
-    tl.store(d_A_log_ptr + partial_offset, d_A_log_partial, mask=h_mask)
-    tl.store(d_dt_bias_ptr + partial_offset, d_dt_bias_partial, mask=h_mask)
+    if DETERMINISTIC:
+        partial_offset = (pid_b * tl.num_programs(1) + pid_s) * num_v_heads + h_offs
+        tl.store(d_A_log_ptr + partial_offset, d_A_log_partial, mask=h_mask)
+        tl.store(d_dt_bias_ptr + partial_offset, d_dt_bias_partial, mask=h_mask)
+    else:
+        tl.atomic_add(d_A_log_ptr + h_offs, d_A_log_partial, mask=h_mask)
+        tl.atomic_add(d_dt_bias_ptr + h_offs, d_dt_bias_partial, mask=h_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -989,15 +1003,33 @@ def _triton_g_beta_backward(
 
     device = qkvzba.device
 
-    # Fixed tiles keep both the partial sums and their final reduction repeatable.
-    block_s, block_h = 128, 16
-    sequence_blocks = triton.cdiv(seq_len, block_s)
-    g_beta_grid = (batch, sequence_blocks, triton.cdiv(num_value_heads, block_h))
+    deterministic = use_deterministic_mode()
+    kernel = _g_beta_backward_kernel
+    launch_kwargs = {}
+    if deterministic:
+        config = autotune_configs(_g_beta_autotune_configs())[0]
+        launch_kwargs = {
+            **config.kwargs,
+            "num_warps": config.num_warps,
+            "num_stages": config.num_stages,
+        }
+        sequence_blocks = triton.cdiv(seq_len, config.kwargs["BLOCK_S"])
+        grad_shape = (2, batch, sequence_blocks, num_value_heads)
+        # Launch the selected config directly, including when mode changes after import.
+        kernel = kernel.fn
+    else:
+        grad_shape = (2, num_value_heads)
+
+    g_beta_grid = lambda meta: (
+        batch,
+        triton.cdiv(seq_len, meta["BLOCK_S"]),
+        triton.cdiv(num_value_heads, meta["BLOCK_H"]),
+    )
     with _launch_context(device, stream):
-        d_param_grads = torch.empty(
-            (2, batch, sequence_blocks, num_value_heads), dtype=torch.float32, device=device
-        )
-        _g_beta_backward_kernel[g_beta_grid](
+        d_param_grads = torch.empty(grad_shape, dtype=torch.float32, device=device)
+        if not deterministic:
+            d_param_grads.zero_()
+        kernel[g_beta_grid](
             qkvzba,
             A_log,
             dt_bias,
@@ -1019,12 +1051,11 @@ def _triton_g_beta_backward(
             d_beta_out.stride(0),
             d_beta_out.stride(1),
             d_beta_out.stride(2),
-            BLOCK_S=block_s,
-            BLOCK_H=block_h,
-            num_warps=4,
-            num_stages=2,
+            DETERMINISTIC=deterministic,
+            **launch_kwargs,
         )
-        d_param_grads = d_param_grads.sum(dim=(1, 2))
+        if deterministic:
+            d_param_grads = d_param_grads.sum(dim=(1, 2))
     return d_qkvzba_out, d_param_grads[0], d_param_grads[1]
 
 
