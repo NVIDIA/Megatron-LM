@@ -163,12 +163,19 @@ _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 _TOPK_TIE_BREAK_EPS = 1.0e-12
 _INDEXER_RATIO = 1
 _INDEXER_SOFTMAX_SCALE = 1.0
-# cuDNN radix top-k allocates an int32 scratch of ``rows x 2 x num_cols`` per launch.
-_TOPK_WRAPPER_MAX_SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
+# cuDNN radix top-k allocates an int32 scratch of ``rows x 2 x num_cols`` per launch. 8 GiB is
+# 1024 rows per launch at 1M keys (4.3 waves of CTAs on GB300 instead of 256 rows), which
+# measured 20.85 -> 14.24 ms per 1M CP64 rank-0 call; at 128K it fits all 4096 rows in one launch.
+# The scratch is transient but needs this much spare memory, eagerly and inside a CUDA graph
+# pool, for every call whose FP32 scores exceed 1 GiB (rows x cols > 2**28): it is
+# min(8 GiB, twice the score buffer the caller already holds), so e.g. a 32K CP1 call (4 GiB of
+# scores) also takes 8 GiB where it took 2 GiB. Headroom was checked only for 1M-token CP64 and
+# 128K-token CP32 calls; 4K CP1 calls stay far below 1 GiB of scores.
+_TOPK_WRAPPER_MAX_SCRATCH_BYTES = 8 * 1024 * 1024 * 1024
 _TOPK_WRAPPER_SCRATCH_INT32_FACTOR = 2
 # The frontend indexes that scratch with int32: one launch may hold at most 2**31 elements, so
 # the highest scratch index is 2**31 - 1 (FE 1.21 has no internal split). The limit is on
-# elements, not rows, so short rows still get large launches. At 1M keys an 8 GiB budget hits
+# elements, not rows, so short rows still get large launches. At 1M keys the 8 GiB budget hits
 # exactly 2**31 elements (1024 rows). That deliberately takes FE >= 1.31's own split branch
 # (it splits only above 2**31 - 1 elements, into ``(2**31 - 1) // (2 * cols) + 1`` = 1024 rows,
 # i.e. the same single 2**31-element buffer); both FE 1.21 and FE 1.31 were validated exact
@@ -797,8 +804,8 @@ def _indexer_top_k_wrapper_chunked(
     # before the next one. The frontend allocates a launch's outputs before its scratch, so a
     # chunk result still alive at the next launch (as in the former collect-then-torch.cat) is
     # carved out of the scratch block just freed, and every later launch needs a second
-    # scratch-sized segment: with an 8 GiB budget, two 8 GiB blocks in a CUDA graph's private
-    # pool at 1M (16.02 GiB reserved against an 8.25 GiB allocated peak), likewise cached eagerly.
+    # scratch-sized segment: two 8 GiB blocks in a CUDA graph's private pool at 1M (16.02 GiB
+    # reserved against an 8.25 GiB allocated peak), likewise cached eagerly.
     indices = torch.empty((n_rows, topk_k), dtype=torch.int32, device=scores_flat.device)
     values = (
         torch.empty((n_rows, topk_k), dtype=scores_flat.dtype, device=scores_flat.device)

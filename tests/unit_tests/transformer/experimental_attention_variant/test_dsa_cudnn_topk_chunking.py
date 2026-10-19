@@ -16,12 +16,6 @@ def _scratch_bytes(rows: int, num_cols: int) -> int:
     return rows * 2 * num_cols * 4
 
 
-@pytest.fixture(autouse=True)
-def _eight_gib_scratch_budget(monkeypatch):
-    """The cases below are sized for an 8 GiB scratch budget (1024 rows per 1M-key launch)."""
-    monkeypatch.setattr(dsa_cudnn_kernels, "_TOPK_WRAPPER_MAX_SCRATCH_BYTES", 8 * _GIB)
-
-
 # (case, rows, score columns, expected rows per launch). The 1M rows are the CP64 rank 0/21/42/63
 # score-buffer widths of a 1M-token sequence; 128K is CP32 rank 0.
 _TOPK_SHAPES = [
