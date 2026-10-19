@@ -4,7 +4,7 @@ import re
 
 import torch
 
-from megatron.lite.primitive.ckpt.row_reader import RowSliceReader as SafeTensorReader
+from megatron.lite.primitive.ckpt.row_reader import RowSliceReader
 
 _ATTENTION = {
     "linear_q_down_proj.weight": "wq_a.weight",
@@ -197,7 +197,7 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
         or n.endswith("tid2eid")
     ]
     loaded = []
-    with SafeTensorReader(hf_path, device=next(model.parameters()).device) as reader:
+    with RowSliceReader(hf_path, device=next(model.parameters()).device) as reader:
         read = _record_reads(reader)
         for name, tensor in state:
             if name.endswith(".ape"):

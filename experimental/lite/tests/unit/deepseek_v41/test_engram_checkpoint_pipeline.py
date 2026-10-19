@@ -59,6 +59,14 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     load_hf_weights(model, str(tmp_path), cfg, ps)
     assert torch.equal(model.layers["0"].attn_norm.weight, torch.ones(4))
     assert torch.equal(model.embed.weight, torch.full((2, 4), 2.0))  # dequantized
+    from megatron.lite.model.deepseek_v41.lite.checkpoint import _sharded_state
+
+    unequal = torch.nn.Module()
+    unequal.lookup = SimpleNamespace(
+        group=SimpleNamespace(size=lambda: 2, rank=lambda: 1), boundaries=(0, 2, 5)
+    )
+    with pytest.raises(ValueError, match="equal Core row shards"):
+        _sharded_state(unequal, "", (), None, {})
     unread = stage()
     del unread.embed  # a stage-local release key nobody reads
     with pytest.raises(ValueError, match=r"unread \['embed.weight'\]"):

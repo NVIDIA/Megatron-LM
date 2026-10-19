@@ -3,11 +3,14 @@
 import pytest
 
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+from megatron.lite.model.deepseek_v41.lite import protocol
 from megatron.lite.model.deepseek_v41.lite.components import attention
 from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
 from megatron.lite.model.deepseek_v41.lite.components.config import core_config, validate_runtime_cp
 from megatron.lite.primitive.modules.attention import cross_layer as compressor
 from megatron.lite.primitive.modules.attention import ratio_one
+from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
+from megatron.lite.runtime.backends.mlite.runtime import _build_impl_cfg
 from megatron.lite.runtime.contracts import ParallelConfig
 
 
@@ -25,6 +28,8 @@ def test_native_core_configuration_is_bf16_and_keeps_literal_ratios(deterministi
     assert config.deterministic_mode == deterministic and not config.moe_router_fusion
     assert config.moe_router_score_function == "sqrtsoftplus"
     assert config.moe_token_dispatcher_type == "alltoall"
+    runtime = MegatronLiteConfig(hf_path="release", load_hf_weights=deterministic)
+    assert _build_impl_cfg(protocol, runtime).initialize_weights is not deterministic
 
 
 @pytest.mark.parametrize(
