@@ -271,6 +271,10 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         local_blocks=model_cfg.index_local_blocks,
     )
     magi_msa.validate_device()
+    if impl_cfg.deterministic:
+        from megatron.lite.primitive.deterministic import disable_jit_fuser
+
+        disable_jit_fuser()
     if impl_cfg.deterministic and impl_cfg.magi_dense_kernel_backend == "fa4":
         warnings.warn("deterministic=True: fa4 dense backward is not deterministic; use sdpa_ol for bitwise runs", stacklevel=2)
     magi_settings = magi_msa.MagiMsaSettings(
