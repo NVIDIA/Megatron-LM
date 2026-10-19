@@ -47,7 +47,9 @@ def pack_values(value, *, device):
     lead = torch.tensor(
         list(len(header).to_bytes(4, "little") + header), dtype=torch.bfloat16, device=device
     )
-    return torch.cat((lead, *body)).reshape(1, 1, -1)
+    return torch.cat(
+        [torch.nn.functional.pad(part, (0, -part.numel() % 8)) for part in (lead, *body)]
+    ).reshape(1, 1, -1)
 
 
 def unpack_values(carrier):
@@ -57,7 +59,7 @@ def unpack_values(carrier):
     flat = carrier.reshape(-1)
     size = int.from_bytes(bytes(flat[:4].to(torch.uint8).cpu().tolist()), "little")
     metadata = json.loads(bytes(flat[4 : 4 + size].to(torch.uint8).cpu().tolist()))
-    cursor = 4 + size
+    cursor = (4 + size + 7) // 8 * 8
 
     def decode(record):
         nonlocal cursor
@@ -67,13 +69,13 @@ def unpack_values(carrier):
             values = []
             for count in counts:
                 values.append(flat[cursor : cursor + count])
-                cursor += count
+                cursor += (count + 7) // 8 * 8
             if dtype == "float32":
                 result = values[0].float()
                 for value in values[1:]:
                     result = result + value.float()
             elif dtype == "bfloat16":
-                result = values[0].clone()
+                result = values[0]
             else:
                 result = values[0].to(torch.uint8).view(getattr(torch, dtype))
             return result.reshape(shape)

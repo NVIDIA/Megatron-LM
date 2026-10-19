@@ -15,6 +15,8 @@ from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 
 def test_pipeline_source_carrier_preserves_values_and_owner_gradients():
     hidden = torch.randn(5, 1, 4, 8, dtype=torch.bfloat16, requires_grad=True)
+    grad_alignment = []
+    hidden.register_hook(lambda grad: grad_alignment.append(grad.data_ptr() % 16))
     pre = torch.sigmoid(torch.randn(5, 1, 4)).requires_grad_()
     owner = torch.randn(5, 8, requires_grad=True)
     prefix, new_prefix = torch.tensor([0, 2, 5], dtype=torch.int32), torch.tensor(
@@ -37,7 +39,7 @@ def test_pipeline_source_carrier_preserves_values_and_owner_gradients():
     assert torch.equal(values[("candidate_pool", 3)], pool)
     (h.float().sum() + p.sum() + recovered.sum() * 2 + recovered.sum() * 3).backward()
     assert torch.equal(owner.grad, torch.full_like(owner, 5))
-    assert torch.equal(hidden.grad, torch.ones_like(hidden))
+    assert torch.equal(hidden.grad, torch.ones_like(hidden)) and grad_alignment == [0]
     assert torch.equal(pre.grad, torch.ones_like(pre))
 
 
