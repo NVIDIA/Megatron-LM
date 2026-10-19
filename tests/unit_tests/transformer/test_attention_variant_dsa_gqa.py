@@ -313,6 +313,9 @@ def test_simplified_dsa_turns_off_indexer_rotation():
         add_bias_linear=False,
         dsa_indexer_mode="simplified",
         dsa_indexer_topk=4,
+        # Required now that the unset backend resolves to min-memory-triton before the
+        # min-memory checks run. Incidental to what this test is about.
+        dsa_indexer_loss_coeff=0.1,
     )
 
     assert not config.dsa_indexer_rotate_activation

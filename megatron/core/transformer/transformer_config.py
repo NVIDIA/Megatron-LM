@@ -3945,6 +3945,17 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0
             ), "dsa_indexer_topk must be set to a positive integer when using DSA."
+            # These limits are DSGroupedSelfAttention's, and the simplified indexer is the only
+            # signal the config has for it. Non-MLA alone also caught standard-indexer
+            # DSAttention with one query group, which has none of them.
+            dsa_over_gqa = not self.multi_latent_attention and self.dsa_indexer_mode == 'simplified'
+            # 'none' is the field default and means "no fused kernels" on the MLA path. The GQA
+            # path has no such mode, so resolve it to the chunked min-memory backend -- the one
+            # intended for production -- rather than failing. Note this is not a literal reading
+            # of "none": that backend does use Triton kernels. Resolve before anything reads the
+            # field, so the checks below see the backend that will actually run.
+            if dsa_over_gqa and self.dsa_kernel_backend == 'none':
+                self.dsa_kernel_backend = 'min-memory-triton'
             min_memory_dsa_backend = self.dsa_kernel_backend in (
                 'min-memory-triton',
                 'min-memory-torch',
@@ -3959,16 +3970,7 @@ class TransformerConfig(ModelParallelConfig):
                 self.multi_latent_attention and self.dsa_indexer_mode == 'simplified'
             ), "dsa_indexer_mode='simplified' is not supported with multi_latent_attention."
 
-            # These limits are DSGroupedSelfAttention's, and the simplified indexer is the only
-            # signal the config has for it. Non-MLA alone also caught standard-indexer
-            # DSAttention with one query group, which has none of them.
-            if not self.multi_latent_attention and self.dsa_indexer_mode == 'simplified':
-                # 'none' is the field default and means "no fused kernels" on the MLA path.
-                # The GQA path has no such mode, so resolve it to the chunked min-memory
-                # backend -- the one intended for production -- rather than failing. Note this
-                # is not a literal reading of "none": that backend does use Triton kernels.
-                if self.dsa_kernel_backend == 'none':
-                    self.dsa_kernel_backend = 'min-memory-triton'
+            if dsa_over_gqa:
                 assert self.dsa_kernel_backend in (
                     'min-memory-triton',
                     'min-memory-torch',
