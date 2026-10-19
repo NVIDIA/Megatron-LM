@@ -328,6 +328,19 @@ class AccumulatingLinear(nn.Linear):
         )
 
 
+class _LookupEmbedding(nn.Embedding):
+    """Embedding table; lookups go through ``forward`` so module pre-hooks (DDP param gather) fire."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, *, deterministic: bool = False):
+        super().__init__(num_embeddings, embedding_dim)
+        self.deterministic = deterministic
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        if self.deterministic:
+            return self.weight[ids]
+        return _EmbeddingAccumulatingIntoMainGrad.apply(self.weight, ids)
+
+
 class VocabParallelEmbedding(nn.Module):
     """Embedding table split across TP on the vocab dimension."""
 
@@ -342,17 +355,16 @@ class VocabParallelEmbedding(nn.Module):
         self.local_vocab = ensure_divisible(padded_vocab, ps.tp_size)
         self.vocab_start = self.tp_rank * self.local_vocab
         self.vocab_end = self.vocab_start + self.local_vocab
-        self.embedding = nn.Embedding(self.local_vocab, hidden_size)
+        self.embedding = _LookupEmbedding(
+            self.local_vocab, hidden_size, deterministic=self.deterministic
+        )
         self.tp_group = ps.tp_group
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         # input_ids: [B, S] → out: [S, B, H]
         mask = (input_ids >= self.vocab_start) & (input_ids < self.vocab_end)
         local_ids = (input_ids - self.vocab_start).clamp(min=0, max=self.local_vocab - 1)
-        if self.deterministic:
-            out = self.embedding.weight[local_ids]
-        else:
-            out = _EmbeddingAccumulatingIntoMainGrad.apply(self.embedding.weight, local_ids)
+        out = self.embedding(local_ids)
         out = out * mask.unsqueeze(-1)
         if self.tp_size > 1:
             out = _ReduceFromTP.apply(out, self.tp_group)
