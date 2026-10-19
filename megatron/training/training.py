@@ -2115,7 +2115,7 @@ def pretrain(
         # Mirrors train()'s own loop-entry condition, so the "misaligned save_interval"
         # fallback below can skip when there was nothing left to train this invocation
         # (e.g. resubmitting an already-finished job) instead of redoing a redundant save.
-        has_iterations_remaining = args.iteration < (args.train_iters or 0)
+        has_iterations_remaining = train_state.iteration < (args.train_iters or 0)
         if train_state.do_train and (args.train_iters or 0) > 0:
             try:
                 iteration, num_floating_point_operations_so_far = train(
