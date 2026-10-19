@@ -130,7 +130,7 @@ def test_muon_matches_reference(distributed_setup, monkeypatch, dtype, nesterov,
         return assign_owner_work(buffers)
 
     monkeypatch.setattr(muon, "assign_owner_work", record_owner_assignment)
-    optimizer = muon.FsdpMuon(_parameter_groups(params), dp_mesh=mesh, **kwargs)
+    optimizer = muon.FsdpMuon(_parameter_groups(params), **kwargs)
     assert len(owner_assignment_calls) == 1
     assert len(owner_assignment_calls[0]) == 2
     # Upstream Muon requires matrix-only input; FsdpMuon skips the supplied bias.
@@ -215,5 +215,5 @@ def test_muon_matches_reference(distributed_setup, monkeypatch, dtype, nesterov,
                 param.copy_(reference_params[name])
         if step == 0:
             state = copy.deepcopy(optimizer.state_dict())
-            optimizer = muon.FsdpMuon(_parameter_groups(params), dp_mesh=mesh, **kwargs)
+            optimizer = muon.FsdpMuon(_parameter_groups(params), **kwargs)
             optimizer.load_state_dict(state)
