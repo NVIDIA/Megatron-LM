@@ -409,7 +409,8 @@ class TestMoELayerRecomputeSkipsCombineComm:
     """The re-run of a checkpointed MoE layer skips the combine communication.
 
     The gradients must be bitwise those of a re-run that communicates, and the re-run must issue
-    exactly one collective fewer per combine exchange (the forward of the combine).
+    exactly one collective fewer per combine exchange (the forward of the combine). With latent
+    MoE, the re-run reuses the combined latent tensor kept by the forward pass.
     """
 
     @staticmethod
@@ -444,13 +445,22 @@ class TestMoELayerRecomputeSkipsCombineComm:
     @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 1), (1, 2), (1, 4), (2, 2), (2, 4), (1, 8)])
     @pytest.mark.parametrize("shared_expert_overlap", [False, True])
+    @pytest.mark.parametrize("latent", [None, "latent", "latent_norm"])
     def test_recompute_skips_combine_comm(
-        self, monkeypatch, moe_token_dispatcher_type, tp_size, ep_size, shared_expert_overlap
+        self,
+        monkeypatch,
+        moe_token_dispatcher_type,
+        tp_size,
+        ep_size,
+        shared_expert_overlap,
+        latent,
     ):
         if tp_size * ep_size > Utils.world_size:
             pytest.skip(f"needs {tp_size * ep_size} GPUs")
         if shared_expert_overlap and moe_token_dispatcher_type != "alltoall":
             pytest.skip("shared expert overlap needs the alltoall dispatcher")
+        if shared_expert_overlap and latent:
+            pytest.skip("shared expert overlap is not supported with latent MoE in training")
 
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
@@ -467,8 +477,10 @@ class TestMoELayerRecomputeSkipsCombineComm:
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
             moe_ffn_hidden_size=128,
-            moe_shared_expert_intermediate_size=128 if shared_expert_overlap else None,
+            moe_shared_expert_intermediate_size=128 if shared_expert_overlap or latent else None,
             moe_shared_expert_overlap=shared_expert_overlap,
+            moe_latent_size=32 if latent else None,
+            moe_use_norm_before_up_proj=latent == "latent_norm",
             add_bias_linear=False,
             recompute_granularity="selective",
             recompute_modules=["moe"],
@@ -478,8 +490,14 @@ class TestMoELayerRecomputeSkipsCombineComm:
             bf16=True,
             params_dtype=torch.bfloat16,
         )
+        # The latent projections are Transformer Engine linears.
+        get_layer_submodules = (
+            get_gpt_layer_with_transformer_engine_submodules
+            if latent
+            else get_gpt_layer_local_submodules
+        )
         submodules = get_submodules(
-            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
+            get_layer_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
         )
         moe_layer = MoELayer(transformer_config, submodules).cuda()
         hidden_states = torch.randn(
@@ -499,6 +517,7 @@ class TestMoELayerRecomputeSkipsCombineComm:
 
         output, input_grad, grads, counts = forward_backward()
         assert not moe_layer.token_dispatcher.skip_combine_forward_comm
+        assert moe_layer._combined_latent is None
 
         # Reference: the re-run communicates in the combine.
         monkeypatch.setattr(MoELayer, "_skip_combine_comm_on_recompute", lambda self, fn: fn)

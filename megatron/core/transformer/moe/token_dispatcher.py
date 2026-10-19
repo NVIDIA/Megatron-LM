@@ -73,6 +73,9 @@ class MoETokenDispatcher:
     MoE Token Dispatcher
     """
 
+    # Whether token_combine honors skip_combine_forward_comm.
+    supports_skip_combine_forward_comm = False
+
     def __init__(
         self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
@@ -88,8 +91,8 @@ class MoETokenDispatcher:
         # Whether to use NCCL stream for A2A communication, otherwise default stream is used.
         self.use_nccl_stream = False  # Will be set to True when shared_experts is set.
         # Set by the MoE layer while its checkpointed forward is re-run for the backward pass:
-        # nothing reads the combined values then, so the combine may return zeros without
-        # communicating (its backward still communicates). Dispatchers may ignore it.
+        # the combine then returns zeros without communicating (its backward still
+        # communicates). Only read by dispatchers with supports_skip_combine_forward_comm.
         self.skip_combine_forward_comm = False
 
         self.ep_group = pg_collection.ep
@@ -255,6 +258,8 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     Note that this allgather spans the communication domain of TP*EP:
     """
 
+    supports_skip_combine_forward_comm = True
+
     def __init__(
         self,
         num_local_experts: int,
@@ -406,6 +411,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     (6) token combine: A2A(EP)
     (7) combine postprocess: unpermute tokens
     """
+
+    supports_skip_combine_forward_comm = True
 
     # DtoH copies are performed on this stream for overlapping with the main stream.
     cuda_dtoh_stream = None

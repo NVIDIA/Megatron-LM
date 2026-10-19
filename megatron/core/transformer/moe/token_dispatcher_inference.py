@@ -60,6 +60,9 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     and defines update_metadata independently.
     """
 
+    # The inference combines do not take the recompute skip.
+    supports_skip_combine_forward_comm = False
+
     # [1] int32: total valid tokens across all EP ranks this step.
     # Written in-place each step so CUDA graph replay sees a stable address.
     # NVLSAllGatherVDispatcher points this at _step_metadata[0:1] on first init
