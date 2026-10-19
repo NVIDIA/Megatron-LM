@@ -30,6 +30,15 @@ from megatron.lite.model.deepseek_v41.lite.ratio_one import RatioOneAttention
 from megatron.lite.model.deepseek_v41.lite.sources import DS41IndexKey, publish_latent
 
 
+class FrozenIndexerCSA(CompressedSparseAttention):
+    """Core 7b150acf: zero auxiliary loss uses one forward layout, with autograd."""
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.training = bool(mode and self.config.dsa_indexer_loss_coeff)
+        return self
+
+
 class ModelNorm(WrappedTorchNorm):
     def __new__(cls, config, hidden_size, eps, **kwargs):
         return (
@@ -125,7 +134,7 @@ class DS41AttentionSources(nn.Module):
         self.group = pg_collection.cp
         state = context.state
         if self.ratio in (0, 2):
-            self.native = CompressedSparseAttention(
+            self.native = FrozenIndexerCSA(
                 config=config,
                 submodules=CompressedSparseAttentionSubmodules(),
                 layer_number=layer_number,
@@ -133,7 +142,7 @@ class DS41AttentionSources(nn.Module):
                 rotary_pos_emb=rotary_pos_emb,
                 pg_collection=pg_collection,
                 **kwargs,
-            )
+            ).train()
         if self.ratio == 0:
             return
         if self.ratio == 2:

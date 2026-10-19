@@ -145,3 +145,16 @@ def test_runtime_rejects_unknown_model_options_before_build():
 def test_non_adam_optimizer_is_rejected_before_model_allocation(option):
     with pytest.raises(ValueError, match="optimizer"):
         _validate(DeepseekV41Config(num_hidden_layers=4), ImplConfig(**option))
+
+
+def test_zero_aux_loss_keeps_forward_layout_without_disabling_autograd():
+    from megatron.lite.model.deepseek_v41.lite.assembly import FrozenIndexerCSA
+
+    module = FrozenIndexerCSA.__new__(FrozenIndexerCSA)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(dsa_indexer_loss_coeff=0.0)
+    module.projection = torch.nn.Linear(2, 2, bias=False)
+    module.train()
+    assert not module.training and module.projection.training
+    module.projection(torch.ones(1, 2)).sum().backward()
+    assert module.projection.weight.grad is not None
