@@ -17,11 +17,24 @@ def _config(moe_paged_stash):
     )
 
 
+class _FakeCommManager:
+
+    def __init__(self, config):
+        self.config = config
+        self.moe_expert_rank_capacity_factor = config.moe_expert_rank_capacity_factor
+
+    def disable_expert_rank_capacity(self):
+        self.moe_expert_rank_capacity_factor = None
+
+    def restore_expert_rank_capacity(self):
+        self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
+
+
 class _FakeTokenDispatcher:
 
     def __init__(self, config):
         self.config = config
-        self._comm_manager = SimpleNamespace(moe_expert_rank_capacity_factor=1.5)
+        self._comm_manager = _FakeCommManager(config)
         self.invalidate_count = 0
         self.reset_count = 0
 

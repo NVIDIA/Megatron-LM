@@ -1111,6 +1111,19 @@ class _DispatchManager(ABC):
             if getattr(self, attr, None) is not None:
                 setattr(self, attr, None)
 
+    def disable_expert_rank_capacity(self) -> None:
+        """Clear the static expert-rank budget so the next attempt dispatches dropless.
+
+        Called by PagedStashRunner before it reruns a step that went over the expert-rank
+        budget or overflowed the paged stash, on backends that have an expert-rank budget
+        (``moe_expert_rank_capacity_factor``).
+        """
+        self.moe_expert_rank_capacity_factor = None
+
+    def restore_expert_rank_capacity(self) -> None:
+        """Restore the configured static expert-rank budget after a successful step."""
+        self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
+
     @abstractmethod
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Set up metadata of routing_map and probs."""
@@ -1221,11 +1234,38 @@ class _HybridEPManager(_DispatchManager):
             )
 
         self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
+        # Static budget set aside by disable_expert_rank_capacity() for a dropless rerun.
+        self._saved_num_permuted_tokens: int | None = None
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
         # When runtime token equalization is enabled, HybridEP metadata and hidden
         # states are padded to the group-wide max and trimmed again in combine.
         self._original_num_tokens: Optional[int] = None
         self._padded_num_tokens: Optional[int] = None
+
+    def disable_expert_rank_capacity(self) -> None:
+        """Save and clear the static expert-rank budget so the rerun dispatches dropless.
+
+        setup_metadata() also drops the budget once the factor is unset, but a CUDA graph
+        replay that skips setup_metadata() needs the budget back after the rerun:
+        restore_expert_rank_capacity() restores the value saved here. Per-expert capacity
+        (drop-and-pad) is static and stays.
+        """
+        if self.moe_expert_rank_capacity_factor is not None and not self.drop_and_pad:
+            self._saved_num_permuted_tokens = self.num_permuted_tokens
+            self.num_permuted_tokens = None
+            self.tokens_per_expert = None
+        self.moe_expert_rank_capacity_factor = None
+
+    def restore_expert_rank_capacity(self) -> None:
+        """Restore the configured static budget after a successful step.
+
+        Eager forwards recompute the budget in setup_metadata(); a replayed CUDA graph that
+        skips setup_metadata() reads the budget saved by disable_expert_rank_capacity().
+        """
+        self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
+        if self._saved_num_permuted_tokens is not None:
+            self.num_permuted_tokens = self._saved_num_permuted_tokens
+            self._saved_num_permuted_tokens = None
 
     def setup_metadata(
         self,
