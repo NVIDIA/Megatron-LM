@@ -31,10 +31,6 @@ BUCKET = "tests/unit_tests/pipeline_parallel/**/*.py"
 @pytest.fixture
 def source_tree(tmp_path):
     root = tmp_path / "source"
-    (root / "tests/unit_tests").mkdir(parents=True)
-    (root / "tests/unit_tests/test_example.py").write_text(
-        "def test_one(): pass\ndef test_two(): pass\n"
-    )
     for name in (*cache.COMPATIBILITY_FILES, "docker/.ngc_version.dev", "docker/Dockerfile.ci.dev"):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -55,19 +51,7 @@ def generation(tmp_path, source_tree):
         path.parent.mkdir(parents=True)
         database = DB(str(path))
         database.con.close()
-        cache.record_phase(
-            directory,
-            phase,
-            {
-                "world_size": 2,
-                "rootpath": str(source_tree),
-                "nodeids": [
-                    "tests/unit_tests/test_example.py::test_one",
-                    "tests/unit_tests/test_example.py::test_two",
-                ],
-                "files": cache.collection_inventory(source_tree),
-            },
-        )
+        cache.record_phase(directory, phase)
     cache.finalize(directory, identity, "b" * 40, "123-1")
     return directory, identity
 
@@ -118,7 +102,7 @@ def test_platform_and_bucket_are_isolated(source_tree):
     ]
     assert len({identity["cache_prefix"] for identity in identities}) == 3
     assert all(
-        identity["cache_prefix"].startswith("unit-testmon-v2-main-") for identity in identities
+        identity["cache_prefix"].startswith("unit-testmon-v1-main-") for identity in identities
     )
     assert all(root_conftest in identity["compatibility"]["inputs"] for identity in identities)
     assert all(
@@ -148,7 +132,7 @@ def test_new_platform_uses_registry_without_hashing_its_recipe(source_tree, monk
     (source_tree / recipe).write_text("original recipe")
 
     before = cache.cache_identity(source_tree, BUCKET, "dgx_gb300", IMAGE_ID)
-    assert before["cache_prefix"].startswith("unit-testmon-v2-main-dgx_gb300-")
+    assert before["cache_prefix"].startswith("unit-testmon-v1-main-dgx_gb300-")
     assert "tests/unit_tests/testmon_cache.py" not in before["compatibility"]["inputs"]
     assert recipe not in before["compatibility"]["inputs"]
 
@@ -252,7 +236,7 @@ def test_invalid_phase_is_rejected_without_repair(generation, mutation):
     else:
         metadata = json.loads(metadata_path.read_text())
         if mutation == "unsupported-metadata-schema":
-            metadata["schema"] = cache.SCHEMA + 1
+            metadata["schema"] = 2
         elif mutation == "runtime":
             metadata["runtime"]["python"] = "0.0.0"
         else:
@@ -279,7 +263,7 @@ def test_manifest_rejects_unsupported_cache_schema(generation):
     directory, identity = generation
     path = directory / "manifest.json"
     manifest = json.loads(path.read_text())
-    manifest["schema"] = cache.SCHEMA + 1
+    manifest["schema"] = 2
     path.write_text(json.dumps(manifest))
     before = _snapshot(directory)
     with pytest.raises(ValueError, match="compatibility"):
@@ -295,77 +279,6 @@ def test_manifest_requires_timezone_for_age_reporting(generation):
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="timezone"):
         cache.validate_cache(directory, identity, identity["cache_prefix"] + "123-1")
-
-
-def test_finalization_uses_rank_zero_metadata_without_per_rank_files(generation, source_tree):
-    directory, identity = generation
-    metadata_before = {
-        phase: (directory / phase / "metadata.json").read_bytes() for phase in cache.PHASES
-    }
-    cache.finalize(directory, identity, "b" * 40, "123-2")
-    for phase in cache.PHASES:
-        assert not (directory / phase / "collection").exists()
-        assert (directory / phase / "metadata.json").read_bytes() == metadata_before[phase]
-        metadata = json.loads((directory / phase / "metadata.json").read_text())
-        assert metadata["collection"] == {
-            "rootpath": str(source_tree),
-            "world_size": 2,
-            "nodeids": [
-                "tests/unit_tests/test_example.py::test_one",
-                "tests/unit_tests/test_example.py::test_two",
-            ],
-            "files": cache.collection_inventory(source_tree),
-        }
-
-
-@pytest.mark.parametrize("mutation", ["missing", "nodeids", "files", "world-size", "rootpath"])
-def test_finalize_rejects_invalid_rank_zero_collection(generation, mutation):
-    directory, identity = generation
-    (directory / "manifest.json").unlink()
-    metadata_path = directory / "experimental/metadata.json"
-    metadata = json.loads(metadata_path.read_text())
-    if mutation == "missing":
-        del metadata["collection"]
-    else:
-        collection = metadata["collection"]
-        if mutation == "files":
-            collection["files"] = {"tests/unit_tests/test_example.py": "invalid-hash"}
-        elif mutation == "world-size":
-            collection["world_size"] = 0
-        elif mutation == "nodeids":
-            collection["nodeids"] = [None]
-        else:
-            collection["rootpath"] = ""
-    metadata_path.write_text(json.dumps(metadata))
-    before = _snapshot(directory)
-    with pytest.raises(ValueError, match="collection inventory"):
-        cache.finalize(directory, identity, "b" * 40, "123-2")
-    assert _snapshot(directory) == before
-    assert not (directory / "manifest.json").exists()
-
-
-def test_cache_requires_finalized_collection_inventory(generation):
-    directory, identity = generation
-    path = directory / "prod/metadata.json"
-    metadata = json.loads(path.read_text())
-    del metadata["collection"]
-    path.write_text(json.dumps(metadata))
-    before = _snapshot(directory)
-    with pytest.raises(ValueError, match="collection inventory"):
-        cache.validate_cache(directory, identity, identity["cache_prefix"] + "123-1")
-    assert _snapshot(directory) == before
-
-
-def test_collection_inventory_tracks_test_helpers_and_added_or_removed_files(source_tree):
-    helper = source_tree / "tests/unit_tests/shared/helper.py"
-    helper.parent.mkdir()
-    helper.write_text("def helper(): return 1\n")
-    first = cache.collection_inventory(source_tree)
-    assert "tests/unit_tests/shared/helper.py" in first
-    helper.write_text("def helper(): return 2\n")
-    assert cache.collection_inventory(source_tree) != first
-    helper.unlink()
-    assert "tests/unit_tests/shared/helper.py" not in cache.collection_inventory(source_tree)
 
 
 def _action_script(name):

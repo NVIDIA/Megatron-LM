@@ -5,23 +5,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import platform
 import re
 import sqlite3
+import subprocess
 import sys
 from contextlib import closing
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 
-from testmon_cache import (
-    PHASES,
-    PLATFORMS,
-    TESTMON_VERSION,
-    cache_identity,
-    collection_inventory,
-    validate_cache,
-)
+from testmon_cache import PHASES, PLATFORMS, TESTMON_VERSION, cache_identity, validate_cache
 
 
 def _source_path(root: Path, filename: str) -> Path:
@@ -44,23 +39,59 @@ def _nodeid(root: Path, value: str) -> str:
     return value
 
 
-def _collection(root: Path, metadata: dict, files: dict[str, str]) -> dict:
-    collection = metadata.get("collection")
-    if not isinstance(collection, dict):
-        raise ValueError("missing rank-zero collection inventory")
-    world_size = collection.get("world_size")
-    if type(world_size) is not int or world_size < 1:
-        raise ValueError("invalid rank collection world size")
-    nodeids = collection.get("nodeids")
-    if not isinstance(nodeids, list) or len(set(nodeids)) != len(nodeids):
-        raise ValueError("invalid rank collection node IDs")
-    for nodeid in nodeids:
-        _nodeid(root, nodeid)
-    if collection.get("files") != files:
-        # Collection can execute arbitrary Python and generate parameters.
-        # Any new or changed test/helper needs collection in its original GPU environment.
+def _test_sources_unchanged(root: Path, source_sha: str, recipe_path: str | None = None) -> None:
+    """Require unchanged test sources without adding metadata to the baseline."""
+    if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+        raise ValueError("invalid Testmon baseline source commit")
+
+    def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, timeout=30, check=check
+        )
+
+    if git("cat-file", "-e", f"{source_sha}^{{commit}}", check=False).returncode:
+        # Actions checks out only the tested commit. Fetch the cached main commit
+        # without changing branch refs or requiring the repository's full history.
+        git("fetch", "--no-tags", "--no-write-fetch-head", "--depth=1", "origin", source_sha)
+
+    expected = {}
+    tracked_paths = ["tests/unit_tests"]
+    if recipe_path is not None:
+        tracked_paths.append(recipe_path)
+    entries = git("ls-tree", "-r", "-z", source_sha, "--", *tracked_paths).stdout
+    for entry in entries.split(b"\0"):
+        if not entry:
+            continue
+        header, filename = entry.split(b"\t", 1)
+        mode, kind, blob = header.split()
+        if mode not in (b"100644", b"100755") or kind != b"blob":
+            raise ValueError("baseline unit-test sources contain symbolic links or submodules")
+        name = filename.decode("utf-8", errors="surrogateescape")
+        if name.endswith(".py") or name == recipe_path:
+            expected[name] = blob.decode("ascii")
+
+    tests = root / "tests/unit_tests"
+    paths = list(tests.rglob("*"))
+    if recipe_path is not None:
+        # Recipe changes can alter bucket membership, markers, or GPU count.
+        paths.append(root / recipe_path)
+    if (
+        not tests.is_dir()
+        or (root / "tests").is_symlink()
+        or tests.is_symlink()
+        or any(path.is_symlink() for path in paths)
+    ):
+        raise ValueError("unit-test sources contain missing directories or symbolic links")
+
+    current = {}
+    for path in paths:
+        name = path.relative_to(root).as_posix()
+        if (path.suffix == ".py" or name == recipe_path) and path.is_file():
+            data = path.read_bytes()
+            blob = b"blob " + str(len(data)).encode("ascii") + b"\0" + data
+            current[name] = hashlib.sha1(blob, usedforsecurity=False).hexdigest()
+    if current != expected:
         raise ValueError("unit-test sources changed; GPU collection is required")
-    return collection
 
 
 def _changed_files(directory: Path, source_sha: str) -> list[str]:
@@ -129,7 +160,7 @@ def _mandatory_files(
     ]
 
 
-def _select_phase(root: Path, database: Path, collected: list[str]) -> list[str]:
+def _select_phase(root: Path, database: Path) -> list[str]:
     from testmon.process_code import Module, blob_to_checksums, read_source_sha
 
     with closing(
@@ -138,7 +169,11 @@ def _select_phase(root: Path, database: Path, collected: list[str]) -> list[str]
         environments = connection.execute("SELECT id FROM environment").fetchall()
         if len(environments) != 1:
             raise ValueError("Testmon baseline must have exactly one environment")
-        recorded = connection.execute("SELECT test_name, failed FROM test_execution").fetchall()
+        # Testmon inserts placeholders before marker filtering. Completed tests,
+        # including skips, have a duration; deselected placeholders do not.
+        recorded = connection.execute(
+            "SELECT test_name, failed FROM test_execution WHERE duration IS NOT NULL"
+        ).fetchall()
         fingerprints = connection.execute(
             "SELECT te.test_name, f.filename, f.fsha, f.method_checksums "
             "FROM test_execution te "
@@ -146,16 +181,12 @@ def _select_phase(root: Path, database: Path, collected: list[str]) -> list[str]
             "JOIN file_fp f ON f.id = tf.fingerprint_id"
         ).fetchall()
 
-    inventory = set(collected)
-    # Testmon records placeholders before pytest applies marker deselection.
-    known = {_nodeid(root, nodeid) for nodeid, _ in recorded} & inventory
-    # Keep any collected tests that have no recorded dependency evidence.
-    selected = inventory - known
-    selected.update(nodeid for nodeid, failed in recorded if nodeid in inventory and failed != 0)
+    known = {_nodeid(root, nodeid) for nodeid, _ in recorded}
+    selected = {nodeid for nodeid, failed in recorded if failed != 0}
     sources = {}
     covered = set()
     for nodeid, filename, recorded_sha, fingerprint in fingerprints:
-        if nodeid not in inventory:
+        if nodeid not in known:
             continue
         covered.add(nodeid)
         if filename not in sources:
@@ -220,9 +251,8 @@ def select(
             raise ValueError("unexpected pytest-testmon version")
         changed_files = _changed_files(pr_files_dir, source_sha)
         mandatory = _mandatory_files(root, bucket, recipe_platform, changed_files)
-        files = collection_inventory(root)
+        _test_sources_unchanged(root, manifest["source_sha"], PLATFORMS[recipe_platform]["recipe"])
         metadata = {}
-        collections = {}
         for phase in PHASES:
             metadata[phase] = json.loads((cache_dir / phase / "metadata.json").read_text())
             runtime = metadata[phase]["runtime"]
@@ -233,14 +263,8 @@ def select(
                 or runtime.get("implementation") != platform.python_implementation()
             ):
                 raise ValueError("CPU Python differs from the Testmon fingerprint interpreter")
-            collections[phase] = _collection(root, metadata[phase], files)
-        if len({collection["world_size"] for collection in collections.values()}) != 1:
-            raise ValueError("phase collection world sizes differ")
         phases = {
-            phase: _select_phase(
-                root, cache_dir / phase / ".testmondata", collections[phase]["nodeids"]
-            )
-            for phase in PHASES
+            phase: _select_phase(root, cache_dir / phase / ".testmondata") for phase in PHASES
         }
         # Recollect affected files in both modes: production dependencies can change
         # parameter IDs or experimental markers without changing the test source.
@@ -254,7 +278,6 @@ def select(
             reason="selected on CPU from the compatible main baseline",
             phases=phases,
             runtime={phase: metadata[phase]["runtime"] for phase in PHASES},
-            world_size=collections["prod"]["world_size"],
             mandatory_files=mandatory,
         )
     except (
@@ -265,6 +288,7 @@ def select(
         TypeError,
         KeyError,
         sqlite3.Error,
+        subprocess.SubprocessError,
     ) as error:
         plan["reason"] = str(error)
     return plan
@@ -279,7 +303,6 @@ def prepare(
     *,
     image_id: str | None = None,
     check_runtime: bool = False,
-    world_size: int | None = None,
 ) -> None:
     """Validate a selected plan before exposing its IDs to the distributed runner."""
     from testmon_cache import runtime_identity
@@ -299,11 +322,6 @@ def prepare(
         raise ValueError("Testmon plan has no immutable container image identity")
     if image_id is not None and planned_image != image_id:
         raise ValueError("Testmon plan container image changed")
-    planned_world_size = plan.get("world_size")
-    if type(planned_world_size) is not int or planned_world_size < 1:
-        raise ValueError("invalid Testmon plan world size")
-    if world_size is not None and planned_world_size != world_size:
-        raise ValueError("Testmon plan distributed world size changed")
     phases = plan.get("phases")
     if not isinstance(phases, dict) or set(phases) != set(PHASES):
         raise ValueError("incomplete Testmon plan phases")
@@ -346,7 +364,6 @@ def main(argv: list[str] | None = None) -> int:
     prepare_parser = commands.add_parser("prepare")
     prepare_parser.add_argument("--plan", type=Path, required=True)
     prepare_parser.add_argument("--check-runtime", action="store_true")
-    prepare_parser.add_argument("--world-size", type=int)
     for child in (select_parser, prepare_parser):
         child.add_argument("--cache-dir", type=Path, required=True)
         child.add_argument("--bucket", required=True)
@@ -364,7 +381,6 @@ def main(argv: list[str] | None = None) -> int:
                 args.source_sha,
                 image_id=args.image_id,
                 check_runtime=args.check_runtime,
-                world_size=args.world_size,
             )
         except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
             print(f"Unit Testmon plan unavailable: {error}", file=sys.stderr)

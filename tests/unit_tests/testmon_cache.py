@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, distributions, version
 from pathlib import Path
 
-SCHEMA = 2
+SCHEMA = 1
 TESTMON_VERSION = "2.2.0"
 PHASES = ("prod", "experimental")
 PLATFORMS = {
@@ -112,42 +112,6 @@ def _bucket_conftests(root: Path, bucket: str) -> set[Path]:
     }
 
 
-def collection_inventory(root: Path) -> dict[str, str]:
-    """Fingerprint test sources and helpers without importing GPU dependencies."""
-    return {
-        path.relative_to(root).as_posix(): _digest(path)
-        for path in sorted((root / "tests/unit_tests").rglob("*.py"))
-        if path.is_file()
-    }
-
-
-def _validate_collection(collection: object) -> None:
-    if not isinstance(collection, dict):
-        raise ValueError("missing Testmon collection inventory")
-    world_size = collection.get("world_size")
-    nodeids = collection.get("nodeids")
-    files = collection.get("files")
-    if (
-        type(world_size) is not int
-        or world_size < 1
-        or not isinstance(collection.get("rootpath"), str)
-        or not collection["rootpath"]
-        or not isinstance(nodeids, list)
-        or any(not isinstance(nodeid, str) or not nodeid or "\n" in nodeid for nodeid in nodeids)
-        or not isinstance(files, dict)
-        or any(
-            not isinstance(path, str)
-            or not path.startswith("tests/unit_tests/")
-            or ".." in Path(path).parts
-            or not path.endswith(".py")
-            or not isinstance(digest, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", digest)
-            for path, digest in files.items()
-        )
-    ):
-        raise ValueError("invalid Testmon collection inventory")
-
-
 def cache_identity(
     root: Path, bucket: str, recipe_platform: str, image_id: str = "unknown"
 ) -> dict:
@@ -208,9 +172,8 @@ def _validate_database(database: Path) -> None:
         raise ValueError(f"invalid Testmon database {database}: {error}") from error
 
 
-def record_phase(cache_dir: Path, phase: str, collection: dict) -> None:
-    """Save rank zero's dependency database and collection after a successful phase."""
-    _validate_collection(collection)
+def record_phase(cache_dir: Path, phase: str) -> None:
+    """Checkpoint and mark a successfully completed rank-zero baseline phase."""
     database = _database(cache_dir, phase)
     if not database.is_file():
         raise ValueError(f"missing Testmon database: {database}")
@@ -232,7 +195,6 @@ def record_phase(cache_dir: Path, phase: str, collection: dict) -> None:
             "complete": True,
             "runtime": identity,
             "database_sha256": _digest(database),
-            "collection": collection,
         },
     )
 
@@ -247,7 +209,6 @@ def validate_phase(cache_dir: Path, phase: str, *, check_runtime: bool = True) -
         or metadata.get("complete") is not True
     ):
         raise ValueError(f"incomplete Testmon phase: {phase}")
-    _validate_collection(metadata.get("collection"))
     runtime = metadata.get("runtime")
     if not isinstance(runtime, dict) or runtime.get("testmon") != TESTMON_VERSION:
         raise ValueError(f"invalid Testmon runtime metadata: {phase}")

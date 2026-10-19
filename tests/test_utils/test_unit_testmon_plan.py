@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -58,13 +61,26 @@ def project(tmp_path):
         "@pytest.mark.experimental\ndef test_experimental():\n    assert active(2) == 3\n"
     )
     (directory / "test_other.py").write_text("def test_other():\n    assert 1 + 1 == 2\n")
-    # Exercise Testmon's tracked-file hash path, without committing anything.
+    # Keep the fixtures independent of the developer's Git identity and signing setup.
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "add", "."], cwd=root, check=True)
     return root
 
 
 def _baseline(project, directory, bucket=BUCKET):
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    tree = subprocess.check_output(["git", "write-tree"], cwd=project, text=True).strip()
+    baseline_sha = subprocess.check_output(
+        ["git", "hash-object", "-t", "commit", "-w", "--stdin"],
+        cwd=project,
+        text=True,
+        input=(
+            f"tree {tree}\n"
+            "author Test Fixture <fixture@example.test> 0 +0000\n"
+            "committer Test Fixture <fixture@example.test> 0 +0000\n\n"
+            "Testmon baseline fixture\n"
+        ),
+    ).strip()
     target = bucket.removesuffix("/**/*.py")
     for phase in cache.PHASES:
         result = subprocess.run(
@@ -99,7 +115,7 @@ def _baseline(project, directory, bucket=BUCKET):
         )
         assert result.returncode == 0, result.stdout + result.stderr
     identity = cache.cache_identity(project, bucket, PLATFORM, IMAGE_ID)
-    cache.finalize(directory, identity, SOURCE_SHA, "123-1")
+    cache.finalize(directory, identity, baseline_sha, "123-1")
     return directory, identity["cache_prefix"] + "123-1"
 
 
@@ -164,6 +180,19 @@ def _metadata(generation, phase, update):
     path.write_text(json.dumps(metadata))
 
 
+def _change_database(generation, phase, statement, parameters=()):
+    database = generation[0] / phase / ".testmondata"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(statement, parameters)
+    _metadata(
+        generation,
+        phase,
+        lambda value: value.update(
+            database_sha256=hashlib.sha256(database.read_bytes()).hexdigest()
+        ),
+    )
+
+
 def _snapshot(directory):
     return {
         str(path.relative_to(directory)): (path.read_bytes(), path.stat().st_mtime_ns)
@@ -173,11 +202,16 @@ def _snapshot(directory):
 
 
 def test_unchanged_selection_is_empty_and_keeps_cache_readonly(project, generation):
+    assert cache.SCHEMA == 1
+    for phase in cache.PHASES:
+        metadata = json.loads((generation[0] / phase / "metadata.json").read_text())
+        assert "collection" not in metadata
+        assert "world_size" not in metadata
     before = _snapshot(generation[0])
     plan = _select(project, generation)
     assert plan["mode"] == "selected", plan["reason"]
     assert plan["phases"] == {"prod": [], "experimental": []}
-    assert plan["world_size"] == 1
+    assert "world_size" not in plan
     assert plan["runtime"]["prod"] == cache.runtime_identity()
     assert _snapshot(generation[0]) == before
 
@@ -198,7 +232,7 @@ def test_deleted_dependency_selects_its_test_file(project, generation):
     assert plan["phases"] == {"prod": [APP_TEST], "experimental": [APP_TEST]}
 
 
-@pytest.mark.parametrize("change", ("new", "modified", "deleted", "helper"))
+@pytest.mark.parametrize("change", ("new", "modified", "deleted", "helper", "staged"))
 def test_collection_changes_fall_back_to_full_bucket(project, generation, change):
     path = project / OTHER_TEST
     if change == "new":
@@ -209,17 +243,85 @@ def test_collection_changes_fall_back_to_full_bucket(project, generation, change
         path.unlink()
     else:
         path.write_text("raise AssertionError('the CPU selector must never import tests')\n")
+    if change == "staged":
+        subprocess.run(["git", "add", str(path)], cwd=project, check=True)
     plan = _select(project, generation)
     assert plan["mode"] == "full"
     assert "sources changed" in plan["reason"]
 
 
-def test_collected_tests_without_dependency_evidence_are_always_selected(project, generation):
-    extra = OTHER_TEST + "::test_unrecorded"
-    _metadata(generation, "prod", lambda value: value["collection"]["nodeids"].append(extra))
+def test_executed_tests_without_dependency_evidence_are_always_selected(project, generation):
+    _change_database(
+        generation,
+        "prod",
+        "DELETE FROM test_execution_file_fp WHERE test_execution_id IN "
+        "(SELECT id FROM test_execution WHERE test_name = ?)",
+        (OTHER_TEST + "::test_other",),
+    )
     plan = _select(project, generation)
     assert plan["mode"] == "selected", plan["reason"]
     assert plan["phases"] == {"prod": [OTHER_TEST], "experimental": [OTHER_TEST]}
+
+
+def test_marker_placeholders_are_not_executed_tests(project, generation):
+    with closing(sqlite3.connect(generation[0] / "prod/.testmondata")) as connection:
+        assert connection.execute(
+            "SELECT duration FROM test_execution WHERE test_name = ?",
+            (APP_TEST + "::test_experimental",),
+        ).fetchone() == (None,)
+    with closing(sqlite3.connect(generation[0] / "experimental/.testmondata")) as connection:
+        assert connection.execute(
+            "SELECT duration FROM test_execution WHERE test_name = ?",
+            (OTHER_TEST + "::test_other",),
+        ).fetchone() == (None,)
+    assert planner._select_phase(project, generation[0] / "prod/.testmondata") == []
+    assert planner._select_phase(project, generation[0] / "experimental/.testmondata") == []
+
+
+def test_skipped_and_xfailed_tests_retain_execution_evidence(project, tmp_path):
+    (project / OTHER_TEST).write_text(
+        "import pytest\n\n"
+        "@pytest.fixture\ndef skip_fixture():\n    pytest.skip('fixture skip')\n\n"
+        "def test_pass():\n    pass\n\n"
+        "@pytest.mark.skip(reason='static skip')\ndef test_skip():\n    pass\n\n"
+        "@pytest.mark.skipif(True, reason='condition')\ndef test_skipif():\n    pass\n\n"
+        "def test_fixture_skip(skip_fixture):\n    pass\n\n"
+        "def test_call_skip():\n    pytest.skip('call skip')\n\n"
+        "@pytest.mark.xfail(run=False, reason='disabled')\n"
+        "def test_xfail_no_run():\n    pass\n\n"
+        "@pytest.mark.xfail(reason='expected failure')\ndef test_xfail():\n    assert False\n\n"
+        "@pytest.mark.xfail(reason='unexpected pass')\ndef test_xpass():\n    pass\n"
+    )
+    generation = _baseline(project, tmp_path / "cache")
+    expected = {
+        OTHER_TEST + "::" + name
+        for name in (
+            "test_pass",
+            "test_skip",
+            "test_skipif",
+            "test_fixture_skip",
+            "test_call_skip",
+            "test_xfail_no_run",
+            "test_xfail",
+            "test_xpass",
+        )
+    }
+    with closing(sqlite3.connect(generation[0] / "prod/.testmondata")) as connection:
+        executed = {
+            nodeid
+            for (nodeid,) in connection.execute(
+                "SELECT test_name FROM test_execution WHERE duration IS NOT NULL"
+            )
+        }
+    assert expected <= executed
+    _change_database(
+        generation,
+        "prod",
+        "DELETE FROM test_execution_file_fp WHERE test_execution_id IN "
+        "(SELECT id FROM test_execution WHERE test_name LIKE ?)",
+        (OTHER_TEST + "::%",),
+    )
+    assert set(planner._select_phase(project, generation[0] / "prod/.testmondata")) == expected
 
 
 @pytest.mark.parametrize("image_id", ("unknown", "sha256:" + "c" * 64))
@@ -229,15 +331,16 @@ def test_unproven_runtime_image_falls_back(project, generation, image_id):
     assert "image" in plan["reason"]
 
 
-@pytest.mark.parametrize("problem", ("collection", "python", "database", "world_size", "key"))
+@pytest.mark.parametrize("problem", ("baseline", "python", "database", "key"))
 def test_incomplete_evidence_falls_back(project, generation, problem):
     overrides = {}
-    if problem == "collection":
-        _metadata(generation, "prod", lambda value: value.pop("collection"))
+    if problem == "baseline":
+        manifest_path = generation[0] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["source_sha"] = "f" * 40
+        manifest_path.write_text(json.dumps(manifest))
     elif problem == "python":
         _metadata(generation, "prod", lambda value: value["runtime"].update(python="0.0.0"))
-    elif problem == "world_size":
-        _metadata(generation, "prod", lambda value: value["collection"].update(world_size=2))
     elif problem == "database":
         (generation[0] / "prod/.testmondata").write_bytes(b"invalid sqlite")
     else:
@@ -287,14 +390,7 @@ def test_prepare_preserves_nodeids_and_validates_container_runtime(
     plan["phases"]["prod"] = [APP_TEST + '::test_active[space " and $value]']
     monkeypatch.chdir(project)
     planner.prepare(
-        plan,
-        generation[0],
-        BUCKET,
-        PLATFORM,
-        SOURCE_SHA,
-        image_id=IMAGE_ID,
-        check_runtime=True,
-        world_size=1,
+        plan, generation[0], BUCKET, PLATFORM, SOURCE_SHA, image_id=IMAGE_ID, check_runtime=True
     )
     for phase in cache.PHASES:
         selected = generation[0] / ".testmon-work" / phase / "selected-tests"
@@ -331,7 +427,7 @@ def test_host_prepare_needs_only_the_standard_library(project, generation):
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("problem", ("full", "source", "image", "runtime", "world_size", "path"))
+@pytest.mark.parametrize("problem", ("full", "source", "image", "runtime", "path"))
 def test_prepare_rejects_stale_or_invalid_selection(project, generation, monkeypatch, problem):
     plan = _select(project, generation)
     if problem == "full":
@@ -342,28 +438,21 @@ def test_prepare_rejects_stale_or_invalid_selection(project, generation, monkeyp
         plan["image_id"] = "sha256:" + "c" * 64
     elif problem == "runtime":
         plan["runtime"]["prod"]["python"] = "0.0.0"
-    elif problem == "world_size":
-        plan["world_size"] = 2
     else:
         plan["phases"]["prod"] = ["tests/unit_tests/../../escape.py::test_bad"]
     monkeypatch.chdir(project)
     with pytest.raises(ValueError):
         planner.prepare(
-            plan,
-            generation[0],
-            BUCKET,
-            PLATFORM,
-            SOURCE_SHA,
-            image_id=IMAGE_ID,
-            check_runtime=True,
-            world_size=1,
+            plan, generation[0], BUCKET, PLATFORM, SOURCE_SHA, image_id=IMAGE_ID, check_runtime=True
         )
     assert not (generation[0] / ".testmon-work").exists()
 
 
 def test_explicit_file_bucket_recollects_after_source_changes(project, tmp_path):
     generation = _baseline(project, tmp_path / "cache", APP_TEST)
-    unchanged = _select(project, generation, bucket=APP_TEST)
+    baseline_sha = json.loads((generation[0] / "manifest.json").read_text())["source_sha"]
+    _pr_files(project, [], tested_sha=baseline_sha)
+    unchanged = _select(project, generation, bucket=APP_TEST, source_sha=baseline_sha)
     assert unchanged["mode"] == "selected", unchanged["reason"]
     changed = _select(project, generation, bucket=APP_TEST, source_sha="c" * 40)
     assert changed["mode"] == "full"

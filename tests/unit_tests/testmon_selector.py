@@ -23,24 +23,6 @@ class _SelectionOutput:
         self.output.write_text("".join(f"{nodeid}\n" for nodeid in selected_tests))
 
 
-class _BaselineCollection:
-    """Record rank zero's inventory, assuming all ranks collect the same test IDs."""
-
-    def __init__(self, inventory, world_size: int) -> None:
-        self.inventory = inventory
-        self.world_size = world_size
-        self.collection: dict | None = None
-
-    def pytest_collection_finish(self, session) -> None:
-        root = session.config.rootpath.resolve()
-        self.collection = {
-            "world_size": self.world_size,
-            "rootpath": str(root),
-            "nodeids": sorted({item.nodeid for item in session.items}),
-            "files": self.inventory(root),
-        }
-
-
 def _database(cache_dir: Path, phase: str) -> Path:
     return cache_dir.resolve() / phase / ".testmondata"
 
@@ -77,7 +59,7 @@ def _testmon_dependency_override() -> str:
 
 def _run(args: argparse.Namespace) -> int:
     # Spawned workers reload this script after its directory leaves sys.path.
-    from testmon_cache import collection_inventory, record_phase, validate_phase
+    from testmon_cache import record_phase, validate_phase
 
     try:
         rank = int(os.environ["RANK"])
@@ -93,10 +75,9 @@ def _run(args: argparse.Namespace) -> int:
     if not pytest_args:
         raise RuntimeError("pytest arguments are required after --")
 
-    plugin: _BaselineCollection | _SelectionOutput | None = None
+    selection_plugin = None
     if args.mode == "baseline":
         if rank == 0:
-            plugin = _BaselineCollection(collection_inventory, world_size)
             database = _database(args.cache_dir, args.phase)
             _clear_database_files(database)
             (database.parent / "metadata.json").unlink(missing_ok=True)
@@ -112,7 +93,7 @@ def _run(args: argparse.Namespace) -> int:
         database = _copy_database(args.cache_dir, args.phase, rank)
         selection_file = database.parent / "selected-tests"
         selection_file.unlink(missing_ok=True)
-        plugin = _SelectionOutput(selection_file)
+        selection_plugin = _SelectionOutput(selection_file)
         pytest_args.extend(
             (
                 "-o",
@@ -132,11 +113,10 @@ def _run(args: argparse.Namespace) -> int:
 
     import pytest
 
-    result = int(pytest.main(pytest_args, plugins=[plugin] if plugin is not None else []))
-    if isinstance(plugin, _BaselineCollection) and result in (0, 5):
-        if plugin.collection is None:
-            raise RuntimeError("missing baseline pytest collection")
-        record_phase(args.cache_dir, args.phase, plugin.collection)
+    plugins = [selection_plugin] if selection_plugin else []
+    result = int(pytest.main(pytest_args, plugins=plugins))
+    if args.mode == "baseline" and rank == 0 and result in (0, 5):
+        record_phase(args.cache_dir, args.phase)
     return 0 if result == 5 else result
 
 

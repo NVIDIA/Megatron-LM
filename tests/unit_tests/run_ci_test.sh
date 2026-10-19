@@ -345,7 +345,7 @@ run_enforced_tests() {
                 --plan "$UNIT_TESTMON_CACHE_DIR/plan.json" --cache-dir "$UNIT_TESTMON_CACHE_DIR" \
                 --bucket "$BUCKET" --platform "dgx_$PLATFORM" \
                 --source-sha "$(git rev-parse HEAD)" \
-                --check-runtime --world-size "$((NUM_NODES * GPUS_PER_NODE))"; then
+                --check-runtime; then
             write_testmon_summary "full fallback: CPU selection plan failed runtime validation"
             run_full_tests
             return
