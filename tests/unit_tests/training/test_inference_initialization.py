@@ -42,7 +42,6 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
     calls = {}
     for name in (
         "set_run_config",
-        "initialize_runtime_services",
         "initialize_megatron",
         "load_checkpoint",
         "generate_and_write_samples_conditional",
@@ -55,7 +54,6 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
     script.main()
 
     calls["set_run_config"].assert_called_once_with(cfg)
-    calls["initialize_runtime_services"].assert_called_once_with(args)
     calls["initialize_megatron"].assert_called_once_with()
     if load_checkpoint:
         calls["load_checkpoint"].assert_called_once_with([model], None, None)
@@ -206,6 +204,7 @@ def test_inference_distributed_initialization_without_training_fields(
     ):
         delattr(args, name)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(initialize, "initialize_runtime_services", Mock())
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize, "set_default_log_ranks", Mock())
@@ -282,6 +281,7 @@ def test_distributed_training_services_require_explicit_opt_in(
 
     monkeypatch.setattr(run_config, "finalize", finalize_config)
     for name in (
+        "initialize_runtime_services",
         "init_persistent_async_worker",
         "initialize_rerun_state_machine",
         "_initialize_distributed",
@@ -300,6 +300,7 @@ def test_distributed_training_services_require_explicit_opt_in(
 
     assert events == [
         "finalize_config",
+        "initialize_runtime_services",
         "init_persistent_async_worker",
         "initialize_rerun_state_machine",
         "_initialize_distributed",

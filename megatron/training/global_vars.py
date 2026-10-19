@@ -171,6 +171,7 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
     assert cfg_container is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
+    cfg_container.validate()
     set_run_config(cfg_container)
     set_args(args)
     initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=True)
@@ -179,10 +180,13 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
 def initialize_runtime_services(
     args: Namespace, *, build_tokenizer: bool = True, training: bool = False
 ) -> None:
-    """Initialize shared services, plus training-only services when requested."""
+    """Build services from validated config; normally called by initialize_megatron."""
+    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
     cfg = get_run_config()
     if build_tokenizer:
         _build_tokenizer(args)
+    resolve_tokenizer_vocab_size(cfg, getattr(args, "padded_vocab_size", None))
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 

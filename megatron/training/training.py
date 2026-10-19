@@ -1597,6 +1597,8 @@ def pretrain(
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
     callbacks: list[Callback] | CallbackManager | None = None,
+    *,
+    build_tokenizer: bool = True,
 ):
     """Main training program.
 
@@ -1639,6 +1641,8 @@ def pretrain(
             torch.distributed.init_process_group
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
+        build_tokenizer: whether startup builds the shared tokenizer. Disable for
+            workloads that provide their own tokenization, such as heterogeneous MiMo.
     """
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
@@ -1665,6 +1669,7 @@ def pretrain(
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
         training=True,
+        build_tokenizer=build_tokenizer,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
