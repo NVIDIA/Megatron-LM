@@ -802,6 +802,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.request_counter = Counter()
         self.finished_request_count = 0
         self.evicted_request_count = 0
+        # Staging is drained by now (checked above), so the backlog peak starts over.
+        self._staging_tasks_peak = 0
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()

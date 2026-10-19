@@ -1988,6 +1988,9 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     engine.resume_request_ids = []
     engine._vision_embedding_cache = {"cached": _make_vision_cache_entry(torch.ones(1))}
     engine._vision_embedding_cache_bytes = 4
+    # Drained, so the staging backlog peak is a stale per-run statistic.
+    engine._staging_tasks = set()
+    engine._staging_tasks_peak = 3
 
     loop = engine._loop
     condition = engine._cond
@@ -2016,6 +2019,7 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     assert engine.resume_request_ids is None
     assert not engine._vision_embedding_cache
     assert engine._vision_embedding_cache_bytes == 0
+    assert engine._staging_tasks_peak == 0
     engine.context.reset.assert_called_once_with()
     engine.controller._async_sched_forward.clear.assert_called_once_with()
 
