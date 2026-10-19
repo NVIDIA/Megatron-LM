@@ -38,6 +38,18 @@ from tests.unit_tests.transformer.test_attention import _test_parallel_attention
 pytestmark = pytest.mark.launch_on_gb200
 
 
+@pytest.fixture(autouse=True)
+def fresh_gdn_compile_cache():
+    """Keep independent TP/CP/model cases from changing one another's execution mode."""
+    # Parameter-vs-Tensor CP views and shape variants can exhaust Dynamo's default
+    # recompile budget across cases. A later SBHD/THD pair would then compare eager
+    # with compiled BF16 arithmetic. Keep the default limit and share the cache
+    # within each comparison, without disabling compilation or relaxing tolerances.
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
+
+
 def _assert_relative_rms_close(
     actual: torch.Tensor, expected: torch.Tensor, tolerance: float, name: str
 ) -> None:

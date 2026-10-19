@@ -473,10 +473,11 @@ class TestFP8Param:
             loss = output.mean()
             loss.backward()
 
+            # Production finalization fences GTP in both DP-overlap modes. Otherwise
+            # output-layer wgrads remain unflushed, even after optimizer.step(), and
+            # a later model can try to reduce them over already-destroyed groups.
+            _gtp_grad_fence()
             if args.overlap_grad_reduce:
-                # Production order (finalize_model_grads): the GTP fence runs BEFORE the DP
-                # grad sync and is what flushes an accumulated wgrad.
-                _gtp_grad_fence()
                 gpt_model[0].finish_grad_sync()
 
             for name, param in gpt_model[0].named_parameters():

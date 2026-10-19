@@ -18,7 +18,10 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -256,7 +259,12 @@ def _make_models(config, kind, empty):
             spec.module = HyperConnectionTransformerLayer
             spec.submodules.self_attention_hyper_connection = HyperConnectionModule
             spec.submodules.mlp_hyper_connection = HyperConnectionModule
-            model = GPTModel(transformer_layer_spec=spec, **kwargs)
+            mtp_spec = (
+                get_gpt_mtp_block_spec(config, spec, use_transformer_engine=True, vp_stage=vp_stage)
+                if config.mtp_num_layers
+                else None
+            )
+            model = GPTModel(transformer_layer_spec=spec, mtp_block_spec=mtp_spec, **kwargs)
         else:
             pattern = "*-||*-|" if empty and pp_size > 1 else "*-*-"
             if config.mtp_num_layers:
@@ -273,8 +281,8 @@ def _make_models(config, kind, empty):
 
 
 @pytest.mark.internal
-def test_mhc_gpt_pipeline_rejects_mtp():
-    """Reject GPT's early contraction before constructing its multi-stream MTP block."""
+def test_mhc_gpt_pipeline_constructs_mtp_on_last_stage():
+    """Dev's retained multistream path supports GPT MTP on the last PP stage."""
     if Utils.world_size % 2 != 0:
         pytest.skip("Requires a world size divisible by 2")
     Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
@@ -289,11 +297,11 @@ def test_mhc_gpt_pipeline_rejects_mtp():
             standalone=False,
             mtp=True,
         )
-        with pytest.raises(
-            NotImplementedError,
-            match="GPTModel does not support mHC with pipeline parallelism and MTP",
-        ):
-            _make_models(config, "gpt", False)
+        models = _make_models(config, "gpt", False)
+        last_stage = parallel_state.is_pipeline_last_stage()
+        assert len(models) == 1
+        assert models[0].mtp_process == last_stage
+        assert hasattr(models[0], "mtp") == last_stage
     finally:
         Utils.destroy_model_parallel()
 
@@ -414,6 +422,7 @@ def fresh_mhc_compile_cache():
         ("gpt", 2, 1, 1, False, True, False, False, False),
         ("hybrid", 2, 1, 1, False, False, True, False, False),
         ("hybrid", None, 2, 1, False, False, False, True, False),
+        ("gpt", None, 1, 1, False, False, False, True, False),
         ("gpt", None, 1, 2, True, False, False, False, False),
         ("gpt", 2, 1, 2, True, False, False, False, False),
     ],
@@ -424,6 +433,7 @@ def fresh_mhc_compile_cache():
         "embedding_loss",
         "empty_hybrid",
         "tp_sp_mtp",
+        "gpt_mtp",
         "cp_variable",
         "vpp_cp_variable",
     ],

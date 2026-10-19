@@ -125,6 +125,8 @@ def _assert_bitwise_across_ranks(loss_ref, loss_test, label):
 
 
 def _run_pair(extra, label):
+    from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
+
     if Utils.world_size != 4:
         pytest.skip("Requires exactly 4 torchrun ranks for TP2 x GTP2")
     harness = _LayerShardedHarness()
@@ -137,6 +139,7 @@ def _run_pair(extra, label):
             tp_size=2, recipe=_RECIPE, fp8_param_gather=False, muon_tp_mode="duplicated", **common
         )
         assert harness.layer_sharded_instances == 0
+        assert not gtp._GTP_PENDING_WGRAD_ACCUM, "duplicated run left GTP gradients unflushed"
         loss_lsh = harness._run_test_helper(
             tp_size=2,
             recipe=_RECIPE,
@@ -145,6 +148,7 @@ def _run_pair(extra, label):
             **common,
         )
         assert loss_dup.shape == loss_lsh.shape == (common["num_steps"],)
+        assert not gtp._GTP_PENDING_WGRAD_ACCUM, "layer-sharded run left GTP gradients unflushed"
         assert harness.layer_sharded_instances >= 1, "no LayerShardedMuon was constructed"
         assert harness.wired_groups > 0, "the layer-wise wiring assigned no NS homes"
         assert harness.two_d_groups == harness.wired_groups, (
