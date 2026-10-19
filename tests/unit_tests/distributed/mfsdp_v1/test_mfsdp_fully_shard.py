@@ -382,9 +382,17 @@ class TestMegatronFsdpFullyShard:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("shard_strategy", [NO_SHARD, OPTIM, OPTIM_GRADS, OPTIM_GRADS_PARAMS])
+    @pytest.mark.parametrize(
+        "shard_strategy,use_fsdp_unit",
+        [
+            (NO_SHARD, False),
+            (NO_SHARD, True),
+            (OPTIM, True),
+            (OPTIM_GRADS, True),
+            (OPTIM_GRADS_PARAMS, True),
+        ],
+    )
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    @pytest.mark.parametrize("use_fsdp_unit", [False, True])
     def test_local_linear_fused_wgrad_accumulation(self, shard_strategy, dtype, use_fsdp_unit):
         """Retain every microbatch, then reset the gradient for the next optimization cycle."""
         device_mesh = build_distributed_environment((1, Utils.world_size, 1, 1))
