@@ -3928,6 +3928,9 @@ class TransformerConfig(ModelParallelConfig):
                     "Simplified DSA requires a positive dsa_indexer_head_dim when "
                     "explicitly set."
                 )
+                assert (
+                    self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0
+                ), "dsa_indexer_topk must be set to a positive integer when using DSA."
                 self.dsa_indexer_n_heads = 1
                 if self.dsa_indexer_head_dim is None:
                     self.dsa_indexer_head_dim = self.kv_channels
@@ -3936,15 +3939,14 @@ class TransformerConfig(ModelParallelConfig):
                 # so resolve it here rather than making every simplified config turn it off.
                 self.dsa_indexer_rotate_activation = False
             else:
+                # The standard indexer belongs to DSA over MLA, which upstream reaches through
+                # the 'D' layer-pattern symbol. That symbol sets experimental_attention_variant
+                # for the user without supplying indexer parameters, so requiring them here
+                # would reject a configuration upstream considers valid. Sanity-check what is
+                # set and leave the rest to that path's own owner.
                 assert (
-                    self.dsa_indexer_n_heads is not None and self.dsa_indexer_n_heads > 0
-                ), "dsa_indexer_n_heads must be set to a positive integer when using DSA."
-                assert (
-                    self.dsa_indexer_head_dim is not None and self.dsa_indexer_head_dim > 0
-                ), "dsa_indexer_head_dim must be set to a positive integer when using DSA."
-            assert (
-                self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0
-            ), "dsa_indexer_topk must be set to a positive integer when using DSA."
+                    self.dsa_indexer_topk is None or self.dsa_indexer_topk > 0
+                ), "dsa_indexer_topk must be positive when set."
             # These limits are DSGroupedSelfAttention's, and the simplified indexer is the only
             # signal the config has for it. Non-MLA alone also caught standard-indexer
             # DSAttention with one query group, which has none of them.
