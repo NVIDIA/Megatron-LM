@@ -23,13 +23,23 @@ class SchedulePolicy:
 
     ``None`` prefetches one successor, preserving the default behavior. ``0``
     disables prefetching. Positive values specify parameter-element budgets.
+
+    ``reduce_scatter_interval`` counts completed module backwards, not individual
+    parameter callbacks. Values greater than one retain one full local-gradient
+    buffer per trainable parameter group in main-gradient precision. Mark the
+    last microbatch with ``microbatch(context, is_last=True)`` to reduce any
+    incomplete window before consuming gradients. All data-parallel ranks must
+    use the same policy and backward order. The default reduces every backward.
     """
 
     forward_prefetch_size: int | None = None
     backward_prefetch_size: int | None = None
+    reduce_scatter_interval: int = 1
 
     def __post_init__(self) -> None:
-        """Validate non-negative prefetch budgets."""
+        """Validate prefetch budgets and the gradient-reduction interval."""
+        if type(self.reduce_scatter_interval) is not int or self.reduce_scatter_interval < 1:
+            raise ValueError("reduce_scatter_interval must be a positive integer.")
         if self.forward_prefetch_size is not None and self.forward_prefetch_size < 0:
             raise ValueError(
                 "forward_prefetch_size must be non-negative, " f"got {self.forward_prefetch_size}."

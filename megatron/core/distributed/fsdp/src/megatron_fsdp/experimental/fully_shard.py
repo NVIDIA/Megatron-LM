@@ -177,13 +177,14 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
 def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
     """Mark an FSDP microbatch as the last accumulation microbatch.
 
-    At present, this is only needed for HSDP/HFSDP gradient accumulation, so
-    FSDP finalizes gradients only on the last backward. Plain all-``Shard(0)`` data
-    parallelism finalizes gradients on every backward and does not need it.
+    HSDP/HFSDP finalize the outer data-parallel reduction on the last backward.
+    Modules with ``SchedulePolicy(reduce_scatter_interval > 1)`` also reduce any
+    incomplete local-gradient accumulation window on that backward. Other plain
+    all-``Shard(0)`` configurations do not need this scope.
 
     Args:
         context: FSDP context whose roots should use this microbatch state.
-        is_last: Whether forwards in this scope are for the last microbatch.
+        is_last: Whether backward work in this scope completes the last microbatch.
     """
     context.ensure_finalized()
     previous_state = context.is_last_microbatch
