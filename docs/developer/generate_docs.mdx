@@ -12,20 +12,6 @@ description: Shows the commands to build and preview the Megatron Core documenta
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 */}
 
-To generate a preview copy of the docs:
-
-1. Commit and push your work to the Megatron repository.
-2. Wait for CI checks to complete on your pull request (PR).
-3. Review the content built for you at the preview link associated with your PR.
-
-PR previews and production publishing use separate Fern tokens, so a preview build cannot change the published docs:
-
-- `DOCS_FERN_PREVIEW_TOKEN` is a repository or organization secret. The preview workflow uses it to build the preview site and post the link on your PR.
-- `DOCS_FERN_PUBLISH_TOKEN` is a secret in the `fern-publish` environment. Only the publish workflow uses it, and a maintainer approves each publish run.
-
-Maintainers create both tokens with `fern token` for the `nvidia` Fern organization.
-
-
 To generate docs locally:
 
 1. Review the [Fern Quick Start](https://buildwithfern.com/learn/docs/getting-started/quickstart).

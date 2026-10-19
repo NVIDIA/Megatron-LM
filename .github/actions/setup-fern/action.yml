@@ -15,11 +15,9 @@
 
 # The single place the Node and Fern CLI versions are set for every Fern workflow.
 #
-# The caller must check out this action first. In the preview comment workflow,
-# fern.config.json comes from an untrusted pull request artifact, so the version
-# is checked against a strict semver pattern before it reaches `npm install`.
-# Otherwise a crafted value could install an arbitrary package that later runs
-# with a Fern token in its environment.
+# The caller must check out this action first. The version in fern.config.json is
+# checked against a strict semver pattern before it reaches `npm install`, so a
+# pull request cannot change it into an arbitrary package spec.
 
 name: 'Set up Fern CLI'
 description: 'Installs Node and the fern-api version pinned in fern.config.json'

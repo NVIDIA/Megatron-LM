@@ -20,12 +20,11 @@
 #
 # This is the only workflow that holds the publish token, and it is only reachable
 # from a tag push or a manual dispatch, both of which require write access. Never
-# add a pull_request or pull_request_target trigger here. PR previews use the
-# separate DOCS_FERN_PREVIEW_TOKEN in fern-docs-preview-comment.yml.
+# add a pull_request or pull_request_target trigger here.
 #
 # Required configuration:
 # - Environment: fern-publish, restricted to main and docs/v* tags, with required reviewers
-# - Environment secret: DOCS_FERN_PUBLISH_TOKEN (from `fern token` for the nvidia Fern org)
+# - Repository secret: FERN_TOKEN (from `fern token` for the nvidia Fern org)
 
 name: Publish Fern Docs
 
@@ -83,7 +82,7 @@ jobs:
 
       - name: Publish Docs
         env:
-          FERN_TOKEN: ${{ secrets.DOCS_FERN_PUBLISH_TOKEN }}
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
         working-directory: ./docs/fern
         run: |
           set -o pipefail
