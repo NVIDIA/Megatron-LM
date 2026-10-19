@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 [build-system]
-requires = ["setuptools>=80", "pybind11", "packaging>=24.2"]
+requires = ["setuptools<80.0.0", "pybind11", "packaging>=24.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -83,7 +83,7 @@ mlm = [
 ]
 
 dev = [
-    "nvidia-modelopt[torch]>=0.44; sys_platform != 'darwin'",
+    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
     "nvidia-resiliency-ext==0.6.0",
     "tqdm",
@@ -91,7 +91,7 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
-    "opentelemetry-api>=1.33.1,<2",
+    "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "flash-linear-attention[tilelang]==0.5.1",
@@ -117,7 +117,7 @@ lts = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
-    "opentelemetry-api>=1.33.1,<2",
+    "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "megatron-energon[av_decode]~=6.0",
@@ -169,7 +169,7 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 build = [
-    "setuptools>=80",
+    "setuptools<80.0.0,>=77.0.0",
     "packaging>=24.2",
     "hatchling",
     "pybind11",
@@ -206,6 +206,10 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    # The Mamba revision pinned from main requires tilelang==0.1.8 and apache-tvm-ffi<=0.1.9.
+    # Override them to the versions the dev extra pins, as main does.
+    "tilelang==0.1.12",
+    "apache-tvm-ffi==0.1.11",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
 ]
@@ -244,6 +248,7 @@ transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", 
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible

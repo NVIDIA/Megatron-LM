@@ -2009,6 +2009,49 @@ class CompressedSparseAttentionSubmodules:
     indexer: Union[ModuleSpec, type] = None
 
 
+class _CompactIndexerWorkspaceStore:
+    """Warmed-up compact-indexer workspaces (BSHD, THD, balanced THD per slot) and the active one
+    of each kind (the immediately preceding warm-up, which capture reuses).
+
+    One store per CSA module reproduces the historical per-layer ownership. With
+    ``TransformerConfig.dsa_compact_indexer_workspace_sharing`` all CSA modules built from the same
+    config on the same device share one store: layers execute serially on one stream and nothing in
+    a workspace outlives the indexer dispatch that fills it (the quantized q/k, packed scales and
+    candidate offsets are consumed by the compact top-k kernel, whose outputs are copied into
+    per-dispatch buffers; the attention and indexer-loss backward read bf16 saved tensors, never
+    the workspace), so a later layer overwriting the buffers is the same reuse eager gets from
+    its transient allocations.
+    """
+
+    def __init__(self) -> None:
+        self.bshd: list[BSHDCompactIndexerWorkspace] = []
+        self.bshd_active: BSHDCompactIndexerWorkspace | None = None
+        self.thd: list[THDCompactIndexerWorkspace] = []
+        self.thd_active: THDCompactIndexerWorkspace | None = None
+        self.balanced_thd: dict[str, list[THDCompactIndexerWorkspace]] = {}
+        self.balanced_thd_active: dict[str, THDCompactIndexerWorkspace] = {}
+
+    def __deepcopy__(self, memo):
+        # Runtime GPU state shared by graphs; a copied config must not duplicate it.
+        return self
+
+
+def _shared_compact_indexer_workspace_store(config, device: torch.device):
+    """Return the store shared by all CSA layers built from ``config`` on ``device``."""
+    stores = getattr(config, "_compact_indexer_workspace_stores", None)
+    if stores is None:
+        stores = {}
+        # Plain attribute on the (non-frozen) dataclass: not a field, so it is invisible to
+        # ``dataclasses.asdict``/``replace``; ``__deepcopy__`` above keeps copies from cloning it.
+        setattr(config, "_compact_indexer_workspace_stores", stores)
+    key = (device.type, device.index)
+    store = stores.get(key)
+    if store is None:
+        store = _CompactIndexerWorkspaceStore()
+        stores[key] = store
+    return store
+
+
 class CompressedSparseAttention(MegatronModule):
     """Sparse core attention for CompressedSparseAttention.
 
@@ -2120,22 +2163,15 @@ class CompressedSparseAttention(MegatronModule):
             )
 
         # Compact CUDA graphs reference caller-owned THD offsets and MXFP8
-        # buffers by address. Retain every warmed-up static geometry for the
-        # lifetime of this module so later graph captures cannot invalidate an
-        # earlier graph's storage. Candidate scratch and compact outputs are
-        # allocated inside the forward, so the CUDA-graph pool can reuse them
-        # after each serialized graph.
-        # ``_active_*`` identifies the immediately preceding warmup.
-        self._bshd_compact_indexer_workspaces: list[BSHDCompactIndexerWorkspace] = []
-        self._active_bshd_compact_indexer_workspace: BSHDCompactIndexerWorkspace | None = None
-        self._thd_compact_indexer_workspaces: list[THDCompactIndexerWorkspace] = []
-        self._active_thd_compact_indexer_workspace: THDCompactIndexerWorkspace | None = None
-        self._balanced_thd_compact_indexer_workspaces: dict[
-            str, list[THDCompactIndexerWorkspace]
-        ] = {}
-        self._active_balanced_thd_compact_indexer_workspaces: dict[
-            str, THDCompactIndexerWorkspace
-        ] = {}
+        # buffers by address. Every warmed-up static geometry is retained in a
+        # ``_CompactIndexerWorkspaceStore`` for the lifetime of the graphs so
+        # later captures cannot invalidate an earlier graph's storage. Candidate
+        # scratch and compact outputs are allocated inside the forward, so the
+        # CUDA-graph pool can reuse them after each serialized graph. The store
+        # is bound lazily (the device is only known at the first dispatch) and,
+        # with ``config.dsa_compact_indexer_workspace_sharing``, is shared by all
+        # CSA layers built from this config on that device.
+        self._compact_indexer_store: _CompactIndexerWorkspaceStore | None = None
 
     def backward_dw(self):
         """Compute the deferred weight gradients of the optional compressor/indexer submodules.
@@ -2151,6 +2187,64 @@ class CompressedSparseAttention(MegatronModule):
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
     # ------------------------------------------------------------------
+
+    def _compact_indexer_workspace_store(
+        self, device: torch.device | None = None
+    ) -> _CompactIndexerWorkspaceStore:
+        """Bind (once) and return this layer's compact-indexer workspace store."""
+        store = self._compact_indexer_store
+        if store is None:
+            if device is None:
+                param = next(self.parameters(), None)
+                device = (
+                    param.device
+                    if param is not None
+                    else torch.device("cuda", torch.cuda.current_device())
+                )
+            if getattr(self.config, "dsa_compact_indexer_workspace_sharing", True):
+                store = _shared_compact_indexer_workspace_store(self.config, device)
+            else:
+                store = _CompactIndexerWorkspaceStore()
+            self._compact_indexer_store = store
+        return store
+
+    # The historical per-module attribute names stay valid (tests and probes read them); they now
+    # resolve into the bound store, shared or private.
+    @property
+    def _bshd_compact_indexer_workspaces(self) -> list[BSHDCompactIndexerWorkspace]:
+        return self._compact_indexer_workspace_store().bshd
+
+    @property
+    def _active_bshd_compact_indexer_workspace(self) -> BSHDCompactIndexerWorkspace | None:
+        return self._compact_indexer_workspace_store().bshd_active
+
+    @_active_bshd_compact_indexer_workspace.setter
+    def _active_bshd_compact_indexer_workspace(self, value) -> None:
+        self._compact_indexer_workspace_store().bshd_active = value
+
+    @property
+    def _thd_compact_indexer_workspaces(self) -> list[THDCompactIndexerWorkspace]:
+        return self._compact_indexer_workspace_store().thd
+
+    @property
+    def _active_thd_compact_indexer_workspace(self) -> THDCompactIndexerWorkspace | None:
+        return self._compact_indexer_workspace_store().thd_active
+
+    @_active_thd_compact_indexer_workspace.setter
+    def _active_thd_compact_indexer_workspace(self, value) -> None:
+        self._compact_indexer_workspace_store().thd_active = value
+
+    @property
+    def _balanced_thd_compact_indexer_workspaces(
+        self,
+    ) -> dict[str, list[THDCompactIndexerWorkspace]]:
+        return self._compact_indexer_workspace_store().balanced_thd
+
+    @property
+    def _active_balanced_thd_compact_indexer_workspaces(
+        self,
+    ) -> dict[str, THDCompactIndexerWorkspace]:
+        return self._compact_indexer_workspace_store().balanced_thd_active
 
     def _get_bshd_compact_indexer_workspace(
         self,
@@ -2168,6 +2262,7 @@ class CompressedSparseAttention(MegatronModule):
         wrapper, avoiding an extra permutation during graph capture.
         """
         precision = self.config.dsa_indexer_precision
+        self._compact_indexer_workspace_store(q.device)
         if self.config.cuda_graph_impl == "none" or not bshd_compact_indexer_available(
             q, k, precision
         ):
@@ -2189,8 +2284,16 @@ class CompressedSparseAttention(MegatronModule):
         capturing = torch.cuda.is_current_stream_capturing()
         workspace = self._active_bshd_compact_indexer_workspace
         if capturing:
-            if workspace is not None and workspace.matches_shape(**match_kwargs):
-                return workspace
+            # As on the THD path: under full recompute the no-grad forward and the recompute
+            # can alternate return_softmax, so the active workspace is not necessarily the one
+            # this capture needs; any warmed-up workspace of the geometry serves.
+            candidates = [workspace] if workspace is not None else []
+            candidates += [w for w in self._bshd_compact_indexer_workspaces if w is not workspace]
+            for candidate in candidates:
+                if candidate.matches_shape(**match_kwargs):
+                    if candidate is not workspace:
+                        self._active_bshd_compact_indexer_workspace = candidate
+                    return candidate
             raise ValueError(
                 "BSHD compact CUDA graph capture requires an eagerly prepared compact "
                 "workspace for the active static geometry. Run eager warmup before capture."
@@ -2234,11 +2337,14 @@ class CompressedSparseAttention(MegatronModule):
         """Return persistent compact storage for a warmed-up THD graph geometry.
 
         Workspace sizing synchronizes with the host, so it is performed only
-        during eager CUDA-graph warmup. Capture reuses the active workspace;
-        when warmup was skipped or static shapes changed, capture must fail
-        clearly. Unsupported devices/frontends retain the non-compact path.
+        during eager CUDA-graph warmup. Capture reuses a warmed-up workspace of
+        the slot (the active one first, then the other geometries warm-up
+        prepared); when none matches, because warmup was skipped or static
+        shapes changed, capture must fail clearly. Unsupported devices/frontends
+        retain the non-compact path.
         """
         precision = self.config.dsa_indexer_precision
+        self._compact_indexer_workspace_store(q.device)
         if self.config.cuda_graph_impl == "none" or not thd_compact_indexer_available(
             q, k, precision
         ):
@@ -2246,39 +2352,54 @@ class CompressedSparseAttention(MegatronModule):
 
         capturing = torch.cuda.is_current_stream_capturing()
         # Head and tail have different causal offsets and may have different
-        # geometry. Keep their quantization/candidate metadata separate, just as
-        # each attention module owns storage independently of the other layers.
+        # geometry. Keep their quantization/candidate metadata in separate slots;
+        # within a slot the layers built from one config share the workspaces
+        # (dsa_compact_indexer_workspace_sharing), so the slot is what keeps the
+        # head and tail of the balanced indexer apart.
         balanced = workspace_slot != "default"
         workspace = (
             self._active_balanced_thd_compact_indexer_workspaces.get(workspace_slot)
             if balanced
             else self._active_thd_compact_indexer_workspace
         )
-        if capturing:
-            if workspace is not None and workspace.matches(
-                q=q,
-                k=k,
-                topk=topk,
-                ratio=ratio,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                q_causal_offsets=q_causal_offsets,
-                return_softmax=return_softmax,
-                precision=precision,
-            ):
-                return workspace
-            raise ValueError(
-                "THD compact CUDA graph capture requires an eagerly prepared compact "
-                "workspace for the active packed geometry. Run eager warmup before capture."
-            )
-
         workspaces = (
             self._balanced_thd_compact_indexer_workspaces.setdefault(workspace_slot, [])
             if balanced
             else self._thd_compact_indexer_workspaces
         )
+        if capturing:
+            # Under full activation recompute the checkpoint forward (no_grad) and its recompute
+            # alternate between two geometries (return_softmax differs), so the last prepared
+            # workspace is not necessarily the one this capture needs. Any warmed-up workspace of
+            # this slot may be reused: matching is shape-only (no host synchronization).
+            candidates = [workspace] if workspace is not None else []
+            candidates += [w for w in workspaces if w is not workspace]
+            for candidate in candidates:
+                if candidate.matches(
+                    q=q,
+                    k=k,
+                    topk=topk,
+                    ratio=ratio,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    q_causal_offsets=q_causal_offsets,
+                    return_softmax=return_softmax,
+                    precision=precision,
+                ):
+                    if balanced:
+                        self._active_balanced_thd_compact_indexer_workspaces[workspace_slot] = (
+                            candidate
+                        )
+                    else:
+                        self._active_thd_compact_indexer_workspace = candidate
+                    return candidate
+            raise ValueError(
+                "THD compact CUDA graph capture requires an eagerly prepared compact "
+                "workspace for the active packed geometry. Run eager warmup before capture."
+            )
+
         for workspace in workspaces:
             if workspace.matches(
                 q=q,
@@ -2469,7 +2590,14 @@ class CompressedSparseAttention(MegatronModule):
 
         nvtx_range_push("sparse_attn_kernel")
         output = csa_sparse_attn(
-            query, kv_full, self.attn_sink.float(), flat_idxs, self.softmax_scale, out_rope=out_rope
+            query,
+            kv_full,
+            self.attn_sink.float(),
+            flat_idxs,
+            self.softmax_scale,
+            out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -2529,6 +2657,8 @@ class CompressedSparseAttention(MegatronModule):
             self.softmax_scale,
             topk_length=flat_tlen,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -2590,6 +2720,7 @@ class CompressedSparseAttention(MegatronModule):
             compact_workspace=compact_workspace,
             indexer_precision=self.config.dsa_indexer_precision,
             deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
             out_rope=out_rope,
         )
         nvtx_range_pop("sparse_attn_kernel")
@@ -2936,6 +3067,8 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=flat_tlen,
             is_thd=True,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         return output.unsqueeze(1)
 
@@ -3045,6 +3178,8 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=flat_tlen,
             is_thd=True,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         return output.unsqueeze(1)
 
@@ -3153,6 +3288,7 @@ class CompressedSparseAttention(MegatronModule):
             compact_workspace=compact_workspace,
             indexer_precision=self.config.dsa_indexer_precision,
             deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
             thd_window_size=self.window_size,
             thd_compressed_is_sequence_major=True,
             out_rope=out_rope,
@@ -3707,6 +3843,8 @@ class CompressedSparseAttention(MegatronModule):
                     self.window_size,
                     kv_reconstruction_parts,
                     fused_out_rope,
+                    self.config.deterministic_mode,
+                    self.config.cuda_graph_impl != "none",
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
@@ -3737,6 +3875,8 @@ class CompressedSparseAttention(MegatronModule):
                 is_thd=True,
                 kv_reconstruction_parts=kv_reconstruction_parts,
                 out_rope=fused_out_rope,
+                deterministic=self.config.deterministic_mode,
+                cuda_graph=self.config.cuda_graph_impl != "none",
             )
         else:
             output = unfused_compressed_sparse_attn(

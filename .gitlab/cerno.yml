@@ -1,0 +1,17 @@
+# Megatron-LM configuration for Cerno.
+
+gitlab:
+  project_id: 19378
+  repo_name: ADLR/megatron-lm
+
+modules:
+  megatron_lm:
+    build_module: megatron-lm
+    channel_id_env: MCORE_SLACK_CHANNEL_ID
+    reconcile_proposal: true
+    team_key: MCORE
+    project_template: "MCore CI Testing"
+    linear_issue_status: "Need Triage"
+    enable_linear_open: true
+    enable_linear_modify: true
+    enable_linear_close: true

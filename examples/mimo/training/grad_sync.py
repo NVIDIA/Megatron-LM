@@ -62,7 +62,7 @@ def _is_pg_member(pg) -> bool:
 
 def _is_token_source_rank(language_pg) -> bool:
     """Whether this rank is on the LLM (last PP stage, TP rank 0) coordinate that sums
-    the global token count over DP/CP.
+    the global token count over all data lanes.
 
     Sourcing from this single coordinate avoids double-counting across TP/PP replicas.
     The _is_pg_member guards short-circuit encoder-grid ranks (non-member pp/tp groups)
@@ -101,18 +101,17 @@ def _token_source_global_rank(language_grid) -> int:
 def _global_token_count(num_tokens, language_pg, src_global_rank) -> float:
     """Total non-padded tokens in the global batch, visible on every rank.
 
-    Only the LLM token-source rank computes the count by summing over the LLM DP/CP
-    group; it then broadcasts that N_global from its global rank to every rank in the
+    Only the LLM token-source ranks compute the count by summing over all LLM data lanes;
+    the source then broadcasts N_global from its global rank to every rank in the
     world (including the non-colocated encoder grid, where ``language_pg`` is None) so
     both modules divide by the same per-token mean.
     """
     global_num_tokens = torch.zeros(1, dtype=torch.float32, device="cuda")
     if _is_token_source_rank(language_pg):
-        # Collective over DP/CP: every (pp_last, tp0) rank participates so the all-reduce
-        # does not hang; only DP/CP rank 0 keeps the result and is the broadcast root.
+        data_group = language_pg.dp_cp_gtp_remat or language_pg.dp_cp
         token_count = num_tokens.to(dtype=torch.float32).sum().view(1)
-        dist.all_reduce(token_count, group=language_pg.dp_cp, op=dist.ReduceOp.SUM)
-        if dist.get_rank(group=language_pg.dp_cp) == 0:
+        dist.all_reduce(token_count, group=data_group, op=dist.ReduceOp.SUM)
+        if dist.get_rank(group=data_group) == 0:
             global_num_tokens.copy_(token_count)
     dist.broadcast(global_num_tokens, src=src_global_rank)
     return float(global_num_tokens.item())
@@ -191,3 +190,12 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
     # The schedule always calls grad_scale_func with a Tensor loss; the per-token
     # mean is applied in finalize_grads_func, so no extra scaling is needed here.
     mimo_model.config.grad_scale_func = lambda loss: loss
+
+    if getattr(args, "overlap_grad_reduce", False):
+        assert mimo_model.config.no_sync_func is None, (
+            "MIMO overlap owns config.no_sync_func; a second synchronization context "
+            "cannot be composed safely"
+        )
+        mimo_model.config.no_sync_func = mimo_model.no_sync
+        if getattr(args, "align_grad_reduce", False):
+            mimo_model.config.grad_sync_func = mimo_model.start_grad_sync

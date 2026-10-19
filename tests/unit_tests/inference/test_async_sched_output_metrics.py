@@ -57,6 +57,25 @@ def test_inference_comparator_ignores_async_sched_counters():
     assert "async_sched_compaction_step_count" in _NON_REQUEST_TOP_LEVEL_KEYS
 
 
+@pytest.mark.parametrize(("prompt_tokens", "prompt_length"), [([1, 2, 3], None), (None, 3)])
+def test_print_unique_prompts_and_outputs_uses_available_prompt_length(
+    capsys, prompt_tokens, prompt_length
+):
+    """Ensure reporting supports direct and coordinator inference results."""
+    request = SimpleNamespace(
+        prompt="prompt",
+        prompt_tokens=prompt_tokens,
+        prompt_length=prompt_length,
+        generated_text="generated",
+        generated_tokens=[4],
+        events=[],
+    )
+
+    inference_utils.print_unique_prompts_and_outputs([request])
+
+    assert "[n 1, l 3] prompt" in capsys.readouterr().out
+
+
 def test_capture_engine_stats_includes_async_sched_counters():
     """Ensure offline reporting captures async scheduling counters from the engine context."""
     context = SimpleNamespace(

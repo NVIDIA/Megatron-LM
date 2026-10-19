@@ -32,7 +32,7 @@ from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
-class TestHyperConnectionCheckpoint:
+class TestHyperConnectionModuleCheckpoint:
     """Test HyperConnectionModule checkpoint functionality."""
 
     def setup_method(self, method):
@@ -443,6 +443,24 @@ class TestTransformerConfigRecomputeMhc:
         )
         assert "mhc" in config.recompute_modules
         assert config.enable_hyper_connections is True
+
+    @pytest.mark.parametrize(
+        "extra_kwargs, error_type, match",
+        [
+            ({"mhc_sinkhorn_iterations": 0}, ValueError, "mhc_sinkhorn_iterations"),
+            ({"mhc_init_gating_factor": -0.1}, ValueError, "mhc_init_gating_factor"),
+        ],
+    )
+    def test_config_rejects_unsupported_combinations(self, extra_kwargs, error_type, match):
+        """Unsupported mHC combinations must fail at config time, not mid-forward."""
+        with pytest.raises(error_type, match=match):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_hyper_connections=True,
+                **extra_kwargs,
+            )
 
     def test_config_accepts_initial_attention_only_te_graph_split(self):
         config = TransformerConfig(

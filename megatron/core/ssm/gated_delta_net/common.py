@@ -34,6 +34,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 try:
     from fla.modules.convolution import causal_conv1d
@@ -85,7 +86,12 @@ class GatedDeltaNetSubmodules:
 
 
 class GatedDeltaRuleInterface(Protocol):
-    """Callable interface shared by GDN-family kernels."""
+    """
+    Unified typing protocol for linear attention interfaces, compliant to upstream FLA interfaces.
+
+    Only ``q``/``k``/``v``/``g`` are common to every kernel, and only as keywords: each
+    variant inserts its own gates after ``g`` (e.g., ``beta`` for GDN, ``b``/``w`` for GDN2).
+    """
 
     def __call__(
         self,
@@ -93,7 +99,6 @@ class GatedDeltaRuleInterface(Protocol):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        beta: torch.Tensor,
         *,
         scale: float | None = None,
         initial_state: torch.Tensor | None = None,
@@ -392,6 +397,29 @@ class _GDNBase(MegatronModule):
         # pylint: disable=missing-function-docstring
         raise NotImplementedError
 
+    def _gated_norm_and_a2a(
+        self,
+        core_attn_out: torch.Tensor,
+        gate: torch.Tensor,
+        thd_cp_a2a_inv: torch.Tensor | None,
+        batch: int,
+        seq_len: int,
+        packed_seq_params: PackedSeqParams | None = None,
+    ) -> torch.Tensor:
+        # RMSNorm
+        nvtx_range_push(suffix="gated_norm")
+        norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+
+        # Transpose: b s x --> s b x
+        # From bshd back to sbhd format
+        norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
+        norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
+
+        return a2a_hp_to_cp(
+            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
+        )
+
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
         # Output Norm
@@ -420,12 +448,12 @@ class _GDNBase(MegatronModule):
         Prepare all gated delta rule kernel inputs.
 
         Fuses split, reshape, L2 norm, decay/gate activations, repeat_interleave, and
-        contiguous operations. ``gate_feats`` holds the in_proj sections after qkv
-        and gate, which ``_compute_gates`` turns into the decay and gating tensors.
+        contiguous operations. ``gate_feats`` holds the variant-specific in_proj
+        sections, which ``_compute_gates`` turns into the decay and gating tensors.
 
         Returns:
             (dict[str, Tensor]): Kernel inputs keyed by kernel argument name (``q``,
-            ``k``, ``v``, ``g``, and ``beta``), and the output
+            ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
         cp_size = 1 if cp_size_headwise is None else cp_size_headwise
@@ -486,18 +514,19 @@ class _GDNBase(MegatronModule):
         *gate_feats: tuple[torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
-        Compute the log-decay ``g`` and remaining kernel inputs.
+        Compute the log-decay ``g`` and the variant-specific kernel inputs.
 
         Args:
             A_log_local_cp: CP-local slice of ``A_log``.
             dt_bias_local_cp: CP-local slice of ``dt_bias``.
             batch: Batch size.
             seq_len: Sequence length.
-            gate_feats: The in_proj output sections after the qkv and output-gate sections.
+            gate_feats: The variant-specific in_proj output sections (everything after
+                the qkv and output-gate sections, in ``feat_dim_split`` order).
 
         Returns:
             (tuple[Tensor, dict[str, Tensor]]): The log-decay ``g`` and a dict of the
-            remaining kernel inputs keyed by kernel argument name.
+            remaining variant-specific kernel inputs keyed by kernel argument name.
         """
         raise NotImplementedError
 

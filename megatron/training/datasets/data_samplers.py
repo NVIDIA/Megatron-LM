@@ -2,7 +2,6 @@
 
 """Dataloaders."""
 
-
 import random
 
 import numpy as np
@@ -20,6 +19,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     if dataset is None:
         return None
+    # Empty split (e.g. valid/test when --eval-iters 0): return null loader
+    try:
+        if len(dataset) == 0:
+            return None
+    except TypeError:
+        pass
     args = get_args()
 
     if hasattr(dataset, 'split'):
@@ -104,6 +109,16 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
+    if args.sequence_packing_scheduler is not None and args.num_workers > 0 and not is_eval:
+        # Packing schedulers draw a whole global batch, global_batch_size /
+        # (micro_batch_size * DP) items on every DP rank, at the start of each
+        # step. Keeping that many items in flight lets the workers and the
+        # pin-memory thread build the next step's batch while the current step
+        # trains, at the cost of host memory for one more global batch.
+        items_per_step = args.global_batch_size // (
+            micro_batch_size * mpu.get_data_parallel_world_size()
+        )
+        extra_kwargs["prefetch_factor"] = max(2, -(-items_per_step // args.num_workers))
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,

@@ -151,3 +151,4 @@ MODEL_ARGS_5:
   --tensor-model-parallel-size: 1
   --context-parallel-size: 1
   --pipeline-model-parallel-size: 2
+LAUNCHER: ft_launcher

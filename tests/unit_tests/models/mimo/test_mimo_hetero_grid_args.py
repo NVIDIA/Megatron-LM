@@ -62,6 +62,33 @@ def test_canonical_layout_validates_and_maps_specs():
     assert language_grid_spec.expt_tp == 1
 
 
+def test_gtp_layout_validates_and_maps_weight_shard_axes():
+    args = _layout_8gpu_20l(
+        llm_dp=1,
+        llm_ep=2,
+        tensor_parallel_num_weight_shards=4,
+        expert_tensor_parallel_num_weight_shards=2,
+    )
+
+    assert validate_hetero_grid_args(args, WORLD_SIZE_8) == (4, 4)
+    assert not hasattr(args, "gtp_weight_remat_size")
+    assert not hasattr(args, "expert_gtp_weight_remat_size")
+
+    _, language_grid_spec = build_module_grid_specs(
+        args, WORLD_SIZE_8, encoder_module_name="radio_encoder"
+    )
+    assert language_grid_spec.gtp_remat == 2
+    assert language_grid_spec.dp == 1
+    assert language_grid_spec.expt_gtp_remat == 2
+    assert language_grid_spec.expt_dp == 1
+
+
+def test_weight_shards_must_divide_language_tp():
+    args = _layout_8gpu_20l(tensor_parallel_num_weight_shards=3)
+    with pytest.raises(ValueError, match="must be divisible"):
+        validate_hetero_grid_args(args, WORLD_SIZE_8)
+
+
 def test_overlapping_spans_raise():
     # llm-offset 2 makes llm ranks {2,3,4,5} overlap encoder ranks {0,1,2,3}.
     args = _layout_8gpu_20l(llm_offset=2)
@@ -103,10 +130,29 @@ def test_llm_cp_must_be_one():
         validate_hetero_grid_args(args, WORLD_SIZE_8)
 
 
+def test_encoder_overlap_requires_grad_reduce():
+    args = _layout_8gpu_20l(encoder_ddp_overlap=True, overlap_grad_reduce=False)
+    with pytest.raises(ValueError, match="requires --overlap-grad-reduce"):
+        validate_hetero_grid_args(args, WORLD_SIZE_8)
+
+
+def test_encoder_overlap_accepts_uniform_participation_opt_in():
+    args = _layout_8gpu_20l(encoder_ddp_overlap=True, overlap_grad_reduce=True)
+    assert validate_hetero_grid_args(args, WORLD_SIZE_8) == (4, 4)
+
+
 def test_llm_only_requires_offset_zero():
     args = _layout_8gpu_20l(llm_only=True, llm_offset=4)
     with pytest.raises(ValueError, match="--llm-only requires --llm-offset 0"):
         validate_hetero_grid_args(args, WORLD_SIZE_8)
+
+
+def test_llm_only_rejects_encoder_overlap():
+    args = _layout_8gpu_20l(
+        llm_only=True, llm_offset=0, llm_ep=2, encoder_ddp_overlap=True, overlap_grad_reduce=True
+    )
+    with pytest.raises(ValueError, match="cannot be used with --llm-only"):
+        validate_hetero_grid_args(args, 4)
 
 
 def test_llm_only_covers_world():
