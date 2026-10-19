@@ -5,8 +5,8 @@
 Thin facade over the core implementation in ``generalized_tensor_parallelism`` and CUDA-graph
 lifecycle support in ``gtp_cuda_graphs``. GTP depends on TransformerEngine: if TE is missing or
 too old the core module imports cleanly but reports ``HAVE_TE = False``, mirrored here as
-``HAVE_GTP = False``. Consumers gate every GTP code path behind ``if HAVE_GTP:``, so no core
-module uses GTP symbols without TE.
+``HAVE_GTP = False``. Consumers guard optional GTP symbol access with ``HAVE_GTP``, so no
+core module uses GTP symbols without TE.
 """
 
 try:
@@ -44,8 +44,8 @@ try:
 
     HAVE_GTP = HAVE_TE
 except ImportError:
-    # Defensive fallback for any unexpected inner-import failure; consumers import
-    # the other symbols lazily under an ``if HAVE_GTP:`` guard, so no stubs needed.
+    # Defensive fallback for any unexpected inner-import failure. Consumers guard
+    # optional symbol access with HAVE_GTP, so no stubs are needed.
     HAVE_GTP = False
 
     def deregister_and_clear_gtp_symm_pools() -> None:

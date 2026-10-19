@@ -1224,6 +1224,25 @@ class TEGroupedMLP(MegatronModule):
         Maps local expert to global experts.
         The sharded state dict is interchangable with SequentialMLP's.
         """
+        # Import lazily, as in __init__, so GTP's optional imports can finish first.
+        from megatron.core.tensor_parallel import gtp_api
+
+        # Training can gather these weights, but checkpoint splitting still needs
+        # the full TP-local gate/up layout. Reject before constructing child entries.
+        if (
+            gtp_api.HAVE_GTP
+            and self.config.gated_linear_unit
+            and any(
+                name.startswith("weight") and name[6:].isdigit() and gtp_api.is_gtp_param(param)
+                for name, param in self.linear_fc1.named_parameters(recurse=False)
+            )
+        ):
+            raise NotImplementedError(
+                f"{prefix}linear_fc1: checkpointing EGTP-sharded grouped gated weights is not "
+                "supported. Disable EGTP for grouped gated fc1 or add logical-layout "
+                "checkpoint support."
+            )
+
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
