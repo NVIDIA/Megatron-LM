@@ -36,7 +36,7 @@ class _Mixer(nn.Module):
 
 
 class _OperatorTrace(TorchDispatchMode):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.calls = []
 
@@ -271,7 +271,7 @@ def test_wide_operations_use_current_registered_owners():
 class _RecordingContext:
     """Record checkpoint selection, not actual discard/replay execution."""
 
-    def __init__(self, is_block_end):
+    def __init__(self, is_block_end) -> None:
         self.is_block_end = is_block_end
         self.calls = []
 
