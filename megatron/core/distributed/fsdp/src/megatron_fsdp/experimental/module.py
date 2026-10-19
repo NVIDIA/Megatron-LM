@@ -279,7 +279,7 @@ class FsdpModule:
             if (
                 not context.iteration_order.active
                 and not is_recomputing
-                and next(iter(context.forward_order), None) is self
+                and next(iter(context.forward_order))() is self
             ):
                 context.forward_order.reset()
 
@@ -329,13 +329,16 @@ class FsdpModule:
                 )
 
     def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
+        self, order: ExecutionOrder[ref[nn.Module]], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
-        module = cast(nn.Module, self)
-        if order.advance() is not module:
+        module = order.advance()()
+        if module is None:
+            raise RuntimeError("A module in the FSDP execution order was destroyed.")
+        if module is not self:
             raise RuntimeError("FSDP module calls diverged from the static prefetch order.")
-        next_module = order.next_item()
+        next_ref = order.next_item()
+        next_module = next_ref() if next_ref is not None else None
         if prefetch_size is None:
             if next_module is not None:
                 cast(FsdpModule, next_module)._unshard_parameter_groups()
@@ -348,7 +351,8 @@ class FsdpModule:
             fsdp_module._unshard_parameter_groups()
             prefetched_size += fsdp_module.num_parameter_elements
             offset += 1
-            next_module = order.next_item(offset)
+            next_ref = order.next_item(offset)
+            next_module = next_ref() if next_ref is not None else None
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
@@ -411,10 +415,7 @@ class FsdpModule:
         if self.is_root():
             # Backward has its own first root, in reverse construction order.
             # Resetting at every root would restart the shared cursor mid-pass.
-            if (
-                not context.iteration_order.active
-                and next(iter(context.backward_order), None) is self
-            ):
+            if not context.iteration_order.active and next(iter(context.backward_order))() is self:
                 context.backward_order.reset()
             context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the

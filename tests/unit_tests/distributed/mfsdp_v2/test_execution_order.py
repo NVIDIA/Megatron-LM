@@ -34,7 +34,7 @@ def test_prefetch_replays_occurrences(budget, expected):
     sequence = [modules[index] for index in (0, 1, 0, 0, 2)]
     order = ExecutionOrder()
     for module in sequence:
-        order.append(module)
+        order.append(ref(module))
     # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
     for _ in range(2):
         order.reset()
@@ -42,7 +42,8 @@ def test_prefetch_replays_occurrences(budget, expected):
             prefetched.clear()
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
-            assert order.next_item() is successor
+            next_ref = order.next_item()
+            assert (next_ref() if next_ref is not None else None) is successor
 
 
 def test_explicit_reset_and_exhaustion():
@@ -67,18 +68,25 @@ def test_explicit_reset_and_exhaustion():
 
 
 def test_iteration_and_weak_references():
-    """Traversal preserves repeated occurrences without retaining deleted modules."""
+    """Tuple payloads preserve occurrences while callers keep module ownership weak."""
     first, second = nn.Module(), nn.Module()
-    order = ExecutionOrder([first, second, first, second])
-    assert list(order) == [first, second, first, second]
+    a, b = (ref(first), 'forward'), (ref(second), 'backward')
+    order = ExecutionOrder([a, b, a, b])
+    assert list(order) == [a, b, a, b]
+    assert order.advance() is a
+    assert order.next_item() is b
+    assert order.next_item(2) is a
 
     second_ref = ref(second)
     del second
     gc.collect()
     assert second_ref() is None
-    assert list(order) == [first, first]
-    assert order.advance() is first
-    assert order.next_item() is None
-    # Traversal skips dead references, but the demand cursor must not skip a call.
+    assert order.advance() is b
+    assert b[0]() is None
+    assert order.position == 2 and len(order) == 4
+
+    # Static FSDP callers detect a destroyed owner without skipping its occurrence.
+    static = ExecutionOrder([ref(first), second_ref])
+    FsdpModule._prefetch_parameter_groups(first, static, None)
     with pytest.raises(RuntimeError, match='destroyed'):
-        order.advance()
+        FsdpModule._prefetch_parameter_groups(first, static, None)

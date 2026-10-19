@@ -19,11 +19,14 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Literal
 from weakref import ref
 
+from .execution_order import ExecutionOrder
+
 if TYPE_CHECKING:
     from .context import FsdpContext
     from .module import FsdpModule
 
 DemandPhase = Literal["forward", "backward", "recompute", "none"]
+Demand = tuple[ref["FsdpModule"], DemandPhase]
 
 
 class IterationOrder:
@@ -34,11 +37,10 @@ class IterationOrder:
     """
 
     def __init__(self) -> None:
-        self._orders: dict[Hashable, tuple[list[ref["FsdpModule"]], tuple[DemandPhase, ...]]] = {}
-        self._order: list[ref["FsdpModule"]] | None = None
-        self._phases: list[DemandPhase] | tuple[DemandPhase, ...] = ()
+        self._orders: dict[Hashable, ExecutionOrder[Demand]] = {}
+        self._order: ExecutionOrder[Demand] | None = None
         self._recording = False
-        self._execution_position = self._prefetch_position = 0
+        self._prefetch_position = 0
 
     @property
     def active(self) -> bool:
@@ -55,48 +57,43 @@ class IterationOrder:
             raise RuntimeError("FSDP iteration scopes cannot overlap on the same context.")
         self._recording = rerecord or key not in self._orders
         if self._recording:
-            self._order, self._phases = [], []
+            self._order = ExecutionOrder()
         else:
-            self._order, self._phases = self._orders[key]
-        self._execution_position = self._prefetch_position = 0
+            self._order = self._orders[key]
+        self._order.reset()
+        self._prefetch_position = 0
         try:
             yield
-            if self._execution_position != len(self._order):
+            if self._order.position != len(self._order):
                 raise RuntimeError(
                     "FSDP iteration ended before consuming its recorded demand order."
                 )
             if self._recording:
-                self._orders[key] = self._order, tuple(self._phases)
+                self._orders[key] = self._order
         except BaseException:
             self._orders.pop(key, None)
             raise
         finally:
-            self._execution_position = self._prefetch_position = 0
+            self._prefetch_position = 0
             self._order = None
-            self._phases = ()
             self._recording = False
 
     def record(self, module: "FsdpModule", phase: DemandPhase) -> None:
         """Observe a demand only during the initial recording iteration."""
         if not self._recording or self._order is None:
             raise RuntimeError("No FSDP iteration recording is active.")
-        self._order.append(ref(module))
-        self._phases.append(phase)
+        self._order.append((ref(module), phase))
 
     def advance(self) -> tuple["FsdpModule", DemandPhase]:
         """Consume the next occurrence; the caller validates its observed demand."""
         if self._order is None:
             raise RuntimeError("No FSDP iteration is active.")
-        # A complete iteration never wraps; extra demands are mismatches.
-        if self._execution_position == len(self._order):
-            raise RuntimeError("FSDP demand exceeded the recorded iteration order.")
-        module = self._module_at(self._execution_position)
-        phase = self._phases[self._execution_position]
-        self._execution_position += 1
-        return module, phase
+        module_ref, phase = self._order.advance()
+        return self._resolve(module_ref), phase
 
-    def _module_at(self, position: int) -> "FsdpModule":
-        module = self._order[position]()
+    @staticmethod
+    def _resolve(module_ref: ref["FsdpModule"]) -> "FsdpModule":
+        module = module_ref()
         if module is None:
             raise RuntimeError("A module in the recorded FSDP iteration was destroyed.")
         return module
@@ -110,10 +107,14 @@ class IterationOrder:
         """
         if not self.active or self._recording or budget == 0:
             return
-        self._prefetch_position = max(self._prefetch_position, self._execution_position)
+        self._prefetch_position = max(self._prefetch_position, self._order.position)
         size = 0
-        while self._prefetch_position < len(self._order):
-            module = self._module_at(self._prefetch_position)
+        while True:
+            offset = self._prefetch_position - self._order.position + 1
+            demand = self._order.next_item(offset)
+            if demand is None:
+                break
+            module = self._resolve(demand[0])
             self._prefetch_position += 1
             module._unshard_parameter_groups()
             size += module.num_parameter_elements

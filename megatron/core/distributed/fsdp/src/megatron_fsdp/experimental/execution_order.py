@@ -12,49 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Weakly held construction or recorded module execution sequences."""
+"""Generic execution sequences with occurrence-based traversal."""
 
 from collections.abc import Iterable, Iterator
 from typing import Generic, TypeVar
-from weakref import ref
 
 T = TypeVar("T")
 
 
 class ExecutionOrder(Generic[T]):
-    """Consume weak occurrences with an explicitly reset execution cursor.
+    """Consume ordered occurrences with an explicitly reset execution cursor.
 
     Repeated items are ordinary occurrences. The caller validates each item
-    returned by advance(); lookahead never changes execution progress.
+    returned by advance(); lookahead never changes execution progress. Callers
+    own item lifetimes and can store weak references in their payloads.
     """
 
     def __init__(self, items: Iterable[T] = ()) -> None:
-        """Create a weak execution sequence, preserving repeated occurrences."""
-        self._items: list[ref[T]] = [ref(item) for item in items]
+        """Create an execution sequence, preserving repeated occurrences."""
+        self._items: list[T] = list(items)
         self._position = 0
 
     def append(self, item: T) -> None:
-        """Append one weakly held occurrence."""
-        self._items.append(ref(item))
+        """Append one occurrence."""
+        self._items.append(item)
 
     def reset(self) -> None:
-        """Start a new traversal; root hooks own static traversal boundaries."""
+        """Start a new traversal."""
         self._position = 0
 
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @property
+    def position(self) -> int:
+        """Number of occurrences consumed in the current traversal."""
+        return self._position
+
     def __iter__(self) -> Iterator[T]:
-        """Iterate over live occurrences in execution order."""
-        for item_ref in self._items:
-            item = item_ref()
-            if item is not None:
-                yield item
+        """Iterate over all occurrences without changing execution progress."""
+        return iter(self._items)
 
     def advance(self) -> T:
         """Consume the next occurrence without lookup or automatic wrapping."""
         if self._position >= len(self._items):
-            raise RuntimeError("FSDP calls exceeded the static execution order; reset it first.")
-        item = self._items[self._position]()
-        if item is None:
-            raise RuntimeError("A module in the FSDP execution order was destroyed.")
+            raise RuntimeError("Calls exceeded the execution order; reset it first.")
+        item = self._items[self._position]
         self._position += 1
         return item
 
@@ -63,4 +66,4 @@ class ExecutionOrder(Generic[T]):
         next_index = self._position - 1 + offset
         if next_index < 0 or next_index >= len(self._items):
             return None
-        return self._items[next_index]()
+        return self._items[next_index]

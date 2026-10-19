@@ -92,7 +92,14 @@ def test_record_and_replay_mixed_occurrences():
         assert b._unshard_parameter_groups.call_count == before
         order.prefetch(2)
         assert b._unshard_parameter_groups.call_count == before + 1
-        for module, phase in events[1:]:
+        _demand(order, *events[1])
+        # Lookahead already passed occurrences 1 and 2. Further prefetch must
+        # continue at 3 and 4 even while the execution cursor is still at 2.
+        order.prefetch(None)
+        assert gathers.mock_calls[-1][0] == "b"
+        order.prefetch(None)
+        assert gathers.mock_calls[-1][0] == "a"
+        for module, phase in events[2:]:
             _demand(order, module, phase)
 
 
@@ -208,8 +215,8 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
     assert forward_reset.call_count == (0 if record_iteration else 5)
     assert backward_reset.call_count == (0 if record_iteration else 3)
     if record_iteration:
-        _, phases = context.iteration_order._orders["default"]
-        assert "recompute" in phases
+        demands = context.iteration_order._orders["default"]
+        assert "recompute" in [phase for _, phase in demands]
     else:
         assert not context.iteration_order._orders
     # Group-packed shards need the FSDP layout to reconstruct parameters;
