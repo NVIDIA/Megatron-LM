@@ -729,7 +729,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
                 )
-                # Uncompress the latent KV cache for the general attention path.
+                # Uncompress the KV cache for unabsorbed attention.
                 key, value = self.uncompress_kv_from_cache(kv_cache)
             else:
                 # Read key/value *pointer* tensors from cache.
