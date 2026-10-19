@@ -36,6 +36,8 @@ def core_config(
         cp_partition_mode="contiguous",
         sequence_packing_scheduler="dp_balanced",
         pipeline_model_parallel_size=parallel.pp,
+        pipeline_dtype=torch.bfloat16 if parallel.pp > 1 else None,
+        pipeline_model_parallel_layout=getattr(parallel, "pp_layout", None),
         expert_model_parallel_size=parallel.ep,
         expert_tensor_parallel_size=1,
         params_dtype=torch.bfloat16,

@@ -52,6 +52,7 @@ def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
     mpu.initialize_model_parallel(
         tensor_model_parallel_size=p.tp,
         pipeline_model_parallel_size=p.pp,
+        pipeline_model_parallel_layout=getattr(p, "pp_layout", None),
         virtual_pipeline_model_parallel_size=None if int(p.vpp or 1) <= 1 else p.vpp,
         context_parallel_size=p.cp,
         expert_model_parallel_size=p.ep,
@@ -190,7 +191,9 @@ def build_dist_opt_stack(
 
     # Single-source-of-truth OptimizerConfig construction for native lite
     # model protocols.
-    opt_config = build_dist_opt_optimizer_config(opt)
+    opt_config = build_dist_opt_optimizer_config(
+        opt, override_optimizer_config=getattr(engine_cfg, "override_optimizer_config", None)
+    )
 
     # This branch falls back to Megatron-Core mpu globals for the optimizer's process
     # groups. Long term, this primitive should always pass its own
@@ -282,6 +285,7 @@ def _build_transformer_config(model_cfg, engine_cfg):
         moe_ffn_hidden_size=getattr(model_cfg, "moe_intermediate_size", None),
         tensor_model_parallel_size=p.tp,
         pipeline_model_parallel_size=p.pp,
+        pipeline_model_parallel_layout=getattr(p, "pp_layout", None),
         context_parallel_size=p.cp,
         expert_model_parallel_size=p.ep,
         expert_tensor_parallel_size=p.etp if p.etp is not None else 1,

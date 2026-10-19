@@ -1,0 +1,207 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""BF16 DS4.1 training protocol over native Core components."""
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
+from types import SimpleNamespace
+
+import torch
+
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+from megatron.lite.model.deepseek_v41.lite.native import core_config
+from megatron.lite.model.protocol_utils import nested_from_packed
+from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.parallel import init_parallel
+from megatron.lite.primitive.parallel.thd import pack_nested_thd, parallel_state_from_model
+from megatron.lite.runtime.contracts import ParallelConfig
+from megatron.lite.runtime.contracts.loss import get_loss_context
+
+
+@dataclass(frozen=True)
+class ImplConfig:
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
+    device: str = "cuda"
+    dtype: torch.dtype = torch.bfloat16
+    hf_path: str = ""
+    token_map: object = None
+    trainable_engram: bool = False
+    shard_engram: bool = True
+    recompute: object = None
+    pipeline_split_layer: object = None
+    optimizer: str | None = "muon"
+    optimizer_config: object = None
+    attention_backend_override: str | None = None
+    router_aux_loss_coef: float = 0.0
+    quantized: bool = False
+    w4a8_experts: bool = False
+
+
+def validate_impl_cfg_keys(values):
+    extra = set(values) - {f.name for f in fields(ImplConfig)}
+    if extra:
+        raise ValueError(f"Unsupported DS4.1 implementation options: {sorted(extra)}")
+
+
+def build_model_config(source, **overrides):
+    cfg = (
+        DeepseekV41Config._from_hf_dict(source)
+        if isinstance(source, dict)
+        else DeepseekV41Config.from_hf(str(source))
+    )
+    for name, value in overrides.items():
+        if not hasattr(cfg, name):
+            raise ValueError(f"Unknown DS4.1 release field: {name}")
+        setattr(cfg, name, value)
+    return cfg
+
+
+def _validate(model_cfg, impl):
+    if (
+        impl.quantized
+        or impl.w4a8_experts
+        or impl.dtype not in (torch.bfloat16, "bfloat16", "bf16")
+    ):
+        raise ValueError("DS4.1 standard training supports BF16 execution only")
+    if impl.parallel.vpp != 1 or impl.parallel.tp != 1 or impl.parallel.etp not in (None, 1):
+        raise ValueError("DS4.1 supports TP=ETP=VPP=1")
+    if impl.router_aux_loss_coef not in (None, 0):
+        raise ValueError("DS4.1 standard post-training has no auxiliary indexer/router loss")
+    if impl.recompute and impl.recompute not in ("full", ["full"]):
+        raise ValueError("DS4.1 recomputation currently supports whole-layer 'full' only")
+    if impl.pipeline_split_layer is not None:
+        cuts = impl.pipeline_split_layer
+        cuts = [cuts] if isinstance(cuts, int) else list(cuts)
+        bounds = [0, *cuts, model_cfg.num_hidden_layers]
+        if len(cuts) != impl.parallel.pp - 1 or any(a >= b for a, b in zip(bounds, bounds[1:])):
+            raise ValueError("DS4.1 pipeline cuts must define nonempty ordered stages")
+        rows = [["decoder"] * (b - a) for a, b in zip(bounds, bounds[1:])]
+        rows[0].insert(0, "embedding")
+        rows[-1].append("loss")
+        impl.parallel.pp_layout = rows
+    core_config(model_cfg, impl.parallel, initialize=False)
+
+
+def _optimizer(chunks, cfg, impl, ps):
+    from megatron.lite.primitive.optimizers.megatron_wrap import (
+        build_dist_opt_stack,
+        finalize_dist_opt_grads,
+    )
+
+    values = impl.optimizer_config
+    values = dict(values) if isinstance(values, Mapping) else dict(vars(values)) if values else {}
+    if values.pop("segmented_host", False):
+        raise ValueError("DS4.1 native Core optimizer does not support segmented_host")
+    aliases = {"ns_steps": "muon_num_ns_steps", "coefficient_type": "muon_coefficient_type"}
+    core = {
+        aliases.get(k, k): values.pop(k)
+        for k in list(values)
+        if k in aliases or k.startswith("muon_")
+    }
+    values.setdefault("optimizer", "muon" if impl.optimizer == "muon" else "adam")
+    values.setdefault("lr", 1e-5)
+    values.setdefault("weight_decay", 0.0)
+    values.setdefault("clip_grad", 1.0)
+    core.setdefault("muon_num_ns_steps", 2)
+    core.setdefault("muon_split_mla_qkv", False)
+    engine = SimpleNamespace(
+        parallel=impl.parallel,
+        optimizer=SimpleNamespace(**values),
+        deterministic=False,
+        override_optimizer_config=core,
+    )
+    chunks[:], optimizer = build_dist_opt_stack(chunks, model_cfg=cfg, engine_cfg=engine, ps=ps)
+    # Keep the existing checkpoint/consumer convention without adding another optimizer.
+    optimizer.optimizers = [
+        getattr(o, "optimizer", o) for o in getattr(optimizer, "chained_optimizers", [optimizer])
+    ]
+    return optimizer, lambda: finalize_dist_opt_grads(chunks, optimizer)
+
+
+def build_model(model_cfg, *, impl_cfg):
+    _validate(model_cfg, impl_cfg)
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+
+    ps = init_parallel(impl_cfg.parallel)
+    token_map = impl_cfg.token_map
+    if token_map is None and impl_cfg.hf_path:
+        from pathlib import Path
+
+        path = Path(impl_cfg.hf_path) / "token_map.pt"
+        if path.is_file():
+            token_map = torch.load(path, map_location="cpu", weights_only=True)
+    chunks = [DeepseekV41Model(model_cfg, impl_cfg, ps, token_map=token_map)]
+    chunks[0].ds41_module_inventory = chunks[0].module_inventory()
+    optimizer, finalize = (None, None)
+    if impl_cfg.optimizer is not None:
+        optimizer, finalize = _optimizer(chunks, model_cfg, impl_cfg, ps)
+    return ModelBundle(
+        chunks,
+        ps,
+        optimizer,
+        finalize,
+        forward_step,
+        extras={"model_cfg": model_cfg, "optimizer_backend": "dist_opt" if optimizer else "none"},
+    )
+
+
+def forward_step(model, batch):
+    ps = parallel_state_from_model(model)
+    lens = batch.sizes().to(device=batch.input_ids.device)
+    nested = lambda x: None if x is None else nested_from_packed(x, lens)
+    packed = pack_nested_thd(
+        nested(batch.input_ids),
+        cp_size=ps.cp_size,
+        cp_rank=ps.cp_rank,
+        cp_group=ps.cp_group,
+        split_cp=False,
+        labels=nested(batch.labels),
+        roll_labels=batch.labels is not None,
+        loss_mask=nested(
+            batch.loss_mask
+            if batch.loss_mask is not None
+            else torch.ones_like(batch.input_ids, dtype=torch.float32)
+        ),
+        roll_loss_mask=True,
+    )
+    original = packed.packed_seq_params
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=original.cu_seqlens_q,
+        cu_seqlens_kv=original.cu_seqlens_kv,
+        cu_seqlens_q_padded=original.cu_seqlens_q_padded,
+        cu_seqlens_kv_padded=original.cu_seqlens_kv_padded,
+        max_seqlen_q=original.max_seqlen_q,
+        max_seqlen_kv=original.max_seqlen_kv,
+        cp_partition_mode="contiguous",
+        cp_group=ps.cp_group,
+        local_cp_size=ps.cp_size,
+    )
+    total = packed.input_ids.numel()
+    local = total // ps.cp_size
+    span = slice(ps.cp_rank * local, (ps.cp_rank + 1) * local)
+    select = lambda x: None if x is None else x.reshape(-1)[span]
+    context = get_loss_context()
+    output = model(
+        select(packed.input_ids),
+        packed_seq_params=params,
+        full_input_ids=packed.input_ids.reshape(-1),
+        labels=select(packed.labels),
+        loss_mask=select(packed.loss_mask),
+        temperature=context.temperature if context else 1.0,
+        calculate_entropy=context.calculate_entropy if context else False,
+    )
+    if context is not None and context.normalization_denominator is not None and "loss" in output:
+        denominator = context.normalization_denominator
+        if denominator <= 0:
+            raise ValueError("DS4.1 loss normalization denominator must be positive")
+        mask = select(packed.loss_mask)
+        if mask is None:
+            mask = torch.ones_like(output["log_probs"])
+        output["loss"] = -(output["log_probs"] * mask).sum() / denominator
+    return output
+
+
+def load_hf_weights(chunk, hf_path, model_cfg, ps):
+    from megatron.lite.model.deepseek_v41.lite.checkpoint import load_hf_weights as load
+
+    return load(chunk, hf_path, model_cfg, ps)
