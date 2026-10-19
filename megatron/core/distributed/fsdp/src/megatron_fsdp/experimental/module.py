@@ -34,7 +34,12 @@ from .context import FsdpContext
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .parameter_group import (
+    FsdpParameter,
+    FsdpParameterGroup,
+    effective_dtype,
+    get_containing_parameter_group,
+)
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
 
@@ -77,19 +82,25 @@ class FsdpModule:
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
-        grad_divisor: int = 1,
+        grad_scale: float = 1.0,
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
+        grad_accumulation_count: int | None = None,
     ) -> None:
-        """Initialize FSDP runtime state on an already-constructed module."""
+        """Initialize FSDP runtime state on an already-constructed module.
+
+        Args:
+            grad_accumulation_count: Total parameter-gradient callbacks per reduction
+                window. Defaults to one per owned trainable parameter.
+        """
         self._context = context
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
-        if grad_divisor <= 0:
-            raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
+        if grad_scale <= 0:
+            raise ValueError(f"grad_scale must be positive, got {grad_scale}.")
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             first_parameter = next(iter(group_parameters.values()))
@@ -107,18 +118,16 @@ class FsdpModule:
                         main_weight_placements, group_dtype
                     ),
                     mixed_precision_policy=mixed_precision_policy,
-                    grad_divisor=grad_divisor,
+                    grad_scale=grad_scale,
                     use_symmetric_memory=use_symmetric_memory,
                     parameter_to_owner=context.parameter_to_owner,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
         self._trainable_parameter_countdown = Countdown(
-            sum(
-                len(group.fsdp_parameters)
-                for group in self._parameter_groups
-                if group.requires_grad
-            )
+            grad_accumulation_count
+            if grad_accumulation_count is not None
+            else sum(1 for _ in self._trainable_fsdp_parameters())
         )
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``register_hooks`` is
@@ -181,7 +190,7 @@ class FsdpModule:
 
         The hook runs when this module's backward is complete, so it can reshard
         this module's parameters and reduce their gradients. It is invoked once
-        all of this module's trainable parameters have accumulated gradients, or
+        all expected gradient-accumulation callbacks have arrived, or
         via a full-backward hook when the module owns no trainable parameters.
 
         Args:
@@ -230,6 +239,13 @@ class FsdpModule:
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
                     lambda parameter=parameter: grad_hook(parameter)
                 )
+
+    def _trainable_fsdp_parameters(self) -> Iterator[FsdpParameter]:
+        """Iterate this module's trainable parameters in a stable order."""
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            yield from group.fsdp_parameters
 
     @staticmethod
     def _pre_load_state_dict(
@@ -374,6 +390,24 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
+        # Shared-layer MTP (mtp_use_repeated_layer=True) reuses the same FSDP block:
+        #   h1 = block(fuse(h0, shifted_embeddings_1))
+        #   h2 = block(fuse(h1, shifted_embeddings_2))
+        #   (loss1(h1) + loss2(h2)).backward()
+        # In ordinary autograd, backward enters depth 2 then depth 1, invoking this
+        # pre-hook twice on the same wrapper. Each shared parameter's post-accumulate
+        # hook fires once after both uses contribute, so our post_backward() has not
+        # reset BACKWARD when depth 1 enters.
+        # TODO: Separate post_backward (phase/weight release) from grads_ready (reduction).
+        # In shared MTP, post_backward would run twice (once per depth), resetting
+        # the phase after each invocation. Depth 1 could then enter from RESTING
+        # and gather its weights normally, without this guard. grads_ready would
+        # run once, after both depths' local gradient contributions have accumulated,
+        # and perform the reduction.
+        # This likely requires addressing static prefetch order for repeated invocations first:
+        # https://github.com/NVIDIA/Megatron-LM/issues/7764
+        if self.phase is FsdpModule.Phase.BACKWARD:
+            return
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context

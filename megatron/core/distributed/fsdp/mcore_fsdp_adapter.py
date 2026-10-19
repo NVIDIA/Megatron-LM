@@ -67,6 +67,9 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
         copy_parameter_attributes,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+        sync_model_weights_from_main_weights,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         all_sharding_strategies_in,
         any_sharding_strategy_in,
@@ -198,6 +201,15 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
     ):
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
+
+        if config.moe_virtual_expert_load_balance:
+            raise ValueError(
+                "MoonEP is not yet integrated with Megatron-FSDP v1. Supporting it requires "
+                "binding gathered expert weights, acquiring FSDP-managed full-gradient "
+                "buffers through get_main_grad, and completing replica-gradient accumulation "
+                "before FSDP reduces or releases those buffers. "
+                "Use regular DDP or the distributed optimizer for now."
+            )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -665,6 +677,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         expert_dp_mesh, expert_placements = _build_expert_mesh_and_placements(
             config, ddp_config, pg_collection, device_type
         )
+        dense_grad_scale, expert_grad_scale = _get_grad_scales(config, dp_mesh, expert_dp_mesh)
 
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
@@ -698,9 +711,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             construction_context = nullcontext(active_context)
         with construction_context:
             if expert_dp_mesh is not None:
-                # Expert parameters use expert-DP rather than the full dense-DP group.
-                # Their gradients need the EP divisor because the same expert receives
-                # contributions after dispatch from every EP rank.
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
                         if config.init_model_with_meta_device:
@@ -709,7 +719,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
-                            grad_divisor=config.expert_model_parallel_size,
+                            grad_scale=expert_grad_scale,
                             **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
@@ -724,17 +734,30 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
+                        grad_scale=dense_grad_scale,
                         **common_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
-                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
+                module,
+                mesh=dp_mesh,
+                placements=dense_placements,
+                grad_scale=dense_grad_scale,
+                **common_fully_shard_kwargs,
             )
         super().__init__(config=config, module=module)
 
         if config.overlap_moe_expert_parallel_comm:
             register_combined_1f1b_hooks(self.module)
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Load main weights and refresh the buffers used for forward compute."""
+        super().load_state_dict(state_dict, strict=strict)
+        # DCP writes into FP32 main-weight DTensors. BF16 and quantized compute
+        # buffers have separate storage and must be refreshed before the first
+        # resumed forward, just as they are after every optimizer step.
+        sync_model_weights_from_main_weights(self.module.parameters())
 
     @staticmethod
     def _validate_config(
@@ -758,6 +781,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If a required process group is missing or the model,
                 topology, or data-parallel configuration uses an unsupported feature.
         """
+        if config.moe_virtual_expert_load_balance:
+            raise ValueError(
+                "MoonEP is not yet integrated with Megatron-FSDP v2. Supporting it requires "
+                "rebinding gathered expert weights after unshard, providing FSDP-managed "
+                "full-gradient buffers for native and replica contributions, and completing "
+                "replica-gradient accumulation before FSDP packs/reduce-scatters gradients "
+                "or releases their buffers."
+            )
         if disable_bucketing:
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
         if not hasattr(pg_collection, 'dp_cp'):
@@ -814,10 +845,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 raise ValueError("MFSDP v2 with EP requires an explicit expert-DP process group.")
             if not any(isinstance(submodule, MoELayer) for submodule in module.modules()):
                 raise ValueError("MFSDP v2 with EP requires MoE transformer layers.")
-        if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
-            raise ValueError(
-                "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
-            )
         if (
             ddp_config.outer_dp_sharding_strategy != "no_shard"
             and ddp_config.num_distributed_optimizer_instances <= 1
@@ -840,8 +867,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
-        if config.calculate_per_token_loss:
-            raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
+        if config.calculate_per_token_loss and (
+            config.pipeline_model_parallel_size != 1
+            or ddp_config.num_distributed_optimizer_instances != 1
+        ):
+            raise ValueError(
+                "MFSDP v2 per-token loss has not been tested with PP>1 "
+                "or multiple optimizer instances."
+            )
         if config.fp4 or ddp_config.fp4_param_gather:
             raise ValueError("MFSDP v2 does not currently support FP4.")
         if config.fp8 and config.fp8_recipe != "mxfp8":
@@ -883,6 +916,24 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """
         with microbatch(self.module.context, is_last=False):
             yield
+
+    @torch.no_grad()
+    def scale_gradients(self, scaling_factor: float | torch.Tensor) -> None:
+        """Scale finalized gradient shards before clipping and the optimizer step.
+
+        Args:
+            scaling_factor: Multiplier, usually the reciprocal global token count.
+                Accepts a Python scalar or a scalar tensor from finalize_model_grads().
+        """
+        grads = []
+        for parameter in self.parameters():
+            if parameter.grad is not None:
+                assert not any(
+                    placement.is_partial() for placement in parameter.grad.placements
+                ), "MFSDP v2 gradient scaling requires finalized gradients."
+                grads.append(parameter.grad.to_local())
+        if grads:
+            torch._foreach_mul_(grads, scaling_factor)
 
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
         """No-op: MFSDP v2 gathers parameters from its forward pre-hooks."""
@@ -960,14 +1011,64 @@ _DATA_PARALLEL_PLACEMENTS = {
 }
 
 
+def _get_grad_scales(
+    config: TransformerConfig, dp_mesh: DeviceMesh, expert_dp_mesh: DeviceMesh | None
+) -> tuple[float, float]:
+    """Return the dense and expert gradient multipliers applied after MFSDP v2 averaging."""
+    if config.calculate_per_token_loss:
+        # With per-token normalization, backward uses each rank's sum of valid-token
+        # losses, sᵢ, where nᵢ is the valid-token count.
+        # Consider one microbatch on four ranks with EP = EDP = 2. The EP groups are
+        # (0, 1) and (2, 3); expert A has replicas on ranks 0 and 2. EP backward routes
+        # gradients from both source ranks' losses back to each expert replica:
+        #     g₀ = ∂(s₀ + s₁)/∂θ_A,  g₂ = ∂(s₂ + s₃)/∂θ_A.
+        # We need their sum, so cancel EDP averaging with grad_scale = EDP:
+        #     ((g₀ + g₂) / EDP) * EDP = g₀ + g₂
+        #                            = ∂(s₀ + s₁ + s₂ + s₃)/∂θ_A.
+        # For dense parameters θ_dense, let gᵢ = ∂sᵢ/∂θ_dense. Here dp_mesh.size() = 4.
+        # MFSDP averages over all four ranks, then multiplies by grad_scale = 4:
+        #     ((g₀ + g₁ + g₂ + g₃) / 4) * 4 = g₀ + g₁ + g₂ + g₃
+        #                                  = ∂(s₀ + s₁ + s₂ + s₃)/∂θ_dense.
+        # After accumulation, finalize_model_grads() divides gradients by N, the valid-token
+        # count across all ranks and microbatches. For this single-microbatch example,
+        # N = n₀ + n₁ + n₂ + n₃, so the final expert gradient is:
+        #     (g₀ + g₂) / N = ∂[(s₀ + s₁ + s₂ + s₃) / N]/∂θ_A.
+        dense_grad_scale = float(dp_mesh.size())
+        expert_grad_scale = 1.0
+        if expert_dp_mesh is not None:
+            expert_grad_scale = float(expert_dp_mesh.size())
+    else:
+        # Without per-token normalization, backward uses each microbatch's mean
+        # valid-token loss, so dense gradients need the mesh's rank average.
+        #
+        # For experts, consider one microbatch on four ranks with EP = EDP = 2.
+        # The EP groups are (0, 1) and (2, 3); expert A has replicas on ranks 0 and 2.
+        # Let sᵢ be the sum of valid-token losses and nᵢ the valid-token count on
+        # source rank i. Its mean loss is sᵢ / nᵢ. EP backward routes gradients back
+        # to the experts, so each replica includes BOTH source ranks' mean losses:
+        #     g₀ = ∂(s₀/n₀ + s₁/n₁)/∂θ_A,  g₂ = ∂(s₂/n₂ + s₃/n₃)/∂θ_A.
+        # EDP averaging followed by grad_scale = 1 / EP gives:
+        #     ((g₀ + g₂) / EDP) * (1 / EP) = (g₀ + g₂) / 4
+        #                                  = ∂[(s₀/n₀ + s₁/n₁ + s₂/n₂ + s₃/n₃) / 4]/∂θ_A.
+        # The same calculation applies to the experts on ranks 1 and 3.
+        # There are EP * EDP source ranks, but EDP averaging divides by only EDP.
+        # Multiply by 1 / EP as well to obtain the mean gradient over all source ranks.
+        # When all nᵢ are equal, this equals:
+        #     ∂[(s₀ + s₁ + s₂ + s₃) / (n₀ + n₁ + n₂ + n₃)]/∂θ_A,
+        # matching the per-token branch above.
+        dense_grad_scale = 1.0
+        expert_grad_scale = 1.0 / config.expert_model_parallel_size
+    return dense_grad_scale, expert_grad_scale
+
+
 def _build_expert_mesh_and_placements(
     config: TransformerConfig,
     ddp_config: DistributedDataParallelConfig,
     pg_collection: ProcessGroupCollection,
     device_type: str,
 ) -> Tuple[DeviceMesh | None, Placements | None]:
-    """Build the expert-DP mesh and placements, or return neither when EP is disabled."""
-    if config.expert_model_parallel_size <= 1:
+    """Build expert placements for MoE models, including when EP has only one rank."""
+    if config.num_moe_experts is None:
         return None, None
 
     inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)

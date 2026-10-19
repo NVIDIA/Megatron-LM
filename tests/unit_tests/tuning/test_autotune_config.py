@@ -131,6 +131,7 @@ def test_training_installs_the_policy_before_distributed_init(
     # Parsed but not validated, as in callers that build their own arguments.
     args = parser.parse_args(['--deterministic-mode', '--triton-autotune-modules', 'my_kernels'])
     monkeypatch.setattr(initialization, 'get_args', lambda: args)
+    monkeypatch.setattr(initialization, 'initialize_runtime_services', Mock())
     monkeypatch.setattr(initialization, 'setup_logging', lambda: None)
     monkeypatch.setattr(initialization, 'initialize_rerun_state_machine', Mock())
 
