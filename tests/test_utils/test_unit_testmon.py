@@ -575,7 +575,6 @@ def test_cpu_selection(cpu_baseline, monkeypatch, change, mode, selected):
             arguments["recipe_platform"],
             arguments["source_sha"],
             image_id=arguments["image_id"],
-            check_runtime=True,
         )
         for phase in before:
             output = directory / ".testmon-work" / phase
@@ -619,7 +618,6 @@ def test_cpu_plan_execution(tmp_path, validation_status, full_runs, selected_run
             "run_testmon_phase() { echo 'unexpected GPU selection' >&2; return 99; }",
             "coverage() { return 0; }",
             "uv() {",
-            '  if [[ "$1" == pip ]]; then return 0; fi',
             '  if [[ "$*" == *testmon_plan.py* ]]; then return "$VALIDATION_STATUS"; fi',
             '  echo "$*" >> "$EVENTS"',
             "}",

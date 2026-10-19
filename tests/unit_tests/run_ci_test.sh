@@ -338,15 +338,12 @@ run_enforced_tests() {
     local target prod_count experimental_count mandatory_count
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
     if [[ "${UNIT_TESTMON_MODE:-enforce}" == "preselected" ]]; then
-        # CPU selection has already finished. Check the actual runtime before
-        # consuming its plan; no distributed collection runs on this path.
-        if ! uv pip install --python /opt/venv/bin/python --no-deps "pytest-testmon==2.2.0" \
-            || ! uv run --no-sync python tests/unit_tests/testmon_plan.py prepare \
+        # Use the CPU selection; the host has already checked the pulled image.
+        if ! uv run --no-sync python tests/unit_tests/testmon_plan.py prepare \
                 --plan "$UNIT_TESTMON_CACHE_DIR/plan.json" --cache-dir "$UNIT_TESTMON_CACHE_DIR" \
                 --bucket "$BUCKET" --platform "dgx_$PLATFORM" \
-                --source-sha "$(git rev-parse HEAD)" \
-                --check-runtime; then
-            write_testmon_summary "full fallback: CPU selection plan failed runtime validation"
+                --source-sha "$(git rev-parse HEAD)"; then
+            write_testmon_summary "full fallback: CPU selection plan is unavailable or invalid"
             run_full_tests
             return
         fi

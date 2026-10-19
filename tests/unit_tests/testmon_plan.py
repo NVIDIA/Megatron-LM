@@ -155,7 +155,7 @@ def select(
         if manifest.get("image_id") != image_id:
             # The CPU host cannot measure the packages in a different GPU image.
             # Equal image IDs prove the baseline runtime is still the execution runtime.
-            raise ValueError("container image changed; GPU runtime validation is required")
+            raise ValueError("container image changed; full GPU execution is required")
         if not any(char in bucket for char in "*?[") and source_sha != manifest["source_sha"]:
             # Explicit-file pytest arguments bypass Testmon's stable-file collection skip.
             # They may discover new IDs from collection-only production dependencies.
@@ -165,7 +165,6 @@ def select(
         changed_files = _changed_files(pr_files_dir, source_sha)
         mandatory = _mandatory_files(root, bucket, recipe_platform, changed_files)
         _test_sources_unchanged(root, manifest["source_sha"], PLATFORMS[recipe_platform]["recipe"])
-        runtimes = {}
         for phase in PHASES:
             runtime = json.loads((cache_dir / phase / "metadata.json").read_text())["runtime"]
             if (
@@ -173,7 +172,6 @@ def select(
                 or runtime["implementation"] != platform.python_implementation()
             ):
                 raise ValueError("CPU Python differs from the Testmon fingerprint interpreter")
-            runtimes[phase] = runtime
         phases = {
             phase: _select_phase(root, cache_dir / phase / ".testmondata") for phase in PHASES
         }
@@ -188,7 +186,6 @@ def select(
             mode="selected",
             reason="selected on CPU from the compatible main baseline",
             phases=phases,
-            runtime=runtimes,
             mandatory_files=mandatory,
         )
     except (
@@ -213,11 +210,8 @@ def prepare(
     source_sha: str,
     *,
     image_id: str | None = None,
-    check_runtime: bool = False,
 ) -> None:
-    """Validate a selected plan before exposing its IDs to the distributed runner."""
-    from testmon_cache import runtime_identity
-
+    """Validate the plan identity and write the distributed runner's selection files."""
     if plan["schema"] != 1 or plan["mode"] != "selected":
         raise ValueError("no valid CPU-selected Testmon plan")
     if (
@@ -228,10 +222,6 @@ def prepare(
         raise ValueError("Testmon plan does not match this checkout and bucket")
     if image_id is not None and plan["image_id"] != image_id:
         raise ValueError("Testmon plan container image changed")
-    if check_runtime:
-        runtime = runtime_identity()
-        if any(plan["runtime"][phase] != runtime for phase in PHASES):
-            raise ValueError("Testmon plan runtime environment changed")
     for phase in PHASES:
         output = cache_dir / ".testmon-work" / phase / "selected-tests"
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -251,7 +241,6 @@ def main(argv: list[str] | None = None) -> int:
     select_parser.add_argument("--output", type=Path, required=True)
     prepare_parser = commands.add_parser("prepare")
     prepare_parser.add_argument("--plan", type=Path, required=True)
-    prepare_parser.add_argument("--check-runtime", action="store_true")
     for child in (select_parser, prepare_parser):
         child.add_argument("--cache-dir", type=Path, required=True)
         child.add_argument("--bucket", required=True)
@@ -268,7 +257,6 @@ def main(argv: list[str] | None = None) -> int:
                 args.platform,
                 args.source_sha,
                 image_id=args.image_id,
-                check_runtime=args.check_runtime,
             )
         except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
             print(f"Unit Testmon plan unavailable: {error}", file=sys.stderr)
