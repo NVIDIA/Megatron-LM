@@ -14,6 +14,7 @@ from megatron.core.models.hybrid.shortcut_block import (
     group_layers_into_shortcut_blocks,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.layer_interface import LayerExecutionContext, LayerInputs
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -244,7 +245,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
 
     def attn_forward(hidden_states, packed_seq_params=None, **kwargs):
         observed["attn_packed"] = packed_seq_params
-        observed["cp_metadata"] = kwargs.get("packed_sequence_cp_metadata")
+        observed["packed_sequence_cp_metadata"] = kwargs.get("packed_sequence_cp_metadata")
         assert {
             key: value
             for key, value in kwargs.items()
@@ -294,27 +295,26 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
     monkeypatch.setattr(block, "_moe_shared_experts", shared)
     monkeypatch.setattr(block, "_postprocess", postprocess)
 
-    cp_metadata = object()
+    packed_sequence_cp_metadata = object()
     hidden_states = torch.zeros(2, 1, config.hidden_size)
-    output = block(
-        hidden_states=hidden_states,
-        attention_mask=None,
-        inference_context=None,
-        rotary_pos_emb=None,
-        sequence_len_offset=None,
-        packed_seq_params="packed-input",
-        padding_mask=None,
-        quant_context_factory=quant_context_factory,
-        cp_layout_state=RecordingCPLayoutState(),
-        packed_sequence_cp_metadata=cp_metadata,
-        attn_recompute_context=attn_context,
-        moe_recompute_context=moe_context,
+    output, bias = block(
+        hidden_states,
+        LayerInputs(
+            packed_seq_params="packed-input",
+            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+            execution_context=LayerExecutionContext(
+                quant_context_factory=quant_context_factory,
+                cp_layout_state=RecordingCPLayoutState(),
+                residual_stream_recompute_plan=[None] * 4 + [attn_context, moe_context],
+            ),
+        ),
     )
+    assert bias is None
 
     assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
     assert observed == {
         "attn_packed": "packed-4",
-        "cp_metadata": cp_metadata if uses_cp_metadata else None,
+        "packed_sequence_cp_metadata": packed_sequence_cp_metadata if uses_cp_metadata else None,
         "route_packed": "packed-5",
         "shared_packed": "packed-5",
         "postprocess_packed": "packed-5",
@@ -377,16 +377,14 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     hidden_states = torch.zeros(2, 1, config.hidden_size)
     InferenceMode.set_active()
     try:
-        output = block(
-            hidden_states=hidden_states,
-            attention_mask=None,
-            inference_context=inference_context,
-            rotary_pos_emb=None,
-            sequence_len_offset=None,
-            packed_seq_params=None,
-            padding_mask=None,
-            quant_context_factory=quant_context_factory,
+        output, bias = block(
+            hidden_states,
+            LayerInputs(
+                inference_context=inference_context,
+                execution_context=LayerExecutionContext(quant_context_factory),
+            ),
         )
+        assert bias is None
     finally:
         InferenceMode.unset_active()
 
@@ -603,16 +601,11 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             monkeypatch.setattr(block, "_wait_combine", lambda combined_output: combined_output)
 
         hidden_states = torch.arange(1.0, 5.0, requires_grad=True)
-        output = block(
-            hidden_states=hidden_states,
-            attention_mask=None,
-            inference_context=None,
-            rotary_pos_emb=None,
-            sequence_len_offset=None,
-            packed_seq_params=None,
-            padding_mask=None,
-            quant_context_factory=quant_context_factory,
+        output, bias = block(
+            hidden_states,
+            LayerInputs(execution_context=LayerExecutionContext(quant_context_factory)),
         )
+        assert bias is None
         output.sum().backward()
         gradients = {
             name: parameter.grad.detach().clone()
@@ -713,16 +706,11 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
     def quant_context_factory(*_args):
         yield
 
-    output = block(
-        hidden_states=hidden_states,
-        attention_mask=None,
-        inference_context=None,
-        rotary_pos_emb=None,
-        sequence_len_offset=None,
-        packed_seq_params=None,
-        padding_mask=None,
-        quant_context_factory=quant_context_factory,
+    output, bias = block(
+        hidden_states,
+        LayerInputs(execution_context=LayerExecutionContext(quant_context_factory)),
     )
+    assert bias is None
     output.sum().backward()
 
     assert calls["checkpoint_input"] is hidden_states

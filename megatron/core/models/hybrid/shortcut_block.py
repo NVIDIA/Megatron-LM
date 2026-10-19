@@ -26,7 +26,12 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import LayerInputs
+from megatron.core.transformer.layer_interface import (
+    LayerExecutionContext,
+    LayerInputs,
+    LayerInterface,
+    bind_layer_inputs,
+)
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
@@ -129,7 +134,7 @@ def group_layers_into_shortcut_blocks(
     return grouped_layers
 
 
-class ShortcutMoEBlock(MegatronModule):
+class ShortcutMoEBlock(MegatronModule, LayerInterface):
     """Own and execute one attention-layer/shortcut-MoE pair."""
 
     _parallel_stream: torch.cuda.Stream | None = None
@@ -426,6 +431,7 @@ class ShortcutMoEBlock(MegatronModule):
         assert bias is None, "Shortcut blocks require complete residual layers"
         return hidden_states
 
+    @bind_layer_inputs
     def forward(
         self,
         hidden_states,
@@ -435,11 +441,9 @@ class ShortcutMoEBlock(MegatronModule):
         sequence_len_offset,
         packed_seq_params,
         padding_mask,
-        quant_context_factory,
-        cp_layout_state=None,
         packed_sequence_cp_metadata=None,
-        attn_recompute_context: ResidualStreamRecomputeContext | None = None,
-        moe_recompute_context: ResidualStreamRecomputeContext | None = None,
+        *,
+        execution_context: LayerExecutionContext,
     ):
         """Run the eager schedule with each physical layer's quantization context.
 
@@ -447,6 +451,18 @@ class ShortcutMoEBlock(MegatronModule):
         which never updates KV-cache or recurrent state, and communication stays on the current
         stream.
         """
+
+        if execution_context is None:
+            raise ValueError("Shortcut execution requires a LayerExecutionContext.")
+        quant_context_factory = execution_context.quant_context_factory
+        cp_layout_state = execution_context.cp_layout_state
+        attn_recompute_context = moe_recompute_context = None
+        plan = execution_context.residual_stream_recompute_plan
+        if plan:
+            if self.attn_local_idx is None or self.moe_local_idx is None:
+                raise ValueError("Shortcut replay requires both physical layer indices.")
+            attn_recompute_context = plan[self.attn_local_idx]
+            moe_recompute_context = plan[self.moe_local_idx]
 
         # Split-stage calls bypass the shared forward binder.
         if (

@@ -118,7 +118,7 @@ def checkpointed_forward(
                                 packed_seq_params=layer_packed_seq_params,
                                 padding_mask=padding_mask,
                                 input_ids=input_ids,
-                                cp_metadata=packed_sequence_cp_metadata,
+                                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                             ),
                         )
                         assert bias is None, "Recompute requires complete residual layers"

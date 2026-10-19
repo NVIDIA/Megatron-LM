@@ -13,7 +13,7 @@ from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
     LayerInputs,
-    layer_inputs_forward,
+    bind_layer_inputs,
     wants_input_ids,
 )
 from megatron.core.transformer.module import (
@@ -121,16 +121,16 @@ class HyperConnectionHybridLayer(MegatronModule):
             layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
-    @layer_inputs_forward(
-        aliases={"packed_sequence_cp_metadata": "cp_metadata"},
-        output=lambda result: (result[0], None),
-        reject={
-            "residual_stream_recompute_context": TypeError(
+    def layer_inputs_forward(self, hidden_states, inputs, **kwargs):
+        """Reject residual-stream replay before executing the mHC boundary."""
+        if inputs.residual_stream_recompute_context is not None:
+            raise TypeError(
                 "HyperConnectionHybridLayer does not support residual_stream recomputation; "
                 "select 'mhc' in recompute_modules and configure mhc_recompute_layer_num instead."
             )
-        },
-    )
+        return super().layer_inputs_forward(hidden_states, inputs, **kwargs)
+
+    @bind_layer_inputs(output=lambda result: result[0])
     def forward(
         self,
         hidden_states: Tensor,
@@ -170,7 +170,7 @@ class HyperConnectionHybridLayer(MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                     sequence_len_offset=sequence_len_offset,
                     packed_seq_params=packed_seq_params,
-                    cp_metadata=packed_sequence_cp_metadata,
+                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                     padding_mask=padding_mask,
                     input_ids=input_ids,
                 ),

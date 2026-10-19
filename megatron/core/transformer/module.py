@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.transformer.layer_interface import LayerInputs, _parse_layer_inputs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -89,16 +90,26 @@ class MegatronModule(torch.nn.Module):
     def __call__(self, *args, **kwargs):
         # Bind once, before graph selection or PyTorch hooks, and convert the
         # result only after the normal module execution path has completed.
-        adapter = getattr(self.forward, "_layer_input_adapter", None)
-        if adapter is not None:
-            return adapter(
-                self,
-                self._call_with_bound_args,
-                args,
-                kwargs,
-                hidden_as_keyword=self._layer_input_hidden_as_keyword,
-            )
+        if getattr(self.forward, "_layer_input_binding", None) is not None:
+            shared_inputs = _parse_layer_inputs(args, kwargs)
+            if shared_inputs is not None:
+                return self.layer_inputs_forward(*shared_inputs)
         return self._call_with_bound_args(*args, **kwargs)
+
+    def layer_inputs_forward(self, hidden_states, inputs: LayerInputs, *, _call=None):
+        """Bind shared inputs, execute the layer, and normalize its output.
+
+        Override this method for layer-owned validation or shared-call behavior,
+        then delegate to super. Forward ``**kwargs`` so direct ``forward`` calls
+        preserve their private execution callback and bypass hooks/graph dispatch.
+        """
+        return self.forward._layer_input_binding(
+            self,
+            self._call_with_bound_args if _call is None else _call,
+            hidden_states,
+            inputs,
+            hidden_as_keyword=self._layer_input_hidden_as_keyword if _call is None else False,
+        )
 
     def _call_with_bound_args(self, *args, **kwargs):
         """Execute an ordinary forward call through PyTorch's hook/compile machinery."""

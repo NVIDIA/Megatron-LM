@@ -40,7 +40,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
     LayerInputs,
     LayerInterface,
-    layer_inputs_forward,
+    bind_layer_inputs,
 )
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
@@ -130,7 +130,7 @@ def test_attention_adapter_threads_every_execution_input():
     inputs = LayerInputs(
         attention_mask=mask,
         rotary_pos_emb=rope,
-        cp_metadata=metadata,
+        packed_sequence_cp_metadata=metadata,
         packed_seq_params=packed,
         inference_context=context,
         sequence_len_offset=3,
@@ -217,7 +217,7 @@ def test_gdp_training_forward_backward_and_packed_metadata():
         core._gdp_chunk_forward = lambda x, **kwargs: x.sin()
         core.out_proj = DeferredBiasLinear(4, 4, bias=bias)
         packed, metadata = (object(), object())
-        inputs = LayerInputs(packed_seq_params=packed, cp_metadata=metadata)
+        inputs = LayerInputs(packed_seq_params=packed, packed_sequence_cp_metadata=metadata)
         assert_equivalent(
             core,
             lambda m, x: apply_output_bias(
@@ -286,7 +286,9 @@ def test_skeleton_adapters_preserve_recompute_and_mhc_state():
     x = torch.randn(2, 4)
     replay, manager, metadata = (object(), object(), object())
     inputs = LayerInputs(
-        cp_metadata=metadata, input_ids=object(), residual_stream_recompute_context=replay
+        packed_sequence_cp_metadata=metadata,
+        input_ids=object(),
+        residual_stream_recompute_context=replay,
     )
     for cls in (TransformerLayer, MambaLayer):
         module = bare(cls)
@@ -332,7 +334,7 @@ def test_mamba_binding_owns_cp_metadata_selection(mode, has_metadata):
     metadata = object() if has_metadata else None
     module._call_with_bound_args = Mock(return_value=x)
 
-    assert module(x, LayerInputs(cp_metadata=metadata)) == (x, None)
+    assert module(x, LayerInputs(packed_sequence_cp_metadata=metadata)) == (x, None)
     kwargs = module._call_with_bound_args.call_args.kwargs
     if mode == "chunkwise" and has_metadata:
         assert kwargs["packed_sequence_cp_metadata"] is metadata
@@ -426,7 +428,7 @@ def test_recompute_calls_shared_inputs_and_replays_gradients(config_cls, method)
     assert len(layer.inputs) == 2
     for inputs in layer.inputs:
         assert inputs.input_ids is ids
-        assert inputs.cp_metadata is metadata
+        assert inputs.packed_sequence_cp_metadata is metadata
 
 
 def test_hybrid_stack_eager_and_full_recompute_use_the_same_call():
@@ -488,7 +490,7 @@ def test_hybrid_stack_eager_and_full_recompute_use_the_same_call():
         assert_bit_exact(x.grad, {}, reference.grad, {})
         for layer in stack.layers:
             assert isinstance(layer.received_inputs, LayerInputs)
-            assert layer.received_inputs.cp_metadata is metadata
+            assert layer.received_inputs.packed_sequence_cp_metadata is metadata
             assert layer.received_inputs.packed_seq_params is packed
 
 
@@ -631,7 +633,7 @@ def test_mhc_fallback_accepts_native_layer_inputs_and_preserves_gradients(shared
         rotary_pos_emb=object(),
         sequence_len_offset=7,
         packed_seq_params=object(),
-        cp_metadata=object(),
+        packed_sequence_cp_metadata=object(),
         padding_mask=object(),
         input_ids=object(),
     )
@@ -647,7 +649,7 @@ def test_mhc_fallback_accepts_native_layer_inputs_and_preserves_gradients(shared
             sequence_len_offset=inputs.sequence_len_offset,
             packed_seq_params=inputs.packed_seq_params,
             padding_mask=inputs.padding_mask,
-            packed_sequence_cp_metadata=inputs.cp_metadata,
+            packed_sequence_cp_metadata=inputs.packed_sequence_cp_metadata,
             input_ids=inputs.input_ids,
         )
         assert context is None
@@ -688,26 +690,39 @@ def test_cross_attention_rejects_unsupported_shared_inputs():
 
 def test_mamba_mixer_rejects_chunkwise_metadata():
     with pytest.raises(NotImplementedError, match="packed-sequence chunkwise CP metadata"):
-        bare(MambaMixer)(torch.randn(2, 4), LayerInputs(cp_metadata=object()))
+        bare(MambaMixer)(torch.randn(2, 4), LayerInputs(packed_sequence_cp_metadata=object()))
+
+
+@pytest.mark.parametrize("cls", [GatedDeltaNet, GatedDeltaNet2])
+def test_gdn_cores_preserve_chunkwise_metadata_rejection(cls):
+    with pytest.raises(AssertionError, match="packed-sequence chunkwise CP metadata"):
+        bare(cls)(torch.randn(2, 4), LayerInputs(packed_sequence_cp_metadata=object()))
 
 
 class ExplicitSignatureLayer(MegatronModule):
     """Exercise binding without implementing any LayerInputs-specific method."""
 
-    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"})
+    @bind_layer_inputs
     def forward(
         self, hidden_states, attention_mask=None, *, packed_sequence_cp_metadata=None, **kwargs
     ):
         self.seen = (attention_mask, packed_sequence_cp_metadata, kwargs)
-        return hidden_states.sin(), None
+        return hidden_states.sin()
 
 
 @pytest.mark.parametrize("call_style", ["positional", "mixed", "x", "hidden_states", "forward"])
 def test_signature_binding_preserves_hooks_gradients_and_legacy_calls(call_style):
-    module = bare(ExplicitSignatureLayer)
+    class CustomLayer(ExplicitSignatureLayer):
+        def layer_inputs_forward(self, hidden_states, inputs, **kwargs):
+            events.append("shared")
+            return super().layer_inputs_forward(hidden_states, inputs, **kwargs)
+
+    module = bare(CustomLayer)
     x = torch.randn(2, 4, requires_grad=True)
     mask, metadata, unrelated = object(), object(), object()
-    inputs = LayerInputs(attention_mask=mask, cp_metadata=metadata, input_ids=unrelated)
+    inputs = LayerInputs(
+        attention_mask=mask, packed_sequence_cp_metadata=metadata, input_ids=unrelated
+    )
     events = []
 
     def before(module, args, kwargs):
@@ -720,8 +735,8 @@ def test_signature_binding_preserves_hooks_gradients_and_legacy_calls(call_style
 
     def after(module, args, kwargs, output):
         events.append("after")
-        assert output[1] is None  # Output conversion happens after module hooks.
-        return output[0] * 3, None
+        assert isinstance(output, torch.Tensor)  # Normalization happens after module hooks.
+        return output * 3
 
     pre = module.register_forward_pre_hook(before, with_kwargs=True)
     post = module.register_forward_hook(after, with_kwargs=True)
@@ -739,15 +754,18 @@ def test_signature_binding_preserves_hooks_gradients_and_legacy_calls(call_style
     assert module.seen == (mask, metadata, {})
     expected = x.sin() if call_style == "forward" else (x * 2).sin() * 3
     assert_bit_exact(result[0], {}, expected, {})
-    assert events == ([] if call_style == "forward" else ["before", "after"])
+    assert events == (["shared"] if call_style == "forward" else ["shared", "before", "after"])
     expected_grad = torch.autograd.grad(expected.sum(), x)[0]
     result[0].sum().backward()
     assert_bit_exact(x.grad, {}, expected_grad, {})
     pre.remove()
     post.remove()
-    # Legacy calls retain positional arguments, arbitrary kwargs, and the bias slot.
+    events.clear()
+    # Legacy calls retain positional arguments, arbitrary kwargs, and the tensor result.
     old = module(x, mask, packed_sequence_cp_metadata=metadata, unrelated=unrelated)
-    assert len(old) == 2 and old[1] is None
+    assert isinstance(old, torch.Tensor)
+    assert events == []
+    assert_bit_exact(old, {}, x.sin(), {})
     assert module.seen == (mask, metadata, {"unrelated": unrelated})
     assert inspect.signature(module.forward) == inspect.signature(
         module.forward.__wrapped__
@@ -778,23 +796,32 @@ def test_shared_call_rejects_ambiguous_arguments_before_execution(args, kwargs):
 
 def test_adapter_validates_declarations_and_requires_a_forwarding_schema():
     with pytest.raises(TypeError, match="explicit hidden-state"):
-        layer_inputs_forward(lambda self, *args, **kwargs: None)
+        bind_layer_inputs(lambda self, *args, **kwargs: None)
     with pytest.raises(ValueError, match="alias"):
-        layer_inputs_forward(lambda self, x: x, aliases={"typo": "attention_mask"})
+        bind_layer_inputs(lambda self, x: x, aliases={"typo": "attention_mask"})
     with pytest.raises(ValueError, match="Required parameter"):
-        layer_inputs_forward(lambda self, x, required: x)
+        bind_layer_inputs(lambda self, x, required: x)
     with pytest.raises(ValueError, match="policies"):
-        layer_inputs_forward(lambda self, x: x, omit_none=("attention_mask",))
+        bind_layer_inputs(lambda self, x: x, omit_none=("attention_mask",))
     with pytest.raises(ValueError, match="alias"):
-        layer_inputs_forward(lambda self, x, **kwargs: x, aliases={"x": "attention_mask"})
+        bind_layer_inputs(lambda self, x, **kwargs: x, aliases={"x": "attention_mask"})
 
 
 @pytest.mark.parametrize("mode", ["eager", "local", "te_capture", "te_replay"])
-def test_shared_binding_surrounds_graph_dispatch_without_recursion(mode):
+@pytest.mark.parametrize("output_kind", ["tensor", "pair", "bias"])
+def test_shared_binding_surrounds_graph_dispatch_without_recursion(mode, output_kind):
+    bias = torch.randn(4, requires_grad=True) if output_kind == "bias" else None
+
     class Layer(GraphableMegatronModule):
-        @layer_inputs_forward
+        def layer_inputs_forward(self, hidden_states, inputs, **kwargs):
+            if inputs.context is not None:
+                raise ValueError("Unsupported context")
+            return super().layer_inputs_forward(hidden_states, inputs, **kwargs)
+
+        @bind_layer_inputs
         def forward(self, hidden_states, attention_mask=None):
-            return hidden_states.sin(), None
+            output = hidden_states.sin()
+            return output if output_kind == "tensor" else (output, bias)
 
     module = bare(Layer)
     x = torch.randn(2, 4, requires_grad=True)
@@ -820,14 +847,23 @@ def test_shared_binding_surrounds_graph_dispatch_without_recursion(mode):
     for _ in range(2):
         result = module(x, LayerInputs(attention_mask=mask))
         assert (
-            len(result) == 2 and result[1] is None
+            len(result) == 2 and result[1] is bias
         )  # Both eager and graph output obey the pair contract.
         assert_bit_exact(result[0], {}, x.sin(), {})
-        assert seen[-1][1] is None
+        if output_kind == "tensor":
+            assert result[0] is seen[-1]
+        else:
+            assert result is seen[-1]
     assert len(seen) == 2
     assert len(calls) == (0 if mode == "eager" else 2)
-    result[0].sum().backward()
+    with pytest.raises(ValueError, match="Unsupported context"):
+        module(x, LayerInputs(attention_mask=mask, context=object()))
+    assert len(seen) == 2
+    assert len(calls) == (0 if mode == "eager" else 2)
+    apply_output_bias(result).sum().backward()
     assert_bit_exact(x.grad, {}, x.detach().cos(), {})
+    if bias is not None:
+        assert_bit_exact(bias.grad, {}, torch.full_like(bias, x.shape[0]), {})
     if mode == "local":
         module._should_call_te_cudagraph.assert_not_called()
     else:
@@ -853,7 +889,7 @@ def test_inherited_adapter_and_override_keep_distinct_signatures():
         pass
 
     class Override(ExplicitSignatureLayer):
-        @layer_inputs_forward
+        @bind_layer_inputs
         def forward(self, hidden_states, input_ids=None):
             self.ids = input_ids
             return hidden_states, None
@@ -929,10 +965,10 @@ def test_mhc_per_call_setup_runs_before_graph_dispatch():
 
 def test_te_capture_and_replay_use_legacy_tensors_and_manual_hooks():
     class Layer(GraphableMegatronModule):
-        @layer_inputs_forward
+        @bind_layer_inputs
         def forward(self, hidden_states, attention_mask=None):
             self.forward_count += 1
-            return hidden_states.sin(), None
+            return hidden_states.sin()
 
     module = bare(Layer)
     module.config = SimpleNamespace(
@@ -947,7 +983,7 @@ def test_te_capture_and_replay_use_legacy_tensors_and_manual_hooks():
         assert_bit_exact(module(x, inputs)[0], {}, x.sin(), {})
     hook = Mock()
     module.cuda_graph_manual_hooks = [(hook, (module,))]
-    graph = Mock(side_effect=lambda hidden_states, **kwargs: (hidden_states.sin(), None))
+    graph = Mock(side_effect=lambda hidden_states, **kwargs: hidden_states.sin())
     module.cuda_graphs = [graph]
     for microbatch in (0, 1):
         module.current_microbatch = microbatch

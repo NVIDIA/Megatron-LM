@@ -31,7 +31,7 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import LayerInterface, layer_inputs_forward
+from megatron.core.transformer.layer_interface import LayerInterface, bind_layer_inputs
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
@@ -351,7 +351,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 
-    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"})
+    @bind_layer_inputs
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -361,6 +361,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_sequence_cp_metadata=None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run a GDN variant's recurrence followed by its output projection."""
@@ -371,6 +372,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             inference_params=inference_params,
+            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
             **kwargs,
         )
         return self.forward_post_core_attn(norm_out)

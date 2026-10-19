@@ -28,7 +28,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     l2norm,
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
-from megatron.core.transformer.layer_interface import layer_inputs_forward
+from megatron.core.transformer.layer_interface import bind_layer_inputs
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
@@ -287,7 +287,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         return norm_out
 
-    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"})
+    @bind_layer_inputs
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -297,6 +297,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_sequence_cp_metadata=None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dispatch inference, then fall through to the training two-stage path.
@@ -338,6 +339,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             attention_mask,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
             **kwargs,
         )
 

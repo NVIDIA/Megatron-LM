@@ -26,7 +26,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.layer_interface import LayerInterface, layer_inputs_forward
+from megatron.core.transformer.layer_interface import LayerInterface, bind_layer_inputs
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -257,7 +257,7 @@ class MLP(MegatronModule, LayerInterface):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-    @layer_inputs_forward
+    @bind_layer_inputs
     def forward(
         self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
     ):

@@ -45,7 +45,11 @@ from megatron.core.transformer.hyper_connection import (
     learned_output_contract,
 )
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import LayerInputs, layer_inputs_forward
+from megatron.core.transformer.layer_interface import (
+    LayerExecutionContext,
+    LayerInputs,
+    bind_layer_inputs,
+)
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute import (
     build_residual_stream_recompute_plan,
@@ -536,9 +540,7 @@ class HybridStack(MegatronModule):
             manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
     # The legacy decoder can additionally return the mHC stream for MTP.
-    @layer_inputs_forward(
-        output=lambda result: (result[0] if isinstance(result, tuple) else result, None)
-    )
+    @bind_layer_inputs(output=lambda result: result[0] if isinstance(result, tuple) else result)
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -682,6 +684,11 @@ class HybridStack(MegatronModule):
             if use_residual_stream_recompute
             else [None] * self.num_layers_per_pipeline_rank
         )
+        execution_context = LayerExecutionContext(
+            quant_context_factory=get_inner_quant_context,
+            cp_layout_state=cp_layout_state,
+            residual_stream_recompute_plan=residual_stream_recompute_plan,
+        )
 
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
@@ -717,62 +724,55 @@ class HybridStack(MegatronModule):
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
 
-                    if isinstance(layer, ShortcutMoEBlock):
+                    is_shortcut = isinstance(layer, ShortcutMoEBlock)
+                    finalize_recompute_context = residual_stream_recompute_context
+                    if is_shortcut:
                         if layer.moe_local_idx is None:
                             raise RuntimeError(
                                 "A registered ShortcutMoEBlock is missing its MoE physical index."
                             )
-                        moe_recompute_context = residual_stream_recompute_plan[layer.moe_local_idx]
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
+                        finalize_recompute_context = residual_stream_recompute_plan[
+                            layer.moe_local_idx
+                        ]
+                        # Composite layers enter a quantization context for each physical layer.
+                        inner_quant_context = nullcontext()
+                    else:
+                        if cp_layout_state is not None:
+                            hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
+                                physical_layer_idx, hidden_states
+                            )
+                        # Layers have 1-indexed layer numbers attribute.
+                        inner_quant_context = get_inner_quant_context(
+                            layer_config, layer.layer_number - 1
+                        )
+                    # Observe ordinary layers inside their CP layout conversions.
+                    residual_accumulator = hidden_states
+                    with inner_quant_context:
+                        layer_inputs = LayerInputs(
                             attention_mask=attention_mask,
                             inference_context=inference_context,
                             rotary_pos_emb=rotary_pos_emb,
                             sequence_len_offset=sequence_len_offset,
                             packed_seq_params=layer_packed_seq_params,
                             padding_mask=padding_mask,
-                            quant_context_factory=get_inner_quant_context,
-                            cp_layout_state=cp_layout_state,
+                            input_ids=input_ids,
                             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                            attn_recompute_context=residual_stream_recompute_context,
-                            moe_recompute_context=moe_recompute_context,
+                            residual_stream_recompute_context=residual_stream_recompute_context,
+                            mhc_recompute_manager=mhc_manager,
+                            execution_context=execution_context,
                         )
-                        residual_stream_recompute_context = moe_recompute_context
-                    else:
-                        if cp_layout_state is not None:
-                            hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
-                                physical_layer_idx, hidden_states
-                            )
-                        # Keep both residuals in the layer's layout, inside the CP conversions.
-                        residual_accumulator = hidden_states
-                        # Layers have 1-indexed layer numbers attribute.
-                        inner_quant_context = get_inner_quant_context(
-                            layer_config, layer.layer_number - 1
-                        )
-                        with inner_quant_context:
-                            layer_inputs = LayerInputs(
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                rotary_pos_emb=rotary_pos_emb,
-                                sequence_len_offset=sequence_len_offset,
-                                packed_seq_params=layer_packed_seq_params,
-                                padding_mask=padding_mask,
-                                input_ids=input_ids,
-                                cp_metadata=packed_sequence_cp_metadata,
-                                residual_stream_recompute_context=residual_stream_recompute_context,
-                                mhc_recompute_manager=mhc_manager,
-                            )
-                            hidden_states, bias = layer(hidden_states, layer_inputs)
-                            assert bias is None, "HybridStack requires complete residual layers"
+                        hidden_states, bias = layer(hidden_states, layer_inputs)
+                        assert bias is None, "HybridStack requires complete residual layers"
 
+                    if not is_shortcut:
                         observe_layer_residuals(layer, residual_accumulator, hidden_states)
                         if cp_layout_state is not None:
                             hidden_states = cp_layout_state.finalize_layer(
                                 physical_layer_idx, hidden_states
                             )
 
-                    if residual_stream_recompute_context is not None:
-                        residual_stream_recompute_context.finalize(hidden_states)
+                    if finalize_recompute_context is not None:
+                        finalize_recompute_context.finalize(hidden_states)
                     self._finalize_mhc_recompute_layer(
                         manager=mhc_manager,
                         hidden_states=hidden_states,

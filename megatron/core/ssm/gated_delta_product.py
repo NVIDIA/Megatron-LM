@@ -36,7 +36,7 @@ from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.layer_interface import LayerInterface, layer_inputs_forward
+from megatron.core.transformer.layer_interface import LayerInterface, bind_layer_inputs
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
@@ -530,7 +530,7 @@ class GatedDeltaProductMixer(
         """Apply GDP's output projection to a recurrence output."""
         return self.out_proj(y)
 
-    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"})
+    @bind_layer_inputs
     def forward(
         self,
         hidden_states,

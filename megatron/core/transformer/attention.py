@@ -34,7 +34,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import LayerInterface, layer_inputs_forward
+from megatron.core.transformer.layer_interface import LayerInterface, bind_layer_inputs
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
@@ -1705,7 +1705,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, LayerInterface, ABC):
 
         return output, bias
 
-    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"})
+    @bind_layer_inputs
     @copy_signature(forward_pre_attn_and_core_attn)
     def forward(self, *args, **kwargs):
         """Run core attention followed by the output projection."""
@@ -2159,10 +2159,9 @@ class CrossAttention(Attention):
     [s, b, h] and returns output of the same size.
     """
 
-    forward = layer_inputs_forward(
-        Attention.forward.__wrapped__,
-        reject=NotImplementedError("CrossAttention does not support the LayerInputs call shape"),
-    )
+    def layer_inputs_forward(self, hidden_states, inputs, **kwargs):
+        """Keep shared invocation unsupported while preserving ordinary cross-attention."""
+        raise NotImplementedError("CrossAttention does not support the LayerInputs call shape")
 
     def __init__(
         self,

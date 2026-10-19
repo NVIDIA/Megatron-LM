@@ -11,7 +11,7 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
-from megatron.core.transformer.layer_interface import layer_inputs_forward
+from megatron.core.transformer.layer_interface import bind_layer_inputs
 
 try:
     from nemo.lens.helpers import managed_span as _otel_managed_span
@@ -251,9 +251,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         return None
 
-    @layer_inputs_forward(
-        output=lambda result: (result, None),
-        aliases={"packed_sequence_cp_metadata": "cp_metadata"},
+    @bind_layer_inputs(
         exclude=("rotary_pos_emb",),  # Unused by this skeleton, including its CUDA graphs.
         omit_none=("packed_sequence_cp_metadata", "residual_stream_recompute_context"),
         include_if={

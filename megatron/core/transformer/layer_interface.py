@@ -17,10 +17,25 @@ from torch import Tensor
 from megatron.core.utils import experimental_api, internal_api
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+    from contextlib import AbstractContextManager
+
+    from megatron.core.context_parallel.layout import ContextParallelLayoutState
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
     from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+@experimental_api
+@dataclass(frozen=True)
+class LayerExecutionContext:
+    """Per-invocation scheduling state for layers that execute several physical layers."""
+
+    quant_context_factory: Callable[[TransformerConfig, int], AbstractContextManager]
+    cp_layout_state: ContextParallelLayoutState | None = None
+    residual_stream_recompute_plan: Sequence[ResidualStreamRecomputeContext | None] = ()
 
 
 @experimental_api
@@ -39,7 +54,7 @@ class LayerInputs:
     padding_mask: Tensor | None = None
     input_ids: Tensor | None = None
     sequence_len_offset: Tensor | int | None = None
-    cp_metadata: PackedSequenceCPMetadata | None = None
+    packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None
     rotary_pos_cos: Tensor | None = None
     rotary_pos_sin: Tensor | None = None
     rotary_pos_cos_sin: Tensor | None = None
@@ -50,6 +65,7 @@ class LayerInputs:
     cp_layout_plan: Any = None
     residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None
     mhc_recompute_manager: Any = None
+    execution_context: LayerExecutionContext | None = None
 
 
 LayerOutput = tuple[Tensor, Tensor | None]
@@ -66,8 +82,9 @@ class LayerInterface(Protocol):
     context, and recurrent state are never carried in the bias slot.
 
     Implement ``forward(x, inputs) -> LayerOutput`` directly, or decorate an
-    explicit-argument forward with ``layer_inputs_forward``. Legacy output
-    formats are adapted only for shared calls.
+    explicit-argument forward with ``bind_layer_inputs``. Decorated forwards
+    may return a tensor when no deferred bias remains; the helper supplies the
+    ``None`` bias slot. Legacy output formats are adapted only for shared calls.
     """
 
     def forward(self, x: Tensor, inputs: LayerInputs) -> LayerOutput:
@@ -82,8 +99,27 @@ def wants_input_ids(module) -> bool:
     return bool(getattr(router, "is_hash_layer", False))
 
 
+def _parse_layer_inputs(args, kwargs):
+    """Extract a shared invocation, or return None for an ordinary forward call."""
+    positional_inputs = len(args) >= 2 and isinstance(args[1], LayerInputs)
+    if not positional_inputs and "inputs" not in kwargs:
+        return None
+    if positional_inputs:
+        if len(args) != 2 or kwargs:
+            raise TypeError("LayerInputs cannot be mixed with legacy arguments")
+        return args
+    inputs = kwargs["inputs"]
+    if not isinstance(inputs, LayerInputs):
+        raise TypeError("inputs must be a LayerInputs instance")
+    if len(args) == 1 and len(kwargs) == 1:
+        return args[0], inputs
+    if not args and len(kwargs) == 2 and ("x" in kwargs or "hidden_states" in kwargs):
+        return kwargs["x"] if "x" in kwargs else kwargs["hidden_states"], inputs
+    raise TypeError("Use layer(hidden_states, inputs) without legacy arguments")
+
+
 @experimental_api
-def layer_inputs_forward(
+def bind_layer_inputs(
     legacy_forward=None,
     *,
     aliases=None,
@@ -92,7 +128,6 @@ def layer_inputs_forward(
     exclude=(),
     include_if=None,
     input_transform=None,
-    reject=None,
 ):
     """Accept ``(hidden_states, LayerInputs)`` through an ordinary forward signature.
 
@@ -105,16 +140,22 @@ def layer_inputs_forward(
     ``omit_none`` preserves legacy graph argument sets. ``include_if`` maps
     parameter names to predicates on the module.
     ``input_transform(module, hidden_states)`` expresses shared-call-only normalization.
-    ``reject`` is an exception for all shared calls, or a field-to-exception map
-    rejecting non-None values. ``output`` converts legacy results explicitly.
+    ``output`` converts legacy results explicitly,
+    such as selecting hidden states from a ``(hidden_states, context)`` result.
 
-    MegatronModule applies the attached binder before hooks and graph dispatch,
-    then converts the result after execution. The wrapper also supports direct
-    ``forward`` calls. Legacy calls bypass all shared-call policies. ``inputs``
-    is reserved for the container and cannot be mixed with legacy arguments.
+    Implementations may return a tensor or ``(hidden_states, bias)``. After any
+    explicit output conversion, tensor results become ``(result, None)`` and
+    pairs pass through unchanged. Callers always receive the shared output pair.
+
+    MegatronModule routes shared calls through its overridable
+    ``layer_inputs_forward`` method, which applies the binder before hooks and
+    graph dispatch and normalizes the result after execution. Direct ``forward``
+    calls use the same override but bypass hooks and graph dispatch. Legacy calls
+    bypass shared-call policies. ``inputs`` is reserved for the container and
+    cannot be mixed with legacy arguments.
     """
     if legacy_forward is None:
-        return lambda forward: layer_inputs_forward(
+        return lambda forward: bind_layer_inputs(
             forward,
             aliases=aliases,
             output=output,
@@ -122,7 +163,6 @@ def layer_inputs_forward(
             exclude=exclude,
             include_if=include_if,
             input_transform=input_transform,
-            reject=reject,
         )
 
     parameters = list(inspect.signature(legacy_forward).parameters.values())[1:]
@@ -165,37 +205,11 @@ def layer_inputs_forward(
             raise TypeError("LayerInputs fields must be keyword-capable parameters")
         if parameter.default is inspect.Parameter.empty and name not in mapping:
             raise ValueError(f"Required parameter {name} has no LayerInputs binding")
-    if isinstance(reject, dict):
-        if not reject.keys() <= field_names:
-            raise ValueError("Rejected inputs must name LayerInputs fields")
-        reject = tuple(reject.items())
     binding = tuple(
         (name, source, name in omit_none, include_if.get(name)) for name, source in mapping.items()
     )
 
-    def adapter(module, call, args, kwargs, *, hidden_as_keyword=False):
-        positional_inputs = len(args) >= 2 and isinstance(args[1], LayerInputs)
-        if not positional_inputs and "inputs" not in kwargs:
-            return call(*args, **kwargs)
-        if positional_inputs:
-            if len(args) != 2 or kwargs:
-                raise TypeError("LayerInputs cannot be mixed with legacy arguments")
-            hidden_states, inputs = args
-        else:
-            inputs = kwargs["inputs"]
-            if not isinstance(inputs, LayerInputs):
-                raise TypeError("inputs must be a LayerInputs instance")
-            if len(args) == 1 and len(kwargs) == 1:
-                hidden_states = args[0]
-            elif not args and len(kwargs) == 2 and ("x" in kwargs or "hidden_states" in kwargs):
-                hidden_states = kwargs["x"] if "x" in kwargs else kwargs["hidden_states"]
-            else:
-                raise TypeError("Use layer(hidden_states, inputs) without legacy arguments")
-        if isinstance(reject, Exception):
-            raise type(reject)(*reject.args)
-        for source, error in reject or ():
-            if getattr(inputs, source) is not None:
-                raise type(error)(*error.args)
+    def invoke(module, call, hidden_states, inputs, *, hidden_as_keyword=False):
         bound = {}
         for name, source, skip_none, predicate in binding:
             value = getattr(inputs, source)
@@ -209,11 +223,18 @@ def layer_inputs_forward(
             result = call(**bound)
         else:
             result = call(hidden_states, **bound)
-        return output(result) if output is not None else result
+        if output is not None:
+            result = output(result)
+        return (result, None) if isinstance(result, Tensor) else result
 
     @wraps(legacy_forward)
     def forward(self, *args, **kwargs):
-        return adapter(self, lambda *a, **kw: legacy_forward(self, *a, **kw), args, kwargs)
+        shared_inputs = _parse_layer_inputs(args, kwargs)
+        if shared_inputs is None:
+            return legacy_forward(self, *args, **kwargs)
+        return self.layer_inputs_forward(
+            *shared_inputs, _call=lambda *a, **kw: legacy_forward(self, *a, **kw)
+        )
 
-    forward._layer_input_adapter = adapter
+    forward._layer_input_binding = invoke
     return forward

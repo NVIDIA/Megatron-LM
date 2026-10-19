@@ -16,7 +16,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import LayerInterface, layer_inputs_forward
+from megatron.core.transformer.layer_interface import LayerInterface, bind_layer_inputs
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -698,7 +698,7 @@ class MoELayer(BaseMoELayer, LayerInterface):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
-    @layer_inputs_forward(input_transform=lambda module, x: module.pre_norm(x))
+    @bind_layer_inputs(input_transform=lambda module, x: module.pre_norm(x))
     def forward(
         self,
         hidden_states: torch.Tensor,

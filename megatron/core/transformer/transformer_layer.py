@@ -9,7 +9,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
-from megatron.core.transformer.layer_interface import layer_inputs_forward, wants_input_ids
+from megatron.core.transformer.layer_interface import bind_layer_inputs, wants_input_ids
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
@@ -1115,8 +1115,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return hidden_states, context
 
-    @layer_inputs_forward(
-        output=lambda result: (result[0], None),
+    @bind_layer_inputs(
+        output=lambda result: result[0],
         exclude=("rotary_pos_cos_sin",),
         omit_none=(
             "context",
