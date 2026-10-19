@@ -144,6 +144,42 @@ def _engram(reader, name, tensor, model):
     return value
 
 
+class _Consumed:
+    """Reader proxy recording every release key a load reads."""
+
+    def __init__(self, reader):
+        self.reader, self.keys = reader, set()
+
+    def __getattr__(self, name):
+        return getattr(self.reader, name)
+
+    def get_tensor(self, key, **kwargs):
+        self.keys.add(key)
+        return self.reader.get_tensor(key, **kwargs)
+
+    def _get_raw_tensor(self, key, device):
+        self.keys.add(key)
+        return self.reader._get_raw_tensor(key, device)
+
+
+def _stage_keys(index, model, cfg, ps):
+    """Release keys this pipeline stage and EP rank must consume."""
+    start, end = model.local_layer_range
+    local = cfg.n_routed_experts // ps.ep_size
+    top = {"embed.weight"} if model.layout.has_embed else set()
+    top |= {"head.weight", "norm.weight"} if model.layout.has_head else set()
+    keys = set()
+    for key in index:
+        layer = re.match(r"layers\.(\d+)\.(?:ffn\.experts\.(\d+)\.)?", key)
+        if layer is None:
+            keys |= {key} & top
+        elif start <= int(layer[1]) < end and (
+            layer[2] is None or 0 <= int(layer[2]) - ps.ep_rank * local < local
+        ):
+            keys.add(key)
+    return keys
+
+
 @torch.no_grad()
 def load_hf_weights(chunk, hf_path, model_cfg, ps):
     model = chunk
@@ -159,7 +195,8 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
         or n.endswith("tid2eid")
     ]
     loaded = []
-    with SafeTensorReader(hf_path) as reader:
+    with SafeTensorReader(hf_path) as raw:
+        reader = _Consumed(raw)
         for name, tensor in state:
             if name.endswith(".ape"):
                 if torch.count_nonzero(tensor):
@@ -177,6 +214,16 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
                     value = _read(reader, key, tensor.shape)
             tensor.copy_(value.to(device=tensor.device, dtype=tensor.dtype))
             loaded.append(name)
+        # No silently unmapped state on either side.
+        unread = sorted(_stage_keys(raw.index, model, model_cfg, ps) - reader.keys)
+        unloaded = sorted(
+            n
+            for m, module in model.named_modules()
+            for n in (f"{m}.{b}".lstrip(".") for b in _local_tensors(module))
+            if n not in loaded and not n.endswith(".ape")
+        )
+        if unread or unloaded:
+            raise ValueError(f"DS4.1 release load: unread {unread[:8]}, unloaded {unloaded[:8]}")
     model.ds41_loaded_tensors = tuple(loaded)
 
 

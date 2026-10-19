@@ -75,3 +75,41 @@ def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
             model.sharded_state_dict()
     finally:
         dist.destroy_process_group()
+
+
+def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
+    import json
+
+    from safetensors.torch import save_file
+
+    from megatron.lite.model.deepseek_v41.lite.checkpoint import load_hf_weights
+
+    names = ["embed.weight", "layers.0.attn_norm.weight", "layers.1.attn_norm.weight", "mtp.x"]
+    save_file({n: torch.ones(4, dtype=torch.bfloat16) for n in names}, tmp_path / "a.safetensors")
+    index = {"weight_map": {n: "a.safetensors" for n in names}}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    def stage():  # first stage holding layer 0; layer 1 and MTP belong elsewhere
+        layer = torch.nn.Module()
+        layer.attn_norm = torch.nn.Module()
+        layer.attn_norm.weight = torch.nn.Parameter(torch.zeros(4))
+        model = torch.nn.Module()
+        model.embed = torch.nn.Embedding(1, 4)
+        model.embed.weight = torch.nn.Parameter(torch.zeros(4))
+        model.layers = torch.nn.ModuleDict({"0": layer})
+        model.local_layer_range = (0, 1)
+        model.layout = SimpleNamespace(has_embed=True, has_head=False)
+        return model
+
+    cfg, ps = SimpleNamespace(n_routed_experts=1), SimpleNamespace(ep_size=1, ep_rank=0)
+    model = stage()
+    load_hf_weights(model, str(tmp_path), cfg, ps)
+    assert torch.equal(model.layers["0"].attn_norm.weight, torch.ones(4))
+    unread = stage()
+    del unread.embed  # a stage-local release key nobody reads
+    with pytest.raises(ValueError, match=r"unread \['embed.weight'\]"):
+        load_hf_weights(unread, str(tmp_path), cfg, ps)
+    unloaded = stage()
+    unloaded.layers["0"].register_buffer("state", torch.zeros(1))  # persistent, unmapped
+    with pytest.raises(ValueError, match=r"unloaded \['layers.0.state'\]"):
+        load_hf_weights(unloaded, str(tmp_path), cfg, ps)
