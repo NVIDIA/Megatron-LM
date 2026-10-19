@@ -33,6 +33,10 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.residual_connection import (
+    ResidualConnection,
+    ResidualConnectionOperation,
+)
 from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     checkpoint_residual_read,
@@ -918,13 +922,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             residual_stream_recompute_context=residual_stream_recompute_context,
         )
 
-    def _get_self_attention_residual_connection(self):
-        """Return an optional architecture-owned self-attention connection."""
+    def _get_self_attention_residual_connection(
+        self, operation: ResidualConnectionOperation
+    ) -> ResidualConnection | None:
+        """Return the optional architecture-owned self-attention reader or writer."""
 
         return None
 
-    def _get_mlp_residual_connection(self):
-        """Return an optional architecture-owned MLP connection."""
+    def _get_mlp_residual_connection(
+        self, operation: ResidualConnectionOperation
+    ) -> ResidualConnection | None:
+        """Return the optional architecture-owned MLP reader or writer."""
 
         return None
 
@@ -948,7 +956,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             ``_apply_self_attn_bda_step``. A configured residual connection uses
             it for the corresponding write state; otherwise base returns ``()``.
         """
-        residual_connection = self._get_self_attention_residual_connection()
+        residual_connection = self._get_self_attention_residual_connection(operation="read")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
@@ -957,7 +965,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if recompute_context is None:
                 hidden_states, connection_state = apply_module(residual_connection)(
                     hidden_states,
-                    operation="read",
                     fp32_residual_connection=self.config.fp32_residual_connection,
                     branch_input_dtype=self.config.params_dtype,
                 )
@@ -1033,7 +1040,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
-        residual_connection = self._get_self_attention_residual_connection()
+        residual_connection = self._get_self_attention_residual_connection(operation="write")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
@@ -1051,7 +1058,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             is_terminal_write = bool(
                 recompute_context is not None
                 and recompute_context.is_block_end
-                and self._get_mlp_residual_connection() is None
+                and self._get_mlp_residual_connection(operation="write") is None
             )
             if recompute_context is not None and not is_terminal_write:
                 hidden_states = checkpoint_residual_write(
@@ -1066,7 +1073,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 with self.bias_dropout_add_exec_handler():
                     hidden_states = apply_module(residual_connection)(
                         attention_output_with_bias,
-                        operation="write",
                         state=attn_state,
                         dropout_probability=self.hidden_dropout,
                         training=self.training,
@@ -1254,7 +1260,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             through to ``_apply_mlp_bda_step``. A configured residual connection
             uses it for the corresponding write state; otherwise base returns ``()``.
         """
-        residual_connection = self._get_mlp_residual_connection()
+        residual_connection = self._get_mlp_residual_connection(operation="read")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
@@ -1263,7 +1269,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if recompute_context is None:
                 hidden_states, connection_state = apply_module(residual_connection)(
                     hidden_states,
-                    operation="read",
                     fp32_residual_connection=self.config.fp32_residual_connection,
                     branch_input_dtype=self.config.params_dtype,
                 )
@@ -1578,7 +1583,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
-        residual_connection = self._get_mlp_residual_connection()
+        residual_connection = self._get_mlp_residual_connection(operation="write")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
@@ -1613,7 +1618,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 with self.bias_dropout_add_exec_handler():
                     hidden_states = apply_module(residual_connection)(
                         mlp_output_with_bias,
-                        operation="write",
                         state=mlp_state,
                         dropout_probability=self.hidden_dropout,
                         training=self.training,

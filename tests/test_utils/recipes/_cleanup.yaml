@@ -55,4 +55,4 @@ products:
     products:
       - environment: [dev]
         scope: [cleanup]
-        platforms: [dgx_a100, dgx_h100, dgx_gb200]
+        platforms: [dgx_h100, dgx_gb200]
