@@ -387,15 +387,20 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_
     )
 
 
-def test_fused_wgrad_releases_buffers(distributed_setup):
-    """No fused gradient buffer outlives the backward that filled it."""
+@pytest.mark.parametrize(
+    "caller_managed_grad_sync", [False, True], ids=["autograd_callback", "caller_managed"]
+)
+def test_fused_wgrad_releases_buffers(distributed_setup, caller_managed_grad_sync):
+    """No fused gradient buffer outlives the gradient synchronization that follows its backward."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Sequential(
         te.LayerNormLinear(16, 32, bias=True, device=device, fuse_wgrad_accumulation=True),
         te.Linear(32, 16, bias=True, device=device, fuse_wgrad_accumulation=True),
     )
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(
+        device=device, caller_managed_grad_sync=caller_managed_grad_sync
+    ) as context:
         for layer in model:
             fully_shard(layer, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
@@ -406,6 +411,8 @@ def test_fused_wgrad_releases_buffers(distributed_setup):
     for _ in range(3):
         optimizer.zero_grad(set_to_none=True)
         model(x).square().mean().backward()
+        if caller_managed_grad_sync:
+            context.finish_grad_sync()
         optimizer.step()
         assert context._pending_fused_grad_buffers == []
         torch.cuda.synchronize(device)
