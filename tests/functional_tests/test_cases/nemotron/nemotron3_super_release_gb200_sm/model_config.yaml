@@ -13,7 +13,10 @@ ENV_VARS:
   NVTE_FWD_LAYERNORM_SM_MARGIN: 20
   TORCHINDUCTOR_WORKER_START: fork
   QUANTIZATION_TYPE_DEBUG: 1
-  NON_DETERMINSTIC_RESULTS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+  TRITON_CACHE_AUTOTUNING: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
   # Distributed args
@@ -35,8 +38,7 @@ MODEL_ARGS:
   --micro-batch-size: 1
   --global-batch-size: 512
   --train-samples: 12207031
-  --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: native
+  --deterministic-mode: true
   --attention-backend: fused
   --transformer-impl: transformer_engine
   --cuda-graph-impl: transformer_engine
