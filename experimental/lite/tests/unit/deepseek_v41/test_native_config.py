@@ -3,7 +3,13 @@
 import pytest
 
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+from megatron.lite.model.deepseek_v41.lite.components import attention
+from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
+from megatron.lite.model.deepseek_v41.lite.components.config import core_config, validate_runtime_cp
 from megatron.lite.model.deepseek_v41.topology import validate_build
+from megatron.lite.primitive.modules.attention import cross_layer as compressor
+from megatron.lite.primitive.modules.attention import ratio_one
+from megatron.lite.runtime.contracts import ParallelConfig
 
 
 @pytest.mark.parametrize("cp", [1, 2])
@@ -52,8 +58,6 @@ def test_invalid_ownership(kwargs):
 
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_native_core_configuration_is_bf16_and_keeps_literal_ratios(deterministic):
-    from megatron.lite.model.deepseek_v41.lite.native import core_config
-    from megatron.lite.runtime.contracts import ParallelConfig
 
     config = core_config(
         DeepseekV41Config(num_hidden_layers=4),
@@ -80,8 +84,6 @@ def test_native_core_configuration_is_bf16_and_keeps_literal_ratios(deterministi
     ],
 )
 def test_native_recompute_rejected_before_core_build(overrides):
-    from megatron.lite.model.deepseek_v41.lite.native import core_config
-    from megatron.lite.runtime.contracts import ParallelConfig
 
     with pytest.raises(ValueError, match="must use KVSourceState.checkpoint"):
         core_config(DeepseekV41Config(num_hidden_layers=4), ParallelConfig(), **overrides)
@@ -89,8 +91,6 @@ def test_native_recompute_rejected_before_core_build(overrides):
 
 def test_runtime_cp_is_explicit_and_checked_against_model_and_packed_params():
     from types import SimpleNamespace
-
-    from megatron.lite.model.deepseek_v41.lite.native import validate_runtime_cp
 
     release = DeepseekV41Config(cp_size=2)
     group = SimpleNamespace(size=lambda: 2)
@@ -113,8 +113,6 @@ def test_native_cp_config_readers_are_unreachable_from_ds41_attention():
         csa,
         deepseek_v4_hybrid_attention,
     )
-    from megatron.lite.model.deepseek_v41.lite import attention, compressor, ratio_one
-    from megatron.lite.model.deepseek_v41.lite.attention import DS41SelfAttention
 
     assert multi_latent_attention.MultiLatentAttention not in DS41SelfAttention.__mro__
     expected = {("rotary_pos_embedding", 302), ("multi_latent_attention", 1014)}
@@ -125,8 +123,6 @@ def test_native_cp_config_readers_are_unreachable_from_ds41_attention():
                 "context_parallel_size",
                 "cp_partition_mode",
             }:
-                # Only config fields: PackedSeqParams.cp_partition_mode is the
-                # supported runtime contract, not the unused Core config.
                 value = ast.unparse(node.value)
                 if value.endswith("config"):
                     found.add((module.__name__.rsplit(".", 1)[-1], node.lineno))

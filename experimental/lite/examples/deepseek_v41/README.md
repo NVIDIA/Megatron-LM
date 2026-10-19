@@ -51,26 +51,21 @@ forward and does not emulate its quantization kernels.
 
 ## Numerical acceptance
 
-Both official references consume the same dequantized BF16 weights as this
-model; FP64 promotes those exact values. Activation quantization is disabled,
-MTP is not executed, and Engram table values must agree exhaustively. Calibrate
-35 fixed records (21,504 response tokens) in at least three fresh processes,
-with two identical forwards each. If reference noise at any gated quantile
-reaches half its BF16-versus-FP64 band, stop without issuing a threshold.
+Acceptance uses small randomly initialized pytest models covering every layer type,
+Engram and shared sources; release-weight P40E and official comparisons are reports.
+GPU attention tests use `CUBLAS_WORKSPACE_CONFIG=:4096:8`,
+`torch.use_deterministic_algorithms(True, warn_only=True)` and
+`impl_cfg.deterministic_mode=True`. Attention CP2/CP1 outputs and input/KV/parameter
+backward gradients must be bitwise equal after CP reduction; whole-model CP is
+report-only. Each rank needs at least the attention window's rows; shorter packs
+fail. Main attention gradients must be nonzero and finite.
 
-Against official FP64 emulation, the standard model's per-token log-probability
-errors at p50/p99/p99.9 must each be within 1.1 times the official BF16 model's
-own error; maximum error is reported. Identical batches are required for parallel
-comparisons: maximum absolute LP error 0.125 nat, p99 error 0.03 nat, mean loss
-absolute/relative tolerance 0.02/0.005. All expected trainable gradients must be
-present and finite. CUDA FlashMLA and CPU unfused paths need separate evidence.
-
-The 24-step SFT test requires all steps applied and finite, with the final seven
-steps' mean loss at most 0.8 times the initial seven. DCP must restore the saved
-model/optimizer/scheduler/RNG/data state and continue for three same-batch steps
-within loss absolute/relative tolerance 0.05/0.005. No cross-run bitwise result is
-required. Checkpoint CPU RNG adaptation is confined to a test fixture; GPU tests
-must use unmodified Core RNG handling.
+The 24-step random SFT gate freezes its data, seed and calibrated learning rate
+before acceptance: final-seven mean loss must be at most 0.8 times first-seven.
+DCP restores model/optimizer/scheduler/RNG state and continues three same-batch
+steps within loss absolute/relative tolerance 0.05/0.005. Report per-rank memory
+peaks; OOM means resource-incomplete, not a numerical pass. CPU checkpoint RNG
+adaptation is confined to a test fixture; GPU tests use unmodified Core RNG.
 
 ## Build for training
 

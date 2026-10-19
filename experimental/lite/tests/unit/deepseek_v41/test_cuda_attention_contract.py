@@ -6,8 +6,11 @@ import pytest
 import torch
 
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
-from megatron.lite.model.deepseek_v41.lite.native import core_config, require_native_hadamard
-from megatron.lite.model.deepseek_v41.lite.ratio_one import flash_positions
+from megatron.lite.model.deepseek_v41.lite.components.config import (
+    core_config,
+    require_native_hadamard,
+)
+from megatron.lite.primitive.modules.attention.ratio_one import flash_positions
 from megatron.lite.runtime.contracts import ParallelConfig
 
 
@@ -15,8 +18,6 @@ from megatron.lite.runtime.contracts import ParallelConfig
 def test_backend_is_set_at_construction_and_validated_by_core():
     release = DeepseekV41Config(num_hidden_layers=4)
     assert core_config(release, ParallelConfig()).dsa_kernel_backend == "none"
-    # Core rejects the fused backend without CUDA when the config is built,
-    # which assigning dsa_kernel_backend afterwards would skip.
     with pytest.raises(ValueError, match="requires a CUDA device"):
         core_config(
             DeepseekV41Config(num_hidden_layers=4), ParallelConfig(), attention_backend="cudnn"

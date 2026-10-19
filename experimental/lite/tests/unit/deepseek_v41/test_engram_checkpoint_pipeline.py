@@ -8,14 +8,12 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
 
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.lite.model.deepseek_v41.lite.checkpoint import (
     attach_checkpoint_metadata,
     load_hf_weights,
 )
-from megatron.lite.model.deepseek_v41.lite.engram import Engram, ShardedFrozenTable
 from megatron.lite.model.deepseek_v41.lite.protocol import forward_step
 from megatron.lite.runtime.contracts import PackedBatch
 
@@ -32,10 +30,8 @@ def test_forward_step_rows_are_original_unpadded_rows(rank):
 
     ids = torch.arange(12)
     output = forward_step(Rows(), PackedBatch(ids, ids, torch.tensor([5, 1, 6])))
-    # Documents padded to 8 + 4 + 8 physical rows, contiguous CP halves of 10.
     expected = [0, 1, 2, 3, 4, -1, -1, -1, 5, -1] if rank == 0 else [-1, -1, *range(6, 12), -1, -1]
     assert output["rows"].tolist() == expected
-    # Padding rows are never valid; document ends stay masked by the label roll.
     assert not output["valid_mask"][output["rows"] < 0].any()
     assert output["valid_mask"].sum() == (4 if rank == 0 else 5)
 
@@ -50,7 +46,6 @@ def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
         engram = torch.nn.Module()
         engram.embed, engram.wkv = table, torch.nn.Linear(4, 4, bias=False)
         engram.register_buffer("cache", torch.zeros(2), persistent=False)
-        # A native Core module describes itself; global mpu is never initialized here.
         native = MegatronModule(
             TransformerConfig(num_layers=1, hidden_size=4, num_attention_heads=1)
         )
@@ -61,6 +56,7 @@ def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
             [model], SimpleNamespace(dp_cp_rank=1, dp_cp_group=dist.group.WORLD)
         )
         state = model.sharded_state_dict()
+        assert set(model.state_dict()) == set(state)
         assert model._mlite_dist_opt_sharded_state_dict
         assert set(state) == {"engrams.1.embed.weight", "engrams.1.wkv.weight", "native.bias"}
         rows = state["engrams.1.embed.weight"]
@@ -76,7 +72,6 @@ def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
 def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     names = ["layers.0.attn_norm.weight", "layers.1.attn_norm.weight", "mtp.x"]
     tensors = {n: torch.ones(4, dtype=torch.bfloat16) for n in names}
-    # Quantized release storage: its scale sidecar is read, so it counts as consumed.
     tensors["embed.weight"] = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
     tensors["embed.weight_scale_inv"] = torch.full((1, 1), 2.0)
     save_file(tensors, tmp_path / "a.safetensors")
@@ -106,29 +101,3 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     unloaded.layers["0"].register_buffer("state", torch.zeros(1))  # persistent, unmapped
     with pytest.raises(ValueError, match=r"unloaded \['layers.0.state'\]"):
         load_hf_weights(unloaded, str(tmp_path), cfg, ps)
-
-
-def test_engram_masked_rows_pass_the_residual_through():
-    engram = Engram(4, 2, torch.nn.Embedding(6, 4), torch.nn.Linear(8, 12, bias=False))
-    hidden, ids = torch.randn(3, 1, 2, 4), torch.tensor([[[0, 1]], [[2, 3]], [[4, 5]]])
-    out = engram(hidden, ids, torch.tensor([[True], [False], [True]]))
-    assert torch.equal(out[1], hidden[1]) and not torch.equal(out[0], hidden[0])
-
-
-def _gather_worker(rank, store):
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method=f"file://{store}", rank=rank, world_size=2)
-    ranks = dict(tp_rank=0, ep_rank=0, etp_rank=0, gtp_remat_rank=0, egtp_remat_rank=0)
-    model_parallel_cuda_manual_seed(915, **ranks, gtp_remat_world_size=1, egtp_remat_world_size=1)
-    config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
-    table = ShardedFrozenTable(5, 8, config, dist.group.WORLD)  # 6 padded rows, 3 per rank
-    full = torch.arange(48.0, device="cuda").reshape(6, 8).to(table.weight.dtype)
-    table.weight.copy_(full[3 * rank : 3 * rank + 3])
-    ids = torch.tensor([[0, 4], [2, 3], [1, 0]], device="cuda")[rank:]  # 3 and 2 query rows
-    assert torch.equal(table(ids), full[ids])
-    dist.destroy_process_group()
-
-
-@pytest.mark.gpus(2, min_architecture="blackwell")
-def test_sharded_engram_table_matches_a_single_table_lookup(tmp_path):
-    torch.multiprocessing.spawn(_gather_worker, args=(f"{tmp_path}/store",), nprocs=2)

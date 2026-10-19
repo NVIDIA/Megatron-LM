@@ -1,10 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Resolving VERL's fused cross entropy leaves the global RNG streams unchanged.
-
-VERL's import chain draws from Python's RNG at import time (rich's style ids via
-transformers). The first import happens inside a training step, after a resumed
-run restored its RNG; it must not advance the restored streams.
-"""
+"""Lazy fused-kernel import must preserve every global RNG stream across resume."""
 
 import importlib.abc
 import importlib.machinery
@@ -17,7 +12,6 @@ import torch
 
 
 class _DrawingFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Serve verl.utils.kernel.linear_cross_entropy; its import draws from the RNGs."""
 
     names = ('verl', 'verl.utils', 'verl.utils.kernel', 'verl.utils.kernel.linear_cross_entropy')
 
@@ -40,7 +34,6 @@ def test_resolving_the_fused_kernel_keeps_rng_streams(monkeypatch):
     from megatron.lite.primitive.ops import linear_cross_entropy as module
 
     for name in _DrawingFinder.names:
-        # Absent first; setitem restores the absence (or the real module) afterwards.
         monkeypatch.setitem(sys.modules, name, None)
         del sys.modules[name]
     monkeypatch.setattr(sys, 'meta_path', [_DrawingFinder(), *sys.meta_path])
@@ -56,7 +49,6 @@ def test_resolving_the_fused_kernel_keeps_rng_streams(monkeypatch):
     assert random.getstate() == before[0]
     assert np.array_equal(np.random.get_state()[1], before[1])
     assert torch.equal(torch.get_rng_state(), before[2])
-    # Resolved once: later steps neither import nor draw.
     assert module._verl_linear_cross_entropy() is fused
 
 

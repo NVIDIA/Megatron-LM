@@ -18,29 +18,29 @@ from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.lite.model.deepseek_v41.lite.assembly import (
+from megatron.lite.model.deepseek_v41.lite.components.assembly import (
     DS41AttentionSources,
     ModelNorm,
     SourceContext,
 )
-from megatron.lite.model.deepseek_v41.lite.attention import DS41SelfAttention
-from megatron.lite.model.deepseek_v41.lite.block import DS41Block
-from megatron.lite.model.deepseek_v41.lite.carrier import pack_sources, unpack_sources
-from megatron.lite.model.deepseek_v41.lite.engram import (
-    DS41Engram,
-    NgramHash,
-    hash_multipliers,
-    prime_buckets,
-)
-from megatron.lite.model.deepseek_v41.lite.moe import bind_sorted_selection
-from megatron.lite.model.deepseek_v41.lite.native import (
+from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
+from megatron.lite.model.deepseek_v41.lite.components.block import DS41Block
+from megatron.lite.model.deepseek_v41.lite.components.carrier import pack_sources, unpack_sources
+from megatron.lite.model.deepseek_v41.lite.components.config import (
     core_config,
     core_groups,
     validate_runtime_cp,
 )
-from megatron.lite.model.deepseek_v41.lite.state import KVSourceState
+from megatron.lite.model.deepseek_v41.lite.components.engram import (
+    DS41Engram,
+    hash_multipliers,
+    prime_buckets,
+)
+from megatron.lite.model.deepseek_v41.lite.moe import bind_sorted_selection
 from megatron.lite.model.deepseek_v41.topology import validate_build
+from megatron.lite.primitive.modules.engram import NgramHash
 from megatron.lite.primitive.parallel import build_pipeline_chunk_layout
+from megatron.lite.primitive.parallel.source_state import KVSourceState
 
 
 class CoreAttentionSources(DS41AttentionSources):

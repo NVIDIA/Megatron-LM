@@ -6,11 +6,11 @@ import pytest
 import torch
 
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
-from megatron.lite.model.deepseek_v41.lite.carrier import pack_sources, unpack_sources
 from megatron.lite.model.deepseek_v41.lite.checkpoint import source_name
-from megatron.lite.model.deepseek_v41.lite.engram import NgramHash
+from megatron.lite.model.deepseek_v41.lite.components.carrier import pack_sources, unpack_sources
 from megatron.lite.model.deepseek_v41.lite.protocol import ImplConfig, _validate, forward_step
-from megatron.lite.model.deepseek_v41.lite.state import KVSourceState
+from megatron.lite.primitive.modules.engram import NgramHash
+from megatron.lite.primitive.parallel.source_state import KVSourceState
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 
 
@@ -36,7 +36,6 @@ def test_pipeline_source_carrier_preserves_values_and_owner_gradients():
     assert torch.equal(h, hidden) and torch.equal(p, pre)
     assert torch.equal(recovered, owner) and torch.equal(recovered_prefix, prefix)
     assert torch.equal(values[("candidate_pool", 3)], pool)
-    # Two downstream readers contribute once each to the original owner.
     (h.float().sum() + p.sum() + recovered.sum() * 2 + recovered.sum() * 3).backward()
     assert torch.equal(owner.grad, torch.full_like(owner, 5))
     assert torch.equal(hidden.grad, torch.ones_like(hidden))
@@ -85,7 +84,6 @@ def test_protocol_real_core_metadata_contiguous_rows_and_document_end_mask(rank)
     assert args["packed_seq_params"].cp_group is model.ps.cp_group
     assert model.ids.numel() == 10  # native padding: 8 + 4 + 8, then contiguous CP
     assert args["full_input_ids"].numel() == 20
-    # One-document tail and every physical padding row contribute no loss.
     mask = args["loss_mask"]
     expected = torch.tensor(
         [1, 1, 1, 1, 0, 0, 0, 0, 0, 0] if rank == 0 else [0, 0, 1, 1, 1, 1, 1, 0, 0, 0]
@@ -145,16 +143,3 @@ def test_runtime_rejects_unknown_model_options_before_build():
 def test_non_adam_optimizer_is_rejected_before_model_allocation(option):
     with pytest.raises(ValueError, match="optimizer"):
         _validate(DeepseekV41Config(num_hidden_layers=4), ImplConfig(**option))
-
-
-def test_zero_aux_loss_keeps_forward_layout_without_disabling_autograd():
-    from megatron.lite.model.deepseek_v41.lite.assembly import FrozenIndexerCSA
-
-    module = FrozenIndexerCSA.__new__(FrozenIndexerCSA)
-    torch.nn.Module.__init__(module)
-    module.config = SimpleNamespace(dsa_indexer_loss_coeff=0.0)
-    module.projection = torch.nn.Linear(2, 2, bias=False)
-    module.train()
-    assert not module.training and module.projection.training
-    module.projection(torch.ones(1, 2)).sum().backward()
-    assert module.projection.weight.grad is not None

@@ -8,7 +8,7 @@ import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
-from megatron.lite.model.deepseek_v41.lite.native import core_config
+from megatron.lite.model.deepseek_v41.lite.components.config import core_config
 from megatron.lite.model.protocol_utils import nested_from_packed
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import init_parallel

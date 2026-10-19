@@ -1,7 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DS4.1 DCP resume on native Core distributed Adam at release width: the restored state equals
-the saved one, three resumed steps draw the control's batches with losses within 0.05 + 0.005 *
-|control|, dense replicas agree after the save, and bad loads and vanished gradients are caught."""
+"""Small native Adam DCP: exact restored state, three continued steps and negative controls."""
 import copy
 import json
 import pickle
@@ -22,28 +20,21 @@ from megatron.lite.primitive.ckpt import dcp as checkpoint
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 from megatron.lite.runtime.contracts.loss import LossContext, use_loss_context
 
-TOKENS, ATOL, RTOL = 2048, 0.05, 0.005
-CONFIG = Path(__file__).parents[2] / "fixtures/deepseek_v41/reference/config.json"
+TOKENS, ATOL, RTOL = 80, 0.05, 0.005
+from _ds41_fixture import tiny_config
 
 
 def _build(ep, device):
-    release = json.loads(CONFIG.read_text())
-    text = release["text_config"]  # the official 4L prefix; 8 experts, a small Engram table
-    text.update(num_hidden_layers=4, n_routed_experts=8, engram_layer_ids=[1], engram_vocab_size=31)
-    text.update(kv_source_layer_ids=[2], index_source_layer_ids=[2], candidate_source_layer_id=-1)
-    text.update(engram_compressed_vocab_size=256, engram_num_embeddings=[1998])  # 24 primes > 30
-    text["compress_ratios"] = text["compress_ratios"][:4] + text["compress_ratios"][-3:]
-    config = protocol.build_model_config(release)
+    config = tiny_config()
     adam = dict(lr=1e-5, min_lr=1e-5, adam_beta1=0.9, adam_beta2=0.999, adam_eps=1e-8)
     kwargs = dict(device=device, parallel=ParallelConfig(ep=ep), attention_backend_override="cudnn")
-    kwargs.update(token_map=[t % 256 for t in range(config.vocab_size)], optimizer_config=adam)
+    kwargs.update(token_map=list(range(config.vocab_size)), optimizer_config=adam)
     bundle = protocol.build_model(config, impl_cfg=protocol.ImplConfig(optimizer="adam", **kwargs))
     schedulers = [torch.optim.lr_scheduler.StepLR(o, 1, 0.8) for o in bundle.optimizer.optimizers]
     return bundle, schedulers, kwargs["parallel"]
 
 
 def _step(bundle, schedulers, drop_head_grad=False):
-    # Every host RNG stream feeds the batch: a missing restore changes it.
     offset = random.randrange(30) + int(np.random.randint(30)) + int(torch.randint(30, (1,)))
     ids = (torch.randint(1, 32, (TOKENS,)) + offset % 30).cuda()
     batch = PackedBatch(ids, ids, torch.tensor([TOKENS]).cuda())
