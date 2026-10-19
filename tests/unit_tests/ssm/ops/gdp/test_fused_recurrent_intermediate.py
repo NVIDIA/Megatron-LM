@@ -18,7 +18,7 @@ tolerance.
 import pytest
 import torch
 
-from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+from megatron.core.ops.ssm.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
 # Householder copies per draft token. `M == 1` is the plain Gated Delta Net
 # recurrence; anything above folds M steps into the sequence dimension per

@@ -26,6 +26,7 @@ megatron/core/models/audio/ @NVIDIA/mcore-audio
 
 megatron/core/models/mamba/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 megatron/core/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
+megatron/core/ops/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 
 megatron/core/models/hybrid/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 

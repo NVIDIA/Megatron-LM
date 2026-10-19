@@ -5,11 +5,11 @@ import unittest
 import torch
 
 try:
-    from megatron.core.ssm.ops.common.intermediate_extraction import (
+    from megatron.core.ops.ssm.common.intermediate_extraction import (
         scatter_intermediate_conv,
         scatter_intermediate_ssm,
     )
-    from megatron.core.ssm.ops.mamba2.ssd_combined import (
+    from megatron.core.ops.ssm.mamba2.ssd_combined import (
         is_int_pow_2,
         mamba_chunk_scan_combined_varlen,
     )
