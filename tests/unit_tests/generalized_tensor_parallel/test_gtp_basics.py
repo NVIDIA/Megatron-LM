@@ -2159,6 +2159,22 @@ class TestGTPCaptureParamReadiness:
         assert ag_streams == [graphed_ag_stream]
         assert rs_streams == [graphed_rs_stream]
 
+    def test_capture_comm_predicate_includes_future_graphed_chains(self):
+        state = gtp_cuda_graphs.GTPCaptureCommState()
+        future = type("Param", (), {"chain_id": "GTP_future_role_graphed"})()
+        eager = type("Param", (), {"chain_id": "GTP_future_role_ungraphed"})()
+        ag_stream, rs_stream = object(), object()
+        for param in (future, eager, object()):
+            state.register_comm(param, ag_stream, reduce_scatter=False)
+            state.register_comm(param, rs_stream, reduce_scatter=True)
+        params, ag_streams, rs_streams = state.get_comms_for_chains(gtp_module._chain_is_graphed)
+        assert params == [future]
+        assert ag_streams == [ag_stream]
+        assert rs_streams == [rs_stream]
+
+    def test_graphed_drain_ignores_params_without_chain_id(self):
+        gtp_module.wait_async_comms(graphed_only=True, params=[object()])
+
 
 # ---------------------------------------------------------------------------
 # count_zeros_fp32 must exclude GTP alignment padding, end-to-end through the

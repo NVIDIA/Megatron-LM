@@ -15,6 +15,11 @@ try:
         HAVE_TE,
         GTPChain,
         GTPEmbeddingWeight,
+    )
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        _chain_is_graphed as is_graphed_chain,
+    )
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         attach_gtp_to_presharded_module,
         classify_gtp_remat_chains,
         configure_gtp_remat_from_recipe,
@@ -67,6 +72,7 @@ __all__ = [
     "dequantize_gtp_native_fp8",
     "get_ag_stream",
     "get_graphed_chain_ids",
+    "is_graphed_chain",
     "get_rs_stream",
     "gtp_native_fp8_load_context",
     "gtp_remat_shard_dim0",

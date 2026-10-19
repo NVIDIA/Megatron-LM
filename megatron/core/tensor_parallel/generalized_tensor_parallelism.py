@@ -142,11 +142,11 @@ _GTP_REMAT_GROUPED_FC2 = f"{_GTP_REMAT_GROUPED_PREFIX}fc2"
 
 
 def get_graphed_chain_ids() -> tuple[str, ...]:
-    """Return captured chains whose streams must join a local CUDA graph."""
+    """Return the currently classified captured chain IDs for diagnostics."""
     return (
         GTPChain.GRAPHED.value,
-        f"{_GTP_REMAT_GROUPED_FC1}_graphed",
-        f"{_GTP_REMAT_GROUPED_FC2}_graphed",
+        f"{_GTP_REMAT_GROUPED_FC1}_{_graphness_suffix(True)}",
+        f"{_GTP_REMAT_GROUPED_FC2}_{_graphness_suffix(True)}",
     )
 
 
@@ -1594,7 +1594,9 @@ class GTPShardedParam(torch.nn.Parameter):
             # the host in the normal asynchronous NCCL configuration.
             completion_recorded = async_op and _chain_is_grouped(self.chain_id)
             if completion_recorded:
-                handle.wait()
+                # TE synchronous fallbacks can return no Work even with async_op=True.
+                if handle is not None:
+                    handle.wait()
                 event = self._recompute_ag_event if recompute else self.ag_event
                 event.record()
                 handle = None
@@ -2819,12 +2821,10 @@ def wait_async_comms(
     """
     comm_params = list(_inflight_comm_params) if params is None else params
     for param in comm_params:
-        if graphed_only and not _chain_is_graphed(param.chain_id):
+        param_chain_id = getattr(param, "chain_id", GTPChain.UNGRAPHED.value)
+        if graphed_only and not _chain_is_graphed(param_chain_id):
             continue
-        if (
-            chain_id is not None
-            and getattr(param, "chain_id", GTPChain.UNGRAPHED.value) != chain_id
-        ):
+        if chain_id is not None and param_chain_id != chain_id:
             continue
         had_ag = param._prefetch_handle is not None
         param._wait_param_gather()

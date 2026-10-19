@@ -72,9 +72,9 @@ except ImportError:
 if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import (
         GTP_CONFIG,
-        get_graphed_chain_ids,
         get_rs_stream,
         initialize_graph_wgrad_rings,
+        is_graphed_chain,
         preserve_gtp_prefetch_state,
         set_cuda_graph_mempool,
         track_gtp_capture_comms,
@@ -84,7 +84,7 @@ else:
     # Placeholders so static analysis does not flag these GTP-only symbols as
     # possibly-used-before-assignment; every use site is guarded by HAVE_GTP /
     # gtp_remat at runtime.
-    get_graphed_chain_ids = None
+    is_graphed_chain = None
     GTP_CONFIG = None
     get_rs_stream = None
     initialize_graph_wgrad_rings = None
@@ -1377,7 +1377,7 @@ class _CudaGraphRunner(torch.nn.Module):
                         # by both capture ownership and chain keeps UNGRAPHED work on its eager
                         # lifecycle instead of turning it into a cross-graph handoff.
                         warmup_params, warmup_ag_streams, warmup_rs_streams = (
-                            warmup_comms.get_comms_for_chains(get_graphed_chain_ids())
+                            warmup_comms.get_comms_for_chains(is_graphed_chain)
                         )
                         wait_async_comms(graphed_only=True, params=warmup_params)
                         self._wait_side_streams(warmup_ag_streams)
@@ -1424,7 +1424,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     if self.gtp_remat:
                         # Forward only issues AG prefetches. Drain the operations directly.
                         captured_params, captured_ag_streams, _ = (
-                            capture_comms.get_comms_for_chains(get_graphed_chain_ids())
+                            capture_comms.get_comms_for_chains(is_graphed_chain)
                         )
                         wait_async_comms(graphed_only=True, skip_rs=True, params=captured_params)
                         self._wait_side_streams(captured_ag_streams)
@@ -1580,7 +1580,7 @@ class _CudaGraphRunner(torch.nn.Module):
             #             happen here (see wait_async_comms).
             if self.gtp_remat:
                 captured_params, captured_ag_streams, captured_rs_streams = (
-                    capture_comms.get_comms_for_chains(get_graphed_chain_ids())
+                    capture_comms.get_comms_for_chains(is_graphed_chain)
                 )
                 # Phase 1: drain AG
                 wait_async_comms(graphed_only=True, skip_rs=True, params=captured_params)

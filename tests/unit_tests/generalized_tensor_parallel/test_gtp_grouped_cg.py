@@ -53,6 +53,7 @@ def _worker_full_iteration(rank, world_size, port):
         param.register_grad_accum_hook(param.expand_as(param).grad_fn.next_functions[0][0], None)
         param.grad_added_to_main_grad = False
     static_x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    # Keep AccumulateGrad alive across capture; this strong reference is intentional.
     input_grad_node = static_x.expand_as(static_x).grad_fn.next_functions[0][0]
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -327,6 +328,51 @@ def test_grouped_consumer_does_not_wait_for_later_gather(captured):
     _run_distributed(_worker_grouped_completion, 4, captured)
 
 
+def _worker_grouped_sync_fallback(rank, world_size, port, monkeypatch, recompute):
+    del rank, port
+    group = torch.distributed.new_group(list(range(world_size)))
+    op = te.ops.GroupedLinear(1, 128, 128, bias=False, device="cuda", dtype=torch.bfloat16)
+    op.gtp_remat_size = group.size()
+    wrap_module_params_gtp(op, ["weight0"], group, is_grouped=True)
+    param = op.weight0
+    param.chain_id = "GTP_remat_grouped_fc1_ungraphed"
+    original_gather = gtp.gather_along_first_dim
+    calls = []
+
+    def synchronous_fallback(*args, **kwargs):
+        assert kwargs["async_op"] is True
+        kwargs["async_op"] = False
+        result, handle = original_gather(*args, **kwargs)
+        assert handle is None
+        calls.append(True)
+        return result, None
+
+    monkeypatch.setattr(gtp, "gather_along_first_dim", synchronous_fallback)
+    try:
+        result, handle = param._all_gather_weight(async_op=True, fwd=True, recompute=recompute)
+        assert calls == [True]  # One local expert takes the non-coalesced gather path.
+        assert handle.completion_recorded
+        if recompute:
+            param._recompute_prefetch_handle = handle
+            param._wait_recompute_param_gather()
+            event = param._recompute_ag_event
+        else:
+            param._prefetch_handle = handle
+            param._wait_param_gather()
+            event = param.ag_event
+        event.wait()
+        torch.cuda.synchronize()
+        assert event.query()
+        assert result[0].shape == (128, 128)
+    finally:
+        torch.distributed.destroy_process_group(group)
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+def test_grouped_sync_fallback_records_completion(monkeypatch, recompute):
+    _run_distributed(_worker_grouped_sync_fallback, 4, monkeypatch, recompute)
+
+
 def _worker_mxfp8_op_fuser(rank, world_size, port):
     """Exercise op-fuser SwiGLU experts with native MXFP8 shards across Adam updates."""
     del rank, port
@@ -412,6 +458,7 @@ def _worker_mxfp8_op_fuser(rank, world_size, port):
         p.grad_added_to_main_grad = False
         p.register_grad_accum_hook(p.expand_as(p).grad_fn.next_functions[0][0], None)
     static_x = torch.randn(512, 256, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    # Keep AccumulateGrad alive across capture; this strong reference is intentional.
     input_grad_node = static_x.expand_as(static_x).grad_fn.next_functions[0][0]
     inputs = [torch.randn_like(static_x) for _ in range(6)]
     stream = torch.cuda.Stream()

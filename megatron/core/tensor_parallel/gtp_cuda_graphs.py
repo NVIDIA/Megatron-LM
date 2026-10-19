@@ -139,9 +139,11 @@ class GTPCaptureCommState:
         """Return owned parameters, AG streams, and RS streams for one GTP chain."""
         return self.get_comms_for_chains((chain_id,))
 
-    def get_comms_for_chains(self, chain_ids: Iterable[str]) -> tuple[list, list, list]:
-        """Return owned communication for selected chains, deduplicating shared streams."""
-        chain_ids = set(chain_ids)
+    def get_comms_for_chains(
+        self, chain_ids: Iterable[str] | Callable[[str], bool]
+    ) -> tuple[list, list, list]:
+        """Select owned communication by IDs or a predicate, deduplicating shared streams."""
+        matches_chain = chain_ids if callable(chain_ids) else set(chain_ids).__contains__
         params = []
         ag_streams = []
         rs_streams = []
@@ -150,7 +152,8 @@ class GTPCaptureCommState:
         rs_stream_ids = set()
 
         for param, stream, reduce_scatter in self._comm_records:
-            if getattr(param, "chain_id", None) not in chain_ids:
+            chain_id = getattr(param, "chain_id", None)
+            if chain_id is None or not matches_chain(chain_id):
                 continue
             if id(param) not in param_ids:
                 param_ids.add(id(param))
