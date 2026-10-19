@@ -4,7 +4,7 @@
 
 import pytest
 
-from megatron.core.ssm.gated_delta_net import HAVE_FLA
+from megatron.core.ops.ssm.gated_delta.common import HAVE_FLA
 from tests.unit_tests.ssm.gated_delta_net_test_cases import GatedDeltaNetModuleTestCases
 
 

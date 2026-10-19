@@ -40,7 +40,7 @@ megatron/core/ops/
 │   └── context_parallel/  chunkwise CP protocol and the FLA / CuTeDSL GDP adapters
 └── attention/
     ├── dsa/               modules.py, layout/masking, kernels/, TileLang & cuDNN adapters
-    ├── csa/               modules.py
+    ├── csa/               modules.py, kernels/ (SBHD and packed THD paths, CP helpers)
     ├── mla.py             absorbed MLA
     └── dsv4.py            DeepSeek-v4 hybrid attention
 ```
@@ -58,6 +58,7 @@ below; until then its module carries the availability checks it had before the m
 | `attention/dsa` | `modules.py`, layout/masking, indexer loss, reference and fused adapters |
 | `attention/dsa/kernels` | TileLang/Triton kernel implementations |
 | `attention/csa` | `modules.py` with compressor/indexer/attention modules and reference kernels |
+| `attention/csa/kernels` | SBHD and packed THD sparse attention, teacher LSE, packed layout and CP helpers |
 | `attention/mla.py` | Absorbed MLA operation and its projection/layout helpers |
 | `attention/dsv4.py` | DeepSeek-v4 hybrid attention operation |
 
@@ -65,7 +66,8 @@ Within a family the file roles are fixed:
 
 - `__init__.py` — the **contract**: a docstring describing tensor layouts, masks,
   state ownership and distributed inputs, plus any typing `Protocol` for the
-  kernel interface. Importing it must not load optional libraries.
+  kernel interface. Importing it must not load optional libraries, and it
+  re-exports nothing: callers import each name from the module that defines it.
 - `backends.py` — the **selectors**: `select_<op>(...)` functions that turn the
   existing config values into concrete callables, using `require()`. This is the
   only place in the family that decides between implementations.
@@ -299,7 +301,7 @@ reference path silently.
 When moving a module, keep its old path as a forwarder built on
 `megatron.core.ops._compat.deprecated_module` and register the mapping in
 `tests/unit_tests/ops/deprecated_paths.py`. Paths absent from that table retain
-their existing ownership; the table is empty until modules are moved.
+their existing ownership.
 
 A forwarder provides the following compatibility behavior:
 
@@ -308,14 +310,23 @@ A forwarder provides the following compatibility behavior:
   old path does not import the implementation or its optional kernel libraries.
 - `from old import *`, private names and pickles that recorded the old
   `__module__` keep working, and every object is the canonical one.
+- Writes go where reads come from. Assigning or deleting a name on a forwarder,
+  including `mock.patch` and `monkeypatch.setattr` on the old path, changes the
+  module that defines it. A forwarder with several targets has no single home for
+  a name, so writing through it raises `AttributeError`.
 - The forwarders are scheduled for removal in the version recorded by
-  `_compat.REMOVAL_VERSION`. In-tree code must use canonical paths; a unit test
-  enforces this.
+  `_compat.REMOVAL_VERSION`. In-tree code must use canonical paths, in imports
+  and in strings such as patch targets; a unit test enforces this.
 
-These are read-through import aliases. Assigning attributes on a deprecated module
-(including monkeypatching a kernel function) does not update the canonical module's
-globals. Patches must target the canonical path. Module `__file__` also names the
-forwarder; use the canonical module when inspecting implementation source.
+A historical package that re-exported names from its modules passes them as
+`exports={name: defining_module}`. Those names resolve from their defining modules
+and form the forwarder's `__all__`, and they are recorded in the table's `EXPORTS`.
+The canonical package does not re-export them, and any compatibility fallback, such
+as an optional entry point that was `None` without its kernels, stays in the
+forwarder.
+
+Module `__file__` names the forwarder; use the canonical module when inspecting
+implementation source.
 
 Ordinary state-dict keys and checkpoint tensor mappings do not depend on the
 source directory. Preserve them when moving an operation, and use the
@@ -325,10 +336,11 @@ old-to-new table to drive the migration-specific regression tests.
 
 `tests/unit_tests/ops/test_deprecated_imports.py` tests the compatibility helper
 with synthetic modules, independently of any migration entries. It covers
-warnings, lazy imports, private and wildcard exports, multiple targets, and
-package child imports. The same file checks registered deprecated paths,
-canonical class identity and pickle round trips, import-path resolution, and
-in-tree use of canonical paths as operations move.
+warnings, lazy imports, private and wildcard exports, multiple targets, package
+child imports, write-through patching and re-exported names. The same file checks
+registered deprecated paths and historical exports, canonical class identity and
+pickle round trips, import-path resolution, that canonical package `__init__`
+files re-export nothing, and in-tree use of canonical paths as operations move.
 
 Add selector and dependency-check tests alongside the family that uses them.
 Family behavior tests live under `tests/unit_tests/ssm/` and

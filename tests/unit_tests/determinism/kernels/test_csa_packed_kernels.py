@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+from megatron.core.ops.attention.csa.kernels import (
     cp_utils,
     csa_indexer_loss_kernels,
     packed_layout,

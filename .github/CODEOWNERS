@@ -26,6 +26,7 @@ megatron/core/models/audio/ @NVIDIA/mcore-audio
 
 megatron/core/models/mamba/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 megatron/core/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
+megatron/core/ops/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 
 megatron/core/models/hybrid/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 
@@ -59,6 +60,7 @@ megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets
 megatron/core/pipeline_parallel/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/pipeline-parallelism
 
 megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/transformer
+megatron/core/ops/attention/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/transformer
 
 megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech
 

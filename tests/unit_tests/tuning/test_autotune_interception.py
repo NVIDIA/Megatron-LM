@@ -91,7 +91,7 @@ def test_install_pins_in_tree_tuner_created_before_install(isolated_policy, monk
 
     monkeypatch.setattr(tuning_policy, "_deterministic_override", None)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
-    tuner, hooks = make_tuner(module="megatron.core.ssm.ops.gdp.chunk_h")
+    tuner, hooks = make_tuner(module="megatron.core.ops.ssm.gdp.chunk_h")
     original_configs = tuner.configs
     assert selection.autotune_configs(original_configs) is original_configs
     assert len(original_configs) == 2

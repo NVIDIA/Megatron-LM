@@ -16,7 +16,7 @@ try:
         mamba_split_conv1d_scan_combined,
     )
 
-    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ops.ssm.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_MAMBA = True
 except ImportError:
@@ -151,7 +151,7 @@ class TestConvParity:
 
     def test_training_conv_matches_varlen_prefill_conv(self, inputs):
         """Bitwise, not close."""
-        from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
+        from megatron.core.ops.ssm.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
         device, dtype = inputs["device"], inputs["dtype"]
         conv_dim = NHEADS * HEADDIM
@@ -191,7 +191,7 @@ class TestFusedTrainingParity:
 
     @requires_pinned_autotune
     def test_fused_training_kernel_matches_varlen_prefill(self, inputs):
-        from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
+        from megatron.core.ops.ssm.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
         device, dtype = inputs["device"], inputs["dtype"]
         x, z, B, C = (inputs[k] for k in ("x", "z", "B", "C"))

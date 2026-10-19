@@ -15,6 +15,7 @@ import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.ops.attention.dsa.modules import DSAIndexerLossAutoScaler
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -27,7 +28,6 @@ from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
     get_overlap_moe_expert_parallel_comm_order,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
@@ -366,9 +366,7 @@ def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkey
 def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
     calculate_per_token_loss, expected_scale
 ):
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        DSAIndexerLossAutoScaler,
-    )
+    from megatron.core.ops.attention.dsa.modules import DSAIndexerLossAutoScaler
 
     config = SimpleNamespace(
         calculate_per_token_loss=calculate_per_token_loss,
@@ -404,9 +402,7 @@ def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
 
 
 def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        DSAIndexerLossAutoScaler,
-    )
+    from megatron.core.ops.attention.dsa.modules import DSAIndexerLossAutoScaler
 
     config = SimpleNamespace(
         calculate_per_token_loss=True,
@@ -443,9 +439,7 @@ def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
 
 @pytest.mark.parametrize("variant", ["dsa", "dsv4_hybrid"])
 def test_indexer_loss_scale_defaults_from_variant_without_mutating_config(variant):
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        DSAIndexerLossAutoScaler,
-    )
+    from megatron.core.ops.attention.dsa.modules import DSAIndexerLossAutoScaler
 
     config = SimpleNamespace(
         calculate_per_token_loss=True,

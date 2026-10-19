@@ -12,15 +12,10 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.ops.ssm.gated_delta.common import chunk_gated_delta_rule
+from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet, torch_chunk_gated_delta_rule
+from megatron.core.ops.ssm.gated_delta.gdn2 import GatedDeltaNet2, chunk_gdn2, torch_chunk_gdn2
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import (
-    GatedDeltaNet,
-    GatedDeltaNet2,
-    chunk_gdn2,
-    torch_chunk_gated_delta_rule,
-    torch_chunk_gdn2,
-)
-from megatron.core.ssm.gated_delta_net.common import chunk_gated_delta_rule
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.ssm.gated_delta_net_test_utils import GatedDeltaNetTestBase
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -262,7 +257,7 @@ class GatedDeltaNetModuleTestCases(GatedDeltaNetTestBase):
             ), f"Grad not identical for {name} ({rank=})"
 
     def test_deterministic_mode(self, monkeypatch):
-        from megatron.core.ssm.gated_delta_net import common
+        from megatron.core.ops.ssm.gated_delta import common
 
         def reject_autotuned_l2norm(*args, **kwargs):
             raise AssertionError("Deterministic GDN must not dispatch FLA's autotuned L2 norm")

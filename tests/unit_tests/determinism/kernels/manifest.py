@@ -35,7 +35,10 @@ from typing import Tuple
 EXEMPT_LABEL = "determinism-exempt"
 
 # Directories whose every ``.py`` file (``__init__.py`` excluded) must be registered.
-KERNEL_DIRECTORIES: Tuple[str, ...] = ("megatron/core/fusions", "megatron/core/ssm/ops")
+# ``megatron/core/ops`` is not one: its families keep operation modules (mixers, context
+# parallelism, checkpoint and inference helpers) beside their kernels. Its kernel files are
+# registered below by path, and new ones are found by ``KERNEL_CONTENT_PATTERNS``.
+KERNEL_DIRECTORIES: Tuple[str, ...] = ("megatron/core/fusions",)
 
 # Regular expressions (``re.MULTILINE``) that mark a source file as kernel-bearing wherever
 # it lives. Matched against the file's current contents by both consumers.
@@ -180,9 +183,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="dsv4_q_rms_norm",
-        sources=(
-            "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
-        ),
+        sources=("megatron/core/ops/attention/dsv4.py",),
         tests=(
             K + "test_fused_activations.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
@@ -429,7 +430,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- SSM
     KernelEntry(
         name="ssm_causal_conv1d",
-        sources=("megatron/core/ssm/causal_conv1d.py",),
+        sources=("megatron/core/ops/ssm/common/causal_conv1d_cp.py",),
         tests=(C + "test_ssm_conv1d.py",),
         kind="external-lib",
         notes="Dao-AILab causal_conv1d; channel-last backward reduces dweight/dbias with "
@@ -438,12 +439,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_mamba2_varlen_kernels",
         sources=(
-            "megatron/core/ssm/ops/mamba2/ssd_combined.py",
-            "megatron/core/ssm/ops/mamba2/ssd_bmm.py",
-            "megatron/core/ssm/ops/mamba2/ssd_chunk_scan.py",
-            "megatron/core/ssm/ops/mamba2/ssd_chunk_state.py",
-            "megatron/core/ssm/ops/mamba2/ssd_state_passing.py",
-            "megatron/core/ssm/ops/mamba2/mamba_ssm.py",
+            "megatron/core/ops/ssm/mamba2/ssd_combined.py",
+            "megatron/core/ops/ssm/mamba2/ssd_bmm.py",
+            "megatron/core/ops/ssm/mamba2/ssd_chunk_scan.py",
+            "megatron/core/ops/ssm/mamba2/ssd_chunk_state.py",
+            "megatron/core/ops/ssm/mamba2/ssd_state_passing.py",
+            "megatron/core/ops/ssm/mamba2/mamba_ssm.py",
         ),
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
@@ -451,7 +452,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_mamba2_batch_invariant_decode",
-        sources=("megatron/core/ssm/ops/mamba2/batch_invariant_decode.py",),
+        sources=("megatron/core/ops/ssm/mamba2/batch_invariant_decode.py",),
         tests=("tests/unit_tests/ssm/ops/mamba2/test_batch_invariant_decode.py",),
         kind="triton",
         training_path=False,
@@ -459,10 +460,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_common_kernels",
         sources=(
-            "megatron/core/ssm/ops/common/causal_conv1d_triton.py",
-            "megatron/core/ssm/ops/common/causal_conv1d_varlen.py",
-            "megatron/core/ssm/ops/common/intermediate_extraction.py",
-            "megatron/core/ssm/ops/common/determinism.py",
+            "megatron/core/ops/ssm/common/causal_conv1d_triton.py",
+            "megatron/core/ops/ssm/common/causal_conv1d_varlen.py",
+            "megatron/core/ops/ssm/common/intermediate_extraction.py",
+            "megatron/core/ops/ssm/common/determinism.py",
         ),
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
@@ -473,18 +474,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_gdp_kernels",
         sources=(
-            "megatron/core/ssm/ops/gdp/chunk.py",
-            "megatron/core/ssm/ops/gdp/chunk_h.py",
-            "megatron/core/ssm/ops/gdp/chunk_o.py",
-            "megatron/core/ssm/ops/gdp/common.py",
-            "megatron/core/ssm/ops/gdp/cumsum.py",
-            "megatron/core/ssm/ops/gdp/decode_prepare.py",
-            "megatron/core/ssm/ops/gdp/fused_recurrent.py",
-            "megatron/core/ssm/ops/gdp/metadata.py",
-            "megatron/core/ssm/ops/gdp/scaled_dot_kkt.py",
-            "megatron/core/ssm/ops/gdp/solve_tril.py",
-            "megatron/core/ssm/ops/gdp/wy_fast.py",
-            "megatron/core/ssm/context_parallel/gdp.py",
+            "megatron/core/ops/ssm/gdp/chunk.py",
+            "megatron/core/ops/ssm/gdp/chunk_h.py",
+            "megatron/core/ops/ssm/gdp/chunk_o.py",
+            "megatron/core/ops/ssm/gdp/common.py",
+            "megatron/core/ops/ssm/gdp/cumsum.py",
+            "megatron/core/ops/ssm/gdp/decode_prepare.py",
+            "megatron/core/ops/ssm/gdp/fused_recurrent.py",
+            "megatron/core/ops/ssm/gdp/metadata.py",
+            "megatron/core/ops/ssm/gdp/scaled_dot_kkt.py",
+            "megatron/core/ops/ssm/gdp/solve_tril.py",
+            "megatron/core/ops/ssm/gdp/wy_fast.py",
+            "megatron/core/ops/ssm/context_parallel/gdp.py",
         ),
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
@@ -496,9 +497,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="gated_delta_net",
         sources=(
-            "megatron/core/ssm/gated_delta_net/common.py",
-            "megatron/core/ssm/gated_delta_net/gdn.py",
-            "megatron/core/ssm/gated_delta_net/gdn2.py",
+            "megatron/core/ops/ssm/gated_delta/common.py",
+            "megatron/core/ops/ssm/gated_delta/gdn.py",
+            "megatron/core/ops/ssm/gated_delta/gdn2.py",
         ),
         tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
@@ -525,7 +526,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_triton_cache_manager",
-        sources=("megatron/core/ssm/triton_cache_manager.py",),
+        sources=("megatron/core/ops/ssm/triton_cache_manager.py",),
         kind="triton",
         exempt_reason="Triton compile-cache manager; no kernel.",
     ),
@@ -674,7 +675,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # the kernels they call (and by module-level tests where they exist); ``notes`` say which.
     KernelEntry(
         name="ssm_mamba_mixer",
-        sources=("megatron/core/ssm/mamba_mixer.py",),
+        sources=("megatron/core/ops/ssm/mamba2/mixer.py",),
         tests=(
             C + "test_ssm_conv1d.py",
             K + "test_ssm_kernels.py",
@@ -689,7 +690,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_gated_delta_product",
-        sources=("megatron/core/ssm/gated_delta_product.py",),
+        sources=("megatron/core/ops/ssm/gdp/mixer.py",),
         tests=(K + "test_ssm_kernels.py",),
         kind="dispatch",
         notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
@@ -712,7 +713,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="mla_rope_dispatch",
         sources=(
             "megatron/core/transformer/multi_latent_attention.py",
-            "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
+            "megatron/core/ops/attention/mla.py",
         ),
         tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
         kind="dispatch",
@@ -724,7 +725,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
-        sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
+        sources=("megatron/core/ops/attention/dsa/modules.py",),
         tests=(K + "test_te_wrappers.py",),
         kind="dispatch",
         notes="Dispatches the non-quantized FP32 indexer projection to TE general_gemm when "
@@ -801,7 +802,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="te_thd_partitioned_indices",
         sources=(
             "megatron/core/datasets/data_schedule.py",
-            "megatron/core/ssm/mamba_context_parallel.py",
+            "megatron/core/ops/ssm/mamba2/context_parallel.py",
             "megatron/core/utils.py",
             "megatron/core/models/mimo/partition/utils.py",
             "megatron/core/models/multimodal/llava_model.py",
@@ -839,9 +840,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
         name="csa_teacher_lse",
-        sources=(
-            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
-        ),
+        sources=("megatron/core/ops/attention/csa/kernels/csa_teacher_lse.py",),
         tests=(K + "test_fused_triton_kernels.py",),
         kind="triton",
         notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
@@ -849,10 +848,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="csa_packed_layout_and_loss",
         sources=(
-            "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py",
-            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_indexer_loss_kernels.py",
-            "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_sparse_attention.py",
-            "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_layout.py",
+            "megatron/core/ops/attention/csa/kernels/cp_utils.py",
+            "megatron/core/ops/attention/csa/kernels/csa_indexer_loss_kernels.py",
+            "megatron/core/ops/attention/csa/kernels/packed_sparse_attention.py",
+            "megatron/core/ops/attention/csa/kernels/packed_layout.py",
         ),
         tests=(
             K + "test_csa_packed_kernels.py",
@@ -865,7 +864,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="dsa_dispatch",
-        sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
+        sources=("megatron/core/ops/attention/dsa/modules.py",),
         tests=(K + "test_fused_triton_kernels.py",),
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
@@ -875,17 +874,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_tilelang_kernels",
         sources=(
-            "megatron/core/transformer/experimental_attention_variant/ops/indexer.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/sparse_mla.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_indexer_bwd.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_indexer_fwd.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_indexer_loss.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_sparse_mla_bwd.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_sparse_mla_fwd.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_utils.py",
-            "megatron/core/transformer/experimental_attention_variant/dsa_kernels.py",
-            "megatron/core/transformer/experimental_attention_variant/dsa_tilelang_kernels.py",
+            "megatron/core/ops/attention/dsa/kernels/indexer.py",
+            "megatron/core/ops/attention/dsa/kernels/sparse_mla.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_dsa.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_indexer_bwd.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_indexer_fwd.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_indexer_loss.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_sparse_mla_bwd.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_sparse_mla_fwd.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_utils.py",
+            "megatron/core/ops/attention/dsa/dsa_kernels.py",
+            "megatron/core/ops/attention/dsa/dsa_tilelang_kernels.py",
         ),
         kind="tilelang",
         exempt_reason="Experimental DeepSeek sparse attention kernels (indexer / sparse MLA backward accumulate with "
@@ -895,9 +894,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- DSA min-memory backends
     KernelEntry(
         name="dsa_min_memory_triton",
-        sources=(
-            "megatron/core/transformer/experimental_attention_variant/dsa_min_memory_triton.py",
-        ),
+        sources=("megatron/core/ops/attention/dsa/dsa_min_memory_triton.py",),
         tests=("tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",),
         kind="triton",
         notes="Streaming top-k routing, selected-score forward/backward, scatter of the selected "
@@ -906,7 +903,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="dsa_min_memory_torch",
-        sources=("megatron/core/transformer/experimental_attention_variant/dsa_min_memory.py",),
+        sources=("megatron/core/ops/attention/dsa/dsa_min_memory.py",),
         tests=("tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",),
         kind="torch-op",
         notes="index_add_ accumulates the key, value and indexer-K gradients where top-k selects "
