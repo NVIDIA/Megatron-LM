@@ -59,7 +59,7 @@ def official_selection():
     stage = ast.parse(
         "def stage(self, q, index_k, weights, shared_attn, ratio, start_pos, seqlen, end_pos, offset): pass"
     ).body[0]
-    stage.body = forward.body[begin:]
+    stage.body = ast.parse("x = q").body + forward.body[begin:]
     exec(
         compile(
             ast.fix_missing_locations(ast.Module(body=[stage], type_ignores=[])),
@@ -202,3 +202,35 @@ def test_ratio_one_only_composes_core_functions():
         }
 
     assert not (bodies(ratio_one) & (bodies(csa) | bodies(dsa) | bodies(cp_utils)))
+
+
+def test_candidate_block_ties_and_two_positive_infinities_match_official(official_selection):
+    reference, _ = official_selection
+    scores = torch.zeros(4, 17)
+    scores[1, :8] = 2  # Within-block and cross-block ties.
+    scores[2, 0] = torch.inf  # Newest block is also pinned to +inf.
+    scores[3, 0] = scores[3, 8] = torch.inf
+    visible = torch.tensor([[17], [17], [17], [17]])
+    for blocks in (1, 2, 3):
+        assert torch.equal(
+            candidate_pool(scores, visible, blocks=blocks, block_size=8),
+            reference(scores, visible, blocks, 8),
+        )
+
+
+def test_indexer_frozen_manifest_does_not_freeze_nonowning_main_kv():
+    from megatron.lite.model.deepseek_v41.lite.native import freeze_indexer_sources
+
+    main = torch.nn.Linear(4, 4, bias=False)
+    indexer = torch.nn.Module()
+    indexer.q = torch.nn.Linear(4, 4, bias=False)
+    indexer.k = torch.nn.Linear(4, 4, bias=False)
+    indexer.weights = torch.nn.Linear(4, 1, bias=False)
+    object.__setattr__(indexer, "main_kv", main)
+    names = freeze_indexer_sources(indexer, loss_coefficient=0)
+    assert names == ("q.weight", "k.weight", "weights.weight")
+    assert indexer.ds41_frozen_parameters == names
+    assert all(not p.requires_grad for p in indexer.parameters())
+    assert main.weight.requires_grad
+    with pytest.raises(ValueError, match="auxiliary loss"):
+        freeze_indexer_sources(indexer, loss_coefficient=0.1)

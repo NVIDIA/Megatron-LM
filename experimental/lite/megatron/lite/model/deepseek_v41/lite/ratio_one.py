@@ -133,6 +133,7 @@ class RatioOneAttention(nn.Module):
         self.layer, self.index_owner, self.candidate_owner = layer, index_owner, candidate_owner
         self.state, self.use_flash = state, use_flash
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
+        self.v_head_dim = config.v_head_dim
         self.attn_sink = nn.Parameter(torch.zeros(config.num_attention_heads, dtype=torch.float32))
 
     def forward(self, query, window_kv, main_kv, index_q, index_k, weights, params):
@@ -143,9 +144,14 @@ class RatioOneAttention(nn.Module):
             prefix = params.cu_seqlens_q
         rows = query.shape[0]
         global_start = self.group.rank() * rows
-        window = async_gather_from_sequence_parallel_region(window_kv, group=self.group).wait()
-        main = async_gather_from_sequence_parallel_region(main_kv, group=self.group).wait()
-        keys = async_gather_from_sequence_parallel_region(index_k.detach(), group=self.group).wait()
+        if self.group.size() == 1:
+            window, main, keys = window_kv, main_kv, index_k.detach()
+        else:
+            window = async_gather_from_sequence_parallel_region(window_kv, group=self.group).wait()
+            main = async_gather_from_sequence_parallel_region(main_kv, group=self.group).wait()
+            keys = async_gather_from_sequence_parallel_region(
+                index_k.detach(), group=self.group
+            ).wait()
         geometry = (
             "ratio_one_selection",
             prefix.data_ptr(),

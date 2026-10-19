@@ -153,5 +153,22 @@ def attach_ratio_two_sources(attention, *, compressor, indexer):
         raise ValueError("DS4.1 attached sources must preserve literal ratio 2")
     if attention.config.csa_dense_mode:
         raise ValueError("DS4.1 learned index selection cannot use csa_dense_mode")
+    freeze_indexer_sources(indexer, loss_coefficient=attention.config.dsa_indexer_loss_coeff)
     attention.compressor, attention.indexer = compressor, indexer
     return attention
+
+
+def freeze_indexer_sources(indexer, *, loss_coefficient):
+    """Register intentionally unused indexer gradients in standard post-training.
+
+    Discrete index selection contributes no differentiable LP loss and this
+    recipe has no auxiliary indexer loss. Only the indexer's registered source
+    parameters are frozen; a main-KV owner must be a non-owning reference.
+    This is an explicit post-training policy, not an inferred official trainer.
+    """
+    if loss_coefficient != 0:
+        raise ValueError("DS4.1 standard post-training does not implement indexer auxiliary loss")
+    names = tuple(name for name, _ in indexer.named_parameters())
+    indexer.requires_grad_(False)
+    indexer.ds41_frozen_parameters = names
+    return names
