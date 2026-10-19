@@ -77,6 +77,7 @@ class ImplConfig:
     msa_index_input_norm: str = "recompute"  # recompute | fused (reuse the qkv LayerNormLinear norm output)
     msa_indexer_kl_loss_coeff: float = 0.0  # >0 trains the indexer with Magi's KL loss; 0 freezes it
     msa_indexer_kl_temperature: float = 1.0
+    disable_jit_fuser: bool = False  # run mcore/lite jit_fuser kernels eagerly (implied by deterministic)
 
 
 # MiniMax's training recipe (mm_megatron_forward / mcore M3 config); fa4_varlen requires cp=1.
@@ -87,6 +88,7 @@ MINIMAX_TRAINING_IMPL = dict(
     msa_indexer_kl_temperature=2.0,
     magi_dense_kernel_backend="fa4_varlen",
     moe_permute_fusion=False,
+    disable_jit_fuser=True,
 )
 
 
@@ -271,7 +273,7 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         local_blocks=model_cfg.index_local_blocks,
     )
     magi_msa.validate_device()
-    if impl_cfg.deterministic:
+    if impl_cfg.deterministic or impl_cfg.disable_jit_fuser:
         from megatron.lite.primitive.deterministic import disable_jit_fuser
 
         disable_jit_fuser()
