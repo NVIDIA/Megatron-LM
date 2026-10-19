@@ -485,7 +485,7 @@ class FsdpModule:
                     )
                 if group.has_fused_wgrad:
                     # Allocated on the current stream: keep it until that stream has waited for
-                    # this reduce-scatter, at the next reduction or at the end of backward.
+                    # this reduce-scatter, at the next reduction or in finish_grad_sync().
                     context.defer_fused_grad_buffer(partial_grad)
 
     @property

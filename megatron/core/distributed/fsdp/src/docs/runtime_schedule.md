@@ -69,11 +69,12 @@ compute stream when the module's own backward starts (not while a checkpointed r
 recomputed), and its views are exposed as `main_grad`. Post-backward adds any autograd
 gradients, removes `main_grad`, and hands the buffer to the reduce-scatter stream as before.
 Because the buffer was allocated on the compute stream, it is released only after the compute
-stream's next wait on the reduce-scatter stream (the next module's reduction or the end of
-backward), so allocation and deallocation stay on one stream without `record_stream`. Up to
-two such buffers are alive at once: one being reduced and one being filled. With delayed
-weight-gradient computation (`delay_wgrad_compute=True`), a module's buffer instead lives
-until its `backward_dw()` has run and the next reduction after that has waited for it.
+stream's next wait on the reduce-scatter stream (the next module's reduction or
+`finish_grad_sync()` at the end of backward), so allocation and deallocation stay on one stream
+without `record_stream`. Up to two such buffers are alive at once: one being reduced and one
+being filled. With delayed weight-gradient computation (`delay_wgrad_compute=True`), a module's
+buffer instead lives until its `backward_dw()` has run and the next reduction or
+`finish_grad_sync()` after that has waited for it.
 
 # Alternatives considered
 

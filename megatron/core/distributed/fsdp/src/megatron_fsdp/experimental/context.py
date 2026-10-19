@@ -223,13 +223,15 @@ class FsdpContext:
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
+        It also releases deferred fused gradient buffers, which the current stream can
+        reuse once it has waited for their reductions.
         """
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+        self.release_fused_grad_buffers()
 
     def post_backward(self) -> None:
         """Order current-stream consumers after this backward's gradient reductions."""
         self.finish_grad_sync()
-        self.release_fused_grad_buffers()
         self._post_backward_hook_registered = False
 
     def register_post_backward_hook(self) -> None:
