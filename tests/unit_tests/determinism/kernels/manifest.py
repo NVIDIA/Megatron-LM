@@ -374,7 +374,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/experts.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert; the "
+        "InferenceGroupedMLP FlashInfer MXFP8 path is replayed on Blackwell with FlashInfer.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -604,6 +605,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/permute.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/moe/fused_moe.py",
+            "megatron/core/inference/moe/flashinfer_bf16.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
         tests=(K + "test_inference_kernels.py",),
@@ -760,7 +762,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         notes="MXFP8Tensor dispatches the Megatron quantize kernel (replayed: "
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
-        "flashinfer on Blackwell and are not replayed in CI.",
+        "flashinfer on Blackwell and are not replayed in CI. flashinfer_mxfp8.py's valid-token-gated "
+        "row kernels are replayed in test_mxfp8_quantize_replays[routed-rows] and "
+        "test_flashinfer_row_kernels_replay.",
     ),
     KernelEntry(
         name="inference_request_seed_sampling",

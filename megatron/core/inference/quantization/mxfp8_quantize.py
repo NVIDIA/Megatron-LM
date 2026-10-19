@@ -39,6 +39,33 @@ def _ceil_div(a, b):
 
 
 @triton.jit
+def _mxfp8_quantize_groups(x, BLOCK_GROUPS: tl.constexpr):
+    """Quantize one row of BLOCK_GROUPS * 32 fp32 values to e4m3 with per-32 e8m0 scales.
+
+    Returns the e4m3 values ([BLOCK_GROUPS * 32]) and the scale exponents ([BLOCK_GROUPS] uint8).
+    The scale rounds up to the next power of two (Mishra et al., https://arxiv.org/pdf/2506.08027).
+    """
+    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
+    max_vals = tl.max(tl.abs(x_grouped), axis=1)
+
+    # 448 is the max representable value in FP8 e4m3.
+    # dequant_scale = min scale s.t. max_val / scale <= 448.
+    dequant_scale = max_vals / 448.0
+    # Round up to next power of 2 via integer bit manipulation:
+    # Adding 0x007FFFFF (mantissa mask) before masking with 0x7F800000
+    # (exponent-only mask) bumps the exponent if any mantissa bits are set.
+    # Result: 2^ceil(log2(max/448)) as a uint32-encoded float.
+    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    # Reinterpret uint32 back as float32 — now a power-of-2 dequantization scale.
+    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+    # Quantization scale is the reciprocal; guard against div-by-zero for all-zero groups.
+    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+
+    quantized = tl.reshape(x_grouped * quant_scale[:, None], [BLOCK_GROUPS * 32])
+    return quantized.to(tl.float8e4nv), (dequant_exp >> 23).to(tl.uint8)
+
+
+@triton.jit
 def _mxfp8_quant_swizzle_kernel(
     out_ptr,  # [M, K] output buffer for float8_e4m3fn quantized data
     scale_ptr,  # 1D output buffer for swizzled uint8 scales (e8m0 exponents)
@@ -109,35 +136,12 @@ def _mxfp8_quant_swizzle_kernel(
 
     # Load full row
     x = tl.load(src_row + offs, mask=mask, other=0.0).to(tl.float32)
-
-    # Per-group-of-32 max
-    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
-    abs_grouped = tl.abs(x_grouped)
-    max_vals = tl.max(abs_grouped, axis=1)
-
-    # 448 is the max representable value in FP8 e4m3.
-    # dequant_scale = min scale s.t. max_val / scale <= 448.
-    dequant_scale = max_vals / 448.0
-    # Round up to next power of 2 via integer bit manipulation:
-    # Adding 0x007FFFFF (mantissa mask) before masking with 0x7F800000
-    # (exponent-only mask) bumps the exponent if any mantissa bits are set.
-    # Result: 2^ceil(log2(max/448)) as a uint32-encoded float.
-    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-    # Reinterpret uint32 back as float32 — now a power-of-2 dequantization scale.
-    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
-    # Quantization scale is the reciprocal; guard against div-by-zero for all-zero groups.
-    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
-
-    # Quantize
-    quantized = x_grouped * quant_scale[:, None]
-    quantized_flat = tl.reshape(quantized, [BLOCK_K])
-    out_fp8 = quantized_flat.to(tl.float8e4nv)
+    out_fp8, scale_exp = _mxfp8_quantize_groups(x, BLOCK_GROUPS)
 
     # Store FP8 data
     tl.store(out_row + offs, out_fp8, mask=mask)
 
     # Store swizzled scales
-    scale_exp = (dequant_exp >> 23).to(tl.uint8)
     col_offs = tl.arange(0, BLOCK_GROUPS)
     col_mask = col_offs < REAL_GROUPS
 
