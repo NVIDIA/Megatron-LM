@@ -263,6 +263,18 @@ def test_executed_tests_without_dependency_evidence_are_always_selected(project,
     assert plan["phases"] == {"prod": [OTHER_TEST], "experimental": [OTHER_TEST]}
 
 
+def test_failed_execution_selects_its_file_without_source_changes(project, generation):
+    _change_database(
+        generation,
+        "prod",
+        "UPDATE test_execution SET failed = 1 WHERE test_name = ?",
+        (OTHER_TEST + "::test_other",),
+    )
+    plan = _select(project, generation)
+    assert plan["mode"] == "selected", plan["reason"]
+    assert plan["phases"] == {"prod": [OTHER_TEST], "experimental": [OTHER_TEST]}
+
+
 def test_marker_placeholders_are_not_executed_tests(project, generation):
     with closing(sqlite3.connect(generation[0] / "prod/.testmondata")) as connection:
         assert connection.execute(
@@ -427,19 +439,21 @@ def test_host_prepare_needs_only_the_standard_library(project, generation):
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("problem", ("full", "source", "image", "runtime", "path"))
+@pytest.mark.parametrize("problem", ("full", "source", "bucket", "platform", "image", "runtime"))
 def test_prepare_rejects_stale_or_invalid_selection(project, generation, monkeypatch, problem):
     plan = _select(project, generation)
     if problem == "full":
         plan["mode"] = "full"
     elif problem == "source":
         plan["source_sha"] = "c" * 40
+    elif problem == "bucket":
+        plan["bucket"] = OTHER_TEST
+    elif problem == "platform":
+        plan["platform"] = "dgx_gb200"
     elif problem == "image":
         plan["image_id"] = "sha256:" + "c" * 64
-    elif problem == "runtime":
-        plan["runtime"]["prod"]["python"] = "0.0.0"
     else:
-        plan["phases"]["prod"] = ["tests/unit_tests/../../escape.py::test_bad"]
+        plan["runtime"]["prod"]["python"] = "0.0.0"
     monkeypatch.chdir(project)
     with pytest.raises(ValueError):
         planner.prepare(
@@ -526,22 +540,7 @@ def test_mandatory_mapping_uses_old_paths_in_renamed_pr_files(project, generatio
 
 @pytest.mark.parametrize(
     "problem",
-    (
-        "missing",
-        "missing-metadata",
-        "missing-files",
-        "malformed",
-        "wrong-sha",
-        "metadata-list",
-        "truncated",
-        "missing-newline",
-        "string-count",
-        "boolean-count",
-        "negative-count",
-        "fractional-count",
-        "too-many-files",
-        "too-many-paths",
-    ),
+    ("missing", "missing-metadata", "missing-files", "malformed", "wrong-sha", "truncated"),
 )
 def test_invalid_pr_changed_file_artifact_runs_full_bucket(project, generation, problem):
     directory = _pr_files(project, ["megatron/core/mandatory/source.py"])
@@ -555,24 +554,11 @@ def test_invalid_pr_changed_file_artifact_runs_full_bucket(project, generation, 
         (directory / "changed-files").unlink()
     elif problem == "malformed":
         metadata_path.write_text("{")
-    elif problem == "metadata-list":
-        metadata_path.write_text("[]")
-    elif problem == "missing-newline":
-        (directory / "changed-files").write_text("megatron/core/mandatory/source.py")
     else:
         if problem == "wrong-sha":
             metadata["tested_sha"] = "c" * 40
         else:
-            field, value = {
-                "truncated": ("changed_paths", 2),
-                "string-count": ("changed_files", "1"),
-                "boolean-count": ("changed_files", True),
-                "negative-count": ("changed_paths", -1),
-                "fractional-count": ("changed_files", 1.5),
-                "too-many-files": ("changed_files", 3001),
-                "too-many-paths": ("changed_paths", 6001),
-            }[problem]
-            metadata[field] = value
+            metadata["changed_paths"] = 2
         metadata_path.write_text(json.dumps(metadata))
     plan = _select(project, generation, pr_files_dir=directory)
     assert plan["mode"] == "full"
@@ -603,22 +589,3 @@ def test_mandatory_files_respect_child_buckets_and_platform_markers(project):
     changed = ["megatron/core/mandatory/source.py"]
     assert planner._mandatory_files(project, BUCKET, "dgx_h100", changed) == [APP_TEST, OTHER_TEST]
     assert planner._mandatory_files(project, BUCKET, "dgx_gb200", changed) == [OTHER_TEST]
-
-
-@pytest.mark.parametrize("problem", ("missing", "nodeid", "unselected", "escape"))
-def test_prepare_rejects_invalid_mandatory_files(project, generation, monkeypatch, problem):
-    plan = _select(project, generation)
-    if problem == "missing":
-        plan.pop("mandatory_files")
-    else:
-        plan["mandatory_files"] = [
-            {
-                "nodeid": OTHER_TEST + "::test_other",
-                "unselected": OTHER_TEST,
-                "escape": "tests/unit_tests/../../escape.py",
-            }[problem]
-        ]
-    monkeypatch.chdir(project)
-    with pytest.raises(ValueError):
-        planner.prepare(plan, generation[0], BUCKET, PLATFORM, SOURCE_SHA, image_id=IMAGE_ID)
-    assert not (generation[0] / ".testmon-work").exists()

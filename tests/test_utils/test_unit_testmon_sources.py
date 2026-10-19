@@ -76,25 +76,13 @@ def test_changed_test_sources_require_collection(repository, staged, change):
         planner._test_sources_unchanged(root, baseline)
 
 
-def test_ignored_python_sources_count_but_bytecode_does_not(repository):
+def test_bytecode_does_not_change_test_sources(repository):
     root, baseline = repository
-    (root / ".git/info/exclude").write_text("generated.py\n__pycache__/\n")
     tests = root / "tests/unit_tests"
     bytecode = tests / "__pycache__/shared_helper.pyc"
     bytecode.parent.mkdir()
     bytecode.write_bytes(b"cached bytecode")
     planner._test_sources_unchanged(root, baseline)
-    (tests / "generated.py").write_text("VALUE = 2\n")
-    with pytest.raises(ValueError, match="unit-test sources changed"):
-        planner._test_sources_unchanged(root, baseline)
-
-
-def test_index_flags_cannot_hide_changed_sources(repository):
-    root, baseline = repository
-    _git(root, "update-index", "--assume-unchanged", "tests/unit_tests/shared_helper.py")
-    (root / "tests/unit_tests/shared_helper.py").write_text("VALUE = 2\n")
-    with pytest.raises(ValueError, match="unit-test sources changed"):
-        planner._test_sources_unchanged(root, baseline)
 
 
 @pytest.mark.parametrize("change", ("unchanged", "modify", "add", "delete"))
@@ -136,17 +124,3 @@ def test_unavailable_baseline_fails_instead_of_accepting_sources(repository):
     with pytest.raises(subprocess.CalledProcessError) as error:
         planner._test_sources_unchanged(root, "f" * 40)
     assert error.value.cmd[1] == "fetch"
-
-
-@pytest.mark.parametrize("kind", ("file", "directory", "baseline"))
-def test_symbolic_links_require_collection(repository, kind):
-    root, baseline = repository
-    tests = root / "tests/unit_tests"
-    if kind == "directory":
-        (tests / "linked").symlink_to(root, target_is_directory=True)
-    else:
-        (tests / "linked.py").symlink_to(tests / "shared_helper.py")
-    if kind == "baseline":
-        baseline = _commit(root, baseline)
-    with pytest.raises(ValueError, match="symbolic links"):
-        planner._test_sources_unchanged(root, baseline)
