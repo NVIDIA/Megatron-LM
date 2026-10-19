@@ -21,14 +21,9 @@ class DistributedSetup:
     device: torch.device
 
 
-@pytest.fixture(scope="function", autouse=True)
+@pytest.fixture(scope="function")
 def distributed_setup() -> Iterator[DistributedSetup]:
-    """Set up this rank's local device and clean up per-test process groups.
-
-    This is autouse, and so runs before any xunit setup_method, because the first test in the
-    process that uses NCCL or symmetric memory decides their settings for every later test.
-    Tests that use the returned values still request it by name.
-    """
+    """Set up this rank's local device and clean up per-test process groups."""
     # Some MFSDP v2 tests are sensitive to NCCL algorithm/channel choices. Clear
     # the suite-wide NCCL defaults (set in the top-level conftest.py) before
     # init_device_mesh initializes NCCL communicators so this bucket uses NCCL
@@ -77,6 +72,7 @@ def distributed_setup() -> Iterator[DistributedSetup]:
         # to session cleanup.
         # https://docs.pytorch.org/docs/stable/distributed.html#reinitialization
         #
+        # TODO(#7322): Remove this workaround when runtime parameters become local tensors.
         # DeviceMesh equality ignores process groups, so DTensor's sharding-propagation cache
         # can hand a later test this test's meshes, whose groups are destroyed below.
         _clear_sharding_prop_cache()
