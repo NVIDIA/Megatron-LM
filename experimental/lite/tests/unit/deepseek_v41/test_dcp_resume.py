@@ -47,7 +47,7 @@ def _step(bundle, schedulers, drop_head_grad=False):
     offset = random.randrange(30) + int(np.random.randint(30)) + int(torch.randint(30, (1,)))
     ids = (torch.randint(1, 32, (TOKENS,)) + offset % 30).cuda()
     batch = PackedBatch(ids, ids, torch.tensor([TOKENS]).cuda())
-    bundle.optimizer.zero_grad()
+    bundle.chunks[0].zero_grad_buffer(), bundle.optimizer.zero_grad()  # as the runtime's zero_grad
     with use_loss_context(LossContext(normalization_denominator=float(TOKENS))):
         loss = bundle.forward_step(bundle.chunks[0], batch)["loss"]
     assert torch.isfinite(loss), "RESUME_LOSS"
