@@ -20,6 +20,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     csa_sparse_attn,
+    get_flash_mla_topk_alignment,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 
@@ -43,6 +44,11 @@ def candidate_pool(scores, visible, *, blocks, block_size):
         -1, indices, values > -torch.inf
     )
     return chosen.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+def flash_positions(positions, alignment):
+    """Pad index columns with -1 (no key) to FlashMLA's top-k alignment."""
+    return F.pad(positions, (0, (-positions.shape[-1]) % alignment), value=-1).contiguous()
 
 
 def select_indices(
@@ -197,7 +203,10 @@ class RatioOneAttention(nn.Module):
         kv = torch.cat((window, main), dim=0)
         scale = self.config.v_head_dim**-0.5
         if self.use_flash:
-            result = csa_sparse_attn(query, kv, self.attn_sink, positions, scale, is_thd=True)
+            positions = flash_positions(positions, get_flash_mla_topk_alignment())
+            result = csa_sparse_attn(
+                query.contiguous(), kv.contiguous(), self.attn_sink, positions, scale, is_thd=True
+            )
         else:
             result = unfused_compressed_sparse_attn(query, kv, self.attn_sink, positions, scale)
         inverse = _OutputInverseRope(

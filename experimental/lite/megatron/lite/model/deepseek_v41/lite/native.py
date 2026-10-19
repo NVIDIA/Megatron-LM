@@ -16,10 +16,37 @@ def reject_native_recompute(granularity, method):
         )
 
 
+def require_native_hadamard():
+    """CUDA indexer keys/queries need the real fast_hadamard_transform.
+
+    Core's rotate_activation asserts only that some transform is installed;
+    a CPU test stand-in must never reach a GPU run.
+    """
+    from megatron.core.transformer.experimental_attention_variant import dsa
+
+    module = getattr(dsa.hadamard_transform, "__module__", None) or ""
+    if not module.startswith("fast_hadamard_transform"):
+        raise ValueError(
+            "DS4.1 CUDA index selection requires the native fast_hadamard_transform; "
+            f"found {dsa.hadamard_transform!r}"
+        )
+
+
 def core_config(
-    release, parallel, *, initialize=True, recompute_granularity=None, recompute_method=None
+    release,
+    parallel,
+    *,
+    initialize=True,
+    recompute_granularity=None,
+    recompute_method=None,
+    attention_backend="none",
 ):
-    """Validate unsupported topology before groups or large tensors are created."""
+    """Validate unsupported topology before groups or large tensors are created.
+
+    ``attention_backend`` is Core's dsa_kernel_backend: "none" runs the unfused
+    sparse attention, "cudnn"/"tilelang" FlashMLA. It is set at construction so
+    Core validates the backend and its dependencies.
+    """
     reject_native_recompute(recompute_granularity, recompute_method)
     validate_build(release, context_parallel_size=parallel.cp)
     if parallel.tp != 1 or parallel.etp not in (None, 1):
@@ -69,7 +96,7 @@ def core_config(
         beta_fast=release.beta_fast,
         beta_slow=release.beta_slow,
         apply_rope_fusion=False,
-        dsa_kernel_backend="none",
+        dsa_kernel_backend=attention_backend,
         dsa_indexer_n_heads=release.index_n_heads,
         dsa_indexer_head_dim=release.index_head_dim,
         dsa_indexer_topk=release.index_topk,
@@ -109,6 +136,8 @@ def core_config(
     # Core's config declares CP1. See the source-guard/MRO/rope contracts.
     config.ds41_candidate_blocks = release.candidate_topk_blocks
     config.ds41_candidate_block_size = release.candidate_block_size
+    if torch.cuda.is_available() and set(config.csa_compress_ratios) & {1, 2}:
+        require_native_hadamard()
     return config
 
 

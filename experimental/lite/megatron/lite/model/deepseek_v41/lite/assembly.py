@@ -15,6 +15,9 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     rotate_activation,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+    use_fused_dsa_kernels,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.lite.model.deepseek_v41.lite.compressor import DS41Compressor
@@ -255,7 +258,7 @@ class DS41AttentionSources(nn.Module):
                 index_owner=policy.index,
                 candidate_owner=context.release.candidate_source_layer_id,
                 state=state,
-                use_flash=config.dsa_kernel_backend != "none",
+                use_flash=use_fused_dsa_kernels(config),
             )
         else:
             raise ValueError("DS4.1 supports literal ratios zero, one and two")
