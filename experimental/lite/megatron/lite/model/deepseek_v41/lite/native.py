@@ -115,3 +115,24 @@ def core_groups(state):
         dp_cp=state.dp_cp_group,
         expt_dp=state.ep_dp_group,
     )
+
+
+def attach_ratio_two_sources(attention, *, compressor, indexer):
+    """Attach DS4.1 sources that Core dev 7b150acf does not construct at ratio 2.
+
+    Core CompressedSparseAttention.forward/_forward_thd/_forward_thd_cp
+    consume these module attributes for ratio > 1. Its constructor only builds
+    an indexer at ratio 4. Keep the literal DS4.1 ratio and native forward;
+    do not select the unrelated DSv4 ratio-4 pooling or duplicate CP code.
+    Ratio 1 is deliberately excluded: Core's forward cannot consume it.
+    """
+    if attention.compress_ratio != 2:
+        raise ValueError("DS4.1 source attachment currently supports only literal ratio 2")
+    if compressor is None or indexer is None:
+        raise ValueError("DS4.1 ratio 2 requires both compressor and indexer sources")
+    if compressor.compress_ratio != 2 or indexer.compress_ratio != 2:
+        raise ValueError("DS4.1 attached sources must preserve literal ratio 2")
+    if attention.config.csa_dense_mode:
+        raise ValueError("DS4.1 learned index selection cannot use csa_dense_mode")
+    attention.compressor, attention.indexer = compressor, indexer
+    return attention

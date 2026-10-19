@@ -545,8 +545,8 @@ def test_shifted_block_uses_explicit_source_checkpoint(cpu_core_checkpoint):
     assert modes == [True, True, False, False, True, True]
 
 
-def test_native_ratio_two_compressor_matches_release_pooling():
-    """Run real parent compression on CPU projections, not a parent-method spy."""
+def _native_cpu_ratio_two_compressor():
+    """Real parent math; only parameter allocation/projections use CPU fixtures."""
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
     from megatron.lite.model.deepseek_v41.lite.native import core_config
@@ -570,6 +570,14 @@ def test_native_ratio_two_compressor_matches_release_pooling():
     compressor.ape = torch.nn.Parameter(torch.zeros(2, 4), requires_grad=False)
     compressor.norm = torch.nn.RMSNorm(4, eps=1e-20, dtype=torch.bfloat16)
     compressor.rotary_pos_emb = lambda length, packed_seq: torch.zeros(length, 1, 1, 2)
+    return compressor
+
+
+def test_native_ratio_two_compressor_matches_release_pooling():
+    """Run real parent compression on CPU projections, not a parent-method spy."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    compressor = _native_cpu_ratio_two_compressor()
     x = (torch.arange(48).reshape(12, 1, 4).float() / 32).to(torch.bfloat16).requires_grad_()
     prefix = torch.tensor([0, 5, 6, 12], dtype=torch.int32)
     params = PackedSeqParams(
@@ -596,3 +604,81 @@ def test_native_ratio_two_compressor_matches_release_pooling():
     assert torch.isfinite(x.grad).all()
     assert torch.isfinite(compressor.linear_wkv.weight.grad).all()
     assert torch.isfinite(compressor.linear_wgate.weight.grad).all()
+
+
+def test_ratio_two_attachment_runs_native_csa_and_indexer_forward():
+    """CPU dispatch proof, not a CUDA projection or full-model CP proof.
+
+    Both Core CSA.forward and CSAIndexer.forward (including real native
+    varlen top-k) run unchanged. The indexer projection boundary supplies CPU
+    q/k/weights; Hadamard/CUDA projections are outside this test's scope.
+    Removing the attached indexer must change actual attention output.
+    """
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.experimental_attention_variant.csa import (
+        CompressedSparseAttention,
+        CompressedSparseAttentionSubmodules,
+        CSAIndexer,
+    )
+    from megatron.lite.model.deepseek_v41.lite.native import attach_ratio_two_sources
+
+    class CPUIndexSources(CSAIndexer):
+        def forward_before_topk(self, x, qr, packed_seq_params=None):
+            # Explicit state-source fixture. Parent forward still computes
+            # segment bounds, causal masking and top-k from these tensors.
+            prefix = packed_seq_params.cu_seqlens_q
+            lengths = (prefix[1:] - prefix[:-1]) // 2
+            compressed = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+            q = torch.ones(x.shape[0], 1, 1, 4)
+            k = torch.arange(int(compressed[-1]) * 4).float().reshape(-1, 1, 4) / 8
+            weights = torch.ones(x.shape[0], 1, 1)
+            return q, k, weights, compressed
+
+    compressor = _native_cpu_ratio_two_compressor()
+    config = compressor.config
+    config.num_attention_heads, config.v_head_dim, config.qk_pos_emb_head_dim = 1, 4, 2
+    config.csa_window_size = 2
+    attention = CompressedSparseAttention(
+        config,
+        CompressedSparseAttentionSubmodules(),
+        1,
+        AttnMaskType.causal,
+        "self",
+        pg_collection=compressor.pg_collection,
+        rotary_pos_emb=compressor.rotary_pos_emb,
+        compress_ratio=2,
+    ).eval()
+    assert attention.indexer is None and attention.compressor is None
+    indexer = CPUIndexSources.__new__(CPUIndexSources)
+    torch.nn.Module.__init__(indexer)
+    indexer.compress_ratio, indexer.index_topk = 2, 1
+    attach_ratio_two_sources(attention, compressor=compressor, indexer=indexer)
+    assert attention.indexer is indexer and attention.compressor is compressor
+    calls = []
+    handle = indexer.register_forward_hook(lambda module, args, output: calls.append(output[1]))
+    x = (torch.arange(48).reshape(12, 1, 4).float() / 32).to(torch.bfloat16)
+    prefix = torch.tensor([0, 6, 8, 12], dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=prefix, cu_seqlens_kv=prefix, max_seqlen_q=6, max_seqlen_kv=6
+    )
+    query, key = x.squeeze(1).unsqueeze(1), x.unsqueeze(2)
+    with torch.no_grad():
+        selected = attention(query, key, key, None, x=x, qr=x, packed_seq_params=params)
+        assert len(calls) == 1 and calls[0].shape == (12, 1)
+        attention.indexer = None
+        all_compressed = attention(query, key, key, None, x=x, qr=x, packed_seq_params=params)
+    handle.remove()
+    assert selected.shape == all_compressed.shape == (12, 1, 4)
+    assert torch.isfinite(selected).all()
+    assert not torch.equal(selected, all_compressed)
+
+
+@pytest.mark.parametrize("ratio", [0, 1, 4])
+def test_ratio_two_attachment_rejects_other_ratios(ratio):
+    from megatron.lite.model.deepseek_v41.lite.native import attach_ratio_two_sources
+
+    with pytest.raises(ValueError, match="only literal ratio 2"):
+        attach_ratio_two_sources(
+            SimpleNamespace(compress_ratio=ratio), compressor=None, indexer=None
+        )
