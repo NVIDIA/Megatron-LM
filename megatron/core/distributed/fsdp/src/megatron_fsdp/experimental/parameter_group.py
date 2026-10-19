@@ -565,7 +565,7 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
-                dtype=self.dtype,
+                dtype=self.grad_comm_dtype,
                 device=self.main_weight.device,
             )
         buffer.local_buffer.zero_()
