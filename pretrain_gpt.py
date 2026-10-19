@@ -70,8 +70,8 @@ try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
     from megatron.post_training.model_config import (
+        apply_modelopt_model_config,
         distillation_config_from_args,
-        modelopt_model_config_from_args,
     )
     from megatron.post_training.utils import is_distillation_model, should_use_modelopt_config
 
@@ -572,12 +572,9 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
     use_modelopt_config = has_nvidia_modelopt and should_use_modelopt_config(args)
+    model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     if use_modelopt_config:
-        model_cfg = modelopt_model_config_from_args(
-            args, model_type="gpt", vocab_size_from_tokenizer=True
-        )
-    else:
-        model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
+        apply_modelopt_model_config(model_cfg, args)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     if use_modelopt_config:
         full_config.distillation = distillation_config_from_args(args, model_cfg)

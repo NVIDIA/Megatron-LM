@@ -50,7 +50,10 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.global_vars import get_run_config, set_run_config
@@ -61,8 +64,8 @@ try:
     from megatron.elastification.loss_func import loss_func as loss_func_modelopt
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.model_config import (
+        apply_modelopt_model_config,
         distillation_config_from_args,
-        modelopt_model_config_from_args,
     )
     has_nvidia_modelopt = True
 except ImportError:
@@ -87,7 +90,7 @@ def count_parameters_in_layer(model, layer_name):
 
 def _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collection):
     """Build one model stage with the stock builder for the ModelOpt config, running its pre-wrap hooks."""
-    model_config = modelopt_model_config_from_args(args, model_type="hybrid")
+    model_config = apply_modelopt_model_config(hybrid_config_from_args(args), args)
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     builder = model_config.get_builder_cls()(model_config)
@@ -599,7 +602,7 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(args)
     if has_nvidia_modelopt and getattr(args, "export_kd_teacher_load", None):
         full_config.distillation = distillation_config_from_args(
-            args, modelopt_model_config_from_args(args, model_type="hybrid")
+            args, apply_modelopt_model_config(hybrid_config_from_args(args), args)
         )
     set_run_config(full_config)
     pretrain(full_config,

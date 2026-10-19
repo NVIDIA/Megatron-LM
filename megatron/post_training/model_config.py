@@ -3,8 +3,9 @@
 """Derive stock GPT/Hybrid model configs for ModelOpt workflows from the CLI arguments.
 
 ModelOpt runs use the regular ``GPTModelBuilder`` / ``HybridModelBuilder``. What is specific to
-ModelOpt (layer specs from the ``--export-*`` flags, a few ``TransformerConfig`` tweaks, and
-the pre-wrap hooks in ``megatron.post_training.model_hooks``) is attached to the config here.
+ModelOpt (layer specs from the ``--export-*`` flags, the offline speculative-decoding tweak, and
+the transformations that select the pre-wrap hooks in ``megatron.post_training.model_hooks``) is
+applied to a stock config by ``apply_modelopt_model_config``.
 """
 
 import dataclasses
@@ -13,7 +14,6 @@ import logging
 import os
 import warnings
 from argparse import Namespace
-from typing import Literal
 
 import yaml
 
@@ -180,69 +180,110 @@ def modelopt_gpt_layer_spec(
 _EXPORT_MODEL_TYPES = {"GPTModel": "gpt", "HybridModel": "hybrid", "MambaModel": "hybrid"}
 
 
-def _resolve_model_type(
-    args: Namespace, model_type: Literal["gpt", "hybrid"] | None
-) -> Literal["gpt", "hybrid"]:
-    """Choose GPT or Hybrid: the caller's ``model_type``, else ``--hybrid-layer-pattern``.
+def _is_hybrid_from_args(args: Namespace) -> bool:
+    """For callers without a fixed model type: hybrid iff ``--hybrid-layer-pattern`` is set.
 
-    The deprecated ``--export-model-type`` is still honored (e.g. for a pure-Mamba model without a
-    layer pattern), but must not contradict the entry point or the layer pattern.
+    The deprecated ``--export-model-type`` still selects the type (e.g. for a pure-Mamba model
+    without a layer pattern); ``_check_model_type`` warns about it.
     """
     flag = getattr(args, "export_model_type", None)
-    if flag is None:
-        if model_type is not None:
-            return model_type
-        return "hybrid" if is_hybrid_model(args) else "gpt"
+    if flag is not None:
+        return _EXPORT_MODEL_TYPES[flag] == "hybrid"
+    return is_hybrid_model(args)
 
-    warnings.warn(
-        "--export-model-type is deprecated: the model type now comes from the entry point "
-        "(pretrain_gpt.py / pretrain_hybrid.py) or from --hybrid-layer-pattern.",
-        DeprecationWarning,
-        stacklevel=3,
-    )
-    flag_type = _EXPORT_MODEL_TYPES[flag]
-    if model_type is not None and flag_type != model_type:
-        raise ValueError(f"--export-model-type {flag} conflicts with this {model_type} entry point.")
-    if flag_type == "gpt" and is_hybrid_model(args):
-        raise ValueError(f"--export-model-type {flag} conflicts with --hybrid-layer-pattern.")
-    return flag_type
+
+def _check_model_type(model_config: GPTModelConfig | HybridModelConfig, args: Namespace) -> None:
+    hybrid = isinstance(model_config, HybridModelConfig)
+    flag = getattr(args, "export_model_type", None)
+    if flag is not None:
+        warnings.warn(
+            "--export-model-type is deprecated: the model type now comes from the entry point "
+            "(pretrain_gpt.py / pretrain_hybrid.py) or from --hybrid-layer-pattern.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        if (_EXPORT_MODEL_TYPES[flag] == "hybrid") != hybrid:
+            raise ValueError(
+                f"--export-model-type {flag} conflicts with the {type(model_config).__name__}."
+            )
+    if not hybrid and is_hybrid_model(args):
+        raise ValueError(
+            "--hybrid-layer-pattern is set but the model config is a GPTModelConfig; "
+            "use pretrain_hybrid.py."
+        )
 
 
 def modelopt_model_config_from_args(
     args: Namespace,
     *,
-    model_type: Literal["gpt", "hybrid"] | None = None,
     disable_moe_grouped_gemm: bool = False,
     vocab_size_from_tokenizer: bool = True,
 ) -> GPTModelConfig | HybridModelConfig:
-    """Build the GPT or Hybrid model config for ModelOpt.
+    """Build the GPT or Hybrid model config for ModelOpt, for callers without a fixed type.
+
+    A model is hybrid iff ``--hybrid-layer-pattern`` is set. Entry points that build one kind
+    of model call ``gpt_config_from_args`` / ``hybrid_config_from_args`` and then
+    ``apply_modelopt_model_config`` instead.
 
     Args:
         args: The parsed arguments, including those from ``add_modelopt_args``.
-        model_type: ``"gpt"`` or ``"hybrid"``, for entry points that build one kind of model.
-            If ``None``, a model is hybrid iff ``--hybrid-layer-pattern`` is set.
+        disable_moe_grouped_gemm: See ``apply_modelopt_model_config``.
+        vocab_size_from_tokenizer: See ``gpt_config_from_args``.
+    """
+    config_from_args = hybrid_config_from_args if _is_hybrid_from_args(args) else gpt_config_from_args
+    model_config = config_from_args(args, vocab_size_from_tokenizer=vocab_size_from_tokenizer)
+    return apply_modelopt_model_config(
+        model_config, args, disable_moe_grouped_gemm=disable_moe_grouped_gemm
+    )
+
+
+def apply_modelopt_model_config(
+    model_config: GPTModelConfig | HybridModelConfig,
+    args: Namespace,
+    *,
+    disable_moe_grouped_gemm: bool = False,
+) -> GPTModelConfig | HybridModelConfig:
+    """Set the ModelOpt layer spec and transformations on a stock GPT or Hybrid model config.
+
+    Args:
+        model_config: A config from ``gpt_config_from_args`` / ``hybrid_config_from_args``,
+            updated in place.
+        args: The parsed arguments, including those from ``add_modelopt_args``.
         disable_moe_grouped_gemm: Force the export spec to use SequentialMLP (per-expert
             linears) instead of the default TEGroupedMLP. Pruning sets this so
             ``mtp.prune`` can operate on individual expert linears; quantize / generate /
             finetune leave the default so MoE quantization (e.g. QuantTEGroupedMLP) works
             and TP+EP > 1 doesn't trip the QuantSequentialMLP unsupported-combo check.
-        vocab_size_from_tokenizer: See ``gpt_config_from_args``.
 
     Returns:
-        A ``GPTModelConfig`` / ``HybridModelConfig`` to build with its regular builder
-        (``config.get_builder_cls()``).
+        ``model_config``, to build with its regular builder (``config.get_builder_cls()``).
     """
     if args.spec is not None:
         raise ValueError("ModelOpt integration does not support custom args.spec.")
-    model_type = _resolve_model_type(args, model_type)
     if args.pipeline_model_parallel_size > 1 and args.virtual_pipeline_model_parallel_size is not None:
         raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
+    _check_model_type(model_config, args)
 
-    # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
-    transformer_config = core_transformer_config_from_args(args)
-
-    if model_type == "gpt":
+    te_mcore_model = args.export_te_mcore_model
+    if isinstance(model_config, HybridModelConfig):
+        if args.export_default_te_spec and te_mcore_model:
+            logger.warning(
+                "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
+                "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
+            )
+            te_mcore_model = False
+        # Default to grouped MLP for the export spec (matches the pre-modernization
+        # behavior of get_hybrid_stack_modelopt_spec — its factory default is True).
+        # ``disable_moe_grouped_gemm`` (set by prune.py) forces SequentialMLP so
+        # mtp.prune can act on individual expert linears.
+        model_config.hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
+            remap_te_layernorm=te_mcore_model,
+            use_default_te_spec=args.export_default_te_spec,
+            moe_grouped_gemm=not disable_moe_grouped_gemm,
+        )
+    else:
         if args.export_offline_model:
+            transformer_config = model_config.transformer
             # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
             transformer_config.original_num_layers = transformer_config.num_layers
             # Set num_layers to 0 for base model in offline mode
@@ -250,38 +291,14 @@ def modelopt_model_config_from_args(
             # SP is not used for offline
             # TODO: DSR1 MTP may require SP
             transformer_config.sequence_parallel = False
-
-        model_config = gpt_config_from_args(
-            args, config=transformer_config, vocab_size_from_tokenizer=vocab_size_from_tokenizer
-        )
         model_config.mtp_layer_spec = modelopt_mtp_layer_spec
         model_config.transformer_layer_spec = functools.partial(
             modelopt_gpt_layer_spec,
             default_te_spec=args.export_default_te_spec,
             force_local_attention=args.export_force_local_attention,
-            remap_te_layernorm=args.export_te_mcore_model,
+            remap_te_layernorm=te_mcore_model,
             real_quant_cfg=args.export_real_quant_cfg,
             disable_moe_grouped_gemm=disable_moe_grouped_gemm,
-        )
-    else:
-        if args.export_default_te_spec and args.export_te_mcore_model:
-            logger.warning(
-                "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
-                "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
-            )
-            args.export_te_mcore_model = False
-
-        model_config = hybrid_config_from_args(
-            args, config=transformer_config, vocab_size_from_tokenizer=vocab_size_from_tokenizer
-        )
-        # Default to grouped MLP for the export spec (matches the pre-modernization
-        # behavior of get_hybrid_stack_modelopt_spec — its factory default is True).
-        # ``disable_moe_grouped_gemm`` (set by prune.py) forces SequentialMLP so
-        # mtp.prune can act on individual expert linears.
-        model_config.hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
-            remap_te_layernorm=args.export_te_mcore_model,
-            use_default_te_spec=args.export_default_te_spec,
-            moe_grouped_gemm=not disable_moe_grouped_gemm,
         )
 
     qad_train_target = getattr(args, 'qad_train_target', None)
@@ -295,7 +312,7 @@ def modelopt_model_config_from_args(
     model_config.transformations = ModelTransformConfig(
         qad_train_target=qad_train_target,
         lsq_scale_lr=getattr(args, "lsq_scale_lr", None),
-        te_mcore_model=args.export_te_mcore_model,
+        te_mcore_model=te_mcore_model,
     )
     return model_config
 

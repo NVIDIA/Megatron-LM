@@ -4,6 +4,7 @@
 
 import functools
 import sys
+import warnings
 from argparse import Namespace
 from unittest.mock import Mock, patch
 
@@ -16,6 +17,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.post_training import model_config as mc
 from megatron.post_training import model_hooks
 from megatron.post_training.arguments import add_modelopt_args
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.models.base import ModelConfig
 from megatron.training.models.distillation import DistillationConfig
@@ -307,48 +309,60 @@ class TestModelOptModelConfigFromArgs:
         assert build.call_args.kwargs["wrap_with_ddp"] is False
 
 
-class TestResolveModelType:
-    @pytest.mark.parametrize(
-        "pattern,model_type,expected",
-        [
-            (None, None, "gpt"),
-            ("M*-", None, "hybrid"),
-            (None, "hybrid", "hybrid"),  # entry point wins, e.g. pure Mamba without a pattern
-            ("M*-", "gpt", "gpt"),
-        ],
-    )
-    def test_entry_point_else_layer_pattern(self, pattern, model_type, expected):
+class TestModelType:
+    @pytest.mark.parametrize("pattern,expected", [(None, GPTModelConfig), ("M*-", HybridModelConfig)])
+    def test_layer_pattern_selects_config(self, pattern, expected):
         args = _make_args(hybrid_layer_pattern=pattern)
-        assert mc._resolve_model_type(args, model_type) == expected
+        with patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None):
+            assert isinstance(mc.modelopt_model_config_from_args(args), expected)
 
     @pytest.mark.parametrize(
         "flag,pattern,expected",
         [
-            ("GPTModel", None, "gpt"),
-            ("HybridModel", "M*-", "hybrid"),
-            ("MambaModel", None, "hybrid"),  # hybrid without a layer pattern
+            ("GPTModel", None, GPTModelConfig),
+            ("HybridModel", "M*-", HybridModelConfig),
+            ("MambaModel", None, HybridModelConfig),  # hybrid without a layer pattern
         ],
     )
     def test_deprecated_flag_is_honored(self, flag, pattern, expected):
         args = _make_args(export_model_type=flag, hybrid_layer_pattern=pattern)
-        with pytest.warns(DeprecationWarning, match="--export-model-type is deprecated"):
-            assert mc._resolve_model_type(args, None) == expected
+        with (
+            patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None),
+            pytest.warns(DeprecationWarning, match="--export-model-type is deprecated"),
+        ):
+            assert isinstance(mc.modelopt_model_config_from_args(args), expected)
 
-    def test_deprecated_flag_conflicting_with_pattern_raises(self):
-        args = _make_args(export_model_type="GPTModel", hybrid_layer_pattern="M*-")
-        with pytest.warns(DeprecationWarning), pytest.raises(ValueError, match="layer-pattern"):
-            mc._resolve_model_type(args, None)
-
-    def test_deprecated_flag_conflicting_with_entry_point_raises(self):
+    def test_deprecated_flag_conflicting_with_config_raises(self):
         args = _make_args(export_model_type="GPTModel")
-        with pytest.warns(DeprecationWarning), pytest.raises(ValueError, match="entry point"):
-            mc._resolve_model_type(args, "hybrid")
+        config = hybrid_config_from_args(args)
+        with pytest.warns(DeprecationWarning), pytest.raises(ValueError, match="conflicts"):
+            mc.apply_modelopt_model_config(config, args)
 
-    def test_entry_point_type_selects_config(self):
-        args = _make_args()
+    @pytest.mark.parametrize("flag", [None, "GPTModel"])
+    def test_gpt_config_with_layer_pattern_raises(self, flag):
+        args = _make_args(hybrid_layer_pattern="M*-", export_model_type=flag)
+        config = gpt_config_from_args(args)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            with pytest.raises(ValueError, match="pretrain_hybrid.py"):
+                mc.apply_modelopt_model_config(config, args)
+
+    def test_entry_point_config_is_updated_in_place(self):
+        args = _make_args(export_te_mcore_model=True)
+        config = hybrid_config_from_args(args)
         with patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None):
-            config = mc.modelopt_model_config_from_args(args, model_type="hybrid")
-        assert isinstance(config, HybridModelConfig)
+            assert mc.apply_modelopt_model_config(config, args) is config
+        assert config.transformations.te_mcore_model is True
+
+    def test_hybrid_default_te_spec_disables_remap_without_touching_args(self):
+        args = _make_args(
+            hybrid_layer_pattern="M*-", export_te_mcore_model=True, export_default_te_spec=True
+        )
+        with patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None) as get_spec:
+            config = mc.modelopt_model_config_from_args(args)
+        assert get_spec.call_args.kwargs["remap_te_layernorm"] is False
+        assert config.transformations.te_mcore_model is False
+        assert args.export_te_mcore_model is True
 
 
 class TestLoadTeacherModelConfig:
