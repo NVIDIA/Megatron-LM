@@ -269,6 +269,9 @@ def test_packed_cp_matches_full_attention_and_gradients(
             context_parallel_size=cp_size,
             attention_cp_layout="contiguous",
             linear_cp_layout="contiguous",
+            # This fixture constructs the scheduler's THD inputs directly below.
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=physical_cu[-1] // cp_size,
             qk_layernorm=True,
             apply_rope_fusion=rope_fusion,
             gradient_accumulation_fusion=True,
@@ -276,7 +279,7 @@ def test_packed_cp_matches_full_attention_and_gradients(
             recompute_modules=["mla_up_proj"] if recompute else [],
         )
         # Isolate CP: keep the packed layout, backend and recompute settings identical.
-        ref_cfg = replace(cfg, context_parallel_size=1)
+        ref_cfg = replace(cfg, context_parallel_size=1, max_seqlen_per_dp_cp_rank=physical_cu[-1])
         model = _build_attention(cfg, 1, pg).cuda()
         reference = _build_attention(ref_cfg, 1, ref_pg).cuda()
         reference.load_state_dict(model.state_dict())
@@ -290,6 +293,7 @@ def test_packed_cp_matches_full_attention_and_gradients(
             cu_seqlens_kv_padded=physical,
             max_seqlen_q=1024,
             max_seqlen_kv=1024,
+            cp_partition_mode="contiguous",
         )
         whole = torch.randn(2048, 1, 256, dtype=torch.bfloat16, device="cuda")
         grad = torch.randn_like(whole)
@@ -327,6 +331,9 @@ def test_packed_cp_matches_full_attention_and_gradients(
             # Sum each document's auxiliary loss using the packed global real-token count.
             sbhd_cfg = replace(
                 ref_cfg,
+                sequence_packing_scheduler=None,
+                max_seqlen_per_dp_cp_rank=None,
+                variable_seq_lengths=False,
                 calculate_per_token_loss=True,
                 dsa_indexer_loss_coeff=coeff / sbhd_real_cu[-1],
             )
