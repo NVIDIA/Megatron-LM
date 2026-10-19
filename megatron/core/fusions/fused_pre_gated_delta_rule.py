@@ -1014,7 +1014,7 @@ def _triton_g_beta_backward(
             "num_stages": config.num_stages,
         }
         sequence_blocks = triton.cdiv(seq_len, config.kwargs["BLOCK_S"])
-        grad_shape = (2, batch, sequence_blocks, num_value_heads)
+        grad_shape: tuple[int, ...] = (2, batch, sequence_blocks, num_value_heads)
         # Launch the selected config directly, including when mode changes after import.
         kernel = kernel.fn
     else:
