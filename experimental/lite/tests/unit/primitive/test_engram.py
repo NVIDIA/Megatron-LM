@@ -40,9 +40,9 @@ def _worker(rank, root):
     assert torch.cuda.memory_allocated() == before and not list(table.parameters())
     table.cuda()  # device moves leave the host FP8 bytes in place
     assert table.embedding.weight is weight and weight.dtype == torch.float8_e4m3fn
-    parts = [None, None]
-    dist.all_gather_object(parts, (weight.clone(), scale.clone()))
-    full, scales = (torch.cat(t).cuda() for t in zip(*parts))
+    parts = [None, None]  # as bytes: Core's object unpickler has no FP8 storage type
+    dist.all_gather_object(parts, [t.view(torch.uint8).clone() for t in (weight, scale)])
+    full, scales = (torch.cat(p).cuda().view(t.dtype) for p, t in zip(zip(*parts), (weight, scale)))
     ids = torch.tensor([[0, 4999], [2500, 3], [1, 2499]], device="cuda")[rank:]  # 3 and 2 rows
     # The official decode: FP32 product per 32-wide block, then BF16.
     expected = full[ids].float().unflatten(-1, (-1, 32)) * scales[ids].float().unsqueeze(-1)
