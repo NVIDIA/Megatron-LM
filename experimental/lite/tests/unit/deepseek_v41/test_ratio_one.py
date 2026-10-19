@@ -25,6 +25,11 @@ def official_selection():
     This is the source-pinned selection stage of Indexer.forward, from its
     first score einsum through its return. It is not a full official model.
     """
+    if os.environ.get("DS41_RUN_OFFICIAL_REFERENCE") != "1":
+        pytest.skip(
+            "External official-source oracle is opt-in: set DS41_RUN_OFFICIAL_REFERENCE=1 "
+            "and DS41_REFERENCE_DIR; see examples/deepseek_v41/README.md"
+        )
     source = Path(os.environ.get("DS41_REFERENCE_DIR", "/tmp/ds41-fixture-reference")) / "model.py"
     raw = source.read_bytes()  # Missing external source is a failure, never a skip.
     assert (
@@ -234,3 +239,11 @@ def test_indexer_frozen_manifest_does_not_freeze_nonowning_main_kv():
     assert main.weight.requires_grad
     with pytest.raises(ValueError, match="auxiliary loss"):
         freeze_indexer_sources(indexer, loss_coefficient=0.1)
+
+
+def test_candidate_pool_with_zero_query_rows_matches_official(official_selection):
+    reference, _ = official_selection
+    scores, visible = torch.empty(0, 6), torch.empty(0, 1, dtype=torch.int64)
+    actual = candidate_pool(scores, visible, blocks=2, block_size=2)
+    assert actual.shape == (0, 6)
+    assert torch.equal(actual, reference(scores, visible, 2, 2))

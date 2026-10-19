@@ -32,7 +32,9 @@ def candidate_pool(scores, visible, *, blocks, block_size):
     if width == 0:
         return torch.zeros_like(scores, dtype=torch.bool)
     padded = F.pad(scores, (0, (-width) % block_size), value=-torch.inf)
-    block_scores = padded.reshape(*scores.shape[:-1], -1, block_size).amax(-1)
+    block_scores = padded.reshape(
+        *scores.shape[:-1], (width + block_size - 1) // block_size, block_size
+    ).amax(-1)
     newest = (visible - 1).div(block_size, rounding_mode="floor")
     block_ids = torch.arange(block_scores.shape[-1], device=scores.device)
     block_scores = torch.where(block_ids == newest, torch.inf, block_scores)
