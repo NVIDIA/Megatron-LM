@@ -182,7 +182,9 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
-        **filter_kwargs_for_callable(fn, {"deterministic": _deterministic_dsa_requested(config)}),
+        **filter_kwargs_for_callable(
+            fn, {"deterministic": _deterministic_dsa_requested(config), "config": config}
+        ),
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,

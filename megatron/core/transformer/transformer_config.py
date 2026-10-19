@@ -497,6 +497,17 @@ class TransformerConfig(ModelParallelConfig):
     indexer whose projections are quantized with ``fp8_recipe`` 'delayed' or 'custom' or
     ``fp4_recipe`` 'custom'. Has no effect without full or ``core_attn`` recompute."""
 
+    dsa_indexer_skip_masked_score_fill: bool = True
+    """Whether the cuDNN packed-THD DSA indexer scorer may skip its ``-inf`` score prefill.
+
+    cuDNN frontend fills the whole dense indexer score buffer (up to tens of GiB per call
+    at 1M context) with ``-inf`` before every scorer launch, although the kernel writes
+    every column that a top-k reads. When the installed frontend names a ``clean_logits``
+    parameter on ``indexer_forward_wrapper`` and ships the top-k out-of-bounds-lane guard
+    (cuDNN frontend >= 1.29), the general packed THD scorer passes ``clean_logits=False``
+    and clamps every reader to the kernel's per-row column limit. Other scorer paths, and
+    frontends without the switch, keep the prefill. Disable for A/B comparisons."""
+
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
     """Precision used only by the fused compact DSA indexer forward and Top-K."""
 

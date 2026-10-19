@@ -10,6 +10,7 @@ import inspect
 import logging
 import math
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -196,6 +197,31 @@ _DETERMINISTIC_SPARSE_BWD_WORKSPACES: dict[tuple[torch.device, int], Tensor] = {
 # First cuDNN frontend release whose dense DSA kernels default to a zero (top-left)
 # q_causal_offset instead of the legacy bottom-right alignment (NVIDIA/cudnn-frontend#316).
 _TOP_LEFT_DEFAULT_Q_OFFSET_FE_VERSION = (1, 26)
+# First cuDNN frontend release whose varlen radix top-k never reads past a row's length.
+_TOPK_OOB_LANE_GUARD_FE_VERSION = (1, 29)
+_NAMED_PARAMETER_CACHE: dict[int, tuple[object, frozenset]] = {}
+_CLEAN_LOGITS_UNAVAILABLE_LOGGED = False
+
+
+@dataclass(frozen=True)
+class IndexerScorerOptions:
+    """Opt-in behaviour of the dense cuDNN indexer scorer, resolved from the config.
+
+    Attributes:
+        skip_masked_score_fill: Let the general packed THD scorer pass
+            ``clean_logits=False`` so cuDNN skips the ``-inf`` prefill of the dense score
+            buffer, when the installed frontend supports it. Columns at or past each row's
+            causal limit are then unspecified; every reader is clamped to that limit.
+    """
+
+    skip_masked_score_fill: bool = False
+
+
+def _scorer_options_from_config(config: Optional["TransformerConfig"]) -> IndexerScorerOptions:
+    """Read the indexer scorer options from ``config`` (defaults when absent)."""
+    return IndexerScorerOptions(
+        skip_masked_score_fill=bool(getattr(config, "dsa_indexer_skip_masked_score_fill", False))
+    )
 
 
 def _indexer_forward_wrapper_with_warning(
@@ -427,6 +453,7 @@ def run_fused_dsa_attention(
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         tp_group=getattr(pg_collection, "tp", None),
+        scorer_options=_scorer_options_from_config(config),
         **packed_thd_kwargs,
     )
 
@@ -1132,6 +1159,7 @@ def _indexer_topk_packed_thd(
     local_packed_cp_query_start: int,
     local_packed_cp_query_len: Optional[int],
     deterministic: bool = False,
+    scorer_options: Optional[IndexerScorerOptions] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """Run cuDNN's general THD indexer for packed sequences at any CP size.
 
@@ -1139,7 +1167,14 @@ def _indexer_topk_packed_thd(
     cuDNN in one call. CP>1 retains the front/back segmented representation required by
     zigzag context parallelism. Top-k selection and sequence-local to global index
     restoration are shared by both representations.
+
+    With ``scorer_options.skip_masked_score_fill`` and a frontend that supports it, the
+    scorer is asked not to prefill the dense score buffer with ``-inf``. Every reader
+    below is then clamped to the kernel's per-row column limit derived from the same
+    segment layout that the kernel consumes.
     """
+    if scorer_options is None:
+        scorer_options = IndexerScorerOptions()
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bshd.size(1)
     if not _packed_thd_kernel_applicable(
@@ -1190,6 +1225,9 @@ def _indexer_topk_packed_thd(
         max_k_half = packed_max_seqlen_k // segment_divisor
         max_score_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
 
+    skip_fill = scorer_options.skip_masked_score_fill and _supports_indexer_clean_logits()
+    if scorer_options.skip_masked_score_fill and not skip_fill:
+        _log_clean_logits_unavailable_once()
     scores = _indexer_forward_wrapper_with_warning(
         score_q,
         score_k,
@@ -1205,19 +1243,41 @@ def _indexer_topk_packed_thd(
             if score_q_causal_offsets is not None
             else {}
         ),
+        **({"clean_logits": False} if skip_fill else {}),
     )["scores"]
+
+    # Without the prefill only [0, column_limit) of each row is defined. Rows outside
+    # every segment are never written, so their limit is zero.
+    column_limits = (
+        _packed_thd_score_column_limits(
+            score_cu_q, score_cu_k, score_q_causal_offsets, num_rows=sq, ratio=_INDEXER_RATIO
+        )
+        if skip_fill
+        else None
+    )
 
     score_topk = min(topk_k, max_score_k)
     if score_topk == max_score_k:
         # Ranking is unnecessary when K covers every score column. This also
         # avoids cuDNN FE's vectorized-output restriction for large odd K.
-        topk_indices = torch.arange(score_topk, dtype=torch.int32, device=device).view(
-            1, 1, score_topk
-        ) + starts.view(1, sq, 1).to(dtype=torch.int32)
+        columns = torch.arange(score_topk, dtype=torch.int32, device=device).view(1, 1, score_topk)
+        topk_indices = columns + starts.view(1, sq, 1).to(dtype=torch.int32)
+        if column_limits is not None:
+            # The caller masks by bounds and finiteness; drop undefined columns first.
+            topk_indices = torch.where(
+                columns < column_limits.view(1, sq, 1),
+                topk_indices,
+                torch.full_like(topk_indices, -1),
+            )
         topk_scores = scores.view(1, sq, score_topk) if return_topk_scores else None
         return _pad_topk_result(topk_indices, topk_scores, topk_k)
 
-    local_seq_lens = (ends - starts).clamp(max=max_score_k).to(torch.int32).contiguous()
+    local_seq_lens = ends - starts
+    if column_limits is not None:
+        local_seq_lens = torch.minimum(
+            local_seq_lens, column_limits.to(local_seq_lens.dtype)
+        ).clamp(min=0)
+    local_seq_lens = local_seq_lens.clamp(max=max_score_k).to(torch.int32).contiguous()
     use_tie_break = _use_dense_indexer_topk_tie_break(scores, score_topk)
     scores_for_topk = _add_indexer_topk_tie_break(scores, inplace=True) if use_tie_break else scores
     tk_result = _indexer_top_k_wrapper_chunked(
@@ -1242,6 +1302,53 @@ def _indexer_topk_packed_thd(
         valid, topk_indices + starts.view(1, sq, 1).to(dtype=topk_indices.dtype), topk_indices
     )
     return _pad_topk_result(topk_indices, topk_scores, topk_k)
+
+
+def _log_clean_logits_unavailable_once() -> None:
+    global _CLEAN_LOGITS_UNAVAILABLE_LOGGED
+    if _CLEAN_LOGITS_UNAVAILABLE_LOGGED:
+        return
+    _CLEAN_LOGITS_UNAVAILABLE_LOGGED = True
+    logging.getLogger(__name__).info(
+        "dsa_indexer_skip_masked_score_fill is set, but the installed cuDNN frontend "
+        "(%s) lacks indexer_forward_wrapper(clean_logits=...) or the top-k out-of-bounds "
+        "lane guard of frontend >= 1.29; keeping the -inf prefill of the indexer scores.",
+        _cudnn_frontend_version(),
+    )
+
+
+def _packed_thd_score_column_limits(
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    q_causal_offsets: Optional[Tensor],
+    *,
+    num_rows: int,
+    ratio: int,
+) -> Tensor:
+    """Per-row column count the THD indexer kernel writes, without host synchronization.
+
+    Row ``r`` of segment ``s`` (``cu_q[s] <= r < cu_q[s + 1]``) is written on columns
+    ``[0, min((offset_s + r - cu_q[s] + 1) // ratio, len_k[s]))``. ``offset_s`` is the
+    explicit q causal offset, or zero, which is the default of every frontend that can
+    skip the prefill. Rows at or after ``cu_q[-1]`` belong to no segment and get zero.
+    """
+    device = cu_seqlens_q.device
+    cu_q = cu_seqlens_q.to(dtype=torch.int64)
+    cu_k = cu_seqlens_k.to(dtype=torch.int64)
+    num_segments = cu_q.numel() - 1
+    rows = torch.arange(num_rows, dtype=torch.int64, device=device)
+    segment = torch.searchsorted(cu_q[1:].contiguous(), rows, right=True).clamp(
+        max=num_segments - 1
+    )
+    local_row = rows - cu_q.index_select(0, segment)
+    if q_causal_offsets is None:
+        offsets = torch.zeros_like(local_row)
+    else:
+        offsets = q_causal_offsets.to(dtype=torch.int64).index_select(0, segment)
+    key_lengths = (cu_k[1:] - cu_k[:-1]).index_select(0, segment)
+    limits = torch.div(offsets + local_row + 1, ratio, rounding_mode="floor")
+    limits = torch.minimum(limits.clamp(min=0), key_lengths)
+    return torch.where(rows < cu_q[-1], limits, torch.zeros_like(limits))
 
 
 def _indexer_topk_single_packed_cp_segments(
@@ -1441,6 +1548,45 @@ def _supports_indexer_q_causal_offsets() -> bool:
     return bool(
         filter_kwargs_for_callable(_cudnn_dsa.indexer_forward_wrapper, {"q_causal_offsets": None})
     )
+
+
+def _accepts_named_parameter(fn, name: str) -> bool:
+    """Whether ``fn`` declares ``name`` explicitly (``**kwargs`` does not count).
+
+    A wrapper that only forwards ``**kwargs`` might drop or reject a capability flag, so
+    capability probes for optional behaviour require the parameter to be named.
+    """
+    cached = _NAMED_PARAMETER_CACHE.get(id(fn))
+    if cached is None or cached[0] is not fn:
+        try:
+            parameters = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            names = frozenset()
+        else:
+            names = frozenset(
+                parameter.name
+                for parameter in parameters.values()
+                if parameter.kind
+                not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+            )
+        cached = (fn, names)
+        _NAMED_PARAMETER_CACHE[id(fn)] = cached
+    return name in cached[1]
+
+
+def _supports_indexer_clean_logits() -> bool:
+    """Whether the dense indexer scorer may leave columns past each row's causal limit unset.
+
+    Requires an ``indexer_forward_wrapper`` that names a ``clean_logits`` parameter and
+    the radix top-k out-of-bounds-lane guard of cuDNN frontend >= 1.29
+    (NVIDIA/cudnn-frontend#410). Older top-k kernels can re-read register-only lanes past
+    a degenerate row from memory, which the ``-inf`` prefill hides today.
+    """
+    if _cudnn_dsa is None:
+        return False
+    return _accepts_named_parameter(
+        _cudnn_dsa.indexer_forward_wrapper, "clean_logits"
+    ) and _cudnn_frontend_at_least(_TOPK_OOB_LANE_GUARD_FE_VERSION)
 
 
 @functools.lru_cache(maxsize=1)
@@ -1802,6 +1948,7 @@ def _indexer_topk_bshd(
     packed_cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
     deterministic: bool = False,
+    scorer_options: Optional[IndexerScorerOptions] = None,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """BSHD-layout indexer scoring and top-K selection.
 
@@ -1822,6 +1969,9 @@ def _indexer_topk_bshd(
     ``use_local_indexer_varlen`` identifies a packed causal identity-key layout. The
     selected packed executor scores compact local query rows directly, then restores
     sequence-local top-k indices to the global packed key coordinate space.
+
+    ``scorer_options`` carries the config-level scorer opt-ins; only the general packed
+    THD executor consumes them.
     """
     _ensure_dsa_namespace()
 
@@ -1944,6 +2094,7 @@ def _indexer_topk_bshd(
                 local_packed_cp_query_start,
                 local_packed_cp_query_len,
                 deterministic=deterministic,
+                scorer_options=scorer_options,
             )
         elif not return_scores:
             topk_indices, topk_scores = _indexer_topk_from_score_chunks(
@@ -2095,6 +2246,7 @@ def run_fused_qk_topk(
     packed_thd_causal_identity_layout: Optional[bool] = None,
     packed_thd_single_sequence: Optional[bool] = None,
     deterministic: bool = False,
+    config: Optional["TransformerConfig"] = None,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Run the cuDNN fused indexer and return top-k indices for split DSA."""
     use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
@@ -2143,6 +2295,7 @@ def run_fused_qk_topk(
         packed_cp_size=cp_size,
         varlen_is_plain_causal=varlen_is_plain_causal,
         deterministic=deterministic,
+        scorer_options=_scorer_options_from_config(config),
     )
     return topk_indices, topk_length
 
@@ -2251,6 +2404,7 @@ def run_fused_qk_topk_with_loss(
             or getattr(config, "deterministic_mode", False)
             or torch.are_deterministic_algorithms_enabled()
         ),
+        _scorer_options_from_config(config),
     )
 
 
@@ -2349,6 +2503,7 @@ def run_fused_qk_topk_with_scores(
         packed_cp_size=cp_size,
         varlen_is_plain_causal=varlen_is_plain_causal,
         deterministic=deterministic,
+        scorer_options=_scorer_options_from_config(config),
     )
     if topk_scores is None:
         return None
@@ -3391,6 +3546,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         packed_max_seqlen_k: Optional[int],
         packed_cp_size: int,
         tp_group,
+        scorer_options: Optional[IndexerScorerOptions] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -3428,6 +3584,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             packed_max_seqlen_q=packed_max_seqlen_q,
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
+            scorer_options=scorer_options,
         )
 
         prepared_topk_length = (
@@ -3606,13 +3763,15 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         #   use_local_indexer_varlen, single_packed_thd_sequence,
         #   local_packed_cp_rank, local_packed_cp_query_start,
         #   local_packed_cp_query_len, packed_cu_seqlens_q, packed_cu_seqlens_k,
-        #   packed_max_seqlen_q, packed_max_seqlen_k, packed_cp_size, tp_group.
+        #   packed_max_seqlen_q, packed_max_seqlen_k, packed_cp_size, tp_group,
+        #   scorer_options.
         return (
             grad_query,
             grad_kv_full,
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -3669,6 +3828,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         tp_group,
         varlen_is_plain_causal: bool = False,
         deterministic: bool = False,
+        scorer_options: Optional[IndexerScorerOptions] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute shared attention top-k metadata and sparse indexer loss."""
         _ensure_dsa_namespace()
@@ -3701,6 +3861,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             packed_cp_size=packed_cp_size,
             varlen_is_plain_causal=varlen_is_plain_causal,
             deterministic=deterministic,
+            scorer_options=scorer_options,
         )
 
         if indexer_score_payload is None:
@@ -3763,7 +3924,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         #   local_packed_cp_query_start, local_packed_cp_query_len,
         #   packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q,
         #   packed_max_seqlen_k, packed_cp_size, tp_group,
-        #   varlen_is_plain_causal, deterministic.
+        #   varlen_is_plain_causal, deterministic, scorer_options.
         gradients = (
             grad_q_indexer,
             grad_k_indexer,
@@ -3791,6 +3952,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             None,
             None,  # varlen_is_plain_causal
             None,  # deterministic
+            None,  # scorer_options
         )
         return gradients[: ctx.num_inputs]
 
@@ -4019,6 +4181,7 @@ def fused_indexer_sparse_attn(
     packed_max_seqlen_k: Optional[int] = None,
     packed_cp_size: int = 1,
     tp_group=None,
+    scorer_options: Optional[IndexerScorerOptions] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Fused DSv3.2 indexer, sparse attention, and optional indexer loss.
 
@@ -4068,6 +4231,7 @@ def fused_indexer_sparse_attn(
         packed_max_seqlen_k,
         packed_cp_size,
         tp_group,
+        scorer_options,
     )
 
 
