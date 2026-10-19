@@ -156,6 +156,8 @@ def _stage_keys(index, model, cfg, ps):
     top |= {"head.weight", "norm.weight"} if model.layout.has_head else set()
     keys = set()
     for key in index:
+        if re.fullmatch(r"layers\.\d+\.ffn\.gate\.bias_vl", key):
+            continue  # Release vision-only router bias; text routing uses ffn.gate.bias.
         layer = re.match(r"layers\.(\d+)\.(?:ffn\.experts\.(\d+)\.)?", key)
         if layer is None:
             keys |= {key} & top

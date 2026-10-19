@@ -64,3 +64,20 @@ def test_release_sources_and_candidate_publisher():
     for candidate in (21, 14):  # a reader of index owner 20; a ratio-two index owner
         with pytest.raises(ValueError, match="candidate publisher"):
             layer_sources(replace(release, candidate_source_layer_id=candidate))
+
+
+def test_small_fixture_preserves_release_source_graph_and_exercises_yarn():
+    from _ds41_fixture import tiny_config
+
+    config = tiny_config()
+    sources = layer_sources(config)
+    assert [(s.kv, s.index) for s in sources[2:8]] == [(i, i) for i in (2, 2, 4, 4, 6, 6)]
+    assert [(s.kv, s.index, s.candidate) for s in sources[8:]] == [
+        (8, 8, True),
+        (8, 8, True),
+        (8, 10, True),
+        (8, 10, True),
+    ]
+    assert config.engram_layer_ids == (1, 6)
+    assert config.compress_rope_theta != config.rope_theta and config.rotary_scaling_factor == 16
+    assert config.original_max_position_embeddings < 75  # actual training/attention documents

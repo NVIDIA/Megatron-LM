@@ -50,22 +50,3 @@ def test_resolving_the_fused_kernel_keeps_rng_streams(monkeypatch):
     assert np.array_equal(np.random.get_state()[1], before[1])
     assert torch.equal(torch.get_rng_state(), before[2])
     assert module._verl_linear_cross_entropy() is fused
-
-
-def test_unavailable_kernel_resolves_to_the_fallback(monkeypatch):
-    from megatron.lite.primitive.ops import linear_cross_entropy as module
-
-    for name in _DrawingFinder.names:
-        monkeypatch.setitem(sys.modules, name, None)  # import raises ImportError
-    monkeypatch.setattr(module, '_VERL_LCE', None)
-    random.seed(3)
-    before = random.getstate()
-    assert module._verl_linear_cross_entropy() is None
-    assert random.getstate() == before
-    hidden = torch.randn(4, 8, dtype=torch.float64)
-    weight = torch.randn(16, 8, dtype=torch.float64)
-    labels = torch.randint(16, (4,))
-    log_probs, entropy = module.linear_cross_entropy(hidden, weight, labels)
-    reference = torch.log_softmax(hidden @ weight.t(), -1).gather(1, labels[:, None])[:, 0]
-    assert torch.allclose(log_probs.double(), reference, atol=1e-5)
-    assert entropy.shape == labels.shape

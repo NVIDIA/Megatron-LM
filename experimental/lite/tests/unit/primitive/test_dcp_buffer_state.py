@@ -87,9 +87,7 @@ def _worker(rank, directory, kind):
             "bad_rows": (dict(rows=4), "rows do not match row shard metadata"),
             "bad_cuts": (dict(boundaries=(1, 3, 5)), "Invalid checkpoint row shard boundaries"),
         }
-        model = (
-            _Plain() if kind in ("plain", "legacy") else _Model(rank, **bad.get(kind, ({}, ""))[0])
-        )
+        model = _Plain() if kind == "plain" else _Model(rank, **bad.get(kind, ({}, ""))[0])
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         _fill(model, rank, 1.0)
         saved = {k: v.clone() for k, v in model.state_dict().items()}
@@ -103,17 +101,8 @@ def _worker(rank, directory, kind):
             .read_metadata()
             .state_dict_metadata
         )
-        if kind == "legacy":
-            model = _Model(rank)
-            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         _fill(model, rank, 7.0)
-        before = {k: v.clone() for k, v in model.state_dict().items()}
-        assert (
-            checkpoint.load_training_checkpoint(
-                model, optimizer, path, load_optimizer=kind != "legacy", **options
-            )
-            == 1
-        )
+        assert checkpoint.load_training_checkpoint(model, optimizer, path, **options) == 1
         restored = model.state_dict()
         if kind == "plain":
             assert keys == {"model.linear.bias", "model.linear.weight", "step"}
@@ -127,17 +116,12 @@ def _worker(rank, directory, kind):
             } <= keys
             assert all(_bytes_equal(restored[k], saved[k]) for k in saved)
             assert float(model.scratch[0]) == 7.0
-        else:
-            assert all(
-                _bytes_equal(restored[k], saved[k]) for k in ("linear.weight", "linear.bias")
-            )
-            assert all(_bytes_equal(restored[k], before[k]) for k in ("bias_state", "table.scale"))
     finally:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("kind", ["plain", "full", "legacy", "bad_rows", "bad_cuts"])
-def test_dcp_persistent_buffers_row_shards_and_legacy(tmp_path, kind):
+@pytest.mark.parametrize("kind", ["plain", "full", "bad_rows", "bad_cuts"])
+def test_dcp_persistent_buffers_and_row_shards(tmp_path, kind):
     mp.start_processes(
         _worker, args=(str(tmp_path), kind), nprocs=WORLD, join=True, start_method="spawn"
     )

@@ -24,12 +24,16 @@ TOKENS, ATOL, RTOL = 80, 0.05, 0.005
 from _ds41_fixture import tiny_config
 
 
-def _build(ep, device):
+def _build(ep, device, root):
     config = tiny_config()
     adam = dict(lr=1e-5, min_lr=1e-5, adam_beta1=0.9, adam_beta2=0.999, adam_eps=1e-8)
     kwargs = dict(device=device, parallel=ParallelConfig(ep=ep), attention_backend_override="cudnn")
     kwargs.update(token_map=list(range(config.vocab_size)), optimizer_config=adam)
     bundle = protocol.build_model(config, impl_cfg=protocol.ImplConfig(optimizer="adam", **kwargs))
+    from test_training import _initialize
+
+    _initialize(bundle.chunks[0].module, bundle.parallel_state, root)
+    bundle.optimizer.reload_model_params()
     schedulers = [torch.optim.lr_scheduler.StepLR(o, 1, 0.8) for o in bundle.optimizer.optimizers]
     return bundle, schedulers, kwargs["parallel"]
 
@@ -92,7 +96,7 @@ def _worker(rank, root, ep, phase):
     dist.init_process_group("nccl", f"file://{root}/store-{phase}", timeout, ep, rank)
     try:
         random.seed(915), np.random.seed(915), torch.manual_seed(915)
-        bundle, schedulers, parallel = _build(ep, f"cuda:{rank}")
+        bundle, schedulers, parallel = _build(ep, f"cuda:{rank}", root)
         chunk, path, control = bundle.chunks[0], str(root / "ckpt"), root / f"ctl-{rank}.pt"
         options = dict(config=parallel, ps=bundle.parallel_state)
         load = lambda: checkpoint.load_training_checkpoint(chunk, bundle.optimizer, path, **options)

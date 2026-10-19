@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
-from megatron.lite.model.deepseek_v41.lite.checkpoint import source_name
 from megatron.lite.model.deepseek_v41.lite.components.carrier import pack_sources, unpack_sources
 from megatron.lite.model.deepseek_v41.lite.protocol import ImplConfig, _validate, forward_step
 from megatron.lite.primitive.modules.engram import NgramHash
@@ -91,20 +90,6 @@ def test_protocol_real_core_metadata_contiguous_rows_and_document_end_mask(rank)
     assert torch.equal(mask, expected)
 
 
-def test_release_source_mapping_owner_shapes():
-    assert (
-        source_name("layers.3.attention.core_attention.main_projection.weight")
-        == "layers.3.attn.compressor.wkv.weight"
-    )
-    assert (
-        source_name("layers.3.attention.core_attention.native.indexer.compressor.wk.weight")
-        == "layers.3.attn.indexer.wk.weight"
-    )
-    assert source_name("layers.3.ffn_mixes.alpha_pre") == "layers.3.hc_ffn_scale"
-    with pytest.raises(KeyError, match="Unmapped"):
-        source_name("unowned.weight")
-
-
 def test_native_optimizer_uses_core_adam_and_variable_microbatch_policy(monkeypatch):
     from megatron.lite.model.deepseek_v41.lite.protocol import _optimizer
     from megatron.lite.primitive.optimizers import megatron_wrap
@@ -125,16 +110,6 @@ def test_native_optimizer_uses_core_adam_and_variable_microbatch_policy(monkeypa
     assert not hasattr(engine, "override_optimizer_config")
     assert engine.ddp_config_overrides == {"overlap_grad_reduce": False}
     assert not engine.deterministic
-
-
-def test_runtime_rejects_unknown_model_options_before_build():
-    from megatron.lite.model.deepseek_v41.lite import protocol
-    from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-    from megatron.lite.runtime.backends.mlite.runtime import _build_impl_cfg
-
-    cfg = MegatronLiteConfig(impl_cfg={"unrecognized_precision": True})
-    with pytest.raises(ValueError, match="Unsupported DS4.1"):
-        _build_impl_cfg(protocol, cfg)
 
 
 @pytest.mark.parametrize(

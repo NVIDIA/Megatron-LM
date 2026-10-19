@@ -29,8 +29,9 @@ handle = create_runtime(RuntimeConfig(backend="mlite", backend_cfg=backend)).bui
 
 ## Tests and limits
 
-Acceptance uses small random pytest models covering every layer type, Engram and
-shared sources. Official/FP64 comparisons and real-weight P40E are reports only.
+Acceptance generates small random release-format safetensors (FP4 experts, FP8
+matrices with E8M0 scales, and native unquantized roles), then uses the strict
+loader. No preconverted BF16 weights are read or written. P40E is report-only.
 GPU attention tests use `CUBLAS_WORKSPACE_CONFIG=:4096:8`,
 `torch.use_deterministic_algorithms(True, warn_only=True)` and
 `impl_cfg.deterministic_mode=True`. Attention CP2/CP1 forward and input/KV/parameter

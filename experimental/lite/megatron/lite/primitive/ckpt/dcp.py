@@ -211,14 +211,7 @@ def load_training_checkpoint(
     if load_model:
         # Buffers and row-sharded parameters load in place through their aliases.
         buffers, covered = _local_state(model, model_prefix)
-        saved = dcp.FileSystemReader(ckpt_path).read_metadata().state_dict_metadata
-        missing = sorted(key for key in buffers if key not in saved)
-        if missing:
-            log_rank0(
-                f"Checkpoint {ckpt_path} has no state for {len(missing)} buffers "
-                f"(saved before buffers were checkpointed), e.g. {missing[0]}"
-            )
-        state_dict.update({k: v for k, v in buffers.items() if k in saved})
+        state_dict.update(buffers)
         for name, param in model.named_parameters():
             if id(param) in covered:
                 continue

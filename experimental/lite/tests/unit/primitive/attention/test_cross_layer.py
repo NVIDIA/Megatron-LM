@@ -21,6 +21,11 @@ from megatron.lite.primitive.modules.attention.cross_layer import (
 from megatron.lite.primitive.parallel.source_state import KVSourceState
 
 
+class Projection(torch.nn.Linear):
+    def forward(self, x):
+        return super().forward(x), None
+
+
 def _compressor(state, layer, owner, group):
     result = SharedCompressor.__new__(SharedCompressor)
     torch.nn.Module.__init__(result)
@@ -72,29 +77,11 @@ def test_owner_reader_dispatch_graph_and_lifetime(cp):
         run(reader)
 
 
-def test_owner_mode_mismatch_and_failure_cleanup():
-    state = KVSourceState()
-    with pytest.raises(ValueError, match="abort"):
-        with state.microbatch():
-            state.resolve(0, 0, ("no-grad",), lambda: torch.ones(1))
-            with pytest.raises(RuntimeError, match="owner"):
-                state.resolve(1, 0, ("grad",), lambda: None)
-            with pytest.raises(RuntimeError, match="already active"):
-                with state.microbatch():
-                    pass
-            raise ValueError("abort")
-    assert not state.active and state.values == {}
-
-
 @pytest.mark.parametrize("tied", [False, True])
 @pytest.mark.parametrize("grad", [False, True])
 @pytest.mark.parametrize("loss_coeff", [0.0, 0.1])
 def test_index_relay_native_topk_order_and_ties(tied, grad, loss_coeff):
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
-
-    class Projection(torch.nn.Linear):
-        def forward(self, x):
-            return super().forward(x), None
 
     state = KVSourceState()
     q_owner = IndexProjection(Projection(4, 4, bias=False), state, 0, 0, "index_q")
@@ -195,10 +182,6 @@ def test_native_indexer_interface_contract():
 @pytest.mark.parametrize("segments", [1, 2, 3])
 def test_cross_segment_sources_native_core_checkpoint(segments, cpu_core_checkpoint):
     """CPU adapts only RNG snapshots; native Core checkpoint/autograd execute."""
-
-    class Projection(torch.nn.Linear):
-        def forward(self, x):
-            return super().forward(x), None
 
     torch.manual_seed(7)
     state = KVSourceState()

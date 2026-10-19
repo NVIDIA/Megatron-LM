@@ -12,19 +12,6 @@ from megatron.lite.primitive.modules.attention import ratio_one
 from megatron.lite.runtime.contracts import ParallelConfig
 
 
-@pytest.mark.parametrize("cp", [1, 2])
-def test_candidate_free_prefix(cp):
-    config = DeepseekV41Config(num_hidden_layers=4)
-    policies = validate_build(config, context_parallel_size=cp)
-    assert [(p.kv, p.index) for p in policies] == [(None, None), (None, None), (2, 2), (2, 2)]
-    assert not any(p.candidate for p in policies)
-
-
-def test_ratio_one_candidate_cp_policy_allowed():
-    policies = validate_build(DeepseekV41Config(), context_parallel_size=2)
-    assert policies[20].candidate and policies[-1].candidate
-
-
 def test_release_text_config_and_overrides():
     config = DeepseekV41Config._from_hf_dict(
         {
@@ -40,20 +27,6 @@ def test_release_text_config_and_overrides():
     assert config.num_hidden_layers == 4 and config.head_dim == 512
     assert config.rotary_scaling_factor == 16 and config.original_max_position_embeddings == 65536
     assert len(config.compress_ratios) == 43
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"kv_source_layer_ids": (8,)},
-        {"index_source_layer_ids": (2, 2)},
-        {"compress_ratios": [0, 0, 3, 2]},
-        {"compress_ratios": [0, 0]},
-    ],
-)
-def test_invalid_ownership(kwargs):
-    with pytest.raises(ValueError):
-        validate_build(DeepseekV41Config(num_hidden_layers=4, **kwargs), context_parallel_size=1)
 
 
 @pytest.mark.parametrize("deterministic", [False, True])

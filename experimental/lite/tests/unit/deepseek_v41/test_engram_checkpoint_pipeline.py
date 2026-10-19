@@ -70,7 +70,12 @@ def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
 
 
 def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
-    names = ["layers.0.attn_norm.weight", "layers.1.attn_norm.weight", "mtp.x"]
+    names = [
+        "layers.0.attn_norm.weight",
+        "layers.1.attn_norm.weight",
+        "layers.0.ffn.gate.bias_vl",
+        "mtp.x",
+    ]
     tensors = {n: torch.ones(4, dtype=torch.bfloat16) for n in names}
     tensors["embed.weight"] = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
     tensors["embed.weight_scale_inv"] = torch.full((1, 1), 2.0)
@@ -101,3 +106,11 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     unloaded.layers["0"].register_buffer("state", torch.zeros(1))  # persistent, unmapped
     with pytest.raises(ValueError, match=r"unloaded \['layers.0.state'\]"):
         load_hf_weights(unloaded, str(tmp_path), cfg, ps)
+
+    key = "layers.0.ffn.gate.bias_vl_extra"  # near-match must not be ignored
+    tensors[key] = torch.ones(1)
+    save_file(tensors, tmp_path / "a.safetensors")
+    index["weight_map"][key] = "a.safetensors"
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+    with pytest.raises(ValueError, match="unread.*bias_vl_extra"):
+        load_hf_weights(stage(), str(tmp_path), cfg, ps)
