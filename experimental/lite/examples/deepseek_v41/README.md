@@ -51,6 +51,13 @@ forward and does not emulate its quantization kernels.
 
 ## Numerical acceptance
 
+Both official references consume the same dequantized BF16 weights as this
+model; FP64 promotes those exact values. Activation quantization is disabled,
+MTP is not executed, and Engram table values must agree exhaustively. Calibrate
+35 fixed records (21,504 response tokens) in at least three fresh processes,
+with two identical forwards each. If reference noise at any gated quantile
+reaches half its BF16-versus-FP64 band, stop without issuing a threshold.
+
 Against official FP64 emulation, the standard model's per-token log-probability
 errors at p50/p99/p99.9 must each be within 1.1 times the official BF16 model's
 own error; maximum error is reported. Identical batches are required for parallel
@@ -64,3 +71,22 @@ model/optimizer/scheduler/RNG/data state and continue for three same-batch steps
 within loss absolute/relative tolerance 0.05/0.005. No cross-run bitwise result is
 required. Checkpoint CPU RNG adaptation is confined to a test fixture; GPU tests
 must use unmodified Core RNG handling.
+
+## Build for training
+
+Run this from a distributed launcher with BF16 release weights and the release
+compressed token map (substitute your paths):
+
+```python
+from megatron.lite.runtime import create_runtime
+from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
+from megatron.lite.runtime.contracts import ParallelConfig, RuntimeConfig
+
+backend = MegatronLiteConfig(
+    model_name="deepseek_v41", impl="lite", hf_path="/path/to/model",
+    parallel=ParallelConfig(ep=4),
+    impl_cfg={"token_map": compressed_token_map, "optimizer": "muon"},
+)
+runtime = create_runtime(RuntimeConfig(backend="mlite", backend_cfg=backend))
+handle = runtime.build_model()
+```

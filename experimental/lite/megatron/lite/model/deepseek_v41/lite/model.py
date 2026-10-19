@@ -124,6 +124,9 @@ class DeepseekV41Model(MegatronModule):
                 self.engrams[str(index)] = DS41Engram(
                     release, config, index, table_group, frozen=not impl.trainable_engram
                 )
+                self.engrams[str(index)].q_weight.use_muon = False
+                self.engrams[str(index)].k_weight.use_muon = False
+                self.engrams[str(index)].embed.weight.use_muon = False
         if self.engrams:
             self.hash = NgramHash(
                 token_map,
@@ -152,7 +155,14 @@ class DeepseekV41Model(MegatronModule):
                 tp_group=ps.tp_group,
             )
             self.head.weight.is_embedding_or_output_parameter = True
+        for module in self.modules():
+            if isinstance(module, MegatronModule) and getattr(module, "tp_group", None) is None:
+                groups = getattr(module, "pg_collection", None)
+                module.tp_group = getattr(groups, "tp", None) or ps.tp_group
         self.to(device=impl.device)
+        self.ds41_frozen_parameters = tuple(
+            name for name, parameter in self.named_parameters() if not parameter.requires_grad
+        )
 
     def module_inventory(self):
         rows = []

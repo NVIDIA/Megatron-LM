@@ -152,6 +152,9 @@ def build_model(model_cfg, *, impl_cfg):
     optimizer, finalize = (None, None)
     if impl_cfg.optimizer is not None:
         optimizer, finalize = _optimizer(chunks, model_cfg, impl_cfg, ps)
+        from megatron.lite.model.deepseek_v41.lite.checkpoint import attach_checkpoint_metadata
+
+        attach_checkpoint_metadata(chunks, ps)
     return ModelBundle(
         chunks,
         ps,
