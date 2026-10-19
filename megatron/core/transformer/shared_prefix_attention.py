@@ -17,6 +17,10 @@ Forward and backward are exact (see :class:`_ComposedForestAttn`). Under
 ``torch.use_deterministic_algorithms(True)``, which ``--deterministic-mode`` enables, the
 backward uses FlashAttention's deterministic kernel. :func:`flash_composed_forest_attention_cp`
 runs the same primitive on zigzag context-parallel shards.
+
+The passes always call FlashAttention 2 (``flash_attn_varlen_func`` and its private varlen
+backward), whatever ``flash_attention_version`` pins for Transformer Engine and the inference
+engine, so :func:`validate_shared_prefix_attention` rejects batch-invariant mode.
 """
 
 from itertools import accumulate
@@ -448,6 +452,14 @@ def validate_shared_prefix_attention(attention, config, *, tp_size: int, cp_size
     if getattr(config, "attn_logit_softcapping", None) is not None:
         raise NotImplementedError(
             "shared-prefix fused attention does not support logit softcapping"
+        )
+    # Batch-invariant mode pins FlashAttention 3 or 4 with a fixed split schedule
+    # (TransformerConfig requires flash_attention_version 3 or 4). The forest always runs
+    # FlashAttention 2 passes merged by log-sum-exp, so it cannot reproduce those kernels.
+    if getattr(config, "batch_invariant_mode", False):
+        raise NotImplementedError(
+            "shared-prefix fused attention does not support batch-invariant mode: it runs "
+            "FlashAttention 2 passes whatever flash_attention_version selects"
         )
     if attention.pg_collection.tp.size() != tp_size:
         raise RuntimeError(
