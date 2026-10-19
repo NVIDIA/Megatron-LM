@@ -21,7 +21,10 @@ def test_prefetch_weights_matches_synchronous_load_and_gpu_memory(tmp_path):
         (tmp_path / 'config.json').write_text(json.dumps(asdict(tiny_config())))
         rt, handle, model, ps = _build(str(tmp_path))
         _initialize(model, ps, tmp_path)
-        expected = {name: value.cpu().clone() for name, value in model.state_dict().items()}
+        expected = {
+            name: value.cpu().clone() if isinstance(value, torch.Tensor) else value
+            for name, value in model.state_dict().items()
+        }
         cfg, impl = model.release, model.impl
         del model, handle, rt
         gc.collect()
@@ -46,6 +49,9 @@ def test_prefetch_weights_matches_synchronous_load_and_gpu_memory(tmp_path):
             assert actual.keys() == expected.keys()
             for name, value in actual.items():
                 want = expected[name]
+                if not isinstance(value, torch.Tensor):
+                    assert value is want is None, name  # BF16 TE has no serialized FP8 extra state
+                    continue
                 assert value.dtype == want.dtype and value.shape == want.shape
                 assert torch.equal(
                     value.detach().cpu().reshape(-1).view(torch.uint8),
