@@ -6,6 +6,12 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.ops.attention.dsa.modules import (
+    DSAIndexer,
+    DSAIndexerSubmodules,
+    DSAttention,
+    DSAttentionSubmodules,
+)
 from megatron.core.ops.ssm.gated_delta.common import GatedDeltaNetSubmodules
 from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet
 from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
@@ -15,12 +21,6 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.dsa import (
-    DSAIndexer,
-    DSAIndexerSubmodules,
-    DSAttention,
-    DSAttentionSubmodules,
-)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (

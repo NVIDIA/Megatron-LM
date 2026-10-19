@@ -20,6 +20,8 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
+from megatron.core.ops.attention.dsa.modules import DSAttention
+from megatron.core.ops.attention.mla import AbsorbedMLASelfAttention
 from megatron.core.ops.ssm.gated_delta.common import HAVE_FLA as HAVE_GDN
 from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet
 from megatron.core.ops.ssm.gated_delta.gdn2 import GatedDeltaNet2
@@ -34,10 +36,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import ModuleSpec, TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-    AbsorbedMLASelfAttention,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
