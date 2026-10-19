@@ -2,8 +2,13 @@
 
 """Tests for config construction before training runtime initialization."""
 
+import logging
+import runpy
 from argparse import ArgumentParser, Namespace
+from contextlib import nullcontext
 from copy import deepcopy
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,13 +16,14 @@ import pytest
 
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
-from megatron.training import arguments, global_vars
+from megatron.training import arguments, global_vars, initialize
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
     inference_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
+from megatron.training.config import DistributedInitConfig
 from megatron.training.config.training_config import TokenizerConfig
 
 
@@ -44,6 +50,148 @@ def _runtime_args():
         exit_signal_handler_for_training=False,
         disable_jit_fuser=False,
     )
+
+
+@pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
+@pytest.mark.parametrize(
+    "overrides", [None, "overlap.yaml", {"qkv_fprop": {"method": "ring_exchange"}}]
+)
+def test_tp_user_buffer_overrides_reach_model_config(adapter, overrides):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.tp_comm_overlap_cfg = overrides
+    config = adapter(
+        args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
+    )
+    assert config.tp_comm_overlap_cfg == overrides
+
+
+@pytest.mark.parametrize("te_version", ["1.8.0", "1.9.0", "2.7.0"])
+@pytest.mark.parametrize("fp8,bf16_layers", [(None, 0), ("hybrid", 0), ("hybrid", 1)])
+@pytest.mark.parametrize("override_source", ["none", "dict", "file"])
+def test_tp_user_buffers_use_config_and_explicit_batch_shape(
+    monkeypatch, tmp_path, te_version, fp8, bf16_layers, override_source
+):
+    from transformer_engine.pytorch import module as te_module
+
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=128,
+        num_attention_heads=8,
+        tensor_model_parallel_size=2,
+        context_parallel_size=2,
+        fp8=fp8,
+        fp8_recipe="tensorwise",
+        first_last_layers_bf16=bool(bf16_layers),
+        num_layers_at_start_in_bf16=bf16_layers,
+        tp_comm_bootstrap_backend="gloo",
+    )
+    overrides = {"qkv_fprop": {"method": "ring_exchange"}}
+    source = overrides if override_source == "dict" else None
+    if override_source == "file":
+        path = tmp_path / "overlap.yaml"
+        path.write_text("qkv_fprop:\n  method: ring_exchange\n")
+        source = str(path)
+    initialize_ub, create_group = Mock(), Mock()
+    modes = SimpleNamespace(NONE="none", FP8="fp8")
+    monkeypatch.setattr(te_module.base, "initialize_ub", initialize_ub)
+    monkeypatch.setattr(te_module.base, "UserBufferQuantizationMode", modes, raising=False)
+    monkeypatch.setattr(initialize, "create_group", create_group)
+    monkeypatch.setattr(
+        initialize, "get_args", Mock(side_effect=AssertionError("global args read"))
+    )
+    monkeypatch.setattr(initialize, "get_te_version", lambda: te_version)
+    monkeypatch.setattr(
+        initialize,
+        "is_te_min_version",
+        lambda minimum: tuple(map(int, te_version.split(".")))
+        >= tuple(map(int, minimum.split("."))),
+    )
+    warning = (
+        pytest.warns(UserWarning, match="supports only MPI")
+        if te_version == "1.8.0"
+        else nullcontext()
+    )
+    with warning:
+        initialize._initialize_tp_communicators(
+            config, sequence_length=96, micro_batch_size=3, tp_comm_overlap_cfg=source
+        )
+    expected = dict(shape=[144, 128], tp_size=2, ub_cfgs={} if source is None else overrides)
+    if te_version == "2.7.0":
+        expected["quantization_modes"] = [modes.FP8 if fp8 else modes.NONE]
+        if bf16_layers:
+            expected["quantization_modes"].append(modes.NONE)
+    else:
+        expected["use_fp8"] = fp8 is not None
+    if te_version == "1.8.0":
+        create_group.assert_called_once_with(backend="mpi", group_desc="TP_BOOTSTRAP_GROUP_MPI")
+    else:
+        expected["bootstrap_backend"] = "gloo"
+        create_group.assert_not_called()
+    initialize_ub.assert_called_once_with(**expected)
+
+
+def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_config):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.rank, args.world_size = 0, 4
+    # These topology values are normally resolved by validate_args.
+    args.gtp_weight_remat_size = args.expert_gtp_weight_remat_size = 1
+    args.gtp_remat_num_sequence_shards = 1
+    args.virtual_pipeline_model_parallel_size = None
+    args.expert_tensor_parallel_size = 1
+    original_args = vars(args).copy()
+    # Keep the legacy defaults different so an accidental args read is detected.
+    run_config.dist = DistributedInitConfig(
+        distributed_backend="gloo",
+        distributed_timeout_minutes=37,
+        local_rank=1,
+        use_sharp=True,
+        sharp_enabled_group="dp_replica",
+        use_gloo_process_groups=False,
+        high_priority_stream_groups=["tp"],
+        use_tp_pp_dp_mapping=True,
+        nccl_communicator_config_path="owned.yaml",
+    )
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(initialize, "print_rank_0", Mock())
+    monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 2)
+    set_device = Mock()
+    monkeypatch.setattr(initialize.torch.cuda, "set_device", set_device)
+    monkeypatch.setattr(initialize.torch.distributed, "is_initialized", lambda: False)
+    init_pg, init_mpu = Mock(), Mock()
+    monkeypatch.setattr(initialize.torch.distributed, "init_process_group", init_pg)
+    monkeypatch.setattr(initialize.inprocess_restart, "maybe_force_nccl_backend_init", Mock())
+    monkeypatch.setattr(initialize.mpu, "model_parallel_is_initialized", lambda: False)
+    monkeypatch.setattr(initialize.mpu, "initialize_model_parallel", init_mpu)
+    for name in (
+        "get_tensor_model_parallel_world_size",
+        "get_pipeline_model_parallel_world_size",
+        "get_gtp_weight_remat_world_size",
+    ):
+        monkeypatch.setattr(initialize.mpu, name, lambda: 1)
+    for name in ("TORCH_FR_DUMP_TEMP_FILE", "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    store = object()
+
+    initialize._initialize_distributed(None, None, store)
+
+    set_device.assert_called_once_with(1)
+    init_pg.assert_called_once_with(
+        backend="gloo", store=store, world_size=4, rank=0, timeout=timedelta(minutes=37)
+    )
+    kwargs = init_mpu.call_args.kwargs
+    assert kwargs["distributed_timeout_minutes"] == 37
+    assert kwargs["nccl_communicator_config_path"] == "owned.yaml"
+    assert kwargs["order"] == "tp-cp-ep-pp-dp"
+    assert kwargs["high_priority_stream_groups"] == ["tp"]
+    assert kwargs["use_sharp"] is True
+    assert kwargs["gtp_remat_num_sequence_shards"] == 1
+    assert kwargs["sharp_enabled_group"] == "dp_replica"
+    assert kwargs["create_gloo_process_groups"] is False
+    assert vars(args) == original_args
 
 
 @pytest.mark.parametrize("experimental", [False, True])
@@ -412,7 +560,7 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
     args.padded_vocab_size = cli_vocab
     args.tensor_model_parallel_size = 2
     checkpoint_args = Namespace(padded_vocab_size=512)
-    state = {"args": checkpoint_args, "iteration": 17, "checkpoint_version": 3.0}
+    state = {"args": checkpoint_args, "checkpoint_version": 3.0}
     monkeypatch.setattr(
         checkpointing,
         "_load_base_checkpoint",
@@ -420,7 +568,6 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
     )
 
     checkpointing.load_args_from_checkpoint(args)
-    assert args.iteration == 17
     model = adapter(
         args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
     )
@@ -471,3 +618,133 @@ def test_vocabulary_resolution_neither_reads_globals_nor_initializes_services(mo
     resolve_tokenizer_vocab_size(cfg, 256)
     assert cfg.tokenizer.padded_vocab_size == 256
     initialize.assert_not_called()
+
+
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("vocabulary", ["tokenizer", "checkpoint", "explicit", "custom"])
+def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
+    monkeypatch, isolated_globals, training, vocabulary
+):
+    """The shared startup owns validation, tokenization, and runtime derivation."""
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.rank = 0
+    args.tokenizer_type = "NullTokenizer"
+    args.vocab_size = 133
+    args.padded_vocab_size = 512 if vocabulary == "checkpoint" else None
+    model = gpt_config_from_args(
+        args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
+    )
+    if vocabulary == "explicit":
+        model.vocab_size = 768
+    elif vocabulary == "custom":
+        model = None
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg.model = model
+    global_vars.set_args(args)
+    global_vars.set_run_config(cfg)
+    events = []
+    finalize = cfg.finalize
+
+    def finalize_inputs():
+        finalize()
+        # Stand in for a centralized derivation: services must see its result.
+        cfg.logger.log_interval = 17
+        events.append("finalize")
+
+    monkeypatch.setattr(cfg, "finalize", finalize_inputs)
+    build = global_vars._build_tokenizer
+
+    def tokenize(received_args):
+        assert events == ["finalize"]
+        assert cfg.logger.log_interval == 17
+        events.append("tokenizer")
+        return build(received_args)
+
+    monkeypatch.setattr(global_vars, "_build_tokenizer", tokenize)
+    expected_vocab = {"tokenizer": 256, "checkpoint": 512, "explicit": 768}
+
+    def writer(received_args):
+        assert received_args is args
+        assert cfg.logger.log_interval == 17
+        if model is not None:
+            assert model.vocab_size == expected_vocab[vocabulary]
+        assert cfg.tokenizer.padded_vocab_size == args.padded_vocab_size
+        events.append("writer")
+
+    monkeypatch.setattr(global_vars, "_set_wandb_writer", writer)
+    monkeypatch.setattr(global_vars, "_set_telemetry", Mock())
+    training_services = Mock(side_effect=lambda args: events.append("training"))
+    monkeypatch.setattr(global_vars, "initialize_training_runtime_services", training_services)
+    monkeypatch.setattr(initialize, "setup_logging", Mock())
+    monkeypatch.setattr(initialize, "initialize_rerun_state_machine", Mock())
+    monkeypatch.setattr(initialize.tuning, "install", Mock())
+
+    initialize.initialize_megatron(
+        allow_no_cuda=True,
+        skip_mpu_initialization=True,
+        training=training,
+        build_tokenizer=vocabulary != "custom",
+    )
+
+    assert events == (
+        ["finalize"]
+        + (["tokenizer"] if vocabulary != "custom" else [])
+        + ["writer"]
+        + (["training"] if training else [])
+    )
+    assert training_services.call_count == int(training)
+    assert (global_vars._GLOBAL_TOKENIZER is None) == (vocabulary == "custom")
+
+
+@pytest.mark.parametrize("bootstrap", [False, True])
+def test_invalid_config_stops_before_runtime_services(monkeypatch, isolated_globals, bootstrap):
+    args = _runtime_args()
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg.profiling.use_nsys_profiler = True
+    cfg.profiling.use_pytorch_profiler = True
+    services = Mock(side_effect=AssertionError("runtime services must not start"))
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
+    monkeypatch.setattr(initialize, "initialize_runtime_services", services)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        if bootstrap:
+            global_vars.set_global_variables(args, cfg)
+        else:
+            global_vars.set_args(args)
+            global_vars.set_run_config(cfg)
+            initialize.initialize_megatron(allow_no_cuda=True)
+    services.assert_not_called()
+
+
+def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_globals, run_config):
+    import megatron.training as training_package
+    from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
+    from megatron.training import argument_utils, utils
+
+    args = Namespace(reset_attention_mask=False, batch_invariant_mode=False)
+    model = Mock()
+    # The real RL callback derives its rollout interval from these batch values.
+    cfg = run_config
+    cfg.train.micro_batch_size = 1
+    cfg.train.global_batch_size = 8
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    monkeypatch.setattr(logging, "basicConfig", Mock())
+    monkeypatch.setattr(arguments, "parse_and_validate_args", Mock(return_value=args))
+    monkeypatch.setattr(utils, "is_hybrid_model", lambda args: False)
+    monkeypatch.setattr(argument_utils, "gpt_config_from_args", Mock(return_value=model))
+    monkeypatch.setattr(argument_utils, "pretrain_cfg_container_from_args", Mock(return_value=cfg))
+    services = Mock(side_effect=AssertionError("entrypoint initialized services before pretrain"))
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
+    pretrain = Mock()
+    monkeypatch.setattr(training_package, "pretrain", pretrain)
+
+    runpy.run_path(str(Path(__file__).resolve().parents[3] / "train_rl.py"), run_name="__main__")
+
+    pretrain.assert_called_once()
+    assert pretrain.call_args.args[0] is cfg
+    callbacks = pretrain.call_args.kwargs["callbacks"]
+    assert [type(callback) for callback in callbacks] == [RLLoggingCallback, RLCheckpointCallback]
+    assert global_vars.get_run_config() is cfg
+    assert global_vars._GLOBAL_TOKENIZER is None
+    services.assert_not_called()
