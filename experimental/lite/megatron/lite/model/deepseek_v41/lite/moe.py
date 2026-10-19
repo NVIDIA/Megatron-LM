@@ -8,13 +8,7 @@ from megatron.core.transformer.moe.router import TopKRouter
 
 
 class SortedTopKPolicy:
-    """Select in score order; Core still normalizes and dispatches.
-
-    Core dev 7b150acf: moe_utils.compute_topk delegates through the instance
-    get_replay_topk interface. No routes are recorded or replayed, and no
-    global replay instance is registered. This preserves the 410b438240
-    selection contract without changing Core or requiring deterministic math.
-    """
+    """Core dev 7b150acf: Select in score order; Core still normalizes and dispatches."""
 
     layer_number = None
 

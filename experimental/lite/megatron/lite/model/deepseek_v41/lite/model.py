@@ -20,7 +20,6 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.lite.model.deepseek_v41.lite.components.assembly import (
     DS41AttentionSources,
-    ModelNorm,
     SourceContext,
 )
 from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
@@ -39,16 +38,13 @@ from megatron.lite.model.deepseek_v41.lite.components.engram import (
 from megatron.lite.model.deepseek_v41.lite.moe import bind_sorted_selection
 from megatron.lite.model.deepseek_v41.topology import validate_build
 from megatron.lite.primitive.modules.engram import NgramHash
+from megatron.lite.primitive.modules.projection import ModelNorm
 from megatron.lite.primitive.parallel import build_pipeline_chunk_layout
 from megatron.lite.primitive.parallel.source_state import KVSourceState
 
 
 class CoreAttentionSources(DS41AttentionSources):
-    """Core Attention constructs once before Hybrid supplies ratio/RoPE.
-
-    Match native CSA's window-only bootstrap defaults; Hybrid immediately
-    replaces that temporary module using the actual per-layer arguments.
-    """
+    """Core Attention constructs once before Hybrid supplies ratio/RoPE."""
 
     def __init__(self, *, compress_ratio=0, rotary_pos_emb=None, **kwargs):
         super().__init__(compress_ratio=compress_ratio, rotary_pos_emb=rotary_pos_emb, **kwargs)
@@ -167,41 +163,6 @@ class DeepseekV41Model(MegatronModule):
                 groups = getattr(module, "pg_collection", None)
                 module.tp_group = getattr(groups, "tp", None) or ps.tp_group
         self.to(device=impl.device)
-        self.ds41_frozen_parameters = tuple(
-            name for name, parameter in self.named_parameters() if not parameter.requires_grad
-        )
-
-    def module_inventory(self):
-        rows = []
-        for key, block in self.layers.items():
-            index = int(key)
-            source = block.attention.core_attention
-            policy = self.context.policies[index]
-            ratio = source.ratio
-            kv_owner = ratio > 0 and policy.kv == index
-            index_owner = ratio > 0 and policy.index == index
-            if ratio == 0:
-                assert source.native.compressor is None and source.native.indexer is None
-            elif ratio == 2:
-                assert source.native.compressor is not None and source.native.indexer is not None
-                assert bool(list(source.native.compressor.parameters())) == kv_owner
-                assert (source.native.indexer.linear_wq_b.linear is not None) == index_owner
-            else:
-                assert hasattr(source, "main_projection") == kv_owner
-                assert hasattr(source, "index_key") == kv_owner
-                assert (source.index_q.linear is not None) == index_owner
-            rows.append(
-                dict(
-                    layer=index,
-                    ratio=ratio,
-                    kv_owner=policy.kv,
-                    index_owner=policy.index,
-                    owns_kv=kv_owner,
-                    owns_index=index_owner,
-                    candidate=policy.candidate,
-                )
-            )
-        return rows
 
     def set_input_tensor(self, value):
         self._input_tensor = value[0] if isinstance(value, (tuple, list)) else value

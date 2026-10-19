@@ -4,12 +4,7 @@ import torch
 
 
 def pack_values(value, *, device):
-    """Pack model source tensors into Core's ordinary dynamic-shape PP tensor.
-
-    FP32 source values use additive BF16 components, preserving their values
-    and differentiable connection. Integer/layout metadata uses byte values;
-    no process group, Python object or native layout object is transmitted.
-    """
+    """Pack model source tensors into Core's ordinary dynamic-shape PP tensor."""
     import json
 
     body = []
@@ -74,6 +69,7 @@ def unpack_values(carrier):
                 result = values[0].float()
                 for value in values[1:]:
                     result = result + value.float()
+                result = torch.where(result == 0, values[0].float(), result)
             elif dtype == "bfloat16":
                 result = values[0]
             else:

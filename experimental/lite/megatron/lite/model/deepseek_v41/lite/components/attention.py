@@ -10,15 +10,7 @@ from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid
 
 
 class DS41SelfAttention(DSv4HybridSelfAttention):
-    """Core dev 7b150acf get_query_key_value_tensors, with DS4.1 Q semantics.
-
-    DS4.1 normalizes the low-rank Q latent, not each projected query head.
-    The parent DSv4 method adds a per-head RMS, so that projection method is
-    model-specific here. Core's forward, boundary exchange, THD layout,
-    compressed attention, inverse RoPE and output projection are inherited.
-    This standard training interface uses packed THD, TP1, unfused RoPE;
-    it does not implement an inference cache or change CP communication.
-    """
+    """Core dev 7b150acf get_query_key_value_tensors, with DS4.1 Q semantics."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -26,13 +18,7 @@ class DS41SelfAttention(DSv4HybridSelfAttention):
             self._use_compressed_rope()
 
     def _use_compressed_rope(self):
-        """Ratio one rotates like every compressing layer: compress theta with YaRN.
-
-        The release (and its reference) select compress_rope_theta and YaRN for any
-        nonzero ratio. Core dev 7b150acf selects them only for ratio > 1, so it gives
-        ratio one the base theta without YaRN. Build Core's ratio > 1 rotary and
-        replace every reference this layer holds to the one Core built.
-        """
+        """Core dev 7b150acf: Ratio one rotates like every compressing layer: compress theta with YaRN."""
         config, old = self.config, self.rotary_pos_emb
         new = YarnRotaryEmbedding(
             config.qk_pos_emb_head_dim,
@@ -93,7 +79,6 @@ class DS41SelfAttention(DSv4HybridSelfAttention):
         low_q = self.q_layernorm(low_q)
         query, _ = self.linear_q_up_proj(low_q)
         query = query.reshape(-1, self.num_attention_heads_per_partition, self.q_head_dim)
-        # No DSv4-only _q_rms_norm: this is the DS4.1 release projection.
         global_start = self.pg_collection.cp.rank() * hidden_states.shape[0]
         content_dim = self.q_head_dim - self.config.qk_pos_emb_head_dim
         query = cp_utils.apply_thd_cp_local_rope_unfused(

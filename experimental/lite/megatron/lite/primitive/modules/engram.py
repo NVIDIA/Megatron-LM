@@ -15,11 +15,7 @@ from megatron.core.tensor_parallel.mappings import (
 
 
 class NgramHash(nn.Module):
-    """Hash a full local batch; packed boundaries restart every lookback.
-
-    No process-global cache: each call is independent of previous microbatches
-    and safe to recompute. Distributed history transport belongs to the caller.
-    """
+    """Hash a full local batch; packed boundaries restart every lookback."""
 
     def __init__(self, token_map, pad_id, multipliers, primes):
         super().__init__()
@@ -105,13 +101,7 @@ class Engram(nn.Module):
 
 
 class ShardedFrozenTable(nn.Module):
-    """Frozen row-sharded FP8 table (E4M3 rows, E8M0 scale per 32) in pinned host memory.
-
-    Each rank keeps its equal row shard on the host. A lookup gathers every rank's IDs
-    through Core's mapping, copies only the owned requested rows to the device, decodes
-    them to BF16, zeroes the others and sums over the group (zeros are exact). Device
-    or dtype moves of the module leave the stored bytes on the host.
-    """
+    """Frozen row-sharded FP8 table (E4M3 rows, E8M0 scale per 32) in pinned host memory."""
 
     def __init__(self, rows, width, group, *, block=32, initialize=True):
         super().__init__()
@@ -157,8 +147,7 @@ class ShardedFrozenTable(nn.Module):
 
 
 def _pinned_empty(shape, dtype):
-    """Exact-size uninitialized host buffer, page-locked in place when CUDA is available
-    (pin_memory=True would round the caching host allocator's block up to a power of two)."""
+    """Exact-size uninitialized host buffer, page-locked in place when CUDA is available"""
     nbytes = shape[0] * shape[1] * dtype.itemsize
     owner = np.empty(max(nbytes, 1), dtype=np.uint8)
     out = torch.from_numpy(owner)[:nbytes].view(dtype).view(shape)

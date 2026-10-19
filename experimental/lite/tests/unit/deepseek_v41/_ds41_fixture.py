@@ -35,3 +35,17 @@ def tiny_config():
         rotary_scaling_factor=16.0,
         original_max_position_embeddings=32,
     )
+
+
+# Spawned workers import this fixture before constructing the actual model.
+import sys
+
+
+class _NoRolloutImports:
+    def find_spec(self, name, path=None, target=None):
+        assert name != "vllm" and not name.startswith("vllm."), name
+        return None
+
+
+assert not any(n == "vllm" or n.startswith("vllm.") for n in sys.modules)
+sys.meta_path.insert(0, _NoRolloutImports())

@@ -66,13 +66,7 @@ def select_indices(
     publish=False,
     candidates=None,
 ):
-    """Per-document Core scorer plus Uncompressed sparse attention two-level candidate policy.
-
-    q=[local rows, index heads, dim], k=[global rows, dim], weights=[local rows, heads].
-    Returned indices address the global packed token buffer; invalid slots are -1.
-    Pools stay local to query rows, with one tensor per document. A reader must
-    provide the same packed query geometry used by its candidate publisher.
-    """
+    """Per-document Core scorer plus Uncompressed sparse attention two-level candidate policy."""
     if topk < 0:
         raise ValueError("Uncompressed sparse attention index top-k must be nonnegative")
     lengths = prefix[1:] - prefix[:-1]
@@ -108,7 +102,6 @@ def select_indices(
                 )
             scores = scores.masked_fill(~candidates[document], -torch.inf)
         # Position order is the release contract. A candidate-limited top-k
-        # must not bring excluded positions back through an arbitrary -inf tie.
         chosen = scores.topk(count, dim=-1, sorted=False).indices.sort(-1).values
         valid = (chosen < visible) & torch.isfinite(scores.gather(-1, chosen))
         selected[rows, :count] = torch.where(valid, chosen + start, -1).int()
@@ -117,15 +110,7 @@ def select_indices(
 
 
 class RatioOneAttention(nn.Module):
-    """Native sparse attention with Uncompressed sparse attention ratio-one source/candidate semantics.
-
-    Core functions used: async_gather_from_sequence_parallel_region,
-    cp_utils.thd_cp_position_ids, fused_qk_topk_naive, batch_of_row,
-    get_window_topk_idxs_thd, csa_sparse_attn/unfused_compressed_sparse_attn,
-    _OutputInverseRope. No collective is implemented or called directly here.
-    Projection and RoPE inputs come from the Uncompressed sparse attention owner modules; the native
-    output inverse-RoPE mirrors the surrounding Hybrid attention contract.
-    """
+    """Native sparse attention with Uncompressed sparse attention ratio-one source/candidate semantics."""
 
     def __init__(
         self,

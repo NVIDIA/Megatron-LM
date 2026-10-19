@@ -37,12 +37,10 @@ class DeepseekV41Config(DeepseekV4Config):
 
     @classmethod
     def _from_hf_dict(cls, hf, **overrides):
-        # The multimodal release nests the text configuration. Vision is not
-        # instantiated by this model; explicit overrides apply to the text fields.
         text = hf.get("text_config", hf)
         config = super()._from_hf_dict(text, **overrides)
         if not config.compress_ratios:
-            config.compress_ratios = [0, 0] + [2] * 18 + [1] * 20 + [0] * 3
+            config.compress_ratios = list(DEFAULT_RATIOS)
         for item in fields(cls):
             if item.name in {
                 "kv_source_layer_ids",
@@ -52,3 +50,6 @@ class DeepseekV41Config(DeepseekV4Config):
             }:
                 setattr(config, item.name, tuple(getattr(config, item.name)))
         return config
+
+
+DEFAULT_RATIOS = (0, 0) + (2,) * 18 + (1,) * 20

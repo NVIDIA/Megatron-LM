@@ -2,7 +2,7 @@
 """DS4.1 source ownership; Core owns layout, communication and scheduling."""
 from dataclasses import dataclass
 
-from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+from megatron.lite.model.deepseek_v41.config import DEFAULT_RATIOS, DeepseekV41Config
 
 
 @dataclass(frozen=True)
@@ -14,11 +14,11 @@ class LayerSources:
 
 def layer_sources(config: DeepseekV41Config) -> tuple[LayerSources, ...]:
     n = config.num_hidden_layers
-    ratios = config.compress_ratios or ([0, 0] + [2] * 18 + [1] * 20 + [0] * 3)
+    ratios = config.compress_ratios or list(DEFAULT_RATIOS)
+    if type(n) is int and not config.compress_ratios and n > 40:
+        raise ValueError("DS4.1 default ratios support at most 40 text layers; MTP is unsupported")
     if type(n) is not int or n <= 0 or len(ratios) < n:
         raise ValueError("DS4.1 needs positive layer count and a ratio for every layer")
-    if not config.compress_ratios and n > 40:
-        raise ValueError("DS4.1 default ratios support at most 40 text layers; MTP is unsupported")
     sources = (config.kv_source_layer_ids, config.index_source_layer_ids)
     for ids in sources:
         if any(type(i) is not int or i < 0 for i in ids) or list(ids) != sorted(set(ids)):
@@ -30,7 +30,6 @@ def layer_sources(config: DeepseekV41Config) -> tuple[LayerSources, ...]:
         or ratios[candidate] != 1
     ):
         # Release (layer 20): the publisher is a ratio-one index owner. A publisher
-        # reusing another layer's selection would never publish its pool.
         raise ValueError("DS4.1 candidate publisher must be a ratio-one index source layer")
     result = []
     for i, ratio in enumerate(ratios[:n]):
@@ -53,7 +52,7 @@ def validate_build(
     if type(context_parallel_size) is not int or context_parallel_size < 1:
         raise ValueError("Context parallel size must be a positive integer")
     policies = layer_sources(config)
-    ratios = config.compress_ratios or ([0, 0] + [2] * 18 + [1] * 20)
+    ratios = config.compress_ratios or list(DEFAULT_RATIOS)
     if any(p.candidate and ratios[i] != 1 for i, p in enumerate(policies)):
         raise ValueError("DS4.1 candidate policy requires the ratio-one model path")
     return policies

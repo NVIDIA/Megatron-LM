@@ -1,16 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Model assembly boundaries: pipeline source ownership and release loading."""
-from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 from megatron.lite.model.deepseek_v41.lite.components.carrier import pack_sources, unpack_sources
-from megatron.lite.model.deepseek_v41.lite.protocol import ImplConfig, _validate, forward_step
+from megatron.lite.model.deepseek_v41.lite.protocol import ImplConfig, _validate
 from megatron.lite.primitive.modules.engram import NgramHash
 from megatron.lite.primitive.parallel.source_state import KVSourceState
-from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 
 
 def test_pipeline_source_carrier_preserves_values_and_owner_gradients():
@@ -18,7 +16,9 @@ def test_pipeline_source_carrier_preserves_values_and_owner_gradients():
     grad_alignment = []
     hidden.register_hook(lambda grad: grad_alignment.append(grad.data_ptr() % 16))
     pre = torch.sigmoid(torch.randn(5, 1, 4)).requires_grad_()
-    owner = torch.randn(5, 8, requires_grad=True)
+    owner = torch.randn(5, 8)
+    owner[0, :2] = torch.tensor([-0.0, 0.0])
+    owner.requires_grad_()
     prefix, new_prefix = torch.tensor([0, 2, 5], dtype=torch.int32), torch.tensor(
         [0, 2, 5], dtype=torch.int32
     )
@@ -35,7 +35,8 @@ def test_pipeline_source_carrier_preserves_values_and_owner_gradients():
     )
     recovered, recovered_prefix = values[new_key]
     assert h.data_ptr() % 16 == 0 and torch.equal(h, hidden) and torch.equal(p, pre)
-    assert torch.equal(recovered, owner) and torch.equal(recovered_prefix, prefix)
+    assert torch.equal(recovered.view(torch.int32), owner.view(torch.int32)), "FP32 raw bits"
+    assert torch.equal(recovered_prefix, prefix)
     assert torch.equal(values[("candidate_pool", 3)], pool)
     (h.float().sum() + p.sum() + recovered.sum() * 2 + recovered.sum() * 3).backward()
     assert torch.equal(owner.grad, torch.full_like(owner, 5))
@@ -55,73 +56,16 @@ def test_hash_resets_history_at_each_packed_document():
 
 
 @pytest.mark.parametrize(
-    "option", [dict(quantized=True), dict(w4a8_experts=True), dict(dtype=torch.float32)]
+    "option,reason",
+    [
+        ({"quantized": True}, "BF16"),
+        ({"w4a8_experts": True}, "BF16"),
+        ({"dtype": torch.float32}, "BF16"),
+        ({"optimizer": "muon"}, "optimizer"),
+        ({"optimizer_config": {"optimizer": "muon"}}, "optimizer"),
+        ({"trainable_engram": True}, "Trainable Engram"),
+    ],
 )
-def test_quantized_execution_rejected_before_model_allocation(option):
-    with pytest.raises(ValueError, match="BF16"):
+def test_unsupported_training_modes_fail_before_allocation(option, reason):
+    with pytest.raises(ValueError, match=reason):
         _validate(DeepseekV41Config(num_hidden_layers=4), ImplConfig(**option))
-
-
-@pytest.mark.parametrize("rank", [0, 1])
-def test_protocol_real_core_metadata_contiguous_rows_and_document_end_mask(rank):
-    from megatron.core.packed_seq_params import PackedSeqParams
-
-    class Capture(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.ps = SimpleNamespace(cp_size=2, cp_rank=rank, cp_group=object())
-
-        def forward(self, input_ids, **kwargs):
-            self.kwargs = kwargs
-            self.ids = input_ids
-            return {"log_probs": torch.zeros_like(input_ids, dtype=torch.float32)}
-
-    model = Capture()
-    ids = torch.arange(12)
-    forward_step(model, PackedBatch(ids, ids, torch.tensor([5, 1, 6])))
-    args = model.kwargs
-    assert isinstance(args["packed_seq_params"], PackedSeqParams)
-    assert args["packed_seq_params"].cp_partition_mode == "contiguous"
-    assert args["packed_seq_params"].cp_group is model.ps.cp_group
-    assert model.ids.numel() == 10  # native padding: 8 + 4 + 8, then contiguous CP
-    assert args["full_input_ids"].numel() == 20
-    mask = args["loss_mask"]
-    expected = torch.tensor(
-        [1, 1, 1, 1, 0, 0, 0, 0, 0, 0] if rank == 0 else [0, 0, 1, 1, 1, 1, 1, 0, 0, 0]
-    )
-    assert torch.equal(mask, expected)
-
-
-def test_native_optimizer_uses_core_adam_and_variable_microbatch_policy(monkeypatch):
-    from megatron.lite.model.deepseek_v41.lite.protocol import _optimizer
-    from megatron.lite.primitive.optimizers import megatron_wrap
-
-    observed = {}
-    native = SimpleNamespace(chained_optimizers=[])
-
-    def construct(chunks, **kwargs):
-        observed.update(kwargs)
-        return chunks, native
-
-    monkeypatch.setattr(megatron_wrap, "build_dist_opt_stack", construct)
-    impl = ImplConfig(optimizer_config={"lr": 1e-5})
-    result, finalize = _optimizer([], DeepseekV41Config(num_hidden_layers=4), impl, object())
-    engine = observed["engine_cfg"]
-    assert result is native and callable(finalize)
-    assert engine.optimizer.optimizer == "adam" and engine.optimizer.lr == 1e-5
-    assert not hasattr(engine, "override_optimizer_config")
-    assert engine.ddp_config_overrides == {"overlap_grad_reduce": False}
-    assert not engine.deterministic
-
-
-@pytest.mark.parametrize(
-    "option", [dict(optimizer="muon"), dict(optimizer_config={"optimizer": "muon"})]
-)
-def test_non_adam_optimizer_is_rejected_before_model_allocation(option):
-    with pytest.raises(ValueError, match="optimizer"):
-        _validate(DeepseekV41Config(num_hidden_layers=4), ImplConfig(**option))
-
-
-def test_trainable_engram_rejected_before_model_allocation():
-    with pytest.raises(ValueError, match="Trainable Engram"):
-        _validate(DeepseekV41Config(), ImplConfig(trainable_engram=True))

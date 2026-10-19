@@ -11,12 +11,7 @@ from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader
 
 
 class RowSliceReader(SafeTensorReader):
-    """Workers own mmap handles and copy raw bytes only; CUDA stays on the caller.
-
-    Row copies write directly into final host buffers. Ordinary tensor prefetch
-    is bounded by ``prefetch_bytes`` (one larger tensor may occupy the window).
-    The mmap view alone is not a prefetch: copying forces the requested pages in.
-    """
+    """Workers own mmap handles and copy raw bytes only; CUDA stays on the caller."""
 
     def __init__(self, path, *, device="cpu", workers=4, prefetch_bytes=512 << 20):
         super().__init__(path, device=device)

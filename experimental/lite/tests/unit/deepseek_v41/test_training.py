@@ -2,7 +2,6 @@
 """Random small full-model gates; real Core/TE/FHT/FlashMLA, synthetic release-format weights, no downloaded weights."""
 import hashlib
 import json
-import re
 from dataclasses import asdict
 from pathlib import Path
 
@@ -16,7 +15,11 @@ from _ds41_fixture import tiny_config
 def _initialize(model, ps, root):
     from safetensors.torch import save_file
 
-    from megatron.lite.model.deepseek_v41.lite.checkpoint import load_hf_weights, source_name
+    from megatron.lite.model.deepseek_v41.lite.checkpoint import (
+        _expert_sources,
+        load_hf_weights,
+        source_name,
+    )
 
     tensors = {}
 
@@ -54,27 +57,16 @@ def _initialize(model, ps, root):
         if name.endswith(".ape"):
             continue
         value = tensor.detach().cpu()
-        match = re.fullmatch(
-            r"layers.(\d+).ffn.(experts|shared_experts).linear_fc([12]).weight(\d*)", name
-        )
+        keys = _expert_sources(name, model.release, ps)
         if name.startswith("engrams."):
             _, layer, suffix = name.split(".", 2)
             if suffix == "embed.embedding.weight":
                 value = torch.empty(model.engrams[layer].global_rows, value.shape[1])
                 suffix = "embed.weight"
             put(f"layers.{layer}.engram.{suffix}", value, table=suffix == "embed.weight")
-        elif match:
-            layer, kind, fc, local = match.groups()
-            base = f"layers.{layer}.ffn.{kind}."
-            if kind == "experts":
-                base += (
-                    str(int(local) + ps.ep_rank * (model.release.n_routed_experts // ps.ep_size))
-                    + "."
-                )
-            for part, chunk in zip(
-                ("w1", "w3") if fc == "1" else ("w2",), value.chunk(2 if fc == "1" else 1)
-            ):
-                put(base + part + ".weight", chunk)
+        elif keys:
+            for key, chunk in zip(keys, value.chunk(len(keys))):
+                put(key, chunk)
         elif name.endswith(("alpha_pre", "alpha_post", "alpha_res")):
             slot = ("alpha_pre", "alpha_post", "alpha_res").index(name.rsplit(".", 1)[1])
             tensors.setdefault(source_name(name), torch.empty(3))[slot] = value.reshape(())

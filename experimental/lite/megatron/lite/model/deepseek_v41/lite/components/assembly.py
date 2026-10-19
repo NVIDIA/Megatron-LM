@@ -18,7 +18,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
     use_fused_dsa_kernels,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.lite.model.deepseek_v41.lite.components.config import (
     attach_ratio_two_sources,
     freeze_indexer_sources,
@@ -28,44 +27,15 @@ from megatron.lite.primitive.modules.attention.cross_layer import (
     IndexProjection,
     LatentIndexKey,
     SharedCompressor,
+    compressor_reader,
     publish_latent,
 )
 from megatron.lite.primitive.modules.attention.ratio_one import RatioOneAttention
-
-
-class ModelNorm(WrappedTorchNorm):
-    def __new__(cls, config, hidden_size, eps, **kwargs):
-        return (
-            super().__new__(cls, config, hidden_size, eps, **kwargs).to(dtype=config.params_dtype)
-        )
-
-
-class FP32Projection(nn.Module):
-    """Release main-compressor projections accumulate from FP32 input/weights."""
-
-    def __init__(self, input_size, output_size, *, config, init_method, **unused):
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty(
-                output_size, input_size, dtype=torch.float32, device=torch.cuda.current_device()
-            )
-        )
-        if config.perform_initialization:
-            init_method(self.weight)
-
-    def forward(self, x):
-        return torch.nn.functional.linear(x.float(), self.weight), None
-
-    def backward_dw(self):
-        pass  # Normal torch autograd; delayed weight gradients are rejected.
+from megatron.lite.primitive.modules.projection import FP32Projection, ModelNorm
 
 
 def remote_compressor(config, group, rotary):
-    """Non-owning Core metadata for a KV source on an earlier PP stage.
-
-    Cached forward outputs arrive as explicit pipeline tensors. No projection
-    is run here and no duplicate owner parameter is registered.
-    """
+    """Non-owning Core metadata for a KV source on an earlier PP stage."""
     result = SharedCompressor.__new__(SharedCompressor)
     nn.Module.__init__(result)
     result.config, result.compress_ratio, result.head_dim = config, 2, config.v_head_dim
@@ -78,24 +48,6 @@ def remote_compressor(config, group, rotary):
     return result
 
 
-def compressor_reader(owner, state, layer, source):
-    """Parameter-free view of a native owner's source/layout metadata.
-
-    Only SharedCompressor's source overrides execute on a reader. Core's
-    _cp_requires_single_projection still sees the actual owner's weights.
-    """
-    view = SharedCompressor.__new__(SharedCompressor)
-    nn.Module.__init__(view)
-    for name, value in vars(owner).items():
-        if name not in {"_parameters", "_buffers", "_modules"}:
-            object.__setattr__(view, name, value)
-    for members in (owner._parameters, owner._buffers, owner._modules):
-        for name, value in members.items():
-            object.__setattr__(view, name, value)
-    view.bind_source(state, layer, source)
-    return view
-
-
 class SourceContext:
     def __init__(self, release, config, groups, state, policies):
         self.release, self.config, self.groups, self.state = release, config, groups, state
@@ -103,11 +55,7 @@ class SourceContext:
 
 
 class DS41AttentionSources(nn.Module):
-    """Core Hybrid's core_attention ModuleSpec, with DS4.1 state sources.
-
-    Ratio0/2 call an unmodified CompressedSparseAttention.forward. Ratio1
-    calls the explicitly approved DS4.1 orchestration over Core operators.
-    """
+    """Core Hybrid's core_attention ModuleSpec, with DS4.1 state sources."""
 
     def __init__(
         self,
@@ -297,22 +245,9 @@ class DS41AttentionSources(nn.Module):
         **kwargs,
     ):
         params, state, policy = packed_seq_params, self.context.state, self.policy
-        if self.ratio == 0:
-            return self.native(
-                query,
-                key,
-                value,
-                attention_mask,
-                x=x,
-                qr=qr,
-                packed_seq_params=params,
-                boundary_hidden=boundary_hidden,
-                boundary_kv=boundary_kv,
-                **kwargs,
-            )
-        if self.layer == policy.kv:
+        if self.ratio and self.layer == policy.kv:
             state.values[("attention_inputs", policy.kv)] = (x, boundary_hidden, params)
-        if self.ratio == 2:
+        if self.ratio in (0, 2):
             return self.native(
                 query,
                 key,

@@ -9,12 +9,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 
 
 class KVSourceState:
-    """Keep local owner outputs attached to their original autograd graph.
-
-    Direct calls share state only within the forward microbatch scope. Native
-    checkpoint segments carry their source tensors explicitly through backward;
-    a later microbatch cannot reuse an old graph. Nested scopes are rejected.
-    """
+    """Keep local owner outputs attached to their original autograd graph."""
 
     def __init__(self) -> None:
         self.active = False
@@ -50,14 +45,7 @@ class KVSourceState:
         return self.values[key]
 
     def checkpoint(self, function: Callable, *args: torch.Tensor, checkpoint_fn=None) -> Any:
-        """Pass shared source tensors across native Core checkpoint boundaries.
-
-        An owner segment publishes its source tensors as checkpoint outputs.
-        A reader segment receives them as explicit tensor inputs. Core then
-        propagates reader gradients to the original owner checkpoint exactly
-        once; a reader replay never requests an owner recomputation out of order.
-        The cached graph is neither a hidden backward closure nor detached data.
-        """
+        """Pass shared source tensors across native Core checkpoint boundaries."""
         if not self.active:
             raise RuntimeError("Checkpointed KV reuse requires an active microbatch")
         if not all(isinstance(arg, torch.Tensor) for arg in args):

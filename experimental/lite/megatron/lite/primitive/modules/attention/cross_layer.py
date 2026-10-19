@@ -182,7 +182,6 @@ class LatentIndexKey(nn.Module):
 
     def backward_dw(self):
         # This projection uses normal torch autograd. Delayed wgrad is not a
-        # supported shared-attention build configuration.
         pass
 
     def _resolve(self, x, prefix, maximum, mode, produce):
@@ -255,3 +254,17 @@ class LatentIndexKey(nn.Module):
             return rotate_activation(key), compressed_prefix
 
         return self._resolve(x, cu_seqlens, max_seqlen_q, "thd_cp", produce)
+
+
+def compressor_reader(owner, state, layer, source):
+    """Parameter-free view of a native owner's source/layout metadata."""
+    view = SharedCompressor.__new__(SharedCompressor)
+    nn.Module.__init__(view)
+    for name, value in vars(owner).items():
+        if name not in {"_parameters", "_buffers", "_modules"}:
+            object.__setattr__(view, name, value)
+    for members in (owner._parameters, owner._buffers, owner._modules):
+        for name, value in members.items():
+            object.__setattr__(view, name, value)
+    view.bind_source(state, layer, source)
+    return view

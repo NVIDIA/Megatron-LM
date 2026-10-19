@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import _validate_dsa_kernel_backend_dependencies
+from megatron.lite.model.deepseek_v41.config import DEFAULT_RATIOS
 from megatron.lite.model.deepseek_v41.topology import validate_build
 
 
@@ -18,11 +19,7 @@ def reject_native_recompute(granularity, method):
 
 
 def require_native_hadamard():
-    """CUDA indexer keys/queries need the real fast_hadamard_transform.
-
-    Core's rotate_activation asserts only that some transform is installed;
-    a CPU test stand-in must never reach a GPU run.
-    """
+    """CUDA indexer keys/queries need the real fast_hadamard_transform."""
     from megatron.core.transformer.experimental_attention_variant import dsa
 
     module = getattr(dsa.hadamard_transform, "__module__", None) or ""
@@ -43,12 +40,7 @@ def core_config(
     attention_backend="none",
     deterministic_mode=False,
 ):
-    """Validate unsupported topology before groups or large tensors are created.
-
-    ``attention_backend`` is Core's dsa_kernel_backend: "none" runs the unfused
-    sparse attention, "cudnn"/"tilelang" FlashMLA. It is set at construction so
-    Core validates the backend and its dependencies.
-    """
+    """Validate unsupported topology before groups or large tensors are created."""
     reject_native_recompute(recompute_granularity, recompute_method)
     _validate_dsa_kernel_backend_dependencies(attention_backend)
     validate_build(release, context_parallel_size=parallel.cp)
@@ -61,7 +53,6 @@ def core_config(
         num_attention_heads=release.num_attention_heads,
         num_query_groups=1,
         ffn_hidden_size=release.moe_intermediate_size,
-        tensor_model_parallel_size=1,
         context_parallel_size=1,
         cp_partition_mode="contiguous",
         sequence_packing_scheduler="dp_balanced",
@@ -87,11 +78,9 @@ def core_config(
         o_lora_rank=release.o_lora_rank,
         o_groups=release.o_groups,
         # DS4.1 composes Core component specs directly. The stock DSv4
-        # selector admits only 0/4/128 and is not the DS4.1 ratio grammar.
-        # Keep literal ratios; do not select or remap to that different model.
         experimental_attention_variant=None,
         csa_compress_ratios=list(release.compress_ratios[: release.num_hidden_layers])
-        or ([0, 0] + [2] * 18 + [1] * 20)[: release.num_hidden_layers],
+        or list(DEFAULT_RATIOS)[: release.num_hidden_layers],
         csa_window_size=release.sliding_window,
         csa_compress_rotary_base=release.compress_rope_theta,
         rotary_base=release.rope_theta,
@@ -105,8 +94,6 @@ def core_config(
         dsa_indexer_head_dim=release.index_head_dim,
         dsa_indexer_topk=release.index_topk,
         dsa_indexer_loss_coeff=0.0,
-        dsa_indexer_precision="bf16",
-        dsa_cp_balance_indexer=False,
         enable_hyper_connections=True,
         num_residual_streams=release.hc_mult,
         mhc_sinkhorn_iterations=release.hc_sinkhorn_iters,
@@ -117,11 +104,9 @@ def core_config(
         moe_shared_expert_intermediate_size=release.moe_intermediate_size
         * release.n_shared_experts,
         moe_router_score_function=release.scoring_func,
-        moe_router_pre_softmax=False,
         moe_router_topk_scaling_factor=release.routed_scaling_factor,
         moe_router_enable_expert_bias=True,
         moe_router_dtype="fp32",
-        moe_router_fusion=False,
         moe_router_load_balancing_type="none",
         moe_token_dispatcher_type="alltoall",
         moe_grouped_gemm=True,
@@ -131,12 +116,8 @@ def core_config(
         add_bias_linear=False,
         hidden_dropout=0.0,
         attention_dropout=0.0,
-        bias_activation_fusion=False,
-        bias_dropout_fusion=False,
     )
 
-    # DS4.1 composes components directly, not the stock DSv4 model selector.
-    # Real CP belongs to release.cp_size / runtime groups and PackedSeqParams;
     # Core's config declares CP1. See the source-guard/MRO/rope contracts.
     if torch.cuda.is_available() and set(config.csa_compress_ratios) & {1, 2}:
         require_native_hadamard()
@@ -170,14 +151,7 @@ def core_groups(state, release):
 
 
 def attach_ratio_two_sources(attention, *, compressor, indexer):
-    """Attach DS4.1 sources that Core dev 7b150acf does not construct at ratio 2.
-
-    Core CompressedSparseAttention.forward/_forward_thd/_forward_thd_cp
-    consume these module attributes for ratio > 1. Its constructor only builds
-    an indexer at ratio 4. Keep the literal DS4.1 ratio and native forward;
-    do not select the unrelated DSv4 ratio-4 pooling or duplicate CP code.
-    Ratio 1 is deliberately excluded: Core's forward cannot consume it.
-    """
+    """Attach DS4.1 sources that Core dev 7b150acf does not construct at ratio 2."""
     if attention.compress_ratio != 2:
         raise ValueError("DS4.1 source attachment currently supports only literal ratio 2")
     if compressor is None or indexer is None:
@@ -192,13 +166,7 @@ def attach_ratio_two_sources(attention, *, compressor, indexer):
 
 
 def freeze_indexer_sources(indexer, *, loss_coefficient):
-    """Register intentionally unused indexer gradients in standard post-training.
-
-    Discrete index selection contributes no differentiable LP loss and this
-    recipe has no auxiliary indexer loss. Only the indexer's registered source
-    parameters are frozen; a main-KV owner must be a non-owning reference.
-    This is an explicit post-training policy, not an inferred official trainer.
-    """
+    """Register intentionally unused indexer gradients in standard post-training."""
     if loss_coefficient != 0:
         raise ValueError("DS4.1 standard post-training does not implement indexer auxiliary loss")
     names = tuple(name for name, _ in indexer.named_parameters())

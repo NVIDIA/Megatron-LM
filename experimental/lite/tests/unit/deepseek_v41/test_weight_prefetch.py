@@ -65,17 +65,8 @@ def test_prefetch_weights_matches_synchronous_load_and_gpu_memory(tmp_path):
             del model, bundle, actual, value, memory
             gc.collect()
             torch.cuda.empty_cache()
-        assert (
-            peaks[1] <= peaks[0] + 16 * 1024**2
-        )  # native payload scratch, not a second model/table
-        (tmp_path / 'prefetch-memory.json').write_text(
-            json.dumps(
-                {
-                    'synchronous_peak_bytes': peaks[0],
-                    'prefetch_peak_bytes': peaks[1],
-                    'state': 'all parameter/persistent buffer native bits equal',
-                }
-            )
-        )
+        assert peaks[1] <= peaks[0] + (16 << 20)
+        metrics = dict(zip(("synchronous_peak_bytes", "prefetch_peak_bytes"), peaks))
+        (tmp_path / "prefetch-memory.json").write_text(json.dumps(metrics))
     finally:
         dist.destroy_process_group()

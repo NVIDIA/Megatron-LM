@@ -59,7 +59,7 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     load_hf_weights(model, str(tmp_path), cfg, ps)
     assert torch.equal(model.layers["0"].attn_norm.weight, torch.ones(4))
     assert torch.equal(model.embed.weight, torch.full((2, 4), 2.0))  # dequantized
-    from megatron.lite.model.deepseek_v41.lite.checkpoint import _sharded_state
+    from megatron.lite.primitive.ckpt.row_state import _sharded_state
 
     unequal = torch.nn.Module()
     unequal.lookup = SimpleNamespace(
@@ -109,22 +109,3 @@ def test_native_fp4_fp8_gpu_decode_matches_cpu_bits(tmp_path):
                 assert torch.equal(
                     cpu.to(dtype).view(torch.uint8), gpu.to(dtype).cpu().view(torch.uint8)
                 )
-
-
-def test_native_row_reads_keep_owned_bytes_across_shards(tmp_path):
-    from megatron.lite.primitive.ckpt.row_reader import RowSliceReader as SafeTensorReader
-
-    tensors = {
-        "weight": torch.arange(128, dtype=torch.uint8).reshape(8, 16).view(torch.float8_e4m3fn),
-        "scale": torch.arange(16, dtype=torch.uint8).reshape(8, 2).view(torch.float8_e8m0fnu),
-    }
-    for key, value in tensors.items():
-        save_file({key: value}, tmp_path / f"{key}.safetensors")
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {k: f"{k}.safetensors" for k in tensors}})
-    )
-    with SafeTensorReader(tmp_path) as reader:
-        rows = reader.get_row_tensors([(k, 3, 6) for k in tensors])
-    for key, value in rows.items():
-        assert value.dtype == tensors[key].dtype and value.shape[0] == 3
-        assert torch.equal(value.view(torch.uint8), tensors[key][3:6].view(torch.uint8))

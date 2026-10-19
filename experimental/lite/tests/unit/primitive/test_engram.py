@@ -27,7 +27,7 @@ def test_release_load_table_allocates_exact_host_bytes_without_random_init(monke
 
 def _worker(rank, root):
     from megatron.core import dist_checkpointing
-    from megatron.lite.model.deepseek_v41.lite.checkpoint import attach_checkpoint_metadata
+    from megatron.lite.primitive.ckpt.row_state import attach_checkpoint_metadata
 
     torch.cuda.set_device(rank)
     store = f"file://{root}/store"

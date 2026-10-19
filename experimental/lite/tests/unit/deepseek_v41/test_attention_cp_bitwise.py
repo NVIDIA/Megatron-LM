@@ -49,6 +49,13 @@ def _worker(rank, root, cp):
     total, width = BOUNDS[-1], model.config.hidden_size
     rows = slice(ps.cp_rank * total // cp, (ps.cp_rank + 1) * total // cp)
     layers = [model.layers[str(i)] for i in range(len(model.layers))]
+    index_calls = {i: [] for i, ratio in enumerate(model.config.csa_compress_ratios) if ratio == 2}
+    hooks = [
+        layers[i].attention.core_attention.native.indexer.linear_wq_b.register_forward_hook(
+            lambda module, args, output, i=i: index_calls[i].append(1)
+        )
+        for i in index_calls
+    ]
     generator = torch.Generator(device="cuda").manual_seed(11)
     draw = lambda: torch.randn(total, 1, width, device="cuda", generator=generator)
     inputs = [draw().bfloat16()[rows].clone().requires_grad_() for _ in layers]
@@ -82,6 +89,8 @@ def _worker(rank, root, cp):
         assert t.grad is not None or geometry[:1] in (("index_k",), ("ratio1_index_k",)), key
     for t in [x.grad for x in inputs] + [t.grad for _, t in sources if t.grad is not None]:
         assert torch.isfinite(t).all() and t.count_nonzero(), "input or source gradient"
+    assert index_calls and all(len(v) == 2 for v in index_calls.values()), index_calls
+    [hook.remove() for hook in hooks]
     weights = {}
     for index, layer in enumerate(layers):
         for name, value in layer.attention.named_parameters():
