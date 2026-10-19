@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.utils import _validate_dsa_kernel_backend_dependencies
 from megatron.lite.model.deepseek_v41.topology import validate_build
 
 
@@ -48,6 +49,7 @@ def core_config(
     Core validates the backend and its dependencies.
     """
     reject_native_recompute(recompute_granularity, recompute_method)
+    _validate_dsa_kernel_backend_dependencies(attention_backend)
     validate_build(release, context_parallel_size=parallel.cp)
     if parallel.tp != 1 or parallel.etp not in (None, 1):
         raise ValueError("DS4.1 native Hybrid attention requires TP=ETP=1")
