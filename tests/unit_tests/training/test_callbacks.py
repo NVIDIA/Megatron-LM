@@ -533,6 +533,8 @@ class TestValidEvents:
             "on_train_step_start",
             "on_train_step_end",
             "on_log",
+            "on_tensorboard_log",
+            "on_checkpoint_saved",
             "on_train_end",
             "on_eval_start",
             "on_eval_step_start",

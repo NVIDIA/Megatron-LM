@@ -563,11 +563,13 @@ def _default_config_from_args(
         return kwargs
 
 
-def resolve_tokenizer_vocab_size(cfg: PretrainConfigContainer, padded_vocab_size: int | None) -> None:
+def resolve_tokenizer_vocab_size(
+    cfg: PretrainConfigContainer | InferenceConfigContainer, padded_vocab_size: int | None
+) -> None:
     """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
 
     Args:
-        cfg: Previously constructed training configuration. Explicit model
+        cfg: Previously constructed run configuration. Explicit model
             vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
         padded_vocab_size: Final size resolved by tokenizer initialization,
             including any CLI/checkpoint override. None is valid only when the
@@ -617,6 +619,7 @@ def gpt_config_from_args(
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
 
+    kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = import_module(args.spec)
 
@@ -705,6 +708,7 @@ def hybrid_config_from_args(
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
 
+    kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if transformer_cfg.transformer_impl == "inference_optimized":
         assert (
             not transformer_cfg.inference_fuse_tp_communication
@@ -790,7 +794,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
 
     optim_cfg, _ = get_megatron_optimizer_config(args)
-    ddp_config = get_megatron_ddp_config(args)
+    ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
 
     cfg = PretrainConfigContainer(
         train=_default_config_from_args(TrainingConfig, args),
@@ -799,7 +803,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         optimizer=optim_cfg,
         scheduler=_default_config_from_args(SchedulerConfig, args),
         ddp=ddp_config,
-        dist=_default_config_from_args(DistributedInitConfig, args),
+        dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
@@ -864,7 +868,7 @@ def inference_cfg_container_from_args(
         model=model_cfg,
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         inference=inference_cfg_from_args(args),
-        dist=_default_config_from_args(DistributedInitConfig, args),
+        dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
