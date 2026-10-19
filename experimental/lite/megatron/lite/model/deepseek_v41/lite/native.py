@@ -8,8 +8,19 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.lite.model.deepseek_v41.topology import validate_build
 
 
-def core_config(release, parallel, *, initialize=True):
+def reject_native_recompute(granularity, method):
+    if granularity is not None or method is not None:
+        raise ValueError(
+            "DS4.1 layer recomputation must use KVSourceState.checkpoint; "
+            "Core recompute_granularity/recompute_method bypass shared-source tensor inputs"
+        )
+
+
+def core_config(
+    release, parallel, *, initialize=True, recompute_granularity=None, recompute_method=None
+):
     """Validate unsupported topology before groups or large tensors are created."""
+    reject_native_recompute(recompute_granularity, recompute_method)
     validate_build(release, context_parallel_size=parallel.cp)
     if parallel.tp != 1 or parallel.etp not in (None, 1):
         raise ValueError("DS4.1 native Hybrid attention requires TP=ETP=1")
@@ -22,6 +33,7 @@ def core_config(release, parallel, *, initialize=True):
         tensor_model_parallel_size=1,
         context_parallel_size=parallel.cp,
         cp_partition_mode="contiguous",
+        sequence_packing_scheduler="dp_balanced",
         pipeline_model_parallel_size=parallel.pp,
         expert_model_parallel_size=parallel.ep,
         expert_tensor_parallel_size=1,

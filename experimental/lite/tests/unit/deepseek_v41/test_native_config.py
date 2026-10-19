@@ -66,3 +66,20 @@ def test_native_core_configuration_is_bf16_and_keeps_literal_ratios():
     assert not config.deterministic_mode and not config.moe_router_fusion
     assert config.moe_router_score_function == "sqrtsoftplus"
     assert config.moe_token_dispatcher_type == "alltoall"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"recompute_granularity": "full"},
+        {"recompute_granularity": "selective"},
+        {"recompute_method": "uniform"},
+        {"recompute_method": "block"},
+    ],
+)
+def test_native_recompute_rejected_before_core_build(overrides):
+    from megatron.lite.model.deepseek_v41.lite.native import core_config
+    from megatron.lite.runtime.contracts import ParallelConfig
+
+    with pytest.raises(ValueError, match="must use KVSourceState.checkpoint"):
+        core_config(DeepseekV41Config(num_hidden_layers=4), ParallelConfig(), **overrides)

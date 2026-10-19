@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from megatron.core.transformer.hyper_connection import HyperConnectionModule, native_h_post_bda
+from megatron.lite.model.deepseek_v41.lite.native import reject_native_recompute
 
 
 class DS41Block(nn.Module):
@@ -17,6 +18,7 @@ class DS41Block(nn.Module):
 
     def __init__(self, config, layer_number, attention, ffn):
         super().__init__()
+        reject_native_recompute(config.recompute_granularity, config.recompute_method)
         self.attention, self.ffn = attention, ffn
         self.attn_mixes = HyperConnectionModule(config, layer_number)
         self.ffn_mixes = HyperConnectionModule(config, layer_number)
@@ -29,7 +31,31 @@ class DS41Block(nn.Module):
         )
         self.copies, self.width = config.num_residual_streams, config.hidden_size
 
-    def forward(self, hidden, pre_mix, *, packed_seq_params, input_ids=None):
+    def forward(
+        self,
+        hidden,
+        pre_mix,
+        *,
+        packed_seq_params,
+        input_ids=None,
+        source_state=None,
+        recompute=False,
+    ):
+        if recompute and torch.is_grad_enabled():
+            if source_state is None:
+                raise ValueError("DS4.1 layer recomputation requires explicit source_state")
+            return source_state.checkpoint(
+                lambda h, pre: self._forward(
+                    h, pre, packed_seq_params=packed_seq_params, input_ids=input_ids
+                ),
+                hidden,
+                pre_mix,
+            )
+        return self._forward(
+            hidden, pre_mix, packed_seq_params=packed_seq_params, input_ids=input_ids
+        )
+
+    def _forward(self, hidden, pre_mix, *, packed_seq_params, input_ids=None):
         shape = hidden.shape
         flat = hidden.reshape(*shape[:2], -1)
         dtype = hidden.dtype

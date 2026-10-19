@@ -343,7 +343,8 @@ def test_ds41_query_projection_contract():
     )
     assert torch.equal(q, expected)
     assert not torch.allclose(q.square().mean(-1), torch.ones(8, 1))
-    assert original is x and torch.equal(k, v)
+    assert original.data_ptr() == x.data_ptr() and original.shape == (8, 4)
+    assert torch.equal(k, v)
     (q.square().mean() + k.square().mean()).backward()
     assert torch.isfinite(x.grad).all()
 
@@ -497,3 +498,48 @@ def test_query_projection_parent_without_per_head_rms_is_bitwise(halo):
     assert len(actual) == len(reference) == (6 if halo else 5)
     for ours, core in zip(actual, reference):
         assert torch.equal(ours, core)
+
+
+def test_shifted_block_uses_explicit_source_checkpoint(cpu_core_checkpoint):
+    from megatron.lite.model.deepseek_v41.lite.block import DS41Block
+
+    modes = []
+
+    class Sublayer(torch.nn.Linear):
+        def forward(self, x, **kwargs):
+            modes.append(torch.is_grad_enabled())
+            return super().forward(x), None
+
+    config = SimpleNamespace(
+        hidden_size=4,
+        num_residual_streams=2,
+        mhc_sinkhorn_iterations=3,
+        mhc_init_gating_factor=1.0,
+        sequence_parallel=False,
+        use_fused_mhc=False,
+        perform_initialization=True,
+        layernorm_epsilon=1e-6,
+        params_dtype=torch.float32,
+        recompute_granularity=None,
+        recompute_method=None,
+    )
+    block = DS41Block(config, 1, Sublayer(4, 4, bias=False), Sublayer(4, 4, bias=False))
+    x = torch.randn(3, 1, 2, 4, requires_grad=True)
+    pre = torch.tensor([1.0, 0.0]).expand(3, 1, 2)
+    expected = block(x, pre, packed_seq_params=None)
+    (expected[0].square().sum() + expected[1].sum()).backward()
+    expected_grad = {name: parameter.grad.clone() for name, parameter in block.named_parameters()}
+    expected_x_grad = x.grad.clone()
+    block.zero_grad(set_to_none=True)
+    x.grad = None
+    state = KVSourceState()
+    with state.microbatch():
+        actual = block(x, pre, packed_seq_params=None, source_state=state, recompute=True)
+    (actual[0].square().sum() + actual[1].sum()).backward()
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+    assert torch.equal(x.grad, expected_x_grad)
+    assert all(
+        torch.equal(parameter.grad, expected_grad[name])
+        for name, parameter in block.named_parameters()
+    )
+    assert modes == [True, True, False, False, True, True]

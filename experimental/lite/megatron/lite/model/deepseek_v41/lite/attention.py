@@ -91,5 +91,11 @@ class DS41SelfAttention(DSv4HybridSelfAttention):
         )
         boundary_kv = None if boundary_hidden is None else kv[:halo_rows]
         kv = kv[halo_rows:]
-        result = (query.contiguous(), kv.contiguous(), kv.contiguous(), low_q, hidden_states)
+        result = (
+            query.contiguous(),
+            kv.contiguous(),
+            kv.contiguous(),
+            low_q,
+            hidden_states.squeeze(1),
+        )
         return result if boundary_kv is None else result + (boundary_kv.contiguous(),)
