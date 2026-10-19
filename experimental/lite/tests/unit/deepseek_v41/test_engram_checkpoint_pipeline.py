@@ -73,8 +73,13 @@ def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
 
 
 def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
-    names = ["embed.weight", "layers.0.attn_norm.weight", "layers.1.attn_norm.weight", "mtp.x"]
-    save_file({n: torch.ones(4, dtype=torch.bfloat16) for n in names}, tmp_path / "a.safetensors")
+    names = ["layers.0.attn_norm.weight", "layers.1.attn_norm.weight", "mtp.x"]
+    tensors = {n: torch.ones(4, dtype=torch.bfloat16) for n in names}
+    # Quantized release storage: its scale sidecar is read, so it counts as consumed.
+    tensors["embed.weight"] = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
+    tensors["embed.weight_scale_inv"] = torch.full((1, 1), 2.0)
+    save_file(tensors, tmp_path / "a.safetensors")
+    names += ["embed.weight", "embed.weight_scale_inv"]
     index = {"weight_map": {n: "a.safetensors" for n in names}}
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
 
@@ -82,7 +87,7 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
         model, layer = torch.nn.Module(), torch.nn.Module()
         layer.attn_norm = torch.nn.Module()
         layer.attn_norm.weight = torch.nn.Parameter(torch.zeros(4))
-        model.embed, model.embed.weight = torch.nn.Module(), torch.nn.Parameter(torch.zeros(4))
+        model.embed, model.embed.weight = torch.nn.Module(), torch.nn.Parameter(torch.zeros(2, 4))
         model.layers, model.local_layer_range = torch.nn.ModuleDict({"0": layer}), (0, 1)
         model.layout = SimpleNamespace(has_embed=True, has_head=False)
         return model
@@ -91,6 +96,7 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     model = stage()
     load_hf_weights(model, str(tmp_path), cfg, ps)
     assert torch.equal(model.layers["0"].attn_norm.weight, torch.ones(4))
+    assert torch.equal(model.embed.weight, torch.full((2, 4), 2.0))  # dequantized
     unread = stage()
     del unread.embed  # a stage-local release key nobody reads
     with pytest.raises(ValueError, match=r"unread \['embed.weight'\]"):

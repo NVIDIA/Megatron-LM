@@ -144,22 +144,16 @@ def _engram(reader, name, tensor, model):
     return value
 
 
-class _Consumed:
-    """Reader proxy recording every release key a load reads."""
+def _record_reads(reader):
+    """Record every tensor the reader materializes, quantization sidecars included."""
+    keys, read = set(), reader._get_raw_tensor
 
-    def __init__(self, reader):
-        self.reader, self.keys = reader, set()
+    def recording(name, device):
+        keys.add(name)
+        return read(name, device)
 
-    def __getattr__(self, name):
-        return getattr(self.reader, name)
-
-    def get_tensor(self, key, **kwargs):
-        self.keys.add(key)
-        return self.reader.get_tensor(key, **kwargs)
-
-    def _get_raw_tensor(self, key, device):
-        self.keys.add(key)
-        return self.reader._get_raw_tensor(key, device)
+    reader._get_raw_tensor = recording
+    return keys
 
 
 def _stage_keys(index, model, cfg, ps):
@@ -195,8 +189,8 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
         or n.endswith("tid2eid")
     ]
     loaded = []
-    with SafeTensorReader(hf_path) as raw:
-        reader = _Consumed(raw)
+    with SafeTensorReader(hf_path) as reader:
+        read = _record_reads(reader)
         for name, tensor in state:
             if name.endswith(".ape"):
                 if torch.count_nonzero(tensor):
@@ -215,7 +209,7 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
             tensor.copy_(value.to(device=tensor.device, dtype=tensor.dtype))
             loaded.append(name)
         # No silently unmapped state on either side.
-        unread = sorted(_stage_keys(raw.index, model, model_cfg, ps) - reader.keys)
+        unread = sorted(_stage_keys(reader.index, model, model_cfg, ps) - read)
         unloaded = sorted(
             n
             for m, module in model.named_modules()
