@@ -25,8 +25,12 @@ def test_registry_reuses_native_lifecycle_and_dist_opt():
     assert inspect.signature(native.build_model).parameters['_model_class'].default is None
 
 
-def test_unported_attention_provider_is_explicit_not_target_parity():
-    assert DeepseekV41Model._build_attention is NativeModel._build_attention
+def test_attention_provider_keeps_compressed_gap_explicit_and_native_lifecycle():
+    from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
+    from megatron.lite.model.deepseek_v41.vllm.attention import SWAAttention
+
+    assert issubclass(SWAAttention, DS41SelfAttention)
+    assert 'ratio>0 Core provisional' in DeepseekV41Model.deployment_providers['attention']
     assert 'NOT_TARGET_PARITY' in DeepseekV41Model.deployment_providers['attention']
     assert DeepseekV41Model.set_input_tensor is NativeModel.set_input_tensor
     assert DeepseekV41Model.forward is NativeModel.forward
