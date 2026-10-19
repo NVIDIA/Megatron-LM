@@ -1341,7 +1341,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     raise RuntimeError(
                         "The installed FlashInfer does not provide "
                         "ActivationType.ClampedRelu2 with clamped_relu2_limit. "
-                        "Install a FlashInfer build containing flashinfer-ai/flashinfer#5696 "
+                        "Install flashinfer-python>=0.7.2 "
                         "or select "
                         "inference_grouped_gemm_backend='torch' or 'vllm'."
                     )

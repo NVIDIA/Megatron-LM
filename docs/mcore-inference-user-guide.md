@@ -487,11 +487,9 @@ On SM10x GPUs, BF16 and MXFP8 experts support the activation `(L * tanh(relu(x) 
 `activation_func_tanh_clamp_scale=L`, `gated_linear_unit=False`,
 and `add_bias_linear=False`. 
 
-Use a FlashInfer build containing [#5696](https://github.com/flashinfer-ai/flashinfer/pull/5696),
-with `ActivationType.ClampedRelu2` and `clamped_relu2_limit` support. This path does not
-support `inference_flashinfer_mxfp8_token_capacity` or `batch_invariant_mode`. 
-
-TODO(helenn): Document a minimum FlashInfer release version.
+Requires FlashInfer >= 0.7.2, with `ActivationType.ClampedRelu2` and
+`clamped_relu2_limit` support. This path does not support
+`inference_flashinfer_mxfp8_token_capacity` or `batch_invariant_mode`.
 
 ### Reading Results
 
