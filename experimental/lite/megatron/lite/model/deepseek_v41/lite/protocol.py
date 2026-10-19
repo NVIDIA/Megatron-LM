@@ -162,6 +162,15 @@ def build_model(model_cfg, *, impl_cfg):
     )
 
 
+def _original_rows(physical, lengths, padded):
+    """Map physical packed rows to the unpadded PackedBatch row; -1 for padding."""
+    starts = torch.cumsum(lengths, 0) - lengths
+    document = torch.searchsorted(padded[1:].to(physical), physical, right=True)
+    offset = physical - padded[document].to(physical)
+    valid = offset < lengths[document]
+    return torch.where(valid, starts[document] + offset, -1), valid
+
+
 def forward_step(model, batch):
     ps = parallel_state_from_model(model)
     lens = batch.sizes().to(device=batch.input_ids.device)
@@ -216,6 +225,10 @@ def forward_step(model, batch):
         if mask is None:
             mask = torch.ones_like(output["log_probs"])
         output["loss"] = -(output["log_probs"] * mask).sum() / denominator
+    if "rows" in output:
+        # Report rows in the caller's unpadded coordinates; padding rows are invalid.
+        output["rows"], valid = _original_rows(output["rows"], lens, original.cu_seqlens_q_padded)
+        output["valid_mask"] = valid & output.get("valid_mask", valid)
     return output
 
 
