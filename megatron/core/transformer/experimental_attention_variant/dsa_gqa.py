@@ -33,6 +33,11 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_using_quantization_scales
 
+try:
+    import deep_select
+except ImportError:
+    deep_select = None
+
 # pylint: disable=line-too-long,missing-class-docstring,missing-function-docstring
 
 
@@ -564,6 +569,16 @@ def _simplified_index_scores(
     )
 
 
+def _deepselect_decode_supported(device: torch.device, topk: int) -> bool:
+    """The pinned DeepSelect CUDA build contains SM100a/SM103a kernels with K <= 4096."""
+    return (
+        deep_select is not None
+        and device.type == "cuda"
+        and 0 < topk <= 4096
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+    )
+
+
 def _simplified_decode_topk(
     scores: torch.Tensor,
     context_lengths: torch.Tensor,
@@ -571,12 +586,37 @@ def _simplified_decode_topk(
     *,
     batch_invariant_mode: bool = False,
 ) -> torch.Tensor:
-    """Select decode tokens, using stable tie breaking only in batch-invariant mode.
+    """Select decode tokens with DeepSelect, falling back to PyTorch on unsupported inputs.
 
-    torch.topk does not fix the order or membership of tied scores when the
-    batch's padded context width changes. A stable order also fixes the sparse
-    attention kernel's floating-point accumulation order for each request.
+    Pass FP32/BF16 scores to DeepSelect without changing their precision. Each
+    row's true end fixes the valid range used for tie breaking across batches,
+    including BF16's batch/width-dependent kernel dispatch. The output order is
+    deterministic but differs from stable argsort's score-then-position order.
+    The PyTorch fallback uses stable argsort only in batch-invariant mode.
     """
+    if scores.numel() == 0:
+        return torch.full((scores.size(0), topk), -1, dtype=torch.int32, device=scores.device)
+    if scores.dtype in (torch.float32, torch.bfloat16) and _deepselect_decode_supported(
+        scores.device, topk
+    ):
+        alignment = deep_select.get_stride_requirement()[0] // scores.element_size()
+        aligned_width = (scores.size(1) + alignment - 1) // alignment * alignment
+        # DeepSelect's CUDA kernels require the padded width to be strictly < 2^23.
+        if aligned_width < 2**23:
+            if scores.stride(1) != 1 or scores.stride(0) % alignment or scores.data_ptr() % 16:
+                scores = F.pad(scores, (0, aligned_width - scores.size(1)), value=-torch.inf)
+            with torch.cuda.device(scores.device):
+                _, indices = deep_select.topk(
+                    scores,
+                    topk,
+                    end=context_lengths.to(torch.int32).contiguous(),
+                    indices_type=torch.int32,
+                    sorted_index=False,
+                    return_value=False,
+                    idx_oob_fill_value=-1,
+                )
+            return indices.contiguous()
+
     if batch_invariant_mode:
         indices = scores.argsort(dim=-1, descending=True, stable=True)[:, :topk].to(torch.int32)
         indices.masked_fill_(indices >= context_lengths[:, None], -1)
@@ -840,6 +880,12 @@ class DSGQACoreAttention(MegatronModule):
                     "The CuTe decode indexer currently supports one query token per request."
                 )
             max_context_length = int(kv_lengths[:num_decode_requests].max().item())
+            if _deepselect_decode_supported(query.device, self.indexer.index_topk):
+                # Write DeepSelect's row alignment padding in the score kernel, avoiding
+                # a full score-buffer copy between the indexer and TopK.
+                alignment = deep_select.get_stride_requirement()[0] // torch.float32.itemsize
+                max_context_length = (max_context_length + alignment - 1) // alignment * alignment
+            decode_context_lengths = kv_lengths[:num_decode_requests].to(torch.int32).contiguous()
             decode_scores = torch.empty(
                 (num_decode_requests, max_context_length), dtype=torch.float32, device=query.device
             )
@@ -847,12 +893,12 @@ class DSGQACoreAttention(MegatronModule):
                 index_q[:num_decode_requests, 0, 0, :].contiguous(),
                 index_key_cache,
                 index_block_table[:num_decode_requests].to(torch.int32).contiguous(),
-                kv_lengths[:num_decode_requests].to(torch.int32).contiguous(),
+                decode_context_lengths,
                 out=decode_scores,
             )
             decode_topk = _simplified_decode_topk(
                 decode_scores,
-                kv_lengths[:num_decode_requests],
+                decode_context_lengths,
                 self.indexer.index_topk,
                 batch_invariant_mode=self.config.batch_invariant_mode,
             )
@@ -865,7 +911,7 @@ class DSGQACoreAttention(MegatronModule):
                 value_cache,
                 block_table[:num_decode_requests].to(torch.int32).contiguous(),
                 decode_topk.contiguous(),
-                kv_lengths[:num_decode_requests].to(torch.int32).contiguous(),
+                decode_context_lengths,
                 self.softmax_scale,
                 out=decode_output,
             )
