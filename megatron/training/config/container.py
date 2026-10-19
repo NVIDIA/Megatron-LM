@@ -34,7 +34,8 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
+from megatron.training.models.build import ModelBuildConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -46,8 +47,42 @@ class ConfigContainerBase:
     Provides sub-config validation and YAML/Dict serialization and deserialization.
     """
 
+    def build_models(self, pg_collection, **kwargs):
+        """Build the declared model with run-owned checkpoint and execution settings."""
+        self.validate()
+        if self.model is None:
+            raise ValueError("A model config is required to build models.")
+        settings = {}
+        if self.model_build.device is not None:
+            settings["device"] = self.model_build.device
+        if self.model_build.wrap_with_ddp is not None:
+            settings["wrap_with_ddp"] = self.model_build.wrap_with_ddp
+        if not self.model_build.mixed_precision:
+            settings["mixed_precision_wrapper"] = None
+        for key, value in settings.items():
+            if key in kwargs and kwargs[key] != value:
+                raise ValueError(f"Build argument {key} conflicts with model_build configuration.")
+            kwargs[key] = value
+        if "checkpoint" in kwargs:
+            raise ValueError("Set container.checkpoint instead of passing a checkpoint override.")
+        kwargs["checkpoint"] = self.checkpoint
+        kwargs.setdefault("use_megatron_fsdp", self.dist.use_megatron_fsdp)
+        kwargs.setdefault("use_torch_fsdp2", self.dist.use_torch_fsdp2)
+        builder = self.model.get_builder_cls()(self.model)
+        return builder.build_distributed_models(pg_collection=pg_collection, **kwargs)
+
     def validate(self) -> None:
         """Run each sub-config's explicit validation before runtime initialization."""
+        dist = getattr(self, "dist", None)
+        model_build = getattr(self, "model_build", None)
+        if model_build is not None and model_build.device is not None and dist is not None:
+            if dist.use_torch_fsdp2 or dist.use_megatron_fsdp:
+                raise ValueError("Explicit device placement conflicts with FSDP-managed placement.")
+        model = getattr(self, "model", None)
+        train = getattr(self, "train", None)
+        if getattr(model, "distillation", None) is not None and train is not None:
+            if train.manual_gc:
+                raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
         rng = getattr(self, "rng", None)
         if rng is not None:
             rng.finalize_model_config(getattr(self, "model", None))
@@ -56,7 +91,7 @@ class ConfigContainerBase:
             validate = getattr(config, "validate", None)
             if callable(validate):
                 validate()
-    
+
     @classmethod
     def from_dict(
         cls: Type[T],
@@ -253,6 +288,7 @@ class ConfigContainerBase:
 class PretrainConfigContainer(ConfigContainerBase):
     """Top-level container holding all configuration objects."""
 
+    model_build: ModelBuildConfig = field(default_factory=ModelBuildConfig)
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     model: HybridModelConfig | GPTModelConfig
@@ -300,6 +336,10 @@ class InferenceConfigContainer(ConfigContainerBase):
     ``OptimizerConfig``, ``SchedulerConfig``, ``ValidationConfig``,
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
+
+    model_build: ModelBuildConfig = field(
+        default_factory=lambda: ModelBuildConfig(wrap_with_ddp=False)
+    )
 
     model: HybridModelConfig | GPTModelConfig
     """Which model to load for inference."""

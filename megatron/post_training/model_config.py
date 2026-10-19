@@ -7,9 +7,13 @@ ModelOpt (layer specs from the ``--export-*`` flags, a few ``TransformerConfig``
 the pre-wrap hooks in ``megatron.post_training.model_hooks``) is attached to the config here.
 """
 
+import dataclasses
 import functools
 import logging
+import os
 from argparse import Namespace
+
+import yaml
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
@@ -17,14 +21,13 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
 )
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.post_training import model_hooks
 from megatron.training import print_rank_0
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.models.distillation import DistillationConfig
 from megatron.training.models.gpt import GPTModelConfig
 from megatron.training.models.hybrid import HybridModelConfig
+from megatron.training.models.transforms import ModelTransformConfig
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,63 @@ def distillation_config_from_args(args: Namespace) -> DistillationConfig | None:
         teacher_ckpt_format=args.export_kd_teacher_ckpt_format,
         kd_cfg=args.export_kd_cfg,
     )
+
+
+def _load_teacher_model_config(distillation: DistillationConfig, args: Namespace) -> Namespace:
+    """Reads teacher config from a file.
+
+    The config provided, either in the teacher checkpoint dir or via ``distillation.teacher_model_config``,
+    should specify any model architecture settings which differ from the main student model's.
+    The field names should match those returned by get_args() and not TransformerConfig.
+    """
+    if distillation.teacher_model_config is not None:
+        config_path = distillation.teacher_model_config
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Teacher model-config file ({config_path}) not found.")
+    else:
+        config_path = os.path.join(distillation.teacher_load, "model_config.yaml")
+        if not os.path.exists(config_path):
+            logger.warning(
+                "No teacher config provided via --export-kd-teacher-model-config nor found at"
+                f" {distillation.teacher_load}/model_config.yaml. Assuming teacher model architecture same as student's."
+            )  # Useful for cases like QAD
+            config_path = None
+
+    args_dict = vars(args).copy()
+
+    if config_path is not None:
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+
+        del args_dict["kv_channels"]  # not recalculated if present
+        # Setting teacher Flextron fields to false if training with Flextron, can be overridden
+        if "flextron" in args_dict:
+            args_dict["flextron"] = False
+        if "enable_router" in args_dict:
+            args_dict["enable_router"] = False
+        if "freeze_model" in args_dict:
+            args_dict["freeze_model"] = False
+
+        args_dict.update(config)
+
+    # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
+    if (
+        args_dict.get('hybrid_override_pattern') is not None
+        and args_dict.get('hybrid_layer_pattern') is None
+    ):
+        args_dict['hybrid_layer_pattern'] = args_dict['hybrid_override_pattern']
+
+    return Namespace(**args_dict)
+
+
+def modelopt_mtp_layer_spec(model_config: GPTModelConfig):
+    """Keep MTP on the standard decoder spec, independently of ModelOpt decoder quantization."""
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
+
+    config = model_config.transformer
+    return get_gpt_decoder_layer_specs(
+        config, use_transformer_engine=config.transformer_impl == "transformer_engine"
+    )[-1]
 
 
 def modelopt_gpt_layer_spec(
@@ -166,6 +226,7 @@ def modelopt_model_config_from_args(
         model_config = gpt_config_from_args(
             args, config=transformer_config, vocab_size_from_tokenizer=vocab_size_from_tokenizer
         )
+        model_config.mtp_layer_spec = modelopt_mtp_layer_spec
         model_config.transformer_layer_spec = functools.partial(
             modelopt_gpt_layer_spec,
             default_te_spec=args.export_default_te_spec,
@@ -212,18 +273,6 @@ def modelopt_model_config_from_args(
 
     model_config.distillation = distillation_config_from_args(args)
 
-    # Registered in dependency order; see the ``megatron.post_training.model_hooks`` docstring.
-    # ``model_config.restore_modelopt_state`` is deliberately left unset: the restore hook below
-    # owns restoration, and a runner that also honored the flag would restore a second time,
-    # after the KD conversion, where ModelOpt silently skips it.
-    init_meta = model_config.transformer.init_model_with_meta_device
-
-    def register(hook):
-        model_config.pre_wrap_hooks.append(model_hooks.on_model_init_device(hook, init_meta))
-
-    if args.load is not None:
-        register(model_hooks.restore_modelopt_state_hook(args.load))
-
     qad_train_target = getattr(args, 'qad_train_target', None)
     if args.freeze_base_for_mtp:
         if qad_train_target not in (None, 'mtp'):
@@ -232,30 +281,68 @@ def modelopt_model_config_from_args(
                 f"conflicts with --qad-train-target {qad_train_target}"
             )
         qad_train_target = 'mtp'
-    if qad_train_target is not None:
-        register(model_hooks.qad_freeze_hook(qad_train_target))
-
-    register(model_hooks.lsq_hook(getattr(args, "lsq_scale_lr", None)))
-    if args.export_te_mcore_model:
-        register(model_hooks.te_load_state_dict_hook())
+    model_config.transformations = ModelTransformConfig(
+        qad_train_target=qad_train_target,
+        lsq_scale_lr=getattr(args, "lsq_scale_lr", None),
+        te_mcore_model=args.export_te_mcore_model,
+    )
     if model_config.distillation is not None:
-        # Must stay last: the restore (and any freeze) has to see the un-converted student.
-        register(model_hooks.kd_convert_hook(model_config, args, args.export_te_mcore_model))
+        teacher_args = _load_teacher_model_config(model_config.distillation, args)
+        overrides = {}
+        if isinstance(model_config, HybridModelConfig):
+            overrides["hybrid_layer_pattern"] = teacher_args.hybrid_layer_pattern
+        model_config.distillation.teacher_model = dataclasses.replace(
+            model_config,
+            transformer=core_transformer_config_from_args(teacher_args),
+            transformations=None,
+            distillation=None,
+            pre_wrap_hooks=[],
+            post_wrap_hooks=[],
+            **overrides,
+        )
 
     return model_config
 
 
-def build_modelopt_models(
-    args: Namespace, *, disable_moe_grouped_gemm: bool = False, **build_kwargs
-) -> list:
-    """Build the (non-DDP-wrapped by default) model stages for a ModelOpt script.
+def modelopt_inference_config_from_args(
+    args: Namespace,
+    *,
+    disable_moe_grouped_gemm: bool = False,
+    device: str = "cuda",
+    mixed_precision: bool = True,
+):
+    """Translate CLI once; build later from the populated inference run container.
 
-    ``build_kwargs`` are forwarded to ``ModelBuilder.build_distributed_models``.
+    Tokenizer vocabulary is finalized after runtime services initialize. Legacy
+    services can still use get_args(); model construction uses this container.
     """
-    model_config = modelopt_model_config_from_args(
-        args, disable_moe_grouped_gemm=disable_moe_grouped_gemm
+    from megatron.training.argument_utils import inference_cfg_container_from_args
+    from megatron.training.models.build import ModelBuildConfig
+
+    if args.init_model_with_meta_device:
+        args.use_cpu_initialization = True
+    model = modelopt_model_config_from_args(
+        args, disable_moe_grouped_gemm=disable_moe_grouped_gemm, vocab_size_from_tokenizer=True
     )
-    build_kwargs.setdefault("wrap_with_ddp", False)
-    return model_config.get_builder_cls()(model_config).build_distributed_models(
-        ProcessGroupCollection.use_mpu_process_groups(), **build_kwargs
+    cfg = inference_cfg_container_from_args(args, model_cfg=model)
+    cfg.model_build = ModelBuildConfig(
+        device=device, wrap_with_ddp=False, mixed_precision=mixed_precision
     )
+    return cfg
+
+
+def build_modelopt_models(args: Namespace) -> list:
+    """Bridge legacy inference callers that initialize a run container without a model.
+
+    New entry points should translate with modelopt_inference_config_from_args
+    before initialization and call cfg.build_models directly.
+    """
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.training.global_vars import get_run_config
+
+    cfg = get_run_config()
+    if cfg.model is None or cfg.model.transformations is None:
+        translated = modelopt_inference_config_from_args(args)
+        cfg.model = translated.model
+        cfg.model_build = translated.model_build
+    return cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())

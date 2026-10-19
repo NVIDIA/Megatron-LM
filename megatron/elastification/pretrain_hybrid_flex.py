@@ -49,16 +49,18 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+from megatron.training.argument_utils import (
+    pretrain_cfg_container_from_args,
+    resolve_tokenizer_vocab_size,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from megatron.training.global_vars import (
     get_run_config,
     initialize_runtime_services,
     set_run_config,
 )
+from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 
 # modelopt distillation
 try:
@@ -93,8 +95,7 @@ def _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collecti
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     builder = model_config.get_builder_cls()(model_config)
     models = [builder.build_model(pg_collection, pre_process, post_process, vp_stage)]
-    for hook in model_config.pre_wrap_hooks:
-        models = hook(models)
+    models = builder.pre_wrap_hook(get_run_config().checkpoint)(models)
     return models[0]
 
 

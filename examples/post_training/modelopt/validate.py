@@ -12,14 +12,16 @@ import torch
 from modelopt.torch.speculative.plugins.megatron_eagle import MegatronARValidation
 from utils import get_hf_tokenizer
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_config import build_modelopt_models
+from megatron.post_training.model_config import modelopt_inference_config_from_args
 from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_args, initialize_megatron
+from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.config.utils import legacy_checkpoint_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
 
@@ -59,9 +61,9 @@ def add_ar_validation_args(parser):
     return parser
 
 
-def check_arguments():
+def check_arguments(args=None):
     """Checking user arguments."""
-    args = get_args()
+    args = get_args() if args is None else args
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print_rank_0("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
@@ -98,11 +100,13 @@ if __name__ == "__main__":
         })
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    check_arguments(args)
+    cfg = modelopt_inference_config_from_args(args)
+    set_run_config(cfg)
     initialize_runtime_services(args, training=True)
+    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
     initialize_megatron(training=True)
 
-    check_arguments()
 
     args = get_args()
 
@@ -120,12 +124,13 @@ if __name__ == "__main__":
         ground_truth = [None for _ in range(len(prompts))]
 
     tokenizer = get_hf_tokenizer()
-    model = build_modelopt_models(args)
+    model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
 
     report_current_memory_info()
 
-    if args.load is not None:
-        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
+    if cfg.checkpoint.load is not None:
+        with legacy_checkpoint_args():
+            load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
 

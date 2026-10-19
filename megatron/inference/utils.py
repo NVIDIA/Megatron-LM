@@ -27,8 +27,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import log_single_rank, unwrap_model
-from megatron.training import get_args
-from megatron.training import get_tokenizer, get_wandb_writer
+from megatron.training import get_args, get_tokenizer, get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import (
     get_checkpoint_name,
@@ -144,10 +143,16 @@ def _warn_on_unloaded_checkpoint_tensors(args: Namespace, requested_keys: set) -
 def get_model_for_inference() -> MegatronModule:
     """Initialize model and load checkpoint for inference."""
 
-    args = get_args()
+    from megatron.training.config.utils import legacy_checkpoint_args
+    from megatron.training.global_vars import get_run_config
 
-    if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
-        # ModelOpt layer specs and hooks come from the config; the builder is the stock one.
+    args = get_args()
+    cfg = get_run_config()
+    if cfg.model is not None and (
+        cfg.model.transformations is not None or cfg.model.distillation is not None
+    ):
+        model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+    elif HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
         model = build_modelopt_models(args)
     else:
         builder = get_model_builder(args)
@@ -156,19 +161,21 @@ def get_model_for_inference() -> MegatronModule:
             pg_collection=pg_collection, wrap_with_ddp=False
         )
 
-    # Load checkpoint.
-    assert args.load is not None
+    # Checkpoint loading still uses legacy args; location/format belong to the run.
+    checkpoint = cfg.checkpoint
+    assert checkpoint.load is not None
     requested_keys = set()
     args.exit_on_missing_checkpoint = True
-    load_checkpoint(
-        ddp_model=model,
-        optimizer=None,
-        opt_param_scheduler=None,
-        strict=not args.inference_ckpt_non_strict,
-        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
-    )
-    if requested_keys:
-        _warn_on_unloaded_checkpoint_tensors(args, requested_keys)
+    with legacy_checkpoint_args(args, checkpoint):
+        load_checkpoint(
+            ddp_model=model,
+            optimizer=None,
+            opt_param_scheduler=None,
+            strict=not args.inference_ckpt_non_strict,
+            model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
+        )
+        if requested_keys:
+            _warn_on_unloaded_checkpoint_tensors(args, requested_keys)
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"

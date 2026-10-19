@@ -43,7 +43,7 @@ def get_args():
 
 
 def get_run_config():
-    """Return the full pretrain config container."""
+    """Return the active training or inference run config container."""
     _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
     return _GLOBAL_RUN_CONFIG
 

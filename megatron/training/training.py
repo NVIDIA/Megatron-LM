@@ -190,13 +190,13 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
     get_wandb_writer,
-    get_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -2547,14 +2547,8 @@ def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_b
     elif freeze_base_model_for_mtp:
         freeze_hook = _freeze_base_model_for_mtp
 
-    hooks = model_config.pre_wrap_hooks
-    if freeze_hook is not None and freeze_hook not in hooks:
-        # A ModelOpt KD conversion hook must stay last so the freeze applies to the plain student.
-        kd_index = next(
-            (i for i, hook in enumerate(hooks) if getattr(hook, "modelopt_kd_convert", False)),
-            len(hooks),
-        )
-        hooks.insert(kd_index, freeze_hook)
+    if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
+        model_config.pre_wrap_hooks.append(freeze_hook)
 
 
 def _forward_backward_grad_context(args):
@@ -2937,8 +2931,6 @@ def setup_model_and_optimizer(
 
             cfg = cfg_container
             model_config = cfg.model
-            builder_cls = model_config.get_builder_cls()
-            builder = builder_cls(model_config)
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
@@ -2948,7 +2940,7 @@ def setup_model_and_optimizer(
                 freeze_base_model_for_mtp=args.freeze_base_model_for_mtp,
             )
 
-            return builder.build_distributed_models(
+            return cfg.build_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
@@ -3104,14 +3096,21 @@ def setup_model_and_optimizer(
             optimizer.reload_model_params()
         print_rank_0(f'Upcycled checkpoint saved to {args.save}')
 
+    checkpoint_config = getattr(cfg_container, "checkpoint", None)
+    load_dir = checkpoint_config.load if checkpoint_config is not None else args.load
     if (
-        args.load is not None or args.pretrained_checkpoint is not None
+        load_dir is not None or args.pretrained_checkpoint is not None
     ) and not args.moe_use_upcycling:
         one_logger and one_logger.log_metrics(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
-        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load', is_goodput_span=True):
+        from megatron.training.config.utils import legacy_checkpoint_args
+
+        with (
+            _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load', is_goodput_span=True),
+            legacy_checkpoint_args(args, checkpoint_config),
+        ):
 
             ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
             args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
@@ -3157,7 +3156,12 @@ def setup_model_and_optimizer(
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
 
-        load_kd_teacher_checkpoint(model)
+        model_config = getattr(cfg_container, "model", None)
+        load_kd_teacher_checkpoint(
+            model,
+            getattr(model_config, "distillation", None),
+            student_checkpoint=getattr(cfg_container, "checkpoint", None),
+        )
 
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the

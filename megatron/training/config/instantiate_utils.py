@@ -47,9 +47,13 @@ _DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = (
     "signal.",
 )
 
-_DEFAULT_ALLOWED_EXACT: frozenset[str] = frozenset({
-    "functools.partial",
-})
+_DEFAULT_ALLOWED_EXACT: frozenset[str] = frozenset(
+    {
+        "functools.partial",
+        "megatron.post_training.model_config.modelopt_gpt_layer_spec",
+        "megatron.post_training.model_config.modelopt_mtp_layer_spec",
+    }
+)
 
 
 class TargetAllowlist:
@@ -292,6 +296,20 @@ def instantiate_node(
         if _is_target(node):
             should_call_target = node.get(_Keys.CALL, True)
             _target_ = _resolve_target(node.get(_Keys.TARGET), full_key, check_callable=should_call_target)
+            builder_path = node.get("_builder_")
+            if builder_path is not None:
+                from megatron.training.models.base import ModelBuilder, ModelConfig
+
+                if not isinstance(_target_, type) or not issubclass(_target_, ModelConfig):
+                    raise InstantiationException("_builder_ is only valid on a ModelConfig.")
+                builder_cls = _resolve_target(builder_path, full_key, check_callable=True)
+                if not isinstance(builder_cls, type) or not issubclass(builder_cls, ModelBuilder):
+                    raise InstantiationException("_builder_ must resolve to a ModelBuilder class.")
+                if partial or node.get(_Keys.PARTIAL, False):
+                    raise InstantiationException(
+                        "_builder_ cannot be used with partial model configs."
+                    )
+                exclude_keys.add("_builder_")
             kwargs = {}
             is_partial = node.get(_Keys.PARTIAL, False) or partial
 
@@ -316,7 +334,10 @@ def instantiate_node(
             assert callable(_target_)
             # Drop unexpected kwargs in lenient mode or raise in strict mode
             kwargs = _filter_kwargs_for_target(_target_, kwargs, full_key, mode)
-            return _call_target(_target_, partial, args, kwargs, full_key)
+            result = _call_target(_target_, partial, args, kwargs, full_key)
+            if builder_path is not None:
+                result.builder = builder_path
+            return result
         else:
             dict_items = {}
             for key, value in node.items():

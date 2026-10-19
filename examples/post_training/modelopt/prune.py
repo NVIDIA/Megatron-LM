@@ -39,14 +39,16 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     get_tensor_model_parallel_group,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_config import build_modelopt_models
+from megatron.post_training.model_config import modelopt_inference_config_from_args
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, initialize_megatron
+from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.config.utils import legacy_checkpoint_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
 
@@ -178,26 +180,29 @@ if __name__ == "__main__":
     )
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    check_arguments(args)
+    cfg = modelopt_inference_config_from_args(args, disable_moe_grouped_gemm=True)
+    set_run_config(cfg)
     initialize_runtime_services(args, training=True)
+    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
     initialize_megatron(training=True)
 
     args = get_args()
-    check_arguments(args)
 
     tokenizer = get_hf_tokenizer()
     # Pruning operates on per-expert linears (which only exist as separate modules under
     # SequentialMLP, not the packed-tensor TEGroupedMLP). `disable_moe_grouped_gemm=True`
     # forces the export spec to SequentialMLP so mtp.prune can act on individual experts.
     # Other example scripts (quantize.py, generate.py, finetune.py) keep the default.
-    model = build_modelopt_models(args, disable_moe_grouped_gemm=True)
+    model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
     unwrapped_model = unwrap_model(model)[0]
     print_rank_0(f"Original Model: {unwrapped_model}")
 
     report_current_memory_info()
 
-    if args.load is not None:
-        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
+    if cfg.checkpoint.load is not None:
+        with legacy_checkpoint_args():
+            load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:

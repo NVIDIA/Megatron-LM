@@ -229,6 +229,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        device: torch.device | str | None = None,
+        checkpoint=None,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -241,6 +243,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             use_torch_fsdp2: Whether to use Torch FSDP 2.0
             wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
             data_parallel_random_init: Whether to use data parallel random initialization
+            device: Explicit final device, including for meta materialization; None keeps the default.
+            checkpoint: Run-owned checkpoint config used for pre-wrap transformation restoration.
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
@@ -251,7 +255,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             List of model stages.
         """
         transformer_config = self._model_config.transformer
-        composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
+        composed_pre_wrap_hook = self.pre_wrap_hook(checkpoint)
         model_list = unimodal_build_distributed_models(
             self.build_model,
             transformer_config,
@@ -267,6 +271,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
+            device=device,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

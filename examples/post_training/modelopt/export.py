@@ -12,13 +12,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import modelopt.torch.export as mtex
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_config import build_modelopt_models
+from megatron.post_training.model_config import modelopt_inference_config_from_args
 from megatron.training import get_args
+from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.config.utils import legacy_checkpoint_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 
@@ -67,8 +69,11 @@ if __name__ == "__main__":
     )
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    args.use_cpu_initialization = True
+    cfg = modelopt_inference_config_from_args(args, device="cpu")
+    set_run_config(cfg)
     initialize_runtime_services(args, training=True)
+    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
     initialize_megatron(training=True)
 
     args = get_args()
@@ -77,7 +82,6 @@ if __name__ == "__main__":
     # Meta device initialization is used such that models can be materialized in low-precision
     # directly when ModelOpt real quant is used. Otherwise, the model is first initialized
     # as BF16 in memory which may result in OOM and defeat the purpose of real quant.
-    args.use_cpu_initialization = True
     if not args.init_model_with_meta_device:
         warnings.warn(
             "--init-model-with-meta-device is not set. If you would like to resume the "
@@ -86,17 +90,15 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = build_modelopt_models(args)
+    model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
 
-    # Materialize the model from meta device to cpu before loading the checkpoint.
     unwrapped_model = unwrap_model(model)[0]
-    unwrapped_model.to_empty(device="cpu")
 
-    if args.load is not None and Path(args.load).is_dir():
-        load_checkpoint(model, None, None)
+    if cfg.checkpoint.load is not None and Path(cfg.checkpoint.load).is_dir():
+        with legacy_checkpoint_args():
+            load_checkpoint(model, None, None)
     else:
-        raise ValueError(f"Invalid load checkpoint directory: {args.load}")
-
+        raise ValueError(f"Invalid load checkpoint directory: {cfg.checkpoint.load}")
 
     # Decide whether we are exporting only the extra_modules (e.g. EAGLE3).
     # Only the last pp stage may have extra_modules, hence broadcast from the last rank.

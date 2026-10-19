@@ -159,6 +159,9 @@ class GPTModelConfig(ModelConfig):
     transformer: TransformerConfig
     transformer_layer_spec: ModuleSpec | Callable[["GPTModelConfig"], ModuleSpec] | None = None
 
+    mtp_layer_spec: ModuleSpec | Callable[["GPTModelConfig"], ModuleSpec] | None = None
+    """Optional independent transformer layer spec for MTP. Defaults to the decoder spec."""
+
     ### vocab padding related ###
     vocab_size: int | None = None
     """This represents the unpadded vocab size. The padded vocab size is
@@ -353,10 +356,14 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = True,
-        mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+        mixed_precision_wrapper: (
+            Callable[[Any, MegatronModule], MegatronModule] | None
+        ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        device: torch.device | str | None = None,
+        checkpoint=None,
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -369,6 +376,8 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             use_torch_fsdp2: Whether to use Torch FSDP 2.0
             wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
             data_parallel_random_init: Whether to use data parallel random initialization
+            device: Explicit final device, including for meta materialization; None keeps the default.
+            checkpoint: Run-owned checkpoint config used for pre-wrap transformation restoration.
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
@@ -379,7 +388,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             List of model stages.
         """
         transformer_config = self._model_config.transformer
-        composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
+        composed_pre_wrap_hook = self.pre_wrap_hook(checkpoint)
         model_list = unimodal_build_distributed_models(
             self.build_model,
             transformer_config,
@@ -395,6 +404,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
+            device=device,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)
@@ -430,7 +440,11 @@ def mtp_block_spec(
     if config.transformer.mtp_num_layers is not None:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
-        if isinstance(transformer_layer_spec, TransformerBlockSubmodules):
+        if config.mtp_layer_spec is not None:
+            spec = config.mtp_layer_spec
+            if not isinstance(spec, ModuleSpec) and callable(spec):
+                spec = spec(config)
+        elif isinstance(transformer_layer_spec, TransformerBlockSubmodules):
             if transformer_layer_spec.layer_specs:
                 # Reuse the resolved spec: the generic decoder builder rejects experimental attention.
                 spec = transformer_layer_spec.layer_specs[-1]

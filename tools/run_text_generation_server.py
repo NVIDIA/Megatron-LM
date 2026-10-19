@@ -33,7 +33,7 @@ from megatron.training import print_rank_0
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 
 try:
-    from megatron.post_training.model_config import build_modelopt_models
+    from megatron.post_training.model_config import modelopt_inference_config_from_args
 
     HAS_NVIDIA_MODELOPT = True
 except ImportError:
@@ -45,10 +45,13 @@ sys.path.append(
 
 from megatron.core import mpu
 from megatron.training import get_args, get_tokenizer
+from megatron.training.argument_utils import (
+    inference_cfg_container_from_args,
+    resolve_tokenizer_vocab_size,
+)
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
@@ -129,8 +132,16 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    use_modelopt = HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False)
+    cfg = (
+        modelopt_inference_config_from_args(args)
+        if use_modelopt
+        else inference_cfg_container_from_args(args, build_model_config=False)
+    )
+    set_run_config(cfg)
     initialize_runtime_services(args)
+    if use_modelopt:
+        resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
     initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
@@ -148,7 +159,7 @@ def main(model_type: str = "gpt"):
     with load_context:
         if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
             # ModelOpt layer specs and hooks come from the config; the builder is the stock one.
-            model = build_modelopt_models(args)
+            model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
         else:
             builder = get_model_builder(args, provider=model_type)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -156,8 +167,11 @@ def main(model_type: str = "gpt"):
                 pg_collection=pg_collection, wrap_with_ddp=False
             )
 
-    if args.load is not None:
-        _ = load_checkpoint(model, None, None, strict=False)
+    from megatron.training.config.utils import legacy_checkpoint_args
+
+    if cfg.checkpoint.load is not None:
+        with legacy_checkpoint_args():
+            _ = load_checkpoint(model, None, None, strict=False)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]

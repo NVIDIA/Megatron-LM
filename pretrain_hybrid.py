@@ -28,8 +28,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -63,17 +63,18 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from megatron.training.global_vars import (
     get_run_config,
     initialize_runtime_services,
     set_run_config,
 )
+from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
+    from megatron.post_training.loss_func import is_distillation_model
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
     from megatron.post_training.model_config import modelopt_model_config_from_args
     from megatron.post_training.utils import maybe_enable_modelopt
@@ -275,7 +276,9 @@ def loss_func(
             ignore_errors=args.logits_load_ignore_errors,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
-    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+    elif has_nvidia_modelopt and (
+        getattr(args, "modelopt_enabled", False) or is_distillation_model(model)
+    ):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()

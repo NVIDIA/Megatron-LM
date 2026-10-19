@@ -27,6 +27,7 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     read_metadata,
 )
+from megatron.training.models.distillation import DistillationConfig
 from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,9 @@ def get_sharded_load_dir(load_dir: str) -> Optional[Path]:
     return sharded_load_dir
 
 
-def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> None:
+def load_modelopt_state(
+    model: nn.Module, load_dir: Optional[str] = None, *, ckpt_format: str | None = None
+) -> None:
     """Loading modelopt_state without loading the model.
 
     If distributed checkpointing in use, we try to load from the sharded modelopt_state. This will not
@@ -103,15 +106,17 @@ def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> Non
     Args:
         model: the model to load the modelopt_state into
         load_dir: optionally provide a different loading path
+        ckpt_format: explicit checkpoint format; defaults to the runtime format
     """
     args = get_args()
     load_dir = load_dir or args.load
+    ckpt_format = ckpt_format or args.ckpt_format
 
-    if args.ckpt_format == "torch":
+    if ckpt_format == "torch":
         # Non-sharded
         print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
-            state_dict, _, _ = _load_base_checkpoint(args.load, rank0=False)
+            state_dict, _, _ = _load_base_checkpoint(load_dir, rank0=False)
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
             return
@@ -130,22 +135,42 @@ def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> Non
         restore_sharded_modelopt_state([model], sharded_load_dir)
 
 
-def load_kd_teacher_checkpoint(model) -> None:
-    """Load the teacher checkpoint for ModelOpt distillation if the model has one."""
+def load_kd_teacher_checkpoint(
+    model, distillation: DistillationConfig | None = None, *, student_checkpoint=None
+) -> None:
+    """Load teacher weights after wrapping, using configuration or legacy CLI arguments."""
     args = get_args()
-    if not getattr(args, "export_kd_teacher_load", None):
-        return
+    if distillation is None:
+        teacher_load = getattr(args, "export_kd_teacher_load", None)
+        if not teacher_load:
+            return
+        distillation = DistillationConfig(
+            teacher_load=teacher_load,
+            teacher_ckpt_format=getattr(args, "export_kd_teacher_ckpt_format", None),
+        )
 
     teacher = unwrap_model(model[0]).teacher_model
-    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
-    # [WAR]: To avoid error out on loading teacher's checkpoint, we temporarily
-    # set args.finetune to True while loading the teacher checkpoint.
-    original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
-    args.finetune = True
-    if args.export_kd_teacher_ckpt_format is not None:
-        args.ckpt_format = args.export_kd_teacher_ckpt_format
+    print_rank_0(
+        f"Loading teacher as {type(teacher).__name__} from {distillation.teacher_load} ..."
+    )
+    # load_checkpoint still uses runtime args. Adapt only for the duration of this call,
+    # restoring even absent fields and failed loads so the student's state is unchanged.
+    overrides = {
+        "finetune": True,
+        "export_kd_teacher_load": distillation.teacher_load,
+        "ckpt_format": distillation.teacher_ckpt_format
+        or (student_checkpoint.ckpt_format if student_checkpoint is not None else args.ckpt_format),
+    }
+    missing = object()
+    original = {key: getattr(args, key, missing) for key in overrides}
     try:
-        load_checkpoint([teacher], None, None, load_arg='export_kd_teacher_load')
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        load_checkpoint([teacher], None, None, load_arg="export_kd_teacher_load")
     finally:
-        args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
+        for key, value in original.items():
+            if value is missing:
+                delattr(args, key)
+            else:
+                setattr(args, key, value)
     print_rank_0("... teacher loaded successfully.")

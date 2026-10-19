@@ -1,10 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-
 import importlib
 import logging
-from functools import lru_cache
-from dataclasses import is_dataclass
+from contextlib import contextmanager
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
+from functools import lru_cache
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -103,3 +103,44 @@ def _get_init_false_fields(target_class: type) -> frozenset[str]:
         return frozenset()
 
     return frozenset(f.name for f in dataclass_fields(target_class) if not f.init)
+
+
+_ACTIVE_CHECKPOINT = object()
+
+
+@contextmanager
+def legacy_checkpoint_args(args=None, checkpoint=_ACTIVE_CHECKPOINT):
+    """Adapt migrated load location/format to the legacy checkpoint API.
+
+    With no arguments, use the active runtime args and get_run_config().checkpoint.
+    Explicit arguments support isolated callers; checkpoint=None remains a no-op.
+    Other options still come from args during the migration. Restore load
+    location/format even if loading raises.
+    """
+    if checkpoint is None:
+        yield
+        return
+    if args is None:
+        from megatron.training.global_vars import get_args
+
+        args = get_args()
+    if checkpoint is _ACTIVE_CHECKPOINT:
+        from megatron.training.global_vars import get_run_config
+
+        checkpoint = get_run_config().checkpoint
+    if checkpoint is None:
+        yield
+        return
+    missing = object()
+    values = {"load": checkpoint.load, "ckpt_format": checkpoint.ckpt_format}
+    original = {key: getattr(args, key, missing) for key in values}
+    try:
+        for key, value in values.items():
+            setattr(args, key, value)
+        yield
+    finally:
+        for key, value in original.items():
+            if value is missing:
+                delattr(args, key)
+            else:
+                setattr(args, key, value)

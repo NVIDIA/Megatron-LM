@@ -4,27 +4,24 @@
 
 Each ``*_hook`` factory returns a ``list[MegatronModule] -> list[MegatronModule]`` hook that
 runs after the stock GPT/Hybrid builder has built the model stages and before they are
-wrapped (Float16Module / DDP). They are registered, in this order, by
-``megatron.post_training.model_config.modelopt_model_config_from_args``:
+wrapped (Float16Module / DDP). ``modelopt_pre_wrap_hook`` reconstructs them from the
+serializable configuration on each build, in this order:
 
 1. ``restore_modelopt_state_hook``: must come before any hook that converts the model.
 2. ``qad_freeze_hook``
 3. ``lsq_hook``
 4. ``te_load_state_dict_hook``
-5. ``kd_convert_hook``
+5. User ``pre_wrap_hooks`` (including training freezes)
+6. ``kd_convert_hook``
 """
 
 import dataclasses
 import functools
-import logging
-import os
-from argparse import Namespace
 from typing import Callable
 
 import modelopt.torch.distill as mtd
 import modelopt.torch.distill.plugins.megatron as mtd_mcore
 import torch
-import yaml
 
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
@@ -34,24 +31,9 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
 from megatron.post_training.optimizer import install_lsq_optimizer_overrides
 from megatron.training import print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.models.distillation import DistillationConfig
-from megatron.training.models.hybrid import HybridModelConfig
-
-logger = logging.getLogger(__name__)
+from megatron.training.models.base import compose_hooks
 
 PreWrapHook = Callable[[list[MegatronModule]], list[MegatronModule]]
-
-# Student/teacher settings that must agree: the teacher stage runs inside the student's
-# pipeline schedule and exchanges tensors with it.
-_SHARED_STUDENT_TEACHER_ATTRS = (
-    "tensor_model_parallel_size",
-    "pipeline_model_parallel_size",
-    "context_parallel_size",
-    "expert_model_parallel_size",
-    "pipeline_dtype",
-)
-
 
 def on_model_init_device(hook: PreWrapHook, init_model_with_meta_device: bool) -> PreWrapHook:
     """Run ``hook`` under the device context the model stages were built in.
@@ -71,7 +53,7 @@ def on_model_init_device(hook: PreWrapHook, init_model_with_meta_device: bool) -
     return wrapped
 
 
-def restore_modelopt_state_hook(load_dir: str) -> PreWrapHook:
+def restore_modelopt_state_hook(load_dir: str, ckpt_format: str | None = None) -> PreWrapHook:
     """Restore ``modelopt_state`` from ``load_dir`` into each model stage.
 
     [IMPORTANT] This must happen before the model is returned to the caller.
@@ -85,7 +67,7 @@ def restore_modelopt_state_hook(load_dir: str) -> PreWrapHook:
 
     def hook(models: list[MegatronModule]) -> list[MegatronModule]:
         for model in models:
-            load_modelopt_state(model=model, load_dir=load_dir)
+            load_modelopt_state(model=model, load_dir=load_dir, ckpt_format=ckpt_format)
         return models
 
     return hook
@@ -214,68 +196,21 @@ def te_load_state_dict_hook() -> PreWrapHook:
     return hook
 
 
-def _load_teacher_model_config(distillation: DistillationConfig, args: Namespace) -> Namespace:
-    """Reads teacher config from a file.
-
-    The config provided, either in the teacher checkpoint dir or via ``distillation.teacher_model_config``,
-    should specify any model architecture settings which differ from the main student model's.
-    The field names should match those returned by get_args() and not TransformerConfig.
-    """
-    if distillation.teacher_model_config is not None:
-        config_path = distillation.teacher_model_config
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Teacher model-config file ({config_path}) not found.")
-    else:
-        config_path = os.path.join(distillation.teacher_load, "model_config.yaml")
-        if not os.path.exists(config_path):
-            logger.warning(
-                "No teacher config provided via --export-kd-teacher-model-config nor found at"
-                f" {distillation.teacher_load}/model_config.yaml. Assuming teacher model architecture same as student's."
-            )  # Useful for cases like QAD
-            config_path = None
-
-    args_dict = vars(args).copy()
-
-    if config_path is not None:
-        with open(config_path) as f:
-            config = yaml.safe_load(f)
-
-        del args_dict["kv_channels"]  # not recalculated if present
-        # Setting teacher Flextron fields to false if training with Flextron, can be overridden
-        if "flextron" in args_dict:
-            args_dict["flextron"] = False
-        if "enable_router" in args_dict:
-            args_dict["enable_router"] = False
-        if "freeze_model" in args_dict:
-            args_dict["freeze_model"] = False
-
-        args_dict.update(config)
-
-    # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
-    if (args_dict.get('hybrid_override_pattern') is not None
-            and args_dict.get('hybrid_layer_pattern') is None):
-        args_dict['hybrid_layer_pattern'] = args_dict['hybrid_override_pattern']
-
-    return Namespace(**args_dict)
-
-
-def _build_teacher(student_model_config, teacher_config_raw: Namespace, teacher_transformer, model):
-    """Build the teacher stage matching ``model`` with the same builder class as the student."""
-    overrides = {}
-    if isinstance(student_model_config, HybridModelConfig):
-        # Note: hybrid_override_pattern is remapped to hybrid_layer_pattern in
-        # _load_teacher_model_config, so teacher_config_raw.hybrid_layer_pattern is always set here.
-        overrides["hybrid_layer_pattern"] = teacher_config_raw.hybrid_layer_pattern
-
-    # Only the architecture differs from the student. Layer specs given as callables
-    # (e.g. the ModelOpt GPT spec) are re-evaluated against the teacher's transformer config.
+def _build_teacher(student_model_config, model):
+    """Build the resolved teacher architecture on the same pipeline stage as the student."""
+    teacher_model_config = student_model_config.distillation.teacher_model
+    if teacher_model_config is None:
+        raise ValueError("Distillation requires a resolved teacher_model configuration.")
+    # Tokenizer initialization may resolve the student's vocabulary after CLI translation.
+    # Student and teacher consume the same token IDs, as in the legacy builder.
     teacher_model_config = dataclasses.replace(
-        student_model_config,
-        transformer=teacher_transformer,
+        teacher_model_config,
+        vocab_size=student_model_config.vocab_size,
+        should_pad_vocab=student_model_config.should_pad_vocab,
+        transformations=None,
         distillation=None,
         pre_wrap_hooks=[],
         post_wrap_hooks=[],
-        **overrides,
     )
     builder = teacher_model_config.get_builder_cls()(teacher_model_config)
     pg_collection = getattr(model, "pg_collection", None)
@@ -289,7 +224,7 @@ def _build_teacher(student_model_config, teacher_config_raw: Namespace, teacher_
     )
 
 
-def kd_convert_hook(student_model_config, args: Namespace, te_mcore_model: bool) -> PreWrapHook:
+def kd_convert_hook(student_model_config, te_mcore_model: bool) -> PreWrapHook:
     """Convert each model stage into a ModelOpt ``DistillationModel`` with its teacher stage.
 
     The teacher is built by the same ``ModelBuilder`` class as the student, from the student's
@@ -302,8 +237,6 @@ def kd_convert_hook(student_model_config, args: Namespace, te_mcore_model: bool)
 
     Args:
         student_model_config: The student ``ModelConfig``; its ``distillation`` must be set.
-        args: The argparse namespace the student config was derived from. Used (read-only)
-            to derive the teacher's ``TransformerConfig``.
         te_mcore_model: Whether to register the TE state_dict key-remapping hook on the teacher.
     """
     distillation = student_model_config.distillation
@@ -314,25 +247,15 @@ def kd_convert_hook(student_model_config, args: Namespace, te_mcore_model: bool)
         if len(models) != 1:
             raise ValueError("ModelOpt KD does not support virtual pipeline parallelism.")
 
-        teacher_config_raw = _load_teacher_model_config(distillation, args)
-        teacher_transformer = core_transformer_config_from_args(teacher_config_raw)
-        for attr in _SHARED_STUDENT_TEACHER_ATTRS:
-            student_value = getattr(student_model_config.transformer, attr)
-            teacher_value = getattr(teacher_transformer, attr)
-            if student_value != teacher_value:
-                raise ValueError(
-                    f"Student and teacher must have the same {attr}, got {student_value} "
-                    f"(student) and {teacher_value} (teacher)."
-                )
+        distillation.validate(student_model_config)
+        teacher_transformer = distillation.teacher_model.transformer
 
         converted = []
         for model in models:
             distill_cfg = mtd_mcore.setup_distillation_config(
                 distillation.kd_cfg, student_cfg=model.config, teacher_cfg=teacher_transformer
             )
-            teacher = _build_teacher(
-                student_model_config, teacher_config_raw, teacher_transformer, model
-            )
+            teacher = _build_teacher(student_model_config, model)
             if te_mcore_model:
                 teacher._register_load_state_dict_pre_hook(mcore_gpt_load_te_state_dict_pre_hook)
 
@@ -349,6 +272,32 @@ def kd_convert_hook(student_model_config, args: Namespace, te_mcore_model: bool)
             converted.append(model)
         return converted
 
-    # Lets later registrations (e.g. freeze hooks) be ordered before the conversion.
-    hook.modelopt_kd_convert = True
     return hook
+
+
+def modelopt_pre_wrap_hook(model_config, checkpoint=None) -> PreWrapHook:
+    """Rebuild setup hooks from configuration, keeping all student freezes before KD.
+
+    Called by the stock builders on every build, including after deserialization.
+    Runtime hooks are composed without modifying the config or duplicating registrations.
+    """
+    hooks = []
+    options = model_config.transformations
+    init_meta = model_config.transformer.init_model_with_meta_device
+
+    def register(hook):
+        hooks.append(on_model_init_device(hook, init_meta))
+
+    if options is not None:
+        if checkpoint is not None and checkpoint.load is not None:
+            register(restore_modelopt_state_hook(checkpoint.load, checkpoint.ckpt_format))
+        if options.qad_train_target is not None:
+            register(qad_freeze_hook(options.qad_train_target))
+        register(lsq_hook(options.lsq_scale_lr))
+        if options.te_mcore_model:
+            register(te_load_state_dict_hook())
+
+    hooks.extend(model_config.pre_wrap_hooks)
+    if model_config.distillation is not None:
+        register(kd_convert_hook(model_config, options.te_mcore_model if options else False))
+    return compose_hooks(hooks)

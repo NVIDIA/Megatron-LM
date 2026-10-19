@@ -4,8 +4,9 @@ import abc
 import functools
 import importlib
 import inspect
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -14,6 +15,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.training.models.distillation import DistillationConfig
+from megatron.training.models.transforms import ModelTransformConfig
 
 # Hooks and callbacks that each run attaches to the live config. Not to be serialized.
 _RUNTIME_FIELDS = frozenset(
@@ -110,9 +112,11 @@ class ModelConfig:
     restore_modelopt_state: bool = False
     """Restore ModelOpt quantization/sparsity state."""
 
+    transformations: ModelTransformConfig | None = None
+    """Declarative ModelOpt setup, reconstructed as hooks by GPT/Hybrid builders."""
+
     distillation: DistillationConfig | None = None
-    """ModelOpt knowledge-distillation teacher. Applied by a pre-wrap hook (see
-    ``megatron.post_training.model_hooks``); the model builders themselves ignore it."""
+    """ModelOpt teacher, converted after setup and user pre-wrap hooks by GPT/Hybrid builders."""
 
     extra_checkpoint_metadata: dict[str, Any] | None = None
     """Store for additional model-related metadata to save in the checkpoint. This 
@@ -129,6 +133,15 @@ class ModelConfig:
     """List of functions that are executed after model initialization is complete.
     Should take the model as the only argument and return a new model as the only return value.
     """
+
+    def validate(self) -> None:
+        """Validate transformations before allocating models or loading checkpoints."""
+        if self.transformations is not None:
+            target = self.transformations.qad_train_target
+            if target not in (None, "mtp", "base", "both"):
+                raise ValueError(f"Unsupported qad_train_target: {target}")
+        if self.distillation is not None:
+            self.distillation.validate(self)
 
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.
@@ -252,6 +265,15 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
 
     def __init__(self, model_config: ModelConfig):
         self._model_config = model_config
+
+    def pre_wrap_hook(self, checkpoint=None) -> Callable:
+        """Resolve declarative setup for each build, without mutating runtime hook lists."""
+        config = self._model_config
+        if config.transformations is not None or config.distillation is not None:
+            from megatron.post_training.model_hooks import modelopt_pre_wrap_hook
+
+            return modelopt_pre_wrap_hook(config, checkpoint)
+        return compose_hooks(config.pre_wrap_hooks)
 
     @abc.abstractmethod
     def build_model(

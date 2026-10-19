@@ -58,6 +58,7 @@ def unimodal_build_distributed_models(
     model_type: ModelType = ModelType.encoder_or_decoder,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    device: torch.device | str | None = None,
 ) -> list[MegatronModule]:
     """Build model stages and wrap for distributed training.
 
@@ -82,6 +83,7 @@ def unimodal_build_distributed_models(
         use_torch_fsdp2: Whether to use Torch FSDP 2.0.
         wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
         data_parallel_random_init: Whether to broadcast parameters from data-parallel rank 0.
+        device: Explicit final device. None preserves the default placement policy.
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
@@ -127,6 +129,7 @@ def unimodal_build_distributed_models(
         mixed_precision_wrapper=mixed_precision_wrapper,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
         use_layer_wise_param_layout=use_layer_wise_param_layout,
+        device=device,
     )
 
 
@@ -143,6 +146,7 @@ def prepare_existing_model_chunks_for_distributed_training(
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    device: torch.device | str | None = None,
 ) -> list[MegatronModule]:
     """Apply the shared post-build distributed lifecycle to already-built model chunks.
 
@@ -159,6 +163,7 @@ def prepare_existing_model_chunks_for_distributed_training(
         use_torch_fsdp2: Whether to use Torch FSDP 2.0.
         wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
         data_parallel_random_init: Whether to broadcast parameters from data-parallel rank 0.
+        device: Explicit final device. None preserves the default placement policy.
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
@@ -187,16 +192,23 @@ def prepare_existing_model_chunks_for_distributed_training(
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     use_cpu_initialization = transformer_config.use_cpu_initialization
-    if not use_torch_fsdp2 and not use_cpu_initialization and not init_model_with_meta_device:
-        for model_module in model_list:
-            model_module.cuda(torch.cuda.current_device())
+    if device is not None and (use_torch_fsdp2 or use_megatron_fsdp):
+        raise ValueError("Explicit device placement is not supported with FSDP-managed placement.")
+    target_device = torch.device(device) if device is not None else torch.device("cuda")
+    if not use_torch_fsdp2 and not init_model_with_meta_device:
+        if device is not None or not use_cpu_initialization:
+            for model_module in model_list:
+                if device is None:
+                    model_module.cuda(torch.cuda.current_device())
+                else:
+                    model_module.to(target_device)
 
     model_list = _wrap_with_mp_wrapper(model_list, transformer_config, mixed_precision_wrapper)
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if init_model_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
         model_list = [
-            to_empty_if_meta_device(model_module, device=torch.device("cuda"))
+            to_empty_if_meta_device(model_module, device=target_device)
             for model_module in model_list
         ]
 

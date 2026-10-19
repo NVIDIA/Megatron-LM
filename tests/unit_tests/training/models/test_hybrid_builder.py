@@ -414,39 +414,25 @@ class TestHybridModelBuilderBuildDistributedModels:
 
         assert result is model_list
 
-    @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
-    def test_pre_wrap_hooks_composed_and_passed(self, mock_unimodal, mock_compose):
-        model_list = [Mock()]
-        mock_unimodal.return_value = model_list
-        composed_pre = Mock()
-        composed_post = Mock(return_value=None)
-        mock_compose.side_effect = [composed_pre, composed_post]
-
-        hook1 = Mock()
-        self.config.pre_wrap_hooks = [hook1]
+    def test_pre_wrap_hooks_composed_and_passed(self, mock_unimodal):
+        stages = [Mock()]
+        mock_unimodal.return_value = stages
+        hook = Mock(return_value=stages)
+        self.config.pre_wrap_hooks = [hook]
         self.builder.build_distributed_models(self.pg)
+        composed = mock_unimodal.call_args.args[10]
+        assert composed(stages) is stages
+        hook.assert_called_once_with(stages)
 
-        # First compose_hooks call must be with the pre_wrap_hooks list
-        assert mock_compose.call_args_list[0] == call([hook1])
-        # The composed pre-wrap hook is the 11th positional arg (index 10)
-        unimodal_args = mock_unimodal.call_args.args
-        assert unimodal_args[10] is composed_pre
-
-    @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
-    def test_post_wrap_hook_applied_to_results(self, mock_unimodal, mock_compose):
-        model_list = [Mock()]
-        wrapped_list = [Mock(), Mock()]
-        mock_unimodal.return_value = model_list
-        composed_pre = Mock()
-        composed_post = Mock(return_value=wrapped_list)
-        mock_compose.side_effect = [composed_pre, composed_post]
-
-        result = self.builder.build_distributed_models(self.pg)
-
-        composed_post.assert_called_once_with(model_list)
-        assert result is wrapped_list
+    def test_post_wrap_hook_applied_to_results(self, mock_unimodal):
+        stages, wrapped = [Mock()], [Mock(), Mock()]
+        mock_unimodal.return_value = stages
+        hook = Mock(return_value=wrapped)
+        self.config.post_wrap_hooks = [hook]
+        assert self.builder.build_distributed_models(self.pg) is wrapped
+        hook.assert_called_once_with(stages)
 
     @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")

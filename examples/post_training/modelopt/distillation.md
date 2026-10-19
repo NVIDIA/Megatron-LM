@@ -27,7 +27,7 @@ override the student arguments before being handed to the teacher constructor. T
 Unlike NeMo-generated checkpoints, Megatron-LM checkpoints do not contain this file by default and must be manually created.
 
 > NOTE: Not all keys in the NeMo-style yaml correspond 1:1 to the argument names for Megatron-LM. These
-are converted in `megatron/post_training/model_hooks.py`.
+are converted in `megatron/post_training/model_config.py`.
 
 ### Distillation config format
 
@@ -94,3 +94,47 @@ both defined in `modelopt.torch.distill.plugins.megatron`.
 
 * A CUDA kernel issue is occurring where student's forward latency is severly prolonged compared to running student forward
 without a teacher model. This means the total time per iteration may be up to 40% longer than ideally expected.
+
+### Configuration-based construction
+
+`modelopt_model_config_from_args` resolves the teacher architecture into
+`DistillationConfig.teacher_model` at CLI translation time. The resolved teacher,
+checkpoint path/format, ModelOpt setup options, and independent MTP specification
+are serialized with the stock GPT/Hybrid model config. Rebuilding a deserialized
+config reconstructs setup hooks automatically; it does not need to reread the
+teacher architecture YAML or retain the original argparse namespace.
+
+Setup runs in this order: restore ModelOpt state, apply QAD freezing and LSQ
+setup, register checkpoint key remapping, run user pre-wrap hooks (including
+training freezes), then convert for KD. Teacher weights are loaded after wrapping
+by `load_kd_teacher_checkpoint(models, model_config.distillation)`. A runner using
+the builders directly must invoke that checkpoint-loading step as well.
+
+The run container owns the stock model config, student checkpoint, and
+`ModelBuildConfig` execution policy. `model.transformations` contains only
+`ModelTransformConfig` options (QAD, LSQ, TE key mapping); it does not duplicate
+checkpoint locations. The teacher's own checkpoint reference stays in
+`DistillationConfig`.
+
+Post-training CLI entry points use `modelopt_inference_config_from_args(args)`
+once, before runtime initialization. After tokenizer setup,
+`resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)` finalizes the same
+model config. Call `cfg.build_models(pg_collection)` to construct it.
+CPU export selects `cfg.model_build.device = "cpu"`; conversion can disable the
+precision wrapper with `cfg.model_build.mixed_precision = False`.
+
+There are no ModelOpt-specific model-config subclasses or model builders.
+Whole-run YAML loading preserves stock builder metadata and transformation
+specs. Container validation checks KD compatibility and placement conflicts
+before construction.
+
+Megatron is still migrating from CLI arguments. Unmigrated runtime services
+continue using `get_args()`. At runtime, `legacy_checkpoint_args()` reads
+`get_run_config().checkpoint` and temporarily supplies the run-owned student load path/format to the legacy
+checkpoint loader and restores the arguments on success or failure.
+Teacher loading uses the corresponding scoped adapter. Other legacy checkpoint
+options remain in args until that API is migrated.
+
+Builders and configuration validation keep explicit inputs so independent configs can
+be built and tested without installing global state. The checkpoint adapter also
+accepts explicit args/config for those callers.
