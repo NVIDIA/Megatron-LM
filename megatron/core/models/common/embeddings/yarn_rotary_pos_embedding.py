@@ -225,9 +225,17 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 its "pure rotation" contract and keep the fused /
                 unfused rope paths bit-equivalent.
         """
+        cp_group = cp_group if cp_group is not None else self.cp_group
         if (
             not hasattr(self, "max_seq_len_cached")
             or seq_len > self.max_seq_len_cached
+            # CP chunk positions depend on the full sequence length.
+            or (
+                seq_len < self.max_seq_len_cached
+                and not packed_seq
+                and cp_group is not None
+                and cp_group.size() > 1
+            )
             or offset != self.offset_cached
             or dtype != self.dtype_cached
             or packed_seq != self.packed_seq_cached
