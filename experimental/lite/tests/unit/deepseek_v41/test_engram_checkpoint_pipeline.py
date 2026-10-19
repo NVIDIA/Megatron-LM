@@ -114,3 +114,29 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
     with pytest.raises(ValueError, match="unread.*bias_vl_extra"):
         load_hf_weights(stage(), str(tmp_path), cfg, ps)
+
+
+@pytest.mark.gpus(1)
+def test_native_fp4_fp8_gpu_decode_matches_cpu_bits(tmp_path):
+    from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader
+
+    codes = torch.arange(256, dtype=torch.uint8).repeat(2)
+    codes[(codes & 127) == 127] = 0  # every finite E4M3 byte, exclude the two NaNs
+    tensors = {
+        "expert.weight": torch.arange(256, dtype=torch.uint8).view(torch.int8).reshape(8, 32),
+        "expert.scale": torch.arange(120, 136, dtype=torch.uint8)
+        .view(torch.float8_e8m0fnu)
+        .reshape(8, 2),
+        "attention.weight": codes.view(torch.float8_e4m3fn).reshape(8, 64),
+        "attention.scale": torch.tensor([[120, 125]], dtype=torch.uint8).view(torch.float8_e8m0fnu),
+    }
+    save_file(tensors, tmp_path / "model.safetensors")
+    with SafeTensorReader(tmp_path) as reader:
+        for key in ("expert.weight", "attention.weight"):
+            args = dict(target_shape=torch.Size((8, 64)), target_dtype=torch.bfloat16)
+            cpu = reader.get_tensor(key, device="cpu", **args)
+            gpu = reader.get_tensor(key, device="cuda", **args)
+            for dtype in (torch.float32, torch.bfloat16):
+                assert torch.equal(
+                    cpu.to(dtype).view(torch.uint8), gpu.to(dtype).cpu().view(torch.uint8)
+                )

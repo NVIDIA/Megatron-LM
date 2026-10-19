@@ -2,7 +2,6 @@
 """Random small full-model gates; real Core/TE/FHT/FlashMLA, synthetic release-format weights, no downloaded weights."""
 import hashlib
 import json
-import os
 import re
 from dataclasses import asdict
 from pathlib import Path

@@ -6,7 +6,6 @@ from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 from megatron.lite.model.deepseek_v41.lite.components import attention
 from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
 from megatron.lite.model.deepseek_v41.lite.components.config import core_config, validate_runtime_cp
-from megatron.lite.model.deepseek_v41.topology import validate_build
 from megatron.lite.primitive.modules.attention import cross_layer as compressor
 from megatron.lite.primitive.modules.attention import ratio_one
 from megatron.lite.runtime.contracts import ParallelConfig

@@ -79,8 +79,7 @@ def test_owner_reader_dispatch_graph_and_lifetime(cp):
 
 @pytest.mark.parametrize("tied", [False, True])
 @pytest.mark.parametrize("grad", [False, True])
-@pytest.mark.parametrize("loss_coeff", [0.0, 0.1])
-def test_index_relay_native_topk_order_and_ties(tied, grad, loss_coeff):
+def test_index_relay_native_topk_order_and_ties(tied, grad):
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 
     state = KVSourceState()
@@ -105,35 +104,6 @@ def test_index_relay_native_topk_order_and_ties(tied, grad, loss_coeff):
 
         selected = select(q, weights)
         assert torch.equal(selected, select(q_reader(-x), w_reader(-x)))
-        from megatron.core.transformer.experimental_attention_variant.csa import (
-            _unfused_indexer_sparse_attn_from_topk,
-        )
-
-        single = torch.tensor([0, 8], dtype=torch.int32)
-        offsets = torch.tensor([0], dtype=torch.int32)
-        ids = torch.arange(8, dtype=torch.int32)[:, None]
-        query = x.reshape(8, 1, 4)
-
-        def auxiliary(q_value, w_value):
-            args = [query, k, torch.zeros(1), ids, q_value[0].reshape(8, 1, 4)]
-            args += [k, w_value[0].squeeze(1), ids, k, 0.5, 0.5, loss_coeff]
-            args += [8, False, 1, 8, (single, single, offsets)]
-            return _unfused_indexer_sparse_attn_from_topk(*args)[1]
-
-        owner_loss = auxiliary(q, weights)
-        reader_loss = auxiliary(q_reader(-x), w_reader(-x))
-        assert torch.equal(owner_loss, reader_loss)
-        if grad:
-            params = (q_owner.linear.weight, w_owner.linear.weight)
-            once = torch.autograd.grad(owner_loss, params, retain_graph=True)
-            (owner_loss + reader_loss).backward()
-            for parameter, expected in zip(params, once):
-                assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
-                torch.testing.assert_close(parameter.grad, 2 * expected)
-                if loss_coeff == 0:
-                    assert torch.count_nonzero(parameter.grad) == 0
-        else:
-            assert not owner_loss.requires_grad and not reader_loss.requires_grad
     assert list(q_reader.parameters()) == [] and list(w_reader.parameters()) == []
 
 

@@ -183,7 +183,7 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
         or n.endswith("tid2eid")
     ]
     loaded = []
-    with SafeTensorReader(hf_path) as reader:
+    with SafeTensorReader(hf_path, device=next(model.parameters()).device) as reader:
         read = _record_reads(reader)
         for name, tensor in state:
             if name.endswith(".ape"):

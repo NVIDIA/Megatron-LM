@@ -13,7 +13,6 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CSAIndexer,
 )
 from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
-from megatron.core.transformer.moe.router import TopKRouter
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
 from megatron.lite.model.deepseek_v41.lite.components.config import (
