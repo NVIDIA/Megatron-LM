@@ -68,8 +68,9 @@ def _validate(model_cfg, impl):
         raise ValueError("DS4.1 supports TP=ETP=VPP=1")
     if impl.router_aux_loss_coef not in (None, 0):
         raise ValueError("DS4.1 standard post-training has no auxiliary indexer/router loss")
-    if impl.recompute and impl.recompute not in ("full", ["full"]):
-        raise ValueError("DS4.1 recomputation currently supports whole-layer 'full' only")
+    modes = impl.recompute.split(",") if isinstance(impl.recompute, str) else impl.recompute or ()
+    if not set(modes) <= {"full", "attn", "moe"}:
+        raise ValueError("DS4.1 recomputation supports only full, attn and moe")
     if impl.pipeline_split_layer is not None:
         cuts = impl.pipeline_split_layer
         cuts = [cuts] if isinstance(cuts, int) else list(cuts)

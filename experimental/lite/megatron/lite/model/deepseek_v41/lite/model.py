@@ -251,7 +251,7 @@ class DeepseekV41Model(MegatronModule):
                     packed_seq_params=params,
                     input_ids=ids,
                     source_state=self.source_state,
-                    recompute=bool(self.impl.recompute),
+                    recompute=self.impl.recompute,
                 )
             if not self.layout.has_head:
                 return {

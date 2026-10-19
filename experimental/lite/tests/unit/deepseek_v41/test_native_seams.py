@@ -500,7 +500,8 @@ def test_query_projection_parent_without_per_head_rms_is_bitwise(halo):
         assert torch.equal(ours, core)
 
 
-def test_shifted_block_uses_explicit_source_checkpoint(cpu_core_checkpoint):
+@pytest.mark.parametrize("recompute", ["full", "moe", "attn", "moe,attn"])
+def test_shifted_block_uses_explicit_source_checkpoint(recompute, cpu_core_checkpoint):
     from megatron.lite.model.deepseek_v41.lite.block import DS41Block
 
     modes = []
@@ -534,7 +535,7 @@ def test_shifted_block_uses_explicit_source_checkpoint(cpu_core_checkpoint):
     x.grad = None
     state = KVSourceState()
     with state.microbatch():
-        actual = block(x, pre, packed_seq_params=None, source_state=state, recompute=True)
+        actual = block(x, pre, packed_seq_params=None, source_state=state, recompute=recompute)
     (actual[0].square().sum() + actual[1].sum()).backward()
     assert all(torch.equal(a, b) for a, b in zip(actual, expected))
     assert torch.equal(x.grad, expected_x_grad)
@@ -542,7 +543,22 @@ def test_shifted_block_uses_explicit_source_checkpoint(cpu_core_checkpoint):
         torch.equal(parameter.grad, expected_grad[name])
         for name, parameter in block.named_parameters()
     )
-    assert modes == [True, True, False, False, True, True]
+
+    def log_probs(result):
+        logits = block.ffn_mixes.aggregate(result[0].flatten(2), result[1])
+        return logits.log_softmax(-1)  # identity head for this CPU block contract
+
+    assert torch.allclose(log_probs(actual), log_probs(expected), atol=0.125, rtol=0)
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in block.parameters())
+    assert (
+        modes
+        == {
+            "full": [True, True, False, False, True, True],
+            "moe": [True, True, True, False, True],
+            "attn": [True, True, False, True, True],
+            "moe,attn": [True, True, False, False, True, True],
+        }[recompute]
+    )
 
 
 def _native_cpu_ratio_two_compressor():

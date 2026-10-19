@@ -41,9 +41,14 @@ class DS41Block(nn.Module):
         source_state=None,
         recompute=False,
     ):
-        if recompute and torch.is_grad_enabled():
-            if source_state is None:
-                raise ValueError("DS4.1 layer recomputation requires explicit source_state")
+        modes = (
+            {"full"}
+            if recompute is True
+            else set(recompute.split(",") if isinstance(recompute, str) else (recompute or ()))
+        )
+        if modes and torch.is_grad_enabled() and source_state is None:
+            raise ValueError("DS4.1 layer recomputation requires explicit source_state")
+        if "full" in modes and torch.is_grad_enabled():
             return source_state.checkpoint(
                 lambda h, pre: self._forward(
                     h, pre, packed_seq_params=packed_seq_params, input_ids=input_ids
@@ -52,27 +57,41 @@ class DS41Block(nn.Module):
                 pre_mix,
             )
         return self._forward(
-            hidden, pre_mix, packed_seq_params=packed_seq_params, input_ids=input_ids
+            hidden,
+            pre_mix,
+            packed_seq_params=packed_seq_params,
+            input_ids=input_ids,
+            source_state=source_state,
+            modes=modes,
         )
 
-    def _forward(self, hidden, pre_mix, *, packed_seq_params, input_ids=None):
-        shape = hidden.shape
-        flat = hidden.reshape(*shape[:2], -1)
-        dtype = hidden.dtype
-        # Release mixing coefficients and reductions are FP32; only the
-        # sublayer input/residual carrier is rounded back to BF16.
-        attn_pre, post, comb = self.attn_mixes.compute_mappings(flat.float())
-        x = self.attn_mixes.aggregate(flat.float(), pre_mix.float()).to(dtype)
-        x = self.attn_norm(x)
-        x, bias = self.attention(x, attention_mask=None, packed_seq_params=packed_seq_params)
-        hidden = native_h_post_bda(
-            comb, hidden.float(), post, x.float(), None if bias is None else bias.float()
-        ).to(dtype)
-        flat = hidden.reshape(*shape[:2], -1)
-        next_pre, post, comb = self.ffn_mixes.compute_mappings(flat.float())
-        x = self.ffn_mixes.aggregate(flat.float(), attn_pre).to(dtype)
-        x = self.ffn_norm(x)
-        x, bias = self.ffn(x, input_ids=input_ids, packed_seq_params=packed_seq_params)
+    def _forward(
+        self, hidden, pre_mix, *, packed_seq_params, input_ids=None, source_state=None, modes=()
+    ):
+        for kind in ("attn", "moe"):
+
+            def step(h, pre, kind=kind):
+                return self._sublayer(h, pre, kind, packed_seq_params, input_ids)
+
+            hidden, pre_mix = (
+                source_state.checkpoint(step, hidden, pre_mix)
+                if kind in modes and torch.is_grad_enabled()
+                else step(hidden, pre_mix)
+            )
+        return hidden, pre_mix
+
+    def _sublayer(self, hidden, pre_mix, kind, packed_seq_params, input_ids):
+        mixes = self.attn_mixes if kind == "attn" else self.ffn_mixes
+        norm = self.attn_norm if kind == "attn" else self.ffn_norm
+        flat, dtype = hidden.flatten(2), hidden.dtype
+        # DS4.1 shifts pre-mixes by one sublayer; Core owns all mixing math.
+        next_pre, post, comb = mixes.compute_mappings(flat.float())
+        x = norm(mixes.aggregate(flat.float(), pre_mix.float()).to(dtype))
+        x, bias = (
+            self.attention(x, attention_mask=None, packed_seq_params=packed_seq_params)
+            if kind == "attn"
+            else self.ffn(x, input_ids=input_ids, packed_seq_params=packed_seq_params)
+        )
         hidden = native_h_post_bda(
             comb, hidden.float(), post, x.float(), None if bias is None else bias.float()
         ).to(dtype)
