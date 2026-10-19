@@ -39,15 +39,39 @@ pytestmark = pytest.mark.launch_on_gb200
 
 
 @pytest.fixture(autouse=True)
-def fresh_gdn_compile_cache():
-    """Keep independent TP/CP/model cases from changing one another's execution mode."""
+def fresh_gdn_compile_cache(request, monkeypatch):
+    """Isolate compiler state and the reduction algorithm used in layout comparisons."""
     # Parameter-vs-Tensor CP views and shape variants can exhaust Dynamo's default
     # recompile budget across cases. A later SBHD/THD pair would then compare eager
     # with compiled BF16 arithmetic. Keep the default limit and share the cache
     # within each comparison, without disabling compilation or relaxing tolerances.
     torch.compiler.reset()
-    yield
-    torch.compiler.reset()
+    if request.node.originalname in (
+        "test_gpu_forward_thd_correctness",
+        "test_gpu_forward_thd_padding_correctness",
+    ):
+        from fla.modules.l2norm import l2norm_fwd_kernel
+
+        # Inductor specializes the FLA call for each layout. Independent tuning
+        # choices can change BF16 tie rounding on Blackwell. Compare layouts with
+        # one supported reduction configuration; leave production tuning alone.
+        config = next(
+            config
+            for config in l2norm_fwd_kernel.configs
+            if config.kwargs.get("BT") == 32 and config.num_warps == 4
+        )
+        monkeypatch.setattr(l2norm_fwd_kernel, "configs", [config])
+        monkeypatch.setattr(l2norm_fwd_kernel, "cache", {})
+        monkeypatch.setattr(
+            l2norm_fwd_kernel,
+            "best_config",
+            getattr(l2norm_fwd_kernel, "best_config", None),
+            raising=False,
+        )
+    try:
+        yield
+    finally:
+        torch.compiler.reset()
 
 
 def _assert_relative_rms_close(
