@@ -52,6 +52,11 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 
 Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/api/pytorch.html)).
 
+`--moe-router-fusion` can fuse the token-local top-k / score operations when
+`moe_router_aux_loss_fusion` is explicitly disabled. Transformer Engine's fused
+auxiliary-loss value uses floating-point atomic reductions and is not guaranteed
+bit-exact, so the separate auxiliary-loss fusion guard above remains required.
+
 GDN and GDN2 use a torch-native query/key L2 normalization in deterministic mode,
 in addition to their native convolution and recurrence paths. FLA's normalization
 autotuner can select reduction layouts with different rounding between processes.

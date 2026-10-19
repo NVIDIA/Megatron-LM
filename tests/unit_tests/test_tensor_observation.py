@@ -35,6 +35,68 @@ def test_tensor_observation_scope_filters_source_kinds_and_restores_noop():
     assert observed[0][4:] == (None, None, None)
 
 
+@pytest.mark.parametrize("fused_loss", [False, True])
+@pytest.mark.parametrize("observe_logits", [False, True])
+@pytest.mark.parametrize("config_logging", [False, True])
+def test_gpt_training_observes_scaled_logits_without_duplicate_projection(
+    monkeypatch, fused_loss, observe_logits, config_logging
+):
+    from megatron.core.models.gpt import gpt_model as gpt_mod
+
+    calls = []
+    observed = []
+
+    class OutputLayer:
+        gather_output = False
+        sequence_parallel = False
+
+        def __call__(self, input_, **kwargs):
+            fused = kwargs.get("output_cross_entropy_loss", False)
+            calls.append(fused)
+            logits = input_ * 2
+            return logits.sum(-1).transpose(0, 1) if fused else (logits, None)
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(mtp_num_layers=None),
+        post_process=True,
+        share_embeddings_and_output_weights=False,
+        fuse_linear_cross_entropy=fused_loss,
+        output_layer=OutputLayer(),
+        _scale_logits=lambda value: value * 3,
+        _scale_fused_cross_entropy_input=lambda value: value * 3,
+        compute_language_model_loss=lambda labels, logits: logits.sum(-1).transpose(0, 1),
+    )
+    monkeypatch.setattr(gpt_mod.InferenceMode, "is_active", lambda: False)
+    monkeypatch.setattr(gpt_mod, "has_config_logger_enabled", lambda config: config_logging)
+    monkeypatch.setattr(gpt_mod, "log_config_to_disk", lambda *args, **kwargs: None)
+    hidden = torch.arange(12, dtype=torch.float32, device="cpu").reshape(4, 1, 3)
+    hidden.requires_grad_()
+    source_kinds = frozenset({"output_logits"}) if observe_logits else frozenset()
+    with capture_tensor_observations(lambda *args: observed.append(args), source_kinds):
+        loss = gpt_mod.GPTModel._postprocess(
+            model,
+            hidden_states=hidden,
+            input_ids=None,
+            position_ids=None,
+            labels=torch.zeros(1, 4, dtype=torch.long, device="cpu"),
+            rotary_pos_emb=None,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            mtp_in_postprocess=False,
+        )
+    expected_logits = hidden.detach() * 6
+    torch.testing.assert_close(loss, expected_logits.sum(-1).transpose(0, 1))
+    loss.sum().backward()
+    torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 6))
+    assert calls.count(True) == int(fused_loss)
+    assert calls.count(False) == int(not fused_loss or observe_logits or config_logging)
+    assert len(observed) == int(observe_logits)
+    if observe_logits:
+        assert observed[0][:3] == (model.output_layer, "output_logits", "output_logits")
+        torch.testing.assert_close(observed[0][3], expected_logits)
+        assert observed[0][4:] == (-1, 0, 1)
+
+
 def test_layer_residual_observation_separates_accumulator_and_net_contribution():
     layer = SimpleNamespace(config=SimpleNamespace(sequence_parallel=True))
     accumulator = torch.tensor([1.0, 2.0], requires_grad=True)

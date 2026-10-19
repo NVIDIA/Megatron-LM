@@ -144,13 +144,19 @@ def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
 
 
 @pytest.mark.internal
-def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch):
-    """Hybrid embedding and padding-mask SP splits must use the same explicit TP group."""
+@pytest.mark.parametrize("input_path", ["embedding", "precomputed", "pipeline"])
+@pytest.mark.parametrize("mtp_enabled", [False, True])
+def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch, input_path, mtp_enabled):
+    """Align the decoder mask once while preserving the full mask for MTP."""
     from megatron.core import tensor_parallel
-    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.models.hybrid import hybrid_model
 
     tp_group = object()
     scatter_calls = []
+    mtp_masks = []
+    input_ids = torch.arange(8).view(1, 8)
+    caller_padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    local_hidden = torch.zeros(4, 1, 8)
 
     def fake_sp_scatter(input_, group=None):
         scatter_calls.append((input_.dtype, group))
@@ -165,10 +171,26 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch):
             return torch.zeros(input_ids.shape[1], input_ids.shape[0], 8)
 
     class FakeDecoder:
+        input_tensor = local_hidden
+
         def __call__(self, *, hidden_states, padding_mask, **_kwargs):
+            if hidden_states is None:
+                hidden_states = self.input_tensor
             assert padding_mask.shape == (1, hidden_states.shape[0])
             return hidden_states
 
+    class FakeMTP:
+        def prepare_cp_layout(self, **kwargs):
+            assert kwargs["padding_mask"] is caller_padding_mask
+            return SimpleNamespace(**kwargs)
+
+        def __call__(self, *, hidden_states, padding_mask, **_kwargs):
+            assert padding_mask is caller_padding_mask
+            mtp_masks.append(padding_mask)
+            return hidden_states
+
+    monkeypatch.setattr(hybrid_model, "resolve_cp_group", lambda group, params: None)
+    monkeypatch.setattr(hybrid_model, "prepare_mtp_sequence_roll_context", lambda **kwargs: None)
     model = SimpleNamespace(
         config=SimpleNamespace(
             fine_grained_activation_offloading=False,
@@ -176,29 +198,32 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch):
             sequence_parallel=True,
             multi_latent_attention=False,
             moe_num_hash_layers=0,
-            mtp_num_layers=None,
+            mtp_num_layers=1 if mtp_enabled else None,
             freeze_base_model_for_mtp=False,
         ),
-        pre_process=True,
+        pre_process=input_path != "pipeline",
         post_process=False,
         embedding=FakeEmbedding(),
         decoder=FakeDecoder(),
-        pg_collection=SimpleNamespace(tp=tp_group),
+        pg_collection=SimpleNamespace(tp=tp_group, cp=None),
         position_embedding_type=None,
         share_embeddings_and_output_weights=False,
-        mtp_process=False,
+        mtp_process=mtp_enabled,
+        mtp=FakeMTP(),
     )
-    input_ids = torch.arange(8).view(1, 8)
-    output = HybridModel.forward(
+    output = hybrid_model.HybridModel.forward(
         model,
         input_ids=input_ids,
         position_ids=input_ids,
         attention_mask=None,
-        padding_mask=torch.zeros_like(input_ids, dtype=torch.bool),
+        padding_mask=caller_padding_mask,
+        decoder_input=local_hidden if input_path == "precomputed" else None,
     )
 
     assert output.shape == (4, 1, 8)
-    assert scatter_calls == [(torch.float32, tp_group), (torch.bool, tp_group)]
+    expected_scatter = [(torch.float32, tp_group)] if input_path == "embedding" else []
+    assert scatter_calls == expected_scatter + [(torch.bool, tp_group)]
+    assert len(mtp_masks) == int(mtp_enabled)
 
 
 # =============================================================================

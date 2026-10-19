@@ -23,6 +23,7 @@ from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.fusions import fused_layer_norm
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
+from megatron.core.models.backends import get_backend
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
@@ -103,6 +104,25 @@ class TestTensorParallelLayers:
             replays=3,
             what="vocab_parallel_cross_entropy",
         )
+
+    @pytest.mark.parametrize("transformer_impl", ["local", "transformer_engine"])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+    def test_linear_fusion_materialized_logits_target_replays(self, transformer_impl, dtype):
+        """Replay the logits-only target, not the Blackwell-only fused output-layer kernel."""
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cross_entropy = get_backend(
+            transformer_impl, cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="linear"
+        ).vocab_parallel_cross_entropy()
+        logits = torch.randn(512, 1024, device="cuda", dtype=dtype, requires_grad=True)
+        labels = torch.randint(0, 1024 * tp_group.size(), (512,), device="cuda")
+        _, grads = assert_replays_bit_exact(
+            lambda l, t: cross_entropy(l, t, tp_group),
+            (logits, labels),
+            replays=3,
+            what=f"linear_fusion_materialized_logits[{transformer_impl},{dtype}]",
+        )
+        assert grads["in[0]"].dtype == dtype
 
     @pytest.mark.parametrize(
         "grad_accum_fusion",

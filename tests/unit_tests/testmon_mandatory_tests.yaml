@@ -19,6 +19,7 @@ mappings:
     test_buckets:
       dgx_h100:
         - tests/unit_tests/ssm/test_gdn_gated_output_norm_fusion.py
+        - tests/unit_tests/ssm/test_gdn_gated_output_norm_distributed.py
         - tests/unit_tests/ssm/gated_delta_net/test_gdn_fusion.py
         - tests/unit_tests/determinism/kernels/test_gated_norm.py
       dgx_gb200:

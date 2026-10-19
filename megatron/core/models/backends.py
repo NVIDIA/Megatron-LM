@@ -78,12 +78,15 @@ def select_cross_entropy(
     Shared by every provider: the choice depends on the config, not on which backend supplies
     the rest of the model, which is how it behaved before this was a provider decision.
     """
-    if cross_entropy_fusion_impl not in ("native", "te"):
+    if cross_entropy_fusion_impl not in ("native", "te", "linear"):
         raise ValueError(
             f"unknown cross_entropy_fusion_impl={cross_entropy_fusion_impl!r}. "
-            "Valid choices: native, te"
+            "Valid choices: native, te, linear"
         )
-    if not cross_entropy_loss_fusion:
+    # Linear + CE fusion is performed by the output layer, before this logits-only
+    # target is called. Keep an unfused target for separately materialized logits;
+    # selecting it here must not replace the model's fused output-layer path.
+    if not cross_entropy_loss_fusion or cross_entropy_fusion_impl == "linear":
         return unfused_cross_entropy
     if cross_entropy_fusion_impl == "native":
         return _fused_ce

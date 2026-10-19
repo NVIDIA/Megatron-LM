@@ -28,7 +28,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
-from megatron.core.tensor_observation import observe_tensor
+from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
@@ -685,13 +685,17 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             padding_mask=padding_mask,
         )
 
+        # Under sequence parallelism the pre-process scatters the padding mask along the sequence
+        # for the decoder (whose hidden states are scattered). The post-process keeps the caller's
+        # full-length mask: the MTP rolls it alongside input_ids / position_ids, and its MoE
+        # layers re-align it to their hidden states themselves.
         (
             decoder_input,
             rotary_pos_emb,
             rotary_pos_cos,
             rotary_pos_sin,
             sequence_len_offset,
-            padding_mask,
+            decoder_padding_mask,
         ) = preproc_output[:6]
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
@@ -718,7 +722,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_cos_sin=rotary_pos_cos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-                padding_mask=padding_mask,
+                padding_mask=decoder_padding_mask,
                 **decoder_extra_block_kwargs,
             )
 
@@ -807,8 +811,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             # Build layout-specific metadata once, then fetch every locally owned
             # MTP field's compact successor rows in one grouped operation. The extra
             # row covers RL's initial label derivation before the per-layer rolls.
+            sequence_roll_tokens = input_ids if input_ids is not None else labels
             sequence_roll_context = prepare_mtp_sequence_roll_context(
-                tensor=input_ids if input_ids is not None else labels,
+                tensor=sequence_roll_tokens,
                 cp_group=mtp_cp_group,
                 packed_seq_params=packed_seq_params,
             )
@@ -817,7 +822,11 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     self.embedding, "add_position_embedding", True
                 )
                 roll_padding_mask = padding_mask if mtp_in_postprocess else None
-                if roll_padding_mask is not None and self.config.sequence_parallel:
+                if (
+                    roll_padding_mask is not None
+                    and self.config.sequence_parallel
+                    and roll_padding_mask.shape != sequence_roll_tokens.shape
+                ):
                     roll_padding_mask = tensor_parallel.gather_from_sequence_parallel_region(
                         roll_padding_mask.transpose(0, 1).contiguous(),
                         tensor_parallel_output_grad=False,
@@ -947,29 +956,36 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        if has_config_logger_enabled(self.config) or labels is None:
+        if (
+            has_config_logger_enabled(self.config)
+            or labels is None
+            or is_observing_tensor("output_logits")
+        ):
             logits, _ = self.output_layer(
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
         else:
+            # Training with labels: the logits are produced (and muP-scaled) below, either by
+            # the fused linear + cross-entropy kernel or by the output layer.
             logits = None
 
-        # Apply MuP output scaling to logits
-        logits = self._scale_logits(logits)
-        gather_output = (
-            self.output_layer.gather_output
-            if runtime_gather_output is None
-            else runtime_gather_output
-        )
-        observe_tensor(
-            self.output_layer,
-            "output_logits",
-            "output_logits",
-            logits,
-            tp_shard_dim=None if gather_output else -1,
-            sequence_dim=0,
-            batch_dim=1,
-        )
+        if logits is not None:
+            # Apply MuP output scaling to logits
+            logits = self._scale_logits(logits)
+            gather_output = (
+                self.output_layer.gather_output
+                if runtime_gather_output is None
+                else runtime_gather_output
+            )
+            observe_tensor(
+                self.output_layer,
+                "output_logits",
+                "output_logits",
+                logits,
+                tp_shard_dim=None if gather_output else -1,
+                sequence_dim=0,
+                batch_dim=1,
+            )
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -997,16 +1013,21 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             return logits.transpose(0, 1).contiguous()
 
         output_layer_kwargs = dict(
-            input_=hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            weight=output_weight, runtime_gather_output=runtime_gather_output
         )
         if self.fuse_linear_cross_entropy:
+            # The fused kernel never materialises the logits, so muP's output scaling goes on
+            # the layer input (the layer has no bias).
             loss = self.output_layer(
+                input_=self._scale_fused_cross_entropy_input(hidden_states),
                 output_cross_entropy_loss=self.fuse_linear_cross_entropy,
                 labels=labels,
                 **output_layer_kwargs,
             )
         else:
-            logits, _ = self.output_layer(**output_layer_kwargs)
+            if logits is None:
+                logits, _ = self.output_layer(input_=hidden_states, **output_layer_kwargs)
+                logits = self._scale_logits(logits)
             loss = self.compute_language_model_loss(labels, logits)
 
         return loss

@@ -3932,6 +3932,9 @@ def te_checkpoint(
 
     from transformer_engine.pytorch.distributed import checkpoint
 
+    from megatron.core.utils import with_current_cuda_device
+
+    forward_func = with_current_cuda_device(forward_func)
     initial_forward = True
 
     def forward_func_without_recomputed_observations(*forward_args, **forward_kwargs):

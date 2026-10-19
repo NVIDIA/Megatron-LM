@@ -82,6 +82,10 @@ def test_repository_config_is_valid():
             "tests/unit_tests/ssm/test_gdn_gated_output_norm_fusion.py",
         ),
         (
+            "megatron/core/fusions/fused_gated_norm.py",
+            "tests/unit_tests/ssm/test_gdn_gated_output_norm_distributed.py",
+        ),
+        (
             "megatron/core/transformer/experimental_attention_variant/cp_balanced_indexer.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention_cp_cuda_graph.py",
         ),

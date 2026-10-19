@@ -693,6 +693,7 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
     module.layer_number = 1
     module.pg_collection = SimpleNamespace(cp=None)
     module.config = SimpleNamespace(
+        cuda_graph_impl="none",
         dsa_indexer_loss_coeff=0.0,
         dsa_indexer_use_sparse_loss=False,
         calculate_per_token_loss=False,
@@ -751,6 +752,7 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
 
     assert actual is expected
     fused_call.assert_called_once()
+    assert fused_call.call_args.kwargs["cuda_graph"] is False
 
 
 def test_public_surface_is_csa_namespaced_and_keeps_dev_cp_entrypoint():

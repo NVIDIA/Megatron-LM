@@ -393,9 +393,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="vocab_parallel_cross_entropy",
-        sources=("megatron/core/tensor_parallel/cross_entropy.py",),
+        sources=(
+            "megatron/core/tensor_parallel/cross_entropy.py",
+            "megatron/core/models/backends.py",
+        ),
         tests=(K + "test_tensor_parallel_kernels.py",),
         kind="torch-op",
+        notes="Includes the materialized-logits target selected alongside output-layer linear + CE fusion.",
     ),
     KernelEntry(
         name="tensor_parallel_mappings",

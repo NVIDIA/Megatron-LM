@@ -2386,8 +2386,13 @@ def process_mtp_loss(
             layer_loss_mask = loss_mask * cumulative_mtp_input_mask
         num_tokens = layer_loss_mask.sum()
         if fuse_linear_cross_entropy:
+            mtp_hidden_states = hidden_states_list[mtp_layer_number + 1]
+            if scale_logits_fn is not None:
+                # The fused kernel never materialises the logits; the output layer has no bias,
+                # so muP's logit scaling is applied to its input instead.
+                mtp_hidden_states = scale_logits_fn(mtp_hidden_states)
             mtp_loss = output_layer(
-                hidden_states_list[mtp_layer_number + 1],
+                mtp_hidden_states,
                 weight=output_weight,
                 runtime_gather_output=runtime_gather_output,
                 output_cross_entropy_loss=True,
@@ -2745,7 +2750,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
 
-        if padding_mask is not None and self.config.sequence_parallel:
+        # The parent model keeps a full-length mask, while subsequent MTP depths
+        # receive the SP-local mask returned below. Gather only the latter.
+        if (
+            padding_mask is not None
+            and self.config.sequence_parallel
+            and padding_mask.shape != input_ids.shape
+        ):
             padding_mask = gather_from_sequence_parallel_region(
                 padding_mask.transpose(0, 1).contiguous(),
                 tensor_parallel_output_grad=False,
@@ -3857,12 +3868,19 @@ class MultiTokenPredictionBlock(MegatronModule):
                 if padding_mask is not None:
                     # Precomputed embeddings bypass the layer's _get_embeddings,
                     # so shift validity here alongside those embeddings.
+                    valid_mask = (~padding_mask).transpose(0, 1).contiguous()
+                    if self.sequence_parallel and valid_mask.shape[0] != decoder_input.shape[0]:
+                        # The parent may supply a full CP-local mask. Match the
+                        # embedding shard before the roll gathers its SP slices.
+                        valid_mask = scatter_to_sequence_parallel_region(
+                            valid_mask, group=self.tp_group
+                        )
                     valid_mask, _ = roll_tensor_precomputed_embeddings(
-                        (~padding_mask).transpose(0, 1).contiguous(),
+                        valid_mask,
                         shifts=-1,
                         dims=0,
                         sp_group=self.tp_group if self.sequence_parallel else None,
-                        cp_group=self.cp_group,
+                        cp_group=cp_group,
                         packed_seq_params=packed_seq_params,
                         return_sum=False,
                     )

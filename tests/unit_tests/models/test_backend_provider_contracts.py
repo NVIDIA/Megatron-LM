@@ -91,6 +91,23 @@ class TestCrossEntropyFollowsTheConfig:
         ).vocab_parallel_cross_entropy()
         assert target is fused_vocab_parallel_cross_entropy
 
+    @pytest.mark.parametrize(
+        "transformer_impl", ["local", "transformer_engine", "inference_optimized"]
+    )
+    @pytest.mark.parametrize("cross_entropy_loss_fusion", [False, True])
+    def test_linear_fusion_is_owned_by_the_output_layer(
+        self, transformer_impl, cross_entropy_loss_fusion
+    ):
+        """The logits-only target must not reject the separate linear + CE fusion path."""
+        target = get_backend_from_config(
+            _config(
+                transformer_impl=transformer_impl,
+                cross_entropy_loss_fusion=cross_entropy_loss_fusion,
+                cross_entropy_fusion_impl="linear",
+            )
+        ).vocab_parallel_cross_entropy()
+        assert target is unfused_cross_entropy
+
     def test_explicit_te_request_is_not_silently_ignored(self):
         """An explicit TE request selects the TE cross-entropy implementation."""
         target = get_backend_from_config(

@@ -13,6 +13,135 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+@pytest.mark.parametrize("sp_sharded_mask", [False, True])
+@pytest.mark.parametrize("runtime_cp_override", [False, True])
+def test_precomputed_mtp_mask_uses_embedding_shard_and_runtime_cp(
+    monkeypatch, sp_sharded_mask, runtime_cp_override
+):
+    from types import SimpleNamespace
+
+    tp_group, base_cp_group, runtime_cp_group = object(), object(), object()
+    if not runtime_cp_override:
+        runtime_cp_group = base_cp_group
+    full_mask = torch.tensor([[False, False, False, True]], device="cpu")
+    padding_mask = full_mask[:, :2].clone() if sp_sharded_mask else full_mask.clone()
+    original_mask = padding_mask.clone()
+    decoder_input = torch.zeros(2, 1, 4, device="cpu")
+    scatter_calls, roll_calls, layer_masks = [], [], []
+
+    def scatter(mask, group):
+        assert group is tp_group and mask.shape == (4, 1)
+        scatter_calls.append(mask.clone())
+        return mask[:2]
+
+    def roll(tensor, *, sp_group, cp_group, **kwargs):
+        assert sp_group is tp_group and cp_group is runtime_cp_group
+        assert tensor.shape[0] == decoder_input.shape[0]
+        roll_calls.append(tensor.clone())
+        return tensor.clone(), None
+
+    def layer(**kwargs):
+        layer_masks.append(kwargs["padding_mask"].clone())
+        return (
+            kwargs["hidden_states"],
+            kwargs["input_ids"],
+            kwargs["position_ids"],
+            kwargs["padding_mask"],
+            kwargs["mtp_input_mask"],
+        )
+
+    block = SimpleNamespace(
+        config=SimpleNamespace(mtp_detach_heads=False, mtp_hsm=False, mtp_num_layers=2),
+        cp_group=base_cp_group,
+        tp_group=tp_group,
+        sequence_parallel=True,
+        vp_stage=None,
+        pp_rank=0,
+        training=True,
+        mtp_use_repeated_layer=False,
+        layers=[layer, layer],
+    )
+    monkeypatch.setattr(mtp, "resolve_cp_group", lambda group, params: runtime_cp_group)
+    monkeypatch.setattr(mtp, "get_mtp_layer_offset", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(mtp, "scatter_to_sequence_parallel_region", scatter)
+    monkeypatch.setattr(mtp, "roll_tensor_precomputed_embeddings", roll)
+    result = mtp.MultiTokenPredictionBlock.forward(
+        block,
+        input_ids=None,
+        position_ids=None,
+        hidden_states=decoder_input.clone(),
+        attention_mask=None,
+        padding_mask=padding_mask,
+        decoder_input=decoder_input,
+    )
+    assert len(scatter_calls) == (0 if sp_sharded_mask else 1)
+    assert len(roll_calls) == 4 and len(layer_masks) == 2
+    for mask in layer_masks:
+        torch.testing.assert_close(mask, full_mask[:, :2])
+    torch.testing.assert_close(padding_mask, original_mask)
+    assert result.shape == (6, 1, 4)
+
+
+@pytest.mark.parametrize("sp_sharded_mask", [False, True])
+def test_mtp_embedding_roll_accepts_full_or_sp_sharded_padding_mask(monkeypatch, sp_sharded_mask):
+    from types import SimpleNamespace
+
+    tp_group = object()
+    layer = SimpleNamespace(
+        config=SimpleNamespace(
+            sequence_parallel=True, attention_cp_layout="zigzag", mtp_detach_heads=False
+        ),
+        cp_group=None,
+        tp_group=tp_group,
+    )
+    tokens = torch.arange(4, device="cpu").view(1, 4)
+    full_mask = torch.tensor([[False, True, False, True]], device="cpu")
+    padding_mask = full_mask[:, :2].clone() if sp_sharded_mask else full_mask.clone()
+    original_mask = padding_mask.clone()
+    calls = []
+
+    def gather(mask, tensor_parallel_output_grad, group):
+        assert group is tp_group and tensor_parallel_output_grad is False
+        assert mask.shape == (2, 1)
+        calls.append("gather")
+        return full_mask.transpose(0, 1)
+
+    def scatter(mask, group):
+        assert group is tp_group and mask.shape == (4, 1)
+        calls.append("scatter")
+        return mask[:2]
+
+    def roll(fields, **kwargs):
+        assert kwargs["sequence_fields"] == ["input_ids", "padding_mask"]
+        torch.testing.assert_close(fields[0], tokens)
+        torch.testing.assert_close(fields[1], full_mask)
+        return [
+            torch.tensor([[1, 2, 3, 0]], device="cpu"),
+            torch.tensor([[True, False, True, True]], device="cpu"),
+        ]
+
+    def embedding(input_ids, position_ids):
+        return torch.zeros(2, 1, 4, device="cpu")
+
+    embedding.add_position_embedding = False
+    embedding.scatter_to_sequence_parallel = True
+    monkeypatch.setattr(mtp, "resolve_cp_group", lambda group, params: None)
+    monkeypatch.setattr(mtp, "gather_from_sequence_parallel_region", gather)
+    monkeypatch.setattr(mtp, "scatter_to_sequence_parallel_region", scatter)
+    monkeypatch.setattr(mtp, "roll_tensor", roll)
+    result = mtp.MultiTokenPredictionLayer._get_embeddings(
+        layer,
+        input_ids=tokens,
+        position_ids=tokens,
+        embedding=embedding,
+        hidden_states=torch.zeros(2, 1, 4, device="cpu"),
+        padding_mask=padding_mask,
+    )
+    assert calls == (["gather", "scatter"] if sp_sharded_mask else ["scatter"])
+    torch.testing.assert_close(result[2], torch.tensor([[True, False]], device="cpu"))
+    torch.testing.assert_close(padding_mask, original_mask)
+
+
 @pytest.mark.parametrize("axis", [0, -3])
 def test_packed_first_axis_roll_respects_valid_ends_and_gradients(axis):
     values = torch.arange(12, dtype=torch.float32).view(6, 1, 2).requires_grad_()

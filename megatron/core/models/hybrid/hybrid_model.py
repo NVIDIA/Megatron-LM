@@ -30,6 +30,7 @@ from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -471,9 +472,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             self._setup_mtp_cuda_graphs()
 
-        # Output
+        # Output. LinearCrossEntropyModule is a ColumnParallelLinear that can also fuse the LM head
+        # with the cross-entropy loss (`--cross-entropy-fusion-impl linear`), as in GPTModel.
         if post_process or self.mtp_process:
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            self.output_layer = LinearCrossEntropyModule(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
@@ -630,7 +632,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         use_precomputed_mtp_embeddings = decoder_input is not None
 
-        # Decoder embedding.
+        # Decoder embedding. Under sequence parallelism the decoder gets the padding mask scattered
+        # along the sequence like its hidden states; the post-process keeps the caller's full-length
+        # mask (the MTP rolls it alongside input_ids / position_ids, and MoE layers re-align it to
+        # their hidden states themselves).
+        decoder_padding_mask = padding_mask
         if decoder_input is not None:
             pass
         elif self.pre_process:
@@ -658,7 +664,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     decoder_input, group=self.pg_collection.tp
                 )
             if padding_mask is not None and self.config.sequence_parallel:
-                padding_mask = (
+                decoder_padding_mask = (
                     tensor_parallel.scatter_to_sequence_parallel_region(
                         padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
                     )
@@ -692,17 +698,21 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # TODO: Apply the same later-stage SP mask alignment in GPTModel.
         # Later pipeline stages receive activations through set_input_tensor.
         decoder_reference = decoder_input
-        if padding_mask is not None and self.config.sequence_parallel and decoder_reference is None:
+        if (
+            decoder_padding_mask is not None
+            and self.config.sequence_parallel
+            and decoder_reference is None
+        ):
             decoder_reference = self.decoder.input_tensor
         if (
-            padding_mask is not None
+            decoder_padding_mask is not None
             and self.config.sequence_parallel
             and decoder_reference is not None
-            and padding_mask.shape[1] != decoder_reference.shape[0]
+            and decoder_padding_mask.shape[1] != decoder_reference.shape[0]
         ):
-            padding_mask = (
+            decoder_padding_mask = (
                 tensor_parallel.scatter_to_sequence_parallel_region(
-                    padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                    decoder_padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
                 )
                 .transpose(0, 1)
                 .contiguous()
@@ -789,7 +799,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
+                padding_mask=decoder_padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
@@ -842,17 +852,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # Prefetch only after converting to the MTP layout: cached rows belong
             # to these token IDs and this packed metadata, not the decoder layout.
             mtp_cp_group = resolve_cp_group(self.pg_collection.cp, mtp_inputs.packed_seq_params)
+            sequence_roll_tokens = (
+                mtp_inputs.input_ids if mtp_inputs.input_ids is not None else mtp_inputs.labels
+            )
             sequence_roll_context = prepare_mtp_sequence_roll_context(
-                tensor=(
-                    mtp_inputs.input_ids if mtp_inputs.input_ids is not None else mtp_inputs.labels
-                ),
+                tensor=sequence_roll_tokens,
                 cp_group=mtp_cp_group,
                 packed_seq_params=mtp_inputs.packed_seq_params,
             )
             if sequence_roll_context is not None:
                 roll_position_ids = getattr(self.embedding, "add_position_embedding", True)
                 roll_padding_mask = mtp_inputs.padding_mask
-                if roll_padding_mask is not None and self.config.sequence_parallel:
+                if (
+                    roll_padding_mask is not None
+                    and self.config.sequence_parallel
+                    and roll_padding_mask.shape != sequence_roll_tokens.shape
+                ):
                     roll_padding_mask = tensor_parallel.gather_from_sequence_parallel_region(
                         roll_padding_mask.transpose(0, 1).contiguous(),
                         tensor_parallel_output_grad=False,
@@ -954,6 +969,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 # then back to [S', B, H] for the output layer.
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+        if (
+            labels is not None
+            and not in_inference_mode
+            and self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == "linear"
+        ):
+            # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are never
+            # materialised, so the loss comes straight out of the output layer and muP's output
+            # scaling is applied to the layer input instead (the layer has no bias).
+            return self.output_layer(
+                self._scale_fused_cross_entropy_input(hidden_states),
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                output_cross_entropy_loss=True,
+                labels=labels,
+            )
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
