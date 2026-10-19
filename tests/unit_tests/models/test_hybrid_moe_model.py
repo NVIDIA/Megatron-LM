@@ -272,6 +272,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_token_dispatcher_type": "alltoall",
     "moe_token_drop_policy": "probs",
     "moe_token_dropping": False,
+    "moe_virtual_expert_load_balance": False,
     "moe_z_loss_coeff": None,
     "moe_enable_routing_replay": False,
     "mrope_section": None,
