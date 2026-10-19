@@ -193,3 +193,10 @@ class _Collapse(torch.autograd.Function):
 
 def collapse(values, pre):
     return _Collapse.apply(values, pre)
+
+
+def aggregate(module, values, pre, out=None):
+    """Core's aggregation ABI, with the inference BF16 collapse rounding."""
+    streams = values.unflatten(-1, (module.n, module.hidden_size)).bfloat16()
+    result = collapse(streams, pre).to(values.dtype)
+    return result if out is None else out.copy_(result)
