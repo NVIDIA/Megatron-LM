@@ -714,8 +714,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/ssm/mamba_ragged.py", "megatron/core/ssm/mamba_ragged_scan.py"),
         tests=(
             K + "test_shared_prefix_mamba_kernels.py",
-            "tests/unit_tests/ssm/test_shared_prefix_mamba_backends.py",
-            "tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_backends.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
         ),
         kind="triton",
         notes="_RaggedGather forward/backward (one owner per input element, fixed-order FP32 "
@@ -734,7 +734,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/ssm/mamba_sequence_packing.py",),
         tests=(
             K + "test_shared_prefix_mamba_kernels.py",
-            "tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
         ),
         kind="dispatch",
         notes="Pads every sequence to a scan-chunk boundary and calls causal_conv1d_fn and "
@@ -748,8 +748,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/ssm/mamba_shared_prefix.py",),
         tests=(
             K + "test_shared_prefix_mamba_kernels.py",
-            "tests/unit_tests/ssm/test_shared_prefix_mamba_backends.py",
-            "tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_backends.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
         ),
         kind="dispatch",
         notes="forward_mamba_layer_shared_prefix routes every Mamba layer through "

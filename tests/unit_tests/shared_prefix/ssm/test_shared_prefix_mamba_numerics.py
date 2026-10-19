@@ -25,7 +25,7 @@ Tolerances (whole-tensor relative L2 unless noted):
 import pytest
 import torch
 
-from tests.unit_tests.ssm.shared_prefix_test_utils import (
+from tests.unit_tests.shared_prefix.ssm.shared_prefix_test_utils import (
     MAMBA_BACKENDS,
     LayerProblemData,
     SharedPrefixProblem,

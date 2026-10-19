@@ -586,7 +586,7 @@ def forward_mamba_layer_shared_prefix(
     - in FP32 with IEEE GEMMs its outputs match per-row dense Mamba to about 1e-7 and its
       gradients to a few 1e-6 (asserted at 5e-5 relative L2); on the tested shapes it stays
       within 1.5x of the dense BF16 error
-      (``tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py``);
+      (``tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py``);
     - its Triton kernels replay bit-exactly under deterministic mode
       (``tests/unit_tests/determinism/kernels/test_shared_prefix_mamba_kernels.py``).
 
