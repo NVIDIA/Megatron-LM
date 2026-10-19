@@ -3,6 +3,7 @@
 """Muon with sharded momentum and owner-compute updates for MFSDP v2."""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
@@ -25,6 +26,15 @@ from .dbuffer import DBuffer
 from .gather_scatter import gather, scatter
 from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+
+
+@dataclass(frozen=True)
+class _FsdpGroupAssignment:
+    """An FSDP group and its cached optimizer-group and owner-rank assignments."""
+
+    fsdp_group: FsdpParameterGroup
+    tensor_to_optimizer_group_index: dict[int, int]
+    tensor_to_owner_rank: dict[int, int]
 
 
 # Design choice: integrating Emerging Optimizers (EO) into FsdpMuon.
@@ -74,9 +84,7 @@ class FsdpMuon(Muon):
         **kwargs: Remaining keyword options accepted by EO's ``Muon``, such as ``nesterov``.
     """
 
-    _fsdp_groups: list[FsdpParameterGroup]
-    _tensor_to_optimizer_group_indices: list[dict[int, int]]
-    _tensor_to_owner_ranks: list[dict[int, int]]
+    _fsdp_group_assignments: list[_FsdpGroupAssignment]
 
     def __init__(
         self,
@@ -89,7 +97,7 @@ class FsdpMuon(Muon):
         super().__init__(params, lr=lr, momentum=momentum, weight_decay=weight_decay, **kwargs)
 
         # Preserve discovery order: communication must be posted identically on every rank.
-        self._fsdp_groups = []
+        fsdp_groups: list[FsdpParameterGroup] = []
         param_to_optimizer_group_index: dict[torch.nn.Parameter, int] = {}
         for group_index, group in enumerate(self.param_groups):
             for param in group["params"]:
@@ -99,28 +107,32 @@ class FsdpMuon(Muon):
                 fsdp_group: FsdpParameterGroup | None = get_containing_parameter_group(param)
                 if fsdp_group is None:
                     raise ValueError("FsdpMuon requires parameters sharded by MFSDP v2.")
-                if fsdp_group not in self._fsdp_groups:
-                    self._fsdp_groups.append(fsdp_group)
+                if fsdp_group not in fsdp_groups:
+                    fsdp_groups.append(fsdp_group)
                 param_to_optimizer_group_index[param] = group_index
-        self._validate_param_groups()
-        self._tensor_to_optimizer_group_indices = [
-            {
-                i: param_to_optimizer_group_index[fp.sharded]
-                for i, fp in enumerate(fsdp_group.fsdp_parameters)
-                if fp.sharded in param_to_optimizer_group_index
-            }
-            for fsdp_group in self._fsdp_groups
-        ]
-        self._tensor_to_owner_ranks = assign_owner_work(
-            group.main_weight for group in self._fsdp_groups
-        )
+        self._validate_param_groups(fsdp_groups)
+        self._fsdp_group_assignments = []
+        for fsdp_group, tensor_to_owner_rank in zip(
+            fsdp_groups, assign_owner_work(group.main_weight for group in fsdp_groups), strict=True
+        ):
+            self._fsdp_group_assignments.append(
+                _FsdpGroupAssignment(
+                    fsdp_group=fsdp_group,
+                    tensor_to_optimizer_group_index={
+                        i: param_to_optimizer_group_index[fp.sharded]
+                        for i, fp in enumerate(fsdp_group.fsdp_parameters)
+                        if fp.sharded in param_to_optimizer_group_index
+                    },
+                    tensor_to_owner_rank=tensor_to_owner_rank,
+                )
+            )
 
-    def _validate_param_groups(self) -> None:
+    def _validate_param_groups(self, fsdp_groups: list[FsdpParameterGroup]) -> None:
         """Validate optimizer parameters and the FSDP buffers that contain them."""
         for group in self.param_groups:
             if group["weight_decay"] != 0:
                 raise NotImplementedError("FsdpMuon does not support nonzero weight decay yet.")
-        for fsdp_group in self._fsdp_groups:
+        for fsdp_group in fsdp_groups:
             if fsdp_group.mesh.ndim != 1:
                 raise NotImplementedError("FsdpMuon requires a one-dimensional DP mesh.")
             for buffer in (fsdp_group.main_weight, fsdp_group.main_grad, fsdp_group.model_weight):
@@ -137,20 +149,18 @@ class FsdpMuon(Muon):
             if group["weight_decay"] != 0:
                 raise NotImplementedError("FsdpMuon does not support nonzero weight decay yet.")
 
-        for fsdp_group, tensor_to_optimizer_group_index, owners in zip(
-            self._fsdp_groups,
-            self._tensor_to_optimizer_group_indices,
-            self._tensor_to_owner_ranks,
-            strict=True,
-        ):
+        for assignment in self._fsdp_group_assignments:
+            fsdp_group: FsdpParameterGroup = assignment.fsdp_group
             active: dict[int, int] = {
                 i: group_index
-                for i, group_index in tensor_to_optimizer_group_index.items()
+                for i, group_index in assignment.tensor_to_optimizer_group_index.items()
                 if fsdp_group.fsdp_parameters[i].sharded.grad is not None
             }
             if not active:
                 continue
-            self._step_group(fsdp_group, active, {i: owners[i] for i in active})
+            self._step_group(
+                fsdp_group, active, {i: assignment.tensor_to_owner_rank[i] for i in active}
+            )
             fsdp_group.sync_model_weight_from_main_weight()
 
     def _step_group(
