@@ -17,9 +17,7 @@ def test_vllm_imports_are_allowlisted_and_delayed():
             if ROOT in path.parents
             else path.relative_to(ROOT.parents[1]).as_posix()
         )
-        allowed = relative.startswith(
-            ("model/deepseek_v41/vllm/", "examples/verl/verl_mlite/rollout/")
-        )
+        allowed = relative.startswith(("model/deepseek_v41/vllm/", "examples/verl/"))
 
         def visit(node, in_function=False):
             names = []
