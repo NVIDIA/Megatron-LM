@@ -1423,12 +1423,10 @@ class _CudaGraphRunner(torch.nn.Module):
 
                     if self.gtp_remat:
                         # Forward only issues AG prefetches. Drain the operations directly.
-                        captured_params, captured_ag_streams, _ = capture_comms.get_comms_for_chains(
-                            get_graphed_chain_ids()
+                        captured_params, captured_ag_streams, _ = (
+                            capture_comms.get_comms_for_chains(get_graphed_chain_ids())
                         )
-                        wait_async_comms(
-                            graphed_only=True, skip_rs=True, params=captured_params
-                        )
+                        wait_async_comms(graphed_only=True, skip_rs=True, params=captured_params)
                         self._wait_side_streams(captured_ag_streams)
 
                 if self.gtp_remat:
