@@ -74,8 +74,14 @@ try:
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast, fp8_model_init
 
+    try:
+        from transformer_engine.pytorch.utils import mark_grouped_tensor as _te_mark_grouped_tensor
+    except ImportError:
+        _te_mark_grouped_tensor = None
+
     HAVE_TE = True
 except ImportError:
+    _te_mark_grouped_tensor = None
     if TYPE_CHECKING:
         # For type checking, treat transformer_engine as always available.
         import transformer_engine as te
@@ -125,6 +131,20 @@ def _set_expert_parameter_attributes(
         if is_partitioned:
             param.partition_dim = 1 if parallel_mode == "row" else 0
             param.partition_stride = 1
+
+
+def mark_grouped_tensor(*tensors: Any) -> None:
+    """Mark dynamic grouped tensors through the Transformer Engine compatibility boundary."""
+    if _te_mark_grouped_tensor is None:
+        raise RuntimeError(
+            "Paged stashing requires Transformer Engine's mark_grouped_tensor utility."
+        )
+    _te_mark_grouped_tensor(*tensors)
+
+
+def is_grouped_tensor_marked(tensor: Any) -> bool:
+    """Return whether a tensor carries Transformer Engine's grouped-tensor marker."""
+    return hasattr(tensor, "grouped_tensor_scale_inv")
 
 
 class TransformerEngineConfigType(enum.Enum):
