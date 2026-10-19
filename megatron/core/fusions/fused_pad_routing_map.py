@@ -80,12 +80,27 @@ def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch
 
     Returns:
         torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
+
+    Raises:
+        RuntimeError: If an expert is routed more than ``num_tokens - num_to_pad`` tokens, so
+            there are not enough zeros left in its row to reach the next multiple of
+            pad_multiple.
     """
     num_tokens, num_experts = routing_map.shape
     if num_tokens == 0:
         return routing_map
 
     input_map = routing_map.transpose(0, 1).contiguous().int()  # [num_experts, num_tokens]
+
+    # Same feasibility contract as pad_routing_map: the kernel can only flip the zeros that
+    # are left in each expert's row, so check it here instead of silently returning an
+    # unaligned count. _assert_async keeps the check off the host.
+    num_ones = input_map.sum(dim=1)
+    torch._assert_async(
+        torch.all(num_ones + (-num_ones) % pad_multiple <= num_tokens),
+        "fused_pad_routing_map: not enough tokens to pad every expert's token count to a "
+        f"multiple of {pad_multiple}",
+    )
 
     output_map = torch.empty_like(input_map)
 
