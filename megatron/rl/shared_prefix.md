@@ -46,13 +46,13 @@ assert tree.first_predecessors()[2] == 3  # excludes parent padding at 4, 5
 ```
 
 The test-only `build_tree_attention_allow_mask` in
-`tests/unit_tests/rl/shared_prefix_oracles.py` is a correctness oracle for these
-deeper trees. It permits real ancestor tokens and causal tokens within the same
-node, and isolates sibling branches and unrelated roots. Its use does **not**
-qualify deeper fused attention or recurrent execution. A model-execution adapter
-(NeMo RL's, for example) should call `iter_star_roots()`, which rejects deeper
-trees, interleaved star storage and padded prompt roots, before lowering to a
-star-only backend. Future generalized
+`tests/unit_tests/rl/shared_prefix/shared_prefix_oracles.py` is a correctness
+oracle for these deeper trees. It permits real ancestor tokens and causal tokens
+within the same node, and isolates sibling branches and unrelated roots. Its use
+does **not** qualify deeper fused attention or recurrent execution. A
+model-execution adapter (NeMo RL's, for example) should call
+`iter_star_roots()`, which rejects deeper trees, interleaved star storage and
+padded prompt roots, before lowering to a star-only backend. Future generalized
 tree execution can reuse the descriptor, path and predecessor contracts while
 adding backend support and generalized source-row/loss mappings.
 
@@ -159,17 +159,15 @@ optional Megatron backend.
 
 ## Validation scope
 
-The portable packing tests live under `tests/unit_tests/rl/test_shared_prefix*`
-and `tests/unit_tests/rl/test_tree_layout.py`. They cover exact prompt identity,
-source-row coverage, causal isolation, physical padding, CP shard reconstruction,
-fallback behavior, execution-count alignment, MTP normalization, seeded
-planning and tensor properties, and the signatures NeMo RL calls.
-Their pure CPU contracts can run without the repository's distributed CUDA
-fixtures:
+The portable packing tests live in `tests/unit_tests/rl/shared_prefix/`. They
+cover exact prompt identity, source-row coverage, causal isolation, physical
+padding, CP shard reconstruction, fallback behavior, execution-count alignment,
+MTP normalization, seeded planning and tensor properties, and the signatures
+NeMo RL calls. Their pure CPU contracts can run without the repository's
+distributed CUDA fixtures:
 
 ```bash
-uv run python -m pytest --noconftest \
-    tests/unit_tests/rl/test_shared_prefix*.py tests/unit_tests/rl/test_tree_layout.py
+uv run python -m pytest --noconftest tests/unit_tests/rl/shared_prefix
 ```
 
 These tests cover planning only. Model numerics, and the agreement between this
