@@ -32,7 +32,8 @@ def _get_dsa_kernel_backend(config: TransformerConfig) -> str:
     """Return the configured DSA kernel backend."""
     backend = config.dsa_kernel_backend
     # The DSA-over-GQA values select implementations that load no fused backend module, so
-    # they are treated like "none" here; TransformerConfig validates the value itself.
+    # every helper in this module treats them like "none"; TransformerConfig validates the
+    # value itself.
     if backend not in _UNFUSED_DSA_KERNEL_BACKENDS and backend not in (
         _BACKEND_MODULE_NAME_BY_BACKEND
     ):
@@ -46,7 +47,7 @@ def _get_dsa_kernel_backend(config: TransformerConfig) -> str:
 def _get_backend_module_name(config: TransformerConfig) -> Optional[str]:
     """Return the optional DSA backend module selected by config."""
     backend = _get_dsa_kernel_backend(config)
-    if backend == "none":
+    if backend in _UNFUSED_DSA_KERNEL_BACKENDS:
         return None
     return _BACKEND_MODULE_NAME_BY_BACKEND[backend]
 
@@ -102,7 +103,7 @@ def use_fused_dsa_kernels(config: TransformerConfig) -> bool:
     backend = config.attention_backend
     if backend == AttnBackend.unfused or backend == "unfused":
         return False
-    return _get_dsa_kernel_backend(config) != "none"
+    return _get_dsa_kernel_backend(config) not in _UNFUSED_DSA_KERNEL_BACKENDS
 
 
 def run_fused_qk_topk(
