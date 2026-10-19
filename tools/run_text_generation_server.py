@@ -34,6 +34,7 @@ from megatron.training.global_vars import initialize_runtime_services, set_run_c
 
 try:
     from megatron.post_training.model_config import modelopt_inference_config_from_args
+    from megatron.post_training.utils import should_use_modelopt_config
 
     HAS_NVIDIA_MODELOPT = True
 except ImportError:
@@ -132,7 +133,7 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    use_modelopt = HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False)
+    use_modelopt = HAS_NVIDIA_MODELOPT and should_use_modelopt_config(args)
     cfg = (
         modelopt_inference_config_from_args(args)
         if use_modelopt
@@ -157,7 +158,7 @@ def main(model_type: str = "gpt"):
 
         load_context = fp8_model_init()
     with load_context:
-        if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+        if use_modelopt:
             # ModelOpt layer specs and hooks come from the config; the builder is the stock one.
             model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
         else:

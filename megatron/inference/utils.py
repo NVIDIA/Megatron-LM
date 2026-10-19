@@ -40,6 +40,7 @@ from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelB
 
 try:
     from megatron.post_training.model_config import build_modelopt_models
+    from megatron.post_training.utils import should_use_modelopt_config
 
     HAS_NVIDIA_MODELOPT = True
 except ImportError:
@@ -151,7 +152,7 @@ def get_model_for_inference() -> MegatronModule:
         cfg.model.transformations is not None or cfg.model.distillation is not None
     ):
         model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
-    elif HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+    elif HAS_NVIDIA_MODELOPT and should_use_modelopt_config(args):
         model = build_modelopt_models(args)
     else:
         builder = get_model_builder(args)

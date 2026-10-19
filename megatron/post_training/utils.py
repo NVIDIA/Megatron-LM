@@ -2,32 +2,70 @@
 
 import inspect
 import os
+import warnings
 
 import modelopt
 import modelopt.torch.quantization as mtq
 import torch
+from modelopt.torch.distill import DistillationModel
 from modelopt.torch.quantization.utils import is_quantized
 from packaging.version import Version
 
+from megatron.core.utils import unwrap_model
 
-def maybe_enable_modelopt(args):
-    """Set `args.modelopt_enabled` if a ModelOpt checkpoint or distillation teacher is
-    configured. Idempotent and safe to call multiple times (e.g. once early in
-    `pretrain_gpt.py` before building the model config, and again as a fallback in
-    `training.py` for callers that don't go through that entrypoint).
+
+def is_distillation_model(model) -> bool:
+    """Return whether a model or model-chunk list contains a distillation model."""
+    unwrapped = unwrap_model(model)
+    if isinstance(unwrapped, list):
+        return any(isinstance(model_chunk, DistillationModel) for model_chunk in unwrapped)
+    return isinstance(unwrapped, DistillationModel)
+
+
+def should_use_modelopt_config(args) -> bool:
+    """Return whether CLI inputs require the ModelOpt-aware model configuration.
+
+    ``--modelopt-enabled`` remains a deprecated compatibility input, but the result is
+    no longer written back to ``args`` or consulted after the run config is created.
     """
     if getattr(args, "modelopt_enabled", False):
-        return
+        warnings.warn(
+            "--modelopt-enabled is deprecated; ModelOpt configuration is now inferred "
+            "from the checkpoint and ModelOpt-specific options.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return True
 
     from megatron.post_training.checkpointing import has_modelopt_state
     from megatron.training import print_rank_0
 
     if args.load is not None and has_modelopt_state(args.load):
         print_rank_0("ModelOpt checkpoint detected")
-        args.modelopt_enabled = True
-    if getattr(args, "export_kd_teacher_load", None):
-        # For distillation ckpts without ModelOpt state
-        args.modelopt_enabled = True
+        return True
+
+    nondefault_options = (
+        getattr(args, "export_model_type", None) is not None,
+        getattr(args, "export_legacy_megatron", False),
+        getattr(args, "export_te_mcore_model", False),
+        getattr(args, "export_default_te_spec", False),
+        getattr(args, "export_force_local_attention", False),
+        getattr(args, "export_kv_cache_quant", "none") != "none",
+        getattr(args, "export_real_quant_cfg", "None") != "None",
+        getattr(args, "export_quant_cfg", None) is not None,
+        getattr(args, "export_kd_teacher_load", None) is not None,
+        getattr(args, "export_kd_teacher_model_config", None) is not None,
+        getattr(args, "export_kd_teacher_ckpt_format", None) is not None,
+        getattr(args, "export_kd_cfg", None) is not None,
+        getattr(args, "qad_train_target", None) is not None,
+        getattr(args, "freeze_base_for_mtp", False),
+        getattr(args, "lsq_scale_lr", None) is not None,
+        getattr(args, "export_qk_l2_norm", False),
+        getattr(args, "export_moe_apply_probs_on_input", False),
+        getattr(args, "export_offline_model", False),
+        getattr(args, "enable_gpt_oss", False),
+    )
+    return any(nondefault_options)
 
 
 def modelopt_version_higher_than(target_version: str):

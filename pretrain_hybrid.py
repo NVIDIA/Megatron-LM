@@ -73,10 +73,9 @@ from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_l
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
-    from megatron.post_training.loss_func import is_distillation_model
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
     from megatron.post_training.model_config import modelopt_model_config_from_args
-    from megatron.post_training.utils import maybe_enable_modelopt
+    from megatron.post_training.utils import is_distillation_model, should_use_modelopt_config
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -275,9 +274,7 @@ def loss_func(
             ignore_errors=args.logits_load_ignore_errors,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
-    elif has_nvidia_modelopt and (
-        getattr(args, "modelopt_enabled", False) or is_distillation_model(model)
-    ):  # [ModelOpt]
+    elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()
@@ -565,9 +562,8 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
-    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+    use_modelopt_config = has_nvidia_modelopt and should_use_modelopt_config(args)
+    if use_modelopt_config:
         model_cfg = modelopt_model_config_from_args(
             args, model_type="hybrid", vocab_size_from_tokenizer=True
         )

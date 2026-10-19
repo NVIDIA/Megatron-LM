@@ -3,17 +3,12 @@
 """Pretrain GPT loss function(s)."""
 
 import torch
-from modelopt.torch.distill import DistillationModel
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.core.utils import unwrap_model
+from megatron.post_training.utils import is_distillation_model
 from megatron.training import get_args
-
-
-def is_distillation_model(model) -> bool:
-    """Recognize KD from the built model, including configuration-only construction."""
-    return isinstance(unwrap_model(model), DistillationModel)
 
 
 def _mask_loss(output_tensor, loss_mask):

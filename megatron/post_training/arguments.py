@@ -155,7 +155,8 @@ def add_modelopt_args(parser):
     group.add_argument(
         '--modelopt-enabled',
         action="store_true",
-        help='Will be set automatically when loading a ModelOpt checkpoint.',
+        help='Deprecated compatibility override. ModelOpt configuration is inferred from the '
+        'checkpoint and ModelOpt-specific options.',
     )
 
     # GPT-OSS YaRN RoPE support

@@ -11,7 +11,6 @@ export HF_DATASETS_CACHE="/tmp/hf_datasets_cache"
 
 # Extra arguments of this script
 MLM_DEFAULT_ARGS=" \
-    --modelopt-enabled \
     --distributed-timeout-minutes 60 \
     --auto-detect-ckpt-format \
     --export-te-mcore-model \

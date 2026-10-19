@@ -6,6 +6,7 @@ import pytest
 
 from megatron.post_training import model_config as mc
 from megatron.post_training import model_hooks
+from megatron.post_training import utils as modelopt_utils
 from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
@@ -15,6 +16,45 @@ from megatron.training.config.instantiate_utils import InstantiationMode
 from megatron.training.models.gpt import GPTModelBuilder
 from megatron.training.models.hybrid import HybridModelBuilder
 from tests.unit_tests.post_training.test_modelopt_model_config import _make_args
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        {"export_te_mcore_model": True},
+        {"export_kd_teacher_load": "/teacher"},
+        {"qad_train_target": "base"},
+    ],
+)
+def test_modelopt_config_selection_from_explicit_options(option):
+    args = _make_args(**option)
+    args.load = None
+    assert modelopt_utils.should_use_modelopt_config(args)
+
+
+def test_modelopt_config_selection_from_checkpoint():
+    args = _make_args()
+    args.load = "/modelopt-checkpoint"
+    with patch(
+        "megatron.post_training.checkpointing.has_modelopt_state", return_value=True
+    ) as has_state:
+        assert modelopt_utils.should_use_modelopt_config(args)
+    has_state.assert_called_once_with(args.load)
+
+
+def test_plain_run_does_not_select_modelopt_config():
+    args = _make_args()
+    args.load = None
+    assert not modelopt_utils.should_use_modelopt_config(args)
+
+
+def test_legacy_modelopt_enable_flag_is_only_a_deprecated_input():
+    args = _make_args(modelopt_enabled=True)
+    args.load = None
+    original_args = vars(args).copy()
+    with pytest.warns(DeprecationWarning, match="modelopt-enabled is deprecated"):
+        assert modelopt_utils.should_use_modelopt_config(args)
+    assert vars(args) == original_args
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
@@ -168,7 +208,6 @@ def test_inference_uses_config_without_cli_enable_flag():
     from megatron.inference import utils
 
     args = Namespace(
-        modelopt_enabled=False,
         load="/configured",
         ckpt_format="torch_dist",
         inference_ckpt_non_strict=False,

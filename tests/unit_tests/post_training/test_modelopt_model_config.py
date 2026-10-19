@@ -555,6 +555,18 @@ class TestTeacherCheckpointConfig:
 
 
 class TestConfigurationDrivenKDLoss:
+    def test_distillation_detection_accepts_model_chunk_lists(self):
+        from modelopt.torch.distill import DistillationModel
+
+        from megatron.post_training.utils import is_distillation_model
+
+        distillation_model = Mock(spec=DistillationModel)
+        with patch(
+            "megatron.post_training.utils.unwrap_model",
+            return_value=[object(), distillation_model],
+        ):
+            assert is_distillation_model([Mock(), Mock()])
+
     @pytest.mark.parametrize("training", [True, False])
     def test_kd_loss_without_legacy_cli_teacher_flag(self, training):
         from modelopt.torch.distill import DistillationModel
