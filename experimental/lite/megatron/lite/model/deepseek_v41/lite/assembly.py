@@ -187,13 +187,22 @@ class DS41AttentionSources(nn.Module):
                 )
             attach_ratio_two_sources(self.native, compressor=main, indexer=indexer)
         elif self.ratio == 1:
-            if self.layer == policy.kv:
-                self.main_projection = FP32Projection(
-                    config.hidden_size,
-                    config.v_head_dim,
+
+            def projection(inputs, outputs):
+                return TELinear(
+                    inputs,
+                    outputs,
+                    parallel_mode="duplicated",
                     config=config,
                     init_method=config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
                 )
+
+            if self.layer == policy.kv:
+                # Release ratio-one wkv is a BF16 linear; only ratio > 1 is FP32.
+                self.main_projection = projection(config.hidden_size, config.v_head_dim)
                 self.main_norm = nn.RMSNorm(
                     config.v_head_dim, eps=config.layernorm_epsilon, dtype=config.params_dtype
                 )
@@ -211,18 +220,6 @@ class DS41AttentionSources(nn.Module):
                     ),
                 )
                 freeze_indexer_sources(self.index_key, loss_coefficient=0)
-
-            def projection(inputs, outputs):
-                return TELinear(
-                    inputs,
-                    outputs,
-                    parallel_mode="duplicated",
-                    config=config,
-                    init_method=config.init_method,
-                    bias=False,
-                    skip_bias_add=False,
-                    skip_weight_param_allocation=False,
-                )
 
             self.index_q = IndexProjection(
                 (
