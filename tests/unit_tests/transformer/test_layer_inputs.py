@@ -290,7 +290,7 @@ def test_skeleton_adapters_preserve_recompute_and_mhc_state():
     )
     for cls in (TransformerLayer, MambaLayer):
         module = bare(cls)
-        module.config = SimpleNamespace(cuda_graph_impl='none')
+        module.config = SimpleNamespace(cuda_graph_impl='none', linear_cp_mode='chunkwise')
         module.mlp = SimpleNamespace(router=SimpleNamespace(is_hash_layer=True))
         module._call_with_bound_args = Mock(
             return_value=(x, None) if cls is TransformerLayer else x
@@ -321,6 +321,29 @@ def test_graph_adapter_passes_tensors_to_legacy_graph_manager():
     assert args[1] == ()
     assert args[2]['hidden_states'] is x
     assert 'inputs' not in args[2]
+
+
+@pytest.mark.parametrize("mode", ["headwise", "chunkwise"])
+@pytest.mark.parametrize("has_metadata", [False, True])
+def test_mamba_binding_owns_cp_metadata_selection(mode, has_metadata):
+    module = bare(MambaLayer)
+    module.config = SimpleNamespace(linear_cp_mode=mode)
+    x = torch.randn(2, 4)
+    metadata = object() if has_metadata else None
+    module._call_with_bound_args = Mock(return_value=x)
+
+    assert module(x, LayerInputs(cp_metadata=metadata)) == (x, None)
+    kwargs = module._call_with_bound_args.call_args.kwargs
+    if mode == "chunkwise" and has_metadata:
+        assert kwargs["packed_sequence_cp_metadata"] is metadata
+    else:
+        assert "packed_sequence_cp_metadata" not in kwargs
+
+    # Explicit legacy calls retain their arguments and tensor return value.
+    assert module(x, packed_sequence_cp_metadata=metadata) is x
+    assert module._call_with_bound_args.call_args.kwargs == {
+        "packed_sequence_cp_metadata": metadata
+    }
 
 
 def test_shortcut_atomic_call_accepts_any_layer_with_shared_inputs():
@@ -403,7 +426,7 @@ def test_recompute_calls_shared_inputs_and_replays_gradients(config_cls, method)
     assert len(layer.inputs) == 2
     for inputs in layer.inputs:
         assert inputs.input_ids is ids
-        assert inputs.cp_metadata is (metadata if config_cls is MambaLayerConfig else None)
+        assert inputs.cp_metadata is metadata
 
 
 def test_hybrid_stack_eager_and_full_recompute_use_the_same_call():
@@ -415,7 +438,7 @@ def test_hybrid_stack_eager_and_full_recompute_use_the_same_call():
             self.config, self.layer_number = (config, layer_number)
 
         def forward(self, hidden_states, inputs):
-            self.assert_inputs = isinstance(inputs, LayerInputs)
+            self.received_inputs = inputs
             return hidden_states.sin(), None
 
     for method in (None, 'uniform', 'block'):
@@ -428,7 +451,7 @@ def test_hybrid_stack_eager_and_full_recompute_use_the_same_call():
             recompute_method=method,
             recompute_num_layers=1 if method else None,
         )
-        group = SimpleNamespace(size=lambda: 1)
+        group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
         with patch(
             'megatron.core.models.hybrid.hybrid_block.build_module',
             side_effect=lambda spec, **kwargs: TensorLayer(**kwargs),
@@ -441,19 +464,32 @@ def test_hybrid_stack_eager_and_full_recompute_use_the_same_call():
                 post_layer_norm=False,
                 pg_collection=SimpleNamespace(tp=group, cp=group, pp=group, tp_cp=group),
             )
+        # Simulate metadata prepared once for a mixed stack; each layer owns its filtering.
+        stack._has_linear_layer_with_chunkwise_cp = True
+        metadata = object()
+        packed = SimpleNamespace(seq_idx=object())
         x = torch.randn(3, 2, 4, requires_grad=True)
-        with patch(
-            'megatron.core.recompute.tensor_parallel.checkpoint',
-            side_effect=lambda fn, distribute, *args: checkpoint(fn, *args, use_reentrant=True),
+        with (
+            patch(
+                'megatron.core.models.hybrid.hybrid_block.build_packed_sequence_cp_metadata',
+                return_value=metadata,
+            ),
+            patch(
+                'megatron.core.recompute.tensor_parallel.checkpoint',
+                side_effect=lambda fn, distribute, *args: checkpoint(fn, *args, use_reentrant=True),
+            ),
         ):
-            result = stack(x, attention_mask=None)
+            result = stack(x, attention_mask=None, packed_seq_params=packed)
             result.sum().backward()
         reference = x.detach().clone().requires_grad_(True)
         expected = reference.sin().sin()
         expected.sum().backward()
         assert_bit_exact(result, {}, expected, {})
         assert_bit_exact(x.grad, {}, reference.grad, {})
-        assert all((layer.assert_inputs for layer in stack.layers))
+        for layer in stack.layers:
+            assert isinstance(layer.received_inputs, LayerInputs)
+            assert layer.received_inputs.cp_metadata is metadata
+            assert layer.received_inputs.packed_seq_params is packed
 
 
 def test_mtp_depth_invokes_the_shared_call_shape():

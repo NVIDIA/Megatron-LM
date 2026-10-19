@@ -144,6 +144,10 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             and self.mixer.supports_two_stage_attention()
         )
 
+    def uses_packed_sequence_cp_metadata(self) -> bool:
+        """Only chunkwise mixers consume the stack's packed-sequence CP metadata."""
+        return self.config.linear_cp_mode == "chunkwise"
+
     def _prepare_mixer_input(self, hidden_states: Tensor) -> Tensor:
         """Convert a branch input to parameter precision and normalize it."""
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
@@ -252,6 +256,9 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         aliases={"packed_sequence_cp_metadata": "cp_metadata"},
         exclude=("rotary_pos_emb",),  # Unused by this skeleton, including its CUDA graphs.
         omit_none=("packed_sequence_cp_metadata", "residual_stream_recompute_context"),
+        include_if={
+            "packed_sequence_cp_metadata": lambda module: module.uses_packed_sequence_cp_metadata()
+        },
     )
     def forward(
         self,

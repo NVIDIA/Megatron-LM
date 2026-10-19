@@ -477,7 +477,11 @@ class TestStreamwiseSigmoidWideResidualConnection:
         branch_input, state = connection(residual_stream, operation="read")
         branch_update = torch.randn_like(base)
         output = connection(
-            branch_update, operation="write", state=state, dropout_probability=0.0, training=False
+            (branch_update, None),
+            operation="write",
+            state=state,
+            dropout_probability=0.0,
+            training=False,
         )
 
         assert torch.allclose(branch_input, base)
@@ -517,7 +521,11 @@ class TestStreamwiseSigmoidWideResidualConnection:
         residual_stream = torch.randn(2, 3 * config.hidden_size)
         branch_input, state = connection(residual_stream, operation="read")
         connection(
-            branch_input, operation="write", state=state, dropout_probability=0.0, training=False
+            (branch_input, None),
+            operation="write",
+            state=state,
+            dropout_probability=0.0,
+            training=False,
         )
 
         assert operations == ["read", "retention", "write"]
@@ -530,7 +538,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
         residual_stream = torch.randn(4, 3 * config.hidden_size, requires_grad=True)
         branch_input, state = connection(residual_stream, operation="read")
         output = connection(
-            branch_input.square(),
+            (branch_input.square(), None),
             operation="write",
             state=state,
             dropout_probability=0.0,

@@ -65,7 +65,7 @@ class _StaticTestConnection(ResidualConnection):
         dropout_probability: float,
         training: bool,
     ) -> Tensor:
-        update, bias = branch_output if isinstance(branch_output, tuple) else (branch_output, None)
+        update, bias = branch_output
         if bias is not None:
             update = update + bias
         update = F.dropout(update, p=dropout_probability, training=training)
@@ -78,7 +78,7 @@ class _HeavyTestBranch(nn.Module):
         self.projection = nn.Linear(width, width)
         self.output_bias = nn.Parameter(torch.randn(width))
 
-    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor | None]:
         return F.gelu(self.projection(hidden_states)), self.output_bias
 
 
@@ -166,19 +166,19 @@ class _MambaMixer(_TransformerBranch):
 
 
 class _RecordingTransformerLayer(WideResidualTransformerLayer):
-    def forward(self, *args, **kwargs):
+    def _call_with_bound_args(self, *args, **kwargs):
         self.received_residual_recompute_kwarg = "residual_stream_recompute_context" in kwargs
-        return super().forward(*args, **kwargs)
+        return super()._call_with_bound_args(*args, **kwargs)
 
 
 class _RecordingOrdinaryTransformerLayer(TransformerLayer):
-    def forward(self, *args, **kwargs):
+    def _call_with_bound_args(self, *args, **kwargs):
         self.received_residual_recompute_kwarg = "residual_stream_recompute_context" in kwargs
-        return super().forward(*args, **kwargs)
+        return super()._call_with_bound_args(*args, **kwargs)
 
 
 class _RecordingMambaLayer(WideResidualMambaLayer):
-    def forward(
+    def _call_with_bound_args(
         self,
         hidden_states,
         *args,
@@ -404,7 +404,7 @@ def test_residual_connection_rejects_branch_dtype_on_write():
 
     with pytest.raises(TypeError, match="read-only"):
         connection(
-            branch_input,
+            (branch_input, None),
             operation="write",
             state=state,
             branch_input_dtype=torch.bfloat16,
@@ -562,9 +562,13 @@ class TestResidualStreamRecomputeIntegration:
         FineGrainedActivationOffloadingInterface.reset_instance()
         Utils.destroy_model_parallel()
 
-    def test_ordered_replay_matches_reference_and_keeps_boundary_live(self):
+    @pytest.mark.parametrize("has_bias", [False, True])
+    def test_ordered_replay_matches_reference_and_keeps_boundary_live(self, has_bias):
         torch.manual_seed(1234)
         reference = _StaticResidualChain().cuda()
+        if not has_bias:
+            for branch in reference.branches:
+                branch.register_parameter("output_bias", None)
         recomputed = copy.deepcopy(reference).cuda()
         reference_input = torch.randn(4, 3, 12, device="cuda", requires_grad=True)
         recomputed_input = reference_input.detach().clone().requires_grad_(True)

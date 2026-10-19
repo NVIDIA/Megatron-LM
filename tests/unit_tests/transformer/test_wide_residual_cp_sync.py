@@ -37,7 +37,11 @@ class _WideResidualHarness(nn.Module):
         branch_input, state = self.connection(residual_stream, operation="read")
         branch_update = torch.tanh(branch_input) + 0.125 * branch_input
         return self.connection(
-            branch_update, operation="write", state=state, dropout_probability=0.0, training=False
+            (branch_update, None),
+            operation="write",
+            state=state,
+            dropout_probability=0.0,
+            training=False,
         )
 
 
@@ -69,7 +73,7 @@ class _WideResidualReplayHarness(nn.Module):
             if context is not None and not context.is_block_end:
                 residual_stream = checkpoint_residual_write(
                     connection,
-                    branch_update,
+                    (branch_update, None),
                     state,
                     context,
                     dropout_probability=0.0,
@@ -77,7 +81,7 @@ class _WideResidualReplayHarness(nn.Module):
                 )
             else:
                 residual_stream = connection(
-                    branch_update,
+                    (branch_update, None),
                     operation="write",
                     state=state,
                     dropout_probability=0.0,

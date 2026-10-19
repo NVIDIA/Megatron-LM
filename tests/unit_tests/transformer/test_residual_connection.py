@@ -68,7 +68,7 @@ class TestResidualConnectionContract:
             connection(residual, operation="read", state=())
         with pytest.raises(TypeError, match="read-only arguments"):
             connection(
-                branch,
+                (branch, None),
                 operation="write",
                 state=(residual,),
                 fp32_residual_connection=True,
@@ -76,9 +76,9 @@ class TestResidualConnectionContract:
                 training=False,
             )
         with pytest.raises(TypeError, match="requires connection state"):
-            connection(branch, operation="write", dropout_probability=0.0, training=False)
+            connection((branch, None), operation="write", dropout_probability=0.0, training=False)
         with pytest.raises(TypeError, match="requires dropout_probability and training"):
-            connection(branch, operation="write", state=(residual,))
+            connection((branch, None), operation="write", state=(residual,))
         with pytest.raises(ValueError, match="Unsupported residual connection operation"):
             connection(residual, operation="invalid")
 
@@ -113,17 +113,18 @@ class TestResidualConnectionContract:
         )
 
         with pytest.raises(TypeError, match="non-empty tuple of tensors"):
-            connection(branch, **{**write_kwargs, "state": ()})
+            connection((branch, None), **{**write_kwargs, "state": ()})
         with pytest.raises(TypeError, match="contain only tensors"):
-            connection(branch, **{**write_kwargs, "state": (object(),)})
-        with pytest.raises(TypeError, match="tensor or an .* tensor tuple"):
-            connection((branch,), **write_kwargs)
+            connection((branch, None), **{**write_kwargs, "state": (object(),)})
+        for invalid_output in (branch, (branch,), (branch, None, None), [branch, None]):
+            with pytest.raises(TypeError, match="must return an .* tensor tuple"):
+                connection(invalid_output, **write_kwargs)
         with pytest.raises(TypeError, match="tensor and an optional tensor"):
             connection((object(), None), **write_kwargs)
         with pytest.raises(ValueError, match="incompatible non-hidden dimensions"):
-            connection(torch.randn(3, 4), **write_kwargs)
+            connection((torch.randn(3, 4), None), **write_kwargs)
         with pytest.raises(ValueError, match="expected branch output hidden size"):
-            connection(torch.randn(2, 5), **write_kwargs)
+            connection((torch.randn(2, 5), None), **write_kwargs)
 
         for write_behavior, expected_error in (
             ("non_tensor", "expected a tensor"),
@@ -133,4 +134,4 @@ class TestResidualConnectionContract:
             with pytest.raises(
                 TypeError if write_behavior == "non_tensor" else ValueError, match=expected_error
             ):
-                invalid_connection(branch, **write_kwargs)
+                invalid_connection((branch, None), **write_kwargs)

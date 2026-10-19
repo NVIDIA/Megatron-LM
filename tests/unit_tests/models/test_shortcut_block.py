@@ -215,13 +215,15 @@ def test_shortcut_pair_rejects_mixed_mtp_ownership():
 
 
 @pytest.mark.parametrize("residual_replay", [False, True], ids=["eager", "replay"])
-def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
+@pytest.mark.parametrize("uses_cp_metadata", [False, True])
+def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_cp_metadata):
     config = _shortcut_config()
     attn_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
     block = ShortcutMoEBlock(
         attn_layer, moe_layer, overlap_a2a=False, attn_local_idx=4, moe_local_idx=5
     )
+    monkeypatch.setattr(attn_layer, "uses_packed_sequence_cp_metadata", lambda: uses_cp_metadata)
     calls = []
     observed = {}
     attn_context, moe_context = (
@@ -312,7 +314,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
     assert observed == {
         "attn_packed": "packed-4",
-        "cp_metadata": cp_metadata,
+        "cp_metadata": cp_metadata if uses_cp_metadata else None,
         "route_packed": "packed-5",
         "shared_packed": "packed-5",
         "postprocess_packed": "packed-5",
@@ -335,7 +337,7 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
 
     def compute_forward(hidden_states, inputs):
         observed["compute_context"] = inputs.inference_context
-        return hidden_states + 1
+        return hidden_states + 1, None
 
     def two_stage(*_args, **_kwargs):
         raise AssertionError("inference must not use the two-stage training path")

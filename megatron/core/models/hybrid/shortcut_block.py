@@ -448,6 +448,13 @@ class ShortcutMoEBlock(MegatronModule):
         stream.
         """
 
+        # Split-stage calls bypass the shared forward binder.
+        if (
+            packed_sequence_cp_metadata is not None
+            and not self.compute_layer.uses_packed_sequence_cp_metadata()
+        ):
+            packed_sequence_cp_metadata = None
+
         select_token_dispatcher = getattr(self.moe_layer.mlp, "select_token_dispatcher", None)
         if select_token_dispatcher is not None:
             select_token_dispatcher()

@@ -716,12 +716,6 @@ class HybridStack(MegatronModule):
                     mhc_manager = mhc_layer_managers[layer_idx]
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
-                    layer_cp_metadata = (
-                        packed_sequence_cp_metadata
-                        if type(layer_config) is layer_utils.MambaLayerConfig
-                        and layer_config.linear_cp_mode == "chunkwise"
-                        else None
-                    )
 
                     if isinstance(layer, ShortcutMoEBlock):
                         if layer.moe_local_idx is None:
@@ -739,7 +733,7 @@ class HybridStack(MegatronModule):
                             padding_mask=padding_mask,
                             quant_context_factory=get_inner_quant_context,
                             cp_layout_state=cp_layout_state,
-                            packed_sequence_cp_metadata=layer_cp_metadata,
+                            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                             attn_recompute_context=residual_stream_recompute_context,
                             moe_recompute_context=moe_recompute_context,
                         )
@@ -764,7 +758,7 @@ class HybridStack(MegatronModule):
                                 packed_seq_params=layer_packed_seq_params,
                                 padding_mask=padding_mask,
                                 input_ids=input_ids,
-                                cp_metadata=layer_cp_metadata,
+                                cp_metadata=packed_sequence_cp_metadata,
                                 residual_stream_recompute_context=residual_stream_recompute_context,
                                 mhc_recompute_manager=mhc_manager,
                             )

@@ -30,6 +30,10 @@ class TwoStageAttentionLayer:
         """Return whether this module instance supports two-stage execution."""
         return True
 
+    def uses_packed_sequence_cp_metadata(self) -> bool:
+        """Whether split-stage execution consumes chunkwise packed-sequence metadata."""
+        return False
+
     def forward_pre_attn_and_core_attn(
         self, *args: Any, packed_sequence_cp_metadata: Any = None, **kwargs: Any
     ) -> Any:

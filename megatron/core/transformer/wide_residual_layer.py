@@ -250,10 +250,7 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         training: bool,
     ) -> Tensor:
         residual_stream = state[0]
-        if isinstance(branch_output, tuple):
-            branch_update, bias = branch_output
-        else:
-            branch_update, bias = branch_output, None
+        branch_update, bias = branch_output
 
         dropout_is_active = training and dropout_probability > 0.0
         defer_update_cast = (

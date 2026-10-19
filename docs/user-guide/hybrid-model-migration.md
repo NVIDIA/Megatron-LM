@@ -427,6 +427,15 @@ with dropout and the residual addition. Compute cores already returning
 contributions internally and returns `(output, None)`; auxiliary losses,
 attention context, and recurrent state never occupy the bias slot.
 
+Residual connections use this same pair for their `write` operation, including
+checkpointed writes. Custom branches without bias must pass `(output, None)`;
+bare tensor writes are no longer accepted.
+
+Stack and recompute callers pass available CP metadata in `LayerInputs` without
+inspecting layer types. Mamba's binding consumes it only in chunkwise mode.
+Split-stage layers declare `uses_packed_sequence_cp_metadata()` so shortcut
+execution applies the same policy when it bypasses the shared forward binding.
+
 Legacy complete layers returning `(hidden_states, context)` declare
 `output=lambda result: (result[0], None)`, while tensor-returning layers declare
 `output=lambda result: (result, None)`. The HybridStack adapter also handles its
