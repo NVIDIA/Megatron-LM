@@ -154,6 +154,16 @@ def _forward_per_document(model, hidden, physical, real):
     return torch.cat(outputs, dim=0)
 
 
+def _packed_real_rows(packed, local_rows, cp_group):
+    """Build the loss mask in physical packed coordinates, including CP offsets."""
+    physical = packed.cu_seqlens_q_padded
+    real_lengths = packed.cu_seqlens_q[1:] - packed.cu_seqlens_q[:-1]
+    start = 0 if cp_group is None else cp_group.rank() * local_rows
+    rows = torch.arange(start, start + local_rows, device=physical.device, dtype=physical.dtype)
+    sequence = (torch.bucketize(rows, physical, right=True) - 1).clamp_max(real_lengths.numel() - 1)
+    return (rows >= physical[sequence]) & (rows - physical[sequence] < real_lengths[sequence])
+
+
 def _run_attention(model, hidden, grad, packed, *, documents=None, cp_group=None):
     """Collect real TE FP32 wgrads, or ordinary grads when fusion is disabled."""
     fused_weights = set()
@@ -162,11 +172,21 @@ def _run_attention(model, hidden, grad, packed, *, documents=None, cp_group=None
             module.weight.main_grad = torch.zeros_like(module.weight, dtype=torch.float32)
             fused_weights.add(id(module.weight))
     hidden = hidden.detach().clone().requires_grad_()
+    real_rows = None
     if documents is None:
         output, _ = model(hidden, attention_mask=None, packed_seq_params=packed)
+        # Sparse kernels need not zero padded query outputs. Match the document
+        # reference's loss mask before backward, otherwise random padding grads
+        # also contribute to real-token KV and parameter gradients. Keep every
+        # real output/gradient and the original similarity assertions unchanged.
+        assert torch.isfinite(output).all()
+        real_rows = _packed_real_rows(packed, hidden.shape[0], cp_group)
+        output = output.masked_fill(~real_rows[:, None, None], 0)
     else:
         output = _forward_per_document(model, hidden, *documents)
     output.backward(grad)
+    if real_rows is not None:
+        assert torch.count_nonzero(hidden.grad[~real_rows]) == 0, "Padding must not affect the loss"
     result = {"output": output.detach(), "input_grad": hidden.grad.detach()}
     for name, param in model.named_parameters():
         value = param.main_grad if id(param) in fused_weights else param.grad
