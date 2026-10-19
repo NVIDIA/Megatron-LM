@@ -117,8 +117,11 @@ def index_topk(x, qr, qa, weights, keys, rope, ratio, emit):
         positions, q, rope, w, 128**-0.5, 32**-0.5, use_fp4=True, weights_out_dtype=torch.float32
     )
     qvalues, qscales = quant
+    emit('indexer_q_codes', qvalues)
+    emit('indexer_q_scales', qscales)
     values, scales = keys
     qscales, w = mqa_logits_mx_inputs(qvalues.view(torch.int8), qscales, w)
+    emit('indexer_scoring_weights', w)
     starts = torch.zeros(x.shape[0], device=x.device, dtype=torch.int32)
     ends = ((positions + 1) // ratio).int()
     logits = as_fp32_logits(
@@ -131,6 +134,10 @@ def index_topk(x, qr, qa, weights, keys, rope, ratio, emit):
             values.shape[0],
         ),
         ends,
+    )
+    emit(
+        'indexer_logits_valid',
+        logits[torch.arange(logits.shape[1], device=x.device)[None] < ends[:, None]],
     )
     topk = torch.full((x.shape[0], 512), -1, device=x.device, dtype=torch.int32)
     top_k_per_row_prefill_index_order(
@@ -158,7 +165,6 @@ def source(attention, x, qr, qa, rope, document, emit):
         latent = _Pool.apply(raw, compressor.norm.weight, ratio, eps)
         emit('compressor_latent', latent[ratio - 1 :: ratio])
         decoded = _Record.apply(latent, rope, ratio)
-        emit('compressed_kv_decoded', decoded)
         key = native.indexer.compressor
         with torch.no_grad():
             keys = index_keys(latent, key.wk.weight, key.norm.weight, rope, ratio, eps)
@@ -175,5 +181,6 @@ def source(attention, x, qr, qa, rope, document, emit):
             return index_topk(x, qr, qa, weights, keys, rope, ratio, emit)
 
     topk = state.resolve(layer, policy.index, ('vllm_index', geometry), select)
+    emit('compressed_kv_decoded', decoded)
     emit('indexer_topk', topk)
     return decoded, topk
