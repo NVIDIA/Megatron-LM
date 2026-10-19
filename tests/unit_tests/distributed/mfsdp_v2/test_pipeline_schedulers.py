@@ -149,7 +149,7 @@ def test_vpp_training_validation_training(distributed_setup):
                 torch.testing.assert_close(actual["loss"], expected["loss"])
         orders = sharded[0].module.context.iteration_order._orders
         assert len(orders) == 2
-        assert all(len(order) > 0 for order, _ in orders.values())
+        assert all(len(order) > 0 for order in orders.values())
         # Also check parameters on non-last PP ranks, which do not return losses.
         for chunk_id, (ref, model) in enumerate(zip(reference, sharded)):
             units = [module for module in model.modules() if isinstance(module, FsdpModule)]
@@ -240,7 +240,8 @@ def test_combined_1f1b_training_matches_eager(distributed_setup, delay_wgrad):
                     atol=0.05,
                 )
             assert len(model.module.context.iteration_order._orders) == 1
-            _, phases = next(iter(model.module.context.iteration_order._orders.values()))
+            order = next(iter(model.module.context.iteration_order._orders.values()))
+            phases = [phase for _, phase in order]
             assert "forward" in phases and "backward" in phases
             # The recorded order follows the actual alternating compute phases.
             assert any(a == "backward" and b == "forward" for a, b in zip(phases, phases[1:]))
