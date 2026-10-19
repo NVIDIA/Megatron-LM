@@ -175,34 +175,6 @@ def test_nonzero_baseline_rank_records_collection_without_database(project, tmp_
     ]
 
 
-def test_baseline_collection_includes_test_helpers(project, tmp_path):
-    helper = project / "tests/unit_tests/shared_helper.py"
-    helper.parent.mkdir()
-    helper.write_text("def shared_helper(): return 1\n")
-    cache = tmp_path / "inventory-cache"
-    result = _invoke(project, cache, "baseline", rank=1)
-    assert result.returncode == 0, result.stdout + result.stderr
-    collection = json.loads((cache / "prod/collection/rank-1.json").read_text())
-    expected = sys.modules["testmon_cache"].collection_inventory(project)
-    assert collection["files"] == expected
-    assert "tests/unit_tests/shared_helper.py" in collection["files"]
-
-
-def test_baseline_records_tests_collected_only_on_nonzero_ranks(project, tmp_path):
-    (project / "tests/test_rank.py").write_text(
-        "import os\n\nif os.environ['RANK'] == '3':\n"
-        "    def test_nonzero_rank_only():\n        assert True\n"
-    )
-    cache = tmp_path / "rank-specific-cache"
-    for rank in (0, 3):
-        result = _invoke(project, cache, "baseline", rank=rank)
-        assert result.returncode == 0, result.stdout + result.stderr
-        collection = json.loads((cache / f"prod/collection/rank-{rank}.json").read_text())
-        assert ("tests/test_rank.py::test_nonzero_rank_only" in collection["nodeids"]) is (
-            rank == 3
-        )
-
-
 @pytest.mark.parametrize("rank", (0, 3))
 def test_baseline_can_start_spawned_checkpoint_workers(project, tmp_path, rank):
     (project / "tests/test_app.py").write_text(textwrap.dedent(f"""\

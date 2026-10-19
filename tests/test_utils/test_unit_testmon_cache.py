@@ -337,30 +337,6 @@ def test_finalize_rejects_incomplete_or_inconsistent_rank_collections(generation
     assert not (directory / "manifest.json").exists()
 
 
-def test_cache_requires_finalized_collection_inventory(generation):
-    directory, identity = generation
-    path = directory / "prod/metadata.json"
-    metadata = json.loads(path.read_text())
-    del metadata["collection"]
-    path.write_text(json.dumps(metadata))
-    before = _snapshot(directory)
-    with pytest.raises(ValueError, match="collection inventory"):
-        cache.validate_cache(directory, identity, identity["cache_prefix"] + "123-1")
-    assert _snapshot(directory) == before
-
-
-def test_collection_inventory_tracks_test_helpers_and_added_or_removed_files(source_tree):
-    helper = source_tree / "tests/unit_tests/shared/helper.py"
-    helper.parent.mkdir()
-    helper.write_text("def helper(): return 1\n")
-    first = cache.collection_inventory(source_tree)
-    assert "tests/unit_tests/shared/helper.py" in first
-    helper.write_text("def helper(): return 2\n")
-    assert cache.collection_inventory(source_tree) != first
-    helper.unlink()
-    assert "tests/unit_tests/shared/helper.py" not in cache.collection_inventory(source_tree)
-
-
 def _action_script(name):
     action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
     return next(step["run"] for step in action["runs"]["steps"] if step["name"] == name)

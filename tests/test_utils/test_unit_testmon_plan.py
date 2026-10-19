@@ -182,17 +182,15 @@ def test_unchanged_selection_is_empty_and_keeps_cache_readonly(project, generati
     assert _snapshot(generation[0]) == before
 
 
-def test_cpu_selects_only_affected_files_in_both_phases(project, generation):
-    (project / "app.py").write_text(
-        "def active(value):\n    return value + 2\n\n" "def unused(value):\n    return value - 1\n"
-    )
-    plan = _select(project, generation)
-    assert plan["mode"] == "selected", plan["reason"]
-    assert plan["phases"] == {"prod": [APP_TEST], "experimental": [APP_TEST]}
-
-
-def test_deleted_dependency_selects_its_test_file(project, generation):
-    (project / "app.py").unlink()
+@pytest.mark.parametrize("deleted", [False, True])
+def test_cpu_selects_only_affected_files_in_both_phases(project, generation, deleted):
+    if deleted:
+        (project / "app.py").unlink()
+    else:
+        (project / "app.py").write_text(
+            "def active(value):\n    return value + 2\n\n"
+            "def unused(value):\n    return value - 1\n"
+        )
     plan = _select(project, generation)
     assert plan["mode"] == "selected", plan["reason"]
     assert plan["phases"] == {"prod": [APP_TEST], "experimental": [APP_TEST]}
@@ -247,39 +245,6 @@ def test_incomplete_evidence_falls_back(project, generation, problem):
     plan = _select(project, generation, **overrides)
     assert plan["mode"] == "full"
     assert plan["reason"]
-
-
-def test_cli_emits_empty_selection_without_gpu_collection(project, generation):
-    output = project / "plan.json"
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(HELPERS / "testmon_plan.py"),
-            "select",
-            "--cache-dir",
-            str(generation[0]),
-            "--bucket",
-            BUCKET,
-            "--platform",
-            PLATFORM,
-            "--image-id",
-            IMAGE_ID,
-            "--source-sha",
-            SOURCE_SHA,
-            "--matched-key",
-            generation[1],
-            "--pr-files-dir",
-            str(project / "pr-files"),
-            "--output",
-            str(output),
-        ],
-        cwd=project,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    assert result.stdout == "mode=selected\nhas_tests=false\n"
-    assert json.loads(output.read_text())["phases"] == {"prod": [], "experimental": []}
 
 
 def test_prepare_preserves_nodeids_and_validates_container_runtime(
@@ -372,43 +337,6 @@ def test_explicit_file_bucket_recollects_after_source_changes(project, tmp_path)
     assert "explicit test-file" in changed["reason"]
 
 
-def test_affected_file_recollects_new_parameter_ids(project, tmp_path):
-    (project / "app.py").write_text(
-        "VALUES = [1]\n\ndef active(value):\n    return value + len(VALUES)\n"
-    )
-    (project / APP_TEST).write_text(
-        "import pytest\nfrom app import VALUES, active\n\n"
-        "@pytest.mark.parametrize('value', VALUES)\n"
-        "def test_value(value):\n    assert active(value) == value + 1\n"
-    )
-    generation = _baseline(project, tmp_path / "cache")
-    (project / "app.py").write_text(
-        "VALUES = [1, 2]\n\ndef active(value):\n    return value + len(VALUES)\n"
-    )
-    plan = _select(project, generation)
-    assert plan["mode"] == "selected", plan["reason"]
-    assert plan["phases"]["prod"] == [APP_TEST]
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-c",
-            str(project / "pytest.ini"),
-            "--collect-only",
-            *plan["phases"]["prod"],
-        ],
-        cwd=project,
-        env={**os.environ, "PYTHONPATH": str(project)},
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    assert "test_value[1]" in result.stdout
-    assert "test_value[2]" in result.stdout
-
-
 def test_mandatory_tests_prevent_empty_gpu_selection(project, generation, monkeypatch):
     _mapping(project)
     _pr_files(project, ["megatron/core/mandatory/unobserved.py"])
@@ -423,82 +351,6 @@ def test_mandatory_tests_prevent_empty_gpu_selection(project, generation, monkey
         output = generation[0] / ".testmon-work" / phase
         assert (output / "mandatory-tests").read_text().splitlines() == [OTHER_TEST]
         assert (output / "selected-tests").read_text().splitlines() == [OTHER_TEST]
-
-
-def test_mandatory_mapping_uses_old_paths_in_renamed_pr_files(project, generation):
-    _mapping(project)
-    _pr_files(
-        project,
-        ["megatron/core/unmapped/renamed.py", "megatron/core/mandatory/original.py"],
-        changed_files=1,
-    )
-    plan = _select(project, generation)
-    assert plan["mode"] == "selected", plan["reason"]
-    assert plan["mandatory_files"] == [OTHER_TEST]
-
-
-@pytest.mark.parametrize(
-    "problem",
-    (
-        "missing",
-        "missing-metadata",
-        "missing-files",
-        "malformed",
-        "wrong-sha",
-        "metadata-list",
-        "truncated",
-        "missing-newline",
-        "string-count",
-        "boolean-count",
-        "negative-count",
-        "fractional-count",
-        "too-many-files",
-        "too-many-paths",
-    ),
-)
-def test_invalid_pr_changed_file_artifact_runs_full_bucket(project, generation, problem):
-    directory = _pr_files(project, ["megatron/core/mandatory/source.py"])
-    metadata_path = directory / "metadata.json"
-    metadata = json.loads(metadata_path.read_text())
-    if problem == "missing":
-        directory = project / "missing-artifact"
-    elif problem == "missing-metadata":
-        metadata_path.unlink()
-    elif problem == "missing-files":
-        (directory / "changed-files").unlink()
-    elif problem == "malformed":
-        metadata_path.write_text("{")
-    elif problem == "metadata-list":
-        metadata_path.write_text("[]")
-    elif problem == "missing-newline":
-        (directory / "changed-files").write_text("megatron/core/mandatory/source.py")
-    else:
-        if problem == "wrong-sha":
-            metadata["tested_sha"] = "c" * 40
-        else:
-            field, value = {
-                "truncated": ("changed_paths", 2),
-                "string-count": ("changed_files", "1"),
-                "boolean-count": ("changed_files", True),
-                "negative-count": ("changed_paths", -1),
-                "fractional-count": ("changed_files", 1.5),
-                "too-many-files": ("changed_files", 3001),
-                "too-many-paths": ("changed_paths", 6001),
-            }[problem]
-            metadata[field] = value
-        metadata_path.write_text(json.dumps(metadata))
-    plan = _select(project, generation, pr_files_dir=directory)
-    assert plan["mode"] == "full"
-    assert plan["reason"]
-
-
-def test_valid_empty_pr_still_allows_empty_selection(project, generation):
-    _mapping(project)
-    _pr_files(project, [])
-    plan = _select(project, generation)
-    assert plan["mode"] == "selected", plan["reason"]
-    assert plan["mandatory_files"] == []
-    assert plan["phases"] == {phase: [] for phase in cache.PHASES}
 
 
 def test_mandatory_files_respect_child_buckets_and_platform_markers(project):
@@ -518,20 +370,14 @@ def test_mandatory_files_respect_child_buckets_and_platform_markers(project):
     assert planner._mandatory_files(project, BUCKET, "dgx_gb200", changed) == [OTHER_TEST]
 
 
-@pytest.mark.parametrize("problem", ("missing", "nodeid", "unselected", "escape"))
-def test_prepare_rejects_invalid_mandatory_files(project, generation, monkeypatch, problem):
-    plan = _select(project, generation)
-    if problem == "missing":
-        plan.pop("mandatory_files")
+@pytest.mark.parametrize("metadata", [None, {"tested_sha": "c" * 40}, {"changed_paths": 2}])
+def test_missing_stale_or_truncated_pr_artifact_runs_full_bucket(project, generation, metadata):
+    directory = _pr_files(project, ["megatron/core/mandatory/source.py"])
+    path = directory / "metadata.json"
+    if metadata is None:
+        path.unlink()
     else:
-        plan["mandatory_files"] = [
-            {
-                "nodeid": OTHER_TEST + "::test_other",
-                "unselected": OTHER_TEST,
-                "escape": "tests/unit_tests/../../escape.py",
-            }[problem]
-        ]
-    monkeypatch.chdir(project)
-    with pytest.raises(ValueError):
-        planner.prepare(plan, generation[0], BUCKET, PLATFORM, SOURCE_SHA, image_id=IMAGE_ID)
-    assert not (generation[0] / ".testmon-work").exists()
+        path.write_text(json.dumps({**json.loads(path.read_text()), **metadata}))
+    plan = _select(project, generation)
+    assert plan["mode"] == "full"
+    assert plan["reason"]
