@@ -19,6 +19,9 @@ def test_release_initialization_and_unsupported_topology(deterministic):
 
 def test_rollout_import_guard_is_active():
     import importlib
+    import sys
 
+    importlib.import_module("_ds41_fixture")
     with pytest.raises(AssertionError, match="vllm"):
         importlib.import_module("vllm")
+    assert not any(n == "vllm" or n.startswith("vllm.") for n in sys.modules)
