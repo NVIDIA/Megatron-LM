@@ -12,7 +12,7 @@ import torch
 from examples.mimo.training.topology import HeteroTopology
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
-from megatron.core.models.mimo.model.base import MimoModel
+from megatron.core.models.mimo.model.base import MimoEncoderFloat16Module, MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module
 from megatron.training.initialize import _set_random_seed
@@ -20,13 +20,10 @@ from megatron.training.models.dist_utils import (
     prepare_existing_model_chunks_for_distributed_training,
 )
 from megatron.training.utils import print_rank_0
+from megatron.training.global_vars import get_run_config
 
-
-class _EncoderFloat16Module(Float16Module):
-    """Float16Module that keeps encoder outputs in model precision for the bridge."""
-
-    def forward(self, *inputs, fp32_output=False, **kwargs):  # noqa: D102
-        return super().forward(*inputs, fp32_output=fp32_output, **kwargs)
+# Preserve the previous example-local import path.
+_EncoderFloat16Module = MimoEncoderFloat16Module
 
 
 def configure_module_rng(
@@ -41,15 +38,16 @@ def configure_module_rng(
     so disjoint modules (and stages) get independent RNG state. Caller invokes once per active
     module on this rank.
     """
+    cfg = get_run_config()
     for _required in ("pp", "dp", "tp", "ep", "expt_tp", "gtp_remat", "expt_gtp_remat"):
         assert (
             getattr(pg_collection, _required, None) is not None
         ), f"pg_collection passed to configure_module_rng must define {_required}"
     _set_random_seed(
-        args.seed + role_seed_offset,
+        cfg.rng.seed + role_seed_offset,
         data_parallel_random_init,
-        te_rng_tracker=getattr(args, "te_rng_tracker", False),
-        inference_rng_tracker=getattr(args, "inference_rng_tracker", False),
+        te_rng_tracker=cfg.rng.te_rng_tracker,
+        inference_rng_tracker=cfg.rng.inference_rng_tracker,
         use_cudagraphable_rng=getattr(args, "cuda_graph_impl", "none") != "none",
         pp_group=pg_collection.pp,
         dp_group=pg_collection.dp,
@@ -141,7 +139,7 @@ def wrap_active_modules_with_ddp(
                     ddp_config, enable_overlap=getattr(args, "mimo_encoder_ddp_overlap", False)
                 ),
                 data_parallel_random_init=data_parallel_random_init,
-                mixed_precision_wrapper=_EncoderFloat16Module,
+                mixed_precision_wrapper=MimoEncoderFloat16Module,
                 use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=use_layer_wise_param_layout,
             )[0]

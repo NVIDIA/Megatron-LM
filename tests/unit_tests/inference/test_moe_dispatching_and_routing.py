@@ -372,6 +372,17 @@ class TestNCCLAllGatherDispatcher:
 
 _NVLS_ENGINE_MAX_TOKENS = 512
 
+_QWEN3_30B_A3B_MOE = dict(
+    hidden_size=2048,
+    moe_ffn_hidden_size=768,
+    num_moe_experts=128,
+    moe_router_topk=8,
+    moe_router_score_function="softmax",
+    moe_router_pre_softmax=False,
+    moe_router_enable_expert_bias=False,
+    moe_router_topk_scaling_factor=None,
+)
+
 
 @pytest.mark.internal
 class TestNVLSAllGatherVDispatcher:
@@ -734,7 +745,14 @@ class TestNVLSAllGatherVDispatcher:
         ],
     )
     def test_batch_invariant_moe_matches_training(
-        self, inference_grouped_gemm_backend, activation_clamp_scale, mxfp8_swiglu, grouped_tensor
+        self,
+        inference_grouped_gemm_backend,
+        activation_clamp_scale,
+        mxfp8_swiglu,
+        grouped_tensor,
+        config_overrides=None,
+        base_local_tokens=17,
+        outlier_tokens=False,
     ):
         """The NVLS inference MoE path should exactly match training AllToAll.
 
@@ -744,6 +762,7 @@ class TestNVLSAllGatherVDispatcher:
         relative to this layer's pre-activations so the tanh saturates rather than
         staying in its near-linear region, where the two paths agree more easily.
         """
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -789,8 +808,10 @@ class TestNVLSAllGatherVDispatcher:
 
         torch.manual_seed(2028)
         torch.cuda.manual_seed(2028)
+        config_overrides = config_overrides or {}
 
         config = _make_base_config(
+            **config_overrides,
             expert_model_parallel_size=Utils.world_size,
             inference_grouped_gemm_backend=inference_grouped_gemm_backend,
             inference_moe_token_dispatcher_type="nvls",
@@ -801,11 +822,11 @@ class TestNVLSAllGatherVDispatcher:
             moe_shared_expert_intermediate_size=None,
             activation_func_tanh_clamp_scale=activation_clamp_scale,
             # The inference clamp kernels target the fused weighted_clamped_squared_relu.
-            # use_fused_weighted_squared_relu defaults to False, which would route the
-            # training branch through tanh_soft_clamp instead — that rounds the clamp to
-            # BF16 and is one ULP away. Only enabled for the clamped case so the unclamped
-            # parametrization keeps its existing coverage.
-            use_fused_weighted_squared_relu=activation_clamp_scale is not None,
+            # The inference squared-ReLU kernel reproduces the fused training op, so train
+            # with it. use_fused_weighted_squared_relu defaults to False, which rounds the
+            # square to BF16 first (and, when clamped, routes through tanh_soft_clamp,
+            # which rounds the clamp to BF16): one ULP away from the kernel either way.
+            use_fused_weighted_squared_relu=True,
             gated_linear_unit=mxfp8_swiglu,
             activation_func=(torch.nn.functional.silu if mxfp8_swiglu else squared_relu),
             bias_activation_fusion=mxfp8_swiglu,
@@ -815,6 +836,11 @@ class TestNVLSAllGatherVDispatcher:
             use_cpu_initialization=not mxfp8_swiglu,
             batch_invariant_backend="te_native",
         )
+        # Symmetric buffers are cached by name and sized on first use, so a buffer
+        # left by a smaller-hidden case cannot hold this case's tokens.
+        NVLSAllGatherVDispatcher._delete_buffers()
+        for key in ("ep_agv_h", "ep_agv_r", "ep_agv_p", "ep_rsv", "ep_meta"):
+            SymmetricMemoryManager.destroy(key)
         NVLSAllGatherVDispatcher.allocate_buffers(
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=config.moe_router_topk,
@@ -824,6 +850,7 @@ class TestNVLSAllGatherVDispatcher:
 
         if mxfp8_swiglu:
             training_config = _make_base_config(
+                **config_overrides,
                 moe_use_grouped_tensor=grouped_tensor,
                 expert_model_parallel_size=Utils.world_size,
                 transformer_impl="transformer_engine",
@@ -858,10 +885,27 @@ class TestNVLSAllGatherVDispatcher:
             quantize_model_to_mxfp8(layer, backend="triton")
         else:
             layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
-        local_tokens = 17 + torch.distributed.get_rank()
-        hidden_states = torch.randn(
-            local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
-        )
+        local_tokens = base_local_tokens + torch.distributed.get_rank()
+        if outlier_tokens:
+            # Per-token and per-channel log-normal scales give rows the outliers real
+            # activations have; plain Gaussian rows do not reach the mismatch.
+            generator = torch.Generator(device="cuda").manual_seed(
+                4242 + torch.distributed.get_rank()
+            )
+            hidden_states = torch.randn(
+                local_tokens, 1, config.hidden_size, device="cuda", generator=generator
+            )
+            hidden_states *= torch.exp(
+                torch.randn(local_tokens, 1, 1, device="cuda", generator=generator)
+            )
+            hidden_states *= torch.exp(
+                0.5 * torch.randn(1, 1, config.hidden_size, device="cuda", generator=generator)
+            )
+            hidden_states = hidden_states.to(torch.bfloat16)
+        else:
+            hidden_states = torch.randn(
+                local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+            )
 
         backend = "te_native" if mxfp8_swiglu or inference_grouped_gemm_backend == "vllm" else None
         with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
@@ -876,6 +920,23 @@ class TestNVLSAllGatherVDispatcher:
                     inference_output, _ = layer(hidden_states.clone())
 
         torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
+
+    def test_batch_invariant_mxfp8_moe_matches_training_with_outlier_tokens(self):
+        """Qwen3-30B-A3B experts and router, fed tokens with outlier scales.
+
+        Gaussian tokens through the default 128-wide layer never reach the case where
+        an outlier token's largest outputs differ by one BF16 ULP between training
+        and inference.
+        """
+        self.test_batch_invariant_moe_matches_training(
+            "torch",
+            None,
+            True,
+            False,
+            config_overrides=_QWEN3_30B_A3B_MOE,
+            base_local_tokens=500,
+            outlier_tokens=True,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────

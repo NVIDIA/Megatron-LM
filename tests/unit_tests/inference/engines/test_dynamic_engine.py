@@ -42,7 +42,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
-from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
@@ -920,6 +920,7 @@ class DynamicEngineTestConfig:
     fp8: bool = False
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
+    flash_attention_version: Optional[int] = 2
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
     # HybridModel, and only the layer pattern and stack spec (and so the
@@ -946,6 +947,7 @@ class DynamicEngineTestConfig:
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
+    moe_enable_routing_replay: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -1191,6 +1193,7 @@ class DynamicInferenceEngineTestBase:
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
+                flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
@@ -1252,6 +1255,7 @@ class DynamicInferenceEngineTestBase:
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
+                moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -1300,6 +1304,7 @@ class DynamicInferenceEngineTestBase:
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
+                flash_attention_version=test_config.flash_attention_version,
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
@@ -1346,6 +1351,7 @@ class DynamicInferenceEngineTestBase:
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
+                moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 normalization=(
                     "RMSNorm"
                     if is_gdn or test_config.transformer_impl == "inference_optimized"
@@ -1575,6 +1581,59 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     _assert_prefix_cache_checkpoint(request, engine.get_request(request.request_id))
 
 
+def test_post_process_zero_token_handoff_keeps_resume_log_prob():
+    request = DynamicInferenceRequest(
+        request_id=17,
+        prompt_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=0,
+            termination_id=-1,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            do_kv_handoff=True,
+        ),
+    )
+    future = mock.Mock()
+    future.done.return_value = False
+    entry = types.SimpleNamespace(
+        record=DynamicInferenceRequestRecord.from_request(request), future=future
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        kv_block_allocator=types.SimpleNamespace(), remove_vlm_request_data=mock.Mock()
+    )
+    engine.requests = {request.request_id: entry}
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+    engine._prepare_handoff_metadata_batch = mock.Mock(return_value={request.request_id: "meta"})
+    engine._capture_handoff_meta = mock.Mock()
+
+    active_request_ids, finished_requests = engine.post_process_requests(
+        request_ids=torch.tensor([request.request_id], dtype=torch.int64),
+        finished_request_ids=torch.tensor([request.request_id], dtype=torch.int64),
+        evict_request_ids=torch.empty(0, dtype=torch.int64),
+        step_time=0.0,
+        sample=torch.tensor([99], dtype=torch.int64),
+        accepted_tokens=None,
+        log_probs=[[-0.25]],
+        consumed_chunked_prefill_request_id=-1,
+        finished_handoff_block_ids={request.request_id: [10]},
+        finished_handoff_decode_tokens={request.request_id: [99]},
+    )
+
+    assert active_request_ids == []
+    assert len(finished_requests) == 1
+    finished_request = finished_requests[0]
+    assert finished_request.generated_tokens == []
+    assert not finished_request.generated_log_probs
+    assert engine._prepare_handoff_metadata_batch.call_args.args[2] == {request.request_id: [-0.25]}
+    engine._capture_handoff_meta.assert_called_once_with(request, "meta")
+    future.set_result.assert_called_once_with(finished_request)
+
+
 @pytest.mark.asyncio
 async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     """Normal and failed completion each expose their one future-owned flat request."""
@@ -1603,7 +1662,8 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     engine.controller = types.SimpleNamespace(
         tokenizer=types.SimpleNamespace(
             detokenize=lambda tokens: f"<{','.join(str(token) for token in tokens)}>"
-        )
+        ),
+        terminating_token_ids=mock.Mock(return_value=frozenset()),
     )
     engine.finished_request_count = 0
     engine.evicted_request_count = 0
@@ -1630,6 +1690,8 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     assert active_ids == []
     assert merge.call_count == 1
     assert future.result() is finished
+    assert finished.finish_reason == "length"
+    engine.controller.terminating_token_ids.assert_called_with(-1, stop_token_ids=None)
     assert finished.generated_log_probs == [-0.25]
     assert finished.generated_top_n_logprobs == [{"<12>": -0.25, "<13>": -1.0}]
     assert finished.tpot == [0.25]
@@ -1700,7 +1762,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
     engine.unified_memory_level = 0
     engine.use_coordinator = False
@@ -1730,10 +1792,130 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
 
     assert engine.context.deallocate_inference_state_buffers.call_count == 1
     assert engine.context.reinitialize_inference_state_buffers.call_count == 1
-    engine.controller._async_sched_logits.clear.assert_called_once_with()
+    engine.controller._async_sched_forward.clear.assert_called_once_with()
     assert engine.state == EngineState.RUNNING
     replayed = [call.args[0].request_id for call in engine._add_request.call_args_list]
     assert replayed == [23, 24, 26, 25]
+
+
+def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
+    """Requests holding no KV at resume must hash under the post-refit weights.
+
+    Under PERSIST the prefix cache survives the refit. A request still waiting
+    at suspend, or submitted while suspended (the coordinator loop keeps
+    admitting), would otherwise match blocks the old weights computed. Requests
+    with prefill or decode progress keep their original salt.
+    """
+    block_size = 4
+    prompt = list(range(100, 100 + 4 * block_size))
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        block_size_tokens=block_size,
+        enable_prefix_caching=True,
+        chunked_prefill_request_id=-1,
+        kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        static_kv_memory_pointers=True,
+        deallocate_inference_state_buffers=mock.Mock(),
+        reinitialize_inference_state_buffers=mock.Mock(),
+        add_vlm_request_data=mock.Mock(),
+    )
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(validate_input_modalities=mock.Mock())
+    )
+    engine.requests = {}
+    engine.waiting_request_ids = deque()
+    engine.state = EngineState.RUNNING
+    engine.unified_memory_level = 0
+    engine.use_coordinator = False
+    engine.allow_stale_multimodal_embeddings = True
+    engine.vision_embedding_cache_max_bytes = 0
+    engine._vision_embedding_cache = OrderedDict()
+    engine._vision_embedding_cache_bytes = 0
+    engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+    engine._notify_cond_for_new_request = mock.Mock(return_value=None)
+
+    def register(request, *, is_resume=False):
+        if not is_resume:
+            engine.requests[request.request_id] = types.SimpleNamespace(
+                record=DynamicInferenceRequestRecord.from_request(request)
+            )
+            engine.waiting_request_ids.append(request.request_id)
+
+    engine._add_request = mock.Mock(side_effect=register)
+
+    def hashes(salt):
+        return compute_block_hashes_batched(
+            torch.tensor(prompt, dtype=torch.int64), block_size, cache_salt=salt
+        )
+
+    with (
+        mock.patch.object(torch.cuda, "current_device", return_value="cpu"),
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
+        mock.patch.object(InferenceMode, "unset_active"),
+        mock.patch.object(InferenceMode, "set_active"),
+        mock.patch.object(torch.cuda, "synchronize"),
+    ):
+        # Served under the pre-refit weights; its blocks stay published under PERSIST.
+        engine.add_request(1, prompt)
+        published = set(engine.get_request(1).precomputed_block_hashes)
+        decoding = engine.get_request(1)
+        decoding.finished_chunk_token_count = len(prompt)
+        decoding.generated_tokens = [7]
+        engine.waiting_request_ids.remove(1)
+
+        # Part-way through a chunked prefill under the old weights.
+        engine.add_request(2, prompt)
+        partial = engine.get_request(2)
+        partial.finished_chunk_token_count = block_size
+        partial.remaining_prompt_tokens = partial.prompt_tokens[block_size:]
+
+        # Still waiting when the refit begins.
+        engine.add_request(3, prompt)
+        engine._add_request(
+            DynamicVLMInferenceRequest(
+                request_id=5,
+                prompt_tokens=torch.tensor(prompt, dtype=torch.int64),
+                sampling_params=SamplingParams(),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
+                block_hash_salt=dynamic_engine._weight_scoped_salt(0, "img-a"),
+                media_cache_key="img-a",
+                num_img_embeddings_per_tile=0,
+                imgs=None,
+                num_tiles=None,
+                decoder_seq_length=0,
+                image_embeddings=torch.zeros(1),
+                image_token_mask=torch.zeros(1),
+            )
+        )
+
+        engine.suspend()
+        # Submitted while suspended for the refit.
+        engine.add_request(4, prompt)
+        assert set(engine.get_request(4).precomputed_block_hashes) <= published
+
+        engine.resume()
+        engine.add_request(6, prompt)
+
+    new_salt = dynamic_engine._weight_scoped_salt(1, None)
+    for request_id in (3, 4):
+        request = engine.get_request(request_id)
+        assert request.block_hash_salt == new_salt
+        assert request.precomputed_block_hashes == hashes(new_salt)
+        assert published.isdisjoint(request.precomputed_block_hashes)
+        assert request.num_matched_prefix_blocks == 0
+    # A post-resume arrival hashes identically, so the two can still share KV.
+    assert engine.get_request(6).precomputed_block_hashes == hashes(new_salt)
+
+    vlm_salt = dynamic_engine._weight_scoped_salt(1, "img-a")
+    assert engine.get_request(5).block_hash_salt == vlm_salt
+    assert engine.get_request(5).precomputed_block_hashes == hashes(vlm_salt)
+
+    # Requests with progress keep the generation their leading blocks were computed by.
+    for request_id in (1, 2):
+        request = engine.get_request(request_id)
+        assert request.block_hash_salt is None
+        assert request.precomputed_block_hashes == hashes(None)
 
 
 def test_add_request_defaults_sampling_params():
@@ -1790,7 +1972,7 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
     engine.num_speculative_tokens = 0
     engine.requests = {}
@@ -1833,7 +2015,7 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     assert not engine._vision_embedding_cache
     assert engine._vision_embedding_cache_bytes == 0
     engine.context.reset.assert_called_once_with()
-    engine.controller._async_sched_logits.clear.assert_called_once_with()
+    engine.controller._async_sched_forward.clear.assert_called_once_with()
 
 
 def test_drained_reset_rejects_suspended_state_before_context_mutation():
@@ -1843,14 +2025,14 @@ def test_drained_reset_rejects_suspended_state_before_context_mutation():
     engine.state = EngineState.SUSPENDED
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
 
     with pytest.raises(RuntimeError, match="only be reset while RUNNING or PAUSED"):
         engine.reset()
 
     engine.context.reset.assert_not_called()
-    engine.controller._async_sched_logits.clear.assert_not_called()
+    engine.controller._async_sched_forward.clear.assert_not_called()
 
 
 def test_drained_reset_rejects_outstanding_requests_before_mutation():
@@ -1862,7 +2044,7 @@ def test_drained_reset_rejects_outstanding_requests_before_mutation():
     engine.requests = requests
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
 
     with pytest.raises(RuntimeError, match="must drain all requests before reset"):
@@ -1870,7 +2052,7 @@ def test_drained_reset_rejects_outstanding_requests_before_mutation():
 
     assert engine.requests is requests
     engine.context.reset.assert_not_called()
-    engine.controller._async_sched_logits.clear.assert_not_called()
+    engine.controller._async_sched_forward.clear.assert_not_called()
 
 
 def _make_request_entry(loop, request_id: int, status: Status, resolve: bool = True):
@@ -2018,7 +2200,8 @@ def test_finished_vlm_reply_omits_input_only_tensors():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.payload_stager = None
 
-    serialized = engine._serialize_finished_request(request, None)
+    engine.local_metadata_ledger_enabled = False
+    serialized = engine._serialize_finished_request(request)
 
     assert serialized["generated_tokens"] == [7]
     for key in (
@@ -2385,6 +2568,37 @@ def _submit_request_message(request_id, sampling_params, prompt, offload_params)
     ]
 
 
+@pytest.mark.parametrize("offload_params", [None, {"destination": "payload-store"}])
+def test_schedule_kv_handoff_preserves_optional_offload_metadata(offload_params):
+    params = SamplingParams(num_tokens_to_generate=2)
+    kv_meta = {"resume_tokens": [99]}
+    message = [
+        msgpack.packb([Headers.SUBMIT_REQUEST_WITH_KV.value, 42, params.serialize(), kv_meta]),
+        msgpack.packb([3, 4]),
+        msgpack.packb([7]),
+    ]
+    if offload_params is not None:
+        message.append(msgpack.packb(offload_params))
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    engine.requests, engine.failed_request_ids = {}, []
+    engine.add_request_with_kv_handoff = mock.Mock()
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+        message,
+        dynamic_engine.zmq.Again,
+    ]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
+    engine.local_metadata_ledger_enabled = False
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine._collect_failed_requests = mock.Mock(return_value=[])
+
+    assert engine.schedule_requests() == 1
+    engine.add_request_with_kv_handoff.assert_called_once_with(
+        42, [3, 4], params, kv_meta, [7], offload_params=offload_params
+    )
+
+
 def test_engine_prepares_prompt_before_model_parallel_broadcast():
     class _Preparer:
         def prepare_prompt(self, prompt, *, offload_params=None):
@@ -2615,6 +2829,89 @@ def test_streaming_partials_buffer_until_token_interval():
 
     engine.socket_for_receiving_requests.send_multipart.assert_called_once()
     assert engine._partial_emit_lengths == {7: 3}
+
+
+def _collect_streamed_partials(engine, streamed):
+    """Run `_try_send_streaming_partials` and accumulate its frames per request id."""
+    engine.socket_for_receiving_requests.send_multipart.reset_mock()
+    engine._try_send_streaming_partials()
+    for call in engine.socket_for_receiving_requests.send_multipart.call_args_list:
+        for frame in call.args[0][1:]:
+            partial = msgpack.unpackb(frame, raw=False)
+            out = streamed.setdefault(
+                partial["request_id"], {"tokens": [], "log_probs": [], "top_n": []}
+            )
+            out["tokens"].extend(partial["new_tokens"])
+            out["log_probs"].extend(partial.get("new_log_probs", []))
+            out["top_n"].extend(partial.get("new_top_n_logprobs", []))
+
+
+@pytest.mark.parametrize("streaming_interval", [1, 3])
+@pytest.mark.parametrize("stop_word_holdback", [False, True])
+def test_streaming_partials_continue_across_checkpoint(streaming_interval, stop_word_holdback):
+    """Streaming must stay aligned with `record.merge()` across an eviction checkpoint.
+
+    Eviction (and recompute on suspend) calls `record.checkpoint()`, which appends
+    a new segment whose prompt absorbs the earlier generations and whose
+    `generated_tokens` restart at 0. The stream offset is tracked over the whole
+    record, so indexing only the latest segment with it skips the first
+    `already` tokens generated after the resume.
+    """
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._partial_emit_lengths = {}
+    engine.socket_for_receiving_requests = mock.Mock()
+
+    request = DynamicInferenceRequest(
+        request_id=7,
+        prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=21,
+            termination_id=-1,
+            streaming=True,
+            streaming_interval=streaming_interval,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+        ),
+        stop_word_ids=[[900, 901, 902]] if stop_word_holdback else None,
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    engine.requests = {7: RequestEntry(record=record, future=None)}
+
+    def generate(token):
+        segment = record[-1]
+        segment.generated_tokens.append(token)
+        if segment.generated_log_probs is None:
+            segment.generated_log_probs = []
+            segment.generated_top_n_logprobs = []
+        segment.generated_log_probs.append(-token / 100.0)
+        segment.generated_top_n_logprobs.append({str(token): -token / 100.0})
+
+    streamed = {}
+    next_token = 100
+    # Two evictions: 5 tokens, then 4 (fewer than already streamed), then 12.
+    segment_lengths = (5, 4, 12)
+    for segment_length in segment_lengths:
+        for _ in range(segment_length):
+            generate(next_token)
+            next_token += 1
+            _collect_streamed_partials(engine, streamed)
+        if segment_length != segment_lengths[-1]:
+            record.checkpoint()
+            # Nothing new to send right after a checkpoint.
+            _collect_streamed_partials(engine, streamed)
+
+    merged = record.merge()
+    assert len(record.requests) == 3
+    assert merged.generated_tokens == list(range(100, 121))
+    out = streamed[7]
+    sent = len(out["tokens"])
+    assert out["tokens"] == merged.generated_tokens[:sent]
+    # Holdback / interval may keep a tail unsent; the final reply carries it.
+    holdback = 2 if stop_word_holdback else 0
+    assert sent >= len(merged.generated_tokens) - holdback - (streaming_interval - 1)
+    assert sent == engine._partial_emit_lengths[7]
+    assert out["log_probs"] == merged.generated_log_probs[:sent]
+    assert out["top_n"] == merged.generated_top_n_logprobs[:sent]
 
 
 def _generated_event_tokens(request):
@@ -3217,6 +3514,102 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert allocator.pool_avail == allocator.pool_size - 1
         assert context.total_request_count == 0
         assert context.paused_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_streaming_partials_match_merged_record_after_eviction(self) -> None:
+        """Streamed token/logprob deltas equal `record.merge()` for evicted requests.
+
+        A KV pool too small for all requests with no paused-block budget forces
+        evictions. An evicted request resumes as a new record segment whose
+        `generated_tokens` restart at 0, while its stream offset is already
+        non-zero; the stream must continue from the merged position instead of
+        skipping (or stalling on) tokens generated after the resume.
+        """
+        num_requests = 8
+        prompt_length = 256
+        num_tokens_to_generate = 48
+        block_size_tokens = 256
+        pool_block_count = 6
+
+        probe_env = self._build_test_env(DynamicEngineTestConfig())
+        block_size_bytes = probe_env.engine.context.block_size_bytes
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=num_requests,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=num_tokens_to_generate,
+            context_block_size_tokens=block_size_tokens,
+            context_buffer_size_gb=(pool_block_count * block_size_bytes + 1) / 1024**3,
+            context_paused_buffer_size_gb=0.0,
+            context_max_requests=num_requests,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        context = engine.context
+        vocab_size = test_config.vocab_size
+
+        # Deterministic, position-dependent tokens (next = input + 1) so a skipped
+        # or repeated token changes the streamed sequence, not just its length.
+        def mock_increment_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            logits = torch.zeros(
+                *tokens.shape, vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            next_tokens = (tokens + 1) % (vocab_size - 1)
+            logits.scatter_(-1, next_tokens.unsqueeze(-1), 100.0)
+            if test_config.materialize_only_last_token_logits:
+                logits = context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        engine.controller.inference_wrapped_model.model.forward = mock_increment_forward
+
+        for request in env.requests:
+            request.sampling_params.termination_id = -1
+            request.sampling_params.streaming = True
+            engine._add_request(request)
+
+        # Mirror the coordinator branch of `async_bookkeep`: drop finished
+        # requests' offsets, then stream deltas for the remaining requests.
+        engine._partial_emit_lengths = {}
+        engine.socket_for_receiving_requests = mock.Mock()
+        streamed = {}
+        segments_seen = {}
+        finished_requests = []
+        for _ in range(4000):
+            if not engine.has_unfinished_requests():
+                break
+            step_finished = engine.step_modern()["finished_requests"]
+            finished_requests.extend(step_finished)
+            for request in step_finished:
+                engine._partial_emit_lengths.pop(request.request_id, None)
+            for rid, entry in engine.requests.items():
+                segments_seen[rid] = max(segments_seen.get(rid, 1), len(entry.record.requests))
+            _collect_streamed_partials(engine, streamed)
+
+        assert not engine.has_unfinished_requests()
+        assert engine.evicted_request_count > 0, "no request was evicted"
+        assert len(finished_requests) == num_requests
+
+        resumed_and_streamed = 0
+        for request in finished_requests:
+            assert len(request.generated_tokens) == num_tokens_to_generate
+            out = streamed.get(request.request_id, {"tokens": [], "log_probs": []})
+            sent = len(out["tokens"])
+            assert out["tokens"] == request.generated_tokens[:sent], request.request_id
+            assert out["log_probs"] == request.generated_log_probs[:sent], request.request_id
+            # Only the final step's token(s) may be left to the final reply.
+            assert sent >= num_tokens_to_generate - 1, (request.request_id, sent)
+            if segments_seen.get(request.request_id, 1) > 1:
+                resumed_and_streamed += 1
+        assert resumed_and_streamed > 0, "no evicted request streamed after resuming"
         assert context.active_token_count == 0
 
     @pytest.mark.internal
@@ -4434,31 +4827,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_chunked_prefill_avoid_single_token_chunk(self):
-        """
-        Test that chunked prefill scheduling avoids leaving exactly 1 token for the final chunk.
-        This leads to a known bug in the Flash Attention kernel:
-        https://github.com/Dao-AILab/flash-attention/issues/1537
+    def test_chunked_prefill_single_token_final_chunk(self):
+        """Chunked prefill leaves a one-token final chunk rather than reshaping the split.
 
-        Scenario:
-            - Max tokens per step (Chunk Size): 256
-            - Request prompt length: 513
-
-        Default scheduling would do:
-            1. Chunk 256 (Remaining 257)
-            2. Chunk 256 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
-            3. Chunk 1
-
-        Fixed scheduling should do:
-            1. Chunk 256 (Remaining 257) -> 513 - 256 == 257. Schedule full 256.
-            2. Chunk 255 (Remaining 2)   -> 257 tokens left. If we take 256, 1 remains.
-                                            So we reduce chunk to 255.
-            3. Chunk 2   (Remaining 0)
+        Prompt of 513 tokens with a 256-token budget: chunks of 256, 256, then 1. Numerical
+        correctness of one-token chunks is covered by
+        test_single_token_prefill_chunks_match_unchunked_baseline.
         """
         prefill_chunk_size = 256
-        # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
-        # 256 + 255 + 2 = 513
-        prompt_len = 513
+        prompt_len = 2 * prefill_chunk_size + 1
 
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
@@ -4476,64 +4853,29 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ctx = env.engine.context
 
         # Mock the model forward function to avoid possible numerics issues
-        # caused by random inputs
         model_instance = env.engine.controller.inference_wrapped_model.model
         model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
-        # Create a request with length 513
-        req_tokens = torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda')
         req = DynamicInferenceRequest(
             request_id=1,
-            prompt_tokens=req_tokens,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda'),
             sampling_params=SamplingParams(num_tokens_to_generate=1),
         )
-
         env.engine._add_request(req)
 
-        assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
-
-        # --- Step 1 (async primer) ---
-        # Available: 256. Remaining: 513.
-        # Logic: 513 - 256 = 257. Not 1. Schedule full 256.
         env.engine.step_modern()
+        assert ctx.request_query_lengths[0].item() == prefill_chunk_size
+        assert req.finished_chunk_token_count == prefill_chunk_size
 
-        assert env.engine.context.total_request_count == 1, env.engine.context.total_request_count
-        assert ctx.request_query_lengths[0].item() == 256
-
-        assert (
-            req.finished_chunk_token_count == 256
-        ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
-
-        # --- Step 2 ---
-        # Resolve the first chunk and launch the second.
-        # Available: 256. Remaining un-prefilled: 257.
-        # Logic: 257 - 256 = 1. This is the edge case!
-        # Fix should reduce chunk size by 1 (to 255).
         env.engine.step_modern()
+        assert ctx.request_query_lengths[0].item() == prefill_chunk_size
+        assert req.finished_chunk_token_count == 2 * prefill_chunk_size
 
-        assert env.engine.context.total_request_count == 1, env.engine.context.total_request_count
-        assert ctx.request_query_lengths[0].item() == 255
-
-        # 256 (previous) + 255 (this step) = 511
-        assert req.finished_chunk_token_count == 511, (
-            "Step 2: Expected 511 tokens processed (256+255), "
-            f"got {req.finished_chunk_token_count}. "
-        )
-
-        # --- Step 3 ---
-        # Resolve the second chunk and launch the final chunk.
-        # Remaining un-prefilled: 2. Available: 256.
-        # Logic: 2 <= 256. Schedule 2.
         env.engine.step_modern()
-
-        assert ctx.total_request_count == 1
         assert ctx.num_prefill_requests == 1
-        assert ctx.request_query_lengths[0].item() == 2
+        assert ctx.request_query_lengths[0].item() == 1
 
-        # --- Step 4 ---
-        # Resolve the final prefill output and complete the request.
         env.engine.step_modern()
-
         assert ctx.num_prefill_requests == 0
         assert req.status == Status.COMPLETED
 
@@ -4542,29 +4884,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_chunked_prefill_delay_scheduling_for_unavoidable_single_token_chunk(self):
-        """
-        Test that chunked prefill scheduling delays execution when the only available
-        option is to schedule a chunk of size 1 that leaves exactly 1 token remaining.
+    def test_chunked_prefill_schedules_single_token_chunk_into_leftover_budget(self):
+        """A one-token leftover budget is used rather than deferring the next request.
 
-        Scenario:
-            - Max tokens per step: 256
-            - Request A: 254 token prompt
-            - Request B: 2 token prompt
-
-        Sequence:
-            1. Step 1 async primer:
-               - Request A is scheduled (255 tokens).
-               - Context has 1 token available (256 - 255).
-               - Request B has 2 tokens remaining.
-               - If we schedule 1 token for B, it leaves exactly 1 token for its final chunk,
-                 crashing FA3. Since chunk_length is 1, we can't safely reduce it.
-                 The engine MUST delay scheduling Request B.
-            2. Step 2 resolves Request A and schedules Request B.
-               - Request A completes after its prefill sample is resolved.
-               - Context has all 256 tokens available.
-               - Request B is now safely scheduled for its full 2 tokens.
-            3. Step 3 resolves Request B's prefill sample.
+        Max tokens per step is 256. Request A (255 tokens) leaves 1 token of budget, so
+        request B (2 tokens) is split into two one-token chunks instead of waiting a step.
         """
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
@@ -4585,51 +4909,34 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         model_instance = env.engine.controller.inference_wrapped_model.model
         model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
-        # Add Request A (Length 255)
-        req_a_tokens = torch.randint(0, test_config.vocab_size, (255,), device='cuda')
         req_a = DynamicInferenceRequest(
             request_id=1,
-            prompt_tokens=req_a_tokens,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (255,), device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (2,), device='cuda'),
             sampling_params=SamplingParams(num_tokens_to_generate=1),
         )
         env.engine._add_request(req_a)
-
-        # Add Request B (Length 2)
-        req_b_tokens = torch.randint(0, test_config.vocab_size, (2,), device='cuda')
-        req_b = DynamicInferenceRequest(
-            request_id=2,
-            prompt_tokens=req_b_tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=1),
-        )
         env.engine._add_request(req_b)
 
-        # --- Step 1 (async primer) ---
-        # Schedule and launch Request A fully (255), but delay Request B.
+        # Step 1: A's full prompt plus B's first token fill the 256-token budget.
         env.engine.step_modern()
+        assert ctx.total_request_count == 2
+        assert ctx.active_token_count == 256
+        assert req_b.finished_chunk_token_count == 1
+        assert ctx.request_query_lengths[1].item() == 1
 
-        assert ctx.total_request_count == 1
-        assert ctx.active_token_count == 255
-
-        # Request B MUST be delayed (0 tokens processed) to avoid the FA3 bug
-        assert (
-            req_b.finished_chunk_token_count == 0
-        ), "Request B should have been delayed to avoid leaving a 1-token chunk"
-        assert len(env.engine.waiting_request_ids) == 1
-        assert env.engine.waiting_request_ids[0] == 2
-
-        # --- Step 2 ---
-        # Resolve Request A, then schedule and launch Request B's full 2-token prompt.
+        # Step 2: B's final one-token chunk.
         env.engine.step_modern()
-
         assert req_a.status == Status.COMPLETED
-        assert ctx.total_request_count == 1
         assert ctx.request_ids[0].item() == 2
-        assert ctx.request_query_lengths[0].item() == 2
+        assert ctx.request_query_lengths[0].item() == 1
 
-        # --- Step 3 ---
-        # Resolve Request B's prefill output.
+        # Step 3: resolve B's prefill output.
         env.engine.step_modern()
-
         assert req_b.status == Status.COMPLETED
         assert len(env.engine.waiting_request_ids) == 0
 
@@ -4715,12 +5022,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_prefix_caching_avoid_single_token_effective_chunk(self):
-        """
-        Test that prefix caching combined with chunked prefill avoids leaving exactly
-        1 token for the effective prefill chunk. A 1-token prefill chunk routes to
-        the Flash Attention decode kernel, which crashes due to shape mismatches.
-        """
+    def test_prefix_caching_single_token_effective_chunk(self):
+        """A prefix-cache hit on all but the last prompt token computes only that token."""
         block_size = 16
         prompt_len = 17  # 1 full block (16) + 1 token
 
@@ -4773,13 +5076,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env.engine._add_request(req_b)
         env.engine.step_modern()
 
-        # Verify that `_compute_prefix_match` successfully clamped the skip.
+        # The cached block is skipped in full, leaving a one-token chunk.
         req_b_idx = ctx.request_ids.tolist().index(2)
-
-        assert ctx.request_query_lengths[req_b_idx].item() == 17, (
-            f"Expected effective chunk length to be backed off to 17, "
-            f"but got {ctx.request_query_lengths[req_b_idx].item()}."
-        )
+        assert ctx.request_query_lengths[req_b_idx].item() == 1
+        assert req_b.num_cached_tokens == block_size
 
     @pytest.mark.internal
     @torch.inference_mode()

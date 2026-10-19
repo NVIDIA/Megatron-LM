@@ -689,7 +689,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 if self.D_has_hdim
                 else self.cp.get_D()
             ),
-            z=z if not self.rmsnorm else None,
+            # ssm_prefill, MambaBatchInvariantDecode and the fused path this method
+            # replaces all gate inside the scan; gating in self.norm afterwards is
+            # the same algebra at different precision.
+            z=z if (self.config.batch_invariant_mode or not self.rmsnorm) else None,
             dt_bias=self.cp.get_dt_bias().float(),
             dt_softplus=True,
             return_final_states=ssm_state is not None,
@@ -707,7 +710,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         if self.rmsnorm:
             z = rearrange(z, "b l h p -> l b (h p)").contiguous()
             z = self.cp.post_conv_ssm(z)
-            y = self.norm(y, z)
+            # Already consumed by the scan above when batch-invariant.
+            y = self.norm(y, None if self.config.batch_invariant_mode else z)
 
         return y
 
@@ -977,10 +981,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         # the caller. When enabled, the chunk scan returns its raw states so
         # our Triton kernels do a fused gather+conditional-scatter directly,
         # skipping the dense intermediate tensor and the padded-slot writes.
+        # Batch-invariant mode also caches these complete-chunk FP32 states.
+        # Restoring one does not require the partial-tail decode replay buffers:
+        # the suffix prefill seeds those buffers at the same aligned boundary.
         extract_intermediates = (
-            not self.config.batch_invariant_mode
-            and intermediate_chunk_indices is not None
-            and intermediate_ssm_out is not None
+            intermediate_chunk_indices is not None and intermediate_ssm_out is not None
         )
         ssm_varlen_result = mamba_chunk_scan_combined_varlen(
             x=x,
