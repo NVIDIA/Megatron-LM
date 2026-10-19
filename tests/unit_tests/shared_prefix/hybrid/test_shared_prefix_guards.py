@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid import shared_prefix
 from megatron.core.models.hybrid.shared_prefix import (
     _validate_hybrid_stack,
@@ -301,6 +302,60 @@ def test_unsupported_stack_topology_and_layers_rejected():
             _LAYOUT,
             physical_len=_PHYSICAL_LEN[1],
         )
+
+
+def _bare_mamba_layer(config):
+    """A MambaLayer with an identity norm and a parameterless mixer: no kernels or groups."""
+    layer = MambaLayer.__new__(MambaLayer)
+    torch.nn.Module.__init__(layer)
+    layer.config = config
+    layer.layer_number = 1
+    layer.hidden_dropout = 0.0
+    layer.norm = torch.nn.Identity()
+    layer.mamba_bda = get_bias_dropout_add
+    layer.bias_dropout_add_exec_handler = torch.enable_grad
+    layer.mixer = MambaMixer.__new__(MambaMixer)
+    torch.nn.Module.__init__(layer.mixer)
+    layer.mixer.config = config
+    return layer
+
+
+def test_consecutive_mamba_layers_run_their_module_hooks(monkeypatch):
+    """Each Mamba layer reaches its mixer through MambaLayer.__call__ and MambaMixer.__call__.
+
+    Module hooks, such as Megatron FSDP's unshard, prefetch and reshard hooks, fire only on module
+    calls, so the stack must not call a layer's shared-prefix helper around them.
+    """
+    events = []
+
+    def mixer_half(mixer, hidden_states, call):
+        call.consumed = True
+        events.append("scan")
+        return 2 * hidden_states, None
+
+    monkeypatch.setattr(mamba_shared_prefix, "forward_mamba_mixer_shared_prefix", mixer_half)
+    monkeypatch.delenv("NRL_SP_MAMBA_IMPL", raising=False)
+    config = _config()
+    layers = [_bare_mamba_layer(config) for _ in range(2)]
+    for index, layer in enumerate(layers):
+        for name, module in ((f"layer{index}", layer), (f"mixer{index}", layer.mixer)):
+            module.register_forward_pre_hook(lambda m, a, name=name: events.append(f"{name}_pre"))
+            module.register_forward_hook(lambda m, a, o, name=name: events.append(f"{name}_post"))
+    hidden_states = torch.randint(-4, 5, (_LAYOUT.total_len, 1, 8)).to(torch.bfloat16)
+
+    output = forward_hybrid_stack_shared_prefix(
+        _stack(config, layers),
+        hidden_states,
+        _LAYOUT,
+        position_embedding_type="none",
+        validated_physical_len=_LAYOUT.total_len,
+    )
+
+    layer_events = ["layer{0}_pre", "mixer{0}_pre", "scan", "mixer{0}_post", "layer{0}_post"]
+    assert events == [event.format(index) for index in range(2) for event in layer_events]
+    # Each layer adds its residual to the mixer output 2 * h.
+    torch.testing.assert_close(output, 9 * hidden_states, rtol=0, atol=0)
+    assert all(layer.mixer._shared_prefix_call is None for layer in layers)
 
 
 def test_stack_validation_needs_only_the_physical_length():

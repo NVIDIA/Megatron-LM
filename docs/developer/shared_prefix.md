@@ -59,6 +59,11 @@ replay, and convolution halo are distinct parts of the contract. Every shared pa
 passes channel-last input to `causal_conv1d`, as `MambaMixer` does, because its
 channel-first backward is wrong at some sequence lengths.
 
+Each Mamba layer runs through `MambaLayer.__call__` and `MambaMixer.__call__`, as
+attention and MoE layers run through their module calls, so module hooks such as
+Megatron FSDP's parameter gathers fire as on the dense path. Shared-prefix training
+under Megatron FSDP has not been qualified.
+
 `NRL_SP_MAMBA_IMPL` selects the Mamba backend. The default, `ragged_state_fork`,
 applies to every topology and root count, including TP1/CP1 single stars; it pads
 each branch only to its own chunk boundary. The other values are explicit opt-ins:
@@ -186,7 +191,7 @@ replaces:
   forward context restored during recomputation.
 - `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_guards.py` and
   `tests/unit_tests/shared_prefix/test_shared_prefix_layout.py`: the explicit
-  guards and layout metadata, on CPU.
+  guards, the layout metadata, and the order of Mamba module hooks, on CPU.
 
 In FP32, shared and dense execution differ only in summation order. The layer
 tests bound that difference at 1e-5 relative L2 for MoE and 5e-5 for Mamba. Their
