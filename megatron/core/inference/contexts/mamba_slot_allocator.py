@@ -65,9 +65,9 @@ class MambaSlotAllocator:
         # own per-chunk states using its own chunk size. That conversion is exact
         # only if the quantum is a multiple of that chunk size. Which chunk size to
         # check against follows from the Householder count: ssm_chunking() asserts a
-        # homogeneous SSM stack, so a nonzero count means every SSM layer is Gated
-        # Delta Product, whose prefill kernels chunk at their own fixed size and for
-        # which mamba_chunk_size is an unused default.
+        # homogeneous SSM stack, so a nonzero count means every SSM layer runs the
+        # Gated Delta Product prefill kernels (GDN as a single update), which chunk
+        # at their own fixed size and for which mamba_chunk_size is an unused default.
         if context.gdp_num_householder > 0:
             assert context.ssm_chunk_alignment % GDP_CHUNK_SIZE == 0, (
                 f"SSM chunk alignment must be a multiple of the GDP chunk size "
