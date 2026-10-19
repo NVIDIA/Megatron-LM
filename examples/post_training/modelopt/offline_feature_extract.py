@@ -16,9 +16,9 @@ from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_config import modelopt_inference_config_from_args
 from megatron.training import get_args, get_tokenizer, initialize_megatron
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
 
 
@@ -53,8 +53,6 @@ if __name__ == "__main__":
     # migrated settings use config; remaining settings still use legacy args.
     cfg = modelopt_inference_config_from_args(args)
     set_run_config(cfg)
-    initialize_runtime_services(args, training=True)
-    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
     initialize_megatron(training=True)
 
     args = get_args()
