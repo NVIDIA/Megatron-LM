@@ -207,6 +207,8 @@ def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=Fa
         softmax_type="vanilla",
         attention_dropout=0.0,
         attn_logit_softcapping=None,
+        batch_invariant_mode=False,
+        flash_attention_version=None,
     )
     return module, SimpleNamespace(**{**defaults, **config})
 
@@ -221,6 +223,11 @@ def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=Fa
         ({"softmax_type": "off-by-one"}, NotImplementedError, "vanilla softmax"),
         ({"attention_dropout": 0.1}, NotImplementedError, "zero attention dropout"),
         ({"attn_logit_softcapping": 30.0}, NotImplementedError, "logit softcapping"),
+        (
+            {"batch_invariant_mode": True, "flash_attention_version": 3},
+            NotImplementedError,
+            "batch-invariant mode",
+        ),
         ({"tp": 2}, RuntimeError, "attention TP helper"),
         ({"cp": 2}, RuntimeError, "attention CP helper"),
     ],
@@ -245,6 +252,13 @@ def test_attention_validation_rejects_other_attention_modules(attention):
 @pytest.mark.parametrize("window_size", [None, (-1, -1), [-1, -1]])
 def test_attention_validation_accepts_full_attention_windows(attention, window_size):
     module, config = _validated_attention(window_size=window_size)
+    attention.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
+
+
+@pytest.mark.parametrize("version", [None, 2, 3, 4])
+def test_attention_validation_accepts_any_pinned_flash_version(attention, version):
+    """Without batch-invariant mode the pin selects TE and inference kernels, not the forest."""
+    module, config = _validated_attention(flash_attention_version=version)
     attention.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
 
 

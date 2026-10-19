@@ -2,9 +2,10 @@
 
 """Model-level dense-row references for the shared-prefix HybridModel tests.
 
-They extend the layer-level problems in ``tests/unit_tests/ssm/shared_prefix_test_utils.py`` to
-whole models: a tiny HybridModel runs the dense rows and the shared layout, with MoE routing
-optionally replayed, and the runs are compared per dense row.
+They extend the layer-level problems in
+``tests/unit_tests/shared_prefix/ssm/shared_prefix_test_utils.py`` to whole models: a tiny
+HybridModel runs the dense rows and the shared layout, with MoE routing optionally replayed, and
+the runs are compared per dense row.
 """
 
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.shared_prefix_layout import SharedPrefixLayout
-from tests.unit_tests.ssm.shared_prefix_test_utils import SharedPrefixProblem, rel_l2
+from tests.unit_tests.shared_prefix.ssm.shared_prefix_test_utils import SharedPrefixProblem, rel_l2
 
 # ----------------------------------------------------------------------------- model level
 # With Megatron's default init std (0.02) attention is nearly uniform, so wrong RoPE positions

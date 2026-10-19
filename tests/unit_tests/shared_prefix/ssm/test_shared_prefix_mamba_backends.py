@@ -32,9 +32,11 @@ requires_mamba_kernels = pytest.mark.skipif(
 )
 
 
-def _fake_mixer(*, chunk_size=128, state_dtype=torch.bfloat16):
+def _fake_mixer(*, chunk_size=128, state_dtype=torch.bfloat16, batch_invariant_mode=False):
     return SimpleNamespace(
-        config=SimpleNamespace(params_dtype=torch.bfloat16),
+        config=SimpleNamespace(
+            params_dtype=torch.bfloat16, batch_invariant_mode=batch_invariant_mode
+        ),
         rmsnorm=True,
         chunk_size=chunk_size,
         mamba_training_ssm_states_dtype=state_dtype,
@@ -92,6 +94,18 @@ def test_ragged_kernel_import_failure_fails_validation(monkeypatch, kernels_pres
     with pytest.raises(RuntimeError, match="NRL_SP_MAMBA_IMPL=state_fork"):
         mamba_shared_prefix._validate_mamba_fork(_fake_mixer())
     monkeypatch.setenv("NRL_SP_MAMBA_IMPL", "state_fork")
+    mamba_shared_prefix._validate_mamba_fork(_fake_mixer())
+
+
+@pytest.mark.parametrize("impl", [None, "state_fork", "replay_prefix", "packed_recurrence"])
+def test_batch_invariant_mode_fails_validation(monkeypatch, kernels_present, impl):
+    """Every backend gates the rounded scan output; batch-invariant Mamba gates inside the scan."""
+    if impl is None:
+        monkeypatch.delenv("NRL_SP_MAMBA_IMPL", raising=False)
+    else:
+        monkeypatch.setenv("NRL_SP_MAMBA_IMPL", impl)
+    with pytest.raises(NotImplementedError, match="batch-invariant mode"):
+        mamba_shared_prefix._validate_mamba_fork(_fake_mixer(batch_invariant_mode=True))
     mamba_shared_prefix._validate_mamba_fork(_fake_mixer())
 
 

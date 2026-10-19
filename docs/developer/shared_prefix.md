@@ -174,7 +174,7 @@ replaces:
   prompt-row gather, and the MTP input guards.
 - `tests/unit_tests/transformer/test_multi_token_prediction_loss_groups.py`: one
   grouped `process_mtp_loss` call against one call per loss group, on CPU.
-- `tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py` and
+- `tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py` and
   `test_shared_prefix_mamba_backends.py`: the four differentiable Mamba backends
   against dense rows, including branch lengths in the defective `causal_conv1d`
   length classes, and backend selection.

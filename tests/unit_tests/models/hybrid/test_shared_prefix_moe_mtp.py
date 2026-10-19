@@ -24,7 +24,10 @@ from tests.unit_tests.models.hybrid.shared_prefix_test_utils import (
     run_dense_rows,
     run_shared,
 )
-from tests.unit_tests.ssm.shared_prefix_test_utils import SharedPrefixProblem, round_params_to
+from tests.unit_tests.shared_prefix.ssm.shared_prefix_test_utils import (
+    SharedPrefixProblem,
+    round_params_to,
+)
 from tests.unit_tests.test_utilities import Utils
 
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
