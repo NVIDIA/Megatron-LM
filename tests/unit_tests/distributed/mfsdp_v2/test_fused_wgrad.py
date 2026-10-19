@@ -96,7 +96,7 @@ def test_fused_grad_buffer_prepare_and_take(distributed_setup):
     group.prepare_fused_grad_buffer()
     main_grad = unsharded["weight"].main_grad
     assert main_grad.shape == unsharded["weight"].shape
-    assert main_grad.dtype == group.dtype
+    assert main_grad.dtype == group.grad_comm_dtype
     assert torch.count_nonzero(main_grad) == 0
     assert not any(hasattr(unsharded[name], "main_grad") for name in unfused_names)
 

@@ -95,6 +95,48 @@ def test_partial_grad_buffer_follows_grad_comm_dtype(
         assert parameter.grad.dtype == (main_grads_dtype or torch.bfloat16), name
 
 
+@pytest.mark.parametrize(
+    ("main_grads_dtype", "grad_comm_dtype", "expected_comm_dtype"),
+    [
+        (torch.float32, None, torch.float32),
+        (torch.float32, torch.bfloat16, torch.bfloat16),
+        (None, None, torch.bfloat16),
+    ],
+)
+def test_fused_wgrad_buffer_follows_grad_comm_dtype(
+    distributed_setup, main_grads_dtype, grad_comm_dtype, expected_comm_dtype
+):
+    """TE writes fused wgrads into a reduce-scatter input allocated in grad_comm_dtype."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = te.Linear(
+        16, 16, bias=False, params_dtype=torch.bfloat16, device=device, fuse_wgrad_accumulation=True
+    )
+    policy = MixedPrecisionPolicy(
+        main_params_dtype=torch.float32,
+        main_grads_dtype=main_grads_dtype,
+        grad_comm_dtype=grad_comm_dtype,
+    )
+    with fully_shard_context(device=device):
+        fully_shard(
+            model, mesh=mesh, placements=_default_placements(), mixed_precision_policy=policy
+        )
+    [group] = model.parameter_groups
+    [weight] = [fsdp_parameter.unsharded for fsdp_parameter in group.fsdp_parameters]
+
+    # Registered after fully_shard(), so this runs after MFSDP's backward pre-hook sets main_grad.
+    main_grad_dtypes: list[torch.dtype] = []
+    model.register_full_backward_pre_hook(
+        lambda _module, _grad_output: main_grad_dtypes.append(weight.main_grad.dtype)
+    )
+
+    x = torch.randn(4, 16, device=device, dtype=torch.bfloat16)
+    model(x).float().sum().backward()
+
+    assert main_grad_dtypes == [expected_comm_dtype], main_grad_dtypes
+    assert model.weight.grad.dtype == (main_grads_dtype or torch.bfloat16)
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10,
