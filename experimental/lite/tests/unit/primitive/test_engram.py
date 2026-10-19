@@ -17,6 +17,14 @@ def test_engram_masked_rows_pass_the_residual_through():
     assert torch.equal(out[1], hidden[1]) and not torch.equal(out[0], hidden[0])
 
 
+def test_release_load_table_allocates_exact_host_bytes_without_random_init(monkeypatch):
+    monkeypatch.setattr(torch, "randn", None)  # no random FP32 table when the release is loaded
+    table = ShardedFrozenTable(5, 64, SimpleNamespace(size=lambda: 2), initialize=False)
+    weight, scale = table.embedding.weight, table.embedding.scale  # 3 rows per rank
+    assert (weight.shape, scale.shape, weight.untyped_storage().nbytes()) == ((3, 64), (3, 2), 192)
+    assert (weight.dtype, scale.dtype) == (torch.float8_e4m3fn, torch.float8_e8m0fnu)
+
+
 def _worker(rank, root):
     from megatron.core import dist_checkpointing
     from megatron.lite.model.deepseek_v41.lite.checkpoint import attach_checkpoint_metadata
@@ -32,11 +40,9 @@ def _worker(rank, root):
     assert torch.cuda.memory_allocated() == before and not list(table.parameters())
     table.cuda()  # device moves leave the host FP8 bytes in place
     assert table.embedding.weight is weight and weight.dtype == torch.float8_e4m3fn
-    full = [torch.empty_like(weight.view(torch.uint8)).cuda() for _ in range(2)]
-    dist.all_gather(full, weight.view(torch.uint8).cuda())
-    scales = [torch.empty_like(scale.view(torch.uint8)).cuda() for _ in range(2)]
-    dist.all_gather(scales, scale.view(torch.uint8).cuda())
-    full, scales = (torch.cat(t).view(d) for t, d in ((full, weight.dtype), (scales, scale.dtype)))
+    parts = [None, None]
+    dist.all_gather_object(parts, (weight.clone(), scale.clone()))
+    full, scales = (torch.cat(t).cuda() for t in zip(*parts))
     ids = torch.tensor([[0, 4999], [2500, 3], [1, 2499]], device="cuda")[rank:]  # 3 and 2 rows
     # The official decode: FP32 product per 32-wide block, then BF16.
     expected = full[ids].float().unflatten(-1, (-1, 32)) * scales[ids].float().unsqueeze(-1)
@@ -46,12 +52,11 @@ def _worker(rank, root):
     attach_checkpoint_metadata([module], ps)
     Path(root, "new").mkdir(exist_ok=True)  # both ranks
     dist_checkpointing.save(module.sharded_state_dict(), f"{root}/new")
-    saved = weight.clone(), scale.clone()
     weight.view(torch.uint8).zero_(), scale.view(torch.uint8).zero_()
     dist_checkpointing.load(module.sharded_state_dict(), f"{root}/new")
     assert all(
         torch.equal(a.view(torch.uint8), b.view(torch.uint8))
-        for a, b in zip((weight, scale), saved)
+        for a, b in zip((weight, scale), parts[rank])  # pre-save clones
     )
     dist.destroy_process_group()
 

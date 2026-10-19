@@ -42,7 +42,8 @@ class DS41Engram(Engram):
             raise NotImplementedError("DS4.1 Engram tables are frozen host FP8; not trainable")
         position = release.engram_layer_ids.index(layer)
         rows = release.engram_num_embeddings[position]
-        table = ShardedFrozenTable(rows, release.engram_head_dim, table_group)
+        init = config.perform_initialization  # False when the release is loaded
+        table = ShardedFrozenTable(rows, release.engram_head_dim, table_group, initialize=init)
         width = (
             (release.engram_max_ngram_size - 1) * release.engram_n_heads * release.engram_head_dim
         )

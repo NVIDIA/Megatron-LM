@@ -113,7 +113,7 @@ class ShardedFrozenTable(nn.Module):
     or dtype moves of the module leave the stored bytes on the host.
     """
 
-    def __init__(self, rows, width, group, *, block=32):
+    def __init__(self, rows, width, group, *, block=32, initialize=True):
         super().__init__()
         if width % block:
             raise ValueError("FP8 table width must be a multiple of its scale block")
@@ -122,17 +122,15 @@ class ShardedFrozenTable(nn.Module):
         self.embedding = nn.Module()  # holds the persistent byte buffers and row metadata
         bounds = tuple(i * shard for i in range(group.size() + 1))
         self.embedding.lookup = SimpleNamespace(group=group, boundaries=bounds)
-        value = (torch.randn(shard, width) * 0.02).to(torch.float8_e4m3fn)
-        scale = torch.full((shard, width // block), 127, dtype=torch.uint8)  # 2**0
-        self.embedding.register_buffer("weight", _host_copy(value))
-        self.embedding.register_buffer("scale", _host_copy(scale.view(torch.float8_e8m0fnu)))
+        self.embedding.register_buffer("weight", _pinned_empty((shard, width), torch.float8_e4m3fn))
+        scale = _pinned_empty((shard, width // block), torch.float8_e8m0fnu)
+        self.embedding.register_buffer("scale", scale)
+        if initialize:  # random rows, unit scales; a release load skips this and fills the bytes
+            self.embedding.weight.copy_(torch.randn(shard, width) * 0.02)
+            self.embedding.scale.view(torch.uint8).fill_(127)  # 2**0
 
     def _apply(self, fn, recurse=True):
         return self  # the frozen FP8 bytes stay on the host
-
-    @property
-    def weight(self):
-        return self.embedding.weight
 
     def forward(self, ids):
         rows, size = ids.shape[0], self.group.size()
@@ -158,16 +156,12 @@ class ShardedFrozenTable(nn.Module):
         return out
 
 
-def _host_copy(tensor):
-    """Exact-size host copy, page-locked in place when CUDA is available.
-
-    pin_memory=True goes through the caching host allocator, which rounds each block
-    up to a power of two; register a plain allocation instead.
-    """
-    nbytes = tensor.numel() * tensor.element_size()
+def _pinned_empty(shape, dtype):
+    """Exact-size uninitialized host buffer, page-locked in place when CUDA is available
+    (pin_memory=True would round the caching host allocator's block up to a power of two)."""
+    nbytes = shape[0] * shape[1] * dtype.itemsize
     owner = np.empty(max(nbytes, 1), dtype=np.uint8)
-    out = torch.from_numpy(owner)[:nbytes].view(tensor.dtype).view(tensor.shape)
-    out.copy_(tensor)
+    out = torch.from_numpy(owner)[:nbytes].view(dtype).view(shape)
     if torch.cuda.is_available() and nbytes:
         pointer, cudart = owner.ctypes.data, torch.cuda.cudart()
         if int(cudart.cudaHostRegister(pointer, nbytes, 0)) != 0:
