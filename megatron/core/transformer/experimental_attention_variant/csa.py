@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 from dataclasses import dataclass
@@ -1118,6 +1118,7 @@ class CompressedSparseAttention(MegatronModule):
                 sparse_loss=self.config.dsa_indexer_use_sparse_loss,
                 kv_offset=compressed_offset,
                 calculate_per_token_loss=self.config.calculate_per_token_loss,
+                deterministic=self.config.deterministic_mode,
             )
             nvtx_range_pop("sparse_attn_kernel")
 
@@ -1139,12 +1140,21 @@ class CompressedSparseAttention(MegatronModule):
                 self.indexer.index_topk,
                 self.compress_ratio,
                 indexer_softmax_scale=self.indexer.softmax_scale,
+                deterministic=self.config.deterministic_mode,
             )
             compressed_indices = torch.where(
                 compressed_indices >= 0, compressed_indices + compressed_offset, -1
             )
+            # Match the training forward's key order: FlashMLA's online softmax
+            # accumulates in slot order, even when the selected key set is equal.
+            # Preserve the existing window-first order outside deterministic mode.
+            index_groups = (
+                (compressed_indices, window_indices)
+                if self.config.deterministic_mode
+                else (window_indices, compressed_indices)
+            )
             flat_indices, flat_topk_length = build_flat_topk_idxs(
-                window_indices, compressed_indices, batch_size=batch, compact=True
+                *index_groups, batch_size=batch, compact=True
             )
             nvtx_range_pop("compressed_indices")
 
@@ -1156,6 +1166,7 @@ class CompressedSparseAttention(MegatronModule):
                 flat_indices,
                 self.softmax_scale,
                 topk_length=flat_topk_length,
+                deterministic=self.config.deterministic_mode,
             )
             nvtx_range_pop("sparse_attn_kernel")
         else:
@@ -1173,7 +1184,12 @@ class CompressedSparseAttention(MegatronModule):
 
             nvtx_range_push("sparse_attn_kernel")
             output = csa_sparse_attn(
-                query, kv_full, self.attn_sink.float(), flat_indices, self.softmax_scale
+                query,
+                kv_full,
+                self.attn_sink.float(),
+                flat_indices,
+                self.softmax_scale,
+                deterministic=self.config.deterministic_mode,
             )
             nvtx_range_pop("sparse_attn_kernel")
 
@@ -1570,6 +1586,7 @@ class CompressedSparseAttention(MegatronModule):
                     indexer.index_topk,
                     indexer.softmax_scale,
                     max_seqlen_q=max_seqlen_q,
+                    deterministic=self.config.deterministic_mode,
                 )
                 nvtx_range_pop("dsv4_cp_indexer_topk")
 
@@ -1583,6 +1600,11 @@ class CompressedSparseAttention(MegatronModule):
 
         use_indexer_loss = (
             training_with_grad and compressed_topk is not None and indexer_loss_coeff > 0
+        )
+        # Match the training reduction order even when no-grad disables the
+        # auxiliary loss. Both paths compact this compressed-first layout.
+        compressed_first = use_indexer_loss or (
+            self.config.deterministic_mode and compressed_topk is not None
         )
 
         # ---- Step 6: concatenate the raw local KV sources -------------------
@@ -1629,7 +1651,7 @@ class CompressedSparseAttention(MegatronModule):
             compressed_topk,
             cu_seqlens_compressed=cu_seqlens_compressed,
             seq_to_rank_row=seq_to_rank_row,
-            for_indexer_loss=use_indexer_loss,
+            for_indexer_loss=compressed_first,
             compressed_rows=compressed_kv_rank_major.shape[0],
             cu_seqlens_unpadded=cu_seqlens_q_unpadded,
             output_alignment=get_flash_mla_topk_alignment(),
@@ -1678,6 +1700,8 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_kv_rs_state,
                 self.window_size,
                 kv_reconstruction_parts,
+                # Final forward argument; backward returns no gradient for this flag.
+                self.config.deterministic_mode,
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,
@@ -1698,6 +1722,7 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=topk_length,
             kv_reconstruction_parts=kv_reconstruction_parts,
             q_padding_mask=q_padding_mask,
+            deterministic=self.config.deterministic_mode,
         )
         if training_with_grad and indexer is not None:
             # Zero loss or a pack without compressed keys still needs explicit
