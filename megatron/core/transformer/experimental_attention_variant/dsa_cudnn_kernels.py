@@ -22,6 +22,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_indexer_loss,
     dsa_layout,
     dsa_masking,
+    dsa_topk_zero_ties,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
     FUSED_INDEXER_MAX_SAFE_ROWS,
@@ -32,6 +33,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa_scoring_plan i
     IndexerScoringPlan,
     report_unfused_scoring_once,
     resolve_indexer_scoring_plan,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_topk_zero_ties import (
+    ZERO_TIE_SENTINEL,
+    select_lowest_index_zero_ties,
 )
 from megatron.core.utils import (
     filter_kwargs_for_callable,
@@ -56,9 +61,19 @@ class CudnnDsaInterface(Protocol):
     """
 
     def indexer_top_k_wrapper(
-        self, scores: Tensor, seq_lens: Tensor, top_k: int, next_n: int, return_val: bool
+        self,
+        scores: Tensor,
+        seq_lens: Tensor,
+        top_k: int,
+        next_n: int,
+        return_val: bool,
+        tie_break: int = 0,
     ) -> dict:
-        """Select the top-``top_k`` key indices (and optional scores) per query row."""
+        """Select the top-``top_k`` key indices (and optional scores) per query row.
+
+        ``tie_break`` (cuDNN frontend >= 1.31 only) picks among equal radix keys at the
+        cutoff: 0 arbitrary, 1 lowest source column, 2 highest source column.
+        """
 
     def indexer_forward_wrapper(
         self,
@@ -217,6 +232,10 @@ _DETERMINISTIC_SPARSE_BWD_WORKSPACES: dict[tuple[torch.device, int], Tensor] = {
 _TOP_LEFT_DEFAULT_Q_OFFSET_FE_VERSION = (1, 26)
 # First cuDNN frontend release whose varlen radix top-k never reads past a row's length.
 _TOPK_OOB_LANE_GUARD_FE_VERSION = (1, 29)
+# First cuDNN frontend release whose radix top-k takes ``tie_break`` (1: the lowest source
+# columns among copies of the cutoff key). Older frontends have no such parameter.
+_TOPK_TIE_BREAK_FE_VERSION = (1, 31)
+_TOPK_LOWEST_INDEX_TIE_BREAK = 1
 _NAMED_PARAMETER_CACHE: dict[int, tuple[object, frozenset]] = {}
 _CLEAN_LOGITS_UNAVAILABLE_LOGGED = False
 _MXFP8_SCORER_HEAD_COUNTS = frozenset((32, 64))
@@ -736,9 +755,27 @@ def _selectable_topk_scores(scores: Tensor) -> Tensor:
     the raw kernel spent on a NaN is not refilled, so the members never include a NaN, but the
     member count does depend on where the kernel ranks NaN: radix keys put a positive NaN above
     ``+inf`` (it takes a top-K slot, and the row returns one member fewer per such NaN) and a
-    sign-bit NaN below ``-inf`` (it takes no slot, and the row returns K).
+    sign-bit NaN below ``-inf`` (it takes no slot, and the row returns K). Both deterministic
+    paths apply the same rule to the same raw result, so they agree either way.
     """
     return scores > float("-inf")
+
+
+def _check_deterministic_topk_geometry(
+    scores_flat: Tensor, seq_lens: Tensor, topk_indices: Tensor, topk_k: int
+) -> None:
+    n_rows, sk = scores_flat.shape
+    if sk <= 0 or topk_k <= 0 or topk_k > sk:
+        raise RuntimeError(
+            f"invalid deterministic top-k geometry: rows={n_rows}, sk={sk}, topk={topk_k}"
+        )
+    if seq_lens.ndim != 1 or seq_lens.numel() != n_rows:
+        raise RuntimeError(f"deterministic top-k sequence lengths must have shape ({n_rows},)")
+    if topk_indices.numel() != n_rows * topk_k:
+        raise RuntimeError(
+            "deterministic top-k indices have an unexpected number of elements: "
+            f"expected={n_rows * topk_k}, actual={topk_indices.numel()}"
+        )
 
 
 def _canonicalize_deterministic_topk_membership(
@@ -759,19 +796,13 @@ def _canonicalize_deterministic_topk_membership(
     result holds selectable members. Prefix ranks and ``searchsorted`` compact that set
     into a fixed ``[R,K]`` result, so deterministic mode remains compatible with CUDA
     Graph capture.
+
+    This is the canonical rule. It reads every in-row score, so it is used only when the
+    installed frontend cannot break ties itself (see
+    :func:`_canonicalize_lowest_index_tie_break_topk`).
     """
     n_rows, sk = scores_flat.shape
-    if sk <= 0 or topk_k <= 0 or topk_k > sk:
-        raise RuntimeError(
-            f"invalid deterministic top-k geometry: rows={n_rows}, sk={sk}, topk={topk_k}"
-        )
-    if seq_lens.ndim != 1 or seq_lens.numel() != n_rows:
-        raise RuntimeError(f"deterministic top-k sequence lengths must have shape ({n_rows},)")
-    if topk_indices.numel() != n_rows * topk_k:
-        raise RuntimeError(
-            "deterministic top-k indices have an unexpected number of elements: "
-            f"expected={n_rows * topk_k}, actual={topk_indices.numel()}"
-        )
+    _check_deterministic_topk_geometry(scores_flat, seq_lens, topk_indices, topk_k)
 
     raw_indices = topk_indices.reshape(n_rows, topk_k)
     row_limits = seq_lens.to(dtype=torch.int64).clamp(min=0, max=sk).view(n_rows, 1)
@@ -824,6 +855,112 @@ def _canonicalize_deterministic_topk_membership(
     return {"indices": canonical_indices, "values": canonical_scores}
 
 
+def _canonicalize_lowest_index_tie_break_topk(
+    scores_flat: Tensor,
+    seq_lens: Tensor,
+    topk_indices: Tensor,
+    *,
+    topk_k: int,
+    return_topk_scores: bool,
+) -> dict:
+    """Canonical deterministic top-k from a cuDNN ``tie_break=1`` result in O(rows * K).
+
+    Returns exactly what :func:`_canonicalize_deterministic_topk_membership` returns for the
+    same raw result: every selectable in-row score (not NaN, not ``-inf``; ``+inf`` is
+    selected) strictly above the cutoff plus the lowest-index cutoff ties, in ascending index
+    order, padded with ``-1`` indices and ``finfo.min`` values.
+
+    That rule depends on the raw result only through its selectable in-row members, whose
+    count and minimum (the cutoff) do not depend on how the kernel broke ties. With
+    ``tie_break=1`` the radix kernel keeps every key above the cutoff key plus the lowest-index
+    copies of the cutoff key, so the raw selectable members already are the canonical set
+    (``+inf`` has a single radix key, so an ``+inf`` cutoff needs nothing more), except in one
+    case:
+    radix keys order ``+0.0`` above ``-0.0`` while the rule compares values. When the cutoff
+    value is zero, the raw result holds every positive score plus ``q`` zeros chosen by sign;
+    those rows replace their zeros with the ``q`` lowest-index in-row zeros of either sign
+    (:func:`select_lowest_index_zero_ties`, which reads only those rows). Rows no longer
+    than ``topk_k`` keep every in-row score and need no repair.
+
+    Sorting the selected indices gives the canonical order. Shapes are fixed and no step
+    synchronizes with the host, so the result stays CUDA Graph capturable.
+    """
+    n_rows, sk = scores_flat.shape
+    _check_deterministic_topk_geometry(scores_flat, seq_lens, topk_indices, topk_k)
+
+    raw_indices = topk_indices.reshape(n_rows, topk_k).to(dtype=torch.int32)
+    row_limits = seq_lens.to(dtype=torch.int64).clamp(min=0, max=sk)
+    safe_raw_indices = raw_indices.clamp(min=0, max=sk - 1).to(dtype=torch.int64)
+    raw_scores = torch.gather(scores_flat, dim=1, index=safe_raw_indices)
+    raw_valid = (
+        (raw_indices >= 0)
+        & (raw_indices < sk)
+        & (raw_indices.to(dtype=torch.int64) < row_limits.view(n_rows, 1))
+        & _selectable_topk_scores(raw_scores)
+    )
+    cutoff = torch.where(raw_valid, raw_scores, torch.full_like(raw_scores, float("inf"))).amin(
+        dim=1
+    )
+    raw_zero = raw_valid & (raw_scores == 0)
+    zero_cutoff = (cutoff == 0) & (row_limits > topk_k)
+    zero_quotas = torch.where(
+        zero_cutoff,
+        raw_zero.sum(dim=1, dtype=torch.int32),
+        torch.zeros((n_rows,), dtype=torch.int32, device=scores_flat.device),
+    )
+    zero_ties = select_lowest_index_zero_ties(
+        scores_flat, row_limits.to(dtype=torch.int32), zero_quotas, topk_k
+    )
+
+    kept = raw_valid & ~(raw_zero & zero_cutoff.view(n_rows, 1))
+    candidates = torch.cat(
+        (
+            torch.where(kept, raw_indices, torch.full_like(raw_indices, ZERO_TIE_SENTINEL)),
+            zero_ties,
+        ),
+        dim=1,
+    )
+    # Valid indices are distinct, so stability only orders the sentinel padding.
+    ordered = torch.sort(candidates, dim=1, stable=True)
+    canonical_indices = ordered.values[:, :topk_k]
+    canonical_valid = canonical_indices != ZERO_TIE_SENTINEL
+    canonical_indices = torch.where(
+        canonical_valid, canonical_indices, torch.full_like(canonical_indices, -1)
+    )
+
+    canonical_scores = None
+    if return_topk_scores:
+        # Zero-tie values come from the score buffer, so their sign bit is preserved.
+        safe_zero_ties = zero_ties.clamp(max=sk - 1).to(dtype=torch.int64)
+        candidate_scores = torch.cat(
+            (raw_scores, torch.gather(scores_flat, dim=1, index=safe_zero_ties)), dim=1
+        )
+        canonical_scores = torch.gather(candidate_scores, dim=1, index=ordered.indices[:, :topk_k])
+        canonical_scores = torch.where(
+            canonical_valid,
+            canonical_scores,
+            torch.full_like(canonical_scores, torch.finfo(scores_flat.dtype).min),
+        )
+    return {"indices": canonical_indices, "values": canonical_scores}
+
+
+def _supports_lowest_index_topk_tie_break() -> bool:
+    """Whether cuDNN top-k can keep the lowest-index copies of the cutoff key itself.
+
+    Requires an ``indexer_top_k_wrapper`` that names ``tie_break`` (``**kwargs`` does not
+    count) on cuDNN frontend >= 1.31, the first release whose ``tie_break=1`` semantics were
+    verified. Otherwise deterministic top-k falls back to the full-row canonicalization.
+    """
+    if _cudnn_dsa is None:
+        return False
+    wrapper = getattr(_cudnn_dsa, "indexer_top_k_wrapper", None)
+    return (
+        wrapper is not None
+        and _accepts_named_parameter(wrapper, "tie_break")
+        and _cudnn_frontend_at_least(_TOPK_TIE_BREAK_FE_VERSION)
+    )
+
+
 def _indexer_top_k_wrapper_chunked(
     scores_flat: Tensor,
     seq_lens: Tensor,
@@ -833,26 +970,54 @@ def _indexer_top_k_wrapper_chunked(
 ) -> dict:
     """Run cuDNN top-k in row chunks to bound wrapper scratch allocation.
 
+    Deterministic mode returns the canonical membership and order of
+    :func:`_canonicalize_deterministic_topk_membership`. With a frontend that supports
+    ``tie_break`` it is derived from a ``tie_break=1`` launch at the same chunking as the
+    non-deterministic path; otherwise the full-row canonicalization runs in small chunks.
+
     Every cuDNN top-k call in this module goes through here. The CSA paths
     (``csa_utils/fused_sparse_attention.py``) call the frontend directly with their own sizing
     and deterministic selection (the dense fallback row-chunks under its own 1 GiB score
-    budget when only top-k is needed), so this scratch budget does not apply to them.
+    budget when only top-k is needed), so neither this scratch budget nor the ``tie_break``
+    path applies to them.
     """
     n_rows, sk = scores_flat.shape
     chunk_rows = _topk_wrapper_chunk_rows(n_rows, sk, scores_flat.element_size())
     deterministic = bool(deterministic or torch.are_deterministic_algorithms_enabled())
-    if deterministic:
+    use_frontend_tie_break = deterministic and _supports_lowest_index_topk_tie_break()
+    if deterministic and not use_frontend_tie_break:
         # Bound the masks, prefix ranks, and K-wide gather buffers used by the
         # fixed-shape cutoff repair. The estimate is deliberately conservative.
         repair_bytes_per_row = max(1, 16 * sk + 40 * topk_k)
         chunk_rows = min(
             chunk_rows,
             _bytes_to_chunk_rows(
-                n_rows, repair_bytes_per_row, _DETERMINISTIC_TOPK_REPAIR_MAX_BYTES, 1
+                n_rows,
+                repair_bytes_per_row,
+                _DETERMINISTIC_TOPK_REPAIR_MAX_BYTES,
+                _topk_wrapper_row_alignment(sk, scores_flat.element_size()),
             ),
         )
+    if deterministic:
+        _log_deterministic_topk_path_once(use_frontend_tie_break, scores_flat.is_cuda)
 
     def run_chunk(chunk_scores: Tensor, chunk_seq_lens: Tensor) -> dict:
+        if use_frontend_tie_break:
+            result = _cudnn_dsa.indexer_top_k_wrapper(
+                chunk_scores,
+                chunk_seq_lens,
+                top_k=topk_k,
+                next_n=1,
+                return_val=False,
+                tie_break=_TOPK_LOWEST_INDEX_TIE_BREAK,
+            )
+            return _canonicalize_lowest_index_tie_break_topk(
+                chunk_scores,
+                chunk_seq_lens,
+                result["indices"],
+                topk_k=topk_k,
+                return_topk_scores=return_topk_scores,
+            )
         result = _cudnn_dsa.indexer_top_k_wrapper(
             chunk_scores, chunk_seq_lens, top_k=topk_k, next_n=1, return_val=return_topk_scores
         )
@@ -904,6 +1069,51 @@ def _copy_topk_chunk(destination: Tensor, chunk: Tensor, name: str) -> None:
             f"expected {destination.dtype} and {destination.numel()} ({tuple(destination.shape)})."
         )
     destination.copy_(chunk.reshape(destination.shape))
+
+
+_DETERMINISTIC_TOPK_PATHS_LOGGED: set = set()
+
+
+def _log_deterministic_topk_path_once(use_frontend_tie_break: bool, on_cuda: bool) -> None:
+    """Log once per selection which deterministic top-k path runs and why.
+
+    The fallback full-row canonicalization costs about 2.2 s per 1M CP64 rank-0 call
+    against about 19 ms for ``tie_break=1``, and the zero-tie repair's PyTorch fallback
+    (CUDA without Triton) scans whole rows, so both are reported as warnings.
+    """
+    wrapper = None if _cudnn_dsa is None else getattr(_cudnn_dsa, "indexer_top_k_wrapper", None)
+    names_tie_break = wrapper is not None and _accepts_named_parameter(wrapper, "tie_break")
+    zero_tie_backend = (
+        "triton" if on_cuda and dsa_topk_zero_ties.HAVE_TRITON else ("torch" if on_cuda else "cpu")
+    )
+    key = (use_frontend_tie_break, names_tie_break, zero_tie_backend)
+    if key in _DETERMINISTIC_TOPK_PATHS_LOGGED:
+        return
+    _DETERMINISTIC_TOPK_PATHS_LOGGED.add(key)
+    frontend = _cudnn_frontend_version()
+    logger = logging.getLogger(__name__)
+    if not use_frontend_tie_break:
+        logger.warning(
+            "Deterministic DSA top-k uses the full-row canonicalization (slow: it reads every "
+            "in-row score in small row chunks): cuDNN frontend %s, indexer_top_k_wrapper "
+            "names tie_break=%s; tie_break=1 needs a wrapper naming it and frontend >= %s.",
+            frontend,
+            names_tie_break,
+            _TOPK_TIE_BREAK_FE_VERSION,
+        )
+    elif zero_tie_backend == "torch":
+        logger.warning(
+            "Deterministic DSA top-k uses cuDNN tie_break=1 (frontend %s), but Triton is not "
+            "installed: the signed-zero cutoff repair runs its PyTorch fallback over whole rows.",
+            frontend,
+        )
+    else:
+        logger.info(
+            "Deterministic DSA top-k uses cuDNN tie_break=1 (frontend %s) with the %s "
+            "signed-zero cutoff repair.",
+            frontend,
+            zero_tie_backend,
+        )
 
 
 def _indexer_score_chunk_rows(b: int, sq: int, sk: int) -> int:

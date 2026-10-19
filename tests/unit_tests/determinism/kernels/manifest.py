@@ -972,6 +972,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "atomics). Bit-exact replay is tracked as a follow-up; parity tests live in "
         "tests/unit_tests/transformer/experimental_attention_variant/.",
     ),
+    KernelEntry(
+        name="dsa_topk_zero_ties",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_topk_zero_ties.py",),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_topk_zero_ties.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/"
+            "test_dsa_cudnn_topk_deterministic_gpu.py",
+        ),
+        kind="triton",
+        notes="Lowest-index exact-zero tie selection of the deterministic DSA top-k: integer "
+        "compares and per-row index writes only. The tests compare it exactly with a reference "
+        "(Triton interpreter on CPU, CUDA on GPU) and repeat the deterministic top-k bitwise, "
+        "eager and under CUDA graph replay.",
+    ),
 )
 
 
