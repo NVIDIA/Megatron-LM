@@ -28,7 +28,7 @@ import pytest
 import torch
 
 from megatron.core.shared_prefix_layout import SharedPrefixLayout
-from tests.unit_tests.models.hybrid.shared_prefix_test_utils import (
+from tests.unit_tests.shared_prefix.hybrid.shared_prefix_test_utils import (
     ReplayedRouting,
     TokenProblem,
     build_hybrid_model,

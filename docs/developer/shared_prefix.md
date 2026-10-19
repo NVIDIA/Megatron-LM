@@ -164,27 +164,27 @@ full-model scale.
 GPU tests compare shared execution with the dense rows `[prompt, completion_g]` it
 replaces:
 
-- `tests/unit_tests/models/hybrid/test_shared_prefix_model_parity.py`: HybridModel
-  logits, parameter gradients and expert-bias counts for stars and forests at
-  TP1/CP1, TP2/SP/CP2 and TP1/CP4; full recomputation against the plain shared
-  forward; and the default path with an explicit `None` layout, bit for bit.
-- `tests/unit_tests/models/hybrid/test_shared_prefix_moe_mtp.py` and
+- `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_model_parity.py`:
+  HybridModel logits, parameter gradients and expert-bias counts for stars and
+  forests at TP1/CP1, TP2/SP/CP2 and TP1/CP4; full recomputation against the plain
+  shared forward; and the default path with an explicit `None` layout, bit for bit.
+- `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_moe_mtp.py` and
   `test_shared_prefix_mtp_branches.py`: expert-bias counts through a real router,
   MTP parity and grouped normalization at TP1/CP1 and TP2/SP/CP2, the fixed-order
   prompt-row gather, and the MTP input guards.
-- `tests/unit_tests/transformer/test_multi_token_prediction_loss_groups.py`: one
+- `tests/unit_tests/shared_prefix/test_multi_token_prediction_loss_groups.py`: one
   grouped `process_mtp_loss` call against one call per loss group, on CPU.
 - `tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py` and
   `test_shared_prefix_mamba_backends.py`: the four differentiable Mamba backends
   against dense rows, including branch lengths in the defective `causal_conv1d`
   length classes, and backend selection.
-- `tests/unit_tests/transformer/moe/test_router_shared_prefix.py` and
+- `tests/unit_tests/shared_prefix/test_router_shared_prefix.py` and
   `tests/unit_tests/tensor_parallel/test_random.py`: routing arguments, logical
   expert counts, fixed-row router blocks, the frozen-router backward, and the
   forward context restored during recomputation.
-- `tests/unit_tests/models/hybrid/test_shared_prefix_guards.py` and
-  `tests/unit_tests/test_shared_prefix_layout.py`: the explicit guards and layout
-  metadata, on CPU.
+- `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_guards.py` and
+  `tests/unit_tests/shared_prefix/test_shared_prefix_layout.py`: the explicit
+  guards and layout metadata, on CPU.
 
 In FP32, shared and dense execution differ only in summation order. The layer
 tests bound that difference at 1e-5 relative L2 for MoE and 5e-5 for Mamba. Their
