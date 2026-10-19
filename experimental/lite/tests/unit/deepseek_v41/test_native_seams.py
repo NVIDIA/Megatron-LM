@@ -543,3 +543,56 @@ def test_shifted_block_uses_explicit_source_checkpoint(cpu_core_checkpoint):
         for name, parameter in block.named_parameters()
     )
     assert modes == [True, True, False, False, True, True]
+
+
+def test_native_ratio_two_compressor_matches_release_pooling():
+    """Run real parent compression on CPU projections, not a parent-method spy."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+    from megatron.lite.model.deepseek_v41.lite.native import core_config
+    from megatron.lite.runtime.contracts import ParallelConfig
+
+    class Projection(torch.nn.Linear):
+        def forward(self, x):
+            return torch.nn.functional.linear(x.float(), self.weight), None
+
+    # The parent constructor allocates CUDA. This explicit CPU fixture leaves
+    # its real forward/_forward_thd/pooling/RoPE functions unmodified.
+    compressor = Compressor.__new__(Compressor)
+    torch.nn.Module.__init__(compressor)
+    compressor.config = core_config(DeepseekV41Config(num_hidden_layers=4), ParallelConfig())
+    compressor.compress_ratio, compressor.head_dim, compressor.coff = 2, 4, 1
+    compressor.overlap = compressor.use_fused_compressor = compressor.rotate = False
+    compressor.qk_pos_emb_head_dim = 2
+    compressor.pg_collection = SimpleNamespace(cp=SimpleNamespace(size=lambda: 1, rank=lambda: 0))
+    compressor.linear_wkv = Projection(4, 4, bias=False)
+    compressor.linear_wgate = Projection(4, 4, bias=False)
+    compressor.ape = torch.nn.Parameter(torch.zeros(2, 4), requires_grad=False)
+    compressor.norm = torch.nn.RMSNorm(4, eps=1e-20, dtype=torch.bfloat16)
+    compressor.rotary_pos_emb = lambda length, packed_seq: torch.zeros(length, 1, 1, 2)
+    x = (torch.arange(48).reshape(12, 1, 4).float() / 32).to(torch.bfloat16).requires_grad_()
+    prefix = torch.tensor([0, 5, 6, 12], dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=prefix, cu_seqlens_kv=prefix, max_seqlen_q=6, max_seqlen_kv=6
+    )
+    captured = []
+    handle = compressor.norm.register_forward_hook(
+        lambda module, args, result: captured.append(result)
+    )
+    result, compressed_prefix = compressor(x, params)
+    handle.remove()
+    expected = []
+    for begin, end in [(0, 5), (5, 6), (6, 12)]:
+        count = (end - begin) // 2
+        if count:
+            chunk = x[begin : begin + count * 2]
+            kv = compressor.linear_wkv(chunk)[0].reshape(count, 2, 1, 4)
+            score = compressor.linear_wgate(chunk)[0].reshape(count, 2, 1, 4)
+            expected.append(compressor.norm((kv * score.softmax(1)).sum(1).to(x.dtype)))
+    assert torch.equal(compressed_prefix, torch.tensor([0, 2, 2, 5], dtype=torch.int32))
+    assert torch.equal(captured[0][:5], torch.cat(expected))
+    assert result.shape[0] == 6  # Core owns one static-capacity padding row.
+    result[:5].square().sum().backward()
+    assert torch.isfinite(x.grad).all()
+    assert torch.isfinite(compressor.linear_wkv.weight.grad).all()
+    assert torch.isfinite(compressor.linear_wgate.weight.grad).all()

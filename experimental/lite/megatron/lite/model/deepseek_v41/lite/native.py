@@ -52,7 +52,10 @@ def core_config(
         v_head_dim=release.head_dim,
         o_lora_rank=release.o_lora_rank,
         o_groups=release.o_groups,
-        experimental_attention_variant="dsv4_hybrid",
+        # DS4.1 composes Core component specs directly. The stock DSv4
+        # selector admits only 0/4/128 and is not the DS4.1 ratio grammar.
+        # Keep literal ratios; do not select or remap to that different model.
+        experimental_attention_variant=None,
         csa_compress_ratios=list(release.compress_ratios[: release.num_hidden_layers])
         or ([0, 0] + [2] * 18 + [1] * 20)[: release.num_hidden_layers],
         csa_window_size=release.sliding_window,
