@@ -128,11 +128,18 @@ else:
     SplitAlongDim, TELinear, TENorm, set_save_original_input = None, None, None, None
 
 try:
+    from transformer_engine.pytorch import RMSNorm as TERMSNorm
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
 
     HAVE_FUSED_QKV_ROPE = True
+    # Newer TE versions apply the per-head Q/K RMSNorm inside the same fused kernel.
+    HAVE_FUSED_QKV_NORM_ROPE = (
+        "q_norm_weight" in inspect.signature(apply_fused_qkv_rotary_pos_emb).parameters
+    )
 except ImportError:
+    TERMSNorm = None
     HAVE_FUSED_QKV_ROPE = False
+    HAVE_FUSED_QKV_NORM_ROPE = False
 
 
 class LinearQkvInterface(Protocol):
@@ -1341,6 +1348,53 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         """Specialized attention subclasses retain their atomic forward path."""
         return type(self).forward is Attention.forward
 
+    def qk_norm_fusable_into_qkv_rope(self) -> bool:
+        """Whether the Q/K norms can be folded into TE's fused single-QKV RoPE kernel.
+
+        The kernel applies a per-head RMSNorm with a learnable `[kv_channels]` weight before
+        the rotation, so both norms must be Transformer Engine `RMSNorm` modules over the head
+        dimension with the same epsilon and `zero_centered_gamma`. The fused path applies no
+        YaRN concentration factor, so the config must not request one either.
+        """
+        if not HAVE_FUSED_QKV_NORM_ROPE or self._yarn_concentration_factor != 1.0:
+            return False
+        norms = (self.q_layernorm, self.k_layernorm)
+        if not all(isinstance(norm, TERMSNorm) for norm in norms):
+            return False
+        if any(norm.weight.numel() != self.hidden_size_per_attention_head for norm in norms):
+            return False
+        return (
+            self.q_layernorm.eps == self.k_layernorm.eps
+            and self.q_layernorm.zero_centered_gamma == self.k_layernorm.zero_centered_gamma
+        )
+
+    def _fused_qkv_rope_norm_kwargs(self) -> dict:
+        """Norm arguments of `apply_fused_qkv_rotary_pos_emb` when the Q/K norms are fused in.
+
+        The norm modules' forward is not called on this path, so their forward pre-hooks
+        (DistributedDataParallel uses them to wait for the parameter all-gather) are run here
+        explicitly, as the fused MoE experts do for their linear layers.
+        """
+        if self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp):
+            return {}
+        for norm in (self.q_layernorm, self.k_layernorm):
+            for hook_id, hook in list(norm._forward_pre_hooks.items()):
+                if hook_id in norm._forward_pre_hooks_with_kwargs:
+                    ret = hook(norm, (), {})
+                else:
+                    ret = hook(norm, None)
+                if ret is not None:
+                    raise RuntimeError(
+                        f"{norm.__class__.__name__} has a forward pre-hook that modifies its "
+                        "input, which is not supported when the QK norm is fused into RoPE."
+                    )
+        return dict(
+            q_norm_weight=self.q_layernorm.weight,
+            k_norm_weight=self.k_layernorm.weight,
+            norm_eps=self.q_layernorm.eps,
+            norm_zero_centered_gamma=self.q_layernorm.zero_centered_gamma,
+        )
+
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
@@ -1443,8 +1497,12 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 ),
                 not self.config.flash_decode,
                 HAVE_FUSED_QKV_ROPE,
-                self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp),
-                self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp),
+                self.q_layernorm is None
+                or isinstance(self.q_layernorm, IdentityOp)
+                or self.qk_norm_fusable_into_qkv_rope(),
+                self.k_layernorm is None
+                or isinstance(self.k_layernorm, IdentityOp)
+                or self.qk_norm_fusable_into_qkv_rope(),
             ]
         )
         # Check if fused_single_qkv_rope is requested but either unavailable or not
@@ -1606,7 +1664,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
-                    mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
+                    mixed_qkv,
+                    q_pos_emb,
+                    k_pos_emb,
+                    qkv_split_arg_list,
+                    **self._fused_qkv_rope_norm_kwargs(),
                 )
 
             # TODO, can apply positional embedding to value_layer so it has
