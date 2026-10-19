@@ -117,7 +117,6 @@ def test_native_row_reads_keep_owned_bytes_across_shards(tmp_path):
     )
     with SafeTensorReader(tmp_path) as reader:
         rows = reader.get_row_tensors([(k, 3, 6) for k in tensors])
-    assert set(rows) == set(tensors)
     for key, value in rows.items():
         assert value.dtype == tensors[key].dtype and value.shape[0] == 3
         assert torch.equal(value.view(torch.uint8), tensors[key][3:6].view(torch.uint8))

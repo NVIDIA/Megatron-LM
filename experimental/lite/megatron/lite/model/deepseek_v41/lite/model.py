@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DS4.1 model body on native Core attention, MoE, mHC and vocabulary layers."""
+from pathlib import Path
+
 import torch
 from torch import nn
 
@@ -59,6 +61,10 @@ class DeepseekV41Model(MegatronModule):
         config = core_config(
             release,
             impl.parallel,
+            initialize=not any(
+                (Path(impl.hf_path) / f).is_file()
+                for f in ("model.safetensors.index.json", "model.safetensors")
+            ),
             attention_backend=impl.attention_backend_override or "none",
             deterministic_mode=impl.deterministic_mode,
         )

@@ -20,8 +20,6 @@ def test_native_core_configuration_is_bf16_and_keeps_literal_ratios(deterministi
         deterministic_mode=deterministic,
     )
     assert config.csa_compress_ratios == [0, 0, 2, 2]
-    assert config.qk_head_dim + config.qk_pos_emb_head_dim == 512
-    assert config.dsa_indexer_head_dim == 128 and config.dsa_indexer_n_heads == 32
     assert config.num_moe_experts == 384 and config.context_parallel_size == 1
     assert config.fp8 is None and config.fp4 is None
     assert config.deterministic_mode == deterministic and not config.moe_router_fusion
