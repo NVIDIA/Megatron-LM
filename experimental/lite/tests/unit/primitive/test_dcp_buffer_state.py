@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DCP training checkpoints carry persistent buffers, row shards at their global rows."""
+"""DCP training checkpoints carry persistent buffers and keep row shards at their global rows."""
 
 import json
 from datetime import timedelta
@@ -16,7 +16,8 @@ ROWS = (0, 3, 5)  # rank 0 owns rows [0, 3), rank 1 owns rows [3, 5)
 
 
 class _Table(nn.Module):
-    """A frozen table whose rows are sharded over a group, as Engram's lookup is."""
+    """A table whose rows are sharded over a group, as Engram's lookup is: frozen
+    storage buffers plus a trainable master."""
 
     def __init__(self, rank):
         super().__init__()
@@ -24,6 +25,7 @@ class _Table(nn.Module):
         rows = ROWS[rank + 1] - ROWS[rank]
         self.register_buffer("weight", torch.zeros(rows, 4, dtype=torch.float8_e4m3fn))
         self.register_buffer("scale", torch.zeros(rows, 1))
+        self.master = nn.Parameter(torch.zeros(rows, 4))
 
 
 class _Model(nn.Module):
@@ -43,6 +45,7 @@ def _fill(model, rank, value):
         model.scratch.fill_(value)
         rows = torch.arange(model.table.scale.shape[0], dtype=torch.float32) + ROWS[rank]
         model.table.scale.copy_(rows[:, None] + value)
+        model.table.master.copy_(rows[:, None] * 10 + value)
         model.table.weight.copy_((rows[:, None] + value).expand(-1, 4).to(torch.float8_e4m3fn))
 
 
@@ -100,7 +103,7 @@ def _worker(rank, directory):
         dist.destroy_process_group()
 
 
-def test_dcp_checkpoint_restores_persistent_and_row_sharded_buffers(tmp_path):
+def test_dcp_checkpoint_restores_buffers_and_row_shards(tmp_path):
     mp.start_processes(
         _worker, args=(str(tmp_path),), nprocs=WORLD, join=True, start_method="spawn"
     )
@@ -108,7 +111,8 @@ def test_dcp_checkpoint_restores_persistent_and_row_sharded_buffers(tmp_path):
         record = json.loads((tmp_path / f"rank-{rank}.json").read_text())
         assert "error" not in record, record["error"]
         assert record["step"] == 1
-        # Parameters, the persistent buffer and this rank's table rows come back.
+        # Parameters, the persistent buffer and this rank's own table rows (buffers
+        # and the row-sharded parameter) come back.
         assert all(record["equal"].values()), record["equal"]
         # Non-persistent buffers are not checkpoint state.
         assert record["scratch"] == 7.0
