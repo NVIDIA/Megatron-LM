@@ -11,6 +11,10 @@ the kernels' arithmetic order:
 * ``Fe131DSA`` mirrors cuDNN frontend 1.31.0: no ``q_causal_offsets`` means a zero
   (top-left) offset, the wrapper accepts ``precision='mxfp8'`` with packed E8M0 scales,
   and the buffer is prefilled with ``-inf``.
+* ``Fe131CleanLogitsDSA`` adds the proposed ``clean_logits`` switch. With
+  ``clean_logits=False`` the buffer starts as ``poison`` (NaN by default) and only the
+  causal prefix ``[0, causal_len)`` of every covered row is written, as the FE 1.31
+  kernel does.
 
 ``indexer_top_k_wrapper`` reads only ``[0, seq_len)`` of each row, matching the
 out-of-bounds-lane guard that cuDNN frontend 1.29 added to the varlen radix top-k.
@@ -158,6 +162,7 @@ class Fe131DSA:
     """cuDNN frontend 1.31.0: top-left default offset, MXFP8 dense scorer, prefilled."""
 
     calls: list = []
+    poison: float = float("nan")
 
     @classmethod
     def reset(cls):
@@ -244,3 +249,58 @@ class Fe131DSA:
         return {"scores": cls._run(q, k, w, fill_value=float("-inf"), kwargs=kwargs)}
 
     indexer_top_k_wrapper = staticmethod(indexer_top_k_wrapper)
+
+
+class Fe131CleanLogitsDSA(Fe131DSA):
+    """FE 1.31 plus the proposed ``clean_logits`` switch on the dense indexer forward."""
+
+    calls: list = []
+
+    @classmethod
+    def indexer_forward_wrapper(
+        cls,
+        q,
+        k,
+        w,
+        ratio=4,
+        qhead_per_kv_head=None,
+        m_block_size=128,
+        n_block_size=128,
+        q_stage=2,
+        kv_stage=4,
+        sm_scale=1.0,
+        out=None,
+        stream=None,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        q_causal_offsets=None,
+        precision="bf16",
+        q_scale=None,
+        k_scale=None,
+        cu_seqlens_q_scale_padded=None,
+        cu_seqlens_k_scale_padded=None,
+        sf_vec_size=32,
+        return_lse=False,
+        lse_out=None,
+        clean_logits: bool = True,
+    ):
+        kwargs = dict(
+            ratio=ratio,
+            sm_scale=sm_scale,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            precision=precision,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
+            sf_vec_size=sf_vec_size,
+            clean_logits=clean_logits,
+        )
+        fill_value = float("-inf") if clean_logits else cls.poison
+        return {"scores": cls._run(q, k, w, fill_value=fill_value, kwargs=kwargs)}
