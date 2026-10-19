@@ -21,7 +21,7 @@ from megatron.core.transformer.wide_residual_layer import (
 
 
 class _Mixer(nn.Module):
-    def __init__(self, dtype):
+    def __init__(self, dtype) -> None:
         super().__init__()
         self.projection = nn.Linear(8, 8, dtype=dtype)
 
