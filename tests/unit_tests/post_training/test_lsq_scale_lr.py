@@ -11,10 +11,12 @@ import megatron.training.training as training
 from megatron.core.optimizer import OptimizerConfig, _get_param_groups
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.post_training.model_hooks import _propagate_expert_allreduce_to_lsq_params
+import megatron.post_training.optimizer as modelopt_optimizer
 from megatron.post_training.optimizer import (
     get_lsq_config_overrides,
     install_lsq_optimizer_overrides,
 )
+from megatron.training.models.transforms import ModelTransformConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -38,8 +40,8 @@ def _toy_model():
     return model
 
 
-def _args(lr=3e-5, min_lr=0.0, lsq_scale_lr=None):
-    return Namespace(lr=lr, min_lr=min_lr, lsq_scale_lr=lsq_scale_lr)
+def _model_config(lsq_scale_lr=None):
+    return Namespace(transformations=ModelTransformConfig(lsq_scale_lr=lsq_scale_lr))
 
 
 @pytest.fixture
@@ -51,17 +53,17 @@ def restore_optimizer_config_fn(monkeypatch):
 
 
 def test_no_override_when_unset():
-    assert get_lsq_config_overrides(_args()) == {}
+    assert get_lsq_config_overrides(_model_config(), 3e-5) == {}
 
 
 def test_no_override_when_equal_to_base_lr():
     # An override equal to --lr would create a group that collides with the default group
     # on checkpoint load, so none is created.
-    assert get_lsq_config_overrides(_args(lr=3e-5, lsq_scale_lr=3e-5)) == {}
+    assert get_lsq_config_overrides(_model_config(lsq_scale_lr=3e-5), 3e-5) == {}
 
 
 def test_override_when_set():
-    overrides = get_lsq_config_overrides(_args(lsq_scale_lr=1e-4))
+    overrides = get_lsq_config_overrides(_model_config(lsq_scale_lr=1e-4), 3e-5)
     assert len(overrides) == 1
     (override,) = overrides.values()
     assert override == {"max_lr": 1e-4}
@@ -74,13 +76,18 @@ def test_install_is_idempotent(restore_optimizer_config_fn):
     assert training.get_megatron_optimizer_config is wrapped
 
 
-def test_wrapped_config_adds_lsq_override(restore_optimizer_config_fn):
+def test_wrapped_config_adds_lsq_override(restore_optimizer_config_fn, monkeypatch):
     base_config, base_overrides = training.get_megatron_optimizer_config(
         Namespace(lr=3e-5, min_lr=0.0)
     )
+    monkeypatch.setattr(
+        modelopt_optimizer,
+        "get_run_config",
+        lambda: Namespace(model=_model_config(lsq_scale_lr=1e-4)),
+    )
     install_lsq_optimizer_overrides()
     config, overrides = training.get_megatron_optimizer_config(
-        Namespace(lr=3e-5, min_lr=0.0, lsq_scale_lr=1e-4)
+        Namespace(lr=3e-5, min_lr=0.0)
     )
     assert config == base_config
     assert set(base_overrides).issubset(overrides)
@@ -105,7 +112,7 @@ class TestLSQParamGroups:
     @pytest.mark.parametrize("lsq_scale_lr", [1e-4, 3e-5])
     def test_scale_params_get_own_group(self, lsq_scale_lr):
         config = OptimizerConfig(lr=3e-5, min_lr=0.0, weight_decay=0.0)
-        overrides = get_lsq_config_overrides(_args(lsq_scale_lr=lsq_scale_lr))
+        overrides = get_lsq_config_overrides(_model_config(lsq_scale_lr=lsq_scale_lr), config.lr)
         groups = _get_param_groups([_toy_model()], config, overrides)
 
         if lsq_scale_lr == config.lr:
