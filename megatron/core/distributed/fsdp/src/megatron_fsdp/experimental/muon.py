@@ -13,8 +13,9 @@ from torch.optim.optimizer import ParamsT
 try:
     import emerging_optimizers  # pylint: disable=unused-import
 except ImportError as error:
+    # CI's import checker recognizes "UnavailableError" as a missing optional dependency.
     raise ImportError(
-        "FsdpMuon requires Emerging-Optimizers. "
+        "UnavailableError: FsdpMuon requires Emerging-Optimizers. "
         "Install it with `pip install 'megatron-fsdp[emerging-optimizers]'`."
     ) from error
 
