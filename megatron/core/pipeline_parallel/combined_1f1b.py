@@ -16,6 +16,8 @@ from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     ScheduleNode,
     get_comp_stream,
+    is_pp_last_stage,
+    is_vp_last_stage,
     set_streams,
 )
 from megatron.core.utils import get_attr_wrapped_model
@@ -50,6 +52,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     no_sync_func,
     total_num_tokens,
     check_first_val_step,
+    cp_group_size,
 ):
     """Scheduler for 1f1b with no pipelining.
 
@@ -65,6 +68,9 @@ def combined_1f1b_schedule_for_no_pipelining(
     Phases 2: 2nd microbatch backward + 3rd microbatch forward
     Phases 3: 3rd microbatch backward + 4th microbatch forward
     Phases 4: 4th microbatch backward
+
+    Every microbatch runs on the last (only) pipeline stage; ``cp_group_size`` is the
+    context-parallel size used to scale its loss.
     """
 
     set_streams(high_priority=config.high_priority_a2a_comm_stream)
@@ -89,6 +95,8 @@ def combined_1f1b_schedule_for_no_pipelining(
         None,  # b_output_tensor
         None,  # b_output_tensor_grad
         config,
+        cp_group_size=cp_group_size,
+        is_last_stage=True,
         collect_non_loss_data=collect_non_loss_data,
         checkpoint_activations_microbatch=None,
         is_first_microbatch=check_first_val_step(True),
@@ -112,6 +120,8 @@ def combined_1f1b_schedule_for_no_pipelining(
                 output_tensor,  # b_output_tensor
                 output_tensor_grad,  # b_output_tensor_grad
                 config,
+                cp_group_size=cp_group_size,
+                is_last_stage=True,
                 collect_non_loss_data=collect_non_loss_data,
                 checkpoint_activations_microbatch=None,
                 is_first_microbatch=check_first_val_step((i + 1) == 0),
@@ -133,6 +143,8 @@ def combined_1f1b_schedule_for_no_pipelining(
         output_tensor,  # b_output_tensor
         output_tensor_grad,  # b_output_tensor_grad
         config,
+        cp_group_size=cp_group_size,
+        is_last_stage=True,
         fsdp_wrapper=fsdp_wrapper,
     )
     return forward_data_store, total_num_tokens
@@ -154,6 +166,8 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     check_first_val_step,
     is_first_microbatch_for_model_chunk,
     collect_non_loss_data,
+    cp_group_size,
+    pp_group,
     f_virtual_microbatch_id=None,
     b_virtual_microbatch_id=None,
     pre_forward=None,
@@ -174,6 +188,8 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
           - config, forward_step_func, data_iterator, model, num_microbatches, forward_data_store
           - check_first_val_step, is_first_microbatch_for_model_chunk, collect_non_loss_data
           - pre_forward, pre_backward, post_forward, post_backward
+          - cp_group_size: the context-parallel size, used to scale the loss
+          - pp_group: the pipeline-parallel group, used to find the last stage
         - Callables for the forward_step_helper() and backward_step_helper()
           - forward_step_helper_preprocess, forward_step_helper_postprocess
           - backward_step_helper_preprocess, backward_step_helper_postprocess
@@ -220,10 +236,14 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     f_model_chunk_id = None
     f_microbatch_id = None
     input_tensor = None
+    is_last_stage = False
     if f_virtual_microbatch_id is not None:
         f_microbatch_id = get_microbatch_id_in_model_chunk(f_virtual_microbatch_id, forward=True)
     if f_virtual_microbatch_id is not None:
         f_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
+        is_last_stage = is_vp_last_stage(
+            vp_stage=f_model_chunk_id, vp_size=config.virtual_pipeline_model_parallel_size
+        ) and is_pp_last_stage(pp_group)
         input_tensor = forward_step_helper_preprocess(
             f_virtual_microbatch_id, f_model_chunk_id, f_microbatch_id
         )
@@ -250,6 +270,8 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
         b_output_tensor,
         b_output_tensor_grad,
         config,
+        cp_group_size=cp_group_size,
+        is_last_stage=is_last_stage,
         f_model_chunk_id=f_model_chunk_id,
         pre_forward=pre_forward,
         pre_backward=pre_backward,
@@ -293,6 +315,8 @@ def combined_forward_backward_step(
     b_output_tensor,
     b_output_tensor_grad,
     config,
+    cp_group_size,
+    is_last_stage,
     f_model_chunk_id=None,
     pre_forward=None,
     pre_backward=None,
@@ -311,6 +335,9 @@ def combined_forward_backward_step(
         Need to accept the argument of both forward_step() and backward_step().
         forward_step_func (callable): A function returning a forward schedule plan which is
             an input of schedule_chunk_1f1b function.
+        cp_group_size (int): The context-parallel size, used to scale the forward loss.
+        is_last_stage (bool): Whether the forward model chunk is the last pipeline stage,
+            counting virtual stages; only the last stage computes the loss.
 
         Only exists in 1f1b steady state with p2p overlap.
             pre_forward (callable): The function to call before the forward_step.
@@ -485,6 +512,8 @@ def combined_forward_backward_step(
             collect_non_loss_data,
             num_microbatches,
             forward_data_store,
+            cp_group_size,
+            is_last_stage,
         )
         # Set the schedule plan and loss function to the output tensor
         # This is used to get the schedule plan and loss function in the backward pass
