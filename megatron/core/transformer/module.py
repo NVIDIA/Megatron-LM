@@ -108,7 +108,7 @@ class MegatronModule(torch.nn.Module):
             self._call_with_bound_args if _call is None else _call,
             hidden_states,
             inputs,
-            hidden_as_keyword=self._layer_input_hidden_as_keyword if _call is None else False,
+            hidden_as_keyword=self._layer_input_hidden_as_keyword,
         )
 
     def _call_with_bound_args(self, *args, **kwargs):

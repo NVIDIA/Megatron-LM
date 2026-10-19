@@ -9,9 +9,8 @@ from typing import Literal, TypeAlias, overload
 import torch
 from torch import Tensor, nn
 
-from megatron.core.transformer.layer_interface import LayerOutput
-
-ResidualBranchOutput: TypeAlias = LayerOutput
+# Residual arithmetic consumes projection outputs and their deferred bias only.
+ResidualBranchOutput: TypeAlias = tuple[Tensor, Tensor | None]
 ResidualConnectionState: TypeAlias = tuple[Tensor, ...]
 ResidualConnectionWriteState: TypeAlias = tuple[Tensor, ...]
 ResidualConnectionOperation: TypeAlias = Literal["read", "write"]

@@ -24,7 +24,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.layer_interface import LayerInputs
+from megatron.core.transformer.layer_interface import LayerAddends, LayerInputs
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -85,7 +85,8 @@ def make_stack(symbol, *, stack_spec=hybrid_stack_spec, **config_kwargs):
 
 def apply_output_bias(output):
     assert isinstance(output, tuple) and len(output) == 2
-    hidden_states, bias = output
+    hidden_states, addends = output
+    bias = addends.bias if isinstance(addends, LayerAddends) else addends
     assert isinstance(hidden_states, torch.Tensor)
     assert bias is None or isinstance(bias, torch.Tensor)
     return hidden_states if bias is None else hidden_states + bias
@@ -187,8 +188,8 @@ class TestLayerInputsEquivalence:
         x = torch.randn(64, 2, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
         def adapted(value):
-            output, bias = core(value, LayerInputs())
-            assert bias is None
+            output, addends = core(value, LayerInputs())
+            assert addends.bias is None
             return output
 
         assert_forward_backward(core, x, lambda value: core(core.pre_norm(value))[0], adapted)
@@ -208,8 +209,8 @@ class TestLayerInputsEquivalence:
         def run(value, shared):
             context = ResidualStreamRecomputeContext(CheckpointWithoutOutputManager(), True)
             if shared:
-                output, bias = layer(value, LayerInputs(residual_stream_recompute_context=context))
-                assert bias is None
+                output, addends = layer(value, LayerInputs(residual_stream_recompute_context=context))
+                assert addends.bias is None
             else:
                 output = layer(
                     value, attention_mask=None, residual_stream_recompute_context=context
@@ -240,8 +241,8 @@ class TestLayerInputsEquivalence:
             manager = CheckpointWithoutOutputManager()
             manager.is_last_layer_in_recompute_block = True
             if shared:
-                output, bias = layer(value, LayerInputs(mhc_recompute_manager=manager))
-                assert bias is None
+                output, addends = layer(value, LayerInputs(mhc_recompute_manager=manager))
+                assert addends.bias is None
             else:
                 output = layer(value, attention_mask=None, mhc_recompute_manager=manager)[0]
             manager.discard_all_outputs_and_register_unified_recompute(output)
@@ -265,13 +266,13 @@ class TestLayerInputsEquivalence:
                         context.enable_decode_mode()
                     sequence_offset = torch.full((2,), offset, device="cuda", dtype=torch.int32)
                     if shared:
-                        output, bias = layer(
+                        output, addends = layer(
                             x,
                             LayerInputs(
                                 inference_context=context, sequence_len_offset=sequence_offset
                             ),
                         )
-                        assert bias is None
+                        assert addends.bias is None
                     else:
                         kwargs = {"sequence_len_offset": sequence_offset} if symbol == "*" else {}
                         output = layer(x, attention_mask=None, inference_context=context, **kwargs)
@@ -319,7 +320,7 @@ def check_equivalence(symbol, test_core, *, stack_spec=hybrid_stack_spec, **conf
     def adapted(value):
         output = module(value, LayerInputs(attention_mask=mask))
         if not test_core:
-            assert output[1] is None
+            assert output[1].bias is None
         return apply_output_bias(output)
 
     assert_forward_backward(module, x, legacy, adapted)
@@ -432,8 +433,8 @@ class TestLayerInputsNVLS:
                 legacy, bias = core(x)
                 assert bias is None
                 legacy = legacy.detach().clone()
-                output, bias = core(x, LayerInputs(inference_context=context))
-                assert bias is None
+                output, addends = core(x, LayerInputs(inference_context=context))
+                assert addends.bias is None
                 assert_bit_exact(legacy, {}, output, {})
                 assert core.token_dispatcher is core._inference_token_dispatcher
                 assert core.token_dispatcher._shared_expert_output is None

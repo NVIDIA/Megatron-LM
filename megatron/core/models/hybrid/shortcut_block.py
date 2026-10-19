@@ -417,7 +417,7 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
 
         Uses the same per-layer arguments as HybridStack.forward passes to unpaired layers.
         """
-        hidden_states, bias = self.compute_layer(
+        hidden_states, addends = self.compute_layer(
             hidden_states,
             LayerInputs(
                 attention_mask=attention_mask,
@@ -428,7 +428,7 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
                 padding_mask=padding_mask,
             ),
         )
-        assert bias is None, "Shortcut blocks require complete residual layers"
+        assert addends.bias is None, "Shortcut blocks require complete residual layers"
         return hidden_states
 
     @bind_layer_inputs

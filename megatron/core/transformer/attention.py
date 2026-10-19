@@ -2159,9 +2159,10 @@ class CrossAttention(Attention):
     [s, b, h] and returns output of the same size.
     """
 
-    def layer_inputs_forward(self, hidden_states, inputs, **kwargs):
-        """Keep shared invocation unsupported while preserving ordinary cross-attention."""
-        raise NotImplementedError("CrossAttention does not support the LayerInputs call shape")
+    forward = bind_layer_inputs(
+        Attention.forward.__wrapped__,
+        aliases={"key_value_states": "context", "attention_mask": "context_mask"},
+    )
 
     def __init__(
         self,

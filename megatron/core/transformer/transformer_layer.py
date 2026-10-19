@@ -9,7 +9,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
-from megatron.core.transformer.layer_interface import bind_layer_inputs, wants_input_ids
+from megatron.core.transformer.layer_interface import LayerAddends, bind_layer_inputs, wants_input_ids
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
@@ -1115,8 +1115,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return hidden_states, context
 
+    def layer_inputs_forward(self, hidden_states, inputs, *, _call=None):
+        """Keep TE's partial-capture tensors inside its graph boundary."""
+        if _call is None:
+
+            def _call(*args, **kwargs):
+                result = self._call_with_bound_args(*args, **kwargs)
+                if not isinstance(result, tuple) or (
+                    len(result) == 2 and isinstance(result[1], LayerAddends)
+                ):
+                    return result
+                if (
+                    not self._should_call_local_cudagraph(*args, **kwargs)
+                    and self._should_call_te_cudagraph(*args, **kwargs)
+                ):
+                    context = result[-1] if kwargs.get("context") is not None else None
+                    return result[0], LayerAddends(context=context)
+                return result
+
+        return super().layer_inputs_forward(hidden_states, inputs, _call=_call)
+
     @bind_layer_inputs(
-        output=lambda result: result[0],
         exclude=("rotary_pos_cos_sin",),
         omit_none=(
             "context",
@@ -1159,7 +1178,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 output = self._forward_mlp(
                     hidden_states, kwargs.get("inference_context", None), **mlp_kwargs
                 )
-            return output, context
+            return output, LayerAddends(context=context)
 
     def _forward_pre_mlp_layernorm(
         self,
@@ -1977,7 +1996,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if self.config.delay_offload_until_cuda_graph:
             self.off_interface.flush_delayed_groups()
 
-        if kwargs.get('context') is not None:
+        if isinstance(cuda_graph_output[-1], LayerAddends):
+            context = cuda_graph_output.pop().context
+        elif kwargs.get('context') is not None:
             context = cuda_graph_output.pop()
 
         if (
@@ -2081,7 +2102,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 padding_mask=kwargs.get("padding_mask"),
                 input_ids=kwargs.get("input_ids", None),
             )
-        return output, context
+        return output, LayerAddends(context=context)
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         """Helper function to get tensor arguments for TE CUDA graph."""

@@ -226,9 +226,11 @@ class TestHybridModel:
         decoder_input = torch.ones(4, 2, self.model.config.hidden_size, requires_grad=True)
         grad_enabled = []
 
-        def capture_decoder(**kwargs):
+        def capture_decoder(hidden_states, inputs):
+            from megatron.core.transformer.layer_interface import LayerAddends
+
             grad_enabled.append(torch.is_grad_enabled())
-            return kwargs['hidden_states'] * 2
+            return hidden_states * 2, LayerAddends()
 
         monkeypatch.setattr(self.model.decoder, 'forward', capture_decoder)
         self.model.config.freeze_base_model_for_mtp = freeze_base

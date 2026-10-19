@@ -46,6 +46,7 @@ from megatron.core.transformer.hyper_connection import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
+    LayerAddends,
     LayerExecutionContext,
     LayerInputs,
     bind_layer_inputs,
@@ -122,8 +123,6 @@ class HybridStack(MegatronModule):
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers.
     """
-
-    _uses_layer_inputs = True
 
     def __init__(
         self,
@@ -539,8 +538,7 @@ class HybridStack(MegatronModule):
         if manager is not None and is_block_end:
             manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
-    # The legacy decoder can additionally return the mHC stream for MTP.
-    @bind_layer_inputs(output=lambda result: result[0] if isinstance(result, tuple) else result)
+    @bind_layer_inputs
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -761,8 +759,8 @@ class HybridStack(MegatronModule):
                             mhc_recompute_manager=mhc_manager,
                             execution_context=execution_context,
                         )
-                        hidden_states, bias = layer(hidden_states, layer_inputs)
-                        assert bias is None, "HybridStack requires complete residual layers"
+                        hidden_states, addends = layer(hidden_states, layer_inputs)
+                        assert addends.bias is None, "HybridStack requires complete residual layers"
 
                     if not is_shortcut:
                         observe_layer_residuals(layer, residual_accumulator, hidden_states)
@@ -806,7 +804,7 @@ class HybridStack(MegatronModule):
         )
 
         if mhc_multistream is not None:
-            return hidden_states, mhc_multistream
+            return hidden_states, LayerAddends(mhc_multistream=mhc_multistream)
         return hidden_states
 
     def sharded_state_dict(

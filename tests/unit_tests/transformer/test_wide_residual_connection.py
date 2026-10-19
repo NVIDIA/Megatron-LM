@@ -761,9 +761,9 @@ class TestWideResidualLayerIntegration:
         )
         hidden_states = torch.randn(2, 3, config.hidden_size, requires_grad=True)
 
-        output, context = layer(hidden_states=hidden_states, attention_mask=None)
+        output, addends = layer(hidden_states=hidden_states, attention_mask=None)
 
-        assert context is None
+        assert addends.context is None
         assert type(layer) is TransformerLayer
         assert not hasattr(layer, "residual_connection_self_attn")
         assert not hasattr(layer, "residual_connection_mlp")
@@ -848,10 +848,10 @@ class TestWideResidualLayerIntegration:
         base = torch.randn(2, 3, config.hidden_size, requires_grad=True)
         residual_stream = expand_wide_residual_stream(base, 3)
 
-        output, context = layer(hidden_states=residual_stream, attention_mask=None)
+        output, addends = layer(hidden_states=residual_stream, attention_mask=None)
 
         expected = expand_wide_residual_stream(12.0 * base + 4.0, 3)
-        assert context is None
+        assert addends.context is None
         assert output.shape[-1] == 3 * config.hidden_size
         assert torch.allclose(output, expected)
         assert layer.self_attention.last_hidden_size == config.hidden_size

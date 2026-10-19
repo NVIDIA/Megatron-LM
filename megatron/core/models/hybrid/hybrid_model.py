@@ -27,6 +27,7 @@ from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.layer_interface import LayerInputs
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -694,22 +695,21 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             else nullcontext()
         )
         with backbone_context:
-            decoder_output = self.decoder(
-                hidden_states=decoder_input,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-                input_ids=hash_input_ids,
+            hidden_states, addends = self.decoder(
+                decoder_input,
+                LayerInputs(
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                    packed_seq_params_by_layout=packed_seq_params_by_layout,
+                    cp_layout_plan=cp_layout_plan,
+                    input_ids=hash_input_ids,
+                ),
             )
-        if isinstance(decoder_output, tuple):
-            hidden_states, mhc_multistream = decoder_output
-        else:
-            hidden_states = decoder_output
-            mhc_multistream = None
+        assert addends.bias is None, "HybridModel requires a complete residual decoder"
+        mhc_multistream = addends.mhc_multistream
 
         output_weight = None
         if self.share_embeddings_and_output_weights:

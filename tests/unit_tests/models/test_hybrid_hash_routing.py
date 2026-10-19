@@ -18,6 +18,7 @@ from megatron.core.models.hybrid.hybrid_model import (
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import LayerAddends, bind_layer_inputs, wants_input_ids
 from megatron.core.transformer.moe import router as router_module
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import (
@@ -26,6 +27,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import copy_signature
 
 
 class RecordingTransformerLayer(TransformerLayer):
@@ -43,9 +45,11 @@ class RecordingTransformerLayer(TransformerLayer):
         if cuda_graph_impl == "transformer_engine":
             self.cuda_graphs = [object()]
 
+    @bind_layer_inputs(omit_none=("input_ids",), include_if={"input_ids": wants_input_ids})
+    @copy_signature(TransformerLayer.forward)
     def forward(self, hidden_states, **kwargs):
         self.calls.append(kwargs)
-        return hidden_states, None
+        return hidden_states, LayerAddends()
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
         self.used_cuda_graph = True
@@ -106,6 +110,10 @@ class RecordingNonTransformerLayer(MambaLayer):
         self.layer_number = layer_number
         self.num_calls = 0
 
+    @bind_layer_inputs(
+        exclude=("rotary_pos_emb",),
+        omit_none=("packed_sequence_cp_metadata", "residual_stream_recompute_context"),
+    )
     def forward(
         self,
         hidden_states,
@@ -125,9 +133,9 @@ class RecordingDecoder:
     def __init__(self):
         self.kwargs = None
 
-    def __call__(self, **kwargs):
-        self.kwargs = kwargs
-        return kwargs['hidden_states']
+    def __call__(self, hidden_states, inputs):
+        self.kwargs = vars(inputs)
+        return hidden_states, LayerAddends()
 
 
 class RecordingMoE(torch.nn.Module):

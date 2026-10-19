@@ -387,8 +387,8 @@ state-dict differences:
   HybridModel pattern.
 
 Custom layer classes placed in a `HybridStack` must accept
-`layer(hidden_states, LayerInputs)` and return `(hidden_states, bias)`. Complete
-residual layers return their updated hidden states with `bias=None`.
+`layer(hidden_states, LayerInputs)` and return `(hidden_states, addends)`, where
+`addends` is a `LayerAddends` object. Complete residual layers have `addends.bias=None`.
 A `MegatronModule` can keep an ordinary explicit-argument `forward` and opt into
 shared input binding:
 
@@ -408,11 +408,10 @@ The decorator prepares the field mapping once, using the forward signature.
 Callers pass `layer(hidden_states, inputs)` for every layer; layer implementations
 need neither a `forward_layer` method nor manual container unpacking. Only named
 fields are bound. A `**kwargs` parameter does not receive all container fields.
-Decorated implementations return a tensor when no deferred bias remains, or
-`(hidden_states, bias)` when returning deferred bias. The helper normalizes a
-tensor to `(hidden_states, None)`, so callers always unpack the same pair.
-Legacy calls such as `layer(hidden_states, attention_mask=mask)` still work and
-retain their original output contract. The `inputs` keyword is reserved for the
+Decorated implementations may return a tensor when no addends remain. The helper
+supplies `LayerAddends()`, so callers always unpack the same pair. Existing core
+`(hidden_states, bias)` results are normalized to `LayerAddends(bias=bias)` for
+shared calls. Explicit-argument core calls retain their tensor/bias contract. The `inputs` keyword is reserved for the
 container and cannot be mixed with legacy arguments.
 
 Layers customize shared invocation by overriding `MegatronModule.layer_inputs_forward`:
@@ -440,37 +439,46 @@ Subclasses inherit the binding when they inherit `forward`; an overridden
 `forward` should declare its own binding. Native `forward(x, inputs)` methods
 continue to work without a decorator and must return the output pair themselves.
 
-All shared calls use `LayerOutput = tuple[Tensor, Tensor | None]`. The second
-value is exclusively deferred output-projection bias, which callers can fuse
-with dropout and the residual addition. Compute cores already returning
-`(output, bias)` need no output conversion. MoE combines routed and shared expert
-contributions internally and returns `(output, None)`; auxiliary losses,
-attention context, and recurrent state never occupy the bias slot.
+All shared calls use `LayerOutput = tuple[Tensor, LayerAddends]`:
 
-Residual connections use this same pair for their `write` operation, including
-checkpointed writes. Custom branches without bias must pass `(output, None)`;
-bare tensor writes are no longer accepted.
+- `bias`: deferred output-projection bias, for dropout/residual fusion.
+- `context`: updated cross-attention state.
+- `mhc_multistream`: the pre-contraction decoder stream consumed by MTP.
+
+Only `bias` is additive. Context and the mHC stream are carried unchanged and
+must not be summed into hidden states. MoE combines its routed and shared expert
+contributions internally; auxiliary losses and recurrent caches remain internal.
+
+```python
+hidden_states, addends = layer(hidden_states, inputs)
+context = addends.context
+```
+
+Complete Transformer and mHC layers now return `LayerAddends(context=context)`
+even for explicit-argument calls; callers formerly unpacking `(output, context)`
+must read `.context`. HybridStack returns its optional MTP stream in
+`LayerAddends(mhc_multistream=...)`. Output-selection adapters are no longer needed.
+
+CrossAttention accepts shared inputs: `context` binds to `key_value_states`, and
+`context_mask` binds to `attention_mask`. Its projection bias occupies `addends.bias`.
+
+Residual `write` operations still consume the internal projection pair
+`(output, bias)`; they do not consume auxiliary state. A shared layer result can
+be passed to a residual write as `(hidden_states, addends.bias)`.
 
 `ShortcutMoEBlock` also accepts `layer(hidden_states, inputs)` and returns
-`(hidden_states, None)`. Composite layers receive per-invocation scheduling state
+`(hidden_states, LayerAddends())`. Composite layers receive per-invocation scheduling state
 through `LayerInputs.execution_context`: a `LayerExecutionContext` containing the
 quantization context factory, CP layout state, and physical-layer residual replay
 plan. HybridStack supplies this context; direct calls to shortcut blocks
 must supply it too. The block selects the contexts for both layers of its pair.
 Shortcut scheduling arguments are supplied only through this context. Its
-implementation returns a tensor; the shared helper supplies the `None` bias slot.
+implementation returns a tensor; the shared helper supplies empty addends.
 
 Stack and recompute callers pass available CP metadata in `LayerInputs` without
 inspecting layer types. Mamba's binding consumes it only in chunkwise mode.
 Split-stage layers declare `uses_packed_sequence_cp_metadata()` so shortcut
 execution applies the same policy when it bypasses the shared forward binding.
-
-Legacy complete layers returning `(hidden_states, context)` declare
-`output=lambda result: result[0]`; tensor-returning layers need no output adapter.
-The HybridStack adapter also handles its
-legacy mHC multistream result; the model's legacy decoder call retains that
-extra stream for MTP. The shared utility does not infer tuple semantics or
-perform residual arithmetic.
 
 `MoESubmodules.pre_norm` is available for core input normalization and defaults
 to `IdentityOp`; the MoE binding applies it only for shared calls.

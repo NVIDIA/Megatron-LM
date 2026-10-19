@@ -12,6 +12,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
+    LayerAddends,
     LayerInputs,
     bind_layer_inputs,
     wants_input_ids,
@@ -130,7 +131,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             )
         return super().layer_inputs_forward(hidden_states, inputs, **kwargs)
 
-    @bind_layer_inputs(output=lambda result: result[0])
+    @bind_layer_inputs
     def forward(
         self,
         hidden_states: Tensor,
@@ -143,7 +144,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
         mhc_recompute_manager=None,
         input_ids: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+    ) -> Tuple[Tensor, LayerAddends]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
         aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
@@ -162,7 +163,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         )
 
         if fast_path_result is None:
-            layer_output, bias = self.inner_layer(
+            layer_output, addends = self.inner_layer(
                 aggregated,
                 LayerInputs(
                     attention_mask=attention_mask,
@@ -175,8 +176,8 @@ class HyperConnectionHybridLayer(MegatronModule):
                     input_ids=input_ids,
                 ),
             )
-            assert bias is None, "mHC requires a complete residual layer"
-            context = None
+            assert addends.bias is None, "mHC requires a complete residual layer"
+            context = addends.context
             if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
                 aggregated = aggregated.to(layer_output.dtype)
             layer_output_with_bias = (layer_output - aggregated, None)
@@ -214,4 +215,4 @@ class HyperConnectionHybridLayer(MegatronModule):
             and hidden_states.dtype != self.config.params_dtype
         ):
             hidden_states = hidden_states.to(self.config.params_dtype)
-        return hidden_states, context
+        return hidden_states, LayerAddends(context=context)

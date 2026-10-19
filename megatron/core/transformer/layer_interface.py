@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Common invocation inputs and output/bias pairs for hybrid layers.
+"""Common invocation inputs and named auxiliary outputs for hybrid layers.
 
 Legacy forwards remain supported during migration. The private adapter dispatches
 only on the input container, never on the kind of layer or core.
@@ -13,6 +13,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from torch import Tensor
+from torch.utils._pytree import register_pytree_node
 
 from megatron.core.utils import experimental_api, internal_api
 
@@ -68,27 +69,54 @@ class LayerInputs:
     execution_context: LayerExecutionContext | None = None
 
 
-LayerOutput = tuple[Tensor, Tensor | None]
+@experimental_api
+@dataclass(frozen=True)
+class LayerAddends:
+    """Named outputs accompanying hidden states.
+
+    Only ``bias`` is an additive contribution. ``context`` carries cross-attention
+    state; ``mhc_multistream`` preserves the decoder stream consumed by MTP.
+    """
+
+    bias: Tensor | None = None
+    context: Tensor | None = None
+    mhc_multistream: Tensor | None = None
+
+
+def _flatten_layer_addends(addends):
+    """Expose only present tensors to graph and autograd tree utilities."""
+    names = tuple(field.name for field in fields(addends) if getattr(addends, field.name) is not None)
+    return [getattr(addends, name) for name in names], names
+
+
+register_pytree_node(
+    LayerAddends,
+    _flatten_layer_addends,
+    lambda values, names: LayerAddends(**dict(zip(names, values))),
+)
+
+
+LayerOutput = tuple[Tensor, LayerAddends]
 
 
 @experimental_api
 @runtime_checkable
 class LayerInterface(Protocol):
-    """A layer returns hidden states and an optional deferred output-projection bias.
+    """A layer returns hidden states and named addends.
 
     Compute cores leave output bias separate for dropout/residual fusion. Complete
-    residual layers return their updated hidden states with ``bias=None``. Shared
-    expert contributions are combined inside MoE; auxiliary losses, attention
-    context, and recurrent state are never carried in the bias slot.
+    residual layers return their updated hidden states with ``addends.bias=None``.
+    Shared expert contributions are combined inside MoE. Attention context and
+    the mHC stream have their own fields and are never treated as additive bias.
 
     Implement ``forward(x, inputs) -> LayerOutput`` directly, or decorate an
     explicit-argument forward with ``bind_layer_inputs``. Decorated forwards
-    may return a tensor when no deferred bias remains; the helper supplies the
-    ``None`` bias slot. Legacy output formats are adapted only for shared calls.
+    may return a tensor when no addends remain; the helper supplies empty addends.
+    Legacy ``(hidden_states, bias)`` core outputs are adapted only for shared calls.
     """
 
     def forward(self, x: Tensor, inputs: LayerInputs) -> LayerOutput:
-        """Return exactly ``(hidden_states, bias)`` without applying deferred bias."""
+        """Return ``(hidden_states, addends)`` without applying deferred bias."""
         ...
 
 
@@ -123,7 +151,6 @@ def bind_layer_inputs(
     legacy_forward=None,
     *,
     aliases=None,
-    output=None,
     omit_none=(),
     exclude=(),
     include_if=None,
@@ -140,12 +167,9 @@ def bind_layer_inputs(
     ``omit_none`` preserves legacy graph argument sets. ``include_if`` maps
     parameter names to predicates on the module.
     ``input_transform(module, hidden_states)`` expresses shared-call-only normalization.
-    ``output`` converts legacy results explicitly,
-    such as selecting hidden states from a ``(hidden_states, context)`` result.
-
-    Implementations may return a tensor or ``(hidden_states, bias)``. After any
-    explicit output conversion, tensor results become ``(result, None)`` and
-    pairs pass through unchanged. Callers always receive the shared output pair.
+    Implementations may return a tensor or ``(hidden_states, LayerAddends)``.
+    Tensor results receive empty addends. Existing core ``(hidden_states, bias)``
+    results receive ``LayerAddends(bias=bias)``. Named addends pass through unchanged.
 
     MegatronModule routes shared calls through its overridable
     ``layer_inputs_forward`` method, which applies the binder before hooks and
@@ -158,7 +182,6 @@ def bind_layer_inputs(
         return lambda forward: bind_layer_inputs(
             forward,
             aliases=aliases,
-            output=output,
             omit_none=omit_none,
             exclude=exclude,
             include_if=include_if,
@@ -223,9 +246,12 @@ def bind_layer_inputs(
             result = call(**bound)
         else:
             result = call(hidden_states, **bound)
-        if output is not None:
-            result = output(result)
-        return (result, None) if isinstance(result, Tensor) else result
+        if isinstance(result, Tensor):
+            return result, LayerAddends()
+        hidden_states, addends = result
+        if not isinstance(addends, LayerAddends):
+            return hidden_states, LayerAddends(bias=addends)
+        return result
 
     @wraps(legacy_forward)
     def forward(self, *args, **kwargs):

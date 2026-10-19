@@ -738,7 +738,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
                     )
                     with self.offload_context, inner_quantization_context:
-                        hidden_states, context = layer(
+                        hidden_states, addends = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             context=context,
@@ -754,6 +754,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             padding_mask=padding_mask,
                             **extra_layer_kwargs,
                         )
+                        context = addends.context
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,

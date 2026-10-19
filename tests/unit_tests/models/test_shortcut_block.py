@@ -14,7 +14,7 @@ from megatron.core.models.hybrid.shortcut_block import (
     group_layers_into_shortcut_blocks,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.layer_interface import LayerExecutionContext, LayerInputs
+from megatron.core.transformer.layer_interface import LayerAddends, LayerExecutionContext, LayerInputs
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -297,7 +297,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
 
     packed_sequence_cp_metadata = object()
     hidden_states = torch.zeros(2, 1, config.hidden_size)
-    output, bias = block(
+    output, addends = block(
         hidden_states,
         LayerInputs(
             packed_seq_params="packed-input",
@@ -309,7 +309,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
             ),
         ),
     )
-    assert bias is None
+    assert addends.bias is None
 
     assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
     assert observed == {
@@ -337,7 +337,7 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
 
     def compute_forward(hidden_states, inputs):
         observed["compute_context"] = inputs.inference_context
-        return hidden_states + 1, None
+        return hidden_states + 1, LayerAddends()
 
     def two_stage(*_args, **_kwargs):
         raise AssertionError("inference must not use the two-stage training path")
@@ -377,14 +377,14 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     hidden_states = torch.zeros(2, 1, config.hidden_size)
     InferenceMode.set_active()
     try:
-        output, bias = block(
+        output, addends = block(
             hidden_states,
             LayerInputs(
                 inference_context=inference_context,
                 execution_context=LayerExecutionContext(quant_context_factory),
             ),
         )
-        assert bias is None
+        assert addends.bias is None
     finally:
         InferenceMode.unset_active()
 
@@ -601,11 +601,11 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             monkeypatch.setattr(block, "_wait_combine", lambda combined_output: combined_output)
 
         hidden_states = torch.arange(1.0, 5.0, requires_grad=True)
-        output, bias = block(
+        output, addends = block(
             hidden_states,
             LayerInputs(execution_context=LayerExecutionContext(quant_context_factory)),
         )
-        assert bias is None
+        assert addends.bias is None
         output.sum().backward()
         gradients = {
             name: parameter.grad.detach().clone()
@@ -706,11 +706,11 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
     def quant_context_factory(*_args):
         yield
 
-    output, bias = block(
+    output, addends = block(
         hidden_states,
         LayerInputs(execution_context=LayerExecutionContext(quant_context_factory)),
     )
-    assert bias is None
+    assert addends.bias is None
     output.sum().backward()
 
     assert calls["checkpoint_input"] is hidden_states

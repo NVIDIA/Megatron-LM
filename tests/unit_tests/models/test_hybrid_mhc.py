@@ -11,6 +11,7 @@ from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConn
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.layer_interface import bind_layer_inputs
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
@@ -28,6 +29,7 @@ class _DummyHybridLayer(MegatronModule):
         self.proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.seen_hidden_shapes = []
 
+    @bind_layer_inputs
     def forward(
         self,
         hidden_states,

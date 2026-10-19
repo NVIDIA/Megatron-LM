@@ -109,42 +109,22 @@ def checkpointed_forward(
                     inner_quantization_context = nullcontext()
 
                 with inner_quantization_context:
-                    if getattr(self, "_uses_layer_inputs", False):
-                        hidden_states, bias = layer(
-                            hidden_states,
-                            LayerInputs(
-                                attention_mask=attention_mask,
-                                rotary_pos_emb=rotary_pos_emb,
-                                packed_seq_params=layer_packed_seq_params,
-                                padding_mask=padding_mask,
-                                input_ids=input_ids,
-                                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                            ),
-                        )
-                        assert bias is None, "Recompute requires complete residual layers"
-                    else:
-                        # GPT cross-attention may update context; keep its existing API.
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
+                    hidden_states, addends = layer(
+                        hidden_states,
+                        LayerInputs(
                             attention_mask=attention_mask,
                             context=context,
                             context_mask=context_mask,
                             rotary_pos_emb=rotary_pos_emb,
                             attention_bias=attention_bias,
-                            inference_context=None,
                             packed_seq_params=layer_packed_seq_params,
                             padding_mask=padding_mask,
-                            **(
-                                {"input_ids": input_ids}
-                                if input_ids is not None
-                                and getattr(
-                                    getattr(getattr(layer, "mlp", None), "router", None),
-                                    "is_hash_layer",
-                                    False,
-                                )
-                                else {}
-                            ),
-                        )
+                            input_ids=input_ids,
+                            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                        ),
+                    )
+                    assert addends.bias is None, "Recompute requires complete residual layers"
+                    context = addends.context
 
                 observe_layer_residuals(layer, residual_accumulator, hidden_states)
                 if cp_layout_state is not None:

@@ -170,11 +170,11 @@ class TestParallelTransformerLayer:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        output, context = parallel_transformer_layer(
+        output, addends = parallel_transformer_layer(
             hidden_states=hidden_states, attention_mask=attention_mask
         )
         assert not parallel_transformer_layer.supports_two_stage_attention()
-        assert context is None
+        assert addends.context is None
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
@@ -219,7 +219,7 @@ class TestParallelTransformerLayer:
             with InferenceMode.active():
                 for mlp_chunks_for_prefill in [1, 4]:
                     transformer_config.mlp_chunks_for_prefill = mlp_chunks_for_prefill
-                    hidden_states, context = parallel_transformer_layer(
+                    hidden_states, addends = parallel_transformer_layer(
                         hidden_states=input_hidden_states,
                         attention_mask=attention_mask,
                         inference_context=inference_context,
@@ -227,7 +227,7 @@ class TestParallelTransformerLayer:
                     assert hidden_states.shape[0] == sequence_length
                     assert hidden_states.shape[1] == micro_batch_size
                     assert hidden_states.shape[2] == hidden_size
-                    outputs[mlp_chunks_for_prefill] = (hidden_states, context)
+                    outputs[mlp_chunks_for_prefill] = (hidden_states, addends)
 
             assert torch.equal(outputs[1][0], outputs[4][0])
 
@@ -236,7 +236,7 @@ class TestParallelTransformerLayer:
             outputs = {}
             for mlp_chunks_for_training in [1, 4]:
                 transformer_config.mlp_chunks_for_training = mlp_chunks_for_training
-                hidden_states, context = parallel_transformer_layer(
+                hidden_states, addends = parallel_transformer_layer(
                     hidden_states=input_hidden_states,
                     attention_mask=attention_mask,
                     inference_context=None,
@@ -244,7 +244,7 @@ class TestParallelTransformerLayer:
                 assert hidden_states.shape[0] == sequence_length
                 assert hidden_states.shape[1] == micro_batch_size
                 assert hidden_states.shape[2] == hidden_size
-                outputs[mlp_chunks_for_training] = (hidden_states, context)
+                outputs[mlp_chunks_for_training] = (hidden_states, addends)
 
             assert torch.equal(outputs[1][0], outputs[4][0])
 
@@ -660,7 +660,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
 
         # Forward pass with recompute manager
         manager.is_last_layer_in_recompute_block = True
-        output, context = layer(
+        output, addends = layer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             mhc_recompute_manager=manager,
@@ -707,7 +707,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
 
         # Forward pass - NOT the last layer in block
         manager.is_last_layer_in_recompute_block = False
-        output, context = layer(
+        output, addends = layer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             mhc_recompute_manager=manager,
@@ -1319,7 +1319,7 @@ class TestMHCWithCudaGraph:
         mgr = CheckpointWithoutOutputManager()
         mgr.is_last_layer_in_recompute_block = True
 
-        output, context = layer(
+        output, addends = layer(
             hidden_states=hidden_states, attention_mask=attention_mask, mhc_recompute_manager=mgr
         )
 
@@ -1339,7 +1339,7 @@ class TestMHCWithCudaGraph:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        output, context = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        output, addends = layer(hidden_states=hidden_states, attention_mask=attention_mask)
 
         assert output.shape == (seq_len, batch_size, n_channels)
 
@@ -1404,7 +1404,7 @@ class TestMHCWithOffloading:
             pp_rank=0, vp_size=1, vp_stage=0, min_offloaded_tensor_size=0
         )
 
-        output, context = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        output, addends = layer(hidden_states=hidden_states, attention_mask=attention_mask)
 
         assert output.shape == (
             seq_len,
