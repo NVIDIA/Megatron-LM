@@ -90,7 +90,7 @@ def count_parameters_in_layer(model, layer_name):
 
 def _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collection):
     """Build one model stage with the stock builder for the ModelOpt config, running its pre-wrap hooks."""
-    model_config = modelopt_model_config_from_args(args)
+    model_config = modelopt_model_config_from_args(args, model_type="hybrid")
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     builder = model_config.get_builder_cls()(model_config)

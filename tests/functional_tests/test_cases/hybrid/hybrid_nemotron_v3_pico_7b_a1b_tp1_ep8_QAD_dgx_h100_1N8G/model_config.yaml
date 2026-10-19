@@ -50,7 +50,6 @@ BEFORE_SCRIPT: |
     --init-method-std 0.0256 \
     --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME \
     --mamba-num-heads 64 \
-    --export-model-type MambaModel \
     --num-experts 128 \
     --moe-router-topk 6 \
     --moe-aux-loss-coeff 1e-4 \
@@ -105,7 +104,6 @@ MODEL_ARGS:
   --init-method-std: 0.0256
   --hybrid-layer-pattern: MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME
   --mamba-num-heads: 64
-  --export-model-type: MambaModel
   # MoE
   --num-experts: 128
   --moe-router-topk: 6

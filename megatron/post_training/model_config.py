@@ -11,7 +11,9 @@ import dataclasses
 import functools
 import logging
 import os
+import warnings
 from argparse import Namespace
+from typing import Literal
 
 import yaml
 
@@ -28,6 +30,7 @@ from megatron.training.models.distillation import DistillationConfig
 from megatron.training.models.gpt import GPTModelConfig
 from megatron.training.models.hybrid import HybridModelConfig
 from megatron.training.models.transforms import ModelTransformConfig
+from megatron.training.utils import is_hybrid_model
 
 logger = logging.getLogger(__name__)
 
@@ -151,16 +154,51 @@ def modelopt_gpt_layer_spec(
     )
 
 
+# Values of the deprecated ``--export-model-type`` flag.
+_EXPORT_MODEL_TYPES = {"GPTModel": "gpt", "HybridModel": "hybrid", "MambaModel": "hybrid"}
+
+
+def _resolve_model_type(
+    args: Namespace, model_type: Literal["gpt", "hybrid"] | None
+) -> Literal["gpt", "hybrid"]:
+    """Choose GPT or Hybrid: the caller's ``model_type``, else ``--hybrid-layer-pattern``.
+
+    The deprecated ``--export-model-type`` is still honored (e.g. for a pure-Mamba model without a
+    layer pattern), but must not contradict the entry point or the layer pattern.
+    """
+    flag = getattr(args, "export_model_type", None)
+    if flag is None:
+        if model_type is not None:
+            return model_type
+        return "hybrid" if is_hybrid_model(args) else "gpt"
+
+    warnings.warn(
+        "--export-model-type is deprecated: the model type now comes from the entry point "
+        "(pretrain_gpt.py / pretrain_hybrid.py) or from --hybrid-layer-pattern.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    flag_type = _EXPORT_MODEL_TYPES[flag]
+    if model_type is not None and flag_type != model_type:
+        raise ValueError(f"--export-model-type {flag} conflicts with this {model_type} entry point.")
+    if flag_type == "gpt" and is_hybrid_model(args):
+        raise ValueError(f"--export-model-type {flag} conflicts with --hybrid-layer-pattern.")
+    return flag_type
+
+
 def modelopt_model_config_from_args(
     args: Namespace,
     *,
+    model_type: Literal["gpt", "hybrid"] | None = None,
     disable_moe_grouped_gemm: bool = False,
     vocab_size_from_tokenizer: bool = True,
 ) -> GPTModelConfig | HybridModelConfig:
-    """Build the GPT or Hybrid model config (dispatching on ``--export-model-type``) for ModelOpt.
+    """Build the GPT or Hybrid model config for ModelOpt.
 
     Args:
         args: The parsed arguments, including those from ``add_modelopt_args``.
+        model_type: ``"gpt"`` or ``"hybrid"``, for entry points that build one kind of model.
+            If ``None``, a model is hybrid iff ``--hybrid-layer-pattern`` is set.
         disable_moe_grouped_gemm: Force the export spec to use SequentialMLP (per-expert
             linears) instead of the default TEGroupedMLP. Pruning sets this so
             ``mtp.prune`` can operate on individual expert linears; quantize / generate /
@@ -174,6 +212,7 @@ def modelopt_model_config_from_args(
     """
     if args.spec is not None:
         raise ValueError("ModelOpt integration does not support custom args.spec.")
+    model_type = _resolve_model_type(args, model_type)
     if args.pipeline_model_parallel_size > 1 and args.virtual_pipeline_model_parallel_size is not None:
         raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
 
@@ -199,7 +238,7 @@ def modelopt_model_config_from_args(
     transformer_config.qk_l2_norm = args.export_qk_l2_norm
     transformer_config.moe_apply_probs_on_input = args.export_moe_apply_probs_on_input
 
-    if args.export_model_type == "GPTModel":
+    if model_type == "gpt":
         if args.export_offline_model:
             # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
             transformer_config.original_num_layers = transformer_config.num_layers
@@ -221,20 +260,7 @@ def modelopt_model_config_from_args(
             real_quant_cfg=args.export_real_quant_cfg,
             disable_moe_grouped_gemm=disable_moe_grouped_gemm,
         )
-    elif (
-        args.export_model_type in ("HybridModel", "MambaModel")
-        or getattr(args, "hybrid_layer_pattern", None) is not None
-    ):
-        if args.export_model_type == "MambaModel":
-            import warnings
-
-            warnings.warn(
-                '--export-model-type "MambaModel" is deprecated. '
-                'Use --export-model-type "HybridModel" instead.',
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
+    else:
         if args.export_default_te_spec and args.export_te_mcore_model:
             logger.warning(
                 "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
@@ -254,8 +280,6 @@ def modelopt_model_config_from_args(
             use_default_te_spec=args.export_default_te_spec,
             moe_grouped_gemm=not disable_moe_grouped_gemm,
         )
-    else:
-        raise ValueError("ModelOpt does not support model type {}".format(args.export_model_type))
 
     model_config.distillation = distillation_config_from_args(args)
 

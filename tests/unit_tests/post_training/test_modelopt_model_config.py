@@ -93,9 +93,7 @@ class TestModelOptModelConfigFromArgs:
         assert get_spec.call_args.args[1] is False  # moe_grouped_gemm
 
     def test_hybrid_sets_stack_spec(self):
-        args = _make_args(
-            export_model_type="HybridModel", hybrid_layer_pattern="M*-", export_te_mcore_model=True
-        )
+        args = _make_args(hybrid_layer_pattern="M*-", export_te_mcore_model=True)
         stack_spec = ModuleSpec(module=object)
 
         with patch.object(
@@ -161,7 +159,6 @@ class TestModelOptModelConfigFromArgs:
             lsq_scale_lr=1e-3,
             export_te_mcore_model=True,
             export_kd_teacher_load="/ckpt/teacher",
-            export_model_type="HybridModel" if builder_cls is HybridModelBuilder else "GPTModel",
             hybrid_layer_pattern="M*" if builder_cls is HybridModelBuilder else None,
         )
         args.load = "/ckpt/student"
@@ -227,6 +224,50 @@ class TestModelOptModelConfigFromArgs:
         assert build.call_args.kwargs["device"] == device
         assert build.call_args.kwargs["checkpoint"] is cfg.checkpoint
         assert build.call_args.kwargs["wrap_with_ddp"] is False
+
+
+class TestResolveModelType:
+    @pytest.mark.parametrize(
+        "pattern,model_type,expected",
+        [
+            (None, None, "gpt"),
+            ("M*-", None, "hybrid"),
+            (None, "hybrid", "hybrid"),  # entry point wins, e.g. pure Mamba without a pattern
+            ("M*-", "gpt", "gpt"),
+        ],
+    )
+    def test_entry_point_else_layer_pattern(self, pattern, model_type, expected):
+        args = _make_args(hybrid_layer_pattern=pattern)
+        assert mc._resolve_model_type(args, model_type) == expected
+
+    @pytest.mark.parametrize(
+        "flag,pattern,expected",
+        [
+            ("GPTModel", None, "gpt"),
+            ("HybridModel", "M*-", "hybrid"),
+            ("MambaModel", None, "hybrid"),  # hybrid without a layer pattern
+        ],
+    )
+    def test_deprecated_flag_is_honored(self, flag, pattern, expected):
+        args = _make_args(export_model_type=flag, hybrid_layer_pattern=pattern)
+        with pytest.warns(DeprecationWarning, match="--export-model-type is deprecated"):
+            assert mc._resolve_model_type(args, None) == expected
+
+    def test_deprecated_flag_conflicting_with_pattern_raises(self):
+        args = _make_args(export_model_type="GPTModel", hybrid_layer_pattern="M*-")
+        with pytest.warns(DeprecationWarning), pytest.raises(ValueError, match="layer-pattern"):
+            mc._resolve_model_type(args, None)
+
+    def test_deprecated_flag_conflicting_with_entry_point_raises(self):
+        args = _make_args(export_model_type="GPTModel")
+        with pytest.warns(DeprecationWarning), pytest.raises(ValueError, match="entry point"):
+            mc._resolve_model_type(args, "hybrid")
+
+    def test_entry_point_type_selects_config(self):
+        args = _make_args()
+        with patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None):
+            config = mc.modelopt_model_config_from_args(args, model_type="hybrid")
+        assert isinstance(config, HybridModelConfig)
 
 
 class TestLoadTeacherModelConfig:

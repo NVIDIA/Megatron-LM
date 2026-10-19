@@ -22,7 +22,6 @@ from tests.unit_tests.post_training.test_modelopt_model_config import _make_args
 @pytest.mark.parametrize("kd", [False, True])
 def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
     args = _make_args(
-        export_model_type="HybridModel" if hybrid else "GPTModel",
         hybrid_layer_pattern="M*" if hybrid else None,
         export_kd_teacher_load=str(tmp_path) if kd else None,
     )

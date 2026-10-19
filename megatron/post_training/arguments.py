@@ -9,10 +9,11 @@ def add_modelopt_args(parser):
     group.add_argument(
         "--export-model-type",
         type=str,
-        default="GPTModel",
+        default=None,
         choices=["GPTModel", "HybridModel", "MambaModel"],
-        help='Model type to use in model_provider. Use "HybridModel" for hybrid models '
-        '(formerly MambaModel). "MambaModel" is accepted for backward compatibility but deprecated.',
+        help="Deprecated. The model type comes from the entry point (pretrain_gpt.py / "
+        "pretrain_hybrid.py) or, for the post-training scripts, from --hybrid-layer-pattern "
+        "(hybrid iff set). Only needed for a hybrid model without a layer pattern.",
     )
     group.add_argument(
         "--export-legacy-megatron",
