@@ -30,7 +30,12 @@ from megatron.core.transformer.moe.batch_invariant import unpermute as batch_inv
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecated, internal_api, is_te_min_version
+from megatron.core.utils import (
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+    deprecated,
+    internal_api,
+    is_te_min_version,
+)
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -1521,9 +1526,9 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     Returns:
         int: The alignment size for quantization.
     """
-    # TE's grouped-tensor and fused grouped-MLP kernels require 256-token alignment.
+    # TE's grouped-tensor and fused grouped-MLP kernels share an expert-token alignment.
     if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
-        return 256
+        return TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
     if config.fp4:

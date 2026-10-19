@@ -58,7 +58,7 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT, is_te_min_version
 
 if HAVE_TE:
     import transformer_engine as te
@@ -383,13 +383,15 @@ class TEGroupedMLP(MegatronModule):
             and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
             and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
         )
-        # Routed expert inputs are padded to 256 by get_align_size_for_quantization.
+        # Routed expert inputs use the same alignment via get_align_size_for_quantization.
         # Probe once here to keep signature inspection out of the first forward pass.
         # Older TE versions select fusion through the legacy environment variable instead.
         self._grouped_linear_kwargs = {}
         if self._with_fused_impl:
             if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
-                self._grouped_linear_kwargs["split_alignment"] = 256
+                self._grouped_linear_kwargs["split_alignment"] = (
+                    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
+                )
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
             self.config.gated_linear_unit
@@ -884,8 +886,8 @@ class TEGroupedMLP(MegatronModule):
             pass
         # Regular AllToAll normally reaches this branch because its permutation does not insert
         # the padding needed by the fused grouped-MLP contract. FP8/FP4 require recipe-specific
-        # alignment, while the TE operation-fuser grouped-tensor path currently uses 256-token
-        # expert segments.
+        # alignment, while the TE operation-fuser grouped-tensor path requires expert segments
+        # aligned to TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT.
         elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
@@ -914,8 +916,6 @@ class TEGroupedMLP(MegatronModule):
                 "The Transformer Engine operation-fuser MoE path requires "
                 "moe_use_grouped_tensor=True."
             )
-        # if the number of tokens is 0, pad the hidden states to 256
-
         if self.config.moe_paged_stash:
             permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
             max_num_tokens = permuted_local_hidden_states.shape[0]

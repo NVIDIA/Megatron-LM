@@ -56,6 +56,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Token alignment required by TE's grouped-tensor and fused grouped-MLP kernels.
+TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT = 256
+
 try:
     # Register the TE CUDA kernels
     import transformer_engine  # pylint: disable=unused-import

@@ -38,6 +38,7 @@ from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
     _validate_dsa_kernel_backend_dependencies,
     get_te_version,
     init_method_normal,
@@ -4068,7 +4069,8 @@ class TransformerConfig(ModelParallelConfig):
                         ), (
                             "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
                             "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
-                            "padding uses the required 256-row alignment."
+                            "padding uses the required "
+                            f"{TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}-row alignment."
                         )
                 mxfp8_params_enabled = (
                     bool(self.fp8)

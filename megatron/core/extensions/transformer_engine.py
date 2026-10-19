@@ -61,6 +61,7 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import (
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
     get_pg_rank,
     get_pg_size,
     get_te_version,
@@ -3471,7 +3472,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 )
             self._grouped_linear_kwargs = {}
             if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
-                self._grouped_linear_kwargs["split_alignment"] = 256
+                self._grouped_linear_kwargs["split_alignment"] = (
+                    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
+                )
 
         def _reset_fused_impl(self) -> None:
             """Discard both cached execution views."""
@@ -3622,10 +3625,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             hidden_size = hidden_states.size(-1)
             hidden_states_2d = hidden_states.view(-1, hidden_size)
             total_tokens = hidden_states_2d.size(0)
-            if total_tokens % 256 != 0:
+            if total_tokens % TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT != 0:
                 raise ValueError(
                     f"{self.__class__.__name__} requires the flattened token count to be "
-                    f"divisible by 256 for grouped MLP fusion, but got {total_tokens}. "
+                    f"divisible by {TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT} for grouped MLP "
+                    f"fusion, but got {total_tokens}. "
                     "Inputs must already be aligned; this module does not pad them."
                 )
 

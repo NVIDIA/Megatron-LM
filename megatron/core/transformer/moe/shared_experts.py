@@ -27,6 +27,7 @@ from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
     get_pg_size,
     is_te_min_version,
     is_torch_min_version,
@@ -418,7 +419,7 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         # Cache API support here to keep signature inspection out of forward.
         self._grouped_linear_kwargs = {}
         if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
-            self._grouped_linear_kwargs["split_alignment"] = 256
+            self._grouped_linear_kwargs["split_alignment"] = TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
 
     def _validate_fused_grouped_swiglu(self) -> None:
         """Validate the requested GroupedLinear(num_groups=1) SwiGLU path."""
@@ -566,11 +567,12 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         hidden_size = hidden_states.size(-1)
         hidden_states_2d = hidden_states.view(-1, hidden_size)
         total_tokens = hidden_states_2d.size(0)
-        if total_tokens % 256 != 0:
+        if total_tokens % TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT != 0:
             raise ValueError(
                 f"{self.__class__.__name__} requires the token count after tensor-parallel "
-                f"communication to be divisible by 256, but got {total_tokens}. "
-                "split_alignment=256 does not pad the input."
+                f"communication to be divisible by {TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}, "
+                f"but got {total_tokens}. "
+                f"split_alignment={TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT} does not pad the input."
             )
         tokens_key = (hidden_states.device, total_tokens)
         tokens_per_expert = self._fused_grouped_swiglu_tokens_per_expert.get(tokens_key)
