@@ -689,9 +689,11 @@ def test_fused_wgrad_with_delayed_weight_gradient(distributed_setup):
         )
 
     fused, copied = make_layer(True), make_layer(False)
-    with fully_shard_context(device=device):
+    # backward_dw() runs after autograd's end-of-backward callback, so the caller orders the
+    # current stream after the reductions with finish_grad_sync().
+    with fully_shard_context(device=device, caller_managed_grad_sync=True):
         fully_shard(fused, mesh=mesh, placements=_default_placements())
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, caller_managed_grad_sync=True):
         fully_shard(copied, mesh=mesh, placements=_default_placements())
 
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -701,9 +703,7 @@ def test_fused_wgrad_with_delayed_weight_gradient(distributed_setup):
         assert layer.phase is FsdpModule.Phase.BACKWARD
         layer.backward_dw()
         assert layer.phase is FsdpModule.Phase.RESTING
-    # The end-of-backward callback ran before backward_dw(), so nothing has ordered the current
-    # stream after these reductions yet.
-    torch.cuda.synchronize(device)
+        layer.context.finish_grad_sync()
     torch.testing.assert_close(fused.weight.grad.full_tensor(), copied.weight.grad.full_tensor())
 
 
