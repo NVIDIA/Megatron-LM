@@ -84,6 +84,8 @@ class _BF16Linear(torch.autograd.Function):
         compute = weight.bfloat16()
         ctx.save_for_backward(x, compute)
         ctx.weight_dtype = weight.dtype
+        if not x.reshape(-1, x.shape[-1]).shape[0]:
+            return x.new_empty((*x.shape[:-1], weight.shape[0]), dtype=torch.float32)
         out = bf16_fixed_mm(x.reshape(-1, x.shape[-1]).bfloat16(), compute)
         return out.reshape(*x.shape[:-1], weight.shape[0])
 
@@ -107,3 +109,20 @@ def linear(x, weight, *, fp8, activation=None):
     if activation is not None:
         raise ValueError("BF16 linear cannot consume MXFP8 prequant")
     return _BF16Linear.apply(x, weight)
+
+
+# Inherit Core's allocation/parameter metadata; replace only its local TP1 GEMM.
+from megatron.core.extensions.transformer_engine import TELinear
+
+
+class BF16Linear(TELinear):
+    fp8 = False
+
+    def forward(self, x, weight=None, **kwargs):
+        if self.bias is not None:
+            raise ValueError('DS4.1 BI projections do not support bias')
+        return linear(x, self.weight if weight is None else weight, fp8=self.fp8), None
+
+
+class MXFP8Linear(BF16Linear):
+    fp8 = True

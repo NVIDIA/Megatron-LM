@@ -32,3 +32,11 @@ class _RMSNorm(torch.autograd.Function):
 
 def rms_norm(x, weight, eps):
     return _RMSNorm.apply(x, weight, eps)
+
+
+class ModelNorm(torch.nn.RMSNorm):
+    def __init__(self, config, hidden_size, eps, **kwargs):
+        super().__init__(hidden_size, eps=eps, dtype=config.params_dtype)
+
+    def forward(self, x):
+        return rms_norm(x, self.weight, self.eps)

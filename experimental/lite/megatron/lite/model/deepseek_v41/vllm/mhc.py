@@ -135,3 +135,61 @@ def joint(values, previous_pre, gamma, mixes, *, pending=None, broadcast=False):
         *operands,
         options,
     )
+
+
+class _Post(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, output, residual, post, comb):
+        if not residual.is_cuda:
+            raise RuntimeError("Deployment mHC post requires CUDA")
+        from vllm.model_executor.kernels.mhc.tilelang import mhc_post_tilelang
+
+        ctx.save_for_backward(output, residual, post, comb)
+        copies, width = residual.shape[-2:]
+        return mhc_post_tilelang(
+            output.reshape(-1, width).contiguous(),
+            residual.reshape(-1, copies, width).contiguous(),
+            post.reshape(-1, copies, 1).contiguous(),
+            comb.reshape(-1, copies, copies).contiguous(),
+        ).reshape_as(residual)
+
+    @staticmethod
+    def backward(ctx, grad):
+        output, residual, post, comb = ctx.saved_tensors
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            g = grad.float()
+            dy = (g * post.float().unsqueeze(-1)).sum(-2)
+            dh = torch.einsum("...ij,...jd->...id", comb.float(), g)
+            dp = (g * output.float().unsqueeze(-2)).sum(-1)
+            dc = torch.einsum("...id,...jd->...ij", residual.float(), g)
+        return dy.to(output.dtype), dh.to(residual.dtype), dp.to(post.dtype), dc.to(comb.dtype)
+
+
+def post_mix(output, residual, post, comb):
+    return _Post.apply(output, residual, post, comb)
+
+
+class _Collapse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, values, pre):
+        if not values.is_cuda:
+            raise RuntimeError("Deployment mHC collapse requires CUDA")
+        from vllm.model_executor.kernels.batch_invariant import hc_collapse
+
+        ctx.save_for_backward(values, pre)
+        copies, width = values.shape[-2:]
+        return hc_collapse(
+            values.reshape(-1, copies, width).contiguous(), pre.reshape(-1, copies).contiguous()
+        ).reshape(*values.shape[:-2], width)
+
+    @staticmethod
+    def backward(ctx, grad):
+        values, pre = ctx.saved_tensors
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            g = grad.float().unsqueeze(-2)
+            dh, dp = g * pre.float().unsqueeze(-1), (g * values.float()).sum(-1)
+        return dh.to(values.dtype), dp.to(pre.dtype)
+
+
+def collapse(values, pre):
+    return _Collapse.apply(values, pre)
