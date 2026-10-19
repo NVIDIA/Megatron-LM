@@ -24,6 +24,7 @@ class ImplConfig:
     dtype: torch.dtype = torch.bfloat16
     hf_path: str = ""
     initialize_weights: bool = True
+    prefetch_weights: bool = True
     token_map: object = None
     trainable_engram: bool = False
     shard_engram: bool = True
@@ -151,7 +152,19 @@ def build_model(model_cfg, *, impl_cfg):
         path = Path(impl_cfg.hf_path) / "token_map.pt"
         if path.is_file():
             token_map = torch.load(path, map_location="cpu", weights_only=True)
-    chunks = [DeepseekV41Model(model_cfg, impl_cfg, ps, token_map=token_map)]
+    reader = None
+    if impl_cfg.prefetch_weights and not impl_cfg.initialize_weights and impl_cfg.hf_path:
+        from megatron.lite.primitive.ckpt.row_reader import RowSliceReader
+
+        reader = RowSliceReader(impl_cfg.hf_path, device=impl_cfg.device)
+    try:
+        chunks = [
+            DeepseekV41Model(model_cfg, impl_cfg, ps, token_map=token_map, load_reader=reader)
+        ]
+    except BaseException:
+        if reader is not None:
+            reader.close()
+        raise
     chunks[0].ds41_module_inventory = chunks[0].module_inventory()
     optimizer, finalize = (None, None)
     if impl_cfg.optimizer is not None:

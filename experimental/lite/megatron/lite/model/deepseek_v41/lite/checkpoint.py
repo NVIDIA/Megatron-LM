@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Strict release-to-Core mapping; quantized storage is dequantized to BF16."""
 import re
+from pathlib import Path
 
 import torch
 
@@ -90,7 +91,7 @@ def _read(reader, key, shape):
     return value
 
 
-def _experts(reader, name, tensor, cfg, ps):
+def _expert_sources(name, cfg, ps):
     match = re.fullmatch(
         r"layers\.(\d+)\.ffn\.(experts|shared_experts)\.linear_fc([12])\.weight(\d*)", name
     )
@@ -105,10 +106,44 @@ def _experts(reader, name, tensor, cfg, ps):
         prefix += f"experts.{expert}."
     else:
         prefix += "shared_experts."
-    if fc == "1":
-        shape = (tensor.shape[0] // 2, tensor.shape[1])
-        return torch.cat([_read(reader, prefix + p + ".weight", shape) for p in ("w1", "w3")])
-    return _read(reader, prefix + "w2.weight", tensor.shape)
+    return [prefix + part + ".weight" for part in (("w1", "w3") if fc == "1" else ("w2",))]
+
+
+def _experts(reader, name, tensor, cfg, ps):
+    keys = _expert_sources(name, cfg, ps)
+    if keys is None:
+        return None
+    if len(keys) == 1:
+        return _read(reader, keys[0], tensor.shape)
+    shape = (tensor.shape[0] // 2, tensor.shape[1])
+    return torch.cat([_read(reader, key, shape) for key in keys])
+
+
+def prefetch_engram(reader, table, layer):
+    """Fill final native host buffers while subsequent layers/TE modules build."""
+    start = table.embedding.lookup.boundaries[table.group.rank()]
+    stop = min(start + table.embedding.weight.shape[0], table.rows)
+    reader.prefetch_row_copies(
+        [
+            (f"layers.{layer}.engram.embed.{kind}", start, stop, getattr(table.embedding, kind))
+            for kind in ("weight", "scale")
+        ]
+    )
+
+
+def _prefetch_keys(state, cfg, ps):
+    for name, _ in state:
+        if name.endswith(".ape"):
+            continue
+        keys = _expert_sources(name, cfg, ps)
+        if keys is not None:
+            yield from keys
+        elif name.startswith("engrams."):
+            _, layer, suffix = name.split(".", 2)
+            if not suffix.startswith("embed.embedding."):
+                yield f"layers.{layer}.engram.{suffix}"
+        else:
+            yield source_name(name)
 
 
 def _engram(reader, name, tensor, model):
@@ -133,8 +168,9 @@ def _engram(reader, name, tensor, model):
         expected = torch.float8_e4m3fn if kind == "weight" else torch.float8_e8m0fnu
         if raw.dtype != expected or tensor.dtype != expected or raw.shape[1] != tensor.shape[1]:
             raise ValueError("Engram release storage must retain FP8 weight and E8M0/32 scales")
-        tensor.zero_()
-        tensor[: stop - start].copy_(raw)
+        if raw is not tensor:
+            tensor[stop - start :].zero_()
+            tensor[: stop - start].copy_(raw)
         return tensor
     key = {"wkv.weight": "wkv.weight", "q_weight": "q_weight", "k_weight": "k_weight"}.get(suffix)
     if key is None:
@@ -197,8 +233,15 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
         or n.endswith("tid2eid")
     ]
     loaded = []
-    with RowSliceReader(hf_path, device=next(model.parameters()).device) as reader:
+    reader = getattr(model, "_load_reader", None)
+    model._load_reader = None
+    if reader is not None and reader.path.resolve() != Path(hf_path).resolve():
+        reader.close()
+        raise ValueError("Prefetch source differs from the requested release directory")
+    with reader or RowSliceReader(hf_path, device=next(model.parameters()).device) as reader:
         read = _record_reads(reader)
+        if getattr(getattr(model, "impl", None), "prefetch_weights", False):
+            reader.prefetch_tensors(_prefetch_keys(state, model_cfg, ps))
         for name, tensor in state:
             if name.endswith(".ape"):
                 if torch.count_nonzero(tensor):

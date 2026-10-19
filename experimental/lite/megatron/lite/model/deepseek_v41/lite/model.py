@@ -55,7 +55,7 @@ class CoreAttentionSources(DS41AttentionSources):
 
 
 class DeepseekV41Model(MegatronModule):
-    def __init__(self, release, impl, ps, *, token_map):
+    def __init__(self, release, impl, ps, *, token_map, load_reader=None):
         config = core_config(
             release,
             impl.parallel,
@@ -66,6 +66,7 @@ class DeepseekV41Model(MegatronModule):
         config.persist_layer_norm = False
         super().__init__(config=config)
         self.release, self.impl, self.ps = release, impl, ps
+        self._load_reader = load_reader
         self.parallel_state = ps
         self.tp_group = ps.tp_group
         self.source_state = KVSourceState()
@@ -129,6 +130,10 @@ class DeepseekV41Model(MegatronModule):
                 self.engrams[str(index)] = DS41Engram(
                     release, config, index, table_group, frozen=not impl.trainable_engram
                 )
+                if load_reader is not None:
+                    from megatron.lite.model.deepseek_v41.lite.checkpoint import prefetch_engram
+
+                    prefetch_engram(load_reader, self.engrams[str(index)].embed, index)
         if self.engrams:
             self.hash = NgramHash(
                 token_map,
