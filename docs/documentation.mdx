@@ -1,0 +1,144 @@
+---
+title: Build and Preview the Documentation with Fern
+description: Describes how to install the Fern CLI, preview and validate the documentation locally, manage documentation versions, and publish the site.
+---
+
+{/*
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+*/}
+
+[Fern](https://buildwithfern.com/) builds the Megatron Core documentation. The pages are MDX files under `docs/`, and the Fern configuration is in `docs/fern/`:
+
+- `docs/fern/fern.config.json` pins the Fern CLI version and names the `nvidia` Fern organization.
+- `docs/fern/docs.yml` defines the site settings and the version switcher.
+- `docs/fern/versions/nightly.yml` and `docs/fern/versions/v0.20.0.yml` define the navigation for each documentation version.
+
+## Prerequisites
+
+Before you start, you must complete the following prerequisites:
+
+1. Install Node.js 20, which is the version that the documentation CI workflows use.
+2. Clone the Megatron-LM repository.
+
+## Install the Fern CLI
+
+To install the Fern CLI, complete the following steps:
+
+1. Change to the Fern configuration directory:
+
+   ```bash
+   cd docs/fern
+   ```
+
+2. Install the Fern CLI version that `fern.config.json` pins:
+
+   ```bash
+   npm install -g "fern-api@$(jq -r .version fern.config.json)"
+   ```
+
+   If `jq` is not installed, install the version listed in `fern.config.json` directly, for example `npm install -g fern-api@5.157.6`.
+
+## Preview the Documentation Locally
+
+To preview the documentation locally, complete the following steps:
+
+1. From the `docs/fern` directory, start the development server:
+
+   ```bash
+   fern docs dev
+   ```
+
+2. Open the local URL that the command prints in a web browser.
+   The preview updates as you save changes to the MDX files.
+3. Optional: Run the server on a different port with the `--port` option:
+
+   ```bash
+   fern docs dev --port 3001
+   ```
+
+## Validate the Documentation
+
+To validate the documentation, complete the following steps:
+
+1. From the `docs/fern` directory, run the Fern check:
+
+   ```bash
+   fern check
+   ```
+
+   The command reports errors in `docs.yml`, in the version files, and in the pages they reference.
+2. Optional: Print warnings in addition to errors with the `--warnings` option.
+   Without a Fern login, one warning reports that the missing-redirects check was skipped.
+3. Optional: Check for broken links by starting the preview with the `--broken-links` option:
+
+   ```bash
+   fern docs dev --broken-links
+   ```
+
+The **Fern docs (check)** workflow runs `fern check` on every pull request that changes files under `docs/`.
+
+## Add a Page
+
+To add a page, complete the following steps:
+
+1. Create an MDX file under `docs/` that starts with `title` and `description` frontmatter:
+
+   ```mdx
+   ---
+   title: Page Title
+   description: One sentence that describes the page.
+   ---
+   ```
+
+   Do not add a `#` heading to the page body. Fern renders `title` as the page heading.
+2. Add the page to the navigation in `docs/fern/versions/nightly.yml`:
+
+   ```yaml
+   - page: Page Title
+     path: ../../<section>/<file-name>.mdx
+     slug: <file-name>
+   ```
+
+   Paths in the version files are relative to `docs/fern/versions/`. To include the page in a released version, also add it to that version's file, such as `docs/fern/versions/v0.20.0.yml`.
+3. Run `fern check` to confirm that the new path resolves.
+
+## Manage Documentation Versions
+
+The `versions` list in `docs/fern/docs.yml` defines the version switcher. Each entry points to a navigation file under `docs/fern/versions/`:
+
+```yaml
+versions:
+  - display-name: "0.20.0 (latest)"
+    path: versions/v0.20.0.yml
+    slug: latest
+  - display-name: nightly
+    path: versions/nightly.yml
+    slug: nightly
+```
+
+To add a version for a new release, complete the following steps:
+
+1. Copy `docs/fern/versions/nightly.yml` to a file named for the release, such as `docs/fern/versions/v0.21.0.yml`.
+2. Add an entry for the new file to the `versions` list in `docs/fern/docs.yml`.
+3. Move the `latest` slug and the `(latest)` label to the new entry, and give the previous release its own slug, such as `v0.20.0`.
+4. Run `fern check` to confirm the new version file.
+
+## Publish the Documentation
+
+The **Publish Fern Docs** workflow (`.github/workflows/publish-fern-docs.yml`) publishes the site. Maintainers start it in one of the following ways:
+
+- Push a tag that starts with `docs/v`:
+
+  ```bash
+  git tag docs/v0.21.0
+  git push origin docs/v0.21.0
+  ```
+
+- On the **Actions** tab, select **Publish Fern Docs**, and then select **Run workflow**.
+
+Each run waits for a maintainer to approve it in the `fern-publish` environment, and it publishes with the `FERN_TOKEN` repository secret.

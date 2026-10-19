@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Publishes the Fern documentation site when a docs tag is pushed or manually triggered.
+#
+# To publish:  git tag docs/v1.2.0 && git push origin docs/v1.2.0
+# Or use the "Run workflow" button in the Actions tab.
+#
+# This is the only workflow that holds the publish token, and it is only reachable
+# from a tag push or a manual dispatch, both of which require write access. Never
+# add a pull_request or pull_request_target trigger here.
+#
+# Required configuration:
+# - Environment: fern-publish, restricted to main and docs/v* tags, with required reviewers
+# - Repository secret: FERN_TOKEN (from `fern token` for the nvidia Fern org)
+
+name: Publish Fern Docs
+
+on:
+  push:
+    tags:
+      - 'docs/v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fern-publish
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: fern-publish
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Checkout frozen version content
+        run: |
+          set -eo pipefail
+          for version_file in docs/fern/versions/v*.yml; do
+            [ -e "$version_file" ] || continue
+            version=$(basename "$version_file" .yml)
+            if git rev-parse "$version" >/dev/null 2>&1; then
+              mkdir -p "docs/fern/versions/${version}-content"
+              git archive "$version" -- docs/ | tar -x --strip-components=1 -C "docs/fern/versions/${version}-content"
+              find "docs/fern/versions/${version}-content" -name '*.md' -exec sed -i 's/<img \([^>]*[^/]\)>/<img \1 \/>/g' {} +
+              echo "Extracted docs from $version"
+            else
+              echo "::warning::Tag $version not found — skipping content checkout"
+            fi
+          done
+
+      - name: Set up Fern CLI
+        uses: ./.github/actions/setup-fern
+
+      - name: Stamp version in docs.yml
+        run: |
+          VERSION=$(curl -sf https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name)
+          if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then
+            sed -i 's/display-name: "Latest"/display-name: "Latest · '"${VERSION}"'"/' docs/fern/docs.yml
+          fi
+          echo "--- docs.yml versions after stamp ---"
+          grep "display-name:" docs/fern/docs.yml
+
+      - name: Publish Docs
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        working-directory: ./docs/fern
+        run: |
+          set -o pipefail
+          fern generate --docs 2>&1 | tee /tmp/fern-output.log
+          URL=$(grep -oP 'Published docs to \K.*(?= \()' /tmp/fern-output.log || true)
+          if [ -n "$URL" ]; then
+            echo "### Published: [$URL]($URL)" >> "$GITHUB_STEP_SUMMARY"
+          fi
