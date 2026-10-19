@@ -229,6 +229,32 @@ def is_nccl_ep_fp8_dispatch_available():
     return check_mxfp8_support()[0]
 
 
+def is_flashinfer_routed_mxfp8_available():
+    """FlashInfer's routed MXFP8 MoE needs Blackwell and FlashInfer >= 0.6.4."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_ROUTED_MXFP8
+
+    return (
+        torch.cuda.is_available()
+        and HAVE_FLASHINFER_ROUTED_MXFP8
+        and torch.cuda.get_device_capability()[0] >= 10
+    )
+
+
+def prepare_routed_mxfp8_expert_weight(weight):
+    """Quantize a bf16 [experts, rows, cols] weight to MXFP8 in the routed kernel's layout."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_routed_mxfp8_weights
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    quantized = [MXFP8Tensor.from_bf16(expert, backend="triton") for expert in weight]
+    stacked = MXFP8Tensor(
+        data=torch.stack([expert.data for expert in quantized]).contiguous(),
+        scale=torch.stack([expert.scale for expert in quantized]).contiguous(),
+        backend="triton",
+        dtype=torch.bfloat16,
+    )
+    return prepare_routed_mxfp8_weights(stacked)
+
+
 class Utils:
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))

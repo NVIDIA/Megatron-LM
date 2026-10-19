@@ -58,7 +58,11 @@ from tests.unit_tests.determinism.kernels.harness import (
     deterministic_algorithms,
     seeded,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    is_flashinfer_routed_mxfp8_available,
+    prepare_routed_mxfp8_expert_weight,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -567,6 +571,46 @@ def test_permute_unpermute_replay_under_deterministic_algorithms(fused, with_pro
             replays=3,
             what=f"permute/unpermute[fused={fused}, probs={with_probs}]",
         )
+
+
+@pytest.mark.skipif(
+    not is_flashinfer_routed_mxfp8_available(),
+    reason="FlashInfer routed MXFP8 needs Blackwell and FlashInfer >= 0.6.4",
+)
+def test_inference_grouped_mlp_flashinfer_mxfp8_replays():
+    """InferenceGroupedMLP's FlashInfer MXFP8 path (quantize, TRT-LLM MoE, combine) replays bit-exactly."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import flashinfer_routed_mxfp8_moe
+
+    seeded()
+    num_experts, local_experts, hidden, intermediate, topk = 8, 2, 256, 256, 2
+    rows, valid = 512, 300
+    fc1 = prepare_routed_mxfp8_expert_weight(
+        torch.randn(local_experts, intermediate, hidden, device="cuda", dtype=torch.bfloat16)
+    )
+    fc2 = prepare_routed_mxfp8_expert_weight(
+        torch.randn(local_experts, hidden, intermediate, device="cuda", dtype=torch.bfloat16)
+    )
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    routing_map = torch.randint(0, num_experts, (rows, topk), device="cuda", dtype=torch.int64)
+    probs = torch.rand(rows, topk, device="cuda", dtype=torch.float32)
+    valid_tokens = torch.tensor([valid], dtype=torch.int32, device="cuda")
+
+    def fn(x, routing, weights):
+        return flashinfer_routed_mxfp8_moe(
+            x,
+            routing,
+            weights,
+            fc1,
+            fc2,
+            num_experts=num_experts,
+            local_expert_offset=2,
+            activation_type=6,
+            valid_tokens=valid_tokens,
+        )[:valid]
+
+    assert_replays_bit_exact(
+        fn, (hidden_states, routing_map, probs), backward=False, what="flashinfer_routed_mxfp8_moe"
+    )
 
 
 @pytest.mark.xfail(
