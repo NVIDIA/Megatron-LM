@@ -52,7 +52,6 @@ def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
     mpu.initialize_model_parallel(
         tensor_model_parallel_size=p.tp,
         pipeline_model_parallel_size=p.pp,
-        pipeline_model_parallel_layout=getattr(p, "pp_layout", None),
         virtual_pipeline_model_parallel_size=None if int(p.vpp or 1) <= 1 else p.vpp,
         context_parallel_size=p.cp,
         expert_model_parallel_size=p.ep,
@@ -160,14 +159,14 @@ def build_dist_opt_stack(
         # distinguish `hasattr(param,'allreduce')` from `getattr(..., True)`.
         wrapped_chunks = list(model_chunks)
     else:
-        ddp_config = DistributedDataParallelConfig(
-            # Core's DDP overlaps the gradient reduce-scatter and the parameter all-gather with compute; mcore's DSv4 configuration
-            # turns both on and hides 174 ms of NCCL per step behind the backward pass.
+        ddp_options = dict(
             use_distributed_optimizer=True,
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             grad_reduce_in_fp32=True,
         )
+        ddp_options.update(getattr(engine_cfg, "ddp_config_overrides", {}))
+        ddp_config = DistributedDataParallelConfig(**ddp_options)
         wrapped_chunks = []
         for chunk_idx, chunk in enumerate(model_chunks):
             chunk.model_type = ModelType.encoder_or_decoder

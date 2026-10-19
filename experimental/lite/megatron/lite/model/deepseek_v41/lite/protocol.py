@@ -62,6 +62,8 @@ def _validate(model_cfg, impl):
         or impl.dtype not in (torch.bfloat16, "bfloat16", "bf16")
     ):
         raise ValueError("DS4.1 standard training supports BF16 execution only")
+    if impl.optimizer not in (None, "muon", "adam", "dist_opt"):
+        raise ValueError(f"Unsupported DS4.1 optimizer: {impl.optimizer}")
     if impl.parallel.vpp != 1 or impl.parallel.tp != 1 or impl.parallel.etp not in (None, 1):
         raise ValueError("DS4.1 supports TP=ETP=VPP=1")
     if impl.router_aux_loss_coef not in (None, 0):
@@ -108,6 +110,10 @@ def _optimizer(chunks, cfg, impl, ps):
         optimizer=SimpleNamespace(**values),
         deterministic=False,
         override_optimizer_config=core,
+        # Runtime permits a variable number of microbatches; finish native
+        # reductions once after accumulation, rather than learning a fixed
+        # per-parameter readiness count from the first batch.
+        ddp_config_overrides={"overlap_grad_reduce": False},
     )
     chunks[:], optimizer = build_dist_opt_stack(chunks, model_cfg=cfg, engine_cfg=engine, ps=ps)
     # Keep the existing checkpoint/consumer convention without adding another optimizer.
@@ -122,6 +128,18 @@ def build_model(model_cfg, *, impl_cfg):
     from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
 
     ps = init_parallel(impl_cfg.parallel)
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    model_parallel_cuda_manual_seed(
+        torch.initial_seed(),
+        tp_rank=ps.tp_rank,
+        ep_rank=ps.ep_rank,
+        etp_rank=ps.etp_rank,
+        gtp_remat_rank=0,
+        egtp_remat_rank=0,
+        gtp_remat_world_size=1,
+        egtp_remat_world_size=1,
+    )
     token_map = impl_cfg.token_map
     if token_map is None and impl_cfg.hf_path:
         from pathlib import Path

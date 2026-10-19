@@ -105,3 +105,36 @@ def test_release_source_mapping_owner_shapes():
     assert source_name("layers.3.ffn_mixes.alpha_pre") == "layers.3.hc_ffn_scale"
     with pytest.raises(KeyError, match="Unmapped"):
         source_name("unowned.weight")
+
+
+def test_native_optimizer_keeps_core_muon_settings_and_variable_microbatch_policy(monkeypatch):
+    from megatron.lite.model.deepseek_v41.lite.protocol import _optimizer
+    from megatron.lite.primitive.optimizers import megatron_wrap
+
+    observed = {}
+    native = SimpleNamespace(chained_optimizers=[])
+
+    def construct(chunks, **kwargs):
+        observed.update(kwargs)
+        return chunks, native
+
+    monkeypatch.setattr(megatron_wrap, "build_dist_opt_stack", construct)
+    impl = ImplConfig(optimizer_config={"lr": 1e-5, "ns_steps": 2, "coefficient_type": "quintic"})
+    result, finalize = _optimizer([], DeepseekV41Config(num_hidden_layers=4), impl, object())
+    engine = observed["engine_cfg"]
+    assert result is native and callable(finalize)
+    assert engine.optimizer.optimizer == "muon" and engine.optimizer.lr == 1e-5
+    assert engine.override_optimizer_config["muon_num_ns_steps"] == 2
+    assert engine.override_optimizer_config["muon_coefficient_type"] == "quintic"
+    assert engine.ddp_config_overrides == {"overlap_grad_reduce": False}
+    assert not engine.deterministic
+
+
+def test_runtime_rejects_unknown_model_options_before_build():
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
+    from megatron.lite.runtime.backends.mlite.runtime import _build_impl_cfg
+
+    cfg = MegatronLiteConfig(impl_cfg={"unrecognized_precision": True})
+    with pytest.raises(ValueError, match="Unsupported DS4.1"):
+        _build_impl_cfg(protocol, cfg)

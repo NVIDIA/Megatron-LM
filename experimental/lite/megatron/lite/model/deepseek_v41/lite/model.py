@@ -43,6 +43,17 @@ from megatron.lite.model.deepseek_v41.topology import validate_build
 from megatron.lite.primitive.parallel import build_pipeline_chunk_layout
 
 
+class CoreAttentionSources(DS41AttentionSources):
+    """Core Attention constructs once before Hybrid supplies ratio/RoPE.
+
+    Match native CSA's window-only bootstrap defaults; Hybrid immediately
+    replaces that temporary module using the actual per-layer arguments.
+    """
+
+    def __init__(self, *, compress_ratio=0, rotary_pos_emb=None, **kwargs):
+        super().__init__(compress_ratio=compress_ratio, rotary_pos_emb=rotary_pos_emb, **kwargs)
+
+
 class DeepseekV41Model(MegatronModule):
     def __init__(self, release, impl, ps, *, token_map):
         config = core_config(release, impl.parallel)
@@ -51,6 +62,7 @@ class DeepseekV41Model(MegatronModule):
         super().__init__(config=config)
         self.release, self.impl, self.ps = release, impl, ps
         self.parallel_state = ps
+        self.tp_group = ps.tp_group
         self.source_state = KVSourceState()
         self.context = SourceContext(
             release,
@@ -84,7 +96,7 @@ class DeepseekV41Model(MegatronModule):
                     linear_q_up_proj=TEColumnParallelLinear,
                     linear_kv_proj=TEColumnParallelLinear,
                     core_attention=ModuleSpec(
-                        DS41AttentionSources, params={"context": self.context}
+                        CoreAttentionSources, params={"context": self.context}
                     ),
                     linear_proj=TERowParallelLinear,
                 ),
