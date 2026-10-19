@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Ratio-one layers: release RoPE and source ownership (40L release config)."""
+"""Release source ownership and unsupported candidate publishers."""
 from dataclasses import replace
 
 import pytest

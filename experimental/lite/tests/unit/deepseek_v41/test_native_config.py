@@ -9,9 +9,16 @@ from megatron.lite.runtime.backends.mlite.runtime import _build_impl_cfg
 
 
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_native_core_configuration_is_bf16_and_keeps_literal_ratios(deterministic):
+def test_release_initialization_and_unsupported_topology(deterministic):
 
     runtime = MegatronLiteConfig(hf_path="release", load_hf_weights=deterministic)
     assert _build_impl_cfg(protocol, runtime).initialize_weights is not deterministic
     with pytest.raises(ValueError, match="at most 40 text layers"):
         protocol._validate(DeepseekV41Config(num_hidden_layers=43), protocol.ImplConfig())
+
+
+def test_rollout_import_guard_is_active():
+    import importlib
+
+    with pytest.raises(AssertionError, match="vllm"):
+        importlib.import_module("vllm")
