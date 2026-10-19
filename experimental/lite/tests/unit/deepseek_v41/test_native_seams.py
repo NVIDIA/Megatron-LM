@@ -9,7 +9,11 @@ import torch
 
 from megatron.core.transformer.experimental_attention_variant.csa import Compressor
 from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.router_replay import RouterReplay
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
+from megatron.core.utils import _validate_dsa_kernel_backend_dependencies
+from megatron.lite.model.deepseek_v41.lite import ratio_one
 from megatron.lite.model.deepseek_v41.lite.compressor import DS41Compressor
 from megatron.lite.model.deepseek_v41.lite.moe import SortedTopKPolicy, bind_sorted_selection
 from megatron.lite.model.deepseek_v41.lite.state import KVSourceState
@@ -278,21 +282,27 @@ def test_native_indexer_interface_contract():
     # the constructor contract without pretending a CPU fixture allocates CUDA.
     import ast
 
-    tree = ast.parse(inspect.getsource(inspect.getmodule(CSAIndexer)))
-    native = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "CSAIndexer")
-    constructor = next(
-        n for n in native.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
-    )
-    assigned = {
-        target.attr
-        for n in ast.walk(constructor)
-        if isinstance(n, ast.Assign)
-        for target in n.targets
-        if isinstance(target, ast.Attribute)
-        and isinstance(target.value, ast.Name)
-        and target.value.id == "self"
-    }
-    assert {"linear_wq_b", "linear_weights_proj", "compressor"} <= assigned
+    for cls, attributes in [
+        (CSAIndexer, {"linear_wq_b", "linear_weights_proj", "compressor"}),
+        (TopKRouter, {"router_replay"}),
+    ]:
+        tree = ast.parse(inspect.getsource(inspect.getmodule(cls)))
+        native = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls.__name__
+        )
+        constructor = next(
+            n for n in native.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+        )
+        assigned = {
+            target.attr
+            for n in ast.walk(constructor)
+            if isinstance(n, ast.Assign)
+            for target in n.targets
+            if isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "self"
+        }
+        assert attributes <= assigned
 
 
 def test_ds41_query_projection_contract():
@@ -698,3 +708,27 @@ def test_ratio_two_attachment_rejects_other_ratios(ratio):
         attach_ratio_two_sources(
             SimpleNamespace(compress_ratio=ratio), compressor=None, indexer=None
         )
+
+
+def test_direct_core_signatures_are_pinned_to_dev_7b150acf():
+    contracts = {
+        ratio_one.async_gather_from_sequence_parallel_region: '(input_, tensor_parallel_output_grad=True, group=None)',
+        ratio_one.cp_utils.thd_cp_position_ids: '(cu_seqlens_padded, global_start, local_rows)',
+        ratio_one.fused_qk_topk_naive: '(q, k, weights, index_topk, mask=None, varlen_starts=None, varlen_ends=None, key_positions=None, use_relu=True)',
+        ratio_one.get_window_topk_idxs_thd: '(window_size, cu_seqlens_q, total_q=None)',
+        ratio_one.csa_sparse_attn: '(query, kv, attn_sink, topk_idxs, softmax_scale, topk_length=None, indexer_topk=0, is_thd=False, kv_reconstruction_parts=None, out_rope=None, deterministic=False, cuda_graph=False)',
+        ratio_one.batch_of_row: '(cu_seqlens_q, total_q=None)',
+        ratio_one.unfused_compressed_sparse_attn: '(query, kv_full, attn_sink, topk_indices, softmax_scale)',
+        TopKRouter.__init__: '(self, config, pg_collection=None, is_mtp_layer=False, layer_number=None, hash_moe_layer_threshold=None)',
+        WrappedTorchNorm.__new__: "(cls, config, hidden_size, eps=1e-05, persist_layer_norm=False, zero_centered_gamma=False, normalization='LayerNorm')",
+        _validate_dsa_kernel_backend_dependencies: '(dsa_kernel_backend)',
+    }
+    for function, expected in contracts.items():
+        signature = inspect.signature(function)
+        actual = signature.replace(
+            parameters=[
+                p.replace(annotation=inspect.Parameter.empty) for p in signature.parameters.values()
+            ],
+            return_annotation=inspect.Signature.empty,
+        )
+        assert str(actual) == expected, function.__qualname__
