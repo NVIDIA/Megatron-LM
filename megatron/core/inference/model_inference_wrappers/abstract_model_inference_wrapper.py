@@ -117,6 +117,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
             if modality not in capabilities:
                 raise ValueError(f"Unknown input modality: {modality!r}.")
             if not capabilities[modality]:
+                if modality == "audio":
+                    raise NotImplementedError(
+                        f"{type(self).__name__} does not implement audio prefill "
+                        "(supports_audio is false)."
+                    )
                 raise ValueError(f"{type(self).__name__} does not support {modality} inputs.")
 
     def resolve_media_token_id(self, tokenizer, modality: str) -> int:

@@ -233,6 +233,28 @@ def test_multimodal_serialization_rejects_user_media_cache_key():
         serialize_multimodal_data({"image": [b"image"], "media_cache_key": "user-provided"})
 
 
+def test_serialize_multimodal_data_names_audio_preprocessing():
+    with pytest.raises(NotImplementedError, match="preprocessing") as exc_info:
+        serialize_multimodal_data({"audio": b"clip"})
+    message = str(exc_info.value)
+    assert "audio" in message.lower()
+    assert "Unsupported multimodal modalities" not in message
+
+
+def test_serialize_multimodal_data_names_audio_before_unknown_keys():
+    with pytest.raises(NotImplementedError, match="preprocessing") as exc_info:
+        serialize_multimodal_data({"audio": b"clip", "depth": b"other"})
+    assert "Unsupported multimodal modalities" not in str(exc_info.value)
+
+
+def test_serialize_multimodal_data_unknown_key_stays_generic():
+    with pytest.raises(NotImplementedError, match="Unsupported multimodal modalities") as exc_info:
+        serialize_multimodal_data({"depth": b"clip"})
+    message = str(exc_info.value)
+    assert "preprocessing" not in message
+    assert "supported modalities" in message
+
+
 def test_compute_block_hashes_batched():
     """compute_block_hashes_batched produces one hash per *complete* block and
     chains: the hash of block i depends on block i-1. Single combined test

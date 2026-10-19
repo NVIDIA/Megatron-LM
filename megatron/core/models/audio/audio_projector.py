@@ -89,7 +89,8 @@ class AudioProjection(MegatronModule):
         """Project packed audio embeddings, preserving packing (requires stack_factor == 1)."""
         if self.stack_factor != 1:
             raise NotImplementedError(
-                "Packed audio projection currently supports stack_factor == 1 only"
+                "Packed audio projection requires stack_factor == 1; "
+                "per-audio stacking of PackedAudioEmbeddings is not implemented"
             )
         hidden_states = packed_states.embeddings
         if hidden_states.ndim != 2:
@@ -99,6 +100,12 @@ class AudioProjection(MegatronModule):
         if hidden_states.shape[-1] != self.input_size:
             raise ValueError(
                 f"Expected hidden size {self.input_size}, got {hidden_states.shape[-1]}"
+            )
+        packed_rows = int(packed_states.lengths.sum())
+        if packed_rows != hidden_states.shape[0]:
+            raise ValueError(
+                "Packed audio embeddings must have one row per length before projection, "
+                f"got {hidden_states.shape[0]} rows for sum(lengths)={packed_rows}"
             )
 
         projected_states = self.projector(hidden_states.unsqueeze(1)).squeeze(1)
