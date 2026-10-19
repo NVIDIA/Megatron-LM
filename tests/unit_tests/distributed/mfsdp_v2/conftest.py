@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.distributed_c10d import _world
+from torch.distributed.tensor.debug import _clear_sharding_prop_cache
 
 
 @dataclasses.dataclass(frozen=True)
@@ -20,22 +21,14 @@ class DistributedSetup:
     device: torch.device
 
 
-@pytest.fixture(autouse=True)
-def select_nccl_symmetric_memory_backend() -> None:
-    """Select NCCL as the symmetric-memory backend before each test in this directory.
-
-    is_symm_mem_tensor() marks the current backend as in use, even for ordinary tensors, and
-    the backend cannot change after that. Selecting NCCL here rather than in distributed_setup
-    keeps a DBuffer test that does not request distributed_setup from locking in the default
-    backend when it runs first, which would make every later set_backend("NCCL") raise.
-    """
-    if torch.cuda.is_available():
-        symm_mem.set_backend("NCCL")
-
-
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="function", autouse=True)
 def distributed_setup() -> Iterator[DistributedSetup]:
-    """Set up this rank's local device and clean up per-test process groups."""
+    """Set up this rank's local device and clean up per-test process groups.
+
+    This is autouse, and so runs before any xunit setup_method, because the first test in the
+    process that uses NCCL or symmetric memory decides their settings for every later test.
+    Tests that use the returned values still request it by name.
+    """
     # Some MFSDP v2 tests are sensitive to NCCL algorithm/channel choices. Clear
     # the suite-wide NCCL defaults (set in the top-level conftest.py) before
     # init_device_mesh initializes NCCL communicators so this bucket uses NCCL
@@ -53,6 +46,9 @@ def distributed_setup() -> Iterator[DistributedSetup]:
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        # is_symm_mem_tensor() marks the current symmetric-memory backend as in use,
+        # even for ordinary tensors, so select NCCL before any DBuffer test calls it.
+        symm_mem.set_backend("NCCL")
     else:
         device = torch.device("cpu")
 
@@ -80,6 +76,10 @@ def distributed_setup() -> Iterator[DistributedSetup]:
         # reinitialization. Later test teardown also uses WORLD, so leave its destruction
         # to session cleanup.
         # https://docs.pytorch.org/docs/stable/distributed.html#reinitialization
+        #
+        # DeviceMesh equality ignores process groups, so DTensor's sharding-propagation cache
+        # can hand a later test this test's meshes, whose groups are destroyed below.
+        _clear_sharding_prop_cache()
         for group in list(_world.pg_map):
             if group is not dist.group.WORLD:
                 dist.destroy_process_group(group)
