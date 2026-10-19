@@ -61,7 +61,6 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import (
-    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
     get_pg_rank,
     get_pg_size,
     get_te_version,
@@ -69,6 +68,9 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
+
+# Token alignment required by TE's grouped-tensor and fused grouped-MLP kernels.
+TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT = 256
 
 try:
     import transformer_engine as te

@@ -38,7 +38,6 @@ from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
-    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
     _validate_dsa_kernel_backend_dependencies,
     get_te_version,
     init_method_normal,
@@ -4061,6 +4060,11 @@ class TransformerConfig(ModelParallelConfig):
                         "moe_token_dispatcher_type='alltoall'."
                     )
                     if self.batch_invariant_backend == "te_native":
+                        # Import lazily: the TE extension imports TransformerConfig.
+                        from megatron.core.extensions.transformer_engine import (
+                            TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+                        )
+
                         assert (
                             not self.use_transformer_engine_op_fuser
                         ), "Batch-invariant training does not support TE op fuser."
