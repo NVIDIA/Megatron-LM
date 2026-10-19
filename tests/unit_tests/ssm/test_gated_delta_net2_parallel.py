@@ -11,8 +11,6 @@ from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 
 
-# Intermittent compilation/teardown hangs (#7742).
-@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
