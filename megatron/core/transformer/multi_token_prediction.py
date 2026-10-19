@@ -682,8 +682,9 @@ class MTPLossLoggingHelper:
             tracker["correct_values"].zero_()
         if "total_values" in tracker:
             tracker["total_values"].zero_()
-        tracker["reduce_group"] = None
-        tracker["avg_group"] = None
+        # Keep the reduce_group and avg_group across logging intervals: CUDA graph replay
+        # updates the tensors but does not repeat save_metrics_to_tracker's Python
+        # assignments. A new eager forward will overwrite the groups.
 
     @staticmethod
     def reduce_metrics_in_tracker():
@@ -2439,8 +2440,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         requires_conversion = self.cp_group.size() > 1 and source_layout != target_layout
 
         if requires_conversion:
-            if mtp_input_mask is not None:
-                raise ValueError("mtp_input_mask is not supported with CP layout conversion")
             if cp_batch is None:
                 raise ValueError("cp_batch is required when MTP uses a different CP layout")
             hidden_states = convert_cp_layout(
@@ -2498,6 +2497,8 @@ class MultiTokenPredictionBlock(MegatronModule):
             position_ids = layout_batch["position_ids"]
             labels = layout_batch["labels"]
             loss_mask = layout_batch["loss_mask"]
+            if mtp_input_mask is not None:
+                mtp_input_mask = layout_batch["mtp_input_mask"]
 
         return MultiTokenPredictionInputs(
             input_ids=input_ids,

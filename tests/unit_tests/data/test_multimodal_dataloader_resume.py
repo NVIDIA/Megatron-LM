@@ -15,7 +15,6 @@ _SPEC.loader.exec_module(dataloader_resume)
 
 def _args(**overrides) -> SimpleNamespace:
     values = {
-        "iteration": 0,
         "finetune": False,
         "pretrained_checkpoint": None,
         "strict_dataloader_state_load": False,
@@ -26,19 +25,19 @@ def _args(**overrides) -> SimpleNamespace:
 
 def test_initial_finetune_load_tolerates_missing_dataloader_state():
     assert dataloader_resume.is_initial_checkpoint_load_without_dataloader_state(
-        _args(finetune=True)
+        _args(finetune=True), iteration=0
     )
 
 
 def test_initial_pretrained_load_tolerates_missing_dataloader_state():
     assert dataloader_resume.is_initial_checkpoint_load_without_dataloader_state(
-        _args(pretrained_checkpoint="/checkpoints/initial")
+        _args(pretrained_checkpoint="/checkpoints/initial"), iteration=0
     )
 
 
 def test_nonzero_resume_is_not_an_initial_load():
     assert not dataloader_resume.is_initial_checkpoint_load_without_dataloader_state(
-        _args(iteration=250, finetune=True, pretrained_checkpoint="/checkpoints/initial")
+        _args(finetune=True, pretrained_checkpoint="/checkpoints/initial"), iteration=250
     )
 
 

@@ -8,7 +8,7 @@ spec:
   build: mcore-nemo
   nodes: 1
   gpus: 8
-  platforms: dgx_a100
+  platforms: dgx_h100
   time_limit: 1800
   scope:
   script_setup: |
