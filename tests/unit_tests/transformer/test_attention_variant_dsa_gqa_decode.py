@@ -148,9 +148,36 @@ class TestDSGQADynamicInference:
         Utils.destroy_model_parallel()
 
     def test_short_decode_reuses_both_kernels(self, monkeypatch):
+        from megatron.core.transformer.experimental_attention_variant import dsa_gqa
         from megatron.core.transformer.experimental_attention_variant import (
             dsa_gqa_decode_kernel as kernels,
         )
+
+        deepselect_calls = []
+        if dsa_gqa._deepselect_decode_supported(torch.device("cuda"), 512):
+            original_topk = dsa_gqa.deep_select.topk
+            original_score = kernels.dsa_gqa_decode_indexer_score
+            score_buffers = []
+
+            def capture_score(*args, **kwargs):
+                score_buffers.append(kwargs["out"].data_ptr())
+                return original_score(*args, **kwargs)
+
+            def capture_topk(scores, *args, **kwargs):
+                # The production score kernel must already provide aligned rows.
+                assert scores.dtype == torch.float32
+                assert scores.data_ptr() == score_buffers[-1]
+                assert (
+                    scores.stride(0)
+                    * scores.element_size()
+                    % (dsa_gqa.deep_select.get_stride_requirement()[0])
+                    == 0
+                )
+                deepselect_calls.append(1)
+                return original_topk(scores, *args, **kwargs)
+
+            monkeypatch.setattr(kernels, "dsa_gqa_decode_indexer_score", capture_score)
+            monkeypatch.setattr(dsa_gqa.deep_select, "topk", capture_topk)
 
         for name in ("_COMPILED", "_OPERATORS", "_ATTENTION_COMPILED", "_ATTENTION_OPERATORS"):
             monkeypatch.setattr(kernels, name, {})
@@ -231,6 +258,8 @@ class TestDSGQADynamicInference:
         assert len(compile_calls) == 2
         assert len(kernels._COMPILED) == 1
         assert len(kernels._ATTENTION_COMPILED) == 1
+        if dsa_gqa._deepselect_decode_supported(torch.device("cuda"), 512):
+            assert len(deepselect_calls) == 16
 
     @pytest.mark.parametrize("packed", [False, True])
     @pytest.mark.parametrize("fused", [False, True])
