@@ -360,7 +360,7 @@ class HyperConnectionModule(MegatronModule):
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile
-    def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """
         Compute h from projected hidden states and scaling factors.
 

@@ -355,7 +355,10 @@ class TestIdentityHyperConnectionModule:
         bwd_tol = dict(atol=5e-2, rtol=5e-2)
         torch.testing.assert_close(post_f, post_n, **fwd_tol)
         torch.testing.assert_close(agg_f, agg_n, **fwd_tol)
-        torch.testing.assert_close(out_f, out_n, **fwd_tol)
+        # out = residual + h_post * F: a one-ulp bf16 difference in h_post (the cuTile
+        # projection uses TF32 MMAs, the reference here full FP32) is scaled by |F|, which
+        # reaches ~3 for these inputs, so the absolute tolerance must cover ~0.03.
+        torch.testing.assert_close(out_f, out_n, atol=5e-2, rtol=2e-2)
         torch.testing.assert_close(gx_f, gx_n, **bwd_tol)
         assert grads_f.keys() == grads_n.keys()
         assert set(grads_n) == {"mapping_proj.weight", "alpha_pre", "alpha_post", "bias"}
