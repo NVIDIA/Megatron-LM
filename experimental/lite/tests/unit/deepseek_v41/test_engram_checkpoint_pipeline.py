@@ -51,13 +51,21 @@ def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
         engram = torch.nn.Module()
         engram.embed, engram.wkv = table, torch.nn.Linear(4, 4, bias=False)
         engram.register_buffer("cache", torch.zeros(2), persistent=False)
+        from megatron.core.transformer.module import MegatronModule
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        # A native Core module describes itself; global mpu is never initialized here.
+        native = MegatronModule(
+            TransformerConfig(num_layers=1, hidden_size=4, num_attention_heads=1)
+        )
+        native.tp_group, native.bias = dist.group.WORLD, torch.nn.Parameter(torch.zeros(4))
         model = torch.nn.Module()
-        model.engrams = torch.nn.ModuleDict({"1": engram})
+        model.engrams, model.native = torch.nn.ModuleDict({"1": engram}), native
         ps = SimpleNamespace(dp_cp_rank=1, dp_cp_group=dist.group.WORLD)
         attach_checkpoint_metadata([model], ps)
         state = model.sharded_state_dict()
         assert model._mlite_dist_opt_sharded_state_dict
-        assert set(state) == {"engrams.1.embed.weight", "engrams.1.wkv.weight"}
+        assert set(state) == {"engrams.1.embed.weight", "engrams.1.wkv.weight", "native.bias"}
         rows = state["engrams.1.embed.weight"]
         assert rows.global_shape == (6, 4) and rows.global_offset == (3, 0)
         assert rows.replica_id == (0, 0, 0)  # the row group covers dp x cp: no replicas

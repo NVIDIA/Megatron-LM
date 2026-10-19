@@ -191,7 +191,7 @@ def _local_tensors(module):
     return tensors
 
 
-def _sharded_state(module, prefix, offsets, ps):
+def _sharded_state(module, prefix, offsets, ps, metadata):
     """Core sharded state for the DS4.1 tree.
 
     Native Core modules describe themselves (expert offsets, TP axes). A module
@@ -223,12 +223,12 @@ def _sharded_state(module, prefix, offsets, ps):
         }
     rows = [m for m in module.modules() if getattr(getattr(m, "lookup", None), "group", None)]
     if isinstance(module, MegatronModule) and not rows:
-        return module.sharded_state_dict(prefix, offsets)
+        return module.sharded_state_dict(prefix, offsets, metadata)
     state = make_sharded_tensors_for_checkpoint(
         _local_tensors(module), prefix, {}, offsets, dp_cp_group=ps.dp_cp_group
     )
     for name, child in module.named_children():
-        state.update(_sharded_state(child, f"{prefix}{name}.", offsets, ps))
+        state.update(_sharded_state(child, f"{prefix}{name}.", offsets, ps, metadata))
     return state
 
 
@@ -242,9 +242,13 @@ def attach_checkpoint_metadata(chunks, ps):
             model = model.module
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, _m=model):
+            # Explicit groups: Core's defaults would consult the global mpu state.
+            metadata = dict(metadata or {}, dp_cp_group=ps.dp_cp_group)
             state = {}
             for name, child in _m.named_children():
-                state.update(_sharded_state(child, f"{prefix}{name}.", sharded_offsets, ps))
+                state.update(
+                    _sharded_state(child, f"{prefix}{name}.", sharded_offsets, ps, metadata)
+                )
             return state
 
         chunk.sharded_state_dict = MethodType(sharded_state_dict, chunk)
