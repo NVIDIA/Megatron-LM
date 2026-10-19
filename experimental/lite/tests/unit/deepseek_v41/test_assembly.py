@@ -32,7 +32,7 @@ def test_pipeline_source_carrier_preserves_values_and_owner_gradients():
         ("source", new_prefix.data_ptr(), id(new_group), torch.bfloat16, torch.device("cpu")),
     )
     recovered, recovered_prefix = values[new_key]
-    assert torch.equal(h, hidden) and torch.equal(p, pre)
+    assert h.data_ptr() % 16 == 0 and torch.equal(h, hidden) and torch.equal(p, pre)
     assert torch.equal(recovered, owner) and torch.equal(recovered_prefix, prefix)
     assert torch.equal(values[("candidate_pool", 3)], pool)
     (h.float().sum() + p.sum() + recovered.sum() * 2 + recovered.sum() * 3).backward()

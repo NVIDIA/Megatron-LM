@@ -73,7 +73,7 @@ def unpack_values(carrier):
                 for value in values[1:]:
                     result = result + value.float()
             elif dtype == "bfloat16":
-                result = values[0]
+                result = values[0].clone()
             else:
                 result = values[0].to(torch.uint8).view(getattr(torch, dtype))
             return result.reshape(shape)
