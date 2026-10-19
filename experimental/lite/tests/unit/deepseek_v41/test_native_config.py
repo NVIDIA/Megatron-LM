@@ -50,17 +50,22 @@ def test_invalid_ownership(kwargs):
         validate_build(DeepseekV41Config(num_hidden_layers=4, **kwargs), context_parallel_size=1)
 
 
-def test_native_core_configuration_is_bf16_and_keeps_literal_ratios():
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_native_core_configuration_is_bf16_and_keeps_literal_ratios(deterministic):
     from megatron.lite.model.deepseek_v41.lite.native import core_config
     from megatron.lite.runtime.contracts import ParallelConfig
 
-    config = core_config(DeepseekV41Config(num_hidden_layers=4), ParallelConfig(cp=2, ep=4))
+    config = core_config(
+        DeepseekV41Config(num_hidden_layers=4),
+        ParallelConfig(cp=2, ep=4),
+        deterministic_mode=deterministic,
+    )
     assert config.csa_compress_ratios == [0, 0, 2, 2]
     assert config.qk_head_dim + config.qk_pos_emb_head_dim == 512
     assert config.dsa_indexer_head_dim == 128 and config.dsa_indexer_n_heads == 32
     assert config.num_moe_experts == 384 and config.context_parallel_size == 1
     assert config.fp8 is None and config.fp4 is None
-    assert not config.deterministic_mode and not config.moe_router_fusion
+    assert config.deterministic_mode == deterministic and not config.moe_router_fusion
     assert config.moe_router_score_function == "sqrtsoftplus"
     assert config.moe_token_dispatcher_type == "alltoall"
 

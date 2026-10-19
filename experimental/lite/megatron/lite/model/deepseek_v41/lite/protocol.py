@@ -31,6 +31,7 @@ class ImplConfig:
     optimizer: str | None = "adam"
     optimizer_config: object = None
     attention_backend_override: str | None = None
+    deterministic_mode: bool = False
     router_aux_loss_coef: float = 0.0
     quantized: bool = False
     w4a8_experts: bool = False
@@ -85,7 +86,9 @@ def _validate(model_cfg, impl):
         rows[0].insert(0, "embedding")
         rows[-1].append("loss")
         impl.parallel.pp_layout = rows
-    core_config(model_cfg, impl.parallel, initialize=False)
+    core_config(
+        model_cfg, impl.parallel, initialize=False, deterministic_mode=impl.deterministic_mode
+    )
 
 
 def _optimizer(chunks, cfg, impl, ps):

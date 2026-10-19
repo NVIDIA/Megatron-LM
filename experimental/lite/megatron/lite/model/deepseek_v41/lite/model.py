@@ -57,7 +57,10 @@ class CoreAttentionSources(DS41AttentionSources):
 class DeepseekV41Model(MegatronModule):
     def __init__(self, release, impl, ps, *, token_map):
         config = core_config(
-            release, impl.parallel, attention_backend=impl.attention_backend_override or "none"
+            release,
+            impl.parallel,
+            attention_backend=impl.attention_backend_override or "none",
+            deterministic_mode=impl.deterministic_mode,
         )
         config.persist_layer_norm = False
         super().__init__(config=config)

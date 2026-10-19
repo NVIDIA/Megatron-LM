@@ -41,6 +41,7 @@ def core_config(
     recompute_granularity=None,
     recompute_method=None,
     attention_backend="none",
+    deterministic_mode=False,
 ):
     """Validate unsupported topology before groups or large tensors are created.
 
@@ -71,6 +72,7 @@ def core_config(
         expert_tensor_parallel_size=1,
         params_dtype=torch.bfloat16,
         bf16=True,
+        deterministic_mode=deterministic_mode,
         perform_initialization=initialize,
         normalization="RMSNorm",
         layernorm_epsilon=release.rms_norm_eps,
