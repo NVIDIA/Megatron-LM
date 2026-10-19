@@ -13,6 +13,8 @@ from megatron.core.models.deepseek_v41.config import EngramConfig
 from megatron.core.models.deepseek_v41.engram import Engram, EngramHasher
 from megatron.core.models.deepseek_v41.engram_hash import EngramLayout
 from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
+from megatron.core.optimizer import OptimizerConfig, get_standard_config_overrides
+from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
 
 
 def _hasher():
@@ -54,6 +56,14 @@ def test_hash_resets_and_memory_gradients():
     mask[:, 3] = False
     torch.testing.assert_close(hasher(ids, mask)[:, 4:], hasher(ids[:, 4:]))
     model = Engram(_config(), hasher.layout, 0, SimpleNamespace(ep=None, tp=None, expt_dp=None))
+    overrides = get_standard_config_overrides(OptimizerConfig())
+    for name in ("q_weight", "k_weight"):
+        parameter = getattr(model, name)
+        assert _is_muon_excluded(parameter)
+        assert any(
+            key.matches(parameter, name) and override.get("wd_mult") == 0.0
+            for key, override in overrides.items()
+        )
     hidden = torch.randn(8, 1, 8, requires_grad=True)
     out = model(hidden, hashes, mask)
     torch.testing.assert_close(out[3], hidden[3])

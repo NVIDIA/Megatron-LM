@@ -127,8 +127,9 @@ class Engram(MegatronModule):
             dtype=config.params_dtype,
             device=device,
         )
+        # Vector parameters follow the standard norm weight-decay/Muon policy.
         self.q_weight = nn.Parameter(
-            torch.ones(self.n, config.hidden_size, dtype=config.params_dtype, device=device)
+            torch.ones(self.n * config.hidden_size, dtype=config.params_dtype, device=device)
         )
         self.k_weight = nn.Parameter(torch.ones_like(self.q_weight))
         if config.perform_initialization:
@@ -143,7 +144,8 @@ class Engram(MegatronModule):
         h = hidden_states.float().unflatten(-1, (self.n, self.hidden_size))
         eps = self.config.layernorm_epsilon
         rstd = (h.square().mean(-1) + eps).rsqrt() * (key.square().mean(-1) + eps).rsqrt()
-        dot = (h * key * self.q_weight.float() * self.k_weight.float()).sum(-1)
+        gamma = (self.q_weight.float() * self.k_weight.float()).view(self.n, self.hidden_size)
+        dot = (h * gamma * key).sum(-1)
         dot = dot * rstd * self.hidden_size**-0.5
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
         if token_mask is not None:
