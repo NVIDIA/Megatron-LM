@@ -44,7 +44,7 @@ def _worker(rank, root):
     module = torch.nn.Module()
     module.embed, ps = table, SimpleNamespace(dp_cp_rank=rank, dp_cp_group=group)
     attach_checkpoint_metadata([module], ps)
-    Path(root, "new").mkdir()
+    Path(root, "new").mkdir(exist_ok=True)  # both ranks
     dist_checkpointing.save(module.sharded_state_dict(), f"{root}/new")
     saved = weight.clone(), scale.clone()
     weight.view(torch.uint8).zero_(), scale.view(torch.uint8).zero_()
