@@ -260,6 +260,12 @@ def test_load_cp_smaller_than_save_cp_warns_about_truncation(tmp_path, monkeypat
         cp_size_save=16,
     )
     _load_args(monkeypatch, sft=True, num_samples=1)
+    # The production warning is gated on safe_get_rank() == 0, which falls
+    # back to the RANK env var when torch.distributed isn't initialized --
+    # under CI's torchrun-launched unit-test shards that var is whatever
+    # rank happens to run this pytest process, not necessarily 0. Pin it so
+    # the test doesn't flake depending on shard assignment.
+    monkeypatch.setattr(cached_logits_loss, "safe_get_rank", lambda: 0)
 
     with pytest.warns(UserWarning, match="truncat"):
         make_teacher_tar_dataset(
