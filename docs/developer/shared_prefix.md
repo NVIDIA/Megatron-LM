@@ -39,6 +39,8 @@ Attention runs every star of a forest in at most two FlashAttention varlen passe
 a causal self pass and a non-causal pass from completions to their prompt, and
 merges them by log-sum-exp. Forward and backward are exact. The backward requires
 flash-attn 2.7.0 or later, which stack validation checks before any layer runs.
+The passes always call FlashAttention 2, whatever `flash_attention_version` pins for
+Transformer Engine and the inference engine.
 Under `torch.use_deterministic_algorithms(True)`, which `--deterministic-mode`
 enables, the backward uses FlashAttention's deterministic kernel; no other switch
 is needed for bit-exact attention replay.
@@ -144,15 +146,15 @@ Unsupported combinations fail explicitly, including hash routing, quantization
 recipes, fp8/fp4, wide residual streams, mHC, multi-latent attention,
 attention-logit softcapping, QK-clip statistics, selective core-attention
 recomputation, sliding-window attention, external attention/padding masks,
-inference contexts, fine-grained activation offloading, and CUDA graphs. At CP
-greater than one, Mamba requires `linear_cp_layout='zigzag'`. For MoE, the adapter
-rejects load balancing that replaces top-k routing (such as sinkhorn), nonzero
-auxiliary-loss and z-loss coefficients, input jitter, randomized forced routing,
-expert-capacity token dropping, per-rank capacity token dropping
-(`moe_expert_rank_capacity_factor`), routing replay, and training MLP chunking.
-Auxiliary-loss balancing types with zero coefficients, the MCore default, are
-accepted because they leave top-k routing unchanged. See the validation functions
-for the complete runtime contract.
+inference contexts, fine-grained activation offloading, CUDA graphs, and
+batch-invariant mode. At CP greater than one, Mamba requires
+`linear_cp_layout='zigzag'`. For MoE, the adapter rejects load balancing that
+replaces top-k routing (such as sinkhorn), nonzero auxiliary-loss and z-loss
+coefficients, input jitter, randomized forced routing, expert-capacity token
+dropping, per-rank capacity token dropping (`moe_expert_rank_capacity_factor`),
+routing replay, and training MLP chunking. Auxiliary-loss balancing types with
+zero coefficients, the MCore default, are accepted because they leave top-k
+routing unchanged. See the validation functions for the complete runtime contract.
 
 The capability tokens at the end of `shared_prefix.py` name the implemented code
 paths so integrations can require the exact conjunction they use. They are

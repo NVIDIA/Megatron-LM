@@ -213,6 +213,11 @@ _REJECTED_CONFIGS = [
     ({"wide_residual": object()}, NotImplementedError, "wide residual streams"),
     ({"enable_mhc_connections": True}, NotImplementedError, "mHC connections"),
     ({"attn_logit_softcapping": 30.0}, NotImplementedError, "logit softcapping"),
+    (
+        {"batch_invariant_mode": True, "flash_attention_version": 3},
+        NotImplementedError,
+        "batch-invariant mode",
+    ),
     ({"sequence_parallel": True}, NotImplementedError, "sequence parallelism requires TP>1"),
     ({"tensor_model_parallel_size": 2}, RuntimeError, "tensor-parallel config"),
     ({"context_parallel_size": 2}, RuntimeError, "context-parallel config"),
@@ -254,6 +259,14 @@ _REJECTED_MOE_CONFIGS = [
 def test_unsupported_stack_config_rejected(overrides, error, message):
     stack = _stack(_config(**overrides))
     with pytest.raises(error, match=message):
+        _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+
+
+def test_batch_invariant_mode_rejected_before_layer_checks():
+    """One stack-level message, before the attention and Mamba layers report their own causes."""
+    config = _config(batch_invariant_mode=True, flash_attention_version=3)
+    stack = _stack(config, [_attention_layer(), _mamba_layer(1, contiguous=False)])
+    with pytest.raises(NotImplementedError, match="Hybrid does not yet support batch-invariant"):
         _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
 

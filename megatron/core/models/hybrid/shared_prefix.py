@@ -180,6 +180,14 @@ def _validate_hybrid_stack(
         raise NotImplementedError("shared-prefix Hybrid does not yet support mHC connections")
     if getattr(stack.config, "attn_logit_softcapping", None) is not None:
         raise NotImplementedError("shared-prefix attention does not yet support logit softcapping")
+    # Batch-invariant mode promises bitwise training/inference agreement. Shared-prefix attention
+    # runs FlashAttention 2 passes although this mode pins version 3 or 4, and shared-prefix Mamba
+    # applies its gate to the rounded scan output instead of inside the scan.
+    if getattr(stack.config, "batch_invariant_mode", False):
+        raise NotImplementedError(
+            "shared-prefix Hybrid does not yet support batch-invariant mode: its attention runs "
+            "FlashAttention 2 and its Mamba layers gate after the scan output is rounded"
+        )
     tp_size = stack.tp_group.size()
     sequence_parallel = bool(stack.config.sequence_parallel)
     if tp_size > 1 and not sequence_parallel:
