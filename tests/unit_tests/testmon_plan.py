@@ -15,8 +15,8 @@ from pathlib import Path
 from testmon_cache import PHASES, PLATFORMS, cache_identity, validate_cache
 
 
-def _test_sources_unchanged(root: Path, source_sha: str, recipe_path: str | None = None) -> None:
-    """Require unchanged test sources and recipe before reusing baseline test IDs."""
+def _collection_sources_unchanged(root: Path, source_sha: str, recipe_path: str) -> None:
+    """Defer source changes to GPU collection, which can discover new test IDs."""
 
     def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -26,13 +26,13 @@ def _test_sources_unchanged(root: Path, source_sha: str, recipe_path: str | None
     if git("cat-file", "-e", f"{source_sha}^{{commit}}", check=False).returncode:
         # Actions uses a shallow checkout; fetch the baseline without moving HEAD.
         git("fetch", "--no-tags", "--no-write-fetch-head", "--depth=1", "origin", source_sha)
-    paths = [":(glob)tests/unit_tests/**/*.py"]
-    if recipe_path is not None:
-        paths.append(recipe_path)
+    # Runtime fingerprints do not cover imports used only to generate test IDs.
+    # Preserve the old selector's discovery of new parametrized tests.
+    paths = [":(glob)**/*.py", recipe_path]
     changed = git("diff", "--name-only", source_sha, "--", *paths).stdout
     added = git("ls-files", "--others", "--exclude-standard", "--", *paths).stdout
     if changed or added:
-        raise ValueError("unit-test sources changed; GPU collection is required")
+        raise ValueError("collection sources changed; using the existing GPU selector")
 
 
 def _changed_files(directory: Path, source_sha: str) -> list[str]:
@@ -134,14 +134,14 @@ def select(
     matched_key: str,
     pr_files_dir: Path,
 ) -> dict:
-    """Return a CPU selection, or a full-bucket plan if any evidence is unavailable."""
+    """Return a CPU selection, or defer to the existing GPU selector when unavailable."""
     plan = {
         "schema": 1,
         "source_sha": source_sha,
         "bucket": bucket,
         "platform": recipe_platform,
         "image_id": image_id,
-        "mode": "full",
+        "mode": "enforce",
         "reason": "",
         "phases": {},
     }
@@ -152,8 +152,8 @@ def select(
         manifest = validate_cache(cache_dir, identity, matched_key)
         if manifest.get("image_id") != image_id:
             # The CPU host cannot measure the packages in a different GPU image.
-            # Equal image IDs prove the baseline runtime is still the execution runtime.
-            raise ValueError("container image changed; full GPU execution is required")
+            # Let the existing GPU selector compare installed runtime versions.
+            raise ValueError("container image changed; GPU runtime validation is required")
         if not any(char in bucket for char in "*?[") and source_sha != manifest["source_sha"]:
             # Explicit-file pytest arguments bypass Testmon's stable-file collection skip.
             # They may discover new IDs from collection-only production dependencies.
@@ -162,7 +162,9 @@ def select(
             )
         changed_files = _changed_files(pr_files_dir, source_sha)
         mandatory = _mandatory_files(root, bucket, recipe_platform, changed_files)
-        _test_sources_unchanged(root, manifest["source_sha"], PLATFORMS[recipe_platform]["recipe"])
+        _collection_sources_unchanged(
+            root, manifest["source_sha"], PLATFORMS[recipe_platform]["recipe"]
+        )
         for phase in PHASES:
             runtime = json.loads((cache_dir / phase / "metadata.json").read_text())["runtime"]
             if (

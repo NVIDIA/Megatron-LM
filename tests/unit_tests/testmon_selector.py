@@ -166,7 +166,7 @@ def _run_plan(argv: list[str]) -> int:
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(plan, sort_keys=True, indent=2) + "\n")
-    has_tests = plan["mode"] == "full" or any(plan["phases"].values())
+    has_tests = plan["mode"] != "selected" or any(plan["phases"].values())
     print(f"mode={plan['mode']}")
     print(f"has_tests={str(has_tests).lower()}")
     print(f"Unit Testmon CPU selection: {plan['reason']}", file=sys.stderr)

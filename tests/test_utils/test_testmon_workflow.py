@@ -791,6 +791,29 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
     )
     assert eval(expression, {"__builtins__": {}}, {"needs": needs}) == has_tests
 
+    # CPU failures keep the existing GPU cache-selection path available.
+    result, fallback = _run(
+        _step("_unit-tests.yml", "select", "result")["run"],
+        tmp_path,
+        {
+            "PLAN_MODE": "enforce" if has_tests else "selected",
+            "HAS_TESTS": str(has_tests).lower(),
+            "PLAN_OUTCOME": "success",
+            "UPLOAD_OUTCOME": "skipped" if has_tests else "failure",
+            "PLAN_ARTIFACT": "plan",
+            "BUCKET": bucket,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert fallback == {"mode": "enforce", "has_tests": "true", "plan_artifact": ""}
+    needs.select.outputs = SimpleNamespace(**fallback)
+    assert eval(expression, {"__builtins__": {}}, {"needs": needs})
+    mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
+    mode = mode.removeprefix("${{").removesuffix("}}").replace("&&", "and").replace("||", "or")
+    for requested in ("enforce", "full"):
+        inputs = SimpleNamespace(unit_testmon_mode=requested)
+        assert eval(mode, {"__builtins__": {}}, {"needs": needs, "inputs": inputs}) == requested
+
     for platform in ("dgx_h100", "dgx_gb200"):
         directory = tmp_path / f"unit-test-plan-{platform}"
         directory.mkdir()

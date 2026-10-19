@@ -54,7 +54,7 @@ jobs:
       plan_artifact: ${{ steps.result.outputs.plan_artifact }}
     steps:
       # Selection is an optimization. Failed setup, unavailable caches, or an
-      # incomplete artifact handoff must leave the full GPU bucket enabled.
+      # incomplete artifact handoff must leave GPU selection enabled.
       - name: Checkout
         id: checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -173,7 +173,7 @@ jobs:
           PLAN_ARTIFACT: ${{ steps.identity.outputs.artifact }}
           BUCKET: ${{ inputs.bucket }}
         run: |
-          MODE=full
+          MODE=enforce
           ARTIFACT=""
           if [[ "$PLAN_OUTCOME" == "success" && "$PLAN_MODE" == "selected" \
              && "$UPLOAD_OUTCOME" == "success" && -n "$PLAN_ARTIFACT" \
@@ -193,9 +193,9 @@ jobs:
             echo
             echo "- Bucket: \`$BUCKET\`"
             echo "- Mode: \`$MODE\`"
-            echo "- GPU tests required: \`$HAS_TESTS\`"
-            if [[ "$MODE" == "full" ]]; then
-              echo "- Selection unavailable or incompatible; running the full GPU bucket."
+            echo "- GPU runner required: \`$HAS_TESTS\`"
+            if [[ "$MODE" == "enforce" ]]; then
+              echo "- CPU selection unavailable; selecting tests on GPU with the existing cache checks."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -229,7 +229,7 @@ jobs:
           container-image: ${{ inputs.container-image }}
           platform: ${{ inputs.platform }}
           sha: ${{ inputs.sha }}
-          unit_testmon_mode: ${{ needs.select.outputs.mode == 'selected' && 'preselected' || 'full' }}
+          unit_testmon_mode: ${{ needs.select.outputs.mode == 'selected' && 'preselected' || inputs.unit_testmon_mode }}
           unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
           unit_testmon_plan_artifact: ${{ needs.select.outputs.plan_artifact }}
           unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}

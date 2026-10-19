@@ -471,7 +471,10 @@ def cpu_baseline(project, tmp_path):
     (directory / "test_app.py").write_text(
         (directory / "test_app.py").read_text() + "\nimport pytest\n\n@pytest.mark.experimental\n"
         "def test_experimental():\n    assert active(2) == 3\n"
+        "\nfrom values import VALUES\n\n@pytest.mark.parametrize('value', VALUES)\n"
+        "def test_param(value):\n    assert value > 0\n"
     )
+    (project / "values.py").write_text("VALUES = [1]\n")
     (project / "pytest.ini").write_text("[pytest]\nmarkers = experimental: experimental test\n")
     bucket, platform, image = "tests/unit_tests/example/**/*.py", "dgx_h100", "sha256:" + "a" * 64
     for filename in cache_module.COMPATIBILITY_FILES:
@@ -528,20 +531,20 @@ def cpu_baseline(project, tmp_path):
     ("change", "mode", "selected"),
     [
         ("unchanged", "selected", []),
-        ("dependency", "selected", ["test_app.py"]),
-        ("new-test", "full", []),
+        ("collection-dependency", "enforce", ["test_app.py"]),
+        ("new-test", "enforce", []),
         ("mandatory", "selected", ["test_other.py"]),
-        ("missing-cache", "full", []),
-        ("image", "full", []),
+        ("missing-cache", "enforce", []),
+        ("image", "enforce", []),
     ],
 )
 def test_cpu_selection(cpu_baseline, change, mode, selected):
     arguments = cpu_baseline
     project, directory = arguments["root"], arguments["cache_dir"]
     before = {phase: _snapshot(directory / phase) for phase in ("prod", "experimental")}
-    if change == "dependency":
-        # Selection must not execute this now-failing test.
-        (project / "app.py").write_text("def active(value):\n    return value + 2\n")
+    if change == "collection-dependency":
+        # This import is used only during collection, outside runtime fingerprints.
+        (project / "values.py").write_text("VALUES = [1, 2]\n")
     elif change == "new-test":
         (project / "tests/unit_tests/example/test_new.py").write_text(
             "def test_new():\n    assert False\n"
@@ -590,7 +593,7 @@ def test_cpu_selection(cpu_baseline, change, mode, selected):
     plan = json.loads(plan_path.read_text())
     assert plan["mode"] == mode, plan["reason"]
     assert f"mode={mode}\n" in result.stdout
-    assert f"has_tests={str(mode == 'full' or bool(selected)).lower()}\n" in result.stdout
+    assert f"has_tests={str(mode != 'selected' or bool(selected)).lower()}\n" in result.stdout
     if mode == "selected":
         selected = [f"tests/unit_tests/example/{filename}" for filename in selected]
         assert plan["phases"] == {phase: selected for phase in before}
@@ -609,6 +612,22 @@ def test_cpu_selection(cpu_baseline, change, mode, selected):
             assert (output / "mandatory-tests").read_text().splitlines() == plan["mandatory_files"]
     else:
         assert plan["phases"] == {} and plan["reason"]
+        # Deferring CPU selection must retain the old cache-selection behavior.
+        result = _invoke(
+            project, arguments["cache_dir"], "select", pytest_args=("-m", "not experimental")
+        )
+        if change == "missing-cache":
+            assert result.returncode == 2
+        else:
+            assert result.returncode == 0, result.stdout + result.stderr
+            output = directory / ".testmon-work/prod/rank-0/selected-tests"
+            nodes = output.read_text().splitlines()
+            expected = {
+                "collection-dependency": ["tests/unit_tests/example/test_app.py::test_param[2]"],
+                "new-test": ["tests/unit_tests/example/test_new.py::test_new"],
+                "image": [],
+            }
+            assert nodes == expected[change]
     assert {phase: _snapshot(directory / phase) for phase in before} == before
 
 
